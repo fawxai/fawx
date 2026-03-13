@@ -472,6 +472,62 @@
     background: var(--accent-subtle); color: var(--accent);
   }
 
+  /* ── Empty states grid (Screen 10) ── */
+  .empty-states-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+    max-width: 960px; margin: 0 auto;
+  }
+  .mini-window {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .mini-titlebar {
+    height: 28px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 10px; flex-shrink: 0;
+  }
+  .mini-traffic { display: flex; gap: 5px; }
+  .mini-tl { width: 8px; height: 8px; border-radius: 50%; }
+  .mini-title { flex: 1; text-align: center; font-size: 10px; color: var(--text-secondary); }
+  .mini-content {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 32px 24px; gap: 12px; min-height: 200px;
+  }
+  .mini-content .empty-msg { font-size: 14px; color: var(--text-secondary); text-align: center; line-height: 1.5; }
+  .mini-content .empty-btn {
+    padding: 8px 16px; border-radius: 8px; font-size: 13px; font-family: inherit;
+    cursor: pointer; border: none;
+  }
+  .mini-content .empty-btn-accent { background: var(--accent); color: #fff; }
+  .mini-content .empty-btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+  .empty-state-label {
+    font-size: 11px; font-weight: 600; color: var(--text-secondary);
+    text-transform: uppercase; letter-spacing: 0.5px; padding: 8px 10px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+
+  /* ── iOS Settings (Screen 11) ── */
+  .ios-settings-list { flex: 1; overflow-y: auto; }
+  .ios-settings-section { margin-bottom: 8px; }
+  .ios-settings-header {
+    font-size: 13px; font-weight: 400; color: var(--text-secondary);
+    text-transform: uppercase; padding: 24px 16px 6px;
+  }
+  .ios-settings-group {
+    background: var(--surface); border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .ios-settings-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); min-height: 44px;
+  }
+  .ios-settings-row:last-child { border-bottom: none; }
+  .ios-settings-row-label { font-size: 16px; color: var(--text); }
+  .ios-settings-row-value {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 16px; color: var(--text-secondary);
+  }
+  .ios-settings-chevron { color: var(--text-secondary); opacity: 0.4; font-size: 14px; }
+
   /* ── Empty state ── */
   .empty-state {
     flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -479,6 +535,79 @@
   }
   .empty-fox { font-size: 32px; opacity: 0.5; }
   .empty-text { font-size: 16px; font-weight: 600; color: var(--text-secondary); }
+
+  /* ── Annotation labels ── */
+  .annotation {
+    font-size: 10px; color: var(--text-secondary); opacity: 0.7;
+    font-style: italic; padding: 4px 12px 2px;
+  }
+
+  /* ── Pulsing typing dots (first-token wait) ── */
+  .typing-dots { display: flex; gap: 4px; padding: 10px 0; }
+  .typing-dots span {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); opacity: 0.3;
+    animation: typing-pulse 1.4s ease-in-out infinite;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes typing-pulse {
+    0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+
+  /* ── Error states (Screen 12) ── */
+  .error-banner {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px; font-size: 13px; flex-shrink: 0;
+  }
+  .error-banner-warn {
+    background: rgba(251,191,36,0.12); color: var(--warning);
+    border-bottom: 1px solid rgba(251,191,36,0.2);
+  }
+  .error-banner-error {
+    background: rgba(248,113,113,0.1); color: var(--error);
+    border-bottom: 1px solid rgba(248,113,113,0.2);
+  }
+  .error-banner .retry-btn {
+    margin-left: auto; padding: 4px 12px; border-radius: 6px;
+    font-size: 12px; font-family: inherit; cursor: pointer;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  }
+  .error-card {
+    background: rgba(248,113,113,0.06); border: 1px solid var(--border);
+    border-left: 3px solid var(--error); border-radius: 8px;
+    padding: 16px; margin: 4px 0;
+  }
+  .error-card p { font-size: 14px; color: var(--text); margin-bottom: 12px; }
+  .interrupted-text { font-style: italic; color: var(--text-secondary); font-size: 13px; }
+  .retry-inline {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 12px; border-radius: 6px; font-size: 13px; font-family: inherit;
+    background: var(--surface); border: 1px solid var(--border); color: var(--accent);
+    cursor: pointer; margin-top: 8px;
+  }
+  .animated-dots::after {
+    content: ''; animation: dot-anim 1.5s steps(4,end) infinite;
+  }
+  @keyframes dot-anim {
+    0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; }
+  }
+
+  /* ── Segmented control (settings) ── */
+  .segmented-control {
+    display: flex; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .segmented-control button {
+    flex: 1; padding: 8px 12px; border: none; background: none;
+    font-size: 13px; font-family: inherit; color: var(--text-secondary); cursor: pointer;
+    border-right: 1px solid var(--border);
+  }
+  .segmented-control button:last-child { border-right: none; }
+  .segmented-control button.active {
+    background: var(--accent); color: #fff;
+  }
 </style>
 </head>
 <body>
@@ -495,6 +624,9 @@
     <button class="tab-btn" onclick="showScreen(6)">7. Settings</button>
     <button class="tab-btn" onclick="showScreen(7)">8. iOS Sessions</button>
     <button class="tab-btn" onclick="showScreen(8)">9. iOS Chat</button>
+    <button class="tab-btn" onclick="showScreen(9)">10. Empty States</button>
+    <button class="tab-btn" onclick="showScreen(10)">11. iOS Settings</button>
+    <button class="tab-btn" onclick="showScreen(11)">12. Error States</button>
   </div>
   <div class="theme-toggle">
     <button class="active" onclick="setTheme('dark')">Dark</button>
@@ -556,22 +688,20 @@
         <div class="sidebar-header">
           <button class="new-session-btn">+ New Session</button>
         </div>
+        <div class="annotation">V1 fallback (no preview)</div>
         <div class="sidebar-divider"></div>
         <div class="session-group-label">Today</div>
         <div class="session-row">
           <div class="session-title">Sprint 2 discussion</div>
-          <div class="session-preview">Here's how to add proper error handling...</div>
           <div class="session-meta"><span class="session-time">3m ago</span></div>
         </div>
         <div class="session-row">
           <div class="session-title">Debug streaming issue</div>
-          <div class="session-preview">The SSE connection drops after 30s...</div>
           <div class="session-meta"><span class="session-time">1h ago</span></div>
         </div>
         <div class="session-group-label">Yesterday</div>
         <div class="session-row">
           <div class="session-title">API endpoint planning</div>
-          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
           <div class="session-meta"><span class="session-time">Yesterday</span></div>
         </div>
         <div class="sidebar-bottom">
@@ -689,6 +819,13 @@
             <!-- Assistant streaming -->
             <div class="msg-assistant">
               Sure! Here's how to add proper error handling to the streaming endpoint...<span class="cursor"></span>
+            </div>
+            <!-- Waiting-for-first-token indicator -->
+            <div style="align-self: flex-end; margin-top: 8px;">
+              <div class="msg-user">What about retry logic?</div>
+            </div>
+            <div class="msg-assistant">
+              <div class="typing-dots"><span></span><span></span><span></span></div>
             </div>
           </div>
         </div>
@@ -1002,8 +1139,10 @@
               </div>
               <div class="skill-desc">Schedule tasks and set reminders with cron expressions.</div>
             </div>
+            <!-- V1 fallback cards (no description field) -->
             <!-- 4 -->
             <div class="skill-card">
+              <div class="annotation" style="padding: 0 0 4px;">V1 fallback (no description)</div>
               <div class="skill-card-header">
                 <div class="skill-icon-box">📦</div>
                 <div class="skill-name">web-fetch</div>
@@ -1012,7 +1151,6 @@
                 <span class="skill-tool-chip">fetch_url</span>
                 <span class="skill-tool-chip">extract_text</span>
               </div>
-              <div class="skill-desc">Fetch and extract readable content from any URL.</div>
             </div>
             <!-- 5 -->
             <div class="skill-card">
@@ -1025,7 +1163,6 @@
                 <span class="skill-tool-chip">write_file</span>
                 <span class="skill-tool-chip">list_dir</span>
               </div>
-              <div class="skill-desc">Read, write, and list files on the local filesystem.</div>
             </div>
             <!-- 6 -->
             <div class="skill-card">
@@ -1037,7 +1174,6 @@
                 <span class="skill-tool-chip">evaluate</span>
                 <span class="skill-tool-chip">convert_units</span>
               </div>
-              <div class="skill-desc">Evaluate mathematical expressions and convert between units.</div>
             </div>
           </div>
         </div>
@@ -1144,6 +1280,51 @@
         </div>
       </div>
     </div>
+
+    <!-- Appearance tab -->
+    <div class="mac-window mac-window-settings">
+      <div class="mac-titlebar">
+        <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+        <div class="mac-title">Fawx Settings</div>
+        <div style="width: 52px;"></div>
+      </div>
+      <div class="settings-layout">
+        <div class="settings-sidebar">
+          <div class="settings-nav-item">🔌 Connection</div>
+          <div class="settings-nav-item active">🎨 Appearance</div>
+          <div class="settings-nav-item">🤖 Model & Thinking</div>
+          <div class="settings-nav-item">🔑 Auth Status</div>
+          <div class="settings-nav-item">ℹ️ About</div>
+        </div>
+        <div class="settings-content">
+          <div class="settings-section-title">Appearance</div>
+          <div class="settings-field">
+            <div class="settings-label">Theme</div>
+            <div class="segmented-control">
+              <button>Light</button>
+              <button>Dark</button>
+              <button class="active">System</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <div class="settings-label">Font Size</div>
+            <div class="segmented-control">
+              <button>Small</button>
+              <button class="active">Medium</button>
+              <button>Large</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <div class="settings-label">Code Font</div>
+            <select class="settings-select" disabled>
+              <option selected>SF Mono</option>
+              <option>Menlo</option>
+              <option>Fira Code</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1167,6 +1348,16 @@
     </div>
     <div class="ios-large-title">Sessions</div>
     <input class="ios-search" type="text" placeholder="Search sessions..." disabled>
+    <div class="ios-status-row">
+      <span class="ios-status-dot"></span>
+      <span>Connected</span>
+      <span style="opacity: 0.5;">·</span>
+      <span>Power User</span>
+      <span style="opacity: 0.5;">·</span>
+      <span>claude-sonnet-4-6</span>
+      <span style="opacity: 0.5;">·</span>
+      <span>62% ctx</span>
+    </div>
     <div style="flex: 1; overflow-y: auto;">
       <div class="ios-section-header">Today</div>
       <div class="ios-row">
@@ -1194,15 +1385,15 @@
     </div>
     <div class="ios-tab-bar">
       <div class="ios-tab active">
-        <span class="ios-tab-icon">💬</span>
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">◉</span>
         <span>Chat</span>
       </div>
-      <div class="ios-tab">
-        <span class="ios-tab-icon">🧩</span>
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⊞</span>
         <span>Skills</span>
       </div>
-      <div class="ios-tab">
-        <span class="ios-tab-icon">⚙️</span>
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⚙</span>
         <span>Settings</span>
       </div>
     </div>
@@ -1230,6 +1421,10 @@
     </div>
     <div class="ios-status-row">
       <span class="ios-status-dot"></span>
+      <span>Connected</span>
+      <span style="opacity: 0.5;">·</span>
+      <span>Power User</span>
+      <span style="opacity: 0.5;">·</span>
       <span>claude-sonnet-4-6</span>
       <span style="opacity: 0.5;">·</span>
       <span>62% ctx</span>
@@ -1289,6 +1484,301 @@
       </div>
     </div>
     <div class="iphone-home-indicator"></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 10: Empty States Reference Sheet      -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-9">
+  <div class="empty-states-grid">
+    <!-- 1: No sessions -->
+    <div class="mini-window">
+      <div class="empty-state-label">No sessions exist</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx</div>
+      </div>
+      <div style="display: flex; flex: 1;">
+        <div style="width: 140px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 8px;">
+          <button style="width: 100%; padding: 6px 8px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 11px; font-family: inherit; cursor: pointer;">+ New Session</button>
+          <div style="flex: 1; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--text-secondary); opacity: 0.5; text-align: center; padding: 8px;">No sessions</div>
+        </div>
+        <div class="mini-content">
+          <div style="font-size: 24px; opacity: 0.4;">🦊</div>
+          <div class="empty-msg">No conversations yet.<br>Start a new one!</div>
+          <button class="empty-btn empty-btn-accent">+ New Session</button>
+        </div>
+      </div>
+    </div>
+    <!-- 2: Search no results -->
+    <div class="mini-window">
+      <div class="empty-state-label">Search returns no results</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx</div>
+      </div>
+      <div style="display: flex; flex: 1;">
+        <div style="width: 140px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 8px; gap: 6px;">
+          <div style="padding: 6px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 10px; color: var(--text-secondary);">🔍 xyz</div>
+          <div style="flex: 1; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--text-secondary); opacity: 0.5; text-align: center; padding: 8px;">No matches</div>
+        </div>
+        <div class="mini-content">
+          <div style="font-size: 24px; opacity: 0.4;">🔍</div>
+          <div class="empty-msg">No sessions matching "xyz"</div>
+          <button class="empty-btn empty-btn-secondary">Clear Search</button>
+        </div>
+      </div>
+    </div>
+    <!-- 3: Load failed -->
+    <div class="mini-window">
+      <div class="empty-state-label">Session list load failed</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx</div>
+      </div>
+      <div class="mini-content">
+        <div style="font-size: 24px; opacity: 0.4;">⚠️</div>
+        <div class="empty-msg">Could not load sessions</div>
+        <button class="empty-btn empty-btn-secondary">Retry</button>
+      </div>
+    </div>
+    <!-- 4: Skills empty -->
+    <div class="mini-window">
+      <div class="empty-state-label">Skills empty state</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx — Skills</div>
+      </div>
+      <div class="mini-content">
+        <div style="font-size: 24px; opacity: 0.3;">🧩</div>
+        <div class="empty-msg">No skills loaded on server.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 11: iOS Settings                      -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-10">
+  <div class="iphone-frame">
+    <div class="iphone-notch"></div>
+    <div class="iphone-status-bar">
+      <span>9:41</span>
+      <span style="display: flex; gap: 4px; align-items: center;">
+        <span style="font-size: 10px;">●●●●</span>
+        <span style="font-size: 10px;">WiFi</span>
+        <span style="font-size: 10px;">🔋</span>
+      </span>
+    </div>
+    <div class="ios-nav">
+      <div></div>
+      <div></div>
+    </div>
+    <div class="ios-large-title">Settings</div>
+    <div class="ios-settings-list">
+      <!-- Connection -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Connection</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Server URL</span>
+            <span class="ios-settings-row-value">
+              <span style="font-family: 'SF Mono', Menlo, monospace; font-size: 14px;">100.93.251.101:8400</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Bearer Token</span>
+            <span class="ios-settings-row-value">
+              <span>●●●●●●</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Status</span>
+            <span class="ios-settings-row-value">
+              <span class="ios-status-dot"></span>
+              <span style="color: var(--success);">Connected</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <!-- Appearance -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Appearance</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Theme</span>
+            <span class="ios-settings-row-value">
+              <span>Dark</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Font Size</span>
+            <span class="ios-settings-row-value">
+              <span>Medium</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <!-- Model & Thinking -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Model & Thinking</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Server Model</span>
+            <span class="ios-settings-row-value">
+              <span style="font-family: 'SF Mono', Menlo, monospace; font-size: 14px;">claude-sonnet-4-6</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Thinking Level</span>
+            <span class="ios-settings-row-value">
+              <span>high</span>
+              <span class="ios-settings-chevron">›</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <!-- Auth Status -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Auth Status</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Anthropic</span>
+            <span class="ios-settings-row-value">
+              <span style="color: var(--success);">Authenticated</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">OpenAI</span>
+            <span class="ios-settings-row-value">
+              <span style="color: var(--success);">Authenticated</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <!-- About -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">About</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">App Version</span>
+            <span class="ios-settings-row-value">
+              <span>1.0.0 (42)</span>
+            </span>
+          </div>
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Server Version</span>
+            <span class="ios-settings-row-value">
+              <span>0.9.3</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="ios-tab-bar">
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">◉</span>
+        <span>Chat</span>
+      </div>
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⊞</span>
+        <span>Skills</span>
+      </div>
+      <div class="ios-tab active">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⚙</span>
+        <span>Settings</span>
+      </div>
+    </div>
+    <div class="iphone-home-indicator"></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 12: Error States Reference Sheet      -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-11">
+  <div class="empty-states-grid">
+    <!-- 1: Reconnecting -->
+    <div class="mini-window">
+      <div class="empty-state-label">Reconnecting</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx</div>
+      </div>
+      <div style="display: flex; flex-direction: column; flex: 1;">
+        <div class="error-banner error-banner-warn">
+          <span>⚠</span>
+          <span>Reconnecting<span class="animated-dots"></span></span>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px;">
+          <div style="font-size: 13px; color: var(--text-secondary); text-align: center;">Chat content appears here...</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-secondary); background: var(--surface);">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--warning);"></span>
+          <span style="color: var(--warning);">Reconnecting...</span>
+        </div>
+      </div>
+    </div>
+    <!-- 2: Disconnected -->
+    <div class="mini-window">
+      <div class="empty-state-label">Disconnected</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx</div>
+      </div>
+      <div style="display: flex; flex-direction: column; flex: 1;">
+        <div class="error-banner error-banner-error">
+          <span>✕</span>
+          <span>Cannot connect to server</span>
+          <button class="retry-btn">Retry</button>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px;">
+          <div style="font-size: 13px; color: var(--text-secondary); text-align: center;">Chat content appears here...</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-secondary); background: var(--surface);">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--error);"></span>
+          <span style="color: var(--error);">Disconnected</span>
+        </div>
+      </div>
+    </div>
+    <!-- 3: Interrupted response -->
+    <div class="mini-window">
+      <div class="empty-state-label">Interrupted response</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx — Sprint 2</div>
+      </div>
+      <div style="display: flex; flex-direction: column; flex: 1; padding: 16px; gap: 10px;">
+        <div style="align-self: flex-end; padding: 6px 10px; background: var(--accent-subtle); border-radius: 8px 8px 2px 8px; font-size: 12px; color: var(--text);">Show me the SSE code</div>
+        <div style="font-size: 12px; color: var(--text); line-height: 1.5;">
+          The server sends events using the standard SSE protocol. Here's the core handler that sets up the channel...
+          <span class="interrupted-text"> (interrupted)</span>
+        </div>
+        <button class="retry-inline">↻ Response interrupted — Retry?</button>
+      </div>
+    </div>
+    <!-- 4: Rate limited -->
+    <div class="mini-window">
+      <div class="empty-state-label">Rate limited</div>
+      <div class="mini-titlebar">
+        <div class="mini-traffic"><div class="mini-tl tl-close"></div><div class="mini-tl tl-min"></div><div class="mini-tl tl-max"></div></div>
+        <div class="mini-title">Fawx — Sprint 2</div>
+      </div>
+      <div style="display: flex; flex-direction: column; flex: 1; padding: 16px; gap: 10px;">
+        <div style="align-self: flex-end; padding: 6px 10px; background: var(--accent-subtle); border-radius: 8px 8px 2px 8px; font-size: 12px; color: var(--text);">Explain the auth flow</div>
+        <div class="error-card">
+          <p style="font-size: 13px;">Rate limited by LLM provider. Try again in a moment.</p>
+          <button class="retry-inline">↻ Retry</button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
