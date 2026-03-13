@@ -50,17 +50,19 @@ The Fawx server (`fawx serve --http` on port 8400) exposes 21 HTTP endpoints. Th
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/v1/health` | GET | Connection health check |
+| `/health` | GET | Connection health check (top-level, NOT under /v1/) |
 | `/v1/sessions` | GET/POST | List/create sessions |
 | `/v1/sessions/{id}` | GET/DELETE | Get/delete session |
-| `/v1/sessions/{id}/messages` | GET | Message history |
-| `/v1/sessions/{id}/chat` | POST | Send message (SSE stream response) |
+| `/v1/sessions/{id}/messages` | GET/POST | Message history (GET) / Send message with SSE stream response (POST) |
+| `/v1/sessions/{id}/clear` | POST | Clear session history |
 | `/v1/sessions/{id}/context` | GET | Context window usage (used_tokens, max_tokens, percentage) |
 | `/v1/models` | GET | Available models |
-| `/v1/model` | GET/PUT | Current model / switch model |
+| `/v1/model` | PUT | Switch model (current model available via `/v1/status`) |
 | `/v1/thinking` | GET/PUT | Current thinking level / switch |
 | `/v1/skills` | GET | Loaded skills with descriptions |
-| `/v1/auth/status` | GET | Auth provider status |
+| `/v1/auth` | GET | Auth provider status |
+| `/v1/status` | GET | Server status (includes current model, session info) |
+| `/v1/config` | GET/POST | Server config read/write |
 
 **New in Sprint 3 (just merged):**
 - SSE keep-alive pings: `: ping\n\n` comments every 15s during silence — your SSE parser must ignore these (they're comments, not events)
