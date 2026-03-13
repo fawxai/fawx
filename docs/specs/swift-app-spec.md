@@ -133,10 +133,11 @@ All communication with the Fawx server goes through `FawxClient`, a thin async/a
 ### 2.3 Data Flow
 
 ```
-FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
+FawxClient (HTTP/SSE) → ViewModel (@Observable) → SwiftUI View
                                 ↑
                           User interaction
 ```
+Uses Swift Observation framework (`@Observable` macro, iOS 17+ / macOS 14+), NOT the older `@Published` / `ObservableObject` pattern.
 
 - **No local database in V1.** All state lives on the Fawx server. The app is a pure client.
 - ViewModels hold transient UI state (selected session, draft message, streaming state)
@@ -369,7 +370,8 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 | User message | Right-aligned (or left with user icon), plain text or markdown |
 | Assistant text | Left-aligned, full markdown rendering (headings, lists, code blocks, bold, italic, links) |
 | Assistant streaming | Same as above but tokens appear incrementally, blinking cursor at end |
-| Tool call | Collapsible card: tool name as header, arguments as code, result as expandable body |
+| Tool call (live) | Collapsible card: tool name as header, arguments as code, result as expandable body. Built from `tool_call_start` → `tool_call_complete` → `tool_result` SSE events during streaming. |
+| Tool call (history) | Tool calls in loaded history appear as plain text in assistant messages (the API does not structure them separately). Render as-is — no collapsible cards for historical tool calls in V1. |
 | Error | Red-tinted card with error category and message |
 | System | Centered, muted text (session created, model changed, etc.) |
 
@@ -465,7 +467,7 @@ V2:  ┌─ Queue ▾ ───────────────────�
 - On cancel: partial response stays, marked as "(interrupted)"
 
 **API calls:**
-- Send: `POST /v1/sessions/{id}/messages` with `{"content": "...", "images": []}`, `Accept: text/event-stream`
+- Send: `POST /v1/sessions/{id}/messages` with `{"message": "...", "images": []}`, `Accept: text/event-stream` (⚠️ field is `message` not `content`)
 - History: `GET /v1/sessions/{id}/messages?limit=100` on session open (server default is 100, max unbounded)
 - Model switch: `PUT /v1/model` with `{"model": "..."}`
 - Thinking switch: `PUT /v1/thinking` with `{"level": "..."}`
@@ -507,14 +509,14 @@ The current `SessionInfo` struct has a `label` field (optional, set at creation)
 **Skill card:**
 - Icon (placeholder icon for V1, skills don't ship icons yet)
 - Name (bold)
-- Description (2 lines max, truncated)
-- Status indicator (loaded / available)
+- Tool list (e.g., "web_search, web_fetch")
+- Description (2 lines max, truncated) — ⚠️ requires backend enhancement #3, otherwise omit
 
 **Sections:**
 - **Loaded** — skills currently active on the server
 - Skills are read-only in V1 (no install/remove from GUI)
 
-**API:** `GET /v1/skills` — returns list with name, description, tool count
+**API:** `GET /v1/skills` — returns `{"skills": [{"name", "tools"}], "total": N}`. No description field yet (see backend work item #3).
 
 ### 5.5 Settings
 
@@ -534,9 +536,9 @@ The current `SessionInfo` struct has a `label` field (optional, set at creation)
 - **Code font** — picker: SF Mono, Menlo, Fira Code (if installed)
 
 #### Model & Thinking
-- **Default model** — picker populated from `GET /v1/models`
-- **Default thinking level** — picker (off, low, medium, high, extra high)
-- Note: these are per-session overrides; changing here sets the default for new sessions
+- **Active model** — picker populated from `GET /v1/models`, shows current `active_model`
+- **Thinking level** — picker (off, low, medium, high, extra high)
+- ⚠️ These are **server-wide settings**, not per-session. Changing the model here changes it for all sessions. Label clearly as "Server Model" / "Server Thinking Level" in the UI.
 
 #### Auth Status
 - **Provider list** from `GET /v1/auth`
@@ -611,6 +613,7 @@ Every screen's data source, exhaustively mapped to existing endpoints.
 **Backend work needed before V1 ships:**
 1. `GET /v1/sessions/{id}/context` — **new endpoint** for context window display (data exists in SlidingWindow, needs HTTP exposure)
 2. `SessionInfo` enhancement — add `title: Option<String>` and `preview: Option<String>` fields computed from first/last messages (avoids N+1 sidebar problem)
+3. `SkillSummaryDto` enhancement — add `description: Option<String>` (data exists in WASM skill manifests, just not exposed via API)
 
 All other screens are fully backed by the existing 21-endpoint API surface shipped in Sprint 1 + Sprint 2.
 
@@ -915,40 +918,128 @@ data: {"error": "session storage not available"}
 
 **Client parsing note:** Use `EventSource`-style parsing — read `event:` line for type, `data:` line for JSON payload. The `done` event replaces the `[DONE]` sentinel from the original spec. The `response` field in `done` contains the full assembled response text.
 
-### Model Info
+### Models List — `GET /v1/models` (verified against `settings.rs`)
 ```json
 {
-  "id": "claude-sonnet-4-6",
-  "provider": "anthropic",
-  "name": "Claude Sonnet 4.6",
-  "is_active": true
+  "active_model": "claude-sonnet-4-6",
+  "models": [
+    {
+      "model_id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "auth_method": "api_key"
+    },
+    {
+      "model_id": "gpt-5.4",
+      "provider": "openai",
+      "auth_method": "oauth"
+    }
+  ]
+}
+```
+**Notes:**
+- Field is `model_id`, NOT `id` or `name`.
+- No `is_active` per-model — use `active_model` at top level to determine which is selected.
+- `auth_method` tells you how the provider is authenticated (useful for auth status display).
+- No human-readable display name — derive from `model_id` in the client if needed.
+
+### Set Model — `PUT /v1/model`
+Request: `{"model": "gpt-5.4"}`
+Response:
+```json
+{
+  "previous_model": "claude-sonnet-4-6",
+  "active_model": "gpt-5.4"
 }
 ```
 
-### Thinking Level
+### Thinking Level — `GET /v1/thinking` (verified against `types.rs`)
 ```json
 {
   "level": "high",
-  "available": ["off", "low", "medium", "high", "extra_high"]
+  "budget_tokens": 10000
+}
+```
+**Notes:**
+- No `available` array — the client must hardcode the available levels: `["off", "low", "medium", "high", "extra_high"]`
+- `budget_tokens` is `null` when level is `"off"`
+
+### Set Thinking — `PUT /v1/thinking`
+Request: `{"level": "extra_high"}`
+Response:
+```json
+{
+  "previous_level": "high",
+  "level": "extra_high",
+  "budget_tokens": 32000
 }
 ```
 
-### Skill
+### Skills List — `GET /v1/skills` (verified against `types.rs`)
 ```json
 {
-  "name": "brave-search",
-  "description": "Web search via Brave Search API",
-  "tools": ["web_search"],
-  "loaded": true
+  "skills": [
+    {
+      "name": "brave-search",
+      "tools": ["web_search"]
+    }
+  ],
+  "total": 4
 }
 ```
+**Notes:**
+- ⚠️ No `description` or `loaded` field exists in `SkillSummaryDto`. Only `name` and `tools`.
+- The client cannot show skill descriptions unless the backend is enhanced.
+- **Backend enhancement needed:** Add `description: Option<String>` to `SkillSummaryDto` (the WASM skill manifest has descriptions, just not exposed via API yet).
 
-### Auth Provider
+### Auth Providers — `GET /v1/auth` (verified against `types.rs`)
 ```json
 {
-  "provider": "anthropic",
-  "status": "authenticated",
-  "models": ["claude-sonnet-4-6", "claude-opus-4"]
+  "providers": [
+    {
+      "provider": "anthropic",
+      "auth_methods": ["api_key", "oauth"],
+      "model_count": 3,
+      "status": "authenticated"
+    }
+  ]
+}
+```
+**Notes:**
+- No `models` array — only `model_count` (integer). Client cannot list specific models per provider from this endpoint alone.
+- `auth_methods` is an array of strings, not a single string.
+- `status` values: `"authenticated"` | `"not_configured"` (verify in implementation)
+
+### Create Session — `POST /v1/sessions`
+Request:
+```json
+{
+  "label": "Sprint 2 discussion",
+  "model": "claude-sonnet-4-6"
+}
+```
+**Notes:** Both fields optional. `label` defaults to null, `model` defaults to server's active model.
+
+Response: `SessionInfo` (same shape as list, HTTP 201)
+
+### Send Message — `POST /v1/sessions/{id}/messages`
+Request:
+```json
+{
+  "message": "Show me the streaming implementation",
+  "images": [
+    {
+      "data": "base64-encoded-image-data",
+      "media_type": "image/png"
+    }
+  ]
+}
+```
+**⚠️ CRITICAL:** Field name is `message`, NOT `content`. Using `content` will cause a 422/deserialization error. `images` is an array of `{data, media_type}` objects, not URLs or paths.
+
+### Error Response (all error endpoints)
+```json
+{
+  "error": "session not found: sess-xyz"
 }
 ```
 
