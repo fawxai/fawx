@@ -156,8 +156,8 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 | `surfaceActive` | `#383838` | `#E0E0E0` | Selected/active items |
 | `text` | `#E8E8E8` | `#1A1A1A` | Primary text |
 | `textSecondary` | `#999999` | `#666666` | Secondary/muted text |
-| `accent` | `#FF6B2B` | `#E55A1B` | Sparx orange — brand accent |
-| `accentSubtle` | `#FF6B2B20` | `#E55A1B15` | Accent backgrounds |
+| `accent` | `#E8711A` | `#D45E14` | Fawx orange — matched to logo |
+| `accentSubtle` | `#E8711A20` | `#D45E1415` | Accent backgrounds |
 | `success` | `#4ADE80` | `#22C55E` | Online, connected, passed |
 | `warning` | `#FBBF24` | `#D97706` | Warnings, caution |
 | `error` | `#F87171` | `#DC2626` | Errors, disconnected |
