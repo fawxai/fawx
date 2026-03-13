@@ -16,6 +16,7 @@ members = [
     "engine/crates/fx-storage",
     "engine/crates/fx-tools",
     "engine/crates/fx-analysis",
+    "engine/crates/fx-api",
     "engine/crates/fx-cli",
     "engine/crates/fx-conversation",
     "engine/crates/fx-memory",

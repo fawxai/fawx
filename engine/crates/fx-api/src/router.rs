@@ -1,0 +1,58 @@
+use crate::handlers::config::{handle_config_get, handle_config_set};
+use crate::handlers::fleet::fleet_router;
+use crate::handlers::health::{handle_health, handle_status};
+use crate::handlers::message::handle_message;
+use crate::handlers::webhook::handle_webhook;
+use crate::middleware::auth_middleware;
+use crate::state::HttpState;
+use crate::telegram::webhook::handle_telegram_webhook;
+use axum::middleware;
+use axum::routing::{get, post};
+use axum::Router;
+use fx_fleet::FleetManager;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+
+pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
+    let authenticated = Router::new()
+        .route("/message", post(handle_message))
+        .route("/status", get(handle_status))
+        .route("/config", get(handle_config_get).post(handle_config_set))
+        .route("/webhook/{channel_id}", post(handle_webhook))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let public = Router::new()
+        .route("/health", get(handle_health))
+        .route("/telegram/webhook", post(handle_telegram_webhook));
+    let router = authenticated.merge(public).with_state(state);
+
+    merge_fleet_router(router, fleet_manager)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+}
+
+pub fn merge_fleet_router(
+    router: Router,
+    fleet_manager: Option<Arc<Mutex<FleetManager>>>,
+) -> Router {
+    match fleet_manager {
+        Some(manager) => router.merge(fleet_router(manager)),
+        None => router,
+    }
+}
+
+pub fn load_fleet_manager_if_initialized(
+    data_dir: &Path,
+) -> anyhow::Result<Option<Arc<Mutex<FleetManager>>>> {
+    let fleet_dir = data_dir.join("fleet");
+    if !fleet_dir.join("fleet.key").is_file() {
+        return Ok(None);
+    }
+    let manager = FleetManager::load(&fleet_dir)?;
+    Ok(Some(Arc::new(Mutex::new(manager))))
+}

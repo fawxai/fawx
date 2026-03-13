@@ -80,9 +80,6 @@ async fn handle_fleet_result(
     let Some(node_id) = authenticated_node_id(&state.manager, &headers).await else {
         return StatusCode::UNAUTHORIZED;
     };
-    // TODO(fleet-phase2): Store task result and notify orchestrator.
-    // Result processing will be implemented when experiment scheduling
-    // dispatches tasks to fleet workers.
     match state
         .manager
         .lock()
