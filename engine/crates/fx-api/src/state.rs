@@ -3,6 +3,7 @@ use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
+use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +16,7 @@ pub struct HttpState {
     pub tailscale_ip: Option<String>,
     pub bearer_token: String,
     pub channels: ChannelRuntime,
+    pub data_dir: PathBuf,
 }
 
 #[derive(Clone)]
