@@ -1,9 +1,9 @@
 # Spec: API Sprint 1 — Session Management + Chat Enrichment
 
 **Status**: Ready for implementation
-**Crates touched**: `fx-cli` (http_serve.rs, headless.rs), `fx-session`
-**Estimated scope**: ~250 lines production code + ~150 lines tests
-**Depends on**: PR #1391 (error surfacing) — merge first to avoid conflicts
+**Crates touched**: `fx-api` (new handlers + router extension), `fx-session` (new `clear` method), `fx-cli` (AppEngine extension)
+**Estimated scope**: ~300 lines production code + ~200 lines tests
+**Depends on**: PR #1392 (fx-api extraction) — merged ✅
 
 ---
 
@@ -18,30 +18,32 @@ restarts. A GUI client needs to:
 
 The `fx-session` crate already provides `SessionRegistry` with full
 CRUD + history + persistence (redb). The work is **wiring** these into
-HTTP endpoints and connecting session-scoped message processing.
+HTTP endpoints in `fx-api` and connecting session-scoped message processing
+through the `AppEngine` trait.
 
 ---
 
 ## Design
 
-### Current architecture
+### Current architecture (after Sprint 0)
 
 ```
-POST /message → HeadlessApp::process_message()
-                  └── uses self.conversation_history: Vec<Message>
-                       (single implicit conversation, in-memory only)
+POST /message → fx-api handler → AppEngine::process_message()
+                                    └── HeadlessApp.conversation_history (single implicit session)
 ```
 
 ### Target architecture
 
 ```
-POST /v1/sessions                  → SessionRegistry::create()
-GET  /v1/sessions                  → SessionRegistry::list()
-GET  /v1/sessions/{id}             → SessionRegistry::get_info()
+POST   /v1/sessions                → SessionRegistry::create()
+GET    /v1/sessions                → SessionRegistry::list()
+GET    /v1/sessions/{id}           → SessionRegistry::get_info()
 DELETE /v1/sessions/{id}           → SessionRegistry::destroy()
-GET  /v1/sessions/{id}/messages    → SessionRegistry::history()
-POST /v1/sessions/{id}/messages    → process + record in session
-POST /v1/sessions/{id}/clear       → clear conversation history
+GET    /v1/sessions/{id}/messages  → SessionRegistry::history()
+POST   /v1/sessions/{id}/messages  → AppEngine::process_with_context() → record in session
+POST   /v1/sessions/{id}/clear     → SessionRegistry::clear()
+
+POST   /message                    → extended with optional images + session_id
 ```
 
 All new endpoints live under `/v1/` prefix. The existing `/message`
@@ -50,24 +52,27 @@ implicit "default" session).
 
 ### Why /v1/ prefix
 
-We're building an API that external clients (Swift app) will depend on.
-Versioning now avoids breaking changes later. The existing unversioned
-endpoints (`/message`, `/status`, `/config`) remain as-is for backwards
+We're building an API that a Swift app will depend on. Versioning now
+avoids breaking changes later. The existing unversioned endpoints
+(`/message`, `/status`, `/config`) remain as-is for backwards
 compatibility.
 
 ---
 
 ## Implementation
 
-### 1. Add `SessionRegistry` to `HttpState`
+### 1. Add `SessionRegistry` to `HttpState` (`fx-api/src/state.rs`)
 
 ```rust
-// In http_serve.rs
-struct HttpState {
-    app: Arc<Mutex<HeadlessApp>>,
-    session_registry: Option<SessionRegistry>,  // NEW
-    start_time: Instant,
-    // ... existing fields
+use fx_session::SessionRegistry;
+
+pub struct HttpState {
+    pub(crate) app: Arc<Mutex<dyn AppEngine>>,
+    pub(crate) session_registry: Option<SessionRegistry>,  // NEW
+    pub(crate) start_time: Instant,
+    pub(crate) bearer_token: String,
+    pub(crate) channels: ChannelRuntime,
+    pub(crate) data_dir: PathBuf,
 }
 ```
 
@@ -75,7 +80,43 @@ Initialize from the same redb `Storage` that fx-session already uses.
 If session store initialization fails, log a warning and set to `None`
 (graceful degradation — `/message` still works without sessions).
 
-### 2. Session CRUD endpoints
+The `SessionRegistry` is created in `fx-api/src/lib.rs` during startup
+and passed into `HttpState`. The `fx-api::run()` function (or a new
+`ApiConfig` field) accepts an optional `SessionRegistry`.
+
+### 2. Extend `AppEngine` trait (`fx-api/src/engine.rs`)
+
+Add a method for session-scoped message processing:
+
+```rust
+#[async_trait]
+pub trait AppEngine: Send + Sync {
+    // ... existing methods ...
+
+    /// Process a message with an externally-provided conversation context.
+    /// Returns the result plus updated conversation history.
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error>;
+}
+```
+
+This lets session-scoped handlers pass in the session's history without
+mutating the engine's internal conversation state. The implementation
+in `HeadlessApp` (`fx-cli/src/headless.rs`) temporarily swaps the
+conversation history, runs the cycle, and returns the updated history.
+
+**Option A**: ~~Swap HeadlessApp's internal history~~ — fragile, not concurrent-safe.
+**Option B**: **New method that accepts external context.** ✅ CHOSEN.
+
+### 3. Create session handlers (`fx-api/src/handlers/sessions.rs`)
+
+New file with 7 handler functions:
 
 #### `POST /v1/sessions` — Create session
 
@@ -104,7 +145,7 @@ Response (201):
 Implementation:
 - Generate UUID-based key: `sess-{uuid4_short}`
 - Kind: `SessionKind::Main`
-- Model: use provided model or fall back to `HeadlessApp::active_model()`
+- Model: use provided model or fall back to `AppEngine::active_model()`
 - Return `SessionInfo` as JSON
 
 #### `GET /v1/sessions` — List sessions
@@ -112,7 +153,6 @@ Implementation:
 Query params:
 - `kind` (optional): filter by session kind
 - `limit` (optional, default 50): max results
-- `offset` (optional, default 0): pagination
 
 Response (200):
 ```json
@@ -136,19 +176,12 @@ Response (404): `{ "error": "session not found: {id}" }`
 
 Clears message history but keeps the session metadata.
 
-Implementation: Add a `clear()` method to `SessionRegistry` that empties
-the session's message vec and persists. This is a new method — the
-registry currently has no clear operation.
-
 Response (200): `{ "cleared": true, "key": "{id}" }`
-
-### 3. Session-scoped messaging
 
 #### `GET /v1/sessions/{id}/messages` — Get history
 
 Query params:
 - `limit` (optional, default 100): max messages
-- `before` (optional): pagination cursor (message index)
 
 Response (200):
 ```json
@@ -184,75 +217,120 @@ Request:
 }
 ```
 
-The `images` array is optional. Each entry has `data` (base64) and
-`media_type` (MIME type).
-
 SSE streaming: If the client sends `Accept: text/event-stream`, stream
 the response via SSE (same as current `/message` behavior).
 
 Implementation:
 1. Look up session by key from registry (404 if not found)
-2. Load session's conversation history into a temporary `Vec<Message>`
-3. Call `HeadlessApp::process_message_with_images()` with the session's
-   history context
-4. Record both user message and assistant response in the session
-5. Persist via `SessionStore::save()`
-6. Return response (JSON or SSE stream)
+2. Load session's conversation history via `registry.history()`
+3. Convert `Vec<SessionMessage>` → `Vec<Message>` (type bridge)
+4. Call `AppEngine::process_message_with_context()` with the session's history
+5. Record both user message and assistant response in the session via `registry.send()`
+6. Persist automatically (registry persists on each operation)
+7. Return response (JSON or SSE stream)
 
-**Key design decision**: The session's `Vec<SessionMessage>` is the
-source of truth for history. But `HeadlessApp::process_message()` uses
-its own `conversation_history: Vec<Message>`. We need a bridge:
+### 4. Extend `/message` endpoint (`fx-api/src/handlers/message.rs`)
 
-Option A: Before each session-scoped call, swap HeadlessApp's
-conversation_history with the session's history. After the call, save
-the updated history back to the session.
-
-Option B: Add a `process_message_with_context()` method that accepts
-an external history vec instead of using the internal one.
-
-**Recommended: Option B.** It's cleaner, doesn't mutate shared state,
-and works correctly with concurrent sessions. Add to HeadlessApp:
-
-```rust
-pub async fn process_message_with_context(
-    &mut self,
-    input: &str,
-    images: Vec<EncodedImage>,
-    context: Vec<Message>,
-    callback: Option<StreamCallback>,
-) -> Result<(CycleResult, Vec<Message>), anyhow::Error>
-```
-
-Returns the result plus the updated conversation history (with the new
-user + assistant messages appended). The caller (HTTP handler) persists
-this back to the session.
-
-### 4. Image support on existing `/message` endpoint
-
-Extend `MessageRequest` to accept optional images:
+Extend `MessageRequest` in `fx-api/src/types.rs`:
 
 ```rust
 #[derive(Deserialize)]
-struct MessageRequest {
-    message: String,
+pub(crate) struct MessageRequest {
+    pub(crate) message: String,
     #[serde(default)]
-    images: Vec<ImagePayload>,
+    pub(crate) images: Vec<ImagePayload>,
     #[serde(default)]
-    session_id: Option<String>,  // optional: route to a session
-}
-
-#[derive(Deserialize)]
-struct ImagePayload {
-    data: String,      // base64-encoded
-    media_type: String, // e.g. "image/jpeg"
+    pub(crate) session_id: Option<String>,
 }
 ```
+
+`ImagePayload` already exists in `fx-api/src/types.rs` (added during
+Sprint 0, currently has `#[allow(dead_code)]`). Remove that allow and
+wire it into the message handler.
 
 If `session_id` is provided, route through the session-scoped path.
 If not, use the existing implicit conversation (backwards compatible).
 
-This means the existing `/message` endpoint gets image support AND
-optional session routing without breaking any current clients.
+### 5. Wire routes into router (`fx-api/src/router.rs`)
+
+Add the `/v1/` routes to the authenticated router:
+
+```rust
+let v1 = Router::new()
+    .route("/sessions", post(handle_create_session).get(handle_list_sessions))
+    .route("/sessions/{id}", get(handle_get_session).delete(handle_delete_session))
+    .route("/sessions/{id}/clear", post(handle_clear_session))
+    .route("/sessions/{id}/messages", get(handle_get_messages).post(handle_send_message));
+
+let authenticated = Router::new()
+    .route("/message", post(handle_message))
+    // ... existing routes ...
+    .nest("/v1", v1);
+```
+
+### 6. Add `clear()` to `SessionRegistry` (`fx-session/src/registry.rs`)
+
+New method:
+```rust
+pub fn clear(&self, key: &SessionKey) -> Result<()> {
+    let snapshot = {
+        let mut map = self.write()?;
+        let session = map
+            .get_mut(key)
+            .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        session.clear_messages();
+        session.clone()
+    };
+    self.store.save(&snapshot)?;
+    Ok(())
+}
+```
+
+And `clear_messages()` on `Session` (`fx-session/src/session.rs`):
+```rust
+pub fn clear_messages(&mut self) {
+    self.messages.clear();
+    self.updated_at = now_epoch_secs();
+}
+```
+
+### 7. Add `fx-session` dependency to `fx-api`
+
+In `engine/crates/fx-api/Cargo.toml`:
+```toml
+fx-session = { path = "../fx-session" }
+```
+
+Also add `uuid` for session key generation:
+```toml
+uuid = { version = "1", features = ["v4"] }
+```
+
+---
+
+## Type Bridge: SessionMessage ↔ Message
+
+`fx-session` uses `SessionMessage` (role + content + timestamp).
+`fx-kernel` uses `Message` (role + content blocks + metadata).
+
+The handler needs to convert between them:
+
+```rust
+fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
+    messages.iter().map(|m| Message {
+        role: match m.role {
+            MessageRole::User => Role::User,
+            MessageRole::Assistant => Role::Assistant,
+            MessageRole::System => Role::System,
+        },
+        content: vec![ContentBlock::Text { text: m.content.clone() }],
+        // ... default metadata
+    }).collect()
+}
+```
+
+This conversion lives in `fx-api/src/handlers/sessions.rs` as a
+private helper.
 
 ---
 
@@ -263,20 +341,18 @@ optional session routing without breaking any current clients.
 - **Auth management** (`/auth/*`) — Sprint 2
 - **Compaction integration** — sessions use their own history, compaction
   applies to HeadlessApp's internal history. Session compaction is a
-  follow-up (sessions can grow unbounded for now; `limit` on history
-  queries prevents huge responses).
-- **Session-scoped tool state** — tools currently operate on global state.
-  Session isolation for tools is a future concern.
-- **WebSocket** — SSE is sufficient for the Swift app. URLSession handles
-  SSE natively.
+  follow-up.
+- **Session-scoped tool state** — tools operate on global state.
+- **WebSocket** — SSE is sufficient for the Swift app.
+- **Pagination cursors** — simple `limit` is enough for now.
 
 ---
 
 ## Testing
 
-### Unit tests (`fx-cli`, http_serve.rs)
+### Unit tests in `fx-api` (new test module or extend `tests.rs`)
 
-1. `create_session_returns_info` — POST /v1/sessions returns 201 with
+1. `create_session_returns_201` — POST /v1/sessions returns 201 with
    valid SessionInfo JSON.
 2. `list_sessions_returns_array` — GET /v1/sessions returns sessions
    array after creating two.
@@ -294,10 +370,12 @@ optional session routing without breaking any current clients.
    doesn't error.
 10. `message_with_session_id_routes_to_session` — POST /message with
     session_id records in the correct session.
+11. `sessions_require_auth` — All /v1/ endpoints return 401 without
+    bearer token.
 
-### Integration test (`fx-session`)
+### Unit test in `fx-session`
 
-11. `session_clear_empties_messages_and_persists` — New method test for
+12. `session_clear_empties_messages_and_persists` — New method test for
     SessionRegistry::clear().
 
 ---
@@ -306,8 +384,17 @@ optional session routing without breaking any current clients.
 
 | File | Change |
 |------|--------|
-| `fx-cli/src/http_serve.rs` | Add 7 new route handlers, SessionRegistry in HttpState, ImagePayload type, session_id on MessageRequest |
-| `fx-cli/src/headless.rs` | Add `process_message_with_context()` method |
+| `fx-api/src/handlers/sessions.rs` | NEW — 7 session endpoint handlers + type bridge helper |
+| `fx-api/src/handlers/mod.rs` | Add `pub(crate) mod sessions;` |
+| `fx-api/src/handlers/message.rs` | Extend to handle images + session_id routing |
+| `fx-api/src/types.rs` | Extend MessageRequest with images + session_id, remove dead_code allow on ImagePayload |
+| `fx-api/src/engine.rs` | Add `process_message_with_context()` to AppEngine trait |
+| `fx-api/src/state.rs` | Add `session_registry: Option<SessionRegistry>` to HttpState |
+| `fx-api/src/router.rs` | Add `/v1/` route nest with session endpoints |
+| `fx-api/src/lib.rs` | Initialize SessionRegistry during startup |
+| `fx-api/Cargo.toml` | Add fx-session + uuid dependencies |
+| `fx-api/src/tests.rs` | Add 11 session endpoint tests |
+| `fx-cli/src/headless.rs` | Implement `process_message_with_context()` for HeadlessApp |
 | `fx-session/src/registry.rs` | Add `clear()` method |
 | `fx-session/src/session.rs` | Add `clear_messages()` method |
 
