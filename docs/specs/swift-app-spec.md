@@ -219,7 +219,7 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 │  Settings  │  │ Input bar        [Model] [Think]│    │
 │            │  └─────────────────────────────────┘    │
 ├────────────┴─────────────────────────────────────────┤
-│ ● Connected  │  Power User  │  claude-sonnet-4-6  │
+│ ● Connected │ Power User │ claude-sonnet-4-6 │ ██░░ 62% ctx │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -340,11 +340,46 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 - `⌘⏎` to send (macOS), standard send button (iOS)
 - `Esc` cancels active stream
 
+**Input bar state machine (Steer pattern, inspired by Codex):**
+
+The input bar changes behavior based on streaming state:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ IDLE STATE                                          │
+│ [+]  [ Type a message...          ]  [Model] [Send] │
+│                                       [Think]       │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ STREAMING STATE (input empty)                       │
+│ [+]  [ ...                         ]  [Model] [■ Stop]│
+│                                       [Think]       │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ STREAMING STATE (user typing)                       │
+│ ┌─ Steer ──────────────────────── [×] ┐             │
+│ │ "Actually, use a different approach" │             │
+│ └─────────────────────────────────────┘             │
+│ [+]  [ Actually, use a dif...  ]  [Model] [Send]   │
+│                                    [Think]          │
+└─────────────────────────────────────────────────────┘
+```
+
+- **Idle:** Normal input, accent-colored Send button when text present, muted when empty
+- **Streaming + input empty:** Send button becomes **Stop** button (red/danger style). Tap cancels the active stream.
+- **Streaming + user types:** Stop transitions to **Send**. Sending creates a **steer chip** above the input bar — a dismissable tab showing the queued message. The steer message is delivered to the model as a follow-up/interrupt.
+- **Steer chip:** Shows queued text (truncated), "Steer" label, dismiss (×) button. Only one steer can be queued at a time (sending another replaces it).
+- After stream completes: if a steer is queued, it auto-sends as the next user message.
+
+**API requirement for steer:** `POST /v1/sessions/{id}/messages` sent during an active stream should either (a) interrupt the current response and begin a new turn, or (b) queue and auto-send after the current stream completes. V1 implementation: queue-and-send-after-completion (simpler, no mid-stream interruption). V2: true interruption with partial response preservation.
+
 **Streaming behavior:**
 - On send: input clears, user message appears immediately, assistant message placeholder appears with streaming indicator
 - SSE tokens append to assistant message in real-time
 - Typing indicator (three dots or pulsing cursor) while waiting for first token
-- On `[DONE]`: streaming indicator removed, message finalized
+- On `[DONE]`: streaming indicator removed, message finalized. If steer is queued, auto-send it.
 - On error: error card appears below the partial response (if any)
 - On cancel: partial response stays, marked as "(interrupted)"
 
@@ -353,6 +388,7 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 - History: `GET /v1/sessions/{id}/messages` on session open
 - Model switch: `PUT /v1/model` with `{"model": "..."}`
 - Thinking switch: `PUT /v1/thinking` with `{"level": "..."}`
+- Context window: `GET /v1/sessions/{id}/context` (**NEW — needs backend endpoint**)
 
 ### 5.3 Session List
 
@@ -427,6 +463,40 @@ FawxClient (HTTP/SSE) → ViewModel (@Published) → SwiftUI View
 
 ---
 
+### 5.6 Status Bar
+
+**Persistent bar at the bottom of the window (macOS) or as a header element (iOS).**
+
+```
+● Connected  │  Power User  │  claude-sonnet-4-6  │  ██░░ 62% ctx
+```
+
+**Segments (left to right):**
+1. **Connection indicator** — green dot + "Connected" / yellow dot + "Reconnecting..." / red dot + "Disconnected"
+2. **Permission preset** — "Power User" / "Cautious" / "Experimental" (from server config, read-only in V1)
+3. **Active model** — current model name, tappable to open model picker
+4. **Context window** — progress bar + percentage showing context usage for the active session
+
+**Context window indicator:**
+- Shows `used_tokens / max_tokens` as a mini progress bar + percentage
+- Color coding: green (< 60%), yellow (60-85%), red (> 85%)
+- Tooltip (macOS hover) or tap (iOS) shows exact numbers: "24,576 / 40,000 tokens"
+- Updates after each message exchange (polled from `GET /v1/sessions/{id}/context`)
+- When no session is selected: shows "—" or hides
+
+**API requirement:** `GET /v1/sessions/{id}/context` — **new endpoint needed on backend**
+```json
+{
+  "used_tokens": 24576,
+  "max_tokens": 40000,
+  "percentage": 61.4,
+  "compaction_threshold": 80.0
+}
+```
+This data already exists server-side in the `SlidingWindow` compaction system — just needs an HTTP endpoint to expose it.
+
+---
+
 ## 6. API Integration Map
 
 Every screen's data source, exhaustively mapped to existing endpoints.
@@ -449,8 +519,9 @@ Every screen's data source, exhaustively mapped to existing endpoints.
 | Auth status | `/v1/auth` | GET | Provider auth status |
 | Server status | `/status` | GET | Server health + version |
 | Server config | `/config` | GET | Read-only config view |
+| Context window | `/v1/sessions/{id}/context` | GET | Token usage (⚠️ NEW — needs backend) |
 
-**No V1 endpoints missing.** Every screen is fully backed by the existing 21-endpoint API surface shipped in Sprint 1 + Sprint 2.
+**One new endpoint needed** (`/v1/sessions/{id}/context`) for context window display. All other screens are fully backed by the existing 21-endpoint API surface. Every screen is fully backed by the existing 21-endpoint API surface shipped in Sprint 1 + Sprint 2.
 
 ---
 
