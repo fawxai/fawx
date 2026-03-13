@@ -505,7 +505,7 @@ impl HeadlessApp {
         } = event
         {
             let level = if *recoverable { "warning" } else { "error" };
-            eprintln!("[{level}] [{category:?}] {message}");
+            eprintln!("[{level}] [{category}] {message}");
         }
     }
 

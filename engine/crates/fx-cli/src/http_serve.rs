@@ -146,7 +146,7 @@ fn serialize_stream_event(event: StreamEvent) -> Option<String> {
             message,
             recoverable,
         } => sse_frame(
-            "error",
+            "engine_error",
             serde_json::json!({
                 "category": category,
                 "message": message,
@@ -2067,7 +2067,7 @@ mod tests {
         })
         .expect("error frame");
 
-        assert!(frame.contains("event: error"));
+        assert!(frame.contains("event: engine_error"));
         assert!(frame.contains("\"category\":\"memory\""));
         assert!(frame.contains("\"message\":\"memory flush failed\""));
         assert!(frame.contains("\"recoverable\":true"));

@@ -17,6 +17,24 @@ pub enum ErrorCategory {
     System,
 }
 
+impl ErrorCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::ToolExecution => "tool_execution",
+            Self::Channel => "channel",
+            Self::Memory => "memory",
+            Self::System => "system",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -85,6 +103,11 @@ mod tests {
     fn error_category_serializes_as_snake_case() {
         let json = serde_json::to_string(&ErrorCategory::ToolExecution).unwrap();
         assert_eq!(json, "\"tool_execution\"");
+    }
+
+    #[test]
+    fn error_category_display_uses_snake_case() {
+        assert_eq!(ErrorCategory::ToolExecution.to_string(), "tool_execution");
     }
 
     #[test]
