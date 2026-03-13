@@ -214,7 +214,7 @@
         <li><span class="check">✓</span> Secure file permissions (0600) + atomic persist</li>
         <li><span class="check">✓</span> Node registry with capability-based routing</li>
         <li><span class="check">✓</span> HTTP fleet endpoints (register, heartbeat, result)</li>
-        <li><span class="check">✓</span> Worker join flow (fawx fleet join — tested over Tailscale)</li>
+        <li><span class="check">✓</span> Worker join flow (fawx fleet join — tested MacBook → Mac Mini over Tailscale, confirmed working 2026-03-13)</li>
       </ul>
     </details>
     <hr class="divider">
@@ -226,8 +226,8 @@
       </div>
       <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, and cross-session communication.</p>
       <ul class="feature-list">
-        <li><span class="wip">◐</span> Context compaction with memory flush (compaction engine built, needs pre-compaction journal write)</li>
-        <li><span class="planned">○</span> Error surfacing — route async failures back to user surface instead of swallowing silently</li>
+        <li><span class="check">✓</span> Context compaction with memory flush (PR #1390 — pre-compaction journal write, evicted_indices tracking)</li>
+        <li><span class="check">✓</span> Error surfacing — StreamEvent::Error + ErrorCategory at provider/tool/memory paths (PR #1391)</li>
         <li><span class="planned">○</span> Cross-session messaging (session-to-session communication bus)</li>
         <li><span class="planned">○</span> Cron / scheduled tasks (daemon-level, persist across restarts)</li>
         <li><span class="planned">○</span> Heartbeat monitoring + self-recovery watchdog</li>
