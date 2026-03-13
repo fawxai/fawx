@@ -22,7 +22,10 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
     let v1_router = Router::new()
-        .route("/sessions", post(handle_create_session).get(handle_list_sessions))
+        .route(
+            "/sessions",
+            post(handle_create_session).get(handle_list_sessions),
+        )
         .route(
             "/sessions/{id}",
             get(handle_get_session).delete(handle_delete_session),

@@ -3,8 +3,8 @@ use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResul
 use crate::error::HttpError;
 use crate::handlers::health::sanitize_config;
 use crate::listener::{
-    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip,
-    run_listeners, wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
+    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip, run_listeners,
+    wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
 };
 use crate::middleware::verify_token;
 use crate::router::build_router;
@@ -22,6 +22,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fx_channel_telegram::{IncomingMessage, TelegramChannel};
 use fx_channel_webhook::WebhookChannel;
+use fx_cli::headless::{
+    process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
+    HeadlessAppDeps,
+};
 use fx_config::HttpConfig;
 use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
@@ -29,10 +33,6 @@ use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
 use fx_llm::{
     CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, Message, StreamChunk,
-};
-use fx_cli::headless::{
-    process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
-    HeadlessAppDeps,
 };
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -61,7 +61,10 @@ impl AppEngine for HeadlessApp {
                 process_input_with_commands_streaming(self, input, Some(&source), callback).await?
             }
             (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
-            (false, _) => self.process_message_with_images(input, &images, &source).await?,
+            (false, _) => {
+                self.process_message_with_images(input, &images, &source)
+                    .await?
+            }
         };
 
         Ok(ApiCycleResult {
@@ -79,9 +82,10 @@ impl AppEngine for HeadlessApp {
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
-        let (result, updated_history) =
-            HeadlessApp::process_message_with_context(self, input, images, context, &source, callback)
-                .await?;
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self, input, images, context, &source, callback,
+        )
+        .await?;
 
         Ok((
             ApiCycleResult {
@@ -239,28 +243,28 @@ impl BearerTokenStore for MockBearerTokenStore {
 
 #[test]
 fn tailscale_ip_accepts_valid_range() {
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 64, 0, 1
-    ))));
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 127, 255, 255
-    ))));
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 93, 251, 101
-    ))));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 64, 0, 1)
+    )));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 127, 255, 255)
+    )));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 93, 251, 101)
+    )));
 }
 
 #[test]
 fn tailscale_ip_rejects_outside_range() {
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 63, 0, 0
-    ))));
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 128, 0, 0
-    ))));
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        192, 168, 1, 1
-    ))));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 63, 0, 0)
+    )));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 128, 0, 0)
+    )));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(192, 168, 1, 1)
+    )));
 }
 
 #[test]
@@ -393,8 +397,7 @@ fn message_response_serializes_correctly() {
         iterations: 2,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["response"], "hi there");
     assert_eq!(json["model"], "gpt-4");
     assert_eq!(json["iterations"], 2);
@@ -409,8 +412,7 @@ fn health_response_has_expected_fields() {
         skills_loaded: 3,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert_eq!(json["model"], "claude-3");
     assert_eq!(json["uptime_seconds"], 60);
@@ -428,8 +430,7 @@ fn status_response_has_expected_fields() {
         config: None,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert_eq!(json["tailscale_ip"], "100.93.251.101");
     assert_eq!(json["memory_entries"], 42);
@@ -447,8 +448,7 @@ fn status_response_omits_tailscale_ip_when_unavailable() {
         config: None,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert!(json.get("tailscale_ip").is_none());
 }
@@ -554,7 +554,10 @@ async fn message_endpoint_rejects_empty_message() {
 
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert!(json["error"].as_str().expect("error field").contains("empty"));
+    assert!(json["error"]
+        .as_str()
+        .expect("error field")
+        .contains("empty"));
 }
 
 #[tokio::test]
@@ -894,8 +897,7 @@ mod routing_and_status {
         SessionRegistry, SessionStatus, SessionStore,
     };
     use fx_subagent::{
-        test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
-        SubagentManagerDeps,
+        test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
     };
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
@@ -1012,7 +1014,10 @@ mod routing_and_status {
             .clone()
             .unwrap_or_else(std::env::temp_dir);
         HttpState {
-            app: Arc::new(Mutex::new(make_test_app_with_config(config, config_manager))),
+            app: Arc::new(Mutex::new(make_test_app_with_config(
+                config,
+                config_manager,
+            ))),
             session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
@@ -1177,7 +1182,10 @@ allowed_chat_ids = [123]
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["iterations"], 0);
-        assert!(json["response"].as_str().expect("response string").contains("Fawx Status"));
+        assert!(json["response"]
+            .as_str()
+            .expect("response string")
+            .contains("Fawx Status"));
     }
 
     #[tokio::test]
@@ -1262,7 +1270,9 @@ allowed_chat_ids = [123]
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).expect("content-type"),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
             "text/event-stream"
         );
         let body = resp.into_body().collect().await.expect("body").to_bytes();
@@ -1288,12 +1298,10 @@ allowed_chat_ids = [123]
         assert_eq!(resp.status(), StatusCode::CREATED);
         let body = resp.into_body().collect().await.expect("body").to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert!(
-            json["key"]
-                .as_str()
-                .expect("session key")
-                .starts_with("sess-")
-        );
+        assert!(json["key"]
+            .as_str()
+            .expect("session key")
+            .starts_with("sess-"));
         assert_eq!(json["kind"], "main");
         assert_eq!(json["status"], "idle");
         assert_eq!(json["label"], "Primary");
@@ -1319,7 +1327,10 @@ allowed_chat_ids = [123]
         let body = resp.into_body().collect().await.expect("body").to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["total"], 2);
-        assert_eq!(json["sessions"].as_array().expect("sessions array").len(), 2);
+        assert_eq!(
+            json["sessions"].as_array().expect("sessions array").len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1399,7 +1410,11 @@ allowed_chat_ids = [123]
             .header("authorization", format!("Bearer {TEST_TOKEN}"))
             .body(Body::empty())
             .expect("clear request");
-        let clear_resp = app.clone().oneshot(clear_req).await.expect("clear response");
+        let clear_resp = app
+            .clone()
+            .oneshot(clear_req)
+            .await
+            .expect("clear response");
         assert_eq!(clear_resp.status(), StatusCode::OK);
 
         let history_req = Request::builder()
@@ -1462,7 +1477,9 @@ allowed_chat_ids = [123]
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).expect("content-type"),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
             "text/event-stream"
         );
         let body = resp.into_body().collect().await.expect("body").to_bytes();
@@ -1887,8 +1904,8 @@ mod telegram_update {
     use fx_kernel::context_manager::ContextCompactor;
     use fx_kernel::loop_engine::LoopEngine;
     use fx_llm::{
-        CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
-        ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError, StreamChunk,
+        CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream, ContentBlock,
+        ModelRouter, ProviderCapabilities, ProviderError as LlmError, StreamChunk,
     };
 
     #[derive(Debug)]
@@ -2055,8 +2072,8 @@ mod telegram_update {
     async fn capturing_telegram_server(
         captured: Arc<std::sync::Mutex<Vec<CapturedTelegramRequest>>>,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let app =
-            axum::Router::new().fallback(axum::routing::any(move |uri: axum::http::Uri, body: String| {
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |uri: axum::http::Uri, body: String| {
                 let captured = Arc::clone(&captured);
                 async move {
                     let parsed = serde_json::from_str(&body).expect("capture telegram body");
@@ -2069,7 +2086,8 @@ mod telegram_update {
                         });
                     axum::Json(serde_json::json!({ "ok": true }))
                 }
-            }));
+            },
+        ));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind capture server");
@@ -2338,9 +2356,9 @@ mod telegram_update {
     #[tokio::test]
     async fn process_and_route_message_with_images_passes_through() {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(make_test_app(
-            capturing_router(Arc::clone(&captured)),
-        )));
+        let app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(make_test_app(capturing_router(
+            Arc::clone(&captured),
+        ))));
         let (base_url, _server) = mock_telegram_server().await;
         let telegram = Arc::new(TelegramChannel::new_with_base_url(
             test_telegram_config(),

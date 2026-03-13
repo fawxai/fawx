@@ -124,12 +124,7 @@ impl SessionRegistry {
     }
 
     /// Record a message with an explicit role in a session.
-    pub fn record_message(
-        &self,
-        key: &SessionKey,
-        role: MessageRole,
-        message: &str,
-    ) -> Result<()> {
+    pub fn record_message(&self, key: &SessionKey, role: MessageRole, message: &str) -> Result<()> {
         let snapshot = {
             let mut map = self.write()?;
             let session = map

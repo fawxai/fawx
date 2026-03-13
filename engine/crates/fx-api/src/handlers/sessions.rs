@@ -17,8 +17,8 @@ use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_llm::Message;
 use fx_session::{
-    MessageRole, SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind,
-    SessionMessage, SessionRegistry, SessionStatus,
+    MessageRole, SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
+    SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
@@ -229,14 +229,10 @@ pub(crate) async fn handle_send_message_for_session(
         .await);
     }
 
-    let (result, response) = process_and_route_session_message(
-        &state,
-        &request.message,
-        &images,
-        context,
-    )
-    .await
-    .map_err(internal_error)?;
+    let (result, response) =
+        process_and_route_session_message(&state, &request.message, &images, context)
+            .await
+            .map_err(internal_error)?;
     record_session_turn(&registry, &key, &request.message, &response).map_err(internal_error)?;
 
     Ok(Json(MessageResponse {
@@ -268,16 +264,18 @@ async fn stream_session_message_response(
 ) -> Response {
     let (sender, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
     let disconnected = Arc::new(AtomicBool::new(false));
-    tokio::spawn(run_streaming_session_message_task(StreamingSessionMessageTask {
-        state,
-        registry,
-        key,
-        message,
-        images,
-        context,
-        sender,
-        disconnected,
-    }));
+    tokio::spawn(run_streaming_session_message_task(
+        StreamingSessionMessageTask {
+            state,
+            registry,
+            key,
+            message,
+            images,
+            context,
+            sender,
+            disconnected,
+        },
+    ));
     sse_response(receiver)
 }
 
@@ -297,12 +295,9 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
 
     match result {
         Ok((result, _)) => {
-            if let Err(error) = record_session_turn(
-                &task.registry,
-                &task.key,
-                &task.message,
-                &result.response,
-            ) {
+            if let Err(error) =
+                record_session_turn(&task.registry, &task.key, &task.message, &result.response)
+            {
                 let _ = send_sse_frame(
                     &task.sender,
                     &task.disconnected,
@@ -343,7 +338,11 @@ async fn process_and_route_session_message(
     state
         .channels
         .router
-        .route(&InputSource::Http, &result.response, &ResponseContext::default())
+        .route(
+            &InputSource::Http,
+            &result.response,
+            &ResponseContext::default(),
+        )
         .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
     let response = state
         .channels
@@ -353,15 +352,16 @@ async fn process_and_route_session_message(
     Ok((result, response))
 }
 
-fn create_session(registry: &SessionRegistry, config: SessionConfig) -> anyhow::Result<SessionInfo> {
+fn create_session(
+    registry: &SessionRegistry,
+    config: SessionConfig,
+) -> anyhow::Result<SessionInfo> {
     for _ in 0..5 {
-        let key = generate_session_key();
+        let key = generate_session_key()?;
         match registry.create(key.clone(), SessionKind::Main, config.clone()) {
             Ok(_) => {
                 registry.set_status(&key, SessionStatus::Idle)?;
-                return registry
-                    .get_info(&key)
-                    .map_err(anyhow::Error::new);
+                return registry.get_info(&key).map_err(anyhow::Error::new);
             }
             Err(SessionError::AlreadyExists(_)) => continue,
             Err(error) => return Err(anyhow::Error::new(error)),
@@ -371,9 +371,9 @@ fn create_session(registry: &SessionRegistry, config: SessionConfig) -> anyhow::
     Err(anyhow::anyhow!("failed to generate a unique session key"))
 }
 
-fn generate_session_key() -> SessionKey {
+fn generate_session_key() -> anyhow::Result<SessionKey> {
     let uuid = Uuid::new_v4().simple().to_string();
-    SessionKey::new(format!("sess-{}", &uuid[..8])).expect("generated session key")
+    SessionKey::new(format!("sess-{}", &uuid[..8])).map_err(anyhow::Error::new)
 }
 
 fn record_session_turn(

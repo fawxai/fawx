@@ -1,5 +1,5 @@
-use crate::handlers::sessions::handle_send_message_for_session;
 use crate::engine::{AppEngine, CycleResult};
+use crate::handlers::sessions::handle_send_message_for_session;
 use crate::sse::{
     error_stream_frame, send_sse_frame, sse_response, stream_callback, wants_sse,
     SSE_CHANNEL_CAPACITY,
@@ -106,9 +106,7 @@ pub(crate) fn encoded_images_to_attachments(images: &[EncodedImage]) -> Vec<Imag
         .collect()
 }
 
-pub(crate) fn validate_message_text(
-    message: &str,
-) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+pub(crate) fn validate_message_text(message: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     if message.trim().is_empty() {
         return Err(bad_request("message must not be empty"));
     }
