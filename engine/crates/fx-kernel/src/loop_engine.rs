@@ -10745,6 +10745,25 @@ mod context_compaction_tests {
         }
     }
 
+    /// Mock flush that always fails - verifies non-fatal behavior.
+    #[derive(Debug)]
+    struct FailingFlush;
+
+    #[async_trait]
+    impl CompactionMemoryFlush for FailingFlush {
+        async fn flush(
+            &self,
+            _evicted: &[Message],
+            _scope_label: &str,
+        ) -> Result<(), crate::conversation_compactor::CompactionFlushError> {
+            Err(
+                crate::conversation_compactor::CompactionFlushError::FlushFailed {
+                    reason: "test failure".to_string(),
+                },
+            )
+        }
+    }
+
     #[derive(Debug)]
     struct SizedToolExecutor {
         output_words: usize,
@@ -10925,6 +10944,53 @@ mod context_compaction_tests {
             .evicted
             .iter()
             .all(|message| history.contains(message)));
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_proceeds_on_flush_failure() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .memory_flush(Arc::new(FailingFlush) as Arc<dyn CompactionMemoryFlush>)
+            .build()
+            .expect("test engine build");
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should proceed when flush fails");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(compacted.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_skips_flush_when_none() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should succeed without memory flush configured");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(compacted.len() < messages.len());
     }
 
     #[tokio::test]

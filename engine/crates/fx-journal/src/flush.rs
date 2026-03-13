@@ -8,8 +8,8 @@ use fx_llm::{ContentBlock, Message, MessageRole};
 
 use crate::journal::Journal;
 
-const MAX_CONTENT_CHARS: usize = 4_000;
-const MAX_TOOL_RESULT_CHARS: usize = 500;
+const MAX_CONTENT_BYTES: usize = 4_000;
+const MAX_TOOL_RESULT_BYTES: usize = 500;
 
 /// Flushes evicted conversation content to the journal before compaction.
 #[derive(Debug)]
@@ -65,11 +65,21 @@ impl CompactionMemoryFlush for JournalCompactionFlush {
 }
 
 fn truncate_content(content: &str) -> String {
-    if content.len() > MAX_CONTENT_CHARS {
-        format!("{}...[truncated]", &content[..MAX_CONTENT_CHARS])
-    } else {
-        content.to_string()
+    if content.len() <= MAX_CONTENT_BYTES {
+        return content.to_string();
     }
+
+    let truncate_at = truncate_at_char_boundary(content, MAX_CONTENT_BYTES);
+    format!("{}...[truncated]", &content[..truncate_at])
+}
+
+fn truncate_at_char_boundary(content: &str, max_bytes: usize) -> usize {
+    content
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|&index| index <= max_bytes)
+        .last()
+        .unwrap_or(0)
 }
 
 fn format_evicted_messages(messages: &[Message]) -> String {
@@ -102,8 +112,9 @@ fn format_content_block(block: &ContentBlock) -> Option<String> {
         ContentBlock::ToolUse { name, input, .. } => Some(format!("[tool:{name}] {input}")),
         ContentBlock::ToolResult { content, .. } => {
             let s = content.to_string();
-            if s.len() > MAX_TOOL_RESULT_CHARS {
-                Some(format!("{}...", &s[..MAX_TOOL_RESULT_CHARS]))
+            if s.len() > MAX_TOOL_RESULT_BYTES {
+                let truncate_at = truncate_at_char_boundary(&s, MAX_TOOL_RESULT_BYTES);
+                Some(format!("{}...", &s[..truncate_at]))
             } else {
                 Some(s)
             }
@@ -166,8 +177,30 @@ mod tests {
 
         let j = journal.lock().unwrap();
         let entries = j.list(None);
-        assert!(entries[0].lesson.len() <= MAX_CONTENT_CHARS + 20);
+        assert!(entries[0].lesson.len() <= MAX_CONTENT_BYTES + "...[truncated]".len());
         assert!(entries[0].lesson.ends_with("...[truncated]"));
+    }
+
+    #[tokio::test]
+    async fn flush_handles_multibyte_truncation() {
+        let tmp = TempDir::new().unwrap();
+        let journal = test_journal(&tmp);
+        let flush = JournalCompactionFlush::new(Arc::clone(&journal));
+
+        let emoji_content = "🦝".repeat(2_000);
+        let messages = vec![Message::user(emoji_content)];
+
+        flush.flush(&messages, "perceive").await.unwrap();
+
+        let j = journal.lock().unwrap();
+        let entries = j.list(None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].lesson.ends_with("...[truncated]"));
+        let truncated_prefix = entries[0]
+            .lesson
+            .strip_suffix("...[truncated]")
+            .expect("expected truncated suffix");
+        assert!(entries[0].lesson.is_char_boundary(truncated_prefix.len()));
     }
 
     #[tokio::test]
@@ -197,7 +230,7 @@ mod tests {
         let journal = test_journal(&tmp);
         let flush = JournalCompactionFlush::new(Arc::clone(&journal));
 
-        let big_result = "y".repeat(1_000);
+        let big_result = "🦝".repeat(400);
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: vec![ContentBlock::ToolResult {
@@ -210,7 +243,7 @@ mod tests {
 
         let j = journal.lock().unwrap();
         let lesson = &j.list(None)[0].lesson;
-        // The tool result should be truncated to MAX_TOOL_RESULT_CHARS + "..."
         assert!(lesson.len() < 1_000);
+        assert!(lesson.contains("..."));
     }
 }
