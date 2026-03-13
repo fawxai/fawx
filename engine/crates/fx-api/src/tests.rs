@@ -11,7 +11,10 @@ use crate::router::build_router;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
-use crate::types::{ErrorBody, HealthResponse, MessageRequest, MessageResponse, StatusResponse};
+use crate::types::{
+    AuthProviderDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
+    SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::State;
@@ -28,6 +31,7 @@ use fx_cli::headless::{
 };
 use fx_config::HttpConfig;
 use fx_core::channel::{Channel, ResponseContext};
+use fx_core::runtime_info::{ConfigSummary, RuntimeInfo};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
@@ -101,9 +105,62 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::active_model(self)
     }
 
+    fn available_models(&self) -> Vec<ModelInfoDto> {
+        HeadlessApp::available_models(self)
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
+    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error> {
+        HeadlessApp::set_active_model(self, selector)
+    }
+
+    fn thinking_level(&self) -> ThinkingLevelDto {
+        HeadlessApp::thinking_budget(self).into()
+    }
+
+    fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+        HeadlessApp::handle_thinking(self, Some(level))?;
+        Ok(self.thinking_level())
+    }
+
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+        HeadlessApp::skill_summaries(self)
+            .into_iter()
+            .map(SkillSummaryDto::from)
+            .collect()
+    }
+
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+        HeadlessApp::auth_provider_statuses(self)
+            .into_iter()
+            .map(|s| AuthProviderDto {
+                provider: s.provider,
+                auth_methods: s.auth_methods.into_iter().collect(),
+                model_count: s.model_count,
+                status: "registered".to_string(),
+            })
+            .collect()
+    }
+
     fn config_manager(&self) -> Option<ConfigManagerHandle> {
         HeadlessApp::config_manager(self).cloned()
     }
+}
+
+fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
+    Arc::new(std::sync::RwLock::new(RuntimeInfo {
+        active_model: String::new(),
+        provider: String::new(),
+        skills: Vec::new(),
+        config_summary: ConfigSummary {
+            max_iterations: 3,
+            max_history: 20,
+            memory_enabled: false,
+        },
+        version: "test".to_string(),
+    }))
 }
 
 fn mock_completion_response() -> CompletionResponse {
@@ -950,6 +1007,43 @@ mod routing_and_status {
         }
     }
 
+    struct StaticProvider {
+        name: &'static str,
+        models: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StaticProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(mock_completion_response())
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, LlmError> {
+            Ok(mock_completion_stream())
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.iter().map(ToString::to_string).collect()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
     fn test_engine() -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
@@ -968,6 +1062,28 @@ mod routing_and_status {
         router
     }
 
+    fn settings_router() -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "anthropic",
+                models: vec!["claude-sonnet-4-20250514"],
+            }),
+            "api_key",
+        );
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "openai",
+                models: vec!["gpt-4o"],
+            }),
+            "api_key",
+        );
+        router
+            .set_active("claude-sonnet-4-20250514")
+            .expect("set active");
+        router
+    }
+
     fn make_test_app(config_manager: Option<Arc<StdMutex<ConfigManager>>>) -> HeadlessApp {
         make_test_app_with_config(fx_config::FawxConfig::default(), config_manager)
     }
@@ -976,6 +1092,15 @@ mod routing_and_status {
         config: fx_config::FawxConfig,
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
     ) -> HeadlessApp {
+        build_test_app(mock_router(), config, config_manager, test_runtime_info())
+    }
+
+    fn build_test_app(
+        router: ModelRouter,
+        config: fx_config::FawxConfig,
+        config_manager: Option<Arc<StdMutex<ConfigManager>>>,
+        runtime_info: Arc<std::sync::RwLock<RuntimeInfo>>,
+    ) -> HeadlessApp {
         let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
             factory: Arc::new(DisabledSubagentFactory::new("disabled")),
             limits: SubagentLimits::default(),
@@ -983,7 +1108,8 @@ mod routing_and_status {
 
         HeadlessApp::new(HeadlessAppDeps {
             loop_engine: test_engine(),
-            router: Arc::new(mock_router()),
+            router: Arc::new(router),
+            runtime_info,
             config,
             memory: None,
             embedding_index_persistence: None,
@@ -996,11 +1122,56 @@ mod routing_and_status {
         .expect("test app")
     }
 
+    fn runtime_info_with_skills(skills: &[(&str, &[&str])]) -> Arc<std::sync::RwLock<RuntimeInfo>> {
+        let info = test_runtime_info();
+        let mut guard = info.write().expect("runtime info lock");
+        guard.skills = skills
+            .iter()
+            .map(|(name, tools)| fx_core::runtime_info::SkillInfo {
+                name: (*name).to_string(),
+                tool_names: tools.iter().map(ToString::to_string).collect(),
+            })
+            .collect();
+        drop(guard);
+        info
+    }
+
+    fn temp_config_manager(
+        config_toml: &str,
+    ) -> (TempDir, fx_config::FawxConfig, Arc<StdMutex<ConfigManager>>) {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("config.toml"), config_toml).expect("write config");
+        let manager = Arc::new(StdMutex::new(
+            ConfigManager::new(temp.path()).expect("config manager"),
+        ));
+        let mut config = fx_config::FawxConfig::load(temp.path()).expect("load config");
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        (temp, config, manager)
+    }
+
     fn test_state(
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
         webhooks: Vec<Arc<WebhookChannel>>,
     ) -> HttpState {
         test_state_with_config(fx_config::FawxConfig::default(), config_manager, webhooks)
+    }
+
+    fn test_state_with_app(app: HeadlessApp, webhooks: Vec<Arc<WebhookChannel>>) -> HttpState {
+        let data_dir = app
+            .config()
+            .general
+            .data_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            session_registry: None,
+            start_time: Instant::now(),
+            tailscale_ip: None,
+            bearer_token: TEST_TOKEN.to_string(),
+            channels: build_channel_runtime(None, webhooks),
+            data_dir,
+        }
     }
 
     fn test_state_with_config(
@@ -1025,6 +1196,35 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
+    }
+
+    fn authed_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn authed_json_request(method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("json")
     }
 
     fn make_session_registry() -> SessionRegistry {
@@ -1546,6 +1746,344 @@ allowed_chat_ids = [123]
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_active_and_catalog() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/models"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["active_model"], "claude-sonnet-4-20250514");
+        assert_eq!(json["models"].as_array().expect("models").len(), 2);
+        assert_eq!(json["models"][0]["provider"], "anthropic");
+        assert_eq!(json["models"][1]["model_id"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn set_model_switches_and_returns_previous() {
+        let (_temp, config, manager) =
+            temp_config_manager("[model]\ndefault_model = \"claude-sonnet-4-20250514\"\n");
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                config,
+                Some(manager),
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let update = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/model",
+                r#"{"model":"gpt-4o"}"#,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(update.status(), StatusCode::OK);
+        let update_json = response_json(update).await;
+        assert_eq!(update_json["previous_model"], "claude-sonnet-4-20250514");
+        assert_eq!(update_json["active_model"], "gpt-4o");
+
+        let models = app
+            .oneshot(authed_request("GET", "/v1/models"))
+            .await
+            .expect("response");
+        let models_json = response_json(models).await;
+        assert_eq!(models_json["active_model"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn set_model_invalid_returns_400() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/model",
+                r#"{"model":"nonexistent"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "model not found: nonexistent");
+    }
+
+    #[tokio::test]
+    async fn set_model_empty_selector_returns_400() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request("PUT", "/v1/model", r#"{"model":""}"#))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_model_unresolvable_selector_returns_400() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        // A partial prefix that doesn't match any model or alias pattern
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/model",
+                r#"{"model":"claude"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().expect("error string");
+        assert!(
+            error.contains("not found"),
+            "expected not found error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_thinking_returns_current_level() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let response = app
+            .oneshot(authed_request("GET", "/v1/thinking"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["level"], "adaptive");
+        assert_eq!(json["budget_tokens"], 5000);
+    }
+
+    #[tokio::test]
+    async fn set_thinking_valid_level_returns_200() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"claude-sonnet-4-20250514\"\n\n[general]\nthinking = \"adaptive\"\n",
+        );
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                config,
+                Some(manager),
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let update = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/thinking",
+                r#"{"level":"high"}"#,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(update.status(), StatusCode::OK);
+        let update_json = response_json(update).await;
+        assert_eq!(update_json["previous_level"], "adaptive");
+        assert_eq!(update_json["level"], "high");
+        assert_eq!(update_json["budget_tokens"], 10000);
+
+        let thinking = app
+            .oneshot(authed_request("GET", "/v1/thinking"))
+            .await
+            .expect("response");
+        let thinking_json = response_json(thinking).await;
+        assert_eq!(thinking_json["level"], "high");
+    }
+
+    #[tokio::test]
+    async fn set_thinking_invalid_level_returns_400() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/thinking",
+                r#"{"level":"turbo"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "unknown thinking budget 'turbo'; expected adaptive, high, low, or off"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_skills_returns_summaries() {
+        let runtime_info = runtime_info_with_skills(&[
+            ("brave-search", &["brave_search"][..]),
+            ("journal", &["journal_write", "journal_search"][..]),
+        ]);
+        let state = test_state_with_app(
+            build_test_app(
+                mock_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                runtime_info,
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/skills"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["skills"][0]["name"], "brave-search");
+        assert_eq!(json["skills"][1]["tools"][1], "journal_search");
+    }
+
+    #[tokio::test]
+    async fn list_skills_empty_returns_zero() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let response = app
+            .oneshot(authed_request("GET", "/v1/skills"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 0);
+        assert!(json["skills"].as_array().expect("skills").is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_auth_returns_provider_statuses() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/auth"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["providers"].as_array().expect("providers").len(), 2);
+        assert_eq!(json["providers"][0]["provider"], "anthropic");
+        assert_eq!(json["providers"][0]["model_count"], 1);
+        assert_eq!(json["providers"][1]["status"], "registered");
+    }
+
+    #[tokio::test]
+    async fn sprint2_endpoints_require_auth() {
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+        let requests = [
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/model")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-4o"}"#))
+                .expect("request"),
+            Request::builder()
+                .method("GET")
+                .uri("/v1/thinking")
+                .body(Body::empty())
+                .expect("request"),
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/thinking")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"level":"high"}"#))
+                .expect("request"),
+            Request::builder()
+                .method("GET")
+                .uri("/v1/skills")
+                .body(Body::empty())
+                .expect("request"),
+            Request::builder()
+                .method("GET")
+                .uri("/v1/auth")
+                .body(Body::empty())
+                .expect("request"),
+        ];
+
+        for request in requests {
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     fn config_reload_success_message(config_path: &Path) -> String {
@@ -2132,6 +2670,7 @@ mod telegram_update {
         HeadlessApp::new(HeadlessAppDeps {
             loop_engine: test_engine(),
             router: Arc::new(router),
+            runtime_info: test_runtime_info(),
             config: fx_config::FawxConfig::default(),
             memory: None,
             embedding_index_persistence: None,

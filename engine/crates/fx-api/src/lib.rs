@@ -35,7 +35,10 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 pub use tailscale::is_tailscale_ip;
-pub use types::{ErrorBody, HealthResponse, MessageRequest, MessageResponse, StatusResponse};
+pub use types::{
+    AuthProviderDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
+    SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+};
 
 pub async fn run(
     app: impl AppEngine + 'static,

@@ -1,3 +1,4 @@
+use crate::types::{AuthProviderDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
@@ -34,6 +35,24 @@ pub trait AppEngine: Send + Sync {
     ) -> Result<(CycleResult, Vec<Message>), anyhow::Error>;
 
     fn active_model(&self) -> &str;
+
+    /// List all available models from the router.
+    fn available_models(&self) -> Vec<ModelInfoDto>;
+
+    /// Switch the active model and return the resolved model ID.
+    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error>;
+
+    /// Return the current thinking level and token budget.
+    fn thinking_level(&self) -> ThinkingLevelDto;
+
+    /// Update the thinking level and return the applied value.
+    fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error>;
+
+    /// List loaded skills and their exposed tool names.
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto>;
+
+    /// List redacted auth provider configuration status.
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto>;
 
     fn config_manager(&self) -> Option<ConfigManagerHandle>;
 }

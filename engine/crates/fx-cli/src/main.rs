@@ -482,6 +482,7 @@ fn build_headless_app(
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
         router,
+        runtime_info: bundle.runtime_info,
         config,
         memory: bundle.memory,
         embedding_index_persistence: bundle.embedding_index_persistence,

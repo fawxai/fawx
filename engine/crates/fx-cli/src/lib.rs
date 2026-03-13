@@ -140,6 +140,7 @@ fn build_app_with_dependencies(
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
         router: build_config.router,
+        runtime_info: bundle.runtime_info,
         config: build_config.config,
         memory: bundle.memory,
         embedding_index_persistence: bundle.embedding_index_persistence,

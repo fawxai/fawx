@@ -9,9 +9,12 @@ use async_trait::async_trait;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
 use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+#[cfg(feature = "http")]
+use fx_api::{AuthProviderDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
+use fx_core::runtime_info::RuntimeInfo;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
@@ -28,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -112,6 +115,7 @@ pub struct CycleResult {
 pub struct HeadlessAppDeps {
     pub loop_engine: LoopEngine,
     pub router: Arc<ModelRouter>,
+    pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub config: FawxConfig,
     pub memory: Option<SharedMemoryStore>,
     pub embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
@@ -126,6 +130,7 @@ pub struct HeadlessAppDeps {
 pub struct HeadlessApp {
     loop_engine: LoopEngine,
     router: Arc<ModelRouter>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
     config: FawxConfig,
     memory: Option<SharedMemoryStore>,
     embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
@@ -163,10 +168,10 @@ struct HeadlessSubagentSession {
 struct DisabledSubagentFactory;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AuthProviderStatus {
-    provider: String,
-    auth_methods: BTreeSet<String>,
-    model_count: usize,
+pub struct AuthProviderStatus {
+    pub provider: String,
+    pub auth_methods: BTreeSet<String>,
+    pub model_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +222,7 @@ impl HeadlessApp {
         Ok(Self {
             loop_engine: deps.loop_engine,
             router: deps.router,
+            runtime_info: deps.runtime_info,
             config: deps.config,
             memory: deps.memory,
             embedding_index_persistence: deps.embedding_index_persistence,
@@ -383,6 +389,18 @@ impl HeadlessApp {
         &self.active_model
     }
 
+    pub fn available_models(&self) -> Vec<ModelInfo> {
+        self.router.available_models()
+    }
+
+    pub fn thinking_budget(&self) -> fx_config::ThinkingBudget {
+        self.config.general.thinking.unwrap_or_default()
+    }
+
+    pub fn auth_provider_statuses(&self) -> Vec<AuthProviderStatus> {
+        auth_provider_statuses(self.available_models())
+    }
+
     /// Return the loaded configuration.
     #[allow(dead_code)]
     pub fn config(&self) -> &FawxConfig {
@@ -392,6 +410,38 @@ impl HeadlessApp {
     /// Return the shared config manager (if configured).
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
+    }
+
+    pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
+        let resolved = resolve_headless_model_selector(&self.router, selector)?;
+        apply_headless_active_model(self, &resolved);
+        persist_default_model(
+            &mut self.config,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            &resolved,
+        )?;
+        Ok(resolved)
+    }
+
+    pub fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            level,
+        )
+    }
+
+    pub fn skill_summaries(&self) -> Vec<(String, Vec<String>)> {
+        match self.runtime_info.read() {
+            Ok(info) => runtime_skill_summaries(&info),
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                Vec::new()
+            }
+        }
     }
 
     /// Apply the custom system prompt (if any). Must be called once
@@ -728,6 +778,40 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::active_model(self)
     }
 
+    fn available_models(&self) -> Vec<ModelInfoDto> {
+        HeadlessApp::available_models(self)
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
+    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error> {
+        HeadlessApp::set_active_model(self, selector)
+    }
+
+    fn thinking_level(&self) -> ThinkingLevelDto {
+        HeadlessApp::thinking_budget(self).into()
+    }
+
+    fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+        HeadlessApp::handle_thinking(self, Some(level))?;
+        Ok(self.thinking_level())
+    }
+
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+        HeadlessApp::skill_summaries(self)
+            .into_iter()
+            .map(SkillSummaryDto::from)
+            .collect()
+    }
+
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+        HeadlessApp::auth_provider_statuses(self)
+            .into_iter()
+            .map(auth_provider_dto)
+            .collect()
+    }
+
     fn config_manager(&self) -> Option<ConfigManagerHandle> {
         HeadlessApp::config_manager(self).cloned()
     }
@@ -746,15 +830,7 @@ impl CommandHost for HeadlessApp {
     }
 
     fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
-        let resolved = resolve_headless_model_selector(&self.router, selector)?;
-        self.active_model = resolved.clone();
-        persist_default_model(
-            &mut self.config,
-            self.config_manager.as_ref(),
-            &fawx_data_dir(),
-            &resolved,
-        )?;
-        Ok(resolved)
+        HeadlessApp::set_active_model(self, selector)
     }
 
     fn proposals(&self, selector: Option<&str>) -> anyhow::Result<String> {
@@ -810,13 +886,7 @@ impl CommandHost for HeadlessApp {
     }
 
     fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
-        apply_thinking_budget(
-            &mut self.config,
-            &mut self.loop_engine,
-            self.config_manager.as_ref(),
-            &fawx_data_dir(),
-            level,
-        )
+        HeadlessApp::handle_thinking(self, level)
     }
 
     fn show_history(&self) -> anyhow::Result<String> {
@@ -976,6 +1046,23 @@ fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
         update_auth_provider_status(&mut statuses, model);
     }
     statuses.into_values().collect()
+}
+
+fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, Vec<String>)> {
+    info.skills
+        .iter()
+        .map(|skill| (skill.name.clone(), skill.tool_names.clone()))
+        .collect()
+}
+
+#[cfg(feature = "http")]
+fn auth_provider_dto(status: AuthProviderStatus) -> AuthProviderDto {
+    AuthProviderDto {
+        provider: status.provider,
+        auth_methods: status.auth_methods.into_iter().collect(),
+        model_count: status.model_count,
+        status: "registered".to_string(),
+    }
 }
 
 fn update_auth_provider_status(
@@ -1438,6 +1525,7 @@ impl SubagentFactory for HeadlessSubagentFactory {
         let deps = HeadlessAppDeps {
             loop_engine: bundle.engine,
             router: Arc::clone(&self.deps.router),
+            runtime_info: bundle.runtime_info,
             config: self.deps.config.clone(),
             memory: bundle.memory,
             embedding_index_persistence: bundle.embedding_index_persistence,
@@ -1777,6 +1865,7 @@ mod tests {
         HeadlessApp {
             loop_engine: test_engine(),
             router: Arc::new(ModelRouter::new()),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
             embedding_index_persistence: None,
@@ -2019,6 +2108,7 @@ mod tests {
         HeadlessAppDeps {
             loop_engine: test_engine(),
             router: Arc::new(router),
+            runtime_info: test_runtime_info(),
             config,
             memory: None,
             embedding_index_persistence: None,
@@ -2028,6 +2118,20 @@ mod tests {
             subagent_manager: new_disabled_subagent_manager(),
             canary_monitor: None,
         }
+    }
+
+    fn test_runtime_info() -> Arc<RwLock<RuntimeInfo>> {
+        Arc::new(RwLock::new(RuntimeInfo {
+            active_model: String::new(),
+            provider: String::new(),
+            skills: Vec::new(),
+            config_summary: fx_core::runtime_info::ConfigSummary {
+                max_iterations: 3,
+                max_history: 20,
+                memory_enabled: false,
+            },
+            version: "test".to_string(),
+        }))
     }
 
     fn headless_app_with_router(router: ModelRouter, active_model: &str) -> HeadlessApp {
@@ -2218,6 +2322,7 @@ mod tests {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: Arc::new(router),
+            runtime_info: test_runtime_info(),
             config,
             memory: None,
             embedding_index_persistence: None,
@@ -2543,6 +2648,7 @@ mod tests {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: test_router(),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
             embedding_index_persistence: None,
@@ -2568,6 +2674,7 @@ mod tests {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: test_router(),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
             embedding_index_persistence: None,

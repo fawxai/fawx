@@ -41,6 +41,68 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetModelRequest {
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetThinkingRequest {
+    pub level: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoDto {
+    pub model_id: String,
+    pub provider: String,
+    pub auth_method: String,
+}
+
+impl From<fx_llm::ModelInfo> for ModelInfoDto {
+    fn from(m: fx_llm::ModelInfo) -> Self {
+        Self {
+            model_id: m.model_id,
+            provider: m.provider_name,
+            auth_method: m.auth_method,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThinkingLevelDto {
+    pub level: String,
+    pub budget_tokens: Option<u32>,
+}
+
+impl From<fx_config::ThinkingBudget> for ThinkingLevelDto {
+    fn from(budget: fx_config::ThinkingBudget) -> Self {
+        Self {
+            level: budget.to_string(),
+            budget_tokens: budget.budget_tokens(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillSummaryDto {
+    pub name: String,
+    pub tools: Vec<String>,
+}
+
+impl From<(String, Vec<String>)> for SkillSummaryDto {
+    fn from((name, tools): (String, Vec<String>)) -> Self {
+        Self { name, tools }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthProviderDto {
+    pub provider: String,
+    pub auth_methods: Vec<String>,
+    pub model_count: usize,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedImage {
     pub media_type: String,
