@@ -182,6 +182,25 @@ pub struct ContextInfoSnapshot {
     pub compaction_threshold: f32,
 }
 
+#[cfg(feature = "http")]
+impl fx_api::ContextInfoSnapshotLike for ContextInfoSnapshot {
+    fn used_tokens(&self) -> usize {
+        self.used_tokens
+    }
+
+    fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    fn percentage(&self) -> f32 {
+        self.percentage
+    }
+
+    fn compaction_threshold(&self) -> f32 {
+        self.compaction_threshold
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedKeyEntry {
     file_name: String,
@@ -458,13 +477,7 @@ impl HeadlessApp {
 
     #[cfg(feature = "http")]
     pub fn context_info(&self) -> ContextInfoDto {
-        let snapshot = self.context_info_snapshot();
-        ContextInfoDto {
-            used_tokens: snapshot.used_tokens,
-            max_tokens: snapshot.max_tokens,
-            percentage: snapshot.percentage,
-            compaction_threshold: snapshot.compaction_threshold,
-        }
+        ContextInfoDto::from_snapshot(&self.context_info_snapshot())
     }
 
     pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>)> {

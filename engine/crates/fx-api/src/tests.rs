@@ -12,8 +12,9 @@ use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    AuthProviderDto, ContextInfoDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse,
-    ModelInfoDto, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, HealthResponse,
+    MessageRequest, MessageResponse, ModelInfoDto, SkillSummaryDto, StatusResponse,
+    ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -50,6 +51,24 @@ use tokio::sync::{mpsc, Mutex};
 use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-secret-token-abc123";
+
+impl ContextInfoSnapshotLike for fx_cli::headless::ContextInfoSnapshot {
+    fn used_tokens(&self) -> usize {
+        self.used_tokens
+    }
+
+    fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    fn percentage(&self) -> f32 {
+        self.percentage
+    }
+
+    fn compaction_threshold(&self) -> f32 {
+        self.compaction_threshold
+    }
+}
 
 #[async_trait]
 impl AppEngine for HeadlessApp {
@@ -121,13 +140,7 @@ impl AppEngine for HeadlessApp {
     }
 
     fn context_info(&self) -> ContextInfoDto {
-        let snapshot = HeadlessApp::context_info_snapshot(self);
-        ContextInfoDto {
-            used_tokens: snapshot.used_tokens,
-            max_tokens: snapshot.max_tokens,
-            percentage: snapshot.percentage,
-            compaction_threshold: snapshot.compaction_threshold,
-        }
+        ContextInfoDto::from_snapshot(&HeadlessApp::context_info_snapshot(self))
     }
 
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
@@ -157,6 +170,23 @@ impl AppEngine for HeadlessApp {
     fn config_manager(&self) -> Option<ConfigManagerHandle> {
         HeadlessApp::config_manager(self).cloned()
     }
+}
+
+#[test]
+fn context_info_dto_from_snapshot_uses_shared_helper() {
+    let snapshot = fx_cli::headless::ContextInfoSnapshot {
+        used_tokens: 120,
+        max_tokens: 1000,
+        percentage: 12.0,
+        compaction_threshold: 0.8,
+    };
+
+    let dto = ContextInfoDto::from_snapshot(&snapshot);
+
+    assert_eq!(dto.used_tokens, 120);
+    assert_eq!(dto.max_tokens, 1000);
+    assert_eq!(dto.percentage, 12.0);
+    assert_eq!(dto.compaction_threshold, 0.8);
 }
 
 fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {

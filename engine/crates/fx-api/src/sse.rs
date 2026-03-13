@@ -141,6 +141,7 @@ pub fn sse_response(receiver: mpsc::Receiver<String>) -> Response {
 async fn ping_relay(mut data_rx: mpsc::Receiver<String>, tx: mpsc::Sender<String>) {
     loop {
         tokio::select! {
+            biased;
             frame = data_rx.recv() => {
                 match frame {
                     Some(frame) => {

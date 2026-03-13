@@ -91,6 +91,24 @@ pub struct ContextInfoDto {
     pub compaction_threshold: f32,
 }
 
+pub trait ContextInfoSnapshotLike {
+    fn used_tokens(&self) -> usize;
+    fn max_tokens(&self) -> usize;
+    fn percentage(&self) -> f32;
+    fn compaction_threshold(&self) -> f32;
+}
+
+impl ContextInfoDto {
+    pub fn from_snapshot(snapshot: &impl ContextInfoSnapshotLike) -> Self {
+        Self {
+            used_tokens: snapshot.used_tokens(),
+            max_tokens: snapshot.max_tokens(),
+            percentage: snapshot.percentage(),
+            compaction_threshold: snapshot.compaction_threshold(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SkillSummaryDto {
     pub name: String,
