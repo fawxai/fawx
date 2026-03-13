@@ -203,21 +203,12 @@ fx-api = { path = "../fx-api" }
 The handlers need `HeadlessApp` to process messages. Currently `HeadlessApp`
 lives in `fx-cli/src/headless.rs`.
 
-**Options:**
-1. Move `HeadlessApp` into `fx-kernel` — it's really the engine driver, not CLI-specific.
-2. Keep `HeadlessApp` in `fx-cli` and pass it as `Arc<Mutex<HeadlessApp>>` into `fx-api::ApiConfig`.
-3. Define a trait in `fx-api` that `HeadlessApp` implements, injected at startup.
+**Options considered:**
+1. ~~Move `HeadlessApp` into `fx-kernel`~~ — correct long-term but too large for this PR.
+2. ~~Pass concrete `HeadlessApp` into `fx-api`~~ — creates circular dependency (fx-cli → fx-api → fx-cli).
+3. **Define `AppEngine` trait in `fx-api`.** ✅ CHOSEN.
 
-**Recommended: Option 2** for Sprint 0. It's the least invasive — `HeadlessApp`
-stays where it is, `fx-api` receives it as an opaque `Arc<Mutex<dyn AppEngine>>`
-(or concrete type via generic). Moving `HeadlessApp` to `fx-kernel` is correct
-architecturally but is a larger refactor that should be its own PR.
-
-Actually, the simplest path: `fx-api` depends on `fx-cli`'s `HeadlessApp` type.
-But that creates a circular dependency (fx-cli depends on fx-api, fx-api depends
-on fx-cli).
-
-**Resolution: Define a trait in fx-api.**
+**Decision: Define a trait in fx-api.**
 
 ```rust
 // fx-api/src/engine.rs
