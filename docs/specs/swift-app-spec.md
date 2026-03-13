@@ -259,7 +259,7 @@ enum SidebarSelection: Hashable {
 | Shortcut | Action | Implementation |
 |----------|--------|---------------|
 | `⌘N` | New session | SwiftUI `Commands { }` — `CommandGroup(after: .newItem)` |
-| `⌘⇧O` | Quick session switcher (spotlight-style) | SwiftUI `Commands { }` — custom `CommandMenu("Navigate")` |
+| `⌘⇧O` | Quick session switcher (see below) | SwiftUI `Commands { }` — custom `CommandMenu("Navigate")` |
 | `⌘,` | Open Settings | Automatic from `Settings { }` scene (SwiftUI provides this free) |
 | `⌘⏎` | Send message | `.keyboardShortcut(.return, modifiers: .command)` on Send button |
 | `⌘⇧⌫` | Clear session history | SwiftUI `Commands { }` — custom `CommandMenu("Session")` |
@@ -273,8 +273,14 @@ enum SidebarSelection: Hashable {
 - `⌘,` is automatic — SwiftUI creates it when you declare a `Settings { }` scene.
 - **`⌘⇧O`** (Shift-Command-O) mirrors Xcode's "Open Quickly" pattern. No conflict with standard macOS shortcuts (`⌘O` = Open File, which we don't use).
 
+**Quick session switcher (`⌘⇧O`):**
+- Presented as a **sheet** (`.sheet` modifier), NOT a popover or custom overlay. Sheets have well-defined Esc dismissal behavior on both macOS and iOS.
+- Contains a search field (auto-focused) + filtered session list.
+- Typing filters sessions by label/key. Arrow keys navigate. Return selects. Esc dismisses.
+- On selection: set `SidebarSelection.session(key)` and dismiss the sheet.
+
 **`Esc` priority chain** (evaluated in order):
-1. If a sheet/popover/menu is open → dismiss it (handled by system, highest priority)
+1. If a sheet (including session switcher) / popover / menu is open → dismiss it (handled by SwiftUI, highest priority)
 2. If an SSE stream is active → cancel the stream
 3. If input bar is focused → blur the input bar
 4. Otherwise → no-op
@@ -429,7 +435,7 @@ The new session flow has two sequential API calls: `POST /v1/sessions` (create) 
 - Monospace font (SF Mono / Menlo)
 - Language label in top-right corner
 - Copy button on hover (macOS) or long-press (iOS)
-- Syntax highlighting (basic — at minimum distinguish keywords, strings, comments)
+- **Syntax highlighting: V1 uses monochrome code blocks (no highlighting).** MarkdownUI renders fenced code blocks with language labels and monospace font, but does NOT include a syntax highlighter. Adding one requires either a second dependency ([Splash](https://github.com/JohnSundell/Splash) for Swift-only, or [Highlightr](https://github.com/nicklama/Highlightr) for multi-language via highlight.js) or a custom implementation. **V1 ships without syntax highlighting.** Code blocks are monospace, dark background, language label, copy button — but all text is one color. Syntax highlighting is a V2 enhancement.
 - Horizontal scroll for long lines, no wrapping
 
 **Input bar:**
@@ -531,6 +537,12 @@ V2:  ┌─ Queue ▾ ───────────────────�
   - Clear history
   - Delete session
 - Pull-to-refresh (iOS), auto-refresh on focus (macOS)
+
+**Destructive actions during streaming:**
+- **Delete/clear the currently streaming session:** Show a confirmation alert: "This session is actively streaming. Stop and {delete/clear}?" On confirm: cancel the stream task (`ChatViewModel.stopStreaming()`), then execute the API call (`DELETE` or `POST .../clear`), then set `selection = nil`.
+- **Delete/clear a non-active session while another is streaming:** Allowed without confirmation — it doesn't affect the active stream.
+- **`⌘⇧⌫` (clear):** Disabled when the selected session is streaming. Enabled otherwise.
+- **Session switch while streaming:** Cancel the active stream first (`cleanup()`), then load the new session. The partial response is preserved in the old session's history (server recorded what it received). No confirmation dialog — session switching should feel instant.
 
 **Search:** Search bar at top filters sessions by `label` and `key` fields only (these are the only text fields available from `GET /v1/sessions` without the backend `title`/`preview` enhancement). If backend enhancement #2 ships, also filter by `title` and `preview`. Do NOT attempt to filter by message content — that would require loading all messages for all sessions.
 
@@ -708,34 +720,55 @@ final class AppState {
 
 **Swift 6 strict concurrency rules:**
 - `AppState` and all ViewModels (`ChatViewModel`, `SessionListViewModel`, etc.) MUST be `@MainActor`. All UI state mutation happens on the main actor.
-- `FawxClient` and `SSEStream` run on a **nonisolated** background context. They produce `Sendable` value types (`Session`, `Message`, `ModelInfo`, etc.) that cross the actor boundary.
+- `FawxClient` is a `final class` isolated to a **custom global actor** (`@FawxClientActor`) or implemented as a plain `actor`. It holds the `URLSession` and server URL. It is NOT `@unchecked Sendable` — use proper actor isolation to avoid strict-concurrency fights.
 - All model types (`Session`, `Message`, `ModelInfo`, `ThinkingLevel`, `Skill`, `AuthProvider`, `ServerStatus`) must be `struct` (not class) and conform to `Sendable`.
-- The handoff pattern: `FawxClient` returns a `Sendable` result → ViewModel (on `@MainActor`) assigns it to a `@Observable` property → SwiftUI reacts.
-- SSE streaming uses `AsyncStream<SSEEvent>` where `SSEEvent` is a `Sendable` enum. The ViewModel consumes this stream in a `Task { }` on the main actor.
+- The handoff pattern: `FawxClient` methods are `async` and return `Sendable` value types → ViewModel (on `@MainActor`) awaits and assigns to `@Observable` properties → SwiftUI reacts.
+- SSE streaming uses `AsyncThrowingStream<SSEEvent, Error>` where `SSEEvent` is a `Sendable` enum. The ViewModel consumes this stream in a `Task { }` on the main actor.
+- **Cancellation propagation (CRITICAL):** The `Task` that consumes the SSE stream must be stored on the ViewModel. When the user taps Stop, switches sessions, or the view tears down, cancel the task via `task.cancel()`. Inside `FawxClient`, the `AsyncThrowingStream` must be created with an `onTermination` handler that calls `urlSessionTask.cancel()` on the underlying `URLSessionDataTask`. Without this, orphaned URLSession tasks will leak after every Stop/session-switch.
 - Never capture a `@MainActor`-isolated reference in a `nonisolated` closure. Pass only `Sendable` values across the boundary.
 
 ```swift
-// Example: correct SSE consumption pattern
+// Example: correct SSE consumption + cancellation pattern
 @MainActor @Observable
 final class ChatViewModel {
     var messages: [Message] = []
     var streamingText: String = ""
+    private var streamTask: Task<Void, Never>?  // stored for cancellation
     
     func sendMessage(_ text: String, sessionId: String) {
-        let client = self.client // FawxClient is Sendable
-        Task {
-            let stream = try await client.sendMessage(text, sessionId: sessionId)
-            for await event in stream { // AsyncStream<SSEEvent>
-                switch event {
-                case .textDelta(let text):
-                    self.streamingText += text // safe: @MainActor
-                case .done(let response):
-                    self.messages.append(Message(role: .assistant, content: response))
-                    self.streamingText = ""
-                // ...
+        let client = self.client // FawxClient is an actor, called cross-actor
+        streamTask = Task {
+            do {
+                let stream = try await client.sendMessage(text, sessionId: sessionId)
+                for try await event in stream { // AsyncThrowingStream<SSEEvent, Error>
+                    switch event {
+                    case .textDelta(let text):
+                        self.streamingText += text // safe: @MainActor
+                    case .done(let response):
+                        self.messages.append(Message(role: .assistant, content: response))
+                        self.streamingText = ""
+                    // ...
+                    }
                 }
-            }
+            } catch is CancellationError {
+                // Stream was cancelled (Stop, session switch, view teardown)
+                if !self.streamingText.isEmpty {
+                    self.messages.append(Message(role: .assistant,
+                        content: self.streamingText + "\n\n*(interrupted)*"))
+                    self.streamingText = ""
+                }
+            } catch { /* handle other errors */ }
         }
+    }
+    
+    func stopStreaming() {
+        streamTask?.cancel()  // triggers onTermination in FawxClient → URLSessionTask.cancel()
+        streamTask = nil
+    }
+    
+    // Called on session switch or view teardown
+    func cleanup() {
+        stopStreaming()
     }
 }
 ```
@@ -955,7 +988,20 @@ This allows HTTP to any address. It is necessary for V1 because:
 ### 11.2 Server URL Storage
 
 - Stored in `UserDefaults` via `@AppStorage("server_url")` as a **`String`**, not `URL`. (`@AppStorage` does not natively support `URL?`.)
-- **Canonical format:** The stored string is the URL as-entered by the user, normalized by `URL(string:)?.absoluteString`. Example: `"http://100.93.251.101:8400"`. This exact string is also used as the `kSecAttrAccount` value for Keychain lookup — one canonical format, one source of truth.
+- **Canonical format for Keychain keying:** The stored URL string is normalized before storage AND before Keychain lookup using this algorithm:
+  ```swift
+  func canonicalizeServerURL(_ input: String) -> String? {
+      guard var components = URLComponents(string: input) else { return nil }
+      components.scheme = components.scheme?.lowercased() ?? "http"
+      components.host = components.host?.lowercased()
+      components.path = components.path == "/" ? "" : components.path  // strip trailing slash
+      // Do NOT strip port — 8400 is not a default port for any scheme
+      return components.string
+  }
+  // "HTTP://MyHost:8400/" → "http://myhost:8400"
+  // "http://100.93.251.101:8400" → "http://100.93.251.101:8400"
+  ```
+  The output of this function is stored in `@AppStorage("server_url")` AND used as `kSecAttrAccount`. This prevents duplicate credentials from trailing slashes, scheme casing, or hostname casing.
 - On URL change: test connection with new URL before overwriting the stored value. The old URL's Keychain entry is NOT deleted (in case the user switches back).
 
 ### 11.3 Network Security
@@ -973,7 +1019,7 @@ This allows HTTP to any address. It is necessary for V1 because:
 ### 12.1 Project Setup
 - **Xcode 16+**, Swift 6, SwiftUI
 - **Minimum deployment:** macOS 14 (Sonoma), iOS 17
-- **One approved third-party dependency:** [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) (MarkdownUI) for markdown rendering. Native `AttributedString` markdown support in SwiftUI cannot handle tables, fenced code blocks with language labels, nested lists, or syntax highlighting — all of which are required by this spec. Building a custom renderer would take longer than the rest of the app combined. MarkdownUI is mature (3k+ stars), actively maintained, and has zero transitive dependencies. **This is the approved rendering solution for V1.**
+- **One approved third-party dependency:** [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) (MarkdownUI) for markdown rendering. Native `AttributedString` markdown support in SwiftUI cannot handle tables, fenced code blocks with language labels, or nested lists. MarkdownUI handles all of these. **Note:** MarkdownUI does NOT provide syntax highlighting — V1 ships with monochrome code blocks. If MarkdownUI proves to be in maintenance-mode or incompatible with our needs at build time, the fallback is Apple's `swift-markdown` package for parsing + custom SwiftUI views for rendering.
 - All other networking and UI is native — URLSession, SwiftUI, Keychain Services. No other third-party packages.
 
 ### 12.2 Distribution
