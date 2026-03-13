@@ -169,6 +169,14 @@ fn removable_middle_offsets(bounds: &ZoneBounds, protected_middle: &HashSet<usiz
         .collect()
 }
 
+fn evicted_indices_from_keep_middle(bounds: &ZoneBounds, keep_middle: &[bool]) -> Vec<usize> {
+    keep_middle
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, keep)| (!keep).then_some(bounds.prefix_end + offset))
+        .collect()
+}
+
 fn summarizable_middle_indices(
     bounds: &ZoneBounds,
     protected_middle: &HashSet<usize>,
@@ -283,6 +291,7 @@ fn sliding_compaction_result(
             compacted_count: 0,
             estimated_tokens: before_tokens,
             used_summarization: false,
+            evicted_indices: Vec::new(),
         });
     }
 
@@ -296,6 +305,7 @@ fn sliding_compaction_result(
 
     let (keep_middle, compacted_count) =
         remove_oldest_middle_until_target(messages, target_tokens, &bounds, &removable_offsets)?;
+    let evicted_indices = evicted_indices_from_keep_middle(&bounds, &keep_middle);
     let compacted_messages =
         assemble_sliding_result(messages, &bounds, &keep_middle, compacted_count);
 
@@ -304,6 +314,7 @@ fn sliding_compaction_result(
         messages: compacted_messages,
         compacted_count,
         used_summarization: false,
+        evicted_indices,
     })
 }
 
@@ -367,6 +378,23 @@ pub trait CompactionStrategy: Send + Sync + std::fmt::Debug {
     ) -> Result<CompactionResult, CompactionError>;
 }
 
+/// Persists evicted message content before compaction drops them.
+#[async_trait]
+pub trait CompactionMemoryFlush: Send + Sync + std::fmt::Debug {
+    /// Flush content from messages about to be evicted.
+    async fn flush(
+        &self,
+        evicted: &[Message],
+        scope_label: &str,
+    ) -> Result<(), CompactionFlushError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionFlushError {
+    #[error("memory flush failed: {reason}")]
+    FlushFailed { reason: String },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionError {
     #[error("summarization failed")]
@@ -385,6 +413,8 @@ pub struct CompactionResult {
     pub(crate) compacted_count: usize,
     pub(crate) estimated_tokens: usize,
     pub(crate) used_summarization: bool,
+    /// Indices into the original message slice for messages evicted by compaction.
+    pub(crate) evicted_indices: Vec<usize>,
 }
 
 /// Keeps the N most recent turns and drops older ones.
@@ -548,6 +578,7 @@ impl CompactionStrategy for SummarizingCompactor {
                 compacted_count: 0,
                 estimated_tokens: before_tokens,
                 used_summarization: false,
+                evicted_indices: Vec::new(),
             });
         }
 
@@ -569,6 +600,7 @@ impl CompactionStrategy for SummarizingCompactor {
             compacted_count: summarizable_messages.len(),
             estimated_tokens,
             used_summarization: true,
+            evicted_indices: summarizable_indices,
         })
     }
 }
@@ -910,6 +942,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evicted_indices_empty_when_no_compaction_needed() {
+        let compactor = SlidingWindowCompactor::new(3);
+        let messages = vec![user(5), assistant(5), user(5)];
+        let target = ConversationBudget::estimate_tokens(&messages) + 1;
+
+        let result = compactor.compact(&messages, target).await.expect("compact");
+
+        assert!(result.evicted_indices.is_empty());
+    }
+
+    #[tokio::test]
     async fn compact_preserves_recent_turns() {
         let compactor = SlidingWindowCompactor::new(4);
         let messages = vec![
@@ -969,6 +1012,22 @@ mod tests {
         let result = compactor.compact(&messages, 95).await.expect("compact");
         assert!(!result.messages.contains(&oldest));
         assert!(result.messages.contains(&newer));
+    }
+
+    #[tokio::test]
+    async fn evicted_indices_populated_for_sliding_window() {
+        let compactor = SlidingWindowCompactor::new(2);
+        let messages = vec![
+            Message::system("system"),
+            user(30),
+            assistant(30),
+            user(30),
+            assistant(30),
+        ];
+
+        let result = compactor.compact(&messages, 95).await.expect("compact");
+
+        assert_eq!(result.evicted_indices, vec![1, 2]);
     }
 
     #[tokio::test]
@@ -1072,6 +1131,27 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn evicted_indices_populated_for_summarizing() {
+        let llm = Arc::new(MockSummaryLlm::new(vec![Ok(
+            "Decisions:\n- keep\nFiles modified:\n- src/lib.rs\nTask state:\n- in progress\nKey context:\n- tests failing"
+                .to_string(),
+        )]));
+        let compactor = SummarizingCompactor::new(llm, 2);
+        let messages = vec![
+            Message::system("system"),
+            user(40),
+            assistant(40),
+            user(30),
+            assistant(30),
+            user(20),
+        ];
+
+        let result = compactor.compact(&messages, 120).await.expect("compact");
+
+        assert_eq!(result.evicted_indices, vec![1, 2, 3]);
     }
 
     #[tokio::test]

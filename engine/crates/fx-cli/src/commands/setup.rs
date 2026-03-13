@@ -332,12 +332,26 @@ impl SetupWizard {
             .context("provider not selected")?;
         let models = self.available_models(&provider).await?;
         print_models(&provider, &models);
-        let selection = prompt_list_selection("  > ", models.len())?;
-        let model = models[selection - 1].clone();
-        self.default_model = Some(model.clone());
-        println!("  ✓ Default model: {model}");
-        println!();
-        Ok(())
+        println!("  (press Enter to skip)");
+        loop {
+            let input = prompt_line("  > ")?;
+            if is_skip_input(&input) {
+                let fallback =
+                    default_model_for_provider(self.selected_provider.as_deref(), &models);
+                self.default_model = Some(fallback.clone());
+                println!("  ⏭ Skipped model selection (using {fallback})");
+                println!();
+                return Ok(());
+            }
+            if let Some(selection) = parse_list_selection(&input, models.len()) {
+                let model = models[selection - 1].clone();
+                self.default_model = Some(model.clone());
+                println!("  ✓ Default model: {model}");
+                println!();
+                return Ok(());
+            }
+            println!("  Invalid choice, please enter a number from the list above.");
+        }
     }
 
     fn run_permissions_phase(&mut self) -> anyhow::Result<()> {
@@ -348,21 +362,27 @@ impl SetupWizard {
         );
         println!("    [2] 🔒 Cautious — proposals required for all writes and code execution");
         println!("    [3] 🧪 Experimental — maximum autonomy including kernel self-modification");
-        let preset = prompt_choice_with_surface(
-            PromptSurface::PlainTerminal,
-            "  > ",
-            "Please choose 1, 2, or 3.\n",
-            "permission preset",
-            parse_permissions_selection,
-        )?;
-        self.permissions_preset = Some(preset);
-        println!(
-            "  ✓ Permissions: {} ({})",
-            permission_preset_label(preset),
-            permission_preset_summary(preset)
-        );
-        println!();
-        Ok(())
+        println!("  (press Enter to skip, defaults to Power)");
+        loop {
+            let input = prompt_line("  > ")?;
+            if is_skip_input(&input) {
+                self.permissions_preset = Some(PermissionPreset::Power);
+                println!("  ⏭ Using default: Power");
+                println!();
+                return Ok(());
+            }
+            if let Some(preset) = parse_permissions_selection(&input) {
+                self.permissions_preset = Some(preset);
+                println!(
+                    "  ✓ Permissions: {} ({})",
+                    permission_preset_label(preset),
+                    permission_preset_summary(preset)
+                );
+                println!();
+                return Ok(());
+            }
+            println!("  Invalid choice, please enter 1, 2, or 3.");
+        }
     }
 
     async fn available_models(&self, provider: &str) -> anyhow::Result<Vec<String>> {
@@ -643,13 +663,23 @@ fn prompt_skill_selection(state: &SkillWizardState) -> anyhow::Result<Vec<SkillT
             selected: skill.default_selected,
         })
         .collect::<Vec<_>>();
+    let mut has_toggled = false;
     loop {
         print_skill_selection_prompt(&toggles, state);
+        println!("  (press Enter to confirm, or type \"skip\" to skip)");
         let input = prompt_line("  > ")?;
-        if input.is_empty() {
+        if is_skip_input(&input) {
+            if has_toggled {
+                println!("  ✓ Skills configured");
+            } else {
+                println!("  ⏭ Using default skills selection");
+            }
             return Ok(toggles);
         }
         let indexes = parse_toggle_input(&input, toggles.len());
+        if !indexes.is_empty() {
+            has_toggled = true;
+        }
         apply_skill_toggles(&mut toggles, &indexes);
     }
 }
@@ -883,15 +913,8 @@ fn prompt_required(prompt: &str) -> anyhow::Result<String> {
     .map_err(Into::into)
 }
 
-fn prompt_list_selection(prompt: &str, len: usize) -> anyhow::Result<usize> {
-    prompt_choice_with_surface(
-        PromptSurface::PlainTerminal,
-        prompt,
-        "Please choose one of the numbered options.\n",
-        "list selection",
-        |value| parse_list_selection(value, len),
-    )
-    .map_err(Into::into)
+fn is_skip_input(value: &str) -> bool {
+    value.is_empty() || value.eq_ignore_ascii_case("skip")
 }
 
 fn parse_list_selection(value: &str, len: usize) -> Option<usize> {
@@ -1020,6 +1043,17 @@ fn fallback_models(auth_manager: &AuthManager, provider: &str) -> anyhow::Result
         Err(anyhow!("no models available for {provider}"))
     } else {
         Ok(models)
+    }
+}
+
+fn default_model_for_provider(provider: Option<&str>, models: &[String]) -> String {
+    if let Some(first) = models.first() {
+        return first.clone();
+    }
+    match provider {
+        Some("anthropic") => "claude-sonnet-4-6".to_string(),
+        Some("openai") => "gpt-4o".to_string(),
+        _ => "gpt-4o".to_string(),
     }
 }
 
@@ -1661,6 +1695,40 @@ mod tests {
             vec!["  ! TTS/STT need OpenAI auth. Configure OpenAI to use TTS/STT.".to_string()]
         );
         assert!(provider_requirement_messages(&[test_skill("browser")], &state).is_empty());
+    }
+
+    #[test]
+    fn default_model_for_provider_uses_first_available_model() {
+        let models = vec!["claude-opus-4".to_string(), "claude-sonnet-4".to_string()];
+        assert_eq!(
+            default_model_for_provider(Some("anthropic"), &models),
+            "claude-opus-4"
+        );
+    }
+
+    #[test]
+    fn default_model_for_provider_falls_back_to_hardcoded_when_list_empty() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            default_model_for_provider(Some("anthropic"), &empty),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(default_model_for_provider(Some("openai"), &empty), "gpt-4o");
+        assert_eq!(
+            default_model_for_provider(Some("openrouter"), &empty),
+            "gpt-4o"
+        );
+        assert_eq!(default_model_for_provider(None, &empty), "gpt-4o");
+    }
+
+    #[test]
+    fn is_skip_input_accepts_empty_and_skip_variants() {
+        assert!(is_skip_input(""));
+        assert!(is_skip_input("skip"));
+        assert!(is_skip_input("Skip"));
+        assert!(is_skip_input("SKIP"));
+        assert!(!is_skip_input("1"));
+        assert!(!is_skip_input("abc"));
     }
 
     #[test]
