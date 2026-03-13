@@ -795,22 +795,13 @@
               <p>The server sends events using the standard SSE protocol. Here's the core handler:</p>
               <div class="code-block">
                 <div class="code-header"><span>rust</span><button class="code-copy">Copy</button></div>
-                <div class="code-body">async fn stream_response(session_id: &str) -> impl IntoResponse {
+                <div class="code-body">async fn stream_response(
+    session_id: &str,
+) -> impl IntoResponse {
     let (tx, rx) = mpsc::channel(32);
-    tokio::spawn(async move {
-        while let Some(chunk) = model.next_token().await {
-            tx.send(format!("data: {}\n\n", chunk)).await.ok();
-        }
-    });
     Sse::new(ReceiverStream::new(rx))
 }</div>
               </div>
-              <p>Key points:</p>
-              <ul>
-                <li>Each token arrives as a <code class="inline">text_delta</code> event</li>
-                <li>Tool calls emit <code class="inline">tool_call_start</code> → <code class="inline">tool_call_complete</code> → <code class="inline">tool_result</code></li>
-                <li>Stream ends with a <code class="inline">done</code> event containing the full response</li>
-              </ul>
             </div>
             <!-- User message 2 -->
             <div style="align-self: flex-end;">
