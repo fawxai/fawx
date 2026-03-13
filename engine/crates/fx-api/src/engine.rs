@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
-use fx_llm::ImageAttachment;
+use fx_llm::{ImageAttachment, Message};
 use std::sync::{Arc, Mutex};
 
 pub type ConfigManagerHandle = Arc<Mutex<ConfigManager>>;
@@ -23,6 +23,15 @@ pub trait AppEngine: Send + Sync {
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error>;
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error>;
 
     fn active_model(&self) -> &str;
 

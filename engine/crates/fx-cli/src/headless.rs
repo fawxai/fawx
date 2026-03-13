@@ -344,6 +344,27 @@ impl HeadlessApp {
         Ok(self.finalize_cycle(input, &result))
     }
 
+    pub async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
+        let original_history = std::mem::replace(&mut self.conversation_history, context);
+        let result = match (images.is_empty(), callback) {
+            (true, Some(callback)) => {
+                process_input_with_commands_streaming(self, input, Some(source), callback).await
+            }
+            (true, None) => process_input_with_commands(self, input, Some(source)).await,
+            (false, _) => self.process_message_with_images(input, &images, source).await,
+        };
+        let updated_history = self.conversation_history.clone();
+        self.conversation_history = original_history;
+        result.map(|cycle| (cycle, updated_history))
+    }
+
     pub async fn process_message_for_source_streaming(
         &mut self,
         input: &str,
@@ -659,19 +680,43 @@ impl AppEngine for HeadlessApp {
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<ApiCycleResult, anyhow::Error> {
-        let result = match (images.is_empty(), callback) {
-            (true, Some(callback)) => {
-                process_input_with_commands_streaming(self, input, Some(&source), callback).await?
-            }
-            (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
-            (false, _) => self.process_message_with_images(input, &images, &source).await?,
-        };
+        let (result, _) = HeadlessApp::process_message_with_context(
+            self,
+            input,
+            images,
+            self.conversation_history.clone(),
+            &source,
+            callback,
+        )
+        .await?;
 
         Ok(ApiCycleResult {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
         })
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) =
+            HeadlessApp::process_message_with_context(self, input, images, context, &source, callback)
+                .await?;
+
+        Ok((
+            ApiCycleResult {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            },
+            updated_history,
+        ))
     }
 
     fn active_model(&self) -> &str {

@@ -3,8 +3,9 @@ use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
-use std::path::PathBuf;
+use fx_session::SessionRegistry;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -12,6 +13,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct HttpState {
     pub app: Arc<Mutex<dyn AppEngine>>,
+    pub session_registry: Option<SessionRegistry>,
     pub start_time: Instant,
     pub tailscale_ip: Option<String>,
     pub bearer_token: String,

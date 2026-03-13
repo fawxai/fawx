@@ -27,7 +27,9 @@ use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
-use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, StreamChunk};
+use fx_llm::{
+    CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, Message, StreamChunk,
+};
 use fx_cli::headless::{
     process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
     HeadlessAppDeps,
@@ -67,6 +69,28 @@ impl AppEngine for HeadlessApp {
             model: result.model,
             iterations: result.iterations,
         })
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) =
+            HeadlessApp::process_message_with_context(self, input, images, context, &source, callback)
+                .await?;
+
+        Ok((
+            ApiCycleResult {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            },
+            updated_history,
+        ))
     }
 
     fn active_model(&self) -> &str {
@@ -985,6 +1009,7 @@ mod routing_and_status {
             .unwrap_or_else(std::env::temp_dir);
         HttpState {
             app: Arc::new(Mutex::new(make_test_app_with_config(config, config_manager))),
+            session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
@@ -1371,6 +1396,7 @@ allowed_chat_ids = [123]
         webhooks.insert("alpha".to_string(), webhook);
         let state = HttpState {
             app: Arc::new(Mutex::new(make_test_app(None))),
+            session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),

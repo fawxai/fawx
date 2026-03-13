@@ -140,6 +140,20 @@ impl SessionRegistry {
         Ok(session.recent_messages(limit).to_vec())
     }
 
+    /// Clear the recorded message history for a session.
+    pub fn clear(&self, key: &SessionKey) -> Result<()> {
+        let snapshot = {
+            let mut map = self.write()?;
+            let session = map
+                .get_mut(key)
+                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+            session.clear_messages();
+            session.clone()
+        };
+        self.store.save(&snapshot)?;
+        Ok(())
+    }
+
     /// Update the status of a session.
     pub fn set_status(&self, key: &SessionKey, status: SessionStatus) -> Result<()> {
         let snapshot = {

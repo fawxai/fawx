@@ -28,6 +28,7 @@ use crate::token::{validate_bearer_token, BearerTokenStore};
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_config::HttpConfig;
+use fx_session::{SessionRegistry, SessionStore};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,8 +53,10 @@ pub async fn run(
     let listeners = bind_listeners(listen_plan).await?;
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(telegram.clone(), webhook_channels);
+    let session_registry = init_session_registry(data_dir);
     let state = HttpState {
         app: Arc::clone(&shared_app),
+        session_registry,
         start_time: Instant::now(),
         tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
@@ -70,6 +73,25 @@ pub async fn run(
 
     run_listeners(router, listeners).await?;
     Ok(0)
+}
+
+fn init_session_registry(data_dir: &Path) -> Option<SessionRegistry> {
+    let session_db_path = data_dir.join("sessions.redb");
+    let storage = match fx_storage::Storage::open(&session_db_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(path = %session_db_path.display(), error = %error, "session storage unavailable");
+            return None;
+        }
+    };
+
+    match SessionRegistry::new(SessionStore::new(storage)) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            tracing::warn!(path = %session_db_path.display(), error = %error, "session registry unavailable");
+            None
+        }
+    }
 }
 
 async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {

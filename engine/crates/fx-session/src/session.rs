@@ -65,6 +65,12 @@ impl Session {
         self.updated_at = now;
     }
 
+    /// Remove all recorded messages and update the timestamp.
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
+        self.updated_at = current_epoch_secs();
+    }
+
     /// Return the most recent `limit` messages (or all if fewer exist).
     pub fn recent_messages(&self, limit: usize) -> &[SessionMessage] {
         let start = self.messages.len().saturating_sub(limit);
