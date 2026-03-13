@@ -622,11 +622,23 @@
     <button class="tab-btn" onclick="showScreen(4)">5. Tool Call</button>
     <button class="tab-btn" onclick="showScreen(5)">6. Skills</button>
     <button class="tab-btn" onclick="showScreen(6)">7. Settings</button>
-    <button class="tab-btn" onclick="showScreen(7)">8. iOS Sessions</button>
-    <button class="tab-btn" onclick="showScreen(8)">9. iOS Chat</button>
-    <button class="tab-btn" onclick="showScreen(9)">10. Empty States</button>
-    <button class="tab-btn" onclick="showScreen(10)">11. iOS Settings</button>
-    <button class="tab-btn" onclick="showScreen(11)">12. Error States</button>
+    <button class="tab-btn" onclick="showScreen(7)">7a. Connection</button>
+    <button class="tab-btn" onclick="showScreen(8)">7b. Model</button>
+    <button class="tab-btn" onclick="showScreen(9)">7c. Appearance</button>
+    <button class="tab-btn" onclick="showScreen(10)">8. iOS Sessions</button>
+    <button class="tab-btn" onclick="showScreen(11)">9. iOS Chat</button>
+    <button class="tab-btn" onclick="showScreen(12)">10. Empty States</button>
+    <button class="tab-btn" onclick="showScreen(13)">10a. No Sessions</button>
+    <button class="tab-btn" onclick="showScreen(14)">10b. No Results</button>
+    <button class="tab-btn" onclick="showScreen(15)">10c. Load Failed</button>
+    <button class="tab-btn" onclick="showScreen(16)">10d. Skills Empty</button>
+    <button class="tab-btn" onclick="showScreen(17)">11. iOS Settings</button>
+    <button class="tab-btn" onclick="showScreen(18)">11b. Model Detail</button>
+    <button class="tab-btn" onclick="showScreen(19)">12. Error States</button>
+    <button class="tab-btn" onclick="showScreen(20)">12a. Reconnecting</button>
+    <button class="tab-btn" onclick="showScreen(21)">12b. Disconnected</button>
+    <button class="tab-btn" onclick="showScreen(22)">12c. Interrupted</button>
+    <button class="tab-btn" onclick="showScreen(23)">12d. Rate Limited</button>
   </div>
   <div class="theme-toggle">
     <button class="active" onclick="setTheme('dark')">Dark</button>
@@ -1322,7 +1334,7 @@
 <!-- ════════════════════════════════════════════ -->
 <!-- SCREEN 8: iOS — Session List                 -->
 <!-- ════════════════════════════════════════════ -->
-<div class="screen" id="screen-7">
+<div class="screen" id="screen-10">
   <div class="iphone-frame">
     <div class="iphone-notch"></div>
     <div class="iphone-status-bar">
@@ -1339,13 +1351,14 @@
     </div>
     <div class="ios-large-title">Sessions</div>
     <input class="ios-search" type="text" placeholder="Search sessions..." disabled>
+    <div class="annotation" style="padding: 2px 16px;">Model names abbreviated for mobile — drop provider prefix (e.g., claude-sonnet-4-6 → sonnet-4-6)</div>
     <div class="ios-status-row">
       <span class="ios-status-dot"></span>
       <span>Connected</span>
       <span style="opacity: 0.5;">·</span>
       <span>Power User</span>
       <span style="opacity: 0.5;">·</span>
-      <span>claude-sonnet-4-6</span>
+      <span>sonnet-4-6</span>
       <span style="opacity: 0.5;">·</span>
       <span>62% ctx</span>
     </div>
@@ -1395,7 +1408,7 @@
 <!-- ════════════════════════════════════════════ -->
 <!-- SCREEN 9: iOS — Chat View                    -->
 <!-- ════════════════════════════════════════════ -->
-<div class="screen" id="screen-8">
+<div class="screen" id="screen-11">
   <div class="iphone-frame">
     <div class="iphone-notch"></div>
     <div class="iphone-status-bar">
@@ -1416,7 +1429,7 @@
       <span style="opacity: 0.5;">·</span>
       <span>Power User</span>
       <span style="opacity: 0.5;">·</span>
-      <span>claude-sonnet-4-6</span>
+      <span>sonnet-4-6</span>
       <span style="opacity: 0.5;">·</span>
       <span>62% ctx</span>
     </div>
@@ -1481,7 +1494,7 @@
 <!-- ════════════════════════════════════════════ -->
 <!-- SCREEN 10: Empty States Reference Sheet      -->
 <!-- ════════════════════════════════════════════ -->
-<div class="screen" id="screen-9">
+<div class="screen" id="screen-12">
   <div class="empty-states-grid">
     <!-- 1: No sessions -->
     <div class="mini-window">
@@ -1552,7 +1565,7 @@
 <!-- ════════════════════════════════════════════ -->
 <!-- SCREEN 11: iOS Settings                      -->
 <!-- ════════════════════════════════════════════ -->
-<div class="screen" id="screen-10">
+<div class="screen" id="screen-17">
   <div class="iphone-frame">
     <div class="iphone-notch"></div>
     <div class="iphone-status-bar">
@@ -1623,7 +1636,7 @@
           <div class="ios-settings-row">
             <span class="ios-settings-row-label">Server Model</span>
             <span class="ios-settings-row-value">
-              <span style="font-family: 'SF Mono', Menlo, monospace; font-size: 14px;">claude-sonnet-4-6</span>
+              <span style="font-family: 'SF Mono', Menlo, monospace; font-size: 14px;">sonnet-4-6</span>
               <span class="ios-settings-chevron">›</span>
             </span>
           </div>
@@ -1694,7 +1707,7 @@
 <!-- ════════════════════════════════════════════ -->
 <!-- SCREEN 12: Error States Reference Sheet      -->
 <!-- ════════════════════════════════════════════ -->
-<div class="screen" id="screen-11">
+<div class="screen" id="screen-19">
   <div class="empty-states-grid">
     <!-- 1: Reconnecting -->
     <div class="mini-window">
@@ -1773,13 +1786,777 @@
   </div>
 </div>
 
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 7a: Settings — Connection (Individual)-->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-7">
+  <div class="mac-window mac-window-settings">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx Settings</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div class="settings-layout">
+        <div class="settings-sidebar">
+          <div class="settings-nav-item active">🔌 Connection</div>
+          <div class="settings-nav-item">🎨 Appearance</div>
+          <div class="settings-nav-item">🤖 Model & Thinking</div>
+          <div class="settings-nav-item">🔑 Auth Status</div>
+          <div class="settings-nav-item">ℹ️ About</div>
+        </div>
+      <div class="settings-content">
+        <div class="settings-section-title">Connection</div>
+        <div class="settings-field">
+          <div class="settings-label">Server URL</div>
+          <input class="settings-input" type="text" value="http://100.93.251.101:8400" disabled>
+        </div>
+        <div class="settings-field">
+          <div class="settings-label">Bearer Token</div>
+          <div class="settings-input-row">
+            <input class="settings-input" type="password" value="sk-fawx-xxxxxxxxxxxx" disabled>
+            <button class="eye-toggle">👁</button>
+          </div>
+        </div>
+        <div class="settings-field">
+          <div class="settings-label">Connection Status</div>
+          <div class="settings-status">
+            <span class="status-dot connected"></span>
+            <span style="color: var(--success);">Connected</span>
+            <span style="color: var(--text-secondary); margin-left: 8px;">Uptime: 3h 42m</span>
+          </div>
+        </div>
+        <button class="settings-btn">Test Connection</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 7b: Settings — Model & Thinking       -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-8">
+  <div class="mac-window mac-window-settings">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx Settings</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div class="settings-layout">
+        <div class="settings-sidebar">
+          <div class="settings-nav-item">🔌 Connection</div>
+          <div class="settings-nav-item">🎨 Appearance</div>
+          <div class="settings-nav-item active">🤖 Model & Thinking</div>
+          <div class="settings-nav-item">🔑 Auth Status</div>
+          <div class="settings-nav-item">ℹ️ About</div>
+        </div>
+      <div class="settings-content">
+        <div class="settings-section-title">Model & Thinking</div>
+        <div class="settings-field">
+          <div class="settings-label">Server Model</div>
+          <select class="settings-select" disabled>
+            <option selected>claude-sonnet-4-6</option>
+            <option>gpt-5.4</option>
+            <option>claude-opus-4-6</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <div class="settings-label">Server Thinking Level</div>
+          <select class="settings-select" disabled>
+            <option>off</option>
+            <option>low</option>
+            <option>medium</option>
+            <option selected>high</option>
+            <option>extra high</option>
+          </select>
+        </div>
+        <div class="settings-warning">
+          ⚠️ These settings apply to all sessions on the server.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 7c: Settings — Appearance             -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-9">
+  <div class="mac-window mac-window-settings">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx Settings</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div class="settings-layout">
+        <div class="settings-sidebar">
+          <div class="settings-nav-item">🔌 Connection</div>
+          <div class="settings-nav-item active">🎨 Appearance</div>
+          <div class="settings-nav-item">🤖 Model & Thinking</div>
+          <div class="settings-nav-item">🔑 Auth Status</div>
+          <div class="settings-nav-item">ℹ️ About</div>
+        </div>
+      <div class="settings-content">
+        <div class="settings-section-title">Appearance</div>
+        <div class="settings-field">
+          <div class="settings-label">Theme</div>
+          <div class="segmented-control">
+            <button>Light</button>
+            <button>Dark</button>
+            <button class="active">System</button>
+          </div>
+        </div>
+        <div class="settings-field">
+          <div class="settings-label">Font Size</div>
+          <div class="segmented-control">
+            <button>Small</button>
+            <button class="active">Medium</button>
+            <button>Large</button>
+          </div>
+        </div>
+        <div class="settings-field">
+          <div class="settings-label">Code Font</div>
+          <select class="settings-select" disabled>
+            <option selected>SF Mono</option>
+            <option>Menlo</option>
+            <option>Fira Code</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 10a: Empty State — No Sessions        -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-13">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
+          <span style="font-size: 13px; color: var(--text-secondary); opacity: 0.5;">No sessions</span>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="empty-state">
+          <div class="empty-fox">🦊</div>
+          <div class="empty-text">No conversations yet</div>
+          <div style="font-size: 14px; color: var(--text-secondary); margin-top: 4px;">Start a new session to begin chatting with Fawx</div>
+          <button class="new-session-btn" style="width: auto; margin-top: 12px; padding: 10px 20px;">+ New Session</button>
+        </div>
+        <div class="input-bar-wrapper">
+          <div class="input-bar">
+            <span class="input-field">Message Fawx...</span>
+            <div class="input-controls">
+              <span class="model-badge">claude-sonnet-4-6</span>
+              <span class="thinking-badge">high</span>
+              <button class="send-btn idle">↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot connected"></span><span style="color: var(--success);">Connected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 10b: Empty State — No Search Results  -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-14">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div style="padding: 8px 12px;">
+          <input class="settings-input" type="text" value="xyz" disabled style="font-size: 13px; padding: 6px 10px;">
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px;">
+          <div style="text-align: center;">
+            <div style="font-size: 20px; opacity: 0.4; margin-bottom: 8px;">🔍</div>
+            <div style="font-size: 13px; color: var(--text-secondary);">No results for "xyz"</div>
+          </div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="empty-state">
+          <div style="font-size: 24px; opacity: 0.4;">🔍</div>
+          <div class="empty-text">No sessions matching "xyz"</div>
+          <button class="settings-btn" style="margin-top: 12px;">Clear Search</button>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot connected"></span><span style="color: var(--success);">Connected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 10c: Empty State — Load Failed        -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-15">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
+          <span style="font-size: 13px; color: var(--text-secondary); opacity: 0.5;">Error loading</span>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="empty-state">
+          <div style="font-size: 28px;">⚠️</div>
+          <div class="empty-text">Couldn't load sessions</div>
+          <div style="font-size: 14px; color: var(--text-secondary); margin-top: 4px;">Check your connection and try again</div>
+          <button class="settings-btn" style="margin-top: 12px;">Retry</button>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot" style="background: var(--error);"></span><span style="color: var(--error);">Disconnected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment"><span>—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 10d: Empty State — Skills Empty       -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-16">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx — Skills</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="session-group-label">Today</div>
+        <div class="session-row ">
+          <div class="session-title">Sprint 2 discussion</div>
+          <div class="session-preview">Here's how to add proper error handling...</div>
+          <div class="session-meta"><span class="session-time">3m ago</span></div>
+        </div>
+        <div class="session-row">
+          <div class="session-title">Debug streaming issue</div>
+          <div class="session-preview">The SSE connection drops after 30s...</div>
+          <div class="session-meta"><span class="session-time">1h ago</span></div>
+        </div>
+        <div class="session-group-label">Yesterday</div>
+        <div class="session-row">
+          <div class="session-title">API endpoint planning</div>
+          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
+          <div class="session-meta"><span class="session-time">Yesterday</span></div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area" style="padding: 24px 32px; overflow-y: auto; display: block;">
+        <div style="max-width: 720px; margin: 0 auto;">
+          <h1 style="font-size: 18px; font-weight: 700; color: var(--text); margin-bottom: 4px;">Skills</h1>
+          <p style="font-size: 14px; color: var(--text-secondary); margin-bottom: 24px;">Loaded on server</p>
+          <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 300px; gap: 12px;">
+            <div style="font-size: 32px; opacity: 0.3;">🧩</div>
+            <div style="font-size: 16px; font-weight: 600; color: var(--text-secondary);">No skills loaded</div>
+            <div style="font-size: 14px; color: var(--text-secondary); text-align: center;">Skills are loaded on the Fawx server.<br>Check your server configuration.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot connected"></span><span style="color: var(--success);">Connected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 11b: iOS Settings — Model Detail      -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-18">
+  <div class="iphone-frame">
+    <div class="iphone-notch"></div>
+    <div class="iphone-status-bar">
+      <span>9:41</span>
+      <span style="display: flex; gap: 4px; align-items: center;">
+        <span style="font-size: 10px;">●●●●</span>
+        <span style="font-size: 10px;">WiFi</span>
+        <span style="font-size: 10px;">🔋</span>
+      </span>
+    </div>
+    <div class="ios-chat-nav" style="border-bottom: 1px solid var(--border);">
+      <span class="ios-back">‹</span>
+      <span class="ios-chat-title">Model & Thinking</span>
+    </div>
+    <div class="ios-settings-list">
+      <!-- Model section -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Model</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Server Model</span>
+            <span class="ios-settings-row-value">
+              <span style="font-family: 'SF Mono', Menlo, monospace; font-size: 14px;">sonnet-4-6</span>
+            </span>
+          </div>
+          <!-- Expanded picker -->
+          <div class="ios-settings-row" style="flex-direction: column; align-items: stretch; gap: 0;">
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 0;">
+              <span style="font-size: 16px; color: var(--text);">sonnet-4-6</span>
+              <span style="color: var(--accent); font-size: 18px;">✓</span>
+            </div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid var(--border);">
+              <span style="font-size: 16px; color: var(--text);">gpt-5.4</span>
+              <span></span>
+            </div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid var(--border);">
+              <span style="font-size: 16px; color: var(--text);">opus-4-6</span>
+              <span></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- Thinking section -->
+      <div class="ios-settings-section">
+        <div class="ios-settings-header">Thinking</div>
+        <div class="ios-settings-group">
+          <div class="ios-settings-row">
+            <span class="ios-settings-row-label">Thinking Level</span>
+            <span class="ios-settings-row-value">
+              <span>high</span>
+            </span>
+          </div>
+          <div style="padding: 12px 16px;">
+            <div class="segmented-control" style="border-radius: 8px;">
+              <button style="padding: 6px 0; font-size: 12px;">Off</button>
+              <button style="padding: 6px 0; font-size: 12px;">Low</button>
+              <button style="padding: 6px 0; font-size: 12px;">Adaptive</button>
+              <button class="active" style="padding: 6px 0; font-size: 12px;">High</button>
+              <button style="padding: 6px 0; font-size: 12px;">Extra</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- Footer -->
+      <div style="padding: 8px 16px; font-size: 13px; color: var(--text-secondary);">
+        Changes apply to all sessions on the server.
+      </div>
+    </div>
+    <div class="ios-tab-bar">
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">◉</span>
+        <span>Chat</span>
+      </div>
+      <div class="ios-tab" style="opacity: 0.5;">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⊞</span>
+        <span>Skills</span>
+      </div>
+      <div class="ios-tab active">
+        <span class="ios-tab-icon" style="font-size: 18px; font-weight: 300;">⚙</span>
+        <span>Settings</span>
+      </div>
+    </div>
+    <div class="iphone-home-indicator"></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 12a: Error State — Reconnecting       -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-20">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx — Sprint 2 discussion</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="session-group-label">Today</div>
+        <div class="session-row active">
+          <div class="session-title">Sprint 2 discussion</div>
+          <div class="session-preview">Here's how to add proper error handling...</div>
+          <div class="session-meta"><span class="session-time">3m ago</span></div>
+        </div>
+        <div class="session-row">
+          <div class="session-title">Debug streaming issue</div>
+          <div class="session-preview">The SSE connection drops after 30s...</div>
+          <div class="session-meta"><span class="session-time">1h ago</span></div>
+        </div>
+        <div class="session-group-label">Yesterday</div>
+        <div class="session-row">
+          <div class="session-title">API endpoint planning</div>
+          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
+          <div class="session-meta"><span class="session-time">Yesterday</span></div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="error-banner error-banner-warn">
+          <span>⚠</span>
+          <span>Connection lost. Reconnecting...</span>
+        </div>
+        <div class="chat-messages">
+          <div class="chat-messages-inner">
+            <div style="align-self: flex-end;">
+              <div class="msg-user">Show me the SSE streaming code</div>
+            </div>
+            <div class="msg-assistant">
+              <p>The server sends events using the standard SSE protocol...</p>
+            </div>
+          </div>
+        </div>
+        <div class="input-bar-wrapper">
+          <div class="input-bar" style="opacity: 0.5;">
+            <span class="input-field">Reconnecting...</span>
+            <div class="input-controls">
+              <span class="model-badge">claude-sonnet-4-6</span>
+              <button class="send-btn idle">↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot" style="background: var(--warning);"></span><span style="color: var(--warning);">Reconnecting...</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 12b: Error State — Disconnected       -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-21">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx — Sprint 2 discussion</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="session-group-label">Today</div>
+        <div class="session-row active">
+          <div class="session-title">Sprint 2 discussion</div>
+          <div class="session-preview">Here's how to add proper error handling...</div>
+          <div class="session-meta"><span class="session-time">3m ago</span></div>
+        </div>
+        <div class="session-row">
+          <div class="session-title">Debug streaming issue</div>
+          <div class="session-preview">The SSE connection drops after 30s...</div>
+          <div class="session-meta"><span class="session-time">1h ago</span></div>
+        </div>
+        <div class="session-group-label">Yesterday</div>
+        <div class="session-row">
+          <div class="session-title">API endpoint planning</div>
+          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
+          <div class="session-meta"><span class="session-time">Yesterday</span></div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="error-banner error-banner-error">
+          <span>✕</span>
+          <span>Unable to connect to server</span>
+          <button class="retry-btn">Retry</button>
+        </div>
+        <div class="chat-messages">
+          <div class="chat-messages-inner">
+            <div style="align-self: flex-end;">
+              <div class="msg-user">Show me the SSE streaming code</div>
+            </div>
+            <div class="msg-assistant">
+              <p>The server sends events using the standard SSE protocol...</p>
+            </div>
+          </div>
+        </div>
+        <div class="input-bar-wrapper">
+          <div class="input-bar" style="opacity: 0.5;">
+            <span class="input-field">Server unreachable</span>
+            <div class="input-controls">
+              <span class="model-badge">claude-sonnet-4-6</span>
+              <button class="send-btn idle">↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot" style="background: var(--error);"></span><span style="color: var(--error);">Disconnected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment"><span>—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 12c: Error State — Interrupted        -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-22">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx — Sprint 2 discussion</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="session-group-label">Today</div>
+        <div class="session-row active">
+          <div class="session-title">Sprint 2 discussion</div>
+          <div class="session-preview">Here's how to add proper error handling...</div>
+          <div class="session-meta"><span class="session-time">3m ago</span></div>
+        </div>
+        <div class="session-row">
+          <div class="session-title">Debug streaming issue</div>
+          <div class="session-preview">The SSE connection drops after 30s...</div>
+          <div class="session-meta"><span class="session-time">1h ago</span></div>
+        </div>
+        <div class="session-group-label">Yesterday</div>
+        <div class="session-row">
+          <div class="session-title">API endpoint planning</div>
+          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
+          <div class="session-meta"><span class="session-time">Yesterday</span></div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="chat-messages">
+          <div class="chat-messages-inner">
+            <div style="align-self: flex-end;">
+              <div class="msg-user">Show me the SSE streaming code</div>
+            </div>
+            <div class="msg-assistant">
+              <p>The server sends events using the standard SSE protocol. Here's the core handler that sets up the channel and spawns an async task to stream tokens...</p>
+              <div class="interrupted-text">(Response interrupted)</div>
+            </div>
+            <button class="retry-inline">↻ Retry</button>
+          </div>
+        </div>
+        <div class="input-bar-wrapper">
+          <div class="input-bar">
+            <span class="input-field">Message Fawx...</span>
+            <div class="input-controls">
+              <span class="model-badge">claude-sonnet-4-6</span>
+              <span class="thinking-badge">high</span>
+              <button class="send-btn idle">↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot connected"></span><span style="color: var(--success);">Connected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<!-- SCREEN 12d: Error State — Rate Limited       -->
+<!-- ════════════════════════════════════════════ -->
+<div class="screen" id="screen-23">
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="traffic-lights"><div class="traffic-light tl-close"></div><div class="traffic-light tl-min"></div><div class="traffic-light tl-max"></div></div>
+      <div class="mac-title">Fawx — Sprint 2 discussion</div>
+      <div style="width: 52px;"></div>
+    </div>
+    <div style="flex: 1; display: flex; overflow: hidden;">
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <button class="new-session-btn">+ New Session</button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="session-group-label">Today</div>
+        <div class="session-row active">
+          <div class="session-title">Sprint 2 discussion</div>
+          <div class="session-preview">Here's how to add proper error handling...</div>
+          <div class="session-meta"><span class="session-time">3m ago</span></div>
+        </div>
+        <div class="session-row">
+          <div class="session-title">Debug streaming issue</div>
+          <div class="session-preview">The SSE connection drops after 30s...</div>
+          <div class="session-meta"><span class="session-time">1h ago</span></div>
+        </div>
+        <div class="session-group-label">Yesterday</div>
+        <div class="session-row">
+          <div class="session-title">API endpoint planning</div>
+          <div class="session-preview">Let's map out the Sprint 2 endpoints...</div>
+          <div class="session-meta"><span class="session-time">Yesterday</span></div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item">🧩 Skills</div>
+          <div class="sidebar-nav-item">⚙️ Settings</div>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="chat-messages">
+          <div class="chat-messages-inner">
+            <div style="align-self: flex-end;">
+              <div class="msg-user">Explain the auth flow</div>
+            </div>
+            <div style="align-self: flex-start; max-width: 85%;">
+              <div class="error-card">
+                <p style="font-size: 14px; display: flex; align-items: flex-start; gap: 8px;"><span>⚠️</span> Rate limited — please wait 30 seconds before sending another message</p>
+                <button class="retry-inline">↻ Retry</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="input-bar-wrapper">
+          <div class="input-bar" style="opacity: 0.5;">
+            <span class="input-field" style="color: var(--text-secondary);">Rate limited — wait...</span>
+            <div class="input-controls">
+              <span class="model-badge">claude-sonnet-4-6</span>
+              <button class="send-btn idle">↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-segment"><span class="status-dot connected"></span><span style="color: var(--success);">Connected</span></div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', Menlo, monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill" style="width: 62%;"></div></div>
+        <span>62% ctx</span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 function showScreen(idx) {
-  document.querySelectorAll('.screen').forEach((s, i) => {
-    s.classList.toggle('active', i === idx);
+  document.querySelectorAll('.screen').forEach(s => {
+    s.classList.toggle('active', s.id === 'screen-' + idx);
   });
-  document.querySelectorAll('.tab-btn').forEach((b, i) => {
-    b.classList.toggle('active', i === idx);
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    const match = b.getAttribute('onclick').match(/showScreen\((\d+)\)/);
+    b.classList.toggle('active', match && parseInt(match[1]) === idx);
   });
 }
 
