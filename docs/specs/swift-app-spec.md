@@ -748,7 +748,7 @@ Disconnected → Connecting → Connected
 - On app launch: attempt connection to stored server URL
 - On connection failure: retry with exponential backoff (1s, 2s, 4s, 8s, max 30s)
 - Health check heartbeat every 30s while connected
-- On disconnect: show reconnecting UI, queue outgoing messages
+- On disconnect: show reconnecting UI. **Do NOT queue outgoing message sends.** A queued `POST /v1/sessions/{id}/messages` that fires after reconnection risks double-sending if the original request was partially processed. Instead, disable the send button and show "Reconnecting..." in the input bar. The user can send after connection is restored. (Safe to queue: GET requests like session list refresh.)
 
 ### 7.3 Streaming States (per session)
 
@@ -825,7 +825,7 @@ To handle server-side compaction and external changes (e.g., TUI and GUI both ta
 ### 8.2 API Errors
 - **400 Bad Request:** Show server error message in chat as error card
 - **404 Session Not Found:** Remove from sidebar, show "Session no longer exists"
-- **429 Rate Limited:** "Rate limited by LLM provider. Waiting..." with auto-retry
+- **429 Rate Limited:** "Rate limited by LLM provider." Show error card in chat. **Do NOT auto-retry message sends** (same no-retry-POST rule as stream drops — without an idempotency key, auto-retry risks double-sending). Show a "Retry" button that the user taps explicitly. Safe to auto-retry: GET requests (session list, models, etc.).
 - **500 Server Error:** Error card in chat with raw error (useful for debugging)
 
 ### 8.3 Streaming Errors
@@ -890,21 +890,32 @@ URLSession bytes-based streaming does NOT survive iOS app suspension. The system
 
 **Do NOT use `URLSessionConfiguration.background`** — background URLSession is for downloads/uploads, not SSE streaming. It will not work for our use case.
 
-### 9.3 App Transport Security (iOS)
+### 9.3 App Transport Security (iOS + macOS)
 
-The spec allows plain HTTP for Tailscale/LAN connections. On iOS, this requires an explicit ATS exception in `Info.plist`:
+The spec allows plain HTTP for Tailscale/LAN connections. Both iOS and macOS enforce ATS on URL Loading System traffic (URLSession), so both platforms need configuration.
+
+**The problem:** Tailscale uses CGNAT addresses (100.64.0.0/10). These are NOT local network addresses — `NSAllowsLocalNetworking` does NOT cover them. There is no ATS exception target for IP address ranges.
+
+**V1 approach: require `NSAllowsArbitraryLoads` + recommend HTTPS for production.**
 
 ```xml
 <key>NSAppTransportSecurity</key>
 <dict>
-  <key>NSAllowsLocalNetworking</key>
+  <key>NSAllowsArbitraryLoads</key>
   <true/>
 </dict>
 ```
 
-`NSAllowsLocalNetworking` permits HTTP to local network and Bonjour addresses without a blanket `NSAllowsArbitraryLoads`. For Tailscale IPs (100.x.x.x), this should be sufficient. If not, add a domain-specific exception for the Tailscale CGNAT range. Document this in the README setup guide.
+This allows HTTP to any address. It is necessary for V1 because:
+- Users connect via raw IP addresses (no domain names to create per-domain exceptions)
+- Tailscale CGNAT IPs are not covered by `NSAllowsLocalNetworking`
+- LAN addresses (192.168.x.x) are similarly not covered
 
-**macOS:** No ATS issue — macOS apps are not subject to ATS restrictions by default.
+**Production hardening (document in README):**
+- **Recommended:** Enable Tailscale HTTPS on the server (`tailscale cert <hostname>`, configure `fawx serve --http` to bind with TLS). Then the app connects via `https://machinename.tail-net.ts.net:8400` and ATS is satisfied without any exceptions.
+- **If HTTPS is not feasible:** `NSAllowsArbitraryLoads` is acceptable for a power-user tool distributed outside the App Store (direct download / TestFlight). App Store review may push back — cross that bridge in V2 when we add Tailscale HTTPS as the default.
+
+**Both platforms:** This `Info.plist` entry is needed in BOTH the macOS and iOS targets. macOS does enforce ATS on URLSession traffic despite common misconceptions.
 
 ---
 
@@ -1093,7 +1104,12 @@ data: {"error": "session storage not available"}
 | `done` | `response` | Stream complete, full response text |
 | `error` | `error` | Fatal error (stream terminates) |
 
-**Client parsing note:** Use `EventSource`-style parsing — read `event:` line for type, `data:` line for JSON payload. The `done` event replaces the `[DONE]` sentinel from the original spec. The `response` field in `done` contains the full assembled response text.
+**Client parsing rules:**
+1. **`event:` line** → set the current event type
+2. **`data:` line** → parse JSON payload, dispatch with the current event type
+3. **`:` line (comment/ping)** → no event dispatch, but **MUST reset `lastEventReceivedAt` timestamp** for dead-connection detection. The server sends `: ping` comments every 15s during long tool executions where no real events are emitted. Ignoring these lines means the client will falsely declare the connection dead after 45s even though the server is alive and working.
+4. **Empty line** → event boundary (standard SSE spec)
+5. The `done` event replaces the `[DONE]` sentinel from the original spec. The `response` field in `done` contains the full assembled response text.
 
 ### Models List — `GET /v1/models` (verified against `settings.rs`)
 ```json
