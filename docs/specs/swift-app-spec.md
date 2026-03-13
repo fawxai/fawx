@@ -1310,7 +1310,8 @@ Response:
 }
 ```
 **Notes:**
-- No `available` array — the client must hardcode the available levels: `["off", "low", "adaptive", "high"]`
+- No `available` array — the client must hardcode the available levels for Anthropic models: `["off", "low", "adaptive", "high"]`
+- **V2 note:** Thinking levels are provider-specific. OpenAI/Codex models use `["low", "medium", "high", "extra_high"]`. When multi-provider thinking support lands, the backend should return available levels per provider so the client doesn't hardcode.
 - `budget_tokens` is `null` when level is `"off"`
 
 ### Set Thinking — `PUT /v1/thinking`
