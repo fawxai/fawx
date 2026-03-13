@@ -240,37 +240,29 @@
         <span class="phase-badge badge-building">Building</span>
         <h2 class="phase-title">Native GUI (macOS + iOS)</h2>
       </div>
-      <p class="phase-desc">Swift native app connecting to the HTTP API over Tailscale. Full CLI parity — every terminal command available from the app. Replace Telegram as the daily-driver interface.</p>
+      <p class="phase-desc">Swift native app connecting to the HTTP API over Tailscale. Daily-driver interface replacing Telegram. Spec approved (v5, R7), 50 pixel-accurate mockup screenshots, Codex building SwiftUI.</p>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Prerequisites: HTTP API Parity (30 endpoints)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Backend API — Complete</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Sprint 1: Session CRUD + conversation history + image support (~200 lines)</li>
-        <li><span class="planned">○</span> Sprint 2: Model switching + thinking toggle + auth management (~150 lines)</li>
-        <li><span class="planned">○</span> Sprint 3: Skills CRUD + search, fleet init/add/remove/list (~200 lines)</li>
-        <li><span class="planned">○</span> Sprint 4: Experiment launch/status/history, signals/budget/proposals (~300 lines)</li>
-        <li><span class="planned">○</span> Sprint 5: Diagnostics, logs, audit, backup, update, restart (~150 lines)</li>
+        <li><span class="check">✓</span> Phase 1 API: 21 HTTP endpoints (13 versioned /v1/ + 8 legacy) — sessions, chat, models, thinking, skills, auth, config</li>
+        <li><span class="check">✓</span> Sprint 2: Model switching, thinking toggle, auth status endpoints</li>
+        <li><span class="check">✓</span> Sprint 3: SSE keep-alive pings, context window endpoint, session title/preview, skill descriptions (PR #1395)</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 1: Daily Driver</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Design — Complete</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> SwiftUI shared codebase (macOS + iOS)</li>
-        <li><span class="planned">○</span> SSE streaming for real-time responses</li>
-        <li><span class="planned">○</span> Conversation list + session management</li>
-        <li><span class="planned">○</span> Tool call visualization</li>
-        <li><span class="planned">○</span> Image send/receive</li>
-        <li><span class="planned">○</span> Model switching + thinking toggle</li>
-        <li><span class="planned">○</span> Config management</li>
-        <li><span class="planned">○</span> Error display (StreamEvent::Error)</li>
+        <li><span class="check">✓</span> Swift app spec — approved v5, 7 review rounds, 42+ findings resolved</li>
+        <li><span class="check">✓</span> Design system (colors, typography, spacing, components)</li>
+        <li><span class="check">✓</span> HTML mockups — 25 screens (12 macOS + 13 iOS), dark + light = 50 PNGs</li>
+        <li><span class="check">✓</span> Codex implementation review — 3 rounds of mockup revisions, spec-accurate</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 2: Power User</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">SwiftUI App — In Progress (Codex)</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Experiment progress panel + launcher</li>
-        <li><span class="planned">○</span> Fleet status dashboard</li>
-        <li><span class="planned">○</span> Skill browser + install/remove</li>
-        <li><span class="planned">○</span> Proposal review (approve/reject)</li>
-        <li><span class="planned">○</span> Signal + budget monitoring</li>
-        <li><span class="planned">○</span> Diagnostics + logs + audit viewer</li>
+        <li><span class="wip">◐</span> Phase 1: Project setup, networking (FawxClient + SSE), onboarding, basic chat</li>
+        <li><span class="planned">○</span> Phase 2: Markdown rendering, session management, model/thinking pickers, tool cards</li>
+        <li><span class="planned">○</span> Phase 3: Skills browser, settings, error/empty states, iOS adaptations, keyboard shortcuts</li>
+        <li><span class="planned">○</span> Phase 4: App icon, TestFlight, README</li>
       </ul>
     </div>
     <hr class="divider">
