@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct MessageRequest {
     pub message: String,
+    #[serde(default)]
+    pub images: Vec<ImagePayload>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,7 +47,6 @@ pub struct EncodedImage {
     pub base64_data: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ImagePayload {
     pub data: String,

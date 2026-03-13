@@ -119,16 +119,27 @@ impl SessionRegistry {
     /// recorded in the session history — it is not dispatched to any
     /// model for processing.
     pub fn send(&self, key: &SessionKey, message: &str) -> Result<String> {
+        self.record_message(key, MessageRole::User, message)?;
+        Ok(format!("message recorded in session {}", key))
+    }
+
+    /// Record a message with an explicit role in a session.
+    pub fn record_message(
+        &self,
+        key: &SessionKey,
+        role: MessageRole,
+        message: &str,
+    ) -> Result<()> {
         let snapshot = {
             let mut map = self.write()?;
             let session = map
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
-            session.add_message(MessageRole::User, message);
+            session.add_message(role, message);
             session.clone()
         };
         self.store.save(&snapshot)?;
-        Ok(format!("message recorded in session {}", key))
+        Ok(())
     }
 
     /// Retrieve conversation history for a session (most recent `limit`).
