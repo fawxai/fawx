@@ -3,8 +3,8 @@ use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResul
 use crate::error::HttpError;
 use crate::handlers::health::sanitize_config;
 use crate::listener::{
-    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip,
-    run_listeners, wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
+    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip, run_listeners,
+    wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
 };
 use crate::middleware::verify_token;
 use crate::router::build_router;
@@ -22,15 +22,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fx_channel_telegram::{IncomingMessage, TelegramChannel};
 use fx_channel_webhook::WebhookChannel;
+use fx_cli::headless::{
+    process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
+    HeadlessAppDeps,
+};
 use fx_config::HttpConfig;
 use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
-use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, StreamChunk};
-use fx_cli::headless::{
-    process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
-    HeadlessAppDeps,
+use fx_llm::{
+    CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, Message, StreamChunk,
 };
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -59,7 +61,10 @@ impl AppEngine for HeadlessApp {
                 process_input_with_commands_streaming(self, input, Some(&source), callback).await?
             }
             (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
-            (false, _) => self.process_message_with_images(input, &images, &source).await?,
+            (false, _) => {
+                self.process_message_with_images(input, &images, &source)
+                    .await?
+            }
         };
 
         Ok(ApiCycleResult {
@@ -67,6 +72,29 @@ impl AppEngine for HeadlessApp {
             model: result.model,
             iterations: result.iterations,
         })
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self, input, images, context, &source, callback,
+        )
+        .await?;
+
+        Ok((
+            ApiCycleResult {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            },
+            updated_history,
+        ))
     }
 
     fn active_model(&self) -> &str {
@@ -215,28 +243,28 @@ impl BearerTokenStore for MockBearerTokenStore {
 
 #[test]
 fn tailscale_ip_accepts_valid_range() {
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 64, 0, 1
-    ))));
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 127, 255, 255
-    ))));
-    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 93, 251, 101
-    ))));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 64, 0, 1)
+    )));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 127, 255, 255)
+    )));
+    assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 93, 251, 101)
+    )));
 }
 
 #[test]
 fn tailscale_ip_rejects_outside_range() {
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 63, 0, 0
-    ))));
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        100, 128, 0, 0
-    ))));
-    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-        192, 168, 1, 1
-    ))));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 63, 0, 0)
+    )));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(100, 128, 0, 0)
+    )));
+    assert!(!crate::tailscale::is_tailscale_ip(&IpAddr::V4(
+        Ipv4Addr::new(192, 168, 1, 1)
+    )));
 }
 
 #[test]
@@ -369,8 +397,7 @@ fn message_response_serializes_correctly() {
         iterations: 2,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["response"], "hi there");
     assert_eq!(json["model"], "gpt-4");
     assert_eq!(json["iterations"], 2);
@@ -385,8 +412,7 @@ fn health_response_has_expected_fields() {
         skills_loaded: 3,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert_eq!(json["model"], "claude-3");
     assert_eq!(json["uptime_seconds"], 60);
@@ -404,8 +430,7 @@ fn status_response_has_expected_fields() {
         config: None,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert_eq!(json["tailscale_ip"], "100.93.251.101");
     assert_eq!(json["memory_entries"], 42);
@@ -423,8 +448,7 @@ fn status_response_omits_tailscale_ip_when_unavailable() {
         config: None,
     };
     let json: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
-            .expect("parse");
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
     assert!(json.get("tailscale_ip").is_none());
 }
@@ -530,7 +554,10 @@ async fn message_endpoint_rejects_empty_message() {
 
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert!(json["error"].as_str().expect("error field").contains("empty"));
+    assert!(json["error"]
+        .as_str()
+        .expect("error field")
+        .contains("empty"));
 }
 
 #[tokio::test]
@@ -865,9 +892,12 @@ mod routing_and_status {
         CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream, ModelRouter,
         ProviderCapabilities, ProviderError as LlmError,
     };
+    use fx_session::{
+        MessageRole as SessionMessageRole, SessionConfig, SessionError, SessionKey, SessionKind,
+        SessionRegistry, SessionStatus, SessionStore,
+    };
     use fx_subagent::{
-        test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
-        SubagentManagerDeps,
+        test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
     };
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
@@ -984,13 +1014,46 @@ mod routing_and_status {
             .clone()
             .unwrap_or_else(std::env::temp_dir);
         HttpState {
-            app: Arc::new(Mutex::new(make_test_app_with_config(config, config_manager))),
+            app: Arc::new(Mutex::new(make_test_app_with_config(
+                config,
+                config_manager,
+            ))),
+            session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
+    }
+
+    fn make_session_registry() -> SessionRegistry {
+        let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+        SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+    }
+
+    fn test_state_with_sessions(registry: SessionRegistry) -> HttpState {
+        let mut state = test_state(None, Vec::new());
+        state.session_registry = Some(registry);
+        state
+    }
+
+    fn seed_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = SessionKey::new(key).expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some(format!("label-{key}")),
+                    model: "mock-model".to_string(),
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        key
     }
 
     #[test]
@@ -1119,7 +1182,10 @@ allowed_chat_ids = [123]
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["iterations"], 0);
-        assert!(json["response"].as_str().expect("response string").contains("Fawx Status"));
+        assert!(json["response"]
+            .as_str()
+            .expect("response string")
+            .contains("Fawx Status"));
     }
 
     #[tokio::test]
@@ -1204,7 +1270,9 @@ allowed_chat_ids = [123]
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).expect("content-type"),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
             "text/event-stream"
         );
         let body = resp.into_body().collect().await.expect("body").to_bytes();
@@ -1212,6 +1280,272 @@ allowed_chat_ids = [123]
         assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
         assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
         assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_201() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/sessions")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"label":"Primary"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json["key"]
+            .as_str()
+            .expect("session key")
+            .starts_with("sess-"));
+        assert_eq!(json["kind"], "main");
+        assert_eq!(json["status"], "idle");
+        assert_eq!(json["label"], "Primary");
+        assert_eq!(json["model"], "mock-model");
+        assert_eq!(json["message_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_array() {
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-one");
+        seed_session(&registry, "sess-two");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["total"], 2);
+        assert_eq!(
+            json["sessions"].as_array().expect("sessions array").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_info() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-info");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["model"], "mock-model");
+        assert_eq!(json["label"], "label-sess-info");
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_session_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions/sess-missing")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_it() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-delete");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/sessions/{key}"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(
+            registry.get_info(&key),
+            Err(SessionError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_session_empties_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-clear");
+        registry
+            .record_message(&key, SessionMessageRole::User, "hello")
+            .expect("record user");
+        registry
+            .record_message(&key, SessionMessageRole::Assistant, "Mock response")
+            .expect("record assistant");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let clear_req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/clear"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("clear request");
+        let clear_resp = app
+            .clone()
+            .oneshot(clear_req)
+            .await
+            .expect("clear response");
+        assert_eq!(clear_resp.status(), StatusCode::OK);
+
+        let history_req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("history request");
+        let history_resp = app.oneshot(history_req).await.expect("history response");
+        assert_eq!(history_resp.status(), StatusCode::OK);
+        let body = history_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["total"], 0);
+        assert!(json["messages"].as_array().expect("messages").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_message_records_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-history");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let history = registry.history(&key, 10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, SessionMessageRole::User);
+        assert_eq!(history[0].content, "hello there");
+        assert_eq!(history[1].role, SessionMessageRole::Assistant);
+        assert_eq!(history[1].content, "Mock response");
+    }
+
+    #[tokio::test]
+    async fn session_message_streams_sse() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-stream");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
+            "text/event-stream"
+        );
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
+        assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
+        assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn message_with_images_accepted() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"message":"describe this","images":[{"data":"AQIDBA==","media_type":"image/png"}]}"#,
+            ))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["response"], "Mock response");
+    }
+
+    #[tokio::test]
+    async fn message_with_session_id_routes_to_session() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-route");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"message":"hello there","session_id":"{}"}}"#,
+                key.as_str()
+            )))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let history = registry.history(&key, 10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello there");
+        assert_eq!(history[1].content, "Mock response");
+    }
+
+    #[tokio::test]
+    async fn sessions_require_auth() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn config_reload_success_message(config_path: &Path) -> String {
@@ -1371,6 +1705,7 @@ allowed_chat_ids = [123]
         webhooks.insert("alpha".to_string(), webhook);
         let state = HttpState {
             app: Arc::new(Mutex::new(make_test_app(None))),
+            session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
@@ -1569,8 +1904,8 @@ mod telegram_update {
     use fx_kernel::context_manager::ContextCompactor;
     use fx_kernel::loop_engine::LoopEngine;
     use fx_llm::{
-        CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
-        ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError, StreamChunk,
+        CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream, ContentBlock,
+        ModelRouter, ProviderCapabilities, ProviderError as LlmError, StreamChunk,
     };
 
     #[derive(Debug)]
@@ -1737,8 +2072,8 @@ mod telegram_update {
     async fn capturing_telegram_server(
         captured: Arc<std::sync::Mutex<Vec<CapturedTelegramRequest>>>,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let app =
-            axum::Router::new().fallback(axum::routing::any(move |uri: axum::http::Uri, body: String| {
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |uri: axum::http::Uri, body: String| {
                 let captured = Arc::clone(&captured);
                 async move {
                     let parsed = serde_json::from_str(&body).expect("capture telegram body");
@@ -1751,7 +2086,8 @@ mod telegram_update {
                         });
                     axum::Json(serde_json::json!({ "ok": true }))
                 }
-            }));
+            },
+        ));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind capture server");
@@ -2020,9 +2356,9 @@ mod telegram_update {
     #[tokio::test]
     async fn process_and_route_message_with_images_passes_through() {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(make_test_app(
-            capturing_router(Arc::clone(&captured)),
-        )));
+        let app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(make_test_app(capturing_router(
+            Arc::clone(&captured),
+        ))));
         let (base_url, _server) = mock_telegram_server().await;
         let telegram = Arc::new(TelegramChannel::new_with_base_url(
             test_telegram_config(),

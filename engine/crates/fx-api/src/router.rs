@@ -2,6 +2,10 @@ use crate::handlers::config::{handle_config_get, handle_config_set};
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
+use crate::handlers::sessions::{
+    handle_clear_session, handle_create_session, handle_delete_session, handle_get_messages,
+    handle_get_session, handle_list_sessions, handle_send_message,
+};
 use crate::handlers::webhook::handle_webhook;
 use crate::middleware::auth_middleware;
 use crate::state::HttpState;
@@ -17,11 +21,27 @@ use tokio::sync::Mutex;
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
+    let v1_router = Router::new()
+        .route(
+            "/sessions",
+            post(handle_create_session).get(handle_list_sessions),
+        )
+        .route(
+            "/sessions/{id}",
+            get(handle_get_session).delete(handle_delete_session),
+        )
+        .route("/sessions/{id}/clear", post(handle_clear_session))
+        .route(
+            "/sessions/{id}/messages",
+            get(handle_get_messages).post(handle_send_message),
+        );
+
     let authenticated = Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
         .route("/config", get(handle_config_get).post(handle_config_set))
         .route("/webhook/{channel_id}", post(handle_webhook))
+        .nest("/v1", v1_router)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -119,16 +119,22 @@ impl SessionRegistry {
     /// recorded in the session history — it is not dispatched to any
     /// model for processing.
     pub fn send(&self, key: &SessionKey, message: &str) -> Result<String> {
+        self.record_message(key, MessageRole::User, message)?;
+        Ok(format!("message recorded in session {}", key))
+    }
+
+    /// Record a message with an explicit role in a session.
+    pub fn record_message(&self, key: &SessionKey, role: MessageRole, message: &str) -> Result<()> {
         let snapshot = {
             let mut map = self.write()?;
             let session = map
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
-            session.add_message(MessageRole::User, message);
+            session.add_message(role, message);
             session.clone()
         };
         self.store.save(&snapshot)?;
-        Ok(format!("message recorded in session {}", key))
+        Ok(())
     }
 
     /// Retrieve conversation history for a session (most recent `limit`).
@@ -138,6 +144,20 @@ impl SessionRegistry {
             .get(key)
             .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
         Ok(session.recent_messages(limit).to_vec())
+    }
+
+    /// Clear the recorded message history for a session.
+    pub fn clear(&self, key: &SessionKey) -> Result<()> {
+        let snapshot = {
+            let mut map = self.write()?;
+            let session = map
+                .get_mut(key)
+                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+            session.clear_messages();
+            session.clone()
+        };
+        self.store.save(&snapshot)?;
+        Ok(())
     }
 
     /// Update the status of a session.
@@ -472,5 +492,30 @@ mod tests {
             .history(&SessionKey::new("concurrent").unwrap(), 100)
             .expect("history");
         assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn session_clear_empties_messages_and_persists() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        let reg = SessionRegistry::new(store).expect("registry");
+
+        let key = SessionKey::new("clear-persist").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "hello")
+            .expect("record user");
+        reg.record_message(&key, MessageRole::Assistant, "world")
+            .expect("record assistant");
+
+        reg.clear(&key).expect("clear");
+
+        let store2 = SessionStore::new(storage);
+        let reg2 = SessionRegistry::new(store2).expect("registry2");
+        let info = reg2.get_info(&key).expect("get info");
+        let history = reg2.history(&key, 10).expect("history");
+
+        assert_eq!(info.message_count, 0);
+        assert!(history.is_empty());
     }
 }

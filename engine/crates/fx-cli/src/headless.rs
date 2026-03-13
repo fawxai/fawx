@@ -6,9 +6,9 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
 use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
-use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
@@ -344,6 +344,30 @@ impl HeadlessApp {
         Ok(self.finalize_cycle(input, &result))
     }
 
+    pub async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
+        let original_history = std::mem::replace(&mut self.conversation_history, context);
+        let result = match (images.is_empty(), callback) {
+            (true, Some(callback)) => {
+                process_input_with_commands_streaming(self, input, Some(source), callback).await
+            }
+            (true, None) => process_input_with_commands(self, input, Some(source)).await,
+            (false, _) => {
+                self.process_message_with_images(input, &images, source)
+                    .await
+            }
+        };
+        let updated_history = self.conversation_history.clone();
+        self.conversation_history = original_history;
+        result.map(|cycle| (cycle, updated_history))
+    }
+
     pub async fn process_message_for_source_streaming(
         &mut self,
         input: &str,
@@ -659,19 +683,45 @@ impl AppEngine for HeadlessApp {
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<ApiCycleResult, anyhow::Error> {
-        let result = match (images.is_empty(), callback) {
-            (true, Some(callback)) => {
-                process_input_with_commands_streaming(self, input, Some(&source), callback).await?
-            }
-            (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
-            (false, _) => self.process_message_with_images(input, &images, &source).await?,
-        };
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self,
+            input,
+            images,
+            self.conversation_history.clone(),
+            &source,
+            callback,
+        )
+        .await?;
+        self.conversation_history = updated_history;
 
         Ok(ApiCycleResult {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
         })
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self, input, images, context, &source, callback,
+        )
+        .await?;
+
+        Ok((
+            ApiCycleResult {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            },
+            updated_history,
+        ))
     }
 
     fn active_model(&self) -> &str {
@@ -1686,6 +1736,8 @@ fn extract_token_usage(result: &LoopResult) -> TokenUsage {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    #[cfg(feature = "http")]
+    use fx_api::engine::AppEngine;
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
     use fx_kernel::cancellation::CancellationToken;
@@ -1867,6 +1919,89 @@ mod tests {
                 requires_streaming: false,
             }
         }
+    }
+
+    #[cfg(feature = "http")]
+    #[derive(Debug)]
+    struct ConversationMemoryProvider;
+
+    #[cfg(feature = "http")]
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ConversationMemoryProvider {
+        async fn complete(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Ok(fx_llm::CompletionResponse {
+                content: vec![fx_llm::ContentBlock::Text {
+                    text: conversation_response(&request),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(conversation_response(&request)),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            "conversation-memory"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec!["conversation-memory".to_string()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn conversation_response(request: &fx_llm::CompletionRequest) -> String {
+        let response = if request_contains_text(request, "remember cats")
+            && request_contains_text(request, "what did I say?")
+        {
+            "You said remember cats"
+        } else {
+            "I'll remember cats"
+        };
+        response_payload(response)
+    }
+
+    #[cfg(feature = "http")]
+    fn request_contains_text(request: &fx_llm::CompletionRequest, needle: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, fx_llm::ContentBlock::Text { text } if text == needle))
+        })
+    }
+
+    #[cfg(feature = "http")]
+    fn response_payload(response: &str) -> String {
+        serde_json::json!({
+            "action": {"Respond": {"text": response}},
+            "rationale": "r",
+            "confidence": 0.9,
+            "expected_outcome": null,
+            "sub_goals": []
+        })
+        .to_string()
     }
 
     fn static_model_router(models: &[&'static str]) -> ModelRouter {
@@ -2363,6 +2498,44 @@ mod tests {
             sign.response,
             "Use `fawx sign <skill>` CLI to sign WASM packages."
         );
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_process_message_preserves_history_for_implicit_message_endpoint() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ConversationMemoryProvider));
+        router
+            .set_active("conversation-memory")
+            .expect("set active conversation model");
+
+        let mut app = test_app();
+        app.router = Arc::new(router);
+        app.active_model = "conversation-memory".to_string();
+
+        let first = AppEngine::process_message(
+            &mut app,
+            "remember cats",
+            Vec::new(),
+            InputSource::Http,
+            None,
+        )
+        .await
+        .expect("first http message");
+        assert!(first.response.contains("I'll remember cats"));
+        assert_eq!(app.conversation_history.len(), 2);
+
+        let second = AppEngine::process_message(
+            &mut app,
+            "what did I say?",
+            Vec::new(),
+            InputSource::Http,
+            None,
+        )
+        .await
+        .expect("second http message");
+        assert!(second.response.contains("You said remember cats"));
+        assert_eq!(app.conversation_history.len(), 4);
     }
 
     #[tokio::test]
