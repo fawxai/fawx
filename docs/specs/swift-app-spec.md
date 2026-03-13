@@ -1,6 +1,6 @@
 # Fawx Native App — Swift UI Specification
 
-**Status:** Draft v4 (R3 review fixes applied)
+**Status:** Draft v5 (R1–R5 review fixes applied — pending final approval)
 **Target:** macOS (primary) + iOS (secondary, shared codebase)
 **Framework:** SwiftUI multiplatform
 **Design Reference:** Codex macOS app (screenshots on file)
@@ -477,7 +477,7 @@ The new session flow has two sequential API calls: `POST /v1/sessions` (create) 
 - `⌘⏎` to send (macOS), standard send button (iOS)
 - `Esc` cancels active stream
 
-**Input bar state machine (Queue/Steer pattern, inspired by Codex):**
+**Input bar state machine (Queue pattern, inspired by Codex):**
 
 The input bar changes behavior based on streaming state. In V1, the chip is always labeled "Queued" (queue-after-completion). V2 adds a "Steer" mode for mid-stream redirection.
 
@@ -1070,7 +1070,7 @@ This allows HTTP to any address. It is necessary for V1 because:
       // Reject double-scheme input (e.g., "http://http://example.com").
       // URLComponents silently mangles this into garbage like "http://http//example.com"
       // which would persist a bad URL and a bad Keychain account key.
-      let schemePattern = /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//
+      let schemePattern = #/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//#
       if let match = normalized.firstMatch(of: schemePattern) {
           let afterScheme = normalized[match.range.upperBound...]
           if afterScheme.firstMatch(of: schemePattern) != nil {
