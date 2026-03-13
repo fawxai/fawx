@@ -113,7 +113,7 @@ impl TelegramProgressSender {
             .json(body)
             .send()
             .await
-            .map_err(|error| TelegramError::ApiError(error.to_string()))
+            .map_err(|error| TelegramError::ApiError(crate::sanitize_telegram_error(&error)))
     }
 
     fn should_skip_edit(&self) -> bool {
@@ -194,7 +194,7 @@ async fn parse_message_id(response: reqwest::Response) -> Result<i64, TelegramEr
     let payload: SendMessageResponse = response
         .json()
         .await
-        .map_err(|error| TelegramError::ApiError(error.to_string()))?;
+        .map_err(|error| TelegramError::ApiError(crate::sanitize_telegram_error(&error)))?;
 
     if !payload.ok {
         let description = payload

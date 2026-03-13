@@ -10,6 +10,27 @@ pub mod progress;
 
 pub use progress::build_telegram_progress_callback;
 
+/// Redact Telegram bot tokens from error messages to prevent log leaks.
+pub fn sanitize_telegram_error(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text.as_str();
+    while let Some(start) = remaining.find("/bot") {
+        result.push_str(&remaining[..start]);
+        result.push_str("/bot<REDACTED>");
+        let after_bot = &remaining[start + 4..];
+        match after_bot.find('/') {
+            Some(end) => remaining = &after_bot[end..],
+            None => {
+                remaining = "";
+                break;
+            }
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
 use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use regex::Regex;
@@ -265,7 +286,7 @@ pub(crate) async fn check_api_response(resp: reqwest::Response) -> Result<(), Te
     let api_resp: ApiResponse = resp
         .json()
         .await
-        .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+        .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
     if !api_resp.ok {
         let desc = api_resp
@@ -294,7 +315,7 @@ async fn send_single_message(
         .json(msg)
         .send()
         .await
-        .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+        .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
     check_api_response(resp).await
 }
 
@@ -683,13 +704,13 @@ impl TelegramChannel {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?
             .error_for_status()
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let safe_name = sanitize_file_id(file_id);
         let dest = dest_dir.join(format!("{message_id}-{safe_name}.jpg"));
@@ -707,12 +728,12 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let file_resp: GetFileResponse = resp
             .json()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         if !file_resp.ok {
             return Err(TelegramError::ApiError("getFile failed".to_string()));
@@ -759,7 +780,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -779,7 +800,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -791,7 +812,7 @@ impl TelegramChannel {
             .post(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -803,7 +824,7 @@ impl TelegramChannel {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -826,7 +847,7 @@ impl TelegramChannel {
                 .json(&commands)
                 .send()
                 .await
-                .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+                .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
             check_api_response(resp).await
         }
         .await;
@@ -858,12 +879,12 @@ impl TelegramChannel {
             ))
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let api_resp: GetUpdatesResponse = resp
             .json()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         if !api_resp.ok {
             return Err(TelegramError::ApiError(format!(
@@ -1878,5 +1899,46 @@ mod tests {
                 "/{cmd} should not include the slash prefix"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_bot_token() {
+        let error = "error for url (https://api.telegram.org/bot123456:ABC-DEF/getUpdates)";
+        let sanitized = sanitize_telegram_error(&error);
+        assert!(!sanitized.contains("123456:ABC-DEF"));
+        assert!(sanitized.contains("/bot<REDACTED>/getUpdates"));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_preserves_non_telegram_errors() {
+        let error = "connection refused";
+        assert_eq!(sanitize_telegram_error(&error), "connection refused");
+    }
+
+    #[test]
+    fn api_error_from_reqwest_style_error_is_sanitized_at_construction() {
+        // Simulate what happens when reqwest returns an error containing a bot
+        // token URL — the token should already be redacted inside the ApiError
+        // because construction sites call sanitize_telegram_error.
+        let fake_reqwest_error =
+            "error sending request for url (https://api.telegram.org/bot123456:ABC-DEF/getUpdates): connection reset";
+        let err = TelegramError::ApiError(sanitize_telegram_error(&fake_reqwest_error));
+        let displayed = format!("{err}");
+        assert!(
+            !displayed.contains("123456:ABC-DEF"),
+            "token leaked in display: {displayed}"
+        );
+        assert!(
+            displayed.contains("/bot<REDACTED>/getUpdates"),
+            "expected redacted URL in: {displayed}"
+        );
+    }
+
+    #[test]
+    fn sanitize_telegram_error_handles_multiple_occurrences() {
+        let error = "tried /bot111:AAA/send then /bot222:BBB/edit";
+        let sanitized = sanitize_telegram_error(&error);
+        assert!(!sanitized.contains("111:AAA"));
+        assert!(!sanitized.contains("222:BBB"));
     }
 }
