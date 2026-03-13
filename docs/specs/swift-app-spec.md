@@ -239,42 +239,45 @@ Uses Swift Observation framework (`@Observable` macro, iOS 17+ / macOS 14+), NOT
    - Settings
 
 **Selection model:**
-The sidebar uses a single `enum SidebarDestination: Hashable` for selection:
+The sidebar content pane uses a single selection binding for the detail area:
 ```swift
-enum SidebarDestination: Hashable {
+enum SidebarSelection: Hashable {
     case session(String)  // session key
     case skills
-    case settings
-    case newSession
 }
+// Settings is NOT in this enum — it opens a separate Settings window via ⌘,
 ```
-- `NavigationSplitView` binds to `@State var selection: SidebarDestination?`
-- Session rows and nav items all map to this same type — no mixed selection logic.
-- **On delete selected session:** Set `selection = nil`, which shows the New Session / Empty State in the detail pane.
-- **Sidebar collapse (macOS):** Standard `NavigationSplitView` collapse via toolbar button. Detail pane takes full width. Sidebar state persists across app launches via `@SceneStorage`.
-- **iPad regular width:** Same `NavigationSplitView` as macOS. Sidebar is always visible in regular horizontal size class. In compact size class (iPhone, iPad slide-over), sidebar becomes a navigation stack pushed onto the chat view.
+- `NavigationSplitView` binds to `@SceneStorage("sidebar_selection") var selection: SidebarSelection?`
+- `selection == nil` → detail pane shows New Session / Empty State. There is no separate `.newSession` case — nil IS the new-session state.
+- The "New Session" sidebar button sets `selection = nil`.
+- **On delete selected session:** Set `selection = nil`.
+- **Settings sidebar item (macOS):** Tapping it calls `NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)` or equivalent to open the `Settings { }` scene. It does NOT set `selection` — the sidebar selection stays on the current session/skills while the Settings window opens separately.
+- **Sidebar collapse (macOS):** Standard `NavigationSplitView` collapse via toolbar button. Detail pane takes full width. Selection persists across launches via `@SceneStorage`.
+- **iPad regular width:** Same `NavigationSplitView` as macOS. Sidebar is always visible in regular horizontal size class. In compact size class (iPhone, iPad slide-over), sidebar becomes a navigation stack.
 
 **Keyboard shortcuts:**
-| Shortcut | Action | Scope |
-|----------|--------|-------|
-| `⌘N` | New session | Global (window) |
-| `⌘O` | Quick session switcher (spotlight-style) | Global (window) |
-| `⌘,` | Open Settings (standard macOS Settings scene) | Global (app) |
-| `⌘⏎` | Send message | Input bar focused only |
-| `⌘⇧⌫` | Clear session history | Global when session selected |
-| `⌘1-9` | Switch to nth session | Global (window) |
-| `Esc` | Context-dependent (see below) | Varies |
-| `⌘/` | Focus input bar | Global (window) |
+| Shortcut | Action | Implementation |
+|----------|--------|---------------|
+| `⌘N` | New session | SwiftUI `Commands { }` — `CommandGroup(after: .newItem)` |
+| `⌘⇧O` | Quick session switcher (spotlight-style) | SwiftUI `Commands { }` — custom `CommandMenu("Navigate")` |
+| `⌘,` | Open Settings | Automatic from `Settings { }` scene (SwiftUI provides this free) |
+| `⌘⏎` | Send message | `.keyboardShortcut(.return, modifiers: .command)` on Send button |
+| `⌘⇧⌫` | Clear session history | SwiftUI `Commands { }` — custom `CommandMenu("Session")` |
+| `⌘1-9` | Switch to nth session | SwiftUI `Commands { }` — dynamic `CommandMenu("Navigate")` items |
+| `Esc` | Context-dependent (see below) | `.keyboardShortcut(.escape)` on views with priority chain |
+| `⌘/` | Focus input bar | SwiftUI `Commands { }` — custom `CommandMenu("Navigate")` |
 
-**Shortcut scope rules:**
-- `⌘K` replaced with `⌘O` ("Open") to avoid conflict with standard "Add Link" (`⌘K`) in text fields. `⌘O` is not used by default SwiftUI and reads naturally as "Open session."
-- **`Esc` priority chain** (evaluated in order):
-  1. If a sheet/popover/menu is open → dismiss it (standard macOS behavior, handled by system)
-  2. If an SSE stream is active → cancel the stream
-  3. If input bar is focused → blur the input bar
-  4. Otherwise → no-op
-- `⌘,` opens Settings as a **macOS Settings scene** (`Settings { }` in the App body), NOT as an in-app navigation destination. This is the standard macOS pattern. On iOS, Settings is accessed via the tab bar.
-- All shortcuts use `.keyboardShortcut()` modifier with explicit scope, not global `NSEvent` monitors.
+**Implementation rules:**
+- **App-level actions** (`⌘N`, `⌘⇧O`, `⌘1-9`, `⌘⇧⌫`, `⌘/`) go in SwiftUI `Commands { }` blocks in the `App` body. NOT `.keyboardShortcut()` on views. This is how macOS menu bar items + shortcuts are properly wired.
+- **View-level actions** (`⌘⏎`, `Esc`) use `.keyboardShortcut()` on the specific view/button.
+- `⌘,` is automatic — SwiftUI creates it when you declare a `Settings { }` scene.
+- **`⌘⇧O`** (Shift-Command-O) mirrors Xcode's "Open Quickly" pattern. No conflict with standard macOS shortcuts (`⌘O` = Open File, which we don't use).
+
+**`Esc` priority chain** (evaluated in order):
+1. If a sheet/popover/menu is open → dismiss it (handled by system, highest priority)
+2. If an SSE stream is active → cancel the stream
+3. If input bar is focused → blur the input bar
+4. Otherwise → no-op
 
 ### 4.2 iOS — TabView
 
@@ -505,7 +508,7 @@ V2:  ┌─ Queue ▾ ───────────────────�
 
 **API calls:**
 - Send: `POST /v1/sessions/{id}/messages` with `{"message": "...", "images": []}`, `Accept: text/event-stream` (⚠️ field is `message` not `content`)
-- History: `GET /v1/sessions/{id}/messages?limit=100` on session open (server default is 100, max unbounded)
+- History: `GET /v1/sessions/{id}/messages?limit=200` on session open
 - Model switch: `PUT /v1/model` with `{"model": "..."}`
 - Thinking switch: `PUT /v1/thinking` with `{"level": "..."}`
 - Context window: `GET /v1/sessions/{id}/context` (**NEW — needs backend endpoint**)
@@ -592,13 +595,13 @@ The same server-global model/thinking can be changed from multiple places. These
 |----------|--------------|-------------|---------------|
 | Input bar (model badge) | Current `active_model` | Yes (dropdown) | During streaming |
 | Input bar (thinking badge) | Current thinking level | Yes (dropdown) | During streaming |
-| Status bar (model text) | Current `active_model` | Tap opens input bar picker | Read-only indicator |
+| Status bar (model text) | Current `active_model` | **Read-only display only** — not tappable, not interactive | Never (always shows current state) |
 | Settings → Model & Thinking | Current settings | Yes (pickers) | During streaming (show "Cannot change while streaming") |
 
 - **During streaming:** All model/thinking pickers are **disabled**. Changing the model mid-stream could cause undefined behavior on the server. Show a tooltip/message: "Cannot change model while a response is streaming."
-- **Remote change propagation:** If another client (TUI, Telegram) changes the model, the GUI learns about it on next `GET /v1/models` call (health heartbeat cycle, every 30s). All locations update simultaneously from the single source of truth (`AppState.activeModel`).
+- **Remote change propagation:** The app refreshes model/thinking state by calling `GET /v1/models` and `GET /v1/thinking` on: (a) app launch, (b) session select, (c) after each stream completes. This is NOT tied to the health heartbeat — `/health` only checks connectivity and does not return model/thinking state. All UI locations read from `AppState.activeModel` and `AppState.thinkingLevel` (single source of truth).
 - **Queued steer messages:** A queued steer always uses whatever model is active when it actually sends (after the current stream completes). The model shown in the input bar at queue time is NOT locked in.
-- **Empty/error states:** If `GET /v1/models` fails or returns an empty list, the model picker shows "No models available" (disabled). The thinking picker defaults to "off" if `GET /v1/thinking` fails.
+- **Empty/error states:** If `GET /v1/models` fails or returns an empty list, the model picker shows "Unavailable" (disabled, grayed out). If `GET /v1/thinking` fails, `AppState.thinkingLevel` stays `nil` and the thinking badge shows "—" (unknown) — it does NOT default to "off" because that would misrepresent server state.
 
 #### Auth Status
 - **Provider list** from `GET /v1/auth`
@@ -689,11 +692,13 @@ All other screens are fully backed by the existing 21-endpoint API surface shipp
 @MainActor @Observable
 final class AppState {
     var connectionStatus: ConnectionStatus = .disconnected
-    var serverURL: URL?
+    var serverURLString: String = ""         // stored via @AppStorage("server_url")
+    var serverURL: URL? { URL(string: serverURLString) }  // computed, not stored
     var sessions: [Session] = []
-    var selectedSessionId: String?
+    // NOTE: selection lives in @SceneStorage on the view, NOT here.
+    // AppState holds server-derived data only. See SidebarSelection enum.
     var activeModel: ModelInfo?
-    var thinkingLevel: ThinkingLevel = .off
+    var thinkingLevel: ThinkingLevel?        // nil = unknown/fetch failed (NOT defaulting to .off)
     var availableModels: [ModelInfo] = []
     var skills: [Skill] = []
     var authProviders: [AuthProvider] = []
@@ -803,15 +808,18 @@ To handle server-side compaction and external changes (e.g., TUI and GUI both ta
 
 **History loading rules (single source of truth):**
 
-1. **On session select:** Fetch `GET /v1/sessions/{id}/messages?limit=200`. This is the maximum the client will load. If `total` in the response exceeds 200, show a "Load earlier messages" button at the top (fetches with `?limit=200&offset=N` — **requires backend pagination support, see below**).
-2. **On app foreground (iOS) / window focus (macOS):** Re-fetch the active session's latest messages. Compare with in-memory cache — if server has fewer messages (compaction happened), replace the cache entirely with the server's version.
+**The one and only history loading rule:**
+
+`GET /v1/sessions/{id}/messages?limit=200` — every time, everywhere. 200 is the V1 ceiling.
+
+1. **On session select:** Fetch `?limit=200`. Replace any in-memory cache with the response.
+2. **On app foreground (iOS) / window focus (macOS):** Re-fetch `?limit=200` for the active session. Replace cache.
 3. **During streaming:** Do NOT re-fetch. Trust the local SSE-assembled message.
 4. **After stream completes:** The `done` event contains the full response. Append it to the local cache. The server also persists it, so next re-fetch will include it.
-5. **On session list refresh:** Fetch `GET /v1/sessions` only. Do NOT fetch messages for every session (N+1 problem).
+5. **On session list refresh:** Fetch `GET /v1/sessions` only. Do NOT fetch messages for every session.
+6. **If `total` > 200:** The client cannot access older messages in V1. No "Load earlier" button, no scroll-to-load, no pagination. The user sees the most recent 200 messages and that's it. This is an acceptable limitation — compaction typically runs well before 200 messages.
 
-**V1 pagination contract:** The server currently supports `?limit=N` (default 100). It does NOT support `?offset=N`. For V1, the client fetches the most recent 200 messages and that's the ceiling. Older messages are not accessible from the GUI. This is an acceptable V1 limitation — most active conversations won't exceed 200 messages before compaction runs.
-
-**V2 backend work:** Add `?offset=N` or cursor-based pagination to `GET /v1/sessions/{id}/messages` for "Load earlier" support.
+**V2 backend work:** Add `?offset=N` or cursor-based pagination to `GET /v1/sessions/{id}/messages`.
 
 ---
 
@@ -946,9 +954,9 @@ This allows HTTP to any address. It is necessary for V1 because:
 
 ### 11.2 Server URL Storage
 
-- Stored in `UserDefaults` (standard `@AppStorage`). Not sensitive — it's a network address.
-- Stored alongside theme preference and font size settings.
-- On URL change: test connection with new URL before committing. Keep old URL accessible in case the new one fails.
+- Stored in `UserDefaults` via `@AppStorage("server_url")` as a **`String`**, not `URL`. (`@AppStorage` does not natively support `URL?`.)
+- **Canonical format:** The stored string is the URL as-entered by the user, normalized by `URL(string:)?.absoluteString`. Example: `"http://100.93.251.101:8400"`. This exact string is also used as the `kSecAttrAccount` value for Keychain lookup — one canonical format, one source of truth.
+- On URL change: test connection with new URL before overwriting the stored value. The old URL's Keychain entry is NOT deleted (in case the user switches back).
 
 ### 11.3 Network Security
 
