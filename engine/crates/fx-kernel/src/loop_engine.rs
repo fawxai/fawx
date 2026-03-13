@@ -11,8 +11,8 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
-    estimate_text_tokens, CompactionConfig, CompactionError, CompactionResult, CompactionStrategy,
-    ConversationBudget, SlidingWindowCompactor,
+    estimate_text_tokens, CompactionConfig, CompactionError, CompactionMemoryFlush,
+    CompactionResult, CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
 };
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -355,14 +355,14 @@ impl LoopResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum CompactionScope {
+pub enum CompactionScope {
     Perceive,
     ToolContinuation,
     DecomposeChild,
 }
 
 impl CompactionScope {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Perceive => "perceive",
             Self::ToolContinuation => "tool_continuation",
@@ -404,6 +404,7 @@ pub struct LoopEngine {
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
     conversation_compactor: Box<dyn CompactionStrategy>,
+    memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
     compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
@@ -431,6 +432,7 @@ pub struct LoopEngineBuilder {
     synthesis_instruction: Option<String>,
     compaction_config: Option<CompactionConfig>,
     compaction_llm: Option<Arc<dyn LlmProvider>>,
+    memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
     event_bus: Option<fx_core::EventBus>,
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
@@ -474,6 +476,11 @@ impl LoopEngineBuilder {
 
     pub fn compaction_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.compaction_llm = Some(llm);
+        self
+    }
+
+    pub fn memory_flush(mut self, flush: Arc<dyn CompactionMemoryFlush>) -> Self {
+        self.memory_flush = Some(flush);
         self
     }
 
@@ -550,6 +557,7 @@ impl LoopEngineBuilder {
             compaction_config,
             conversation_budget,
             conversation_compactor,
+            memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             tool_attempts: HashMap::new(),
@@ -2654,6 +2662,25 @@ impl LoopEngine {
 
         self.ensure_compacted_within_hard_limit(scope, &result)?;
         self.log_compaction_result(scope, before_tokens, target_tokens, &result);
+        if result.compacted_count > 0 {
+            if let Some(flush) = &self.memory_flush {
+                let evicted: Vec<Message> = result
+                    .evicted_indices
+                    .iter()
+                    .filter_map(|&i| messages.get(i).cloned())
+                    .collect();
+                if !evicted.is_empty() {
+                    if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
+                        tracing::warn!(
+                            scope = scope.as_str(),
+                            error = %err,
+                            evicted_count = evicted.len(),
+                            "pre-compaction memory flush failed; proceeding without flush"
+                        );
+                    }
+                }
+            }
+        }
         self.record_compaction_iteration(scope, iteration);
         Ok(Cow::Owned(result.messages))
     }
@@ -2711,6 +2738,7 @@ impl LoopEngine {
                     compacted_count: 0,
                     estimated_tokens: context.before_tokens,
                     used_summarization: false,
+                    evicted_indices: Vec::new(),
                 })
             }
         }
@@ -10685,6 +10713,38 @@ mod context_compaction_tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct FlushCall {
+        evicted: Vec<Message>,
+        scope: String,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingMemoryFlush {
+        calls: Mutex<Vec<FlushCall>>,
+    }
+
+    impl RecordingMemoryFlush {
+        fn calls(&self) -> Vec<FlushCall> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CompactionMemoryFlush for RecordingMemoryFlush {
+        async fn flush(
+            &self,
+            evicted: &[Message],
+            scope_label: &str,
+        ) -> Result<(), crate::conversation_compactor::CompactionFlushError> {
+            self.calls.lock().expect("calls lock").push(FlushCall {
+                evicted: evicted.to_vec(),
+                scope: scope_label.to_string(),
+            });
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     struct SizedToolExecutor {
         output_words: usize,
@@ -10829,6 +10889,42 @@ mod context_compaction_tests {
         let summary = summary_message_index(&processed.context_window)
             .expect("expected compacted context summary in context window");
         assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn compaction_flushes_evicted_messages_before_returning_history() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let flush = Arc::new(RecordingMemoryFlush::default());
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .memory_flush(Arc::clone(&flush) as Arc<dyn CompactionMemoryFlush>)
+            .build()
+            .expect("test engine build");
+        let history = large_history(12, 60);
+
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        let calls = flush.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].scope, "perceive");
+        assert!(!calls[0].evicted.is_empty());
+        assert!(calls[0]
+            .evicted
+            .iter()
+            .all(|message| history.contains(message)));
     }
 
     #[tokio::test]

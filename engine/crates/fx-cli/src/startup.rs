@@ -485,6 +485,12 @@ fn build_loop_engine_with_options(
     if let Some(thinking) = thinking_config_from_budget(&thinking_budget) {
         builder = builder.thinking_config(thinking);
     }
+    if let Some(journal) = &skills.journal {
+        builder = builder.memory_flush(Arc::new(fx_journal::JournalCompactionFlush::new(
+            Arc::clone(journal),
+        ))
+            as Arc<dyn fx_kernel::conversation_compactor::CompactionMemoryFlush>);
+    }
 
     let engine = build_loop_engine_from_builder(builder)?;
     Ok(LoopEngineBundle {
@@ -690,6 +696,7 @@ struct SkillRegistryBundle {
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    journal: Option<Arc<Mutex<fx_journal::Journal>>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Signature policy loaded once at startup, shared with the skill watcher
@@ -795,15 +802,18 @@ fn build_skill_registry(
 
     // Load reflective journal for cross-session learning.
     let journal_path = data_dir.join("journal.jsonl");
-    match fx_journal::Journal::load(journal_path) {
+    let journal_arc = match fx_journal::Journal::load(journal_path) {
         Ok(journal) => {
-            let journal_skill = JournalSkill::new(Arc::new(Mutex::new(journal)));
+            let arc = Arc::new(Mutex::new(journal));
+            let journal_skill = JournalSkill::new(Arc::clone(&arc));
             registry.register(Arc::new(journal_skill));
+            Some(arc)
         }
         Err(e) => {
             tracing::warn!("journal unavailable: {e}");
+            None
         }
-    }
+    };
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
@@ -854,6 +864,7 @@ fn build_skill_registry(
         runtime_info,
         scratchpad,
         iteration_counter,
+        journal: journal_arc,
         credential_provider,
         credential_store,
         signature_policy,
