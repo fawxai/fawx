@@ -1,17 +1,17 @@
-mod config_redaction;
+pub(crate) mod config_redaction;
 
 pub mod engine;
-pub mod error;
-pub mod handlers;
-pub mod listener;
-pub mod middleware;
-pub mod router;
-pub mod sse;
-pub mod state;
+pub(crate) mod error;
+pub(crate) mod handlers;
+pub(crate) mod listener;
+pub(crate) mod middleware;
+pub(crate) mod router;
+pub(crate) mod sse;
+pub(crate) mod state;
 pub mod tailscale;
 pub mod telegram;
 pub mod token;
-pub mod types;
+pub(crate) mod types;
 
 #[cfg(test)]
 mod tests;

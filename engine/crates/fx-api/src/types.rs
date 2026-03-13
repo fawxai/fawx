@@ -43,6 +43,7 @@ pub struct EncodedImage {
     pub base64_data: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ImagePayload {
     pub data: String,

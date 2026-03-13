@@ -1,3 +1,4 @@
+// TODO: This logic is duplicated in fx-cli/src/headless.rs. Extract to a shared crate (fx-config or fx-core) when adding more API endpoints.
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 pub(crate) const REDACTED_SECRET: &str = "[REDACTED]";
