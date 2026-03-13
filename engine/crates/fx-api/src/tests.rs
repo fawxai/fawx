@@ -889,6 +889,10 @@ mod routing_and_status {
         CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream, ModelRouter,
         ProviderCapabilities, ProviderError as LlmError,
     };
+    use fx_session::{
+        MessageRole as SessionMessageRole, SessionConfig, SessionError, SessionKey, SessionKind,
+        SessionRegistry, SessionStatus, SessionStore,
+    };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
         SubagentManagerDeps,
@@ -1016,6 +1020,35 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
+    }
+
+    fn make_session_registry() -> SessionRegistry {
+        let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+        SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+    }
+
+    fn test_state_with_sessions(registry: SessionRegistry) -> HttpState {
+        let mut state = test_state(None, Vec::new());
+        state.session_registry = Some(registry);
+        state
+    }
+
+    fn seed_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = SessionKey::new(key).expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some(format!("label-{key}")),
+                    model: "mock-model".to_string(),
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        key
     }
 
     #[test]
@@ -1237,6 +1270,265 @@ allowed_chat_ids = [123]
         assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
         assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
         assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_201() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/sessions")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"label":"Primary"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            json["key"]
+                .as_str()
+                .expect("session key")
+                .starts_with("sess-")
+        );
+        assert_eq!(json["kind"], "main");
+        assert_eq!(json["status"], "idle");
+        assert_eq!(json["label"], "Primary");
+        assert_eq!(json["model"], "mock-model");
+        assert_eq!(json["message_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_array() {
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-one");
+        seed_session(&registry, "sess-two");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["sessions"].as_array().expect("sessions array").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_info() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-info");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["model"], "mock-model");
+        assert_eq!(json["label"], "label-sess-info");
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_session_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions/sess-missing")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_it() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-delete");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/sessions/{key}"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(
+            registry.get_info(&key),
+            Err(SessionError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_session_empties_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-clear");
+        registry
+            .record_message(&key, SessionMessageRole::User, "hello")
+            .expect("record user");
+        registry
+            .record_message(&key, SessionMessageRole::Assistant, "Mock response")
+            .expect("record assistant");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let clear_req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/clear"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("clear request");
+        let clear_resp = app.clone().oneshot(clear_req).await.expect("clear response");
+        assert_eq!(clear_resp.status(), StatusCode::OK);
+
+        let history_req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("history request");
+        let history_resp = app.oneshot(history_req).await.expect("history response");
+        assert_eq!(history_resp.status(), StatusCode::OK);
+        let body = history_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["total"], 0);
+        assert!(json["messages"].as_array().expect("messages").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_message_records_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-history");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let history = registry.history(&key, 10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, SessionMessageRole::User);
+        assert_eq!(history[0].content, "hello there");
+        assert_eq!(history[1].role, SessionMessageRole::Assistant);
+        assert_eq!(history[1].content, "Mock response");
+    }
+
+    #[tokio::test]
+    async fn session_message_streams_sse() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-stream");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).expect("content-type"),
+            "text/event-stream"
+        );
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
+        assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
+        assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn message_with_images_accepted() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"message":"describe this","images":[{"data":"AQIDBA==","media_type":"image/png"}]}"#,
+            ))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["response"], "Mock response");
+    }
+
+    #[tokio::test]
+    async fn message_with_session_id_routes_to_session() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-route");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"message":"hello there","session_id":"{}"}}"#,
+                key.as_str()
+            )))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let history = registry.history(&key, 10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello there");
+        assert_eq!(history[1].content, "Mock response");
+    }
+
+    #[tokio::test]
+    async fn sessions_require_auth() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn config_reload_success_message(config_path: &Path) -> String {

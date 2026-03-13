@@ -498,4 +498,29 @@ mod tests {
             .expect("history");
         assert_eq!(history.len(), 4);
     }
+
+    #[test]
+    fn session_clear_empties_messages_and_persists() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        let reg = SessionRegistry::new(store).expect("registry");
+
+        let key = SessionKey::new("clear-persist").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "hello")
+            .expect("record user");
+        reg.record_message(&key, MessageRole::Assistant, "world")
+            .expect("record assistant");
+
+        reg.clear(&key).expect("clear");
+
+        let store2 = SessionStore::new(storage);
+        let reg2 = SessionRegistry::new(store2).expect("registry2");
+        let info = reg2.get_info(&key).expect("get info");
+        let history = reg2.history(&key, 10).expect("history");
+
+        assert_eq!(info.message_count, 0);
+        assert!(history.is_empty());
+    }
 }
