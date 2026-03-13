@@ -370,10 +370,31 @@ The input bar changes behavior based on streaming state:
 - **Idle:** Normal input, accent-colored Send button when text present, muted when empty
 - **Streaming + input empty:** Send button becomes **Stop** button (red/danger style). Tap cancels the active stream.
 - **Streaming + user types:** Stop transitions to **Send**. Sending creates a **steer chip** above the input bar — a dismissable tab showing the queued message. The steer message is delivered to the model as a follow-up/interrupt.
-- **Steer chip:** Shows queued text (truncated), "Steer" label, dismiss (×) button. Only one steer can be queued at a time (sending another replaces it).
-- After stream completes: if a steer is queued, it auto-sends as the next user message.
+- **Steer chip:** Shows queued text (truncated), mode label, dismiss (×) button. Only one message can be queued at a time (sending another replaces it).
+- After stream completes: if a message is queued, it auto-sends as the next user message.
 
-**API requirement for steer:** `POST /v1/sessions/{id}/messages` sent during an active stream should either (a) interrupt the current response and begin a new turn, or (b) queue and auto-send after the current stream completes. V1 implementation: queue-and-send-after-completion (simpler, no mid-stream interruption). V2: true interruption with partial response preservation.
+**Steer chip modes (V1 → V2 evolution):**
+
+```
+V1:  ┌─ Queued ──────────────────────────── [×] ┐
+     │ "Use async/await instead of callbacks"    │
+     └───────────────────────────────────────────┘
+     (static label, always queues for after completion)
+
+V2:  ┌─ Queue ▾ ────────────────────────── [×] ┐
+     │ "Use async/await instead of callbacks"   │
+     └──────────────────────────────────────────┘
+              │ tap ▾ dropdown
+              ├── Queue   (send after response completes)
+              └── Steer   (redirect model mid-stream)
+```
+
+- **V1:** Chip shows "Queued" as a static label. Behavior is always queue-and-send-after-completion. Non-interactive mode selector.
+- **V2:** Chip label becomes a tappable dropdown toggling between "Queue" and "Steer". "Queue" waits for completion then sends as next turn. "Steer" interrupts the active stream and injects the message as a mid-response redirect — the model receives it immediately and shifts its response. Requires backend support for mid-stream message injection (`POST /v1/sessions/{id}/messages` with `"mode": "steer"` while a stream is active).
+
+**API requirements:**
+- **V1:** `POST /v1/sessions/{id}/messages` sent during an active stream returns 409 (conflict) or queues server-side. Client handles queuing locally.
+- **V2:** Same endpoint accepts optional `"mode": "steer"` field. When `mode=steer` and a stream is active, the server injects the message into the active turn (partial response preserved, model receives new input). When `mode=queue` or omitted, behavior matches V1.
 
 **Streaming behavior:**
 - On send: input clears, user message appears immediately, assistant message placeholder appears with streaming indicator
