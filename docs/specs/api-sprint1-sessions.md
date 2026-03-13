@@ -334,6 +334,72 @@ private helper.
 
 ---
 
+## Edge Cases (MUST handle)
+
+### Session registry unavailable
+All `/v1/sessions*` endpoints must check `state.session_registry.is_some()`.
+If `None`, return:
+```
+503 Service Unavailable
+{ "error": "session storage not available" }
+```
+
+### Empty message body
+`POST /v1/sessions/{id}/messages` must validate that `message` is not
+empty or whitespace-only, same as `/message` does:
+```
+400 Bad Request
+{ "error": "message must not be empty" }
+```
+
+### Invalid base64 image data
+If `images[].data` contains invalid base64, return:
+```
+400 Bad Request
+{ "error": "invalid base64 in image at index {i}" }
+```
+Validate BEFORE processing the message, not during.
+
+### Invalid or unsupported image media_type
+Accept only: `image/jpeg`, `image/png`, `image/gif`, `image/webp`.
+If unsupported:
+```
+400 Bad Request
+{ "error": "unsupported image media type: {type}" }
+```
+
+### Session not found (all single-session endpoints)
+`GET/DELETE /v1/sessions/{id}`, `POST /v1/sessions/{id}/clear`,
+`GET/POST /v1/sessions/{id}/messages` — all return 404 if session
+doesn't exist:
+```
+404 Not Found
+{ "error": "session not found: {id}" }
+```
+
+### History with limit=0
+Return empty messages array with correct total count:
+```json
+{ "messages": [], "total": 42 }
+```
+
+### List sessions ordering
+Return sessions sorted by `updated_at` descending (most recent first).
+
+### Concurrent message sends to same session
+`SessionRegistry` uses `RwLock` internally. The handler acquires the
+lock for history read, releases, processes the message (which can take
+seconds), then re-acquires to record the response. This means two
+concurrent sends to the same session could interleave. This is
+**acceptable for Sprint 1** — document it as a known limitation.
+True session locking is a follow-up.
+
+### Large image payloads
+No size limit enforcement in Sprint 1. The HTTP server's body size
+limit (if configured) provides a natural ceiling. Document as follow-up.
+
+---
+
 ## What NOT to build in Sprint 1
 
 - **Model switching endpoint** (`PUT /model`) — Sprint 2
