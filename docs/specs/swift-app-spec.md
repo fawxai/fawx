@@ -27,7 +27,7 @@ Fawx is a TUI-first agentic engine. This native app is its first graphical shell
 - **Model/thinking is global, not per-session.** `PUT /v1/model` and `PUT /v1/thinking` change the server-wide model/thinking level. Switching model in Session A affects Session B. The UI should make this clear (e.g., status bar shows "Server model" not "Session model"). Per-session model is a V2 backend feature.
 - **No pagination on session list.** Server returns up to 50 sessions (hardcoded `truncate(limit.unwrap_or(50))`). For V1 this is acceptable. V2 adds cursor-based pagination.
 - **No compaction awareness.** When the server compacts a conversation (drops old messages), the app's cached history becomes stale. V1 mitigation: re-fetch full history when switching back to a session. V2: SSE `compaction` event to trigger client-side refresh.
-- **No mid-stream message injection.** Queue is client-side only in V1. See Queued message chip section for V2 steer evolution.
+- **No mid-stream message injection.** Queue is client-side only in V1. See Queued message chip section for V2 evolution.
 
 ### V1 Scope
 - Connect to a Fawx server over the network (Tailscale or LAN)
@@ -479,7 +479,7 @@ The new session flow has two sequential API calls: `POST /v1/sessions` (create) 
 
 **Input bar state machine (Queue pattern, inspired by Codex):**
 
-The input bar changes behavior based on streaming state. In V1, the chip is always labeled "Queued" (queue-after-completion). V2 adds a "Steer" mode for mid-stream redirection.
+The input bar changes behavior based on streaming state. In V1, the chip is always labeled "Queued" (queue-after-completion). V2 evolution is documented in the Queued message chip modes subsection below.
 
 ```
 ┌─────────────────────────────────────────────────────┐
