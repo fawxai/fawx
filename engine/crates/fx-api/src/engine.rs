@@ -1,4 +1,6 @@
-use crate::types::{AuthProviderDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
+use crate::types::{
+    AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto,
+};
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
@@ -45,10 +47,13 @@ pub trait AppEngine: Send + Sync {
     /// Return the current thinking level and token budget.
     fn thinking_level(&self) -> ThinkingLevelDto;
 
+    /// Return current conversation budget usage details.
+    fn context_info(&self) -> ContextInfoDto;
+
     /// Update the thinking level and return the applied value.
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error>;
 
-    /// List loaded skills and their exposed tool names.
+    /// List loaded skills, descriptions, and their exposed tool names.
     fn skill_summaries(&self) -> Vec<SkillSummaryDto>;
 
     /// List redacted auth provider configuration status.

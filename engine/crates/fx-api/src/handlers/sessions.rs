@@ -136,6 +136,19 @@ pub async fn handle_get_session(
     Ok(Json(info).into_response())
 }
 
+pub async fn handle_get_context(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    registry
+        .get_info(&key)
+        .map_err(|error| map_session_error(&id, error))?;
+    let app = state.app.lock().await;
+    Ok(Json(app.context_info()).into_response())
+}
+
 pub async fn handle_delete_session(
     State(state): State<HttpState>,
     Path(id): Path<String>,

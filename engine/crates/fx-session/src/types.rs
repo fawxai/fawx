@@ -100,6 +100,12 @@ pub struct SessionInfo {
     pub status: SessionStatus,
     /// Optional human-readable label.
     pub label: Option<String>,
+    /// Title derived from the first user message.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Preview of the most recent message.
+    #[serde(default)]
+    pub preview: Option<String>,
     /// Model identifier used by this session.
     pub model: String,
     /// Unix epoch seconds when session was created.
@@ -211,6 +217,8 @@ mod tests {
             kind: SessionKind::Main,
             status: SessionStatus::Active,
             label: Some("primary".to_string()),
+            title: Some("Hello world".to_string()),
+            preview: Some("Latest message".to_string()),
             model: "gpt-4".to_string(),
             created_at: 1000,
             updated_at: 2000,
@@ -220,6 +228,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["kind"], "main");
         assert_eq!(parsed["status"], "active");
+        assert_eq!(parsed["title"], "Hello world");
+        assert_eq!(parsed["preview"], "Latest message");
         assert_eq!(parsed["message_count"], 5);
     }
 
@@ -230,6 +240,8 @@ mod tests {
             kind: SessionKind::Subagent,
             status: SessionStatus::Completed,
             label: None,
+            title: None,
+            preview: None,
             model: "claude-3".to_string(),
             created_at: 100,
             updated_at: 200,
@@ -240,6 +252,27 @@ mod tests {
         assert_eq!(restored.key, info.key);
         assert_eq!(restored.kind, info.kind);
         assert_eq!(restored.status, info.status);
+        assert_eq!(restored.title, info.title);
+        assert_eq!(restored.preview, info.preview);
         assert_eq!(restored.model, info.model);
+    }
+
+    #[test]
+    fn session_info_deserializes_without_title_and_preview() {
+        let json = r#"{
+            "key":"sess-legacy",
+            "kind":"main",
+            "status":"idle",
+            "label":null,
+            "model":"gpt-4",
+            "created_at":1,
+            "updated_at":2,
+            "message_count":0
+        }"#;
+
+        let info: SessionInfo = serde_json::from_str(json).expect("deserialize legacy");
+
+        assert!(info.title.is_none());
+        assert!(info.preview.is_none());
     }
 }

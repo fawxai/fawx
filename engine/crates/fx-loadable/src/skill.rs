@@ -29,6 +29,11 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
     /// Unique name identifying this skill.
     fn name(&self) -> &str;
 
+    /// Human-readable description of this skill.
+    fn description(&self) -> &str {
+        ""
+    }
+
     /// Tool definitions this skill provides to the reasoning model.
     fn tool_definitions(&self) -> Vec<ToolDefinition>;
 

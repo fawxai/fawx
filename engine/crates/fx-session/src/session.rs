@@ -84,11 +84,37 @@ impl Session {
             kind: self.kind,
             status: self.status,
             label: self.label.clone(),
+            title: self.compute_title(),
+            preview: self.compute_preview(),
             model: self.model.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             message_count: self.messages.len(),
         }
+    }
+
+    fn compute_title(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| truncate_text(&message.content, 80))
+    }
+
+    fn compute_preview(&self) -> Option<String> {
+        self.messages
+            .last()
+            .map(|message| truncate_text(&message.content, 120))
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -178,7 +204,63 @@ mod tests {
         let info = session.info();
         assert_eq!(info.key, SessionKey::new("s5").unwrap());
         assert_eq!(info.kind, SessionKind::Channel);
+        assert_eq!(info.title.as_deref(), Some("hi"));
+        assert_eq!(info.preview.as_deref(), Some("hello"));
         assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    fn session_info_title_from_first_user_message() {
+        let mut session = Session::new(
+            SessionKey::new("s6").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        session.add_message(MessageRole::Assistant, "system ready");
+        session.add_message(MessageRole::User, "first user title");
+        session.add_message(MessageRole::User, "second user title");
+
+        let info = session.info();
+
+        assert_eq!(info.title.as_deref(), Some("first user title"));
+    }
+
+    #[test]
+    fn session_info_preview_from_last_message() {
+        let mut session = Session::new(
+            SessionKey::new("s7").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        session.add_message(MessageRole::User, "hello");
+        session.add_message(MessageRole::Assistant, "latest preview");
+
+        let info = session.info();
+
+        assert_eq!(info.preview.as_deref(), Some("latest preview"));
+    }
+
+    #[test]
+    fn session_info_returns_none_when_no_messages_exist() {
+        let session = Session::new(
+            SessionKey::new("s8").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+
+        let info = session.info();
+
+        assert!(info.title.is_none());
+        assert!(info.preview.is_none());
+    }
+
+    #[test]
+    fn truncate_text_handles_multibyte_characters() {
+        let text = "🙂".repeat(81);
+
+        let truncated = truncate_text(&text, 80);
+
+        assert_eq!(truncated, format!("{}…", "🙂".repeat(80)));
     }
 
     #[test]

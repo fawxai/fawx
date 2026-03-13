@@ -13,6 +13,8 @@ pub struct RuntimeInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct SkillInfo {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub tool_names: Vec<String>,
 }
 

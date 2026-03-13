@@ -983,6 +983,10 @@ impl LoopEngine {
         &mut self.channel_registry
     }
 
+    pub fn conversation_budget_ref(&self) -> &ConversationBudget {
+        &self.conversation_budget
+    }
+
     /// Synchronise the shared iteration counter and refresh scratchpad context.
     ///
     /// Called at each iteration boundary so `ScratchpadSkill` stamps entries

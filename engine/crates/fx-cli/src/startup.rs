@@ -1149,7 +1149,11 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
     let skills = registry
         .skill_summaries()
         .into_iter()
-        .map(|(name, tool_names)| SkillInfo { name, tool_names })
+        .map(|(name, description, tool_names)| SkillInfo {
+            name,
+            description: Some(description),
+            tool_names,
+        })
         .collect::<Vec<_>>();
 
     match runtime_info.write() {

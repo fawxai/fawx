@@ -2483,6 +2483,7 @@ mod tests {
             provider: "openai".to_string(),
             skills: vec![fx_core::runtime_info::SkillInfo {
                 name: "fawx-builtin".to_string(),
+                description: Some("Built-in runtime tools".to_string()),
                 tool_names: vec!["read_file".to_string(), "self_info".to_string()],
             }],
             config_summary: fx_core::runtime_info::ConfigSummary {

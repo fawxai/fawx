@@ -36,8 +36,8 @@ use tokio::sync::Mutex;
 
 pub use tailscale::is_tailscale_ip;
 pub use types::{
-    AuthProviderDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
-    SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse,
+    ModelInfoDto, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
 };
 
 pub async fn run(

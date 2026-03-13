@@ -84,14 +84,27 @@ impl From<fx_config::ThinkingBudget> for ThinkingLevelDto {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ContextInfoDto {
+    pub used_tokens: usize,
+    pub max_tokens: usize,
+    pub percentage: f32,
+    pub compaction_threshold: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SkillSummaryDto {
     pub name: String,
+    pub description: String,
     pub tools: Vec<String>,
 }
 
-impl From<(String, Vec<String>)> for SkillSummaryDto {
-    fn from((name, tools): (String, Vec<String>)) -> Self {
-        Self { name, tools }
+impl From<(String, String, Vec<String>)> for SkillSummaryDto {
+    fn from((name, description, tools): (String, String, Vec<String>)) -> Self {
+        Self {
+            name,
+            description,
+            tools,
+        }
     }
 }
 

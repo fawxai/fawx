@@ -349,6 +349,14 @@ impl ConversationBudget {
             .saturating_sub(self.output_reserve_tokens)
     }
 
+    pub fn model_context_limit(&self) -> usize {
+        self.model_context_limit
+    }
+
+    pub fn compaction_threshold_value(&self) -> f32 {
+        self.compaction_threshold
+    }
+
     pub fn needs_compaction(&self, messages: &[Message]) -> bool {
         let trigger =
             (self.conversation_budget() as f32 * self.compaction_threshold).ceil() as usize;

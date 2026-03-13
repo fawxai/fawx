@@ -12,8 +12,8 @@ use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    AuthProviderDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
-    SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ErrorBody, HealthResponse, MessageRequest, MessageResponse,
+    ModelInfoDto, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -118,6 +118,16 @@ impl AppEngine for HeadlessApp {
 
     fn thinking_level(&self) -> ThinkingLevelDto {
         HeadlessApp::thinking_budget(self).into()
+    }
+
+    fn context_info(&self) -> ContextInfoDto {
+        let snapshot = HeadlessApp::context_info_snapshot(self);
+        ContextInfoDto {
+            used_tokens: snapshot.used_tokens,
+            max_tokens: snapshot.max_tokens,
+            percentage: snapshot.percentage,
+            compaction_threshold: snapshot.compaction_threshold,
+        }
     }
 
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
@@ -1122,15 +1132,20 @@ mod routing_and_status {
         .expect("test app")
     }
 
-    fn runtime_info_with_skills(skills: &[(&str, &[&str])]) -> Arc<std::sync::RwLock<RuntimeInfo>> {
+    fn runtime_info_with_skills(
+        skills: &[(&str, Option<&str>, &[&str])],
+    ) -> Arc<std::sync::RwLock<RuntimeInfo>> {
         let info = test_runtime_info();
         let mut guard = info.write().expect("runtime info lock");
         guard.skills = skills
             .iter()
-            .map(|(name, tools)| fx_core::runtime_info::SkillInfo {
-                name: (*name).to_string(),
-                tool_names: tools.iter().map(ToString::to_string).collect(),
-            })
+            .map(
+                |(name, description, tools)| fx_core::runtime_info::SkillInfo {
+                    name: (*name).to_string(),
+                    description: (*description).map(ToString::to_string),
+                    tool_names: tools.iter().map(ToString::to_string).collect(),
+                },
+            )
             .collect();
         drop(guard);
         info
@@ -1573,6 +1588,57 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn context_endpoint_returns_budget_info() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-context");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let warmup = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/message",
+                r#"{"message":"hello there"}"#,
+            ))
+            .await
+            .expect("warmup response");
+        assert_eq!(warmup.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/context"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["used_tokens"].as_u64().expect("used tokens") > 0);
+        assert!(json["max_tokens"].as_u64().expect("max tokens") > 0);
+        assert!(json["percentage"].as_f64().expect("percentage") > 0.0);
+        let threshold = json["compaction_threshold"]
+            .as_f64()
+            .expect("compaction threshold");
+        assert!((threshold - 0.8).abs() < 0.000_1);
+    }
+
+    #[tokio::test]
+    async fn context_endpoint_rejects_unknown_session() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions/sess-missing/context"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
     async fn delete_session_removes_it() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-delete");
@@ -1967,8 +2033,12 @@ allowed_chat_ids = [123]
     #[tokio::test]
     async fn list_skills_returns_summaries() {
         let runtime_info = runtime_info_with_skills(&[
-            ("brave-search", &["brave_search"][..]),
-            ("journal", &["journal_write", "journal_search"][..]),
+            (
+                "brave-search",
+                Some("Search the web"),
+                &["brave_search"][..],
+            ),
+            ("journal", None, &["journal_write", "journal_search"][..]),
         ]);
         let state = test_state_with_app(
             build_test_app(
@@ -1990,6 +2060,8 @@ allowed_chat_ids = [123]
         let json = response_json(response).await;
         assert_eq!(json["total"], 2);
         assert_eq!(json["skills"][0]["name"], "brave-search");
+        assert_eq!(json["skills"][0]["description"], "Search the web");
+        assert_eq!(json["skills"][1]["description"], "");
         assert_eq!(json["skills"][1]["tools"][1], "journal_search");
     }
 

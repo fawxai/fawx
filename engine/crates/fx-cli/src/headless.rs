@@ -10,7 +10,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
 use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 #[cfg(feature = "http")]
-use fx_api::{AuthProviderDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
+use fx_api::{AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
@@ -172,6 +172,14 @@ pub struct AuthProviderStatus {
     pub provider: String,
     pub auth_methods: BTreeSet<String>,
     pub model_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextInfoSnapshot {
+    pub used_tokens: usize,
+    pub max_tokens: usize,
+    pub percentage: f32,
+    pub compaction_threshold: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,7 +442,32 @@ impl HeadlessApp {
         )
     }
 
-    pub fn skill_summaries(&self) -> Vec<(String, Vec<String>)> {
+    pub fn context_info_snapshot(&self) -> ContextInfoSnapshot {
+        let budget = self.loop_engine.conversation_budget_ref();
+        let used_tokens = fx_kernel::conversation_compactor::ConversationBudget::estimate_tokens(
+            &self.conversation_history,
+        );
+        let max_tokens = budget.conversation_budget();
+        ContextInfoSnapshot {
+            used_tokens,
+            max_tokens,
+            percentage: context_usage_percentage(used_tokens, max_tokens),
+            compaction_threshold: budget.compaction_threshold_value(),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    pub fn context_info(&self) -> ContextInfoDto {
+        let snapshot = self.context_info_snapshot();
+        ContextInfoDto {
+            used_tokens: snapshot.used_tokens,
+            max_tokens: snapshot.max_tokens,
+            percentage: snapshot.percentage,
+            compaction_threshold: snapshot.compaction_threshold,
+        }
+    }
+
+    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>)> {
         match self.runtime_info.read() {
             Ok(info) => runtime_skill_summaries(&info),
             Err(error) => {
@@ -793,6 +826,10 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::thinking_budget(self).into()
     }
 
+    fn context_info(&self) -> ContextInfoDto {
+        HeadlessApp::context_info(self)
+    }
+
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
         HeadlessApp::handle_thinking(self, Some(level))?;
         Ok(self.thinking_level())
@@ -1048,11 +1085,25 @@ fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
     statuses.into_values().collect()
 }
 
-fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, Vec<String>)> {
+fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>)> {
     info.skills
         .iter()
-        .map(|skill| (skill.name.clone(), skill.tool_names.clone()))
+        .map(|skill| {
+            (
+                skill.name.clone(),
+                skill.description.clone().unwrap_or_default(),
+                skill.tool_names.clone(),
+            )
+        })
         .collect()
+}
+
+fn context_usage_percentage(used_tokens: usize, max_tokens: usize) -> f32 {
+    if max_tokens == 0 {
+        0.0
+    } else {
+        (used_tokens as f32 / max_tokens as f32) * 100.0
+    }
 }
 
 #[cfg(feature = "http")]
