@@ -473,7 +473,7 @@ The new session flow has two sequential API calls: `POST /v1/sessions` (create) 
 - **Right controls:** Send button (accent color when text present, muted when empty)
 - **Below input (inline or dropdown):**
   - Model picker — dropdown showing available models from `GET /v1/models`
-  - Thinking level picker — dropdown (off, low, medium, high, extra high) from `GET /v1/thinking`
+  - Thinking level picker — dropdown (off, low, adaptive, high) from `GET /v1/thinking`
 - `⌘⏎` to send (macOS), standard send button (iOS)
 - `Esc` cancels active stream
 
@@ -626,7 +626,7 @@ The current `SessionInfo` struct has a `label` field (optional, set at creation)
 
 #### Model & Thinking
 - **Active model** — picker populated from `GET /v1/models`, shows current `active_model`
-- **Thinking level** — picker (off, low, medium, high, extra high)
+- **Thinking level** — picker (off, low, adaptive, high)
 - ⚠️ These are **server-wide settings**, not per-session. Changing the model here changes it for all sessions. Label clearly as "Server Model" / "Server Thinking Level" in the UI.
 
 **Model/thinking control locations and conflict rules:**
@@ -1310,7 +1310,7 @@ Response:
 }
 ```
 **Notes:**
-- No `available` array — the client must hardcode the available levels: `["off", "low", "medium", "high", "extra_high"]`
+- No `available` array — the client must hardcode the available levels: `["off", "low", "adaptive", "high"]`
 - `budget_tokens` is `null` when level is `"off"`
 
 ### Set Thinking — `PUT /v1/thinking`

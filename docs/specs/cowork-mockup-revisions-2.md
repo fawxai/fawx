@@ -10,24 +10,27 @@
 
 ---
 
-## Fix 1: Thinking Level Enum Values (Screen 11b)
+## Fix 1: Thinking Level Enum Values (Screen 11b) — CORRECTED
 
-**Problem:** The thinking segmented control on Screen 11b shows `Off | Low | Adaptive | High | Extra`. This has two bugs:
+**Previous revision was wrong.** We incorrectly removed "Adaptive" and added "Medium" / "Extra High". The actual Fawx `ThinkingBudget` enum (source of truth: `fx-config/src/lib.rs`) is:
 
-1. **"Adaptive" is wrong.** The spec defines the thinking levels as: `off, low, medium, high, extra high`. "Adaptive" is an internal engine concept — the Swift app should show "Medium."
-2. **"Extra" is ambiguous.** It's a truncation of "Extra High" but a developer could implement the enum value as `extra` instead of `extra_high`. Show the full label.
+```rust
+enum ThinkingBudget { Adaptive, High, Low, Off }
+```
+
+There are exactly **4 levels**: `off, low, adaptive, high`. No "medium", no "extra high".
 
 **Fix:** Change the segmented control to show exactly:
 
 ```
-Off | Low | Medium | High | Extra High
+Off | Low | Adaptive | High
 ```
 
-With **"High"** selected (orange highlight), same as before.
+With **"High"** selected (orange highlight).
 
-If "Extra High" doesn't fit in the segment width, use **"XHigh"** as the abbreviation — this maps unambiguously to `extra_high`. Do NOT use "Extra" alone.
+Four segments instead of five — this fits more comfortably on the iPhone width.
 
-Also update the **macOS Settings screen (7b)** if it shows a thinking dropdown — make sure it lists: `off, low, medium, high, extra high` (not adaptive).
+Also update the **macOS Settings screen (7b)** thinking dropdown to list exactly: `off, low, adaptive, high`.
 
 ---
 
@@ -68,8 +71,8 @@ If the status strip text currently wraps in the mockup at 390px, also shrink the
 
 | Screen | What Changes | Type |
 |--------|-------------|------|
-| 11b (iOS Model Detail) | Segmented control: `Off \| Low \| Medium \| High \| Extra High` | Copy fix |
-| 7b (macOS Settings — Model) | Thinking dropdown values if shown | Copy fix |
+| 11b (iOS Model Detail) | Segmented control: `Off \| Low \| Adaptive \| High` (4 levels, not 5) | Copy fix |
+| 7b (macOS Settings — Model) | Thinking dropdown: `off, low, adaptive, high` | Copy fix |
 | 12d (Rate Limited — dark + light) | Card text → "Rate limited by LLM provider." + Retry button, no timer | Copy fix |
 | 8 (iOS Sessions) | Add `.lineLimit(1)` annotation to status strip | Annotation |
 | 9 (iOS Chat) | Ensure status strip renders on one line | Layout check |
