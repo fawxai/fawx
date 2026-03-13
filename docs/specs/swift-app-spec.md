@@ -1,6 +1,6 @@
 # Fawx Native App — Swift UI Specification
 
-**Status:** Draft v5 (R1–R5 review fixes applied — pending final approval)
+**Status:** APPROVED (v5 — R1–R7, 42+ findings resolved, Codex R7 APPROVE)
 **Target:** macOS (primary) + iOS (secondary, shared codebase)
 **Framework:** SwiftUI multiplatform
 **Design Reference:** Codex macOS app (screenshots on file)
