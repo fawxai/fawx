@@ -1352,6 +1352,7 @@
     <div class="ios-large-title">Sessions</div>
     <input class="ios-search" type="text" placeholder="Search sessions..." disabled>
     <div class="annotation" style="padding: 2px 16px;">Model names abbreviated for mobile — drop provider prefix (e.g., claude-sonnet-4-6 → sonnet-4-6)</div>
+    <div class="annotation" style="padding: 2px 16px;">SwiftUI: apply .lineLimit(1) — truncate tail, never wrap</div>
     <div class="ios-status-row">
       <span class="ios-status-dot"></span>
       <span>Connected</span>
@@ -1423,6 +1424,7 @@
       <span class="ios-back">‹</span>
       <span class="ios-chat-title">Sprint 2 discussion</span>
     </div>
+    <div class="annotation" style="padding: 2px 16px;">SwiftUI: apply .lineLimit(1) — truncate tail, never wrap</div>
     <div class="ios-status-row">
       <span class="ios-status-dot"></span>
       <span>Connected</span>
@@ -2207,9 +2209,9 @@
             <div class="segmented-control" style="border-radius: 8px;">
               <button style="padding: 6px 0; font-size: 12px;">Off</button>
               <button style="padding: 6px 0; font-size: 12px;">Low</button>
-              <button style="padding: 6px 0; font-size: 12px;">Adaptive</button>
+              <button style="padding: 6px 0; font-size: 12px;">Medium</button>
               <button class="active" style="padding: 6px 0; font-size: 12px;">High</button>
-              <button style="padding: 6px 0; font-size: 12px;">Extra</button>
+              <button style="padding: 6px 0; font-size: 12px;">Extra High</button>
             </div>
           </div>
         </div>
@@ -2517,7 +2519,7 @@
             </div>
             <div style="align-self: flex-start; max-width: 85%;">
               <div class="error-card">
-                <p style="font-size: 14px; display: flex; align-items: flex-start; gap: 8px;"><span>⚠️</span> Rate limited — please wait 30 seconds before sending another message</p>
+                <p style="font-size: 14px; display: flex; align-items: flex-start; gap: 8px;"><span>⚠️</span> Rate limited by LLM provider.</p>
                 <button class="retry-inline">↻ Retry</button>
               </div>
             </div>
@@ -2525,7 +2527,7 @@
         </div>
         <div class="input-bar-wrapper">
           <div class="input-bar" style="opacity: 0.5;">
-            <span class="input-field" style="color: var(--text-secondary);">Rate limited — wait...</span>
+            <span class="input-field" style="color: var(--text-secondary);">Rate limited — try again later</span>
             <div class="input-controls">
               <span class="model-badge">claude-sonnet-4-6</span>
               <button class="send-btn idle">↑</button>
