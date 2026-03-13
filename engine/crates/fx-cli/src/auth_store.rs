@@ -174,6 +174,14 @@ impl AuthStore {
     }
 }
 
+#[cfg(feature = "http")]
+impl fx_api::token::BearerTokenStore for AuthStore {
+    fn get_provider_token(&self, provider: &str) -> Result<Option<String>, String> {
+        AuthStore::get_provider_token(self, provider)
+            .map(|token| token.map(|token| token.to_string()))
+    }
+}
+
 #[allow(dead_code)] // Used by binary-only auth/setup command flows.
 pub fn open_auth_store_with_recovery(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
     match open_verified_auth_store(data_dir) {

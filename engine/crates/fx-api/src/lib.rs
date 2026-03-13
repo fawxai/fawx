@@ -13,6 +13,9 @@ pub mod telegram;
 pub mod token;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 use crate::engine::AppEngine;
 use crate::listener::{
     active_tailscale_ip, bind_listeners, detect_optional_tailscale_ip, listen_targets,

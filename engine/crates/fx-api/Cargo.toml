@@ -26,8 +26,11 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+fx-cli = { path = "../fx-cli", default-features = false }
+fx-subagent = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"
 hyper = "1.0"
+reqwest.workspace = true
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber.workspace = true

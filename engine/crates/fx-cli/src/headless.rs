@@ -6,6 +6,8 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+#[cfg(feature = "http")]
+use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
@@ -364,7 +366,6 @@ impl HeadlessApp {
     }
 
     /// Return the shared config manager (if configured).
-    #[cfg(feature = "http")]
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
     }
@@ -645,6 +646,40 @@ impl HeadlessApp {
             return self.router.available_models();
         }
         models
+    }
+}
+
+#[cfg(feature = "http")]
+#[async_trait]
+impl AppEngine for HeadlessApp {
+    async fn process_message(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<ApiCycleResult, anyhow::Error> {
+        let result = match (images.is_empty(), callback) {
+            (true, Some(callback)) => {
+                process_input_with_commands_streaming(self, input, Some(&source), callback).await?
+            }
+            (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
+            (false, _) => self.process_message_with_images(input, &images, &source).await?,
+        };
+
+        Ok(ApiCycleResult {
+            response: result.response,
+            model: result.model,
+            iterations: result.iterations,
+        })
+    }
+
+    fn active_model(&self) -> &str {
+        HeadlessApp::active_model(self)
+    }
+
+    fn config_manager(&self) -> Option<ConfigManagerHandle> {
+        HeadlessApp::config_manager(self).cloned()
     }
 }
 

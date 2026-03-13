@@ -4,7 +4,7 @@ use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
 use fx_core::channel::ResponseContext;
 use std::path::{Path, PathBuf};
 
-const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 pub fn media_inbound_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("media").join("inbound")
@@ -67,7 +67,7 @@ async fn download_photo_file(
     }
 }
 
-fn encode_downloaded_photo(
+pub(crate) fn encode_downloaded_photo(
     photo: &fx_channel_telegram::PhotoAttachment,
     path: &Path,
 ) -> Option<EncodedImage> {
