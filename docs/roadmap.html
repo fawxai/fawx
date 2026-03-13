@@ -285,7 +285,16 @@
         <li><span class="planned">○</span> Worker mode (fawx serve --fleet)</li>
         <li><span class="planned">○</span> Task dispatch over Tailscale HTTP</li>
         <li><span class="planned">○</span> Heartbeat monitoring + health checks</li>
-        <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)</li>
+        <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)
+          <ul>
+            <li><strong>Security note:</strong> GitHub PATs with <code>contents:write</code> can merge PRs, not just push branches. When implementing PAT sharing to subagents/workers:
+              <br>① Branch protection on <code>staging</code> + <code>main</code> — require review from repo owner before merge (GitHub-level enforcement, not policy)
+              <br>② Fine-grained PAT scoped to fawx repo only (limits blast radius)
+              <br>③ No <code>administration</code> permission on the PAT (prevents subagents from weakening branch protection)
+              <br>④ Result: subagents can push branches + create PRs + comment, but cannot merge to protected branches without owner review approval. <code>dev</code> stays open for automated pipeline.
+            </li>
+          </ul>
+        </li>
         <li><span class="planned">○</span> Fleet-aware experiment scheduling (--fleet flag)</li>
       </ul>
     </div>
