@@ -121,7 +121,7 @@ impl AuthStore {
     }
 
     /// Store a provider token under the `<provider>_token` key.
-    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    #[allow(dead_code)] // Used by binary-only setup/auth command flows
     pub fn store_provider_token(&self, provider: &str, token: &str) -> Result<(), String> {
         let store = self.open_store()?;
         let key = provider_token_key(provider);
