@@ -3,33 +3,63 @@ import SwiftUI
 @main
 struct FawxApp: App {
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("theme") private var storedThemeRawValue = AppTheme.system.rawValue
+    @AppStorage("font_size") private var storedFontSizeRawValue = AppFontSize.medium.rawValue
 
     @State private var appState: AppState
     @State private var sessionViewModel: SessionViewModel
     @State private var chatViewModel: ChatViewModel
+    @State private var skillsViewModel: SkillsViewModel
     @State private var settingsViewModel: SettingsViewModel
 
     init() {
         let appState = AppState()
         let sessionViewModel = SessionViewModel(appState: appState)
         let chatViewModel = ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
+        let skillsViewModel = SkillsViewModel(appState: appState)
         let settingsViewModel = SettingsViewModel(appState: appState)
 
         _appState = State(initialValue: appState)
         _sessionViewModel = State(initialValue: sessionViewModel)
         _chatViewModel = State(initialValue: chatViewModel)
+        _skillsViewModel = State(initialValue: skillsViewModel)
         _settingsViewModel = State(initialValue: settingsViewModel)
     }
 
     var body: some Scene {
+        let selectedTheme = AppTheme(rawValue: storedThemeRawValue) ?? .system
+        let selectedFontSize = AppFontSize(rawValue: storedFontSizeRawValue) ?? .medium
+        let _ = FawxTypography.setScale(selectedFontSize.scale)
+
+        mainWindowScene(selectedTheme: selectedTheme)
+#if os(macOS)
+        Settings {
+            SettingsView(
+                settingsViewModel: settingsViewModel,
+                appState: appState,
+                chatViewModel: chatViewModel
+            )
+        }
+#endif
+    }
+
+    private func mainWindowScene(selectedTheme: AppTheme) -> some Scene {
         WindowGroup {
             rootView
-                .preferredColorScheme(appState.preferredColorScheme)
+                .preferredColorScheme(selectedTheme.colorScheme)
                 .task(id: appState.configurationKey) {
                     await appState.bootstrap()
                     settingsViewModel.reloadStoredValues()
                     await sessionViewModel.refresh()
                     await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+                }
+                .onChange(of: storedThemeRawValue) { _, newValue in
+                    let theme = AppTheme(rawValue: newValue) ?? .system
+                    appState.setTheme(theme)
+                }
+                .onChange(of: storedFontSizeRawValue) { _, newValue in
+                    let fontSize = AppFontSize(rawValue: newValue) ?? .medium
+                    appState.setFontSize(fontSize)
                 }
                 .task(id: appState.configurationKey + "|polling") {
                     guard appState.isConfigured else {
@@ -38,13 +68,18 @@ struct FawxApp: App {
 
                     while !Task.isCancelled {
                         try? await Task.sleep(for: .seconds(30))
-                        guard appState.isConfigured else {
+                        guard appState.isConfigured, appState.connectionStatus == .connected else {
                             continue
                         }
 
-                        try? await appState.refreshServerState()
-                        await sessionViewModel.refresh()
-                        await appState.refreshContext(for: sessionViewModel.selectedSessionID)
+                        do {
+                            _ = try await appState.client.health()
+                            try await appState.refreshServerState()
+                            await sessionViewModel.refresh()
+                            await appState.refreshContext(for: sessionViewModel.selectedSessionID)
+                        } catch {
+                            await appState.noteRecoverableRequestFailure(error)
+                        }
                     }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
@@ -60,10 +95,10 @@ struct FawxApp: App {
                 }
         }
 #if os(macOS)
-        Settings {
-            SettingsView(
-                settingsViewModel: settingsViewModel,
+        .commands {
+            FawxMacCommands(
                 appState: appState,
+                sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel
             )
         }
@@ -77,13 +112,15 @@ struct FawxApp: App {
             ContentView(
                 appState: appState,
                 sessionViewModel: sessionViewModel,
-                chatViewModel: chatViewModel
+                chatViewModel: chatViewModel,
+                skillsViewModel: skillsViewModel
             )
 #else
             TabRootView(
                 appState: appState,
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
+                skillsViewModel: skillsViewModel,
                 settingsViewModel: settingsViewModel
             )
 #endif

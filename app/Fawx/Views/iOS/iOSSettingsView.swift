@@ -39,17 +39,14 @@ struct iOSSettingsView: View {
                     NavigationLink("Model & Thinking") {
                         iOSModelThinkingSettingsView(appState: appState, chatViewModel: chatViewModel)
                     }
+
+                    NavigationLink("Authentication") {
+                        iOSAuthStatusSettingsView(appState: appState)
+                    }
                 }
 
                 Section("Appearance") {
-                    Picker("Theme", selection: Binding(
-                        get: { appState.theme },
-                        set: { appState.setTheme($0) }
-                    )) {
-                        ForEach(AppTheme.allCases, id: \.self) { theme in
-                            Text(theme.rawValue.capitalized).tag(theme)
-                        }
-                    }
+                    AppearanceSettingsPanel(appState: appState)
                 }
 
                 if let status = settingsViewModel.testStatusMessage {
@@ -60,6 +57,11 @@ struct iOSSettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .task {
+                if appState.isConfigured {
+                    try? await appState.refreshServerState()
+                }
+            }
         }
     }
 }
@@ -168,5 +170,29 @@ private struct iOSModelSelectionView: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+    }
+}
+
+private struct iOSAuthStatusSettingsView: View {
+    @Bindable var appState: AppState
+
+    var body: some View {
+        ScrollView {
+            AuthStatusList(
+                providers: appState.authProviders,
+                errorMessage: appState.authProvidersError
+            )
+            .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Authentication")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+        .task {
+            if appState.isConfigured {
+                try? await appState.refreshServerState()
+            }
+        }
     }
 }

@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 struct InputBar: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -107,11 +110,7 @@ struct InputBar: View {
 
     private var primaryButton: some View {
         Button(primaryButtonTitle) {
-            if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                stopAction()
-            } else {
-                sendAction()
-            }
+            performPrimaryAction()
         }
         .buttonStyle(.borderedProminent)
         .tint(primaryButtonTint)
@@ -164,5 +163,15 @@ struct InputBar: View {
 #else
         false
 #endif
+    }
+
+    private func performPrimaryAction() {
+        if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            stopAction()
+            return
+        }
+
+        FawxHaptics.lightImpact()
+        sendAction()
     }
 }

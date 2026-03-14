@@ -71,9 +71,19 @@ final class ChatViewModel {
             await appState.refreshContext(for: sessionID)
             try? await appState.refreshServerState()
         } catch {
+            if case APIError.httpStatus(let code, _) = error, code == 404 {
+                sessionViewModel.removeSession(sessionID)
+                currentSessionID = nil
+                transcriptItems = []
+                errorMessage = "Session no longer exists."
+                await appState.refreshContext(for: nil)
+                return
+            }
+
             transcriptItems = []
             errorMessage = error.localizedDescription
             await appState.refreshContext(for: nil)
+            await appState.noteRecoverableRequestFailure(error)
         }
     }
 
@@ -216,8 +226,14 @@ final class ChatViewModel {
                 }
 
                 if streamFailed && finalResponse == nil {
-                    retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
-                    await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                    let recovered = await recoverInterruptedStream(
+                        sessionID: sessionID,
+                        retryText: retryText
+                    )
+                    if !recovered {
+                        retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
+                        await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                    }
                 } else {
                     await finalizeStream(
                         timestamp: assistantTimestamp,
@@ -229,8 +245,14 @@ final class ChatViewModel {
                 await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
             } catch {
                 errorMessage = "Response interrupted. \(error.localizedDescription)"
-                retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
-                await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                let recovered = await recoverInterruptedStream(
+                    sessionID: sessionID,
+                    retryText: retryText
+                )
+                if !recovered {
+                    retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
+                    await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                }
             }
 
             streamTask = nil
@@ -274,6 +296,31 @@ final class ChatViewModel {
 
         resetStreamingState()
         await appState.refreshContext(for: sessionID)
+    }
+
+    private func recoverInterruptedStream(sessionID: String, retryText: String) async -> Bool {
+        do {
+            let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
+            guard
+                let lastUserIndex = response.messages.lastIndex(where: { message in
+                    message.role == .user && message.content == retryText
+                }),
+                response.messages.indices.contains(response.messages.index(after: lastUserIndex))
+            else {
+                return false
+            }
+
+            transcriptItems = response.messages.map(ChatTranscriptItem.message)
+            retryRequest = nil
+            resetStreamingState()
+            await appState.refreshContext(for: sessionID)
+            await sessionViewModel.refresh()
+            await sendQueuedMessageIfNeeded()
+            return true
+        } catch {
+            await appState.noteRecoverableRequestFailure(error)
+            return false
+        }
     }
 
     private func sendQueuedMessageIfNeeded() async {

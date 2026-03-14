@@ -233,7 +233,10 @@ actor FawxClient {
     }
 
     func authProviders() async throws -> AuthProvidersResponse {
-        try await performRequest(path: "/v1/auth", decodeAs: AuthProvidersResponse.self)
+        try await performRequest(
+            candidatePaths: ["/v1/auth/status", "/v1/auth"],
+            decodeAs: AuthProvidersResponse.self
+        )
     }
 
     func sendTopLevelMessage(

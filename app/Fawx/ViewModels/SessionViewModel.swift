@@ -80,6 +80,7 @@ final class SessionViewModel {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
+            await appState.noteRecoverableRequestFailure(error)
         }
     }
 

@@ -46,7 +46,7 @@ final class PairingFlowTests: XCTestCase {
         let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
 
-        let serverField = app.textFields["serverURLField"]
+        let serverField = app.descendants(matching: .any)["serverURLField"]
         XCTAssertTrue(serverField.waitForExistence(timeout: 5), "Expected the server URL field to appear.")
         serverField.tap()
         serverField.typeText(serverURL)
@@ -77,7 +77,7 @@ final class PairingFlowTests: XCTestCase {
         )
         continueButton.tap()
 
-        let codeField = app.textFields["bearerTokenField"]
+        let codeField = app.descendants(matching: .any)["bearerTokenField"]
         XCTAssertTrue(codeField.waitForExistence(timeout: 5), "Expected the pairing code field to appear.")
         codeField.tap()
         codeField.typeText(pairingCode)

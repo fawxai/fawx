@@ -11,11 +11,17 @@ struct SettingsView: View {
         Form {
             connectionSection
             modelThinkingSection
+            authStatusSection
             appearanceSection
         }
         .formStyle(.grouped)
         .padding(FawxSpacing.paddingLG)
         .frame(minWidth: 520, minHeight: 360)
+        .task {
+            if appState.isConfigured {
+                try? await appState.refreshServerState()
+            }
+        }
     }
 
     private var connectionSection: some View {
@@ -140,14 +146,16 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         Section("Appearance") {
-            Picker("Theme", selection: Binding(
-                get: { appState.theme },
-                set: { appState.setTheme($0) }
-            )) {
-                ForEach(AppTheme.allCases, id: \.self) { theme in
-                    Text(theme.rawValue.capitalized).tag(theme)
-                }
-            }
+            AppearanceSettingsPanel(appState: appState)
+        }
+    }
+
+    private var authStatusSection: some View {
+        Section("Auth Status") {
+            AuthStatusList(
+                providers: appState.authProviders,
+                errorMessage: appState.authProvidersError
+            )
         }
     }
 

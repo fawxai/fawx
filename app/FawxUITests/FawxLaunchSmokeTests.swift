@@ -9,8 +9,9 @@ final class FawxLaunchSmokeTests: XCTestCase {
         let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
 
+        let serverField = app.descendants(matching: .any)["serverURLField"]
         XCTAssertTrue(
-            app.textFields["serverURLField"].waitForExistence(timeout: 5),
+            serverField.waitForExistence(timeout: 5),
             "Expected the onboarding server URL field to appear on launch."
         )
 

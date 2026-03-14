@@ -13,6 +13,10 @@ enum AppTheme: String, CaseIterable, Sendable {
     case light
     case dark
 
+    var displayName: String {
+        rawValue.capitalized
+    }
+
     var colorScheme: ColorScheme? {
         switch self {
         case .system:
@@ -25,6 +29,72 @@ enum AppTheme: String, CaseIterable, Sendable {
     }
 }
 
+enum AppFontSize: String, CaseIterable, Sendable {
+    case small
+    case medium
+    case large
+
+    var displayName: String {
+        rawValue.capitalized
+    }
+
+    var scale: CGFloat {
+        switch self {
+        case .small:
+            return 0.92
+        case .medium:
+            return 1.0
+        case .large:
+            return 1.12
+        }
+    }
+
+    var sliderValue: Double {
+        switch self {
+        case .small:
+            return 0
+        case .medium:
+            return 1
+        case .large:
+            return 2
+        }
+    }
+
+    static func fromSliderValue(_ value: Double) -> AppFontSize {
+        switch Int(value.rounded()) {
+        case ...0:
+            return .small
+        case 2...:
+            return .large
+        default:
+            return .medium
+        }
+    }
+}
+
+enum AppToastStyle: Sendable, Equatable {
+    case info
+    case success
+    case error
+}
+
+struct AppToast: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let message: String
+    let style: AppToastStyle
+}
+
+enum ConnectionBannerTone: Sendable, Equatable {
+    case warning
+    case error
+}
+
+struct ConnectionBannerState: Sendable, Equatable {
+    let message: String
+    let tone: ConnectionBannerTone
+    let showsRetry: Bool
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -32,6 +102,7 @@ final class AppState {
         static let serverURL = "server_url"
         static let pairedDeviceName = "paired_device_name"
         static let theme = "theme"
+        static let fontSize = "font_size"
     }
 
     var connectionStatus: ConnectionStatus = .disconnected
@@ -47,10 +118,17 @@ final class AppState {
     var permissionPresetName = "Power User"
     var connectionError: String?
     var theme: AppTheme
+    var fontSize: AppFontSize
     var isUpdatingServerSettings = false
+    var authProvidersError: String?
+    var sidebarSelection: SidebarSelection?
+    var toast: AppToast?
 
     let client: FawxClient
     private var authToken: String?
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
+    @ObservationIgnored private var reconnectAttempt = 0
 
     init() {
         if UITestLaunchOptions.shouldResetState {
@@ -59,6 +137,7 @@ final class AppState {
 
         let storedServerURL = UserDefaults.standard.string(forKey: StorageKey.serverURL) ?? ""
         let storedTheme = AppTheme(rawValue: UserDefaults.standard.string(forKey: StorageKey.theme) ?? AppTheme.system.rawValue) ?? .system
+        let storedFontSize = AppFontSize(rawValue: UserDefaults.standard.string(forKey: StorageKey.fontSize) ?? AppFontSize.medium.rawValue) ?? .medium
         let storedToken = try? KeychainHelper.token(forServer: storedServerURL)
         let storedDeviceName = UserDefaults.standard.string(forKey: StorageKey.pairedDeviceName)
 
@@ -71,6 +150,7 @@ final class AppState {
         self.serverURLString = resolvedServerURL
         self.pairedDeviceName = resolvedDeviceName
         self.theme = storedTheme
+        self.fontSize = storedFontSize
         self.authToken = resolvedToken
         self.client = FawxClient(
             baseURL: URL(string: resolvedServerURL),
@@ -100,22 +180,38 @@ final class AppState {
         theme.colorScheme
     }
 
+    var connectionBanner: ConnectionBannerState? {
+        guard isConfigured, let connectionError, !connectionError.isEmpty else {
+            if connectionStatus == .reconnecting {
+                return ConnectionBannerState(
+                    message: "Reconnecting to Fawx server at \(serverURLString)...",
+                    tone: .warning,
+                    showsRetry: false
+                )
+            }
+            return nil
+        }
+
+        switch connectionStatus {
+        case .reconnecting:
+            return ConnectionBannerState(message: connectionError, tone: .warning, showsRetry: false)
+        case .disconnected:
+            return ConnectionBannerState(message: connectionError, tone: .error, showsRetry: true)
+        case .connecting, .connected:
+            return nil
+        }
+    }
+
     func bootstrap() async {
         guard isConfigured else {
+            reconnectTask?.cancel()
+            reconnectTask = nil
             connectionStatus = .disconnected
             return
         }
 
-        connectionStatus = .connecting
-        do {
-            lastHealth = try await client.health()
-            connectionStatus = .connected
-            connectionError = nil
-            try await refreshServerState()
-        } catch {
-            connectionStatus = .disconnected
-            connectionError = error.localizedDescription
-        }
+        reconnectAttempt = 0
+        await attemptConnection(initialStatus: .connecting, allowReconnect: true)
     }
 
     func savePairing(serverURLString rawURL: String, token: String, deviceName: String) async throws {
@@ -176,12 +272,40 @@ final class AppState {
         } catch {
             thinkingLevel = nil
         }
+        do {
+            let auth = try await client.authProviders()
+            authProviders = auth.providers.sorted { lhs, rhs in
+                if lhs.isConfigured != rhs.isConfigured {
+                    return lhs.isConfigured && !rhs.isConfigured
+                }
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+            authProvidersError = nil
+        } catch {
+            authProviders = []
+            authProvidersError = error.localizedDescription
+        }
 
         availableModels = models.models
         let activeModelID = status?.model ?? models.activeModel
         activeModel = models.models.first(where: { $0.modelID == activeModelID })
             ?? models.models.first
         permissionPresetName = resolvePermissionPreset(from: status?.config)
+    }
+
+    func retryConnection() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+        await attemptConnection(initialStatus: .connecting, allowReconnect: true)
+    }
+
+    func noteRecoverableRequestFailure(_ error: Error) async {
+        guard shouldReconnect(for: error) else {
+            return
+        }
+
+        await handleConnectionFailure(error, allowReconnect: true)
     }
 
     func refreshContext(for sessionID: String?) async {
@@ -222,12 +346,154 @@ final class AppState {
         UserDefaults.standard.set(theme.rawValue, forKey: StorageKey.theme)
     }
 
+    func setFontSize(_ fontSize: AppFontSize) {
+        self.fontSize = fontSize
+        UserDefaults.standard.set(fontSize.rawValue, forKey: StorageKey.fontSize)
+        FawxTypography.setScale(fontSize.scale)
+    }
+
     private func resolvePermissionPreset(from config: JSONValue?) -> String {
         let rawPreset = config?
             .value(at: ["permissions", "preset"])?
             .stringValue
 
         return permissionPresetLabel(rawPreset)
+    }
+
+    private func attemptConnection(initialStatus: ConnectionStatus, allowReconnect: Bool) async {
+        connectionStatus = initialStatus
+
+        do {
+            lastHealth = try await client.health()
+            try await refreshServerState()
+            handleConnectionRecovered(showsToast: initialStatus != .connecting)
+        } catch {
+            await handleConnectionFailure(error, allowReconnect: allowReconnect)
+        }
+    }
+
+    private func handleConnectionRecovered(showsToast: Bool) {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+        connectionStatus = .connected
+        connectionError = nil
+
+        if showsToast {
+            showToast(message: "Connection restored", style: .success)
+        }
+    }
+
+    private func handleConnectionFailure(_ error: Error, allowReconnect: Bool) async {
+        connectionError = connectionMessage(for: error)
+
+        if isAuthenticationFailure(error) {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            connectionStatus = .disconnected
+            return
+        }
+
+        if allowReconnect {
+            connectionStatus = .reconnecting
+            scheduleReconnectIfNeeded()
+        } else {
+            connectionStatus = .disconnected
+        }
+    }
+
+    private func scheduleReconnectIfNeeded() {
+        guard reconnectTask == nil, isConfigured else {
+            return
+        }
+
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            while !Task.isCancelled && self.isConfigured {
+                let delaySeconds = min(pow(2.0, Double(self.reconnectAttempt)), 30)
+                try? await Task.sleep(for: .seconds(delaySeconds))
+
+                do {
+                    self.lastHealth = try await self.client.health()
+                    try await self.refreshServerState()
+                    self.handleConnectionRecovered(showsToast: true)
+                    return
+                } catch {
+                    self.reconnectAttempt += 1
+                    self.connectionError = self.connectionMessage(for: error)
+
+                    if self.isAuthenticationFailure(error) || self.reconnectAttempt >= 5 {
+                        self.connectionStatus = .disconnected
+                        self.reconnectTask = nil
+                        return
+                    }
+
+                    self.connectionStatus = .reconnecting
+                }
+            }
+        }
+    }
+
+    private func shouldReconnect(for error: Error) -> Bool {
+        isAuthenticationFailure(error) || isConnectivityFailure(error)
+    }
+
+    private func isAuthenticationFailure(_ error: Error) -> Bool {
+        if case APIError.httpStatus(let code, _) = error, code == 401 {
+            return true
+        }
+        return false
+    }
+
+    private func isConnectivityFailure(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut,
+                    .cannotFindHost,
+                    .cannotConnectToHost,
+                    .networkConnectionLost,
+                    .dnsLookupFailed,
+                    .notConnectedToInternet:
+                return true
+            default:
+                return false
+            }
+        }
+
+        if case APIError.invalidResponse = error {
+            return true
+        }
+
+        if case APIError.httpStatus(let code, _) = error, code == 408 || (500 ... 599).contains(code) {
+            return true
+        }
+
+        return false
+    }
+
+    private func connectionMessage(for error: Error) -> String {
+        if isAuthenticationFailure(error) {
+            return "Authentication failed. Check your pairing in Settings."
+        }
+
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return "Connection timed out while contacting \(serverURLString)."
+        }
+
+        return "Cannot connect to Fawx server at \(serverURLString)."
+    }
+
+    private func showToast(message: String, style: AppToastStyle) {
+        toastDismissTask?.cancel()
+        toast = AppToast(message: message, style: style)
+
+        toastDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            self?.toast = nil
+        }
     }
 
     private static func resetPersistedConfiguration() {
@@ -241,5 +507,6 @@ final class AppState {
         defaults.removeObject(forKey: StorageKey.serverURL)
         defaults.removeObject(forKey: StorageKey.pairedDeviceName)
         defaults.removeObject(forKey: StorageKey.theme)
+        defaults.removeObject(forKey: StorageKey.fontSize)
     }
 }
