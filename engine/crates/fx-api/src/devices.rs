@@ -9,7 +9,6 @@ use uuid::Uuid;
 const DEVICE_TOKEN_PREFIX: &str = "fawx_pat_";
 const DEVICE_TOKEN_LENGTH: usize = 32;
 const TOKEN_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-const LEGACY_MILLISECONDS_THRESHOLD: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceToken {
@@ -195,11 +194,7 @@ fn normalize_device_timestamps(device: &mut DeviceToken) {
 }
 
 fn normalize_timestamp(timestamp: u64) -> u64 {
-    if timestamp >= LEGACY_MILLISECONDS_THRESHOLD {
-        timestamp / 1_000
-    } else {
-        timestamp
-    }
+    crate::time_util::normalize_timestamp(timestamp)
 }
 
 #[cfg(unix)]

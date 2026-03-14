@@ -6,8 +6,6 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
-const LEGACY_MILLISECONDS_THRESHOLD: u64 = 1_000_000_000_000;
-
 #[derive(Debug, Clone, Args)]
 pub struct DevicesArgs {
     /// Print JSON output for scripting
@@ -258,11 +256,7 @@ fn relative_age(now: u64, timestamp: u64) -> String {
 }
 
 fn normalize_timestamp(timestamp: u64) -> u64 {
-    if timestamp >= LEGACY_MILLISECONDS_THRESHOLD {
-        timestamp / 1_000
-    } else {
-        timestamp
-    }
+    fx_api::time_util::normalize_timestamp(timestamp)
 }
 
 fn devices_url(port: u16) -> String {

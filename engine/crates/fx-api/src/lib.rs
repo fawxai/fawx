@@ -1,5 +1,5 @@
 pub(crate) mod config_redaction;
-pub(crate) mod time_util;
+pub mod time_util;
 
 pub(crate) mod devices;
 pub mod engine;
