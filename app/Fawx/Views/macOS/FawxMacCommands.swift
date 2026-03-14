@@ -35,7 +35,7 @@ struct FawxMacCommands: Commands {
             .keyboardShortcut("2", modifiers: .command)
 
             Button("Settings") {
-                openSettingsWindow()
+                showSettings()
             }
             .keyboardShortcut("3", modifiers: .command)
         }
@@ -62,6 +62,12 @@ struct FawxMacCommands: Commands {
         chatViewModel.showEmptyState()
     }
 
+    private func showSettings() {
+        appState.sidebarSelection = .settings
+        sessionViewModel.select(nil)
+        chatViewModel.showEmptyState()
+    }
+
     private func clearSelectedSession() {
         guard let selectedSessionID = sessionViewModel.selectedSessionID else {
             return
@@ -79,11 +85,5 @@ struct FawxMacCommands: Commands {
         }
     }
 
-    private func openSettingsWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
-    }
 }
 #endif

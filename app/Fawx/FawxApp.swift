@@ -38,15 +38,6 @@ struct FawxApp: App {
 #endif
 
         mainWindowScene(selectedTheme: selectedTheme)
-#if os(macOS)
-        Settings {
-            SettingsView(
-                settingsViewModel: settingsViewModel,
-                appState: appState,
-                chatViewModel: chatViewModel
-            )
-        }
-#endif
     }
 
     private func mainWindowScene(selectedTheme: AppTheme) -> some Scene {
@@ -121,7 +112,8 @@ struct FawxApp: App {
                 appState: appState,
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
-                skillsViewModel: skillsViewModel
+                skillsViewModel: skillsViewModel,
+                settingsViewModel: settingsViewModel
             )
 #else
             TabRootView(

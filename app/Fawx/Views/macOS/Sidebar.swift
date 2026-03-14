@@ -93,25 +93,12 @@ struct Sidebar: View {
                     isSelected: selection == .skills,
                     action: showSkillsAction
                 )
-
-#if os(macOS)
-                SettingsLink {
-                    Label("Settings", systemImage: "gearshape")
-                        .font(FawxTypography.sidebar)
-                        .foregroundStyle(Color.fawxText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, FawxSpacing.paddingMD)
-                        .padding(.vertical, FawxSpacing.paddingSM)
-                }
-                .buttonStyle(.plain)
-#else
                 sidebarButton(
                     title: "Settings",
                     systemImage: "gearshape",
-                    isSelected: false,
+                    isSelected: selection == .settings,
                     action: openSettingsAction
                 )
-#endif
             }
             .padding(.horizontal, FawxSpacing.paddingSM)
             .padding(.vertical, FawxSpacing.paddingSM)

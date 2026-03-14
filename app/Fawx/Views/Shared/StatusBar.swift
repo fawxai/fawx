@@ -48,12 +48,6 @@ struct StatusBar: View {
                         .accessibilityIdentifier("contextLabel")
                 }
                 .help("\(displayContext.usedTokens) / \(displayContext.maxTokens) tokens")
-            } else if shouldHideUnavailableContext {
-                Text("Ctx unavailable")
-                    .font(FawxTypography.status)
-                    .foregroundStyle(Color.fawxTextSecondary)
-                    .accessibilityIdentifier("contextLabel")
-                    .help("The server has not reported usable context metrics for this session yet.")
             } else {
                 Text("—")
                     .font(FawxTypography.status)
@@ -100,25 +94,11 @@ struct StatusBar: View {
             return nil
         }
 
-        guard !(selectedSessionMessageCount > 0 && context.usedTokens == 0 && context.normalizedPercentage == 0) else {
-            return nil
-        }
-
         return DisplayContext(
             percentage: context.normalizedPercentage,
             usedTokens: context.usedTokens,
             maxTokens: context.maxTokens
         )
-    }
-
-    private var shouldHideUnavailableContext: Bool {
-        guard let context else {
-            return false
-        }
-
-        return selectedSessionMessageCount > 0
-            && context.usedTokens == 0
-            && context.normalizedPercentage == 0
     }
 }
 

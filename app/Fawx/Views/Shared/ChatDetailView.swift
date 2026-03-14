@@ -237,19 +237,7 @@ struct ChatDetailView: View {
             return "—"
         }
 
-        if transcriptMessageCount > 0 && context.usedTokens == 0 && context.normalizedPercentage == 0 {
-            return "Ctx unavailable"
-        }
-
         return "\(Int(context.normalizedPercentage.rounded()))% ctx"
-    }
-
-    private var transcriptMessageCount: Int {
-        chatViewModel.transcriptItems.reduce(into: 0) { count, item in
-            if case .message = item {
-                count += 1
-            }
-        }
     }
 
     private var connectionLabel: String {

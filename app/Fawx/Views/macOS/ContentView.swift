@@ -1,13 +1,12 @@
 import Observation
 import SwiftUI
-#if os(macOS)
-import AppKit
-#endif
+
 struct ContentView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var skillsViewModel: SkillsViewModel
+    @Bindable var settingsViewModel: SettingsViewModel
 
     @SceneStorage("sidebar_selection") private var sidebarSelectionRawValue: String?
 
@@ -29,7 +28,7 @@ struct ContentView: View {
                     newSessionAction: beginNewSession,
                     selectSessionAction: selectSession,
                     showSkillsAction: showSkills,
-                    openSettingsAction: openSettingsWindow,
+                    openSettingsAction: showSettings,
                     clearSessionAction: clearSession,
                     deleteSessionAction: deleteSession
                 )
@@ -87,6 +86,14 @@ struct ContentView: View {
         switch sidebarSelection {
         case .skills:
             SkillsView(skillsViewModel: skillsViewModel)
+                .navigationTitle("Skills")
+        case .settings:
+            SettingsView(
+                settingsViewModel: settingsViewModel,
+                appState: appState,
+                chatViewModel: chatViewModel
+            )
+            .navigationTitle("Settings")
         case .session, .none:
             ChatDetailView(
                 appState: appState,
@@ -95,7 +102,15 @@ struct ContentView: View {
                 emptyStateTitle: "What are you working on?",
                 emptyStateMessage: "Create a new conversation from the sidebar, or start typing and Fawx will create one on your first message."
             )
+            .navigationTitle(detailTitle)
         }
+    }
+
+    private var detailTitle: String {
+        if let session = sessionViewModel.selectedSession {
+            return session.displayTitle
+        }
+        return "New Session"
     }
 
     private var sidebarSelection: SidebarSelection? {
@@ -130,13 +145,10 @@ struct ContentView: View {
         chatViewModel.showEmptyState()
     }
 
-    private func openSettingsWindow() {
-#if os(macOS)
-        NSApp.activate(ignoringOtherApps: true)
-        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
-#endif
+    private func showSettings() {
+        sidebarSelection = .settings
+        sessionViewModel.select(nil)
+        chatViewModel.showEmptyState()
     }
 
     private func restoreSelectionAfterRefresh() async {

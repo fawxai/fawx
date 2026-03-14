@@ -8,15 +8,18 @@ struct SettingsView: View {
     @State private var isPresentingModelSelector = false
 
     var body: some View {
-        Form {
-            connectionSection
-            modelThinkingSection
-            authStatusSection
-            appearanceSection
+        ScrollView {
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingXL) {
+                connectionSection
+                modelThinkingSection
+                authStatusSection
+                appearanceSection
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(.horizontal, FawxSpacing.paddingXL)
+            .padding(.vertical, FawxSpacing.paddingLG)
         }
-        .formStyle(.grouped)
-        .padding(FawxSpacing.paddingLG)
-        .frame(minWidth: 520, minHeight: 360)
+        .background(Color.fawxBackground.ignoresSafeArea())
         .task {
             if appState.isConfigured {
                 await appState.revalidateConnection(allowReconnect: false)
@@ -25,105 +28,123 @@ struct SettingsView: View {
     }
 
     private var connectionSection: some View {
-        Section("Connection") {
-            LabeledContent("Server URL") {
-                Text(settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL)
-                    .foregroundStyle(settingsViewModel.serverURL.isEmpty ? Color.fawxTextSecondary : Color.fawxText)
-                    .textSelection(.enabled)
-            }
+        settingsSection("Connection") {
+            settingsCard {
+                settingsValueRow(
+                    label: "Server URL",
+                    value: settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL,
+                    isSecondary: settingsViewModel.serverURL.isEmpty,
+                    allowsSelection: true
+                )
 
-            LabeledContent("Paired as") {
-                Text(settingsViewModel.pairedDeviceName ?? "Not paired")
-                    .foregroundStyle(settingsViewModel.pairedDeviceName == nil ? Color.fawxTextSecondary : Color.fawxText)
-            }
+                settingsDivider
 
-            LabeledContent("Status") {
-                Text(connectionStatusLabel)
-                    .foregroundStyle(Color.fawxTextSecondary)
-            }
+                settingsValueRow(
+                    label: "Paired as",
+                    value: settingsViewModel.pairedDeviceName ?? "Not paired",
+                    isSecondary: settingsViewModel.pairedDeviceName == nil
+                )
 
-            HStack {
-                Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
-                    Task {
-                        await settingsViewModel.testConnection()
+                settingsDivider
+
+                settingsValueRow(
+                    label: "Status",
+                    value: connectionStatusLabel,
+                    isSecondary: true
+                )
+
+                settingsDivider
+
+                HStack(spacing: FawxSpacing.paddingMD) {
+                    Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
+                        Task {
+                            await settingsViewModel.testConnection()
+                        }
                     }
-                }
-                .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
+                    .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
 
-                Button("Unpair", role: .destructive) {
-                    Task {
-                        await settingsViewModel.unpair()
+                    Button("Unpair", role: .destructive) {
+                        Task {
+                            await settingsViewModel.unpair()
+                        }
                     }
+                    .disabled(!settingsViewModel.isPaired)
+
+                    Spacer(minLength: 0)
                 }
-                .disabled(!settingsViewModel.isPaired)
             }
 
             if let status = settingsViewModel.testStatusMessage {
                 Text(status)
+                    .font(FawxTypography.chatBody)
                     .foregroundStyle(testStatusColor)
             }
         }
     }
 
     private var modelThinkingSection: some View {
-        Section("Model & Thinking") {
-            VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
-                Text("Server Model")
-                    .font(FawxTypography.sidebarTitle)
-                    .foregroundStyle(Color.fawxText)
+        settingsSection("Model & Thinking") {
+            settingsCard {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                    HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+                        VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                            Text("Server Model")
+                                .font(FawxTypography.sidebarTitle)
+                                .foregroundStyle(Color.fawxText)
 
-                HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
-                    VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
-                        Text(activeModelName)
-                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(hasActiveModel ? Color.fawxText : Color.fawxTextSecondary)
-                            .textSelection(.enabled)
-                            .lineLimit(2)
+                            Text(activeModelName)
+                                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(hasActiveModel ? Color.fawxText : Color.fawxTextSecondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
 
-                        if let activeModel = appState.activeModel {
-                            Text(modelMetadataSummary(activeModel))
-                                .font(FawxTypography.status)
-                                .foregroundStyle(Color.fawxTextSecondary)
+                            if let activeModel = appState.activeModel {
+                                Text(modelMetadataSummary(activeModel))
+                                    .font(FawxTypography.status)
+                                    .foregroundStyle(Color.fawxTextSecondary)
+                            }
                         }
-                    }
 
-                    Spacer(minLength: FawxSpacing.paddingMD)
+                        Spacer(minLength: FawxSpacing.paddingMD)
 
-                    Button("Choose Model...") {
-                        isPresentingModelSelector = true
-                    }
-                    .disabled(disableServerControls || appState.availableModels.isEmpty)
-                    .accessibilityIdentifier("modelPicker")
-                }
-            }
-
-            VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
-                Text("Server Thinking Level")
-                    .font(FawxTypography.sidebarTitle)
-                    .foregroundStyle(Color.fawxText)
-
-                Picker("Server Thinking Level", selection: Binding(
-                    get: { appState.thinkingLevel?.rawValue ?? "" },
-                    set: { newValue in
-                        guard !newValue.isEmpty else { return }
-                        Task {
-                            try? await appState.setThinking(ThinkingLevel(rawValue: newValue))
+                        Button("Choose Model...") {
+                            isPresentingModelSelector = true
                         }
-                    }
-                )) {
-                    ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
-                        Text(level.rawValue.capitalized).tag(level.rawValue)
+                        .disabled(disableServerControls || appState.availableModels.isEmpty)
+                        .accessibilityIdentifier("modelPicker")
                     }
                 }
-                .pickerStyle(.segmented)
-                .disabled(disableServerControls)
-                .accessibilityIdentifier("thinkingPicker")
-            }
 
-            if disableServerControls {
-                Text("Cannot change model or thinking while a response is streaming.")
-                    .font(FawxTypography.status)
-                    .foregroundStyle(Color.fawxTextSecondary)
+                settingsDivider
+
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                    Text("Server Thinking Level")
+                        .font(FawxTypography.sidebarTitle)
+                        .foregroundStyle(Color.fawxText)
+
+                    Picker("Server Thinking Level", selection: Binding(
+                        get: { appState.thinkingLevel?.rawValue ?? "" },
+                        set: { newValue in
+                            guard !newValue.isEmpty else { return }
+                            Task {
+                                try? await appState.setThinking(ThinkingLevel(rawValue: newValue))
+                            }
+                        }
+                    )) {
+                        ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
+                            Text(level.rawValue.capitalized).tag(level.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(disableServerControls)
+                    .accessibilityIdentifier("thinkingPicker")
+
+                    if disableServerControls {
+                        Text("Cannot change model or thinking while a response is streaming.")
+                            .font(FawxTypography.status)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+                }
             }
         }
         .sheet(isPresented: $isPresentingModelSelector) {
@@ -145,13 +166,13 @@ struct SettingsView: View {
     }
 
     private var appearanceSection: some View {
-        Section("Appearance") {
+        settingsSection("Appearance") {
             AppearanceSettingsPanel(appState: appState)
         }
     }
 
     private var authStatusSection: some View {
-        Section("Auth Status") {
+        settingsSection("Auth Status") {
             AuthStatusList(
                 providers: appState.authProviders,
                 errorMessage: appState.authProvidersError
@@ -198,5 +219,73 @@ struct SettingsView: View {
 
     private var hasActiveModel: Bool {
         appState.activeModel != nil
+    }
+
+    private func settingsSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+            Text(title)
+                .font(FawxTypography.heading2)
+                .foregroundStyle(Color.fawxText)
+
+            content()
+        }
+    }
+
+    private func settingsCard<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(FawxSpacing.paddingLG)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        }
+    }
+
+    private func settingsValueRow(
+        label: String,
+        value: String,
+        isSecondary: Bool = false,
+        allowsSelection: Bool = false
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: FawxSpacing.paddingMD) {
+            Text(label)
+                .font(FawxTypography.sidebarTitle)
+                .foregroundStyle(Color.fawxText)
+
+            Spacer(minLength: FawxSpacing.paddingLG)
+
+            Text(value)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(isSecondary ? Color.fawxTextSecondary : Color.fawxText)
+                .multilineTextAlignment(.trailing)
+                .modifier(SelectableTextModifier(isSelectable: allowsSelection))
+        }
+    }
+
+    private var settingsDivider: some View {
+        Divider()
+            .overlay(Color.fawxBorder)
+    }
+}
+
+private struct SelectableTextModifier: ViewModifier {
+    let isSelectable: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isSelectable {
+            content.textSelection(.enabled)
+        } else {
+            content
+        }
     }
 }
