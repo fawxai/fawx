@@ -84,15 +84,22 @@ impl From<fx_llm::ModelInfo> for ModelInfoDto {
 pub struct ThinkingLevelDto {
     pub level: String,
     pub budget_tokens: Option<u32>,
+    pub available: Vec<String>,
 }
 
-impl From<fx_config::ThinkingBudget> for ThinkingLevelDto {
-    fn from(budget: fx_config::ThinkingBudget) -> Self {
-        Self {
-            level: budget.to_string(),
-            budget_tokens: budget.budget_tokens(),
-        }
-    }
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ThinkingAdjustedDto {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ModelSwitchDto {
+    pub previous_model: String,
+    pub active_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_adjusted: Option<ThinkingAdjustedDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]

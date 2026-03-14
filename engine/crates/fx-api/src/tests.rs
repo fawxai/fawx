@@ -15,7 +15,7 @@ use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
     AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, HealthResponse,
-    MessageRequest, MessageResponse, ModelInfoDto, SkillSummaryDto, StatusResponse,
+    MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SkillSummaryDto, StatusResponse,
     ThinkingLevelDto,
 };
 use async_trait::async_trait;
@@ -134,21 +134,51 @@ impl AppEngine for HeadlessApp {
             .collect()
     }
 
-    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error> {
-        HeadlessApp::set_active_model(self, selector)
+    fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+        let switched = HeadlessApp::switch_active_model(self, selector)?;
+        Ok(ModelSwitchDto {
+            previous_model: switched.previous_model,
+            active_model: switched.active_model,
+            thinking_adjusted: switched.thinking_adjusted.map(|adjusted| {
+                crate::types::ThinkingAdjustedDto {
+                    from: adjusted.from,
+                    to: adjusted.to,
+                    reason: adjusted.reason,
+                }
+            }),
+        })
     }
 
     fn thinking_level(&self) -> ThinkingLevelDto {
-        HeadlessApp::thinking_budget(self).into()
+        let dto = HeadlessApp::thinking_level_dto(self);
+        ThinkingLevelDto {
+            level: dto.level,
+            budget_tokens: dto.budget_tokens,
+            available: dto.available,
+        }
     }
 
     fn context_info(&self) -> ContextInfoDto {
         ContextInfoDto::from_snapshot(&HeadlessApp::context_info_snapshot(self))
     }
 
+    fn context_info_for_messages(&self, messages: &[Message]) -> ContextInfoDto {
+        let used_tokens = messages.len() * 100;
+        ContextInfoDto {
+            used_tokens,
+            max_tokens: 4_096,
+            percentage: (used_tokens as f32 / 4_096.0) * 100.0,
+            compaction_threshold: 0.8,
+        }
+    }
+
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
-        HeadlessApp::handle_thinking(self, Some(level))?;
-        Ok(self.thinking_level())
+        let dto = HeadlessApp::set_supported_thinking_level(self, level)?;
+        Ok(ThinkingLevelDto {
+            level: dto.level,
+            budget_tokens: dto.budget_tokens,
+            available: dto.available,
+        })
     }
 
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
@@ -1781,16 +1811,16 @@ allowed_chat_ids = [123]
         let key = seed_session(&registry, "sess-context");
         let app = build_router(test_state_with_sessions(registry), None);
 
-        let warmup = app
+        let message_response = app
             .clone()
             .oneshot(authed_json_request(
                 "POST",
-                "/message",
+                &format!("/v1/sessions/{key}/messages"),
                 r#"{"message":"hello there"}"#,
             ))
             .await
-            .expect("warmup response");
-        assert_eq!(warmup.status(), StatusCode::OK);
+            .expect("message response");
+        assert_eq!(message_response.status(), StatusCode::OK);
 
         let response = app
             .oneshot(authed_request(
@@ -2219,7 +2249,16 @@ allowed_chat_ids = [123]
 
     #[tokio::test]
     async fn get_thinking_returns_current_level() {
-        let app = build_router(test_state(None, Vec::new()), None);
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
         let response = app
             .oneshot(authed_request("GET", "/v1/thinking"))
             .await
@@ -2229,6 +2268,10 @@ allowed_chat_ids = [123]
         let json = response_json(response).await;
         assert_eq!(json["level"], "adaptive");
         assert_eq!(json["budget_tokens"], 5000);
+        assert_eq!(
+            json["available"],
+            serde_json::json!(["off", "low", "adaptive", "high"])
+        );
     }
 
     #[tokio::test]
@@ -2288,6 +2331,178 @@ allowed_chat_ids = [123]
             json["error"],
             "unknown thinking budget 'turbo'; expected adaptive, high, low, or off"
         );
+    }
+
+    #[tokio::test]
+    async fn set_thinking_rejects_level_unsupported_by_current_provider() {
+        let (_temp, config, manager) = temp_config_manager(
+            r#"[model]
+default_model = "gpt-4o"
+
+[general]
+thinking = "low"
+"#,
+        );
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                config,
+                Some(manager),
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/thinking",
+                r#"{"level":"adaptive"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "Thinking level 'adaptive' is not supported by the current model. Available: off, low, high"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_model_auto_downgrades_unsupported_thinking_level() {
+        let (_temp, config, manager) = temp_config_manager(
+            r#"[model]
+default_model = "claude-sonnet-4-20250514"
+
+[general]
+thinking = "adaptive"
+"#,
+        );
+        let state = test_state_with_app(
+            build_test_app(
+                settings_router(),
+                config,
+                Some(manager),
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/model",
+                r#"{"model":"gpt-4o"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["active_model"], "gpt-4o");
+        assert_eq!(json["thinking_adjusted"]["from"], "adaptive");
+        assert_eq!(json["thinking_adjusted"]["to"], "high");
+        assert_eq!(
+            json["thinking_adjusted"]["reason"],
+            "adaptive not supported by openai; adjusted to high"
+        );
+
+        let thinking = app
+            .oneshot(authed_request("GET", "/v1/thinking"))
+            .await
+            .expect("response");
+        let thinking_json = response_json(thinking).await;
+        assert_eq!(thinking_json["level"], "high");
+        assert_eq!(
+            thinking_json["available"],
+            serde_json::json!(["off", "low", "high"])
+        );
+    }
+
+    #[tokio::test]
+    async fn set_model_same_provider_preserves_thinking_level() {
+        let (_temp, config, manager) = temp_config_manager(
+            r#"[model]
+default_model = "claude-sonnet-4-20250514"
+
+[general]
+thinking = "adaptive"
+"#,
+        );
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "anthropic",
+                models: vec!["claude-sonnet-4-20250514", "claude-opus-4-1-20250805"],
+            }),
+            "api_key",
+        );
+        router
+            .set_active("claude-sonnet-4-20250514")
+            .expect("set active");
+        let state = test_state_with_app(
+            build_test_app(router, config, Some(manager), test_runtime_info()),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/model",
+                r#"{"model":"claude-opus-4-1-20250805"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["thinking_adjusted"].is_null());
+
+        let thinking = app
+            .oneshot(authed_request("GET", "/v1/thinking"))
+            .await
+            .expect("response");
+        let thinking_json = response_json(thinking).await;
+        assert_eq!(thinking_json["level"], "adaptive");
+    }
+
+    #[tokio::test]
+    async fn get_thinking_unknown_provider_only_allows_off() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "mystery",
+                models: vec!["mystery-model"],
+            }),
+            "api_key",
+        );
+        router.set_active("mystery-model").expect("set active");
+        let state = test_state_with_app(
+            build_test_app(
+                router,
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/thinking"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["available"], serde_json::json!(["off"]));
     }
 
     #[tokio::test]

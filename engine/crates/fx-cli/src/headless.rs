@@ -10,11 +10,14 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
 use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 #[cfg(feature = "http")]
-use fx_api::{AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
+use fx_api::{
+    AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
+    ThinkingAdjustedDto, ThinkingLevelDto,
+};
 use fx_bus::{Envelope, SessionBus};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
-use fx_config::FawxConfig;
+use fx_config::{FawxConfig, ThinkingBudget};
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
@@ -25,7 +28,7 @@ use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter};
+use fx_llm::{supported_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
 use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
@@ -468,7 +471,7 @@ impl HeadlessApp {
     }
 
     pub fn thinking_budget(&self) -> fx_config::ThinkingBudget {
-        self.config.general.thinking.unwrap_or_default()
+        self.current_thinking_budget()
     }
 
     pub fn auth_provider_statuses(&self) -> Vec<AuthProviderStatus> {
@@ -494,7 +497,20 @@ impl HeadlessApp {
         self.cron_store.as_ref()
     }
 
+    pub fn thinking_available_levels(&self) -> Vec<String> {
+        self.active_provider_name()
+            .map(supported_thinking_levels)
+            .unwrap_or_else(|| supported_thinking_levels(""))
+    }
+
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
+        self.switch_active_model(selector)
+            .map(|result| result.active_model)
+    }
+
+    #[cfg(feature = "http")]
+    pub fn switch_active_model(&mut self, selector: &str) -> anyhow::Result<ModelSwitchDto> {
+        let previous_model = self.active_model.clone();
         let resolved = resolve_headless_model_selector(&self.router, selector)?;
         apply_headless_active_model(self, &resolved);
         persist_default_model(
@@ -503,24 +519,112 @@ impl HeadlessApp {
             &fawx_data_dir(),
             &resolved,
         )?;
-        Ok(resolved)
+        let thinking_adjusted = self.adjust_thinking_for_active_model()?;
+        Ok(ModelSwitchDto {
+            previous_model,
+            active_model: resolved,
+            thinking_adjusted,
+        })
     }
 
     pub fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
+        let Some(level) = level else {
+            return Ok(format!(
+                "Current thinking budget: {}",
+                self.config.general.thinking.unwrap_or_default()
+            ));
+        };
+        self.set_supported_thinking_level(level)?;
+        Ok(format!(
+            "Thinking budget set to: {}",
+            self.thinking_budget()
+        ))
+    }
+
+    fn active_provider_name(&self) -> Option<&str> {
+        self.router.provider_for_model(&self.active_model)
+    }
+
+    fn current_thinking_budget(&self) -> ThinkingBudget {
+        self.config.general.thinking.unwrap_or_default()
+    }
+
+    pub fn set_supported_thinking_level(
+        &mut self,
+        level: &str,
+    ) -> anyhow::Result<ThinkingLevelDto> {
+        let budget: ThinkingBudget = level
+            .parse()
+            .map_err(|error: String| anyhow::anyhow!(error))?;
+        self.ensure_supported_thinking_budget(budget)?;
         apply_thinking_budget(
             &mut self.config,
             &mut self.loop_engine,
             self.config_manager.as_ref(),
             &fawx_data_dir(),
+            Some(&budget.to_string()),
+        )?;
+        Ok(self.thinking_level_dto())
+    }
+
+    fn ensure_supported_thinking_budget(&self, budget: ThinkingBudget) -> anyhow::Result<()> {
+        let level = budget.to_string();
+        let available = self.thinking_available_levels();
+        if available.iter().any(|candidate| candidate == &level) {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "Thinking level '{}' is not supported by the current model. Available: {}",
             level,
-        )
+            available.join(", ")
+        ))
+    }
+
+    #[cfg(feature = "http")]
+    pub fn thinking_level_dto(&self) -> ThinkingLevelDto {
+        ThinkingLevelDto {
+            level: self.current_thinking_budget().to_string(),
+            budget_tokens: self.current_thinking_budget().budget_tokens(),
+            available: self.thinking_available_levels(),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn adjust_thinking_for_active_model(&mut self) -> anyhow::Result<Option<ThinkingAdjustedDto>> {
+        let current = self.current_thinking_budget();
+        if self.is_supported_thinking_budget(current) {
+            return Ok(None);
+        }
+        let adjusted = preferred_supported_budget(&self.thinking_available_levels());
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            Some(&adjusted.to_string()),
+        )?;
+        Ok(Some(ThinkingAdjustedDto {
+            from: current.to_string(),
+            to: adjusted.to_string(),
+            reason: thinking_adjustment_reason(current, adjusted, self.active_provider_name()),
+        }))
+    }
+
+    fn is_supported_thinking_budget(&self, budget: ThinkingBudget) -> bool {
+        let level = budget.to_string();
+        self.thinking_available_levels()
+            .iter()
+            .any(|candidate| candidate == &level)
     }
 
     pub fn context_info_snapshot(&self) -> ContextInfoSnapshot {
+        self.context_info_snapshot_for_messages(&self.conversation_history)
+    }
+
+    pub fn context_info_snapshot_for_messages(&self, messages: &[Message]) -> ContextInfoSnapshot {
         let budget = self.loop_engine.conversation_budget_ref();
-        let used_tokens = fx_kernel::conversation_compactor::ConversationBudget::estimate_tokens(
-            &self.conversation_history,
-        );
+        let used_tokens =
+            fx_kernel::conversation_compactor::ConversationBudget::estimate_tokens(messages);
         let max_tokens = budget.conversation_budget();
         ContextInfoSnapshot {
             used_tokens,
@@ -886,21 +990,26 @@ impl AppEngine for HeadlessApp {
             .collect()
     }
 
-    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error> {
-        HeadlessApp::set_active_model(self, selector)
+    fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+        HeadlessApp::switch_active_model(self, selector)
     }
 
     fn thinking_level(&self) -> ThinkingLevelDto {
-        HeadlessApp::thinking_budget(self).into()
+        HeadlessApp::thinking_level_dto(self)
     }
 
     fn context_info(&self) -> ContextInfoDto {
         HeadlessApp::context_info(self)
     }
 
+    fn context_info_for_messages(&self, messages: &[Message]) -> ContextInfoDto {
+        ContextInfoDto::from_snapshot(&HeadlessApp::context_info_snapshot_for_messages(
+            self, messages,
+        ))
+    }
+
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
-        HeadlessApp::handle_thinking(self, Some(level))?;
-        Ok(self.thinking_level())
+        HeadlessApp::set_supported_thinking_level(self, level)
     }
 
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
@@ -1048,6 +1157,30 @@ impl CommandHost for HeadlessApp {
     fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
         Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
     }
+}
+
+fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {
+    for budget in [
+        ThinkingBudget::High,
+        ThinkingBudget::Adaptive,
+        ThinkingBudget::Low,
+        ThinkingBudget::Off,
+    ] {
+        if levels.iter().any(|level| level == &budget.to_string()) {
+            return budget;
+        }
+    }
+    ThinkingBudget::Off
+}
+
+#[cfg(feature = "http")]
+fn thinking_adjustment_reason(
+    from: ThinkingBudget,
+    to: ThinkingBudget,
+    provider: Option<&str>,
+) -> String {
+    let provider = provider.unwrap_or("unknown");
+    format!("{} not supported by {}; adjusted to {}", from, provider, to)
 }
 
 fn handle_headless_synthesis_command(

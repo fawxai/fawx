@@ -1,5 +1,6 @@
 use crate::types::{
-    AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
+    ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use fx_bus::SessionBus;
@@ -43,13 +44,16 @@ pub trait AppEngine: Send + Sync {
     fn available_models(&self) -> Vec<ModelInfoDto>;
 
     /// Switch the active model and return the resolved model ID.
-    fn set_active_model(&mut self, selector: &str) -> Result<String, anyhow::Error>;
+    fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error>;
 
     /// Return the current thinking level and token budget.
     fn thinking_level(&self) -> ThinkingLevelDto;
 
     /// Return current conversation budget usage details.
     fn context_info(&self) -> ContextInfoDto;
+
+    /// Return conversation budget usage details for an explicit message list.
+    fn context_info_for_messages(&self, messages: &[Message]) -> ContextInfoDto;
 
     /// Update the thinking level and return the applied value.
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error>;

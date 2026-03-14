@@ -45,6 +45,18 @@ pub use types::{
     THINKING_BUDGET_LOW,
 };
 
+/// Thinking levels supported by a provider/model family.
+pub fn supported_thinking_levels(provider: &str) -> Vec<String> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => vec!["off", "low", "adaptive", "high"],
+        "openai" => vec!["off", "low", "high"],
+        _ => vec!["off"],
+    }
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
 /// Legacy prompt-generation provider trait.
 ///
 /// This trait is used by the existing local/cloud router implementation.

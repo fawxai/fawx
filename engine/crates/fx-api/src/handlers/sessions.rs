@@ -149,8 +149,12 @@ pub async fn handle_get_context(
     registry
         .get_info(&key)
         .map_err(|error| map_session_error(&id, error))?;
+    let history = registry
+        .history(&key, usize::MAX)
+        .map_err(|error| map_session_error(&id, error))?;
+    let context = session_messages_to_context(&history);
     let app = state.app.lock().await;
-    Ok(Json(app.context_info()).into_response())
+    Ok(Json(app.context_info_for_messages(&context)).into_response())
 }
 
 pub async fn handle_delete_session(

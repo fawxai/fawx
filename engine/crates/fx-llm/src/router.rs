@@ -89,6 +89,17 @@ impl ModelRouter {
         self.active_model.as_deref()
     }
 
+    /// Return the provider for a model identifier, if registered.
+    pub fn provider_for_model(&self, model: &str) -> Option<&str> {
+        self.model_to_provider.get(model).map(String::as_str)
+    }
+
+    /// Return the provider for the active model, if any.
+    pub fn active_provider(&self) -> Option<&str> {
+        self.active_model()
+            .and_then(|model| self.provider_for_model(model))
+    }
+
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
         build_model_infos(&self.model_to_provider, &self.provider_auth_methods)
@@ -1159,5 +1170,92 @@ mod model_router_tests {
         assert!(result.is_ok());
         assert_eq!(calls.lock().unwrap().clone(), vec!["gpt-5".to_string()]);
         assert_eq!(temperatures.lock().unwrap().clone(), vec![None]);
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_tests {
+    use super::ModelRouter;
+    use crate::provider::{
+        CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
+    };
+    use crate::supported_thinking_levels;
+    use crate::types::{CompletionRequest, CompletionResponse, LlmError};
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct StaticProvider {
+        name: &'static str,
+        models: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StaticProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.iter().map(ToString::to_string).collect()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    #[test]
+    fn active_provider_uses_active_model_mapping() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticProvider {
+            name: "anthropic",
+            models: vec!["claude-sonnet-4-20250514"],
+        }));
+        router
+            .set_active("claude-sonnet-4-20250514")
+            .expect("set active");
+
+        assert_eq!(router.active_provider(), Some("anthropic"));
+        assert_eq!(
+            router.provider_for_model("claude-sonnet-4-20250514"),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn supported_thinking_levels_anthropic() {
+        let levels = supported_thinking_levels("anthropic");
+        assert_eq!(levels, vec!["off", "low", "adaptive", "high"]);
+    }
+
+    #[test]
+    fn supported_thinking_levels_openai() {
+        let levels = supported_thinking_levels("openai");
+        assert_eq!(levels, vec!["off", "low", "high"]);
+    }
+
+    #[test]
+    fn supported_thinking_levels_falls_back_to_off_for_unknown_provider() {
+        assert_eq!(
+            supported_thinking_levels("mystery"),
+            vec!["off".to_string()]
+        );
     }
 }

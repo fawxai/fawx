@@ -20,12 +20,8 @@ pub async fn handle_set_model(
     Json(request): Json<SetModelRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorBody>)> {
     let mut app = state.app.lock().await;
-    let previous_model = app.active_model().to_string();
-    let active_model = app.set_active_model(&request.model).map_err(bad_request)?;
-    Ok(Json(json!({
-        "previous_model": previous_model,
-        "active_model": active_model,
-    })))
+    let switched = app.set_active_model(&request.model).map_err(bad_request)?;
+    Ok(Json(json!(switched)))
 }
 
 pub async fn handle_get_thinking(State(state): State<HttpState>) -> Json<Value> {
@@ -46,6 +42,7 @@ pub async fn handle_set_thinking(
         "previous_level": previous.level,
         "level": updated.level,
         "budget_tokens": updated.budget_tokens,
+        "available": updated.available,
     })))
 }
 
