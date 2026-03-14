@@ -2,6 +2,7 @@ use crate::types::{
     AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto,
 };
 use async_trait::async_trait;
+use fx_bus::SessionBus;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
@@ -60,4 +61,6 @@ pub trait AppEngine: Send + Sync {
     fn auth_provider_statuses(&self) -> Vec<AuthProviderDto>;
 
     fn config_manager(&self) -> Option<ConfigManagerHandle>;
+
+    fn session_bus(&self) -> Option<&SessionBus>;
 }

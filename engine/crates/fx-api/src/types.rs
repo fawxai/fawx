@@ -16,6 +16,18 @@ pub struct MessageResponse {
     pub iterations: u32,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SendToSessionRequest {
+    pub text: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SendToSessionResponse {
+    pub envelope_id: String,
+    pub delivered: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,

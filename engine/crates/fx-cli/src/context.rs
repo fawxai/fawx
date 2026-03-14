@@ -157,8 +157,7 @@ mod tests {
             .without_time()
             .with_writer(SharedMakeWriter(Arc::clone(&buffer)))
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let result = action();
+        let result = tracing::subscriber::with_default(subscriber, action);
         let logs = String::from_utf8(buffer.lock().expect("capture logs").clone())
             .expect("captured logs should be utf8");
         (result, logs)

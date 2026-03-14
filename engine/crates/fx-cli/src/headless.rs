@@ -11,6 +11,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 #[cfg(feature = "http")]
 use fx_api::{AuthProviderDto, ContextInfoDto, ModelInfoDto, SkillSummaryDto, ThinkingLevelDto};
+use fx_bus::{Envelope, SessionBus};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
@@ -26,7 +27,9 @@ use fx_kernel::{StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
+use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -34,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::commands::slash::{
@@ -69,7 +73,15 @@ use fx_subagent::{
 #[cfg(feature = "http")]
 const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
 
+pub const MAIN_SESSION_KEY: &str = "main";
 const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
+
+pub fn main_session_key() -> SessionKey {
+    match SessionKey::new(MAIN_SESSION_KEY) {
+        Ok(key) => key,
+        Err(_) => unreachable!("main session key constant must be valid"),
+    }
+}
 
 pub fn fawx_data_dir() -> PathBuf {
     startup_fawx_data_dir()
@@ -124,6 +136,8 @@ pub struct HeadlessAppDeps {
     pub system_prompt_text: Option<String>,
     pub subagent_manager: Arc<SubagentManager>,
     pub canary_monitor: Option<CanaryMonitor>,
+    pub session_bus: Option<SessionBus>,
+    pub session_key: Option<SessionKey>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -145,6 +159,13 @@ pub struct HeadlessApp {
     /// when the `http` feature is enabled.
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    session_bus: Option<SessionBus>,
+    session_key: Option<SessionKey>,
+    /// Bus message receiver. Stored for Phase 2 loop integration —
+    /// will be polled via `tokio::select!` alongside user input to
+    /// process incoming cross-session messages during conversation.
+    #[allow(dead_code)]
+    bus_receiver: Option<mpsc::Receiver<Envelope>>,
 }
 
 #[derive(Clone)]
@@ -152,6 +173,7 @@ pub struct HeadlessSubagentFactoryDeps {
     pub router: Arc<ModelRouter>,
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
+    pub session_bus: Option<SessionBus>,
 }
 
 #[derive(Clone)]
@@ -216,12 +238,8 @@ pub fn init_serve_logging(
 
 impl Drop for HeadlessApp {
     fn drop(&mut self) {
-        let Some(persistence) = &self.embedding_index_persistence else {
-            return;
-        };
-        if let Err(error) = persistence.save_if_dirty() {
-            tracing::warn!(error = %error, "failed to save embedding index on shutdown");
-        }
+        self.unsubscribe_from_session_bus();
+        self.persist_embedding_index();
     }
 }
 
@@ -233,11 +251,34 @@ fn headless_stream_callback(callback: StreamCallback) -> StreamCallback {
 }
 
 impl HeadlessApp {
+    fn initial_bus_receiver(deps: &HeadlessAppDeps) -> Option<mpsc::Receiver<Envelope>> {
+        match (deps.session_bus.as_ref(), deps.session_key.as_ref()) {
+            (Some(bus), Some(session_key)) => Some(bus.subscribe(session_key)),
+            _ => None,
+        }
+    }
+
+    fn persist_embedding_index(&self) {
+        let Some(persistence) = &self.embedding_index_persistence else {
+            return;
+        };
+        if let Err(error) = persistence.save_if_dirty() {
+            tracing::warn!(error = %error, "failed to save embedding index on shutdown");
+        }
+    }
+
+    fn unsubscribe_from_session_bus(&self) {
+        let (Some(bus), Some(session_key)) = (&self.session_bus, self.session_key.as_ref()) else {
+            return;
+        };
+        bus.unsubscribe(session_key);
+    }
+
     /// Build from the standard startup bundle + router + config.
     pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
         // Callers must seed the router's active model before construction.
         let active_model = resolve_active_model(&deps.router, &deps.config)?;
-
+        let bus_receiver = Self::initial_bus_receiver(&deps);
         let max_history = deps.config.general.max_history;
         let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
         let custom_system_prompt = resolve_system_prompt(
@@ -261,6 +302,9 @@ impl HeadlessApp {
             custom_system_prompt,
             canary_monitor: deps.canary_monitor,
             config_manager: deps.config_manager,
+            session_bus: deps.session_bus,
+            session_key: deps.session_key,
+            bus_receiver,
         })
     }
 
@@ -437,6 +481,10 @@ impl HeadlessApp {
     /// Return the shared config manager (if configured).
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
+    }
+
+    pub fn session_bus(&self) -> Option<&SessionBus> {
+        self.session_bus.as_ref()
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -864,6 +912,10 @@ impl AppEngine for HeadlessApp {
 
     fn config_manager(&self) -> Option<ConfigManagerHandle> {
         HeadlessApp::config_manager(self).cloned()
+    }
+
+    fn session_bus(&self) -> Option<&SessionBus> {
+        HeadlessApp::session_bus(self)
     }
 }
 
@@ -1533,12 +1585,51 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     }
 }
 
+fn new_subagent_session_key(bus: Option<&SessionBus>) -> Result<Option<SessionKey>, SubagentError> {
+    if bus.is_none() {
+        return Ok(None);
+    }
+    SessionKey::new(format!("subagent-{}", Uuid::new_v4()))
+        .map(Some)
+        .map_err(|error| SubagentError::Spawn(error.to_string()))
+}
+
 impl HeadlessSubagentFactory {
     pub fn new(deps: HeadlessSubagentFactoryDeps) -> Self {
         Self {
             deps,
             disabled_manager: new_disabled_subagent_manager(),
         }
+    }
+
+    fn build_app(
+        &self,
+        config: &SpawnConfig,
+        cancel_token: CancellationToken,
+    ) -> Result<HeadlessApp, SubagentError> {
+        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        let bundle = build_headless_loop_engine_bundle(
+            &self.deps.config,
+            self.deps.improvement_provider.clone(),
+            options,
+        )
+        .map_err(|error| SubagentError::Spawn(error.to_string()))?;
+        let deps = HeadlessAppDeps {
+            loop_engine: bundle.engine,
+            router: Arc::clone(&self.deps.router),
+            runtime_info: bundle.runtime_info,
+            config: self.deps.config.clone(),
+            memory: bundle.memory,
+            embedding_index_persistence: bundle.embedding_index_persistence,
+            system_prompt_path: None,
+            config_manager: None,
+            system_prompt_text: config.system_prompt.clone(),
+            subagent_manager: Arc::clone(&self.disabled_manager),
+            canary_monitor: None,
+            session_bus: self.deps.session_bus.clone(),
+            session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
+        };
+        HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))
     }
 }
 
@@ -1579,28 +1670,7 @@ impl SubagentFactory for HeadlessSubagentFactory {
             ));
         }
         let cancel_token = CancellationToken::new();
-        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token.clone());
-        let bundle = build_headless_loop_engine_bundle(
-            &self.deps.config,
-            self.deps.improvement_provider.clone(),
-            options,
-        )
-        .map_err(|error| SubagentError::Spawn(error.to_string()))?;
-        let deps = HeadlessAppDeps {
-            loop_engine: bundle.engine,
-            router: Arc::clone(&self.deps.router),
-            runtime_info: bundle.runtime_info,
-            config: self.deps.config.clone(),
-            memory: bundle.memory,
-            embedding_index_persistence: bundle.embedding_index_persistence,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: config.system_prompt.clone(),
-            subagent_manager: Arc::clone(&self.disabled_manager),
-            canary_monitor: None,
-        };
-        let app =
-            HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
+        let app = self.build_app(config, cancel_token.clone())?;
         Ok(CreatedSubagentSession {
             session: Box::new(HeadlessSubagentSession { app }),
             cancel_token,
@@ -1890,12 +1960,16 @@ mod tests {
     use async_trait::async_trait;
     #[cfg(feature = "http")]
     use fx_api::engine::AppEngine;
+    use fx_bus::{BusStore, Payload};
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
     use fx_kernel::cancellation::CancellationToken;
     use fx_kernel::context_manager::ContextCompactor;
     use fx_kernel::loop_engine::LoopEngine;
+    use fx_session::SessionKey;
+    use fx_subagent::SpawnConfig;
     use std::sync::{Arc, Mutex};
+    use tokio::time::Duration;
 
     // ── Test helpers ────────────────────────────────────────────────────
 
@@ -1941,6 +2015,9 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            bus_receiver: None,
         }
     }
 
@@ -2181,6 +2258,8 @@ mod tests {
             system_prompt_text: None,
             subagent_manager: new_disabled_subagent_manager(),
             canary_monitor: None,
+            session_bus: None,
+            session_key: None,
         }
     }
 
@@ -2398,6 +2477,9 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: Some(manager),
+            session_bus: None,
+            session_key: None,
+            bus_receiver: None,
         };
 
         std::fs::write(
@@ -2724,6 +2806,9 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            bus_receiver: None,
         };
 
         let result = app.process_message("hello").await.expect("process message");
@@ -2759,6 +2844,9 @@ mod tests {
                 .with_intervals(1, 1),
             ),
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            bus_receiver: None,
         };
 
         app.process_message("hello")
@@ -3035,12 +3123,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn subagent_sends_status_to_parent() {
+        let store = BusStore::new(fx_storage::Storage::open_in_memory().expect("in-memory bus"));
+        let bus = SessionBus::new(store);
+        let parent_key = SessionKey::new("parent-session").expect("parent key");
+        let mut parent_receiver = bus.subscribe(&parent_key);
+        let factory = HeadlessSubagentFactory::new(HeadlessSubagentFactoryDeps {
+            router: test_router(),
+            config: FawxConfig::default(),
+            improvement_provider: None,
+            session_bus: Some(bus.clone()),
+        });
+        let app = factory
+            .build_app(&SpawnConfig::new("report status"), CancellationToken::new())
+            .expect("build app");
+        let child_key = app.session_key.clone().expect("child session key");
+        let result = app
+            .session_bus()
+            .expect("child session bus")
+            .send(Envelope::new(
+                Some(child_key.clone()),
+                parent_key.clone(),
+                Payload::StatusUpdate {
+                    task_id: "task-1".to_string(),
+                    progress: "50%".to_string(),
+                },
+            ))
+            .await
+            .expect("send status");
+        let envelope = tokio::time::timeout(Duration::from_secs(1), parent_receiver.recv())
+            .await
+            .expect("status update should arrive")
+            .expect("parent receiver should stay open");
+
+        assert!(result.delivered);
+        assert_eq!(envelope.from, Some(child_key));
+        assert_eq!(envelope.to, parent_key);
+        assert_eq!(
+            envelope.payload,
+            Payload::StatusUpdate {
+                task_id: "task-1".to_string(),
+                progress: "50%".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn headless_subagent_factory_new_builds_disabled_manager() {
         let deps = HeadlessSubagentFactoryDeps {
             router: Arc::new(ModelRouter::new()),
             config: FawxConfig::default(),
             improvement_provider: None,
+            session_bus: None,
         };
         let factory = HeadlessSubagentFactory::new(deps);
         let debug = format!("{factory:?}");

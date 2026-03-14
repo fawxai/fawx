@@ -8,11 +8,15 @@ use crate::sse::{
     SSE_CHANNEL_CAPACITY,
 };
 use crate::state::HttpState;
-use crate::types::{EncodedImage, ErrorBody, MessageRequest, MessageResponse};
+use crate::types::{
+    EncodedImage, ErrorBody, MessageRequest, MessageResponse, SendToSessionRequest,
+    SendToSessionResponse,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_llm::Message;
@@ -214,6 +218,26 @@ pub async fn handle_send_message(
     handle_send_message_for_session(state, headers, id, request).await
 }
 
+pub async fn handle_send_to_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Json(request): Json<SendToSessionRequest>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let target = target_session_key(&id)?;
+    let payload = send_request_payload(request)?;
+    let bus = load_session_bus(&state).await?;
+    let result = bus
+        .send(Envelope::new(None, target, payload))
+        .await
+        .map_err(|error| internal_error(anyhow::Error::new(error)))?;
+
+    Ok(Json(SendToSessionResponse {
+        envelope_id: result.envelope_id,
+        delivered: result.delivered,
+    })
+    .into_response())
+}
+
 pub(crate) async fn handle_send_message_for_session(
     state: HttpState,
     headers: HeaderMap,
@@ -400,6 +424,44 @@ fn record_session_turn(
     Ok(())
 }
 
+async fn load_session_bus(state: &HttpState) -> Result<SessionBus, (StatusCode, Json<ErrorBody>)> {
+    let app = state.app.lock().await;
+    app.session_bus()
+        .cloned()
+        .ok_or_else(session_bus_unavailable)
+}
+
+fn send_request_payload(
+    request: SendToSessionRequest,
+) -> Result<Payload, (StatusCode, Json<ErrorBody>)> {
+    match (request.text, request.payload) {
+        (Some(text), None) => {
+            validate_message_text(&text)?;
+            Ok(Payload::Text(text))
+        }
+        (None, Some(payload)) => serde_json::from_value(payload).map_err(invalid_payload),
+        (Some(_), Some(_)) => Err(bad_request("provide either text or payload, not both")),
+        (None, None) => Err(bad_request("request body must include text or payload")),
+    }
+}
+
+fn target_session_key(id: &str) -> Result<SessionKey, (StatusCode, Json<ErrorBody>)> {
+    SessionKey::new(id.to_string()).map_err(|_| bad_request("session id must not be empty"))
+}
+
+fn invalid_payload(error: serde_json::Error) -> (StatusCode, Json<ErrorBody>) {
+    bad_request(&format!("invalid payload: {error}"))
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.to_string(),
+        }),
+    )
+}
+
 fn require_session_registry(
     state: &HttpState,
 ) -> Result<SessionRegistry, (StatusCode, Json<ErrorBody>)> {
@@ -434,6 +496,15 @@ fn session_storage_unavailable() -> (StatusCode, Json<ErrorBody>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorBody {
             error: "session storage not available".to_string(),
+        }),
+    )
+}
+
+fn session_bus_unavailable() -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "session bus not available".to_string(),
         }),
     )
 }

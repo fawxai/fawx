@@ -5,6 +5,7 @@ use chrono::NaiveDate;
 use fx_analysis::AnalysisError;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
+use fx_bus::{BusStore, SessionBus};
 use fx_config::manager::ConfigManager;
 use fx_config::{
     parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
@@ -1227,6 +1228,18 @@ pub(crate) fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> 
         .unwrap_or_else(|| base_data_dir.to_path_buf())
 }
 
+pub(crate) fn build_session_bus_for_data_dir(data_dir: &Path) -> Option<SessionBus> {
+    let bus_db_path = data_dir.join("bus.redb");
+    let storage = match fx_storage::Storage::open(&bus_db_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(path = %bus_db_path.display(), error = %error, "session bus unavailable");
+            return None;
+        }
+    };
+    Some(SessionBus::new(BusStore::new(storage)))
+}
+
 pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
     if let Some(path) = &config.tools.working_dir {
         return path.clone();
@@ -1562,6 +1575,16 @@ mod tests {
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn session_bus_uses_dedicated_bus_database_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let bus = build_session_bus_for_data_dir(temp_dir.path());
+
+        assert!(bus.is_some(), "expected session bus to initialize");
+        assert!(temp_dir.path().join("bus.redb").exists());
+        assert!(!temp_dir.path().join("sessions.redb").exists());
     }
 
     fn create_embedding_model_dir(base: &Path, dimensions: usize) {

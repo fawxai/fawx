@@ -235,6 +235,7 @@ fn build_subagent_runner(
             router: Arc::clone(&router),
             config: config.clone(),
             improvement_provider,
+            session_bus: None,
         },
     );
     let builder = SubagentRoundNodesBuilder {

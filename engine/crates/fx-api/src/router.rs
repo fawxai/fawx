@@ -6,6 +6,7 @@ use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
 use crate::handlers::sessions::{
     handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
     handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
+    handle_send_to_session,
 };
 use crate::handlers::settings::{
     handle_get_thinking, handle_list_auth, handle_list_models, handle_list_skills,
@@ -40,6 +41,7 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/sessions/{id}/messages",
             get(handle_get_messages).post(handle_send_message),
         )
+        .route("/sessions/{id}/send", post(handle_send_to_session))
         .route("/sessions/{id}/context", get(handle_get_context))
         .route("/models", get(handle_list_models))
         .route("/model", put(handle_set_model))

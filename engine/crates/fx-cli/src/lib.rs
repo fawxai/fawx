@@ -122,10 +122,12 @@ fn build_initialized_headless_app(
 fn build_app_with_dependencies(
     build_config: HeadlessAppBuildConfig,
 ) -> anyhow::Result<headless::HeadlessApp> {
+    let session_bus = startup::build_session_bus_for_data_dir(&build_config.data_dir);
     let subagent_manager = build_subagent_manager(
         Arc::clone(&build_config.router),
         &build_config.config,
         build_config.improvement_provider.clone(),
+        session_bus.clone(),
     );
     let bundle = startup::build_headless_loop_engine_bundle(
         &build_config.config,
@@ -149,6 +151,8 @@ fn build_app_with_dependencies(
         system_prompt_text: None,
         subagent_manager,
         canary_monitor: Some(build_canary_monitor(&build_config.data_dir)),
+        session_bus,
+        session_key: Some(headless::main_session_key()),
     })
 }
 
@@ -169,11 +173,13 @@ fn build_subagent_manager(
     router: Arc<fx_llm::ModelRouter>,
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    session_bus: Option<fx_bus::SessionBus>,
 ) -> Arc<fx_subagent::SubagentManager> {
     let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
         router,
         config: config.clone(),
         improvement_provider,
+        session_bus,
     });
 
     Arc::new(fx_subagent::SubagentManager::new(
