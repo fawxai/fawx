@@ -1,5 +1,4 @@
 use crate::config_redaction;
-use crate::devices::DeviceStore;
 use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 use crate::error::HttpError;
 use crate::handlers::health::sanitize_config;
@@ -8,7 +7,6 @@ use crate::listener::{
     wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
 };
 use crate::middleware::verify_token;
-use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
@@ -26,6 +24,7 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use fx_bus::SessionBus;
 use fx_channel_telegram::{IncomingMessage, TelegramChannel};
 use fx_channel_webhook::WebhookChannel;
 use fx_cli::headless::{
@@ -171,6 +170,10 @@ impl AppEngine for HeadlessApp {
 
     fn config_manager(&self) -> Option<ConfigManagerHandle> {
         HeadlessApp::config_manager(self).cloned()
+    }
+
+    fn session_bus(&self) -> Option<&SessionBus> {
+        HeadlessApp::session_bus(self)
     }
 }
 
@@ -981,6 +984,7 @@ fn validate_bearer_token_store_ignores_empty() {
 mod routing_and_status {
     use super::*;
     use async_trait::async_trait;
+    use fx_bus::{BusStore, Payload, SessionBus};
     use fx_config::manager::ConfigManager;
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
@@ -1143,6 +1147,16 @@ mod routing_and_status {
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
         runtime_info: Arc<std::sync::RwLock<RuntimeInfo>>,
     ) -> HeadlessApp {
+        build_test_app_with_bus(router, config, config_manager, runtime_info, None)
+    }
+
+    fn build_test_app_with_bus(
+        router: ModelRouter,
+        config: fx_config::FawxConfig,
+        config_manager: Option<Arc<StdMutex<ConfigManager>>>,
+        runtime_info: Arc<std::sync::RwLock<RuntimeInfo>>,
+        session_bus: Option<SessionBus>,
+    ) -> HeadlessApp {
         let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
             factory: Arc::new(DisabledSubagentFactory::new("disabled")),
             limits: SubagentLimits::default(),
@@ -1160,6 +1174,8 @@ mod routing_and_status {
             system_prompt_text: None,
             subagent_manager,
             canary_monitor: None,
+            session_bus,
+            session_key: None,
         })
         .expect("test app")
     }
@@ -1216,9 +1232,6 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
-            pairing: Arc::new(Mutex::new(PairingState::new())),
-            devices: Arc::new(Mutex::new(DeviceStore::new())),
-            devices_path: Some(data_dir.join("devices.json")),
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
@@ -1243,9 +1256,6 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
-            pairing: Arc::new(Mutex::new(PairingState::new())),
-            devices: Arc::new(Mutex::new(DeviceStore::new())),
-            devices_path: Some(data_dir.join("devices.json")),
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
@@ -1283,6 +1293,12 @@ mod routing_and_status {
     fn make_session_registry() -> SessionRegistry {
         let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
         SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+    }
+
+    fn make_session_bus() -> (SessionBus, BusStore) {
+        let store =
+            BusStore::new(fx_storage::Storage::open_in_memory().expect("in-memory storage"));
+        (SessionBus::new(store.clone()), store)
     }
 
     fn test_state_with_sessions(registry: SessionRegistry) -> HttpState {
@@ -1794,6 +1810,78 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn send_to_session_endpoint_returns_envelope_id() {
+        let (bus, _store) = make_session_bus();
+        let session = SessionKey::new("sess-online").expect("session key");
+        let mut receiver = bus.subscribe(&session);
+        let app = build_router(
+            test_state_with_app(
+                build_test_app_with_bus(
+                    mock_router(),
+                    fx_config::FawxConfig::default(),
+                    None,
+                    test_runtime_info(),
+                    Some(bus.clone()),
+                ),
+                Vec::new(),
+            ),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/sessions/sess-online/send",
+                r#"{"text":"hello session"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["envelope_id"].as_str().expect("envelope id").len() > 10);
+        assert_eq!(json["delivered"], true);
+        assert_eq!(
+            receiver.try_recv().expect("delivered envelope").payload,
+            Payload::Text("hello session".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_nonexistent_session_queues_for_later() {
+        let (bus, store) = make_session_bus();
+        let app = build_router(
+            test_state_with_app(
+                build_test_app_with_bus(
+                    mock_router(),
+                    fx_config::FawxConfig::default(),
+                    None,
+                    test_runtime_info(),
+                    Some(bus),
+                ),
+                Vec::new(),
+            ),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/sessions/sess-missing/send",
+                r#"{"text":"wake up later"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["delivered"], false);
+        assert!(json["envelope_id"].as_str().expect("envelope id").len() > 10);
+        let session = SessionKey::new("sess-missing").expect("session key");
+        assert_eq!(store.count(&session).expect("count"), 1);
+    }
+
+    #[tokio::test]
     async fn message_with_images_accepted() {
         let app = build_router(test_state(None, Vec::new()), None);
         let req = Request::builder()
@@ -1850,85 +1938,6 @@ allowed_chat_ids = [123]
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn pair_exchange_endpoint_is_public() {
-        let temp = TempDir::new().expect("tempdir");
-        let mut config = fx_config::FawxConfig::default();
-        config.general.data_dir = Some(temp.path().to_path_buf());
-        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/pair")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"code":"ZZZ-999"}"#))
-            .expect("request");
-
-        let response = app.oneshot(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let json = response_json(response).await;
-        assert_eq!(json["error"], "invalid_code");
-    }
-
-    #[tokio::test]
-    async fn pair_generate_requires_auth_and_returns_code() {
-        let temp = TempDir::new().expect("tempdir");
-        let mut config = fx_config::FawxConfig::default();
-        config.general.data_dir = Some(temp.path().to_path_buf());
-        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
-
-        // Without auth → 401
-        let no_auth = Request::builder()
-            .method("POST")
-            .uri("/v1/pair/generate")
-            .body(Body::empty())
-            .expect("request");
-        let response = app.clone().oneshot(no_auth).await.expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // With auth → 200 + well-formed code
-        let with_auth = Request::builder()
-            .method("POST")
-            .uri("/v1/pair/generate")
-            .header("authorization", format!("Bearer {TEST_TOKEN}"))
-            .body(Body::empty())
-            .expect("request");
-        let response = app.oneshot(with_auth).await.expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        let code = json["code"].as_str().expect("code field");
-        assert_eq!(code.len(), 7); // XXX-XXX format
-        assert_eq!(&code[3..4], "-");
-        assert!(json["ttl_seconds"].as_u64().unwrap_or(0) > 0);
-    }
-
-    #[tokio::test]
-    async fn device_token_authenticates_and_persists_usage() {
-        let temp = TempDir::new().expect("tempdir");
-        let mut config = fx_config::FawxConfig::default();
-        config.general.data_dir = Some(temp.path().to_path_buf());
-        let state = test_state_with_config(config, None, Vec::new());
-        let devices_path = state.devices_path.clone().expect("devices path");
-        let raw_token = {
-            let mut devices = state.devices.lock().await;
-            let (raw_token, _device) = devices.create_device("Joe's MacBook");
-            assert_eq!(devices.list_devices().len(), 1);
-            devices.save(&devices_path).expect("save devices");
-            raw_token
-        };
-        let app = build_router(state.clone(), None);
-        let request = Request::builder()
-            .method("GET")
-            .uri("/status")
-            .header("authorization", format!("Bearer {raw_token}"))
-            .body(Body::empty())
-            .expect("request");
-
-        let response = app.oneshot(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let loaded = DeviceStore::load(&devices_path);
-        assert!(loaded.list_devices()[0].last_used_at > 0);
     }
 
     #[tokio::test]
@@ -2437,9 +2446,6 @@ allowed_chat_ids = [123]
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
-            pairing: Arc::new(Mutex::new(PairingState::new())),
-            devices: Arc::new(Mutex::new(DeviceStore::new())),
-            devices_path: Some(data_dir.join("devices.json")),
             channels: ChannelRuntime {
                 router: Arc::new(ResponseRouter::new(Arc::new(router_registry))),
                 http: Arc::new(HttpChannel::new()),
@@ -2872,6 +2878,8 @@ mod telegram_update {
             system_prompt_text: None,
             subagent_manager,
             canary_monitor: None,
+            session_bus: None,
+            session_key: None,
         })
         .expect("test app")
     }
