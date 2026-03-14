@@ -1,13 +1,14 @@
+use super::api_client::{
+    api_error_message, bearer_token, http_client, request_error, server_not_running_message,
+};
 use super::runtime_layout::RuntimeLayout;
 use anyhow::Context;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const DEFAULT_PAIR_TTL_SECONDS: u64 = 300;
-const PAIR_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 const PAIR_BOX_CONTENT_WIDTH: usize = 33;
 
 #[derive(Debug, Clone, Args)]
@@ -35,11 +36,6 @@ struct PairCodeResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct GeneratePairRequest {
     ttl_seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,39 +81,6 @@ async fn parse_pair_response(response: reqwest::Response) -> anyhow::Result<Pair
             .context("failed to decode pairing response");
     }
     Err(anyhow::anyhow!(api_error_message(response).await))
-}
-
-async fn api_error_message(response: reqwest::Response) -> String {
-    let status = response.status();
-    match response.json::<ErrorResponse>().await {
-        Ok(body) if !body.error.trim().is_empty() => body.error,
-        _ => format!("request failed with status {status}"),
-    }
-}
-
-fn request_error(error: reqwest::Error) -> anyhow::Error {
-    if error.is_connect() {
-        anyhow::anyhow!(server_not_running_message())
-    } else {
-        anyhow::Error::new(error)
-    }
-}
-
-fn http_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(PAIR_REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .context("failed to build HTTP client")
-}
-
-fn bearer_token(layout: &RuntimeLayout) -> anyhow::Result<&str> {
-    layout
-        .config
-        .http
-        .bearer_token
-        .as_deref()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!(missing_auth_message()))
 }
 
 fn pair_url(port: u16) -> String {
@@ -207,26 +170,11 @@ async fn ping_health(client: &reqwest::Client, port: u16) -> anyhow::Result<()> 
 }
 
 fn remaining_seconds(expires_at: u64) -> u64 {
-    expires_at.saturating_sub(current_unix_seconds())
+    expires_at.saturating_sub(super::api_client::current_unix_seconds())
 }
 
 fn format_countdown(total_seconds: u64) -> String {
     format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
-}
-
-fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
-}
-
-fn server_not_running_message() -> &'static str {
-    "Fawx server is not running. Start it with `fawx serve --http`"
-}
-
-fn missing_auth_message() -> &'static str {
-    "No authentication configured. Run `fawx setup` first."
 }
 
 #[cfg(test)]
@@ -240,6 +188,7 @@ mod tests {
     };
     use fx_config::FawxConfig;
     use serde_json::Value;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::{

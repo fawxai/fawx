@@ -7,7 +7,7 @@ use axum::Json;
 use serde::Serialize;
 use std::path::Path as FsPath;
 
-type HandlerResult<T> = Result<T, (StatusCode, Json<ErrorBody>)>;
+use super::HandlerResult;
 
 #[derive(Debug, Serialize)]
 pub struct ListDevicesResponse {

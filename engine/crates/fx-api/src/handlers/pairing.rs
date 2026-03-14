@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_DEVICE_NAME: &str = "Unnamed device";
 
-type HandlerResult<T> = Result<T, (StatusCode, Json<ErrorBody>)>;
+use super::HandlerResult;
 
 #[derive(Debug, Deserialize)]
 pub struct GeneratePairRequest {

@@ -5,6 +5,7 @@
 //! functions appear unused from the lib's perspective — especially on
 //! macOS where cfg-gated code changes dead-code analysis.
 
+pub(crate) mod api_client;
 #[allow(dead_code)]
 pub mod audit;
 #[allow(dead_code)]

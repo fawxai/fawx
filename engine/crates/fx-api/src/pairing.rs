@@ -1,7 +1,7 @@
 use rand::Rng;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const CODE_LENGTH: usize = 6;
 const MAX_ATTEMPTS: u32 = 5;
@@ -161,10 +161,7 @@ fn normalized_ttl(ttl_seconds: u64) -> u64 {
 }
 
 fn current_time_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+    crate::time_util::current_time_seconds()
 }
 
 fn invalid_attempt_key(code: &str) -> String {

@@ -4,7 +4,6 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DEVICE_TOKEN_PREFIX: &str = "fawx_pat_";
@@ -152,10 +151,7 @@ fn hash_token(token: &str) -> String {
 }
 
 fn current_time_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+    crate::time_util::current_time_seconds()
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

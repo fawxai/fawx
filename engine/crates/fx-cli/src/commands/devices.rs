@@ -1,10 +1,11 @@
+use super::api_client::{
+    api_error_message, bearer_token, current_unix_seconds, http_client, request_error,
+};
 use super::runtime_layout::RuntimeLayout;
 use anyhow::Context;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEVICES_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 const LEGACY_MILLISECONDS_THRESHOLD: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Args)]
@@ -48,11 +49,6 @@ struct RevokeDeviceResponse {
     device_id: String,
     #[serde(default)]
     device_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,20 +159,15 @@ async fn parse_revoke_response(
     Err(anyhow::anyhow!(api_error_message(response).await))
 }
 
-async fn api_error_message(response: reqwest::Response) -> String {
-    let status = response.status();
-    match response.json::<ErrorResponse>().await {
-        Ok(body) if !body.error.trim().is_empty() => body.error,
-        _ => format!("request failed with status {status}"),
-    }
+fn render_devices_table(response: &DevicesResponse) -> String {
+    render_devices_table_at(response, current_unix_seconds())
 }
 
-fn render_devices_table(response: &DevicesResponse) -> String {
+fn render_devices_table_at(response: &DevicesResponse, now: u64) -> String {
     if response.devices.is_empty() {
         return "Paired Devices:\n\n  (no paired devices)\n".to_string();
     }
 
-    let now = current_unix_seconds();
     let devices = sorted_devices(&response.devices);
     let widths = table_widths(&devices, now);
     let header = render_table_header(&widths);
@@ -274,52 +265,12 @@ fn normalize_timestamp(timestamp: u64) -> u64 {
     }
 }
 
-fn http_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(DEVICES_REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .context("failed to build HTTP client")
-}
-
-fn bearer_token(layout: &RuntimeLayout) -> anyhow::Result<&str> {
-    layout
-        .config
-        .http
-        .bearer_token
-        .as_deref()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!(missing_auth_message()))
-}
-
 fn devices_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1/devices")
 }
 
 fn device_url(port: u16, device_id: &str) -> String {
     format!("{}/{}", devices_url(port), device_id)
-}
-
-fn request_error(error: reqwest::Error) -> anyhow::Error {
-    if error.is_connect() {
-        anyhow::anyhow!(server_not_running_message())
-    } else {
-        anyhow::Error::new(error)
-    }
-}
-
-fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
-}
-
-fn server_not_running_message() -> &'static str {
-    "Fawx server is not running. Start it with `fawx serve --http`"
-}
-
-fn missing_auth_message() -> &'static str {
-    "No authentication configured. Run `fawx setup` first."
 }
 
 #[cfg(test)]
@@ -360,24 +311,9 @@ mod tests {
             }],
         };
 
-        let rendered = render_devices_table_with_now(&response, 1_700_000_600);
+        let rendered = render_devices_table_at(&response, 1_700_000_600);
 
         assert!(rendered.contains("10m ago"));
         assert!(rendered.contains("5m ago"));
-    }
-
-    fn render_devices_table_with_now(response: &DevicesResponse, now: u64) -> String {
-        let devices = sorted_devices(&response.devices);
-        let widths = table_widths(&devices, now);
-        let header = render_table_header(&widths);
-        let rows = devices
-            .iter()
-            .map(|device| render_device_row(device, &widths, now))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Paired Devices:\n\n{header}\n{rows}\n\n{} devices paired.",
-            response.devices.len()
-        )
     }
 }
