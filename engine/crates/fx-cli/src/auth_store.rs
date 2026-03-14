@@ -135,7 +135,6 @@ impl AuthStore {
     /// Returns the token wrapped in [`Zeroizing`] so it is automatically
     /// zeroed when dropped, preventing secret material from lingering in
     /// memory.
-    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn get_provider_token(&self, provider: &str) -> Result<Option<Zeroizing<String>>, String> {
         let store = self.open_store()?;
         let key = provider_token_key(provider);
