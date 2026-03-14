@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct InputBar: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
     @Binding var text: String
 
     let queuedMessage: String?
@@ -24,51 +26,25 @@ struct InputBar: View {
                 QueuedMessageChip(text: queuedMessage, dismiss: dismissQueuedMessage)
             }
 
-            HStack(alignment: .bottom, spacing: FawxSpacing.paddingMD) {
-                TextField(effectivePlaceholder, text: $text, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(FawxTypography.input)
-                    .foregroundStyle(Color.fawxText)
-                    .lineLimit(1 ... 6)
-                    .accessibilityIdentifier("messageInput")
-
-                HStack(spacing: FawxSpacing.paddingSM) {
-                    Menu {
-                        ForEach(availableModels) { model in
-                            Button(compactModelName(model.modelID, limit: 28)) {
-                                selectModel(model.modelID)
-                            }
-                        }
-                    } label: {
-                        ModelBadge(title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20))
+            if usesCompactMobileLayout {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                    messageField
+                    HStack(alignment: .center, spacing: FawxSpacing.paddingSM) {
+                        modelMenu
+                        thinkingMenu
+                        Spacer(minLength: 0)
+                        primaryButton
                     }
-                    .disabled(modelMenuDisabled)
-                    .help(modelHelpText)
+                }
+            } else {
+                HStack(alignment: .bottom, spacing: FawxSpacing.paddingMD) {
+                    messageField
 
-                    Menu {
-                        ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
-                            Button(level.rawValue.capitalized) {
-                                selectThinking(level)
-                            }
-                        }
-                    } label: {
-                        ModelBadge(title: displayThinkingLevel(thinkingLevel))
+                    HStack(spacing: FawxSpacing.paddingSM) {
+                        modelMenu
+                        thinkingMenu
+                        primaryButton
                     }
-                    .disabled(thinkingMenuDisabled)
-                    .help(isStreaming ? "Cannot change thinking while a response is streaming." : "Server thinking level")
-
-                    Button(primaryButtonTitle) {
-                        if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            stopAction()
-                        } else {
-                            sendAction()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(primaryButtonTint)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .accessibilityIdentifier("sendButton")
-                    .disabled(primaryButtonDisabled)
                 }
             }
         }
@@ -89,6 +65,60 @@ struct InputBar: View {
             return currentPhase
         }
         return placeholder
+    }
+
+    private var messageField: some View {
+        TextField(effectivePlaceholder, text: $text, axis: .vertical)
+            .textFieldStyle(.plain)
+            .font(FawxTypography.input)
+            .foregroundStyle(Color.fawxText)
+            .lineLimit(1 ... 6)
+            .accessibilityIdentifier("messageInput")
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var modelMenu: some View {
+        Menu {
+            ForEach(availableModels) { model in
+                Button(compactModelName(model.modelID, limit: 28)) {
+                    selectModel(model.modelID)
+                }
+            }
+        } label: {
+            ModelBadge(title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20))
+        }
+        .disabled(modelMenuDisabled)
+        .help(modelHelpText)
+    }
+
+    private var thinkingMenu: some View {
+        Menu {
+            ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
+                Button(level.rawValue.capitalized) {
+                    selectThinking(level)
+                }
+            }
+        } label: {
+            ModelBadge(title: displayThinkingLevel(thinkingLevel))
+        }
+        .disabled(thinkingMenuDisabled)
+        .help(isStreaming ? "Cannot change thinking while a response is streaming." : "Server thinking level")
+    }
+
+    private var primaryButton: some View {
+        Button(primaryButtonTitle) {
+            if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                stopAction()
+            } else {
+                sendAction()
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(primaryButtonTint)
+        .keyboardShortcut(.return, modifiers: .command)
+        .accessibilityIdentifier("sendButton")
+        .disabled(primaryButtonDisabled)
+        .frame(minWidth: 72)
     }
 
     private var modelMenuDisabled: Bool {
@@ -126,5 +156,13 @@ struct InputBar: View {
             return "\(activeModelName)\nCannot change model while a response is streaming."
         }
         return activeModelName
+    }
+
+    private var usesCompactMobileLayout: Bool {
+#if os(iOS)
+        horizontalSizeClass == .compact
+#else
+        false
+#endif
     }
 }

@@ -1,6 +1,8 @@
 import XCTest
 
 final class PairingFlowTests: XCTestCase {
+    private let pairingCodeFilePath = "/tmp/fawx_test_pairing_code.txt"
+
     private var serverURL: String {
         if let value = ProcessInfo.processInfo.environment["FAWX_TEST_SERVER_URL"], value.isEmpty == false {
             return value
@@ -14,14 +16,21 @@ final class PairingFlowTests: XCTestCase {
         return "http://100.123.20.63:8400"
     }
 
-    private var pairingCode: String {
+    private var pairingCode: String? {
         if let value = ProcessInfo.processInfo.environment["FAWX_TEST_PAIRING_CODE"], value.isEmpty == false {
             return value
         }
-        if let value = try? String(contentsOfFile: "/tmp/fawx_test_pairing_code.txt", encoding: .utf8) {
-            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: pairingCodeFilePath),
+              let modifiedAt = attributes[.modificationDate] as? Date,
+              Date().timeIntervalSince(modifiedAt) <= 300,
+              let value = try? String(contentsOfFile: pairingCodeFilePath, encoding: .utf8)
+        else {
+            return nil
         }
-        return ""
+
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     override func setUpWithError() throws {
@@ -30,9 +39,11 @@ final class PairingFlowTests: XCTestCase {
 
     @MainActor
     func testPairingCodeCompletesOnboarding() throws {
-        XCTAssertFalse(pairingCode.isEmpty, "FAWX_TEST_PAIRING_CODE must be set for pairing tests.")
+        guard let pairingCode else {
+            throw XCTSkip("Set a fresh FAWX_TEST_PAIRING_CODE or update /tmp/fawx_test_pairing_code.txt within the last 5 minutes to run pairing tests.")
+        }
 
-        let app = TestConfig.makeApp(resetState: true)
+        let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
 
         let serverField = app.textFields["serverURLField"]

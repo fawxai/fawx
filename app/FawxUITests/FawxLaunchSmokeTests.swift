@@ -6,7 +6,7 @@ final class FawxLaunchSmokeTests: XCTestCase {
     }
 
     func testLaunchShowsOnboardingWhenStateIsReset() throws {
-        let app = TestConfig.makeApp(resetState: true)
+        let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
 
         XCTAssertTrue(

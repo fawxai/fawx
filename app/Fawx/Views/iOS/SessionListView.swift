@@ -105,7 +105,7 @@ struct SessionListView: View {
     }
 
     private func createNewSession() {
-        Task {
+        Task { @MainActor in
             if let sessionID = await sessionViewModel.createNewSession() {
                 openSession(sessionID)
             }
@@ -113,7 +113,7 @@ struct SessionListView: View {
     }
 
     private func clearSession(_ sessionID: String) {
-        Task {
+        Task { @MainActor in
             if chatViewModel.activeStreamSessionID == sessionID {
                 chatViewModel.stopStreaming()
             }
@@ -126,7 +126,7 @@ struct SessionListView: View {
     }
 
     private func deleteSession(_ sessionID: String) {
-        Task {
+        Task { @MainActor in
             if chatViewModel.activeStreamSessionID == sessionID {
                 chatViewModel.stopStreaming()
             }

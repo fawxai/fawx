@@ -59,6 +59,7 @@ struct MessageBubble: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .accessibilityIdentifier(accessibilityIdentifier)
     }
 
     @ViewBuilder
@@ -100,6 +101,17 @@ struct MessageBubble: View {
             return Color.fawxSurface
         case .system:
             return Color.fawxAccentSubtle
+        }
+    }
+
+    private var accessibilityIdentifier: String {
+        switch role {
+        case .user:
+            return "userMessage"
+        case .assistant:
+            return isStreaming ? "streamingAssistantMessage" : "assistantMessage"
+        case .system:
+            return "systemMessage"
         }
     }
 }

@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		01C5301484465E3E7C541A9D /* InputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 087BAB7361F5CCDC27BA6864 /* InputBar.swift */; };
 		078E407AA4F2E807B6B04952 /* ChatDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66BB4F24881B0920C360CCD2 /* ChatDetailView.swift */; };
+		08859F99F1DCFF038B1BB36F /* AuthenticatedChatFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */; };
 		09B4993D6B657C1DFB8BBF50 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DBD84A122470F37BFA9E2CA /* ChatViewModel.swift */; };
 		0D04F1C36E70E3200A207E3E /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2822C7AA61307F89BAE00E0 /* Formatters.swift */; };
 		0EC64120FB0EC24ABB9E18DE /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30D703AD586AB7D1F2B5D6F4 /* OnboardingView.swift */; };
@@ -149,6 +150,7 @@
 		BFFF4154D4D9B8169FD9D9F7 /* FawxClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxClient.swift; sourceTree = "<group>"; };
 		C0F3654454E2926DF38F0ED7 /* ThinkingLevel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkingLevel.swift; sourceTree = "<group>"; };
 		C2E500BF4B907FA02585BB44 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticatedChatFlowTests.swift; sourceTree = "<group>"; };
 		C7F19EE118E04C627C071358 /* Session.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Session.swift; sourceTree = "<group>"; };
 		D077EA1389A1D84FDB7D0DF4 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		D08FE445D7033AAED2208E6D /* AuthProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthProvider.swift; sourceTree = "<group>"; };
@@ -216,6 +218,7 @@
 		4F16518D93A2D15E671C0F51 /* FawxUITests */ = {
 			isa = PBXGroup;
 			children = (
+				C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */,
 				8289C541AC8F222B20A54ADC /* FawxLaunchSmokeTests.swift */,
 				820A7E36F11D83635B504EE7 /* PairingFlowTests.swift */,
 				6333ABC39A5F77ED86604EA0 /* TestConfig.swift */,
@@ -456,6 +459,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				08859F99F1DCFF038B1BB36F /* AuthenticatedChatFlowTests.swift in Sources */,
 				DD6C3C3BDBEB32040E2BCB54 /* FawxLaunchSmokeTests.swift in Sources */,
 				8B2DFC34BD8C1F3D7DA57EBF /* PairingFlowTests.swift in Sources */,
 				37603F5EFF882EE8E4EF50B8 /* TestConfig.swift in Sources */,

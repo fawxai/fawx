@@ -62,13 +62,19 @@ final class AppState {
         let storedToken = try? KeychainHelper.token(forServer: storedServerURL)
         let storedDeviceName = UserDefaults.standard.string(forKey: StorageKey.pairedDeviceName)
 
-        self.serverURLString = storedServerURL
-        self.pairedDeviceName = storedDeviceName
+        let resolvedServerURL = UITestLaunchOptions.serverURLOverride ?? storedServerURL
+        let resolvedToken = UITestLaunchOptions.bearerTokenOverride ?? storedToken ?? nil
+        let resolvedDeviceName = UITestLaunchOptions.pairedDeviceNameOverride
+            ?? storedDeviceName
+            ?? (UITestLaunchOptions.isUITesting && resolvedToken != nil ? "UI Test Device" : nil)
+
+        self.serverURLString = resolvedServerURL
+        self.pairedDeviceName = resolvedDeviceName
         self.theme = storedTheme
-        self.authToken = storedToken ?? nil
+        self.authToken = resolvedToken
         self.client = FawxClient(
-            baseURL: URL(string: storedServerURL),
-            bearerToken: storedToken ?? nil
+            baseURL: URL(string: resolvedServerURL),
+            bearerToken: resolvedToken
         )
     }
 

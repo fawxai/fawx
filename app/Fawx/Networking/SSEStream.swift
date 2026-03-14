@@ -17,28 +17,34 @@ struct SSEParser {
     private var currentDataLines: [String] = []
 
     mutating func parseLine(_ line: String) throws -> [SSEEvent] {
-        if line.hasPrefix(":") {
+        let normalizedLine = line.trimmingTrailingCarriageReturn()
+        var emittedEvents: [SSEEvent] = []
+
+        if normalizedLine.hasPrefix(":") {
             return []
         }
 
-        if line.isEmpty {
+        if normalizedLine.isEmpty {
             return try flush()
         }
 
-        if line.hasPrefix("event:") {
-            currentEventName = line
+        if normalizedLine.hasPrefix("event:") {
+            if currentDataLines.isEmpty == false {
+                emittedEvents.append(contentsOf: try flush())
+            }
+            currentEventName = normalizedLine
                 .dropFirst("event:".count)
-                .trimmingCharacters(in: .whitespaces)
-            return []
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return emittedEvents
         }
 
-        if line.hasPrefix("data:") {
-            let data = line.dropFirst("data:".count)
+        if normalizedLine.hasPrefix("data:") {
+            let data = normalizedLine.dropFirst("data:".count)
             currentDataLines.append(String(data).trimmingPrefixSpace())
-            return []
+            return emittedEvents
         }
 
-        return []
+        return emittedEvents
     }
 
     mutating func finish() throws -> [SSEEvent] {
@@ -82,16 +88,16 @@ struct SSEParser {
             return .toolCallComplete(
                 id: payload.id,
                 name: payload.name,
-                arguments: payload.arguments ?? ""
+                arguments: payload.argumentsString
             )
         case "tool_result":
             let payload = try decoder.decode(ToolResultPayload.self, from: Data(data.utf8))
             return .toolResult(
                 id: payload.id,
-                output: payload.output ?? "",
+                output: payload.outputString,
                 isError: payload.isError
             )
-        case "phase":
+        case "phase", "phase_change":
             let payload = try decoder.decode(PhasePayload.self, from: Data(data.utf8))
             return .phase(payload.phase)
         case "engine_error":
@@ -125,7 +131,11 @@ private struct ToolCallStartPayload: Decodable {
 private struct ToolCallCompletePayload: Decodable {
     let id: String?
     let name: String?
-    let arguments: String?
+    let arguments: JSONValue?
+
+    var argumentsString: String {
+        arguments?.description ?? ""
+    }
 }
 
 private struct ToolCallDeltaPayload: Decodable {
@@ -140,8 +150,12 @@ private struct ToolCallDeltaPayload: Decodable {
 
 private struct ToolResultPayload: Decodable {
     let id: String?
-    let output: String?
+    let output: JSONValue?
     let isError: Bool
+
+    var outputString: String {
+        output?.description ?? ""
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -171,5 +185,9 @@ private struct FatalErrorPayload: Decodable {
 private extension String {
     func trimmingPrefixSpace() -> String {
         hasPrefix(" ") ? String(dropFirst()) : self
+    }
+
+    func trimmingTrailingCarriageReturn() -> String {
+        hasSuffix("\r") ? String(dropLast()) : self
     }
 }
