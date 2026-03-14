@@ -10,11 +10,20 @@ use uuid::Uuid;
 const DEVICE_TOKEN_PREFIX: &str = "fawx_pat_";
 const DEVICE_TOKEN_LENGTH: usize = 32;
 const TOKEN_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const LEGACY_MILLISECONDS_THRESHOLD: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceToken {
     pub id: String,
     pub token_hash: String,
+    pub device_name: String,
+    pub created_at: u64,
+    pub last_used_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub id: String,
     pub device_name: String,
     pub created_at: u64,
     pub last_used_at: u64,
@@ -26,6 +35,17 @@ pub struct DeviceStore {
     devices: Vec<DeviceToken>,
 }
 
+impl From<&DeviceToken> for DeviceInfo {
+    fn from(device: &DeviceToken) -> Self {
+        Self {
+            id: device.id.clone(),
+            device_name: device.device_name.clone(),
+            created_at: device.created_at,
+            last_used_at: device.last_used_at,
+        }
+    }
+}
+
 impl DeviceStore {
     pub fn new() -> Self {
         Self::default()
@@ -35,6 +55,10 @@ impl DeviceStore {
         &self.devices
     }
 
+    pub fn list_device_info(&self) -> Vec<DeviceInfo> {
+        self.devices.iter().map(DeviceInfo::from).collect()
+    }
+
     #[cfg(test)]
     fn list_devices_mut(&mut self) -> &mut Vec<DeviceToken> {
         &mut self.devices
@@ -42,7 +66,7 @@ impl DeviceStore {
 
     pub fn create_device(&mut self, name: &str) -> (String, DeviceToken) {
         let raw_token = format!("{DEVICE_TOKEN_PREFIX}{}", random_token_body());
-        let timestamp = current_time_millis();
+        let timestamp = current_time_seconds();
         let device = DeviceToken {
             id: format!("dev-{}", Uuid::new_v4().simple()),
             token_hash: hash_token(&raw_token),
@@ -60,14 +84,20 @@ impl DeviceStore {
             .devices
             .iter_mut()
             .find(|device| device.token_hash == token_hash)?;
-        device.last_used_at = current_time_millis();
+        device.last_used_at = current_time_seconds();
         Some(device.id.clone())
     }
 
-    pub fn revoke(&mut self, device_id: &str) -> bool {
-        let original_len = self.devices.len();
-        self.devices.retain(|device| device.id != device_id);
-        self.devices.len() != original_len
+    pub fn revoke(&mut self, device_id: &str) -> Option<DeviceToken> {
+        let index = self
+            .devices
+            .iter()
+            .position(|device| device.id == device_id)?;
+        Some(self.devices.remove(index))
+    }
+
+    pub(crate) fn restore_device(&mut self, device: DeviceToken) {
+        self.devices.push(device);
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -84,6 +114,12 @@ impl DeviceStore {
             Err(error) => return handle_load_error(path, error),
         };
         parse_store(path, &bytes)
+    }
+
+    fn normalize_timestamps(&mut self) {
+        for device in &mut self.devices {
+            normalize_device_timestamps(device);
+        }
     }
 }
 
@@ -115,11 +151,11 @@ fn hash_token(token: &str) -> String {
         .collect()
 }
 
-fn current_time_millis() -> u64 {
-    let elapsed = SystemTime::now()
+fn current_time_seconds() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -145,12 +181,28 @@ fn handle_load_error(path: &Path, error: std::io::Error) -> DeviceStore {
 }
 
 fn parse_store(path: &Path, bytes: &[u8]) -> DeviceStore {
-    match serde_json::from_slice(bytes) {
-        Ok(store) => store,
+    match serde_json::from_slice::<DeviceStore>(bytes) {
+        Ok(mut store) => {
+            store.normalize_timestamps();
+            store
+        }
         Err(error) => {
             tracing::warn!(path = %path.display(), error = %error, "failed to parse device store");
             DeviceStore::new()
         }
+    }
+}
+
+fn normalize_device_timestamps(device: &mut DeviceToken) {
+    device.created_at = normalize_timestamp(device.created_at);
+    device.last_used_at = normalize_timestamp(device.last_used_at);
+}
+
+fn normalize_timestamp(timestamp: u64) -> u64 {
+    if timestamp >= LEGACY_MILLISECONDS_THRESHOLD {
+        timestamp / 1_000
+    } else {
+        timestamp
     }
 }
 
@@ -190,6 +242,17 @@ mod tests {
     }
 
     #[test]
+    fn list_device_info_excludes_token_hash() {
+        let mut store = DeviceStore::new();
+        let _ = store.create_device("Joe's MacBook");
+
+        let json = serde_json::to_value(store.list_device_info()).expect("serialize device info");
+
+        assert!(json[0].get("token_hash").is_none());
+        assert_eq!(json[0]["device_name"], "Joe's MacBook");
+    }
+
+    #[test]
     fn authenticate_works() {
         let mut store = DeviceStore::new();
         let (raw_token, device) = store.create_device("Joe's MacBook");
@@ -205,8 +268,8 @@ mod tests {
         let mut store = DeviceStore::new();
         let (raw_token, device) = store.create_device("Joe's MacBook");
 
-        assert!(store.revoke(&device.id));
-        assert!(!store.revoke(&device.id));
+        assert_eq!(store.revoke(&device.id), Some(device.clone()));
+        assert!(store.revoke(&device.id).is_none());
         assert!(store.authenticate(&raw_token).is_none());
     }
 
@@ -238,6 +301,31 @@ mod tests {
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
 
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn load_normalizes_legacy_millisecond_timestamps() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("devices.json");
+        let store = DeviceStore {
+            devices: vec![DeviceToken {
+                id: "dev-123".to_string(),
+                token_hash: "hash".to_string(),
+                device_name: "Joe's MacBook".to_string(),
+                created_at: 1_700_000_000_000,
+                last_used_at: 1_700_000_005_000,
+            }],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&store).expect("serialize legacy store"),
+        )
+        .expect("write legacy store");
+
+        let loaded = DeviceStore::load(&path);
+
+        assert_eq!(loaded.list_devices()[0].created_at, 1_700_000_000);
+        assert_eq!(loaded.list_devices()[0].last_used_at, 1_700_000_005);
     }
 
     #[test]

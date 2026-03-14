@@ -1,4 +1,5 @@
 pub mod config;
+pub mod devices;
 pub mod fleet;
 pub mod health;
 pub mod message;

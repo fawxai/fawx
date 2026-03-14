@@ -92,6 +92,12 @@ enum Commands {
     /// Show runtime status for a running Fawx instance
     Status,
 
+    /// Generate a device pairing code for the local HTTP server
+    Pair(commands::pair::PairArgs),
+
+    /// List or revoke paired devices
+    Devices(commands::devices::DevicesArgs),
+
     /// Show CLI build information
     Version,
 
@@ -847,6 +853,8 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Update(args) => commands::update::run(args),
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Status => Ok(commands::status::run().await?),
+        Commands::Pair(args) => Ok(commands::pair::run(&args).await?),
+        Commands::Devices(args) => Ok(commands::devices::run(&args).await?),
         Commands::Version => Ok(commands::version::run()),
         Commands::Logs(args) => commands::logs::run(&args),
         Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
@@ -1080,6 +1088,30 @@ mod tests {
     fn cli_parses_setup_command() {
         let cli = Cli::parse_from(["fawx", "setup", "--force"]);
         assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
+    }
+
+    #[test]
+    fn cli_parses_pair_command() {
+        let cli = Cli::parse_from(["fawx", "pair", "--ttl", "90", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pair(crate::commands::pair::PairArgs {
+                ttl: 90,
+                json: true
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_devices_revoke_command_with_json_flag_after_subcommand() {
+        let cli = Cli::parse_from(["fawx", "devices", "revoke", "dev-123", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Devices(crate::commands::devices::DevicesArgs {
+                json: true,
+                command: Some(crate::commands::devices::DevicesCommand::Revoke { device_id })
+            })) if device_id == "dev-123"
+        ));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::pairing::{PairingCode, PairingError};
+use crate::pairing::{PairingCode, PairingError, PairingState};
 use crate::state::HttpState;
 use crate::types::ErrorBody;
 use axum::extract::{Json, State};
@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_DEVICE_NAME: &str = "Unnamed device";
 
 type HandlerResult<T> = Result<T, (StatusCode, Json<ErrorBody>)>;
+
+#[derive(Debug, Deserialize)]
+pub struct GeneratePairRequest {
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ExchangePairRequest {
@@ -22,9 +28,22 @@ pub struct ExchangePairResponse {
     pub device_id: String,
 }
 
-pub async fn handle_generate_pair(State(state): State<HttpState>) -> Json<PairingCode> {
+pub async fn handle_generate_pair(
+    State(state): State<HttpState>,
+    request: Option<Json<GeneratePairRequest>>,
+) -> Json<PairingCode> {
     let mut pairing = state.pairing.lock().await;
-    Json(pairing.generate())
+    Json(generate_pair_code(&mut pairing, request))
+}
+
+fn generate_pair_code(
+    pairing: &mut PairingState,
+    request: Option<Json<GeneratePairRequest>>,
+) -> PairingCode {
+    match request.and_then(|Json(request)| request.ttl_seconds) {
+        Some(ttl_seconds) => pairing.generate_with_ttl(ttl_seconds),
+        None => pairing.generate(),
+    }
 }
 
 pub async fn handle_exchange_pair(
@@ -52,7 +71,7 @@ async fn create_and_persist_device(
     let (token, device) = devices.create_device(device_name);
     if let Some(path) = state.devices_path.as_deref() {
         if let Err(error) = devices.save(path) {
-            devices.revoke(&device.id);
+            let _ = devices.revoke(&device.id);
             return Err(error);
         }
     }
