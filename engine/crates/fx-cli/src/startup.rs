@@ -361,6 +361,7 @@ pub struct HeadlessLoopBuildOptions {
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub cancel_token: Option<CancellationToken>,
     pub experiment_progress: Option<ProgressCallback>,
+    pub session_registry: Option<fx_session::SessionRegistry>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -372,6 +373,7 @@ impl HeadlessLoopBuildOptions {
             config_manager: None,
             cancel_token: None,
             experiment_progress: None,
+            session_registry: None,
         }
     }
 
@@ -383,6 +385,7 @@ impl HeadlessLoopBuildOptions {
             config_manager: None,
             cancel_token: Some(cancel_token),
             experiment_progress: None,
+            session_registry: None,
         }
     }
 }
@@ -394,6 +397,7 @@ struct SkillRegistryBuildOptions {
     subagent_control: Option<Arc<dyn SubagentControl>>,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     experiment_progress: Option<ProgressCallback>,
+    session_registry: Option<fx_session::SessionRegistry>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -523,7 +527,12 @@ fn build_skill_registry_options(
         subagent_control: options.subagent_control.clone(),
         config_manager: options.config_manager.clone(),
         experiment_progress: options.experiment_progress.clone(),
+        session_registry: options.session_registry.clone(),
     }
+}
+
+pub fn open_session_registry(data_dir: &Path) -> Option<fx_session::SessionRegistry> {
+    fx_session::SessionRegistry::open(&data_dir.join("sessions.redb"))
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, StartupError> {
@@ -781,24 +790,9 @@ fn build_skill_registry(
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
 
-    // Register session management tools.
-    let session_db_path = data_dir.join("sessions.redb");
-    match fx_storage::Storage::open(&session_db_path) {
-        Ok(storage) => {
-            let store = fx_session::SessionStore::new(storage);
-            match fx_session::SessionRegistry::new(store) {
-                Ok(session_registry) => {
-                    let session_skill = SessionToolsSkill::new(session_registry);
-                    registry.register(Arc::new(session_skill));
-                }
-                Err(e) => {
-                    tracing::warn!("session registry unavailable: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("session storage unavailable: {e}");
-        }
+    if let Some(session_registry) = options.session_registry.clone() {
+        let session_skill = SessionToolsSkill::new(session_registry);
+        registry.register(Arc::new(session_skill));
     }
 
     // Load reflective journal for cross-session learning.
@@ -1960,6 +1954,52 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_without_session_registry_skips_session_tools_and_lock() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = configured_data_dir(&fawx_data_dir(), &config);
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                session_registry: None,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        for session_tool_name in ["session_list", "session_history", "session_send"] {
+            assert!(!names.contains(&session_tool_name.to_string()));
+        }
+
+        let registry = open_session_registry(&data_dir);
+        assert!(
+            registry.is_some(),
+            "session database should remain unlockable"
+        );
+    }
+
+    #[test]
+    fn headless_bundle_with_session_registry_registers_session_tools() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = configured_data_dir(&fawx_data_dir(), &config);
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                session_registry: open_session_registry(&data_dir),
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        for session_tool_name in ["session_list", "session_history", "session_send"] {
+            assert!(names.contains(&session_tool_name.to_string()));
+        }
     }
 
     #[test]

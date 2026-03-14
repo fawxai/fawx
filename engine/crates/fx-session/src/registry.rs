@@ -6,7 +6,9 @@ use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
 };
 use fx_core::error::StorageError;
+use fx_storage::Storage;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 type Result<T> = std::result::Result<T, SessionError>;
@@ -63,6 +65,25 @@ impl SessionRegistry {
             sessions: Arc::new(RwLock::new(sessions)),
             store,
         })
+    }
+
+    /// Open a registry from the redb database at `path`.
+    pub fn open(path: &Path) -> Option<Self> {
+        let storage = match Storage::open(path) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "session storage unavailable");
+                return None;
+            }
+        };
+
+        match Self::new(SessionStore::new(storage)) {
+            Ok(registry) => Some(registry),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "session registry unavailable");
+                None
+            }
+        }
     }
 
     /// List sessions, optionally filtered by kind.
@@ -517,5 +538,38 @@ mod tests {
 
         assert_eq!(info.message_count, 0);
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn open_creates_registry_at_database_path() {
+        let unique = format!(
+            "fx-session-open-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+
+        let registry = SessionRegistry::open(&path).expect("registry should open");
+        registry
+            .create(
+                SessionKey::new("open-path").unwrap(),
+                SessionKind::Main,
+                default_config(),
+            )
+            .expect("create");
+
+        // Drop the first registry to release the exclusive redb lock before reopening.
+        drop(registry);
+
+        let reopened = SessionRegistry::open(&path).expect("registry should reopen");
+        let info = reopened
+            .get_info(&SessionKey::new("open-path").unwrap())
+            .expect("get info");
+        assert_eq!(info.label.as_deref(), Some("test"));
+
+        let _ = std::fs::remove_file(path);
     }
 }

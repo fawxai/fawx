@@ -434,6 +434,7 @@ struct HeadlessStartup {
 
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
+    skip_session_db: bool,
 ) -> anyhow::Result<HeadlessStartup> {
     let config = startup::load_config()?;
     let logging_guard = headless::init_serve_logging(&config)?;
@@ -457,6 +458,7 @@ fn build_headless_startup(
         system_prompt,
         config_manager,
         data_dir.clone(),
+        skip_session_db,
     )?;
     Ok(HeadlessStartup {
         app,
@@ -479,6 +481,7 @@ fn build_headless_app(
     system_prompt: Option<std::path::PathBuf>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
     data_dir: PathBuf,
+    skip_session_db: bool,
 ) -> anyhow::Result<headless::HeadlessApp> {
     let session_bus = startup::build_session_bus_for_data_dir(&data_dir);
     let subagent_manager = build_subagent_manager(
@@ -487,11 +490,15 @@ fn build_headless_app(
         improvement_provider.clone(),
         session_bus.clone(),
     );
-    let bundle = startup::build_headless_loop_engine_bundle(
-        &config,
-        improvement_provider,
-        parent_loop_build_options(&subagent_manager, config_manager.clone()),
-    )?;
+    let session_registry = (!skip_session_db)
+        .then(|| startup::open_session_registry(&data_dir))
+        .flatten();
+    let options = startup::HeadlessLoopBuildOptions {
+        session_registry,
+        ..parent_loop_build_options(&subagent_manager, config_manager.clone())
+    };
+    let bundle =
+        startup::build_headless_loop_engine_bundle(&config, improvement_provider, options)?;
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
         router,
@@ -578,7 +585,7 @@ async fn run_headless(
         mut app,
         _logging_guard,
         ..
-    } = build_headless_startup(system_prompt)?;
+    } = build_headless_startup(system_prompt, false)?;
     if single {
         app.run_single(json).await
     } else {
@@ -598,7 +605,7 @@ async fn run_http_server(
         telegram_config,
         webhook_config,
         data_dir,
-    } = build_headless_startup(system_prompt)?;
+    } = build_headless_startup(system_prompt, true)?;
     app.initialize();
     app.apply_http_defaults();
 

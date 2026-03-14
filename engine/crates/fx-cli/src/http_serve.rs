@@ -28,14 +28,16 @@ pub async fn run(
 
     fx_api::run(
         app,
-        port,
-        http_config,
         auth_store
             .as_ref()
             .map(|store| store as &dyn BearerTokenStore),
-        &data_dir,
-        telegram,
-        webhook_channels,
+        fx_api::RunConfig {
+            port,
+            http_config: http_config.clone(),
+            data_dir,
+            telegram,
+            webhook_channels,
+        },
     )
     .await
 }

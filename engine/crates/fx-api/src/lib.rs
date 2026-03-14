@@ -33,8 +33,8 @@ use crate::token::{validate_bearer_token, BearerTokenStore};
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_config::HttpConfig;
-use fx_session::{SessionRegistry, SessionStore};
-use std::path::Path;
+use fx_session::SessionRegistry;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -46,24 +46,28 @@ pub use types::{
     SkillSummaryDto, StatusResponse, ThinkingLevelDto,
 };
 
+pub struct RunConfig {
+    pub port: u16,
+    pub http_config: HttpConfig,
+    pub data_dir: PathBuf,
+    pub telegram: Option<Arc<TelegramChannel>>,
+    pub webhook_channels: Vec<Arc<WebhookChannel>>,
+}
+
 pub async fn run(
     app: impl AppEngine + 'static,
-    port: u16,
-    http_config: &HttpConfig,
     auth_store: Option<&dyn BearerTokenStore>,
-    data_dir: &Path,
-    telegram: Option<Arc<TelegramChannel>>,
-    webhook_channels: Vec<Arc<WebhookChannel>>,
+    config: RunConfig,
 ) -> anyhow::Result<i32> {
-    let bearer_token = validate_bearer_token(http_config, auth_store)
+    let bearer_token = validate_bearer_token(&config.http_config, auth_store)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let listen_plan = listen_targets(port, detect_optional_tailscale_ip());
+    let listen_plan = listen_targets(config.port, detect_optional_tailscale_ip());
     let listeners = bind_listeners(listen_plan).await?;
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
-    let channels = build_channel_runtime(telegram.clone(), webhook_channels);
-    let session_registry = init_session_registry(data_dir);
-    let devices_path = data_dir.join("devices.json");
+    let channels = build_channel_runtime(config.telegram.clone(), config.webhook_channels);
+    let session_registry = init_session_registry(&config.data_dir);
+    let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
     let state = HttpState {
         app: Arc::clone(&shared_app),
@@ -75,37 +79,22 @@ pub async fn run(
         devices: Arc::new(Mutex::new(devices)),
         devices_path: Some(devices_path),
         channels: channels.clone(),
-        data_dir: data_dir.to_path_buf(),
+        data_dir: config.data_dir.clone(),
     };
-    let fleet_manager = load_fleet_manager_if_initialized(data_dir)?;
+    let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let router = build_router(state, fleet_manager);
 
     print_startup_targets(&listeners);
     eprintln!("Bearer token authentication: enabled");
     validate_telegram_startup(channels.telegram.as_ref()).await;
-    start_telegram_polling(&channels, &shared_app, data_dir);
+    start_telegram_polling(&channels, &shared_app, &config.data_dir);
 
     run_listeners(router, listeners).await?;
     Ok(0)
 }
 
 fn init_session_registry(data_dir: &Path) -> Option<SessionRegistry> {
-    let session_db_path = data_dir.join("sessions.redb");
-    let storage = match fx_storage::Storage::open(&session_db_path) {
-        Ok(storage) => storage,
-        Err(error) => {
-            tracing::warn!(path = %session_db_path.display(), error = %error, "session storage unavailable");
-            return None;
-        }
-    };
-
-    match SessionRegistry::new(SessionStore::new(storage)) {
-        Ok(registry) => Some(registry),
-        Err(error) => {
-            tracing::warn!(path = %session_db_path.display(), error = %error, "session registry unavailable");
-            None
-        }
-    }
+    SessionRegistry::open(&data_dir.join("sessions.redb"))
 }
 
 async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {
