@@ -14,9 +14,9 @@ use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, HealthResponse,
-    MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SkillSummaryDto, StatusResponse,
-    ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, ErrorRecordDto,
+    HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
+    StatusResponse, ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -206,6 +206,18 @@ impl AppEngine for HeadlessApp {
 
     fn session_bus(&self) -> Option<&SessionBus> {
         HeadlessApp::session_bus(self)
+    }
+
+    fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto> {
+        HeadlessApp::recent_errors(self, limit)
+            .into_iter()
+            .map(|record| ErrorRecordDto {
+                timestamp: record.timestamp,
+                category: record.category,
+                message: record.message,
+                recoverable: record.recoverable,
+            })
+            .collect()
     }
 }
 
@@ -1209,6 +1221,7 @@ mod routing_and_status {
             session_bus,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
         })
         .expect("test app")
     }
@@ -2102,6 +2115,54 @@ allowed_chat_ids = [123]
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn recent_errors_endpoint_returns_errors() {
+        let startup_warning = fx_cli::headless::StartupWarning {
+            category: fx_kernel::ErrorCategory::Memory,
+            message: "Failed to initialize memory: broken store".to_string(),
+        };
+        let state = test_state_with_app(
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine: test_engine(),
+                router: Arc::new(settings_router()),
+                runtime_info: test_runtime_info(),
+                config: fx_config::FawxConfig::default(),
+                memory: None,
+                embedding_index_persistence: None,
+                system_prompt_path: None,
+                config_manager: None,
+                system_prompt_text: None,
+                subagent_manager: Arc::new(SubagentManager::new(SubagentManagerDeps {
+                    factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                    limits: SubagentLimits::default(),
+                })),
+                canary_monitor: None,
+                session_bus: None,
+                session_key: None,
+                cron_store: None,
+                startup_warnings: vec![startup_warning],
+            })
+            .expect("test app"),
+            Vec::new(),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/errors/recent"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["errors"].as_array().expect("errors").len(), 1);
+        assert_eq!(json["errors"][0]["category"], "memory");
+        assert_eq!(
+            json["errors"][0]["message"],
+            "Failed to initialize memory: broken store"
+        );
+        assert_eq!(json["errors"][0]["recoverable"], true);
     }
 
     #[tokio::test]
@@ -3234,6 +3295,7 @@ mod telegram_update {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
         })
         .expect("test app")
     }

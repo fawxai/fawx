@@ -1,4 +1,5 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::headless::StartupWarning;
 use crate::helpers::{format_memory_for_prompt, thinking_config_from_budget};
 use async_trait::async_trait;
 use chrono::NaiveDate;
@@ -22,6 +23,7 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
+use fx_kernel::ErrorCategory;
 use fx_kernel::{
     CachingExecutor, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
 };
@@ -352,6 +354,7 @@ pub struct LoopEngineBundle {
     /// Signature policy loaded once at startup, shared with skill watcher.
     pub signature_policy: SignaturePolicy,
     pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub startup_warnings: Vec<StartupWarning>,
 }
 
 #[derive(Clone, Default)]
@@ -517,6 +520,7 @@ fn build_loop_engine_with_options(
         config_manager: options.config_manager.clone(),
         signature_policy: skills.signature_policy,
         cron_store: skills.cron_store,
+        startup_warnings: skills.startup_warnings,
     })
 }
 
@@ -720,6 +724,7 @@ struct SkillRegistryBundle {
     /// to avoid redundant filesystem reads.
     signature_policy: SignaturePolicy,
     cron_store: Option<fx_cron::SharedCronStore>,
+    startup_warnings: Vec<StartupWarning>,
 }
 
 fn build_skill_registry(
@@ -738,9 +743,16 @@ fn build_skill_registry(
         ..ProcessConfig::default()
     }));
     ProcessRegistry::spawn_cleanup_task(&process_registry);
+    let mut startup_warnings = Vec::new();
     let executor = build_tool_executor(&options, tool_config, process_registry);
     let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
-        attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
+        attach_memory_if_enabled(
+            executor,
+            data_dir,
+            config,
+            options.memory_enabled,
+            &mut startup_warnings,
+        );
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
@@ -870,6 +882,10 @@ fn build_skill_registry(
         }
         Err(e) => {
             tracing::warn!(error = %e, "cron store unavailable");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::System,
+                message: format!("Cron store unavailable: {e}"),
+            });
             None
         }
     };
@@ -889,6 +905,7 @@ fn build_skill_registry(
         credential_store,
         signature_policy,
         cron_store,
+        startup_warnings,
     }
 }
 
@@ -967,6 +984,7 @@ fn attach_memory_if_enabled(
     data_dir: &Path,
     config: &FawxConfig,
     enabled: bool,
+    startup_warnings: &mut Vec<StartupWarning>,
 ) -> (
     FawxToolExecutor,
     Option<SharedMemoryStore>,
@@ -977,7 +995,7 @@ fn attach_memory_if_enabled(
     if !enabled {
         return (executor, None, None, None, false);
     }
-    match build_memory_state(data_dir, config) {
+    match build_memory_state(data_dir, config, startup_warnings) {
         Ok((memory_store, snapshot_text, persistence)) => {
             let memory: SharedMemoryStore = Arc::new(Mutex::new(memory_store));
             executor = executor.with_memory(Arc::clone(&memory));
@@ -988,6 +1006,10 @@ fn attach_memory_if_enabled(
         }
         Err(error) => {
             eprintln!("warning: failed to initialize memory: {error}");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize memory: {error}"),
+            });
             (executor, None, None, None, false)
         }
     }
@@ -996,6 +1018,7 @@ fn attach_memory_if_enabled(
 fn build_memory_state(
     data_dir: &Path,
     config: &FawxConfig,
+    startup_warnings: &mut Vec<StartupWarning>,
 ) -> Result<
     (
         JsonFileMemory,
@@ -1006,7 +1029,8 @@ fn build_memory_state(
 > {
     let mut memory_store = JsonFileMemory::new_with_config(data_dir, memory_config(config))?;
     log_pruned_memories(&mut memory_store);
-    let persistence = load_embedding_index_persistence(data_dir, config, &memory_store)?;
+    let persistence =
+        load_embedding_index_persistence(data_dir, config, &memory_store, startup_warnings)?;
     let snapshot = memory_store.snapshot();
     let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
     Ok((memory_store, text, persistence))
@@ -1031,17 +1055,22 @@ fn load_embedding_index_persistence(
     data_dir: &Path,
     config: &FawxConfig,
     memory_store: &JsonFileMemory,
+    startup_warnings: &mut Vec<StartupWarning>,
 ) -> Result<Option<EmbeddingIndexPersistence>, String> {
     if !config.memory.embeddings_enabled {
         tracing::info!("memory embeddings disabled in config");
         return Ok(None);
     }
     let paths = embedding_paths(data_dir);
-    let Some(model) = load_embedding_model_or_warn(&paths.model_dir) else {
+    let Some(model) = load_embedding_model_or_warn(&paths.model_dir, startup_warnings) else {
         return Ok(None);
     };
-    let Some(index) = load_or_build_embedding_index_or_warn(memory_store, &paths.index_path, model)
-    else {
+    let Some(index) = load_or_build_embedding_index_or_warn(
+        memory_store,
+        &paths.index_path,
+        model,
+        startup_warnings,
+    ) else {
         return Ok(None);
     };
     log_embedding_index_status(&index, &paths.index_path)?;
@@ -1063,11 +1092,18 @@ fn embedding_paths(data_dir: &Path) -> EmbeddingPaths {
     }
 }
 
-fn load_embedding_model_or_warn(model_dir: &Path) -> Option<Arc<EmbeddingModel>> {
+fn load_embedding_model_or_warn(
+    model_dir: &Path,
+    startup_warnings: &mut Vec<StartupWarning>,
+) -> Option<Arc<EmbeddingModel>> {
     match load_embedding_model(model_dir) {
         Ok(model) => model,
         Err(error) => {
             tracing::warn!(path = %model_dir.display(), error = %error, "failed to initialize memory embeddings");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize memory embeddings: {error}"),
+            });
             None
         }
     }
@@ -1088,11 +1124,16 @@ fn load_or_build_embedding_index_or_warn(
     memory_store: &JsonFileMemory,
     index_path: &Path,
     model: Arc<EmbeddingModel>,
+    startup_warnings: &mut Vec<StartupWarning>,
 ) -> Option<SharedEmbeddingIndex> {
     match load_or_build_embedding_index(memory_store, index_path, model) {
         Ok(index) => Some(index),
         Err(error) => {
             tracing::warn!(path = %index_path.display(), error = %error, "failed to initialize embedding index");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize embedding index: {error}"),
+            });
             None
         }
     }
@@ -2027,6 +2068,31 @@ mod tests {
         for session_tool_name in ["session_list", "session_history", "session_send"] {
             assert!(names.contains(&session_tool_name.to_string()));
         }
+    }
+
+    #[test]
+    fn headless_bundle_accumulates_startup_warning_for_broken_memory_path() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let memory_dir = data_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("memory.json"), b"not valid json")
+            .expect("write broken memory");
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+
+        assert!(bundle.startup_warnings.iter().any(|warning| {
+            warning.category == ErrorCategory::Memory
+                && warning.message.contains("Failed to initialize memory")
+        }));
     }
 
     #[test]

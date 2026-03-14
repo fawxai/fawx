@@ -1,5 +1,5 @@
 use crate::types::{
-    AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
+    AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
     ThinkingLevelDto,
 };
 use async_trait::async_trait;
@@ -67,4 +67,6 @@ pub trait AppEngine: Send + Sync {
     fn config_manager(&self) -> Option<ConfigManagerHandle>;
 
     fn session_bus(&self) -> Option<&SessionBus>;
+
+    fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto>;
 }

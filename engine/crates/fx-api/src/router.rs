@@ -1,5 +1,6 @@
 use crate::handlers::config::{handle_config_get, handle_config_set};
 use crate::handlers::devices::{handle_delete_device, handle_list_devices};
+use crate::handlers::errors::handle_recent_errors;
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
@@ -53,6 +54,7 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/skills", get(handle_list_skills))
         .route("/auth", get(handle_list_auth))
         .route("/devices", get(handle_list_devices))
+        .route("/errors/recent", get(handle_recent_errors))
         .route("/devices/{id}", delete(handle_delete_device))
         .route("/pair/generate", post(handle_generate_pair))
         .route(

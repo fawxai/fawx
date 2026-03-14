@@ -1,3 +1,4 @@
+use fx_kernel::ErrorCategory;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,19 @@ pub struct StatusResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ErrorRecordDto {
+    pub timestamp: String,
+    pub category: ErrorCategory,
+    pub message: String,
+    pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecentErrorsResponse {
+    pub errors: Vec<ErrorRecordDto>,
 }
 
 #[derive(Debug, Deserialize)]

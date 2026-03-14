@@ -41,9 +41,10 @@ use tokio::sync::Mutex;
 
 pub use tailscale::is_tailscale_ip;
 pub use types::{
-    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, HealthResponse,
-    MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SendToSessionRequest,
-    SendToSessionResponse, SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
+    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, ErrorRecordDto,
+    HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto,
+    RecentErrorsResponse, SendToSessionRequest, SendToSessionResponse, SkillSummaryDto,
+    StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
 };
 
 pub struct RunConfig {

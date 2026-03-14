@@ -26,7 +26,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::{StreamCallback, StreamEvent};
+use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{supported_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
@@ -34,7 +34,7 @@ use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -113,6 +113,23 @@ struct JsonOutput {
 // ── CycleResult ─────────────────────────────────────────────────────────────
 
 /// Result of a single agentic cycle, returned by [`HeadlessApp::process_message`].
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    pub category: ErrorCategory,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ErrorRecord {
+    pub timestamp: String,
+    pub category: ErrorCategory,
+    pub message: String,
+    pub recoverable: bool,
+}
+
+const MAX_ERROR_HISTORY: usize = 50;
+
 pub struct CycleResult {
     /// The assistant's response text.
     pub response: String,
@@ -142,6 +159,7 @@ pub struct HeadlessAppDeps {
     pub session_bus: Option<SessionBus>,
     pub session_key: Option<SessionKey>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub startup_warnings: Vec<StartupWarning>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -166,6 +184,8 @@ pub struct HeadlessApp {
     session_bus: Option<SessionBus>,
     session_key: Option<SessionKey>,
     cron_store: Option<fx_cron::SharedCronStore>,
+    startup_warnings: Vec<StartupWarning>,
+    error_history: VecDeque<ErrorRecord>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -292,7 +312,7 @@ impl HeadlessApp {
             &data_dir,
         );
 
-        Ok(Self {
+        let mut app = Self {
             loop_engine: deps.loop_engine,
             router: deps.router,
             runtime_info: deps.runtime_info,
@@ -310,8 +330,84 @@ impl HeadlessApp {
             session_bus: deps.session_bus,
             session_key: deps.session_key,
             cron_store: deps.cron_store,
+            startup_warnings: deps.startup_warnings,
+            error_history: VecDeque::new(),
             bus_receiver,
-        })
+        };
+        app.record_startup_warning_history();
+        Ok(app)
+    }
+
+    fn record_startup_warning_history(&mut self) {
+        let warnings: Vec<_> = self
+            .startup_warnings
+            .iter()
+            .map(|warning| (warning.category, warning.message.clone()))
+            .collect();
+        for (category, message) in warnings {
+            self.record_error(category, message, true);
+        }
+    }
+
+    fn emit_startup_warnings(&mut self, callback: Option<&StreamCallback>) {
+        let Some(callback) = callback else {
+            return;
+        };
+        for warning in std::mem::take(&mut self.startup_warnings) {
+            let event = StreamEvent::Error {
+                category: warning.category,
+                message: warning.message,
+                recoverable: true,
+            };
+            Self::report_stream_error(&event);
+            callback(event);
+        }
+    }
+
+    fn clear_startup_warnings(&mut self) {
+        self.startup_warnings.clear();
+    }
+
+    fn emit_error(
+        &mut self,
+        callback: Option<&StreamCallback>,
+        category: ErrorCategory,
+        message: String,
+        recoverable: bool,
+    ) {
+        self.record_error(category, message.clone(), recoverable);
+        let Some(callback) = callback else {
+            return;
+        };
+        let event = StreamEvent::Error {
+            category,
+            message,
+            recoverable,
+        };
+        Self::report_stream_error(&event);
+        callback(event);
+    }
+
+    fn record_error(&mut self, category: ErrorCategory, message: String, recoverable: bool) {
+        if self.error_history.len() == MAX_ERROR_HISTORY {
+            self.error_history.pop_front();
+        }
+        self.error_history.push_back(ErrorRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            category,
+            message,
+            recoverable,
+        });
+    }
+
+    pub fn recent_errors(&self, limit: usize) -> Vec<ErrorRecord> {
+        let capped = limit.min(MAX_ERROR_HISTORY);
+        self.error_history
+            .iter()
+            .rev()
+            .take(capped)
+            .cloned()
+            .collect()
     }
 
     /// REPL mode: read lines from stdin, run the loop, print to stdout.
@@ -415,6 +511,7 @@ impl HeadlessApp {
         images: &[ImageAttachment],
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
+        self.clear_startup_warnings();
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot_with_images(input, source, images);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
@@ -746,6 +843,7 @@ impl HeadlessApp {
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
+        self.clear_startup_warnings();
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
@@ -764,10 +862,11 @@ impl HeadlessApp {
         source: &InputSource,
         callback: StreamCallback,
     ) -> Result<CycleResult, anyhow::Error> {
+        let callback = headless_stream_callback(callback);
+        self.emit_startup_warnings(Some(&callback));
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
-        let callback = headless_stream_callback(callback);
         let result = self
             .loop_engine
             .run_cycle_streaming(snapshot, &llm, Some(callback))
@@ -794,7 +893,8 @@ impl HeadlessApp {
         let iterations = extract_iterations(result);
         let tokens_used = extract_token_usage(result);
         self.last_signals = result.signals().to_vec();
-        persist_headless_signals(&self.config, &self.last_signals);
+        let signals = self.last_signals.clone();
+        persist_headless_signals(self, &signals);
         self.record_turn(input, &response);
         CycleResult {
             response,
@@ -1032,6 +1132,18 @@ impl AppEngine for HeadlessApp {
 
     fn session_bus(&self) -> Option<&SessionBus> {
         HeadlessApp::session_bus(self)
+    }
+
+    fn recent_errors(&self, limit: usize) -> Vec<fx_api::ErrorRecordDto> {
+        HeadlessApp::recent_errors(self, limit)
+            .into_iter()
+            .map(|record| fx_api::ErrorRecordDto {
+                timestamp: record.timestamp,
+                category: record.category,
+                message: record.message,
+                recoverable: record.recoverable,
+            })
+            .collect()
     }
 }
 
@@ -1483,7 +1595,9 @@ fn sync_headless_model_from_config(
 fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
     if let Some(router) = Arc::get_mut(&mut app.router) {
         if let Err(error) = router.set_active(model) {
+            let message = format!("Model reload failed after config change: {error}");
             tracing::warn!(error = %error, model, "failed to apply reloaded model to router");
+            app.record_error(ErrorCategory::System, message, true);
         }
     }
     app.active_model = model.to_string();
@@ -1494,14 +1608,22 @@ fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
     SignalStore::new(&data_dir, HEADLESS_SIGNAL_SESSION_ID).map_err(anyhow::Error::new)
 }
 
-fn persist_headless_signals(config: &FawxConfig, signals: &[Signal]) {
-    if let Ok(signal_store) = headless_signal_store(config) {
+fn persist_headless_signals(app: &mut HeadlessApp, signals: &[Signal]) {
+    if let Ok(signal_store) = headless_signal_store(&app.config) {
         if let Err(error) = signal_store.persist(signals) {
+            let message = format!("Signal persist failed: {error}");
             eprintln!("warning: signal persist failed: {error}");
+            app.emit_error(None, ErrorCategory::System, message, true);
         }
         return;
     }
     eprintln!("warning: signal store unavailable for headless session");
+    app.emit_error(
+        None,
+        ErrorCategory::System,
+        "Signal store unavailable for headless session".to_string(),
+        true,
+    );
 }
 
 fn build_headless_improve_context(
@@ -1769,6 +1891,7 @@ impl HeadlessSubagentFactory {
             session_bus: self.deps.session_bus.clone(),
             session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
             cron_store: None,
+            startup_warnings: bundle.startup_warnings,
         };
         HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))
     }
@@ -2159,6 +2282,8 @@ mod tests {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
             bus_receiver: None,
         }
     }
@@ -2403,6 +2528,7 @@ mod tests {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
         }
     }
 
@@ -2523,6 +2649,64 @@ mod tests {
     }
 
     #[test]
+    fn recent_errors_is_bounded_to_fifty_records() {
+        let warnings = (0..55)
+            .map(|idx| StartupWarning {
+                category: ErrorCategory::System,
+                message: format!("warning #{idx}"),
+            })
+            .collect();
+        let mut deps = headless_deps(static_model_router(&["mock-model"]), FawxConfig::default());
+        deps.startup_warnings = warnings;
+
+        let app = HeadlessApp::new(deps).expect("app");
+        let recent = app.recent_errors(100);
+
+        assert_eq!(recent.len(), 50);
+        assert_eq!(recent[0].message, "warning #54");
+        assert_eq!(recent[49].message, "warning #5");
+    }
+
+    #[tokio::test]
+    async fn streaming_message_emits_startup_warnings_before_done() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let mut app = test_app();
+        let mut router = static_model_router(&["mock-model"]);
+        router.set_active("mock-model").expect("set active");
+        app.router = Arc::new(router);
+        app.startup_warnings.push(StartupWarning {
+            category: ErrorCategory::Memory,
+            message: "Failed to initialize memory: broken store".to_string(),
+        });
+
+        let result = app
+            .process_message_streaming(
+                "hello",
+                Arc::new(move |event| {
+                    callback_events.lock().expect("events lock").push(event);
+                }),
+            )
+            .await
+            .expect("streaming result");
+
+        assert_eq!(result.response, mock_completion_text());
+        let events = events.lock().expect("events lock");
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::Error {
+                category: ErrorCategory::Memory,
+                message,
+                recoverable: true,
+            }) if message == "Failed to initialize memory: broken store"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { response }) if *response == mock_completion_text()
+        ));
+    }
+
+    #[test]
     fn proposal_commands_propagate_errors() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp_dir.path().join("proposals"), "not a directory")
@@ -2623,6 +2807,8 @@ mod tests {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
             bus_receiver: None,
         };
 
@@ -2953,6 +3139,8 @@ mod tests {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
             bus_receiver: None,
         };
 
@@ -2992,6 +3180,8 @@ mod tests {
             session_bus: None,
             session_key: None,
             cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
             bus_receiver: None,
         };
 
