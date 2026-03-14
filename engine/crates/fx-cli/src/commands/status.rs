@@ -119,7 +119,7 @@ async fn fetch_health(port: u16) -> Option<HealthPayload> {
 }
 
 async fn fetch_status(layout: &RuntimeLayout) -> Option<StatusPayload> {
-    let token = layout.config.http.bearer_token.as_deref()?;
+    let token = super::api_client::bearer_token(layout).ok()?;
     let client = http_client()?;
     let url = format!("http://127.0.0.1:{}/status", layout.http_port);
     client
