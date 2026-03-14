@@ -228,7 +228,7 @@
       <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, cross-session communication, device pairing, and scheduled tasks.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> Context compaction w/ memory flush — SHIPPED (JournalCompactionFlush)</li>
-        <li><span class="planned">○</span> Error surfacing — StreamEvent::Error exists, but async failures still need to surface to users instead of being swallowed</li>
+        <li><span class="check">✓</span> Error surfacing — startup warnings, SSE error emission, /v1/errors/recent endpoint — StreamEvent::Error exists, but async failures still need to surface to users instead of being swallowed</li>
         <li><span class="check">✓</span> Cross-session messaging — SHIPPED (fx-bus crate)</li>
         <li><span class="check">✓</span> Device pairing — SHIPPED (fawx pair, fawx devices, /v1/devices endpoints)</li>
         <li><span class="check">✓</span> Cron / scheduled tasks — SHIPPED (fx-cron crate merged, 7 HTTP endpoints, 6 agent tools, CronSkill registered in startup)</li>
