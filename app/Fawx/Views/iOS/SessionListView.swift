@@ -59,6 +59,11 @@ struct SessionListView: View {
                         chatViewModel.showEmptyState()
                     }
                 }
+                .onAppear {
+                    if UITestLaunchOptions.shouldResetState {
+                        resetToEmptyConversation()
+                    }
+                }
         }
     }
 
@@ -103,27 +108,7 @@ struct SessionListView: View {
                 ForEach(sessionViewModel.groupedSections) { section in
                     Section(section.title) {
                         ForEach(section.sessions) { session in
-                            Button {
-                                selectSession(session.id)
-                            } label: {
-                                SessionRowView(
-                                    session: session,
-                                    isSelected: session.id == sessionViewModel.selectedSessionID,
-                                    isStreaming: session.id == chatViewModel.activeStreamSessionID
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier("sessionRow_\(session.id)")
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button("Delete", role: .destructive) {
-                                    deleteSession(session.id)
-                                }
-
-                                Button("Clear") {
-                                    pendingClearSession = session
-                                }
-                                .tint(.fawxWarning)
-                            }
+                            sessionRow(for: session)
                         }
                     }
                 }
@@ -292,6 +277,55 @@ struct SessionListView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 240)
         .listRowBackground(Color.clear)
+    }
+
+    @ViewBuilder
+    private func sessionRow(for session: Session) -> some View {
+        let rowContent = SessionRowView(
+            session: session,
+            isSelected: session.id == sessionViewModel.selectedSessionID,
+            isStreaming: session.id == chatViewModel.activeStreamSessionID
+        )
+
+        if usesSplitLayout {
+            Button {
+                selectSession(session.id)
+            } label: {
+                rowContent
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("sessionRow_\(session.id)")
+            .accessibilityElement(children: .contain)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button("Delete", role: .destructive) {
+                    deleteSession(session.id)
+                }
+
+                Button("Clear") {
+                    pendingClearSession = session
+                }
+                .tint(.fawxWarning)
+            }
+        } else {
+            Button {
+                selectSession(session.id)
+            } label: {
+                rowContent
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("sessionRow_\(session.id)")
+            .accessibilityElement(children: .contain)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button("Delete", role: .destructive) {
+                    deleteSession(session.id)
+                }
+
+                Button("Clear") {
+                    pendingClearSession = session
+                }
+                .tint(.fawxWarning)
+            }
+        }
     }
 
     private var usesSplitLayout: Bool {

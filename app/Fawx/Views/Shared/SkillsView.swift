@@ -85,6 +85,7 @@ struct SkillsView: View {
                     }
                 }
                 .accessibilityIdentifier("skillsGrid")
+                .accessibilityElement(children: .contain)
             }
         }
     }
@@ -136,33 +137,35 @@ private struct SkillCardView: View {
                         .foregroundStyle(Color.fawxText)
                         .lineLimit(1)
 
-                    SkillStatusPill(isEnabled: skill.isEnabled)
+                    SkillStatusPill(label: "Loaded", tone: .loaded)
                 }
 
                 Spacer(minLength: 0)
             }
 
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 72), spacing: FawxSpacing.paddingXS)],
-                alignment: .leading,
-                spacing: FawxSpacing.paddingXS
-            ) {
-                ForEach(skill.tools, id: \.self) { tool in
-                    Text(tool)
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.fawxTextSecondary)
-                        .padding(.horizontal, FawxSpacing.paddingSM)
-                        .padding(.vertical, 6)
-                        .background(Color.fawxSurface)
-                        .clipShape(Capsule())
-                }
-            }
-
-            Text(skill.displayDescription ?? "Loaded on the Fawx server.")
+            Text(skill.displayDescription ?? "\(skill.tools.count) tools available on this server.")
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
-                .lineLimit(2)
+                .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: FawxSpacing.paddingSM) {
+                Label("\(skill.tools.count) tools", systemImage: "wrench.and.screwdriver")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+
+                Spacer(minLength: 0)
+            }
+
+            FlowLayout(spacing: FawxSpacing.paddingXS) {
+                ForEach(previewTools, id: \.self) { tool in
+                    ToolChip(label: tool)
+                }
+
+                if remainingToolCount > 0 {
+                    ToolChip(label: "+\(remainingToolCount) more")
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(FawxSpacing.paddingLG)
@@ -172,20 +175,116 @@ private struct SkillCardView: View {
                 .stroke(Color.fawxBorder, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("skillCard_\(skill.name)")
+    }
+
+    private var previewTools: [String] {
+        Array(skill.tools.prefix(4))
+    }
+
+    private var remainingToolCount: Int {
+        max(skill.tools.count - previewTools.count, 0)
     }
 }
 
 private struct SkillStatusPill: View {
-    let isEnabled: Bool
+    enum Tone {
+        case loaded
+        case inactive
+    }
+
+    let label: String
+    let tone: Tone
 
     var body: some View {
-        Text(isEnabled ? "Enabled" : "Disabled")
+        Text(label)
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(isEnabled ? Color.fawxSuccess : Color.fawxTextSecondary)
+            .foregroundStyle(tone == .loaded ? Color.fawxSuccess : Color.fawxTextSecondary)
             .padding(.horizontal, FawxSpacing.paddingSM)
             .padding(.vertical, 5)
-            .background((isEnabled ? Color.fawxSuccess : Color.fawxSurfaceActive).opacity(0.12))
+            .background((tone == .loaded ? Color.fawxSuccess : Color.fawxSurfaceActive).opacity(0.12))
             .clipShape(Capsule())
+    }
+}
+
+private struct ToolChip: View {
+    let label: String
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 11, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.fawxTextSecondary)
+            .padding(.horizontal, FawxSpacing.paddingSM)
+            .padding(.vertical, 6)
+            .background(Color.fawxSurface)
+            .clipShape(Capsule())
+    }
+}
+
+private struct FlowLayout: Layout {
+    let spacing: CGFloat
+
+    init(spacing: CGFloat) {
+        self.spacing = spacing
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var currentLineHeight: CGFloat = 0
+        var requiredWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > maxWidth, currentX > 0 {
+                currentX = 0
+                currentY += currentLineHeight + spacing
+                currentLineHeight = 0
+            }
+
+            requiredWidth = max(requiredWidth, currentX + size.width)
+            currentLineHeight = max(currentLineHeight, size.height)
+            currentX += size.width + spacing
+        }
+
+        return CGSize(
+            width: requiredWidth,
+            height: currentY + currentLineHeight
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var currentLineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > bounds.maxX, currentX > bounds.minX {
+                currentX = bounds.minX
+                currentY += currentLineHeight + spacing
+                currentLineHeight = 0
+            }
+
+            subview.place(
+                at: CGPoint(x: currentX, y: currentY),
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+
+            currentX += size.width + spacing
+            currentLineHeight = max(currentLineHeight, size.height)
+        }
     }
 }
 

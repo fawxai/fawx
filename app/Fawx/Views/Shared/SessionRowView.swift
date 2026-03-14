@@ -39,5 +39,8 @@ struct SessionRowView: View {
         }
         .padding(.vertical, FawxSpacing.paddingXS)
         .padding(.horizontal, FawxSpacing.paddingXS)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("sessionRow_\(session.id)")
     }
 }

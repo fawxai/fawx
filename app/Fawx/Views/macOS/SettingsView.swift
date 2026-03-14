@@ -19,7 +19,7 @@ struct SettingsView: View {
         .frame(minWidth: 520, minHeight: 360)
         .task {
             if appState.isConfigured {
-                try? await appState.refreshServerState()
+                await appState.revalidateConnection(allowReconnect: false)
             }
         }
     }
@@ -60,7 +60,7 @@ struct SettingsView: View {
 
             if let status = settingsViewModel.testStatusMessage {
                 Text(status)
-                    .foregroundStyle(Color.fawxTextSecondary)
+                    .foregroundStyle(testStatusColor)
             }
         }
     }
@@ -173,6 +173,19 @@ struct SettingsView: View {
             return "Reconnecting"
         case .disconnected:
             return "Disconnected"
+        }
+    }
+
+    private var testStatusColor: Color {
+        switch settingsViewModel.testStatusKind {
+        case .idle:
+            return .fawxTextSecondary
+        case .success:
+            return .fawxSuccess
+        case .warning:
+            return .fawxWarning
+        case .failure:
+            return .fawxError
         }
     }
 

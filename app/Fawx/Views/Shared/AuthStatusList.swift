@@ -64,5 +64,6 @@ private struct AuthProviderCard: View {
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
                 .stroke(Color.fawxBorder, lineWidth: 1)
         )
+        .accessibilityIdentifier("authProvider_\(provider.id)")
     }
 }

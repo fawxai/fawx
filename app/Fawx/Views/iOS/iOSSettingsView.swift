@@ -52,16 +52,29 @@ struct iOSSettingsView: View {
                 if let status = settingsViewModel.testStatusMessage {
                     Section("Status") {
                         Text(status)
-                            .foregroundStyle(Color.fawxTextSecondary)
+                            .foregroundStyle(testStatusColor)
                     }
                 }
             }
             .navigationTitle("Settings")
             .task {
                 if appState.isConfigured {
-                    try? await appState.refreshServerState()
+                    await appState.revalidateConnection(allowReconnect: false)
                 }
             }
+        }
+    }
+
+    private var testStatusColor: Color {
+        switch settingsViewModel.testStatusKind {
+        case .idle:
+            return .fawxTextSecondary
+        case .success:
+            return .fawxSuccess
+        case .warning:
+            return .fawxWarning
+        case .failure:
+            return .fawxError
         }
     }
 }
@@ -191,7 +204,7 @@ private struct iOSAuthStatusSettingsView: View {
 #endif
         .task {
             if appState.isConfigured {
-                try? await appState.refreshServerState()
+                await appState.revalidateConnection(allowReconnect: false)
             }
         }
     }

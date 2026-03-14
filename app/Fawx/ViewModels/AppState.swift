@@ -300,6 +300,38 @@ final class AppState {
         await attemptConnection(initialStatus: .connecting, allowReconnect: true)
     }
 
+    func revalidateConnection(allowReconnect: Bool = true) async {
+        guard isConfigured else {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            reconnectAttempt = 0
+            lastHealth = nil
+            connectionError = nil
+            connectionStatus = .disconnected
+            return
+        }
+
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+
+        let initialStatus: ConnectionStatus = allowReconnect ? .reconnecting : .connecting
+        await attemptConnection(initialStatus: initialStatus, allowReconnect: allowReconnect)
+    }
+
+    func markDisconnected(from error: Error) {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+        lastHealth = nil
+        connectionError = connectionMessage(for: error)
+        connectionStatus = .disconnected
+    }
+
+    func userFacingConnectionMessage(for error: Error) -> String {
+        connectionMessage(for: error)
+    }
+
     func noteRecoverableRequestFailure(_ error: Error) async {
         guard shouldReconnect(for: error) else {
             return
@@ -479,11 +511,11 @@ final class AppState {
             return "Authentication failed. Check your pairing in Settings."
         }
 
-        if let urlError = error as? URLError, urlError.code == .timedOut {
-            return "Connection timed out while contacting \(serverURLString)."
+        if isConnectivityFailure(error) {
+            return "Fawx server at \(serverURLString) is offline or unreachable."
         }
 
-        return "Cannot connect to Fawx server at \(serverURLString)."
+        return "Fawx server at \(serverURLString) returned an unexpected response."
     }
 
     private func showToast(message: String, style: AppToastStyle) {

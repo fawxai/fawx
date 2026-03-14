@@ -5,6 +5,7 @@ import UIKit
 #endif
 
 enum DeviceNameProvider {
+    @MainActor
     static func current() -> String {
 #if os(iOS)
         let candidate = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)

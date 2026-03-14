@@ -112,16 +112,38 @@ final class SettingsViewModel {
         defer { isTestingConnection = false }
 
         let client = FawxClient(baseURL: url)
+        let updatesCurrentConnection = appState.isConfigured && appState.serverURLString == canonicalURLString
 
         do {
             let health = try await client.health()
             serverURL = canonicalURLString
             lastSuccessfulURL = canonicalURLString
-            testStatusKind = .success
-            testStatusMessage = "Server reachable. Model: \(health.model)"
+
+            if updatesCurrentConnection {
+                await appState.revalidateConnection(allowReconnect: false)
+
+                if appState.connectionStatus == .connected {
+                    testStatusKind = .success
+                    testStatusMessage = "Connected. Model: \(health.model)"
+                } else {
+                    testStatusKind = .failure
+                    testStatusMessage = "Disconnected. \(appState.connectionError ?? "Check your pairing in Settings.")"
+                }
+            } else {
+                testStatusKind = .success
+                testStatusMessage = "Connected. Model: \(health.model)"
+            }
         } catch {
+            let userMessage = appState.userFacingConnectionMessage(for: error)
+
+            if updatesCurrentConnection {
+                appState.markDisconnected(from: error)
+                testStatusMessage = "Disconnected. \(userMessage)"
+            } else {
+                testStatusMessage = userMessage
+            }
+
             testStatusKind = .failure
-            testStatusMessage = error.localizedDescription
         }
     }
 
