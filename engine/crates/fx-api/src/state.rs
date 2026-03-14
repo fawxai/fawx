@@ -1,4 +1,6 @@
+use crate::devices::DeviceStore;
 use crate::engine::AppEngine;
+use crate::pairing::PairingState;
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
@@ -17,6 +19,9 @@ pub struct HttpState {
     pub start_time: Instant,
     pub tailscale_ip: Option<String>,
     pub bearer_token: String,
+    pub pairing: Arc<Mutex<PairingState>>,
+    pub devices: Arc<Mutex<DeviceStore>>,
+    pub devices_path: Option<PathBuf>,
     pub channels: ChannelRuntime,
     pub data_dir: PathBuf,
 }

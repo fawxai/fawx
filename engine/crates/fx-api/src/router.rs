@@ -2,6 +2,7 @@ use crate::handlers::config::{handle_config_get, handle_config_set};
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
+use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
 use crate::handlers::sessions::{
     handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
     handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
@@ -47,7 +48,8 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             get(handle_get_thinking).put(handle_set_thinking),
         )
         .route("/skills", get(handle_list_skills))
-        .route("/auth", get(handle_list_auth));
+        .route("/auth", get(handle_list_auth))
+        .route("/pair/generate", post(handle_generate_pair));
 
     let authenticated = Router::new()
         .route("/message", post(handle_message))
@@ -62,6 +64,7 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
 
     let public = Router::new()
         .route("/health", get(handle_health))
+        .route("/v1/pair", post(handle_exchange_pair))
         .route("/telegram/webhook", post(handle_telegram_webhook));
     let router = authenticated.merge(public).with_state(state);
 

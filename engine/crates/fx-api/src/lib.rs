@@ -1,10 +1,12 @@
 pub(crate) mod config_redaction;
 
+pub(crate) mod devices;
 pub mod engine;
 pub(crate) mod error;
 pub(crate) mod handlers;
 pub(crate) mod listener;
 pub(crate) mod middleware;
+pub(crate) mod pairing;
 pub(crate) mod router;
 pub(crate) mod sse;
 pub(crate) mod state;
@@ -16,11 +18,13 @@ pub(crate) mod types;
 #[cfg(test)]
 mod tests;
 
+use crate::devices::DeviceStore;
 use crate::engine::AppEngine;
 use crate::listener::{
     active_tailscale_ip, bind_listeners, detect_optional_tailscale_ip, listen_targets,
     print_startup_targets, run_listeners,
 };
+use crate::pairing::PairingState;
 use crate::router::{build_router, load_fleet_manager_if_initialized};
 use crate::state::{build_channel_runtime, HttpState};
 use crate::telegram::polling::run_telegram_polling;
@@ -58,12 +62,17 @@ pub async fn run(
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(telegram.clone(), webhook_channels);
     let session_registry = init_session_registry(data_dir);
+    let devices_path = data_dir.join("devices.json");
+    let devices = DeviceStore::load(&devices_path);
     let state = HttpState {
         app: Arc::clone(&shared_app),
         session_registry,
         start_time: Instant::now(),
         tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
+        pairing: Arc::new(Mutex::new(PairingState::new())),
+        devices: Arc::new(Mutex::new(devices)),
+        devices_path: Some(devices_path),
         channels: channels.clone(),
         data_dir: data_dir.to_path_buf(),
     };

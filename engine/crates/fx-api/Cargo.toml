@@ -21,6 +21,7 @@ fx-llm.workspace = true
 fx-session.workspace = true
 fx-storage.workspace = true
 fx-tools.workspace = true
+rand = "0.8"
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

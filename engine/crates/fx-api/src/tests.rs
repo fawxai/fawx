@@ -1,4 +1,5 @@
 use crate::config_redaction;
+use crate::devices::DeviceStore;
 use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 use crate::error::HttpError;
 use crate::handlers::health::sanitize_config;
@@ -7,6 +8,7 @@ use crate::listener::{
     wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
 };
 use crate::middleware::verify_token;
+use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
@@ -1214,6 +1216,9 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: Some(data_dir.join("devices.json")),
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
@@ -1238,6 +1243,9 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: Some(data_dir.join("devices.json")),
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
@@ -1845,6 +1853,85 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn pair_exchange_endpoint_is_public() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/pair")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"code":"ZZZ-999"}"#))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "invalid_code");
+    }
+
+    #[tokio::test]
+    async fn pair_generate_requires_auth_and_returns_code() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        // Without auth → 401
+        let no_auth = Request::builder()
+            .method("POST")
+            .uri("/v1/pair/generate")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(no_auth).await.expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // With auth → 200 + well-formed code
+        let with_auth = Request::builder()
+            .method("POST")
+            .uri("/v1/pair/generate")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(with_auth).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let code = json["code"].as_str().expect("code field");
+        assert_eq!(code.len(), 7); // XXX-XXX format
+        assert_eq!(&code[3..4], "-");
+        assert!(json["ttl_seconds"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[tokio::test]
+    async fn device_token_authenticates_and_persists_usage() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let state = test_state_with_config(config, None, Vec::new());
+        let devices_path = state.devices_path.clone().expect("devices path");
+        let raw_token = {
+            let mut devices = state.devices.lock().await;
+            let (raw_token, _device) = devices.create_device("Joe's MacBook");
+            assert_eq!(devices.list_devices().len(), 1);
+            devices.save(&devices_path).expect("save devices");
+            raw_token
+        };
+        let app = build_router(state.clone(), None);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("Bearer {raw_token}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let loaded = DeviceStore::load(&devices_path);
+        assert!(loaded.list_devices()[0].last_used_at > 0);
+    }
+
+    #[tokio::test]
     async fn list_models_returns_active_and_catalog() {
         let state = test_state_with_app(
             build_test_app(
@@ -2343,19 +2430,23 @@ allowed_chat_ids = [123]
         router_registry.register(webhook.clone());
         let mut webhooks = std::collections::HashMap::new();
         webhooks.insert("alpha".to_string(), webhook);
+        let data_dir = std::env::temp_dir();
         let state = HttpState {
             app: Arc::new(Mutex::new(make_test_app(None))),
             session_registry: None,
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: Some(data_dir.join("devices.json")),
             channels: ChannelRuntime {
                 router: Arc::new(ResponseRouter::new(Arc::new(router_registry))),
                 http: Arc::new(HttpChannel::new()),
                 telegram: None,
                 webhooks: Arc::new(webhooks),
             },
-            data_dir: std::env::temp_dir(),
+            data_dir,
         };
         let app = build_router(state, None);
         let req = Request::builder()
