@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEGACY_MILLISECONDS_THRESHOLD: u64 = 1_000_000_000_000;
 
-pub(crate) fn current_time_seconds() -> u64 {
+pub fn current_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())

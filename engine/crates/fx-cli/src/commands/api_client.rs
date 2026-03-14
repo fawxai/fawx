@@ -1,7 +1,7 @@
 use super::runtime_layout::RuntimeLayout;
 use anyhow::Context;
 use serde::Deserialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const API_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 
@@ -44,10 +44,7 @@ pub(crate) async fn api_error_message(response: reqwest::Response) -> String {
 }
 
 pub(crate) fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+    fx_api::time_util::current_time_seconds()
 }
 
 pub(crate) fn server_not_running_message() -> &'static str {
