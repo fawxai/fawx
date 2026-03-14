@@ -224,13 +224,14 @@
         <span class="phase-badge badge-building">Building</span>
         <h2 class="phase-title">Agent Foundation — Migration Readiness</h2>
       </div>
-      <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, and cross-session communication.</p>
+      <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, cross-session communication, device pairing, and scheduled tasks.</p>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Context compaction with memory flush (PR #1390 — pre-compaction journal write, evicted_indices tracking)</li>
-        <li><span class="check">✓</span> Error surfacing — StreamEvent::Error + ErrorCategory at provider/tool/memory paths (PR #1391)</li>
-        <li><span class="planned">○</span> Cross-session messaging (session-to-session communication bus)</li>
-        <li><span class="planned">○</span> Cron / scheduled tasks (daemon-level, persist across restarts)</li>
-        <li><span class="planned">○</span> Heartbeat monitoring + self-recovery watchdog</li>
+        <li><span class="check">✓</span> Context compaction with memory flush — pre-compaction journal write, evicted_indices tracking</li>
+        <li><span class="check">✓</span> Error surfacing — StreamEvent::Error + ErrorCategory at provider/tool/memory paths</li>
+        <li><span class="check">✓</span> Cross-session messaging — fx-bus crate, SessionBus, Envelope, BusStore (redb), HTTP endpoint</li>
+        <li><span class="check">✓</span> Device pairing backend — ECDH key exchange, sha2 verification, persist/list/delete devices</li>
+        <li><span class="check">✓</span> CLI: fawx pair + fawx devices — pairing flow, device management, shared api_client module</li>
+        <li><span class="wip">◐</span> Cron / scheduled tasks — spec written, fx-cron crate in progress (redb persistence, 15s tick loop, HTTP API, agent tools)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -257,11 +258,11 @@
         <li><span class="check">✓</span> Codex implementation review — 3 rounds of mockup revisions, spec-accurate</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">SwiftUI App — In Progress (Codex)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">SwiftUI App — In Progress (Codex on Mac Mini)</h3>
       <ul class="feature-list">
-        <li><span class="wip">◐</span> Phase 1: Project setup, networking (FawxClient + SSE), onboarding, basic chat</li>
-        <li><span class="planned">○</span> Phase 2: Markdown rendering, session management, model/thinking pickers, tool cards</li>
-        <li><span class="planned">○</span> Phase 3: Skills browser, settings, error/empty states, iOS adaptations, keyboard shortcuts</li>
+        <li><span class="check">✓</span> Phase 1: Project setup, networking (FawxClient + SSE), onboarding, basic chat</li>
+        <li><span class="check">✓</span> Phase 2: Markdown rendering, session management, model/thinking pickers, code blocks</li>
+        <li><span class="wip">◐</span> Phase 3: Skills browser, settings, error handling, iOS adaptations, keyboard shortcuts</li>
         <li><span class="planned">○</span> Phase 4: App icon, TestFlight, README</li>
       </ul>
     </div>
