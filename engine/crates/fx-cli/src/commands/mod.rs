@@ -5,6 +5,7 @@
 //! functions appear unused from the lib's perspective — especially on
 //! macOS where cfg-gated code changes dead-code analysis.
 
+pub(crate) mod api_client;
 #[allow(dead_code)]
 pub mod audit;
 #[allow(dead_code)]
@@ -15,6 +16,8 @@ pub mod backup;
 pub mod completions;
 #[allow(dead_code)]
 pub mod config;
+#[allow(dead_code)]
+pub mod devices;
 #[allow(dead_code)]
 pub(crate) mod diagnostics;
 #[allow(dead_code)]
@@ -36,6 +39,8 @@ pub mod marketplace;
 #[cfg(feature = "oauth-bridge")]
 #[allow(dead_code)]
 pub mod oauth_bridge;
+#[allow(dead_code)]
+pub mod pair;
 #[allow(dead_code)]
 pub mod reset;
 #[allow(dead_code)]

@@ -1,4 +1,5 @@
 use crate::handlers::config::{handle_config_get, handle_config_set};
+use crate::handlers::devices::{handle_delete_device, handle_list_devices};
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
@@ -17,7 +18,7 @@ use crate::middleware::auth_middleware;
 use crate::state::HttpState;
 use crate::telegram::webhook::handle_telegram_webhook;
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use fx_fleet::FleetManager;
 use std::path::Path;
@@ -51,6 +52,8 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/skills", get(handle_list_skills))
         .route("/auth", get(handle_list_auth))
+        .route("/devices", get(handle_list_devices))
+        .route("/devices/{id}", delete(handle_delete_device))
         .route("/pair/generate", post(handle_generate_pair));
 
     let authenticated = Router::new()

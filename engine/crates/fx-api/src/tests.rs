@@ -1,4 +1,5 @@
 use crate::config_redaction;
+use crate::devices::DeviceStore;
 use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 use crate::error::HttpError;
 use crate::handlers::health::sanitize_config;
@@ -7,6 +8,7 @@ use crate::listener::{
     wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
 };
 use crate::middleware::verify_token;
+use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
@@ -1232,6 +1234,9 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
@@ -1256,9 +1261,18 @@ mod routing_and_status {
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
         }
+    }
+
+    fn test_state_with_devices(devices: DeviceStore) -> HttpState {
+        let mut state = test_state(None, Vec::new());
+        state.devices = Arc::new(Mutex::new(devices));
+        state
     }
 
     fn authed_request(method: &str, uri: &str) -> Request<Body> {
@@ -1288,6 +1302,123 @@ mod routing_and_status {
             .expect("body")
             .to_bytes();
         serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn get_devices_requires_auth() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/devices")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_devices_returns_device_list() {
+        let mut devices = DeviceStore::new();
+        let (_, first) = devices.create_device("Joe's MacBook");
+        let (_, second) = devices.create_device("Joe's iPhone");
+        let app = build_router(test_state_with_devices(devices), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/devices"))
+            .await
+            .expect("response");
+        let json = response_json(response).await;
+
+        assert_eq!(json["devices"].as_array().expect("devices").len(), 2);
+        assert_eq!(json["devices"][0]["id"], first.id);
+        assert_eq!(json["devices"][0]["device_name"], first.device_name);
+        assert_eq!(json["devices"][1]["id"], second.id);
+        assert_eq!(json["devices"][1]["device_name"], second.device_name);
+    }
+
+    #[tokio::test]
+    async fn get_devices_excludes_token_hash() {
+        let mut devices = DeviceStore::new();
+        let _ = devices.create_device("Joe's MacBook");
+        let app = build_router(test_state_with_devices(devices), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/devices"))
+            .await
+            .expect("response");
+        let json = response_json(response).await;
+
+        assert!(json["devices"][0].get("token_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_device_revokes_token() {
+        let mut devices = DeviceStore::new();
+        let (raw_token, device) = devices.create_device("Joe's MacBook");
+        let app = build_router(test_state_with_devices(devices), None);
+
+        let before_delete = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("Bearer {raw_token}"))
+            .body(Body::empty())
+            .expect("request");
+        let before_response = app
+            .clone()
+            .oneshot(before_delete)
+            .await
+            .expect("response before delete");
+        assert_eq!(before_response.status(), StatusCode::OK);
+
+        let delete_response = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/devices/{}", device.id),
+            ))
+            .await
+            .expect("delete response");
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let after_delete = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("Bearer {raw_token}"))
+            .body(Body::empty())
+            .expect("request");
+        let after_response = app
+            .oneshot(after_delete)
+            .await
+            .expect("response after delete");
+        assert_eq!(after_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_device_not_found() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("DELETE", "/v1/devices/dev-missing"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+
+        assert_eq!(json["error"], "device not found");
+    }
+
+    #[tokio::test]
+    async fn delete_device_requires_auth() {
+        let app = build_router(test_state(None, Vec::new()), None);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/v1/devices/dev-123")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn make_session_registry() -> SessionRegistry {
@@ -2446,6 +2577,9 @@ allowed_chat_ids = [123]
             start_time: Instant::now(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
             channels: ChannelRuntime {
                 router: Arc::new(ResponseRouter::new(Arc::new(router_registry))),
                 http: Arc::new(HttpChannel::new()),

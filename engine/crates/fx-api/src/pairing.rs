@@ -12,6 +12,7 @@ const INVALID_PREFIX: &str = "invalid:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PairingCode {
     pub code: String,
+    pub expires_at: u64,
     pub ttl_seconds: u64,
 }
 
@@ -39,12 +40,18 @@ impl PairingState {
     }
 
     pub fn generate(&mut self) -> PairingCode {
+        self.generate_with_ttl(PAIRING_TTL_SECONDS)
+    }
+
+    pub fn generate_with_ttl(&mut self, ttl_seconds: u64) -> PairingCode {
+        let ttl_seconds = normalized_ttl(ttl_seconds);
         self.cleanup_expired();
         let code = self.next_unique_code();
-        self.codes.insert(code.clone(), pending_pair());
+        self.codes.insert(code.clone(), pending_pair(ttl_seconds));
         PairingCode {
             code: format_code(&code),
-            ttl_seconds: PAIRING_TTL_SECONDS,
+            expires_at: current_time_seconds().saturating_add(ttl_seconds),
+            ttl_seconds,
         }
     }
 
@@ -86,7 +93,7 @@ impl PairingState {
         let pair = self
             .codes
             .entry(key)
-            .or_insert_with(pending_pair);
+            .or_insert_with(|| pending_pair(PAIRING_TTL_SECONDS));
         pair.attempts += 1;
         if pair.attempts >= MAX_ATTEMPTS {
             return Err(PairingError::TooManyAttempts);
@@ -142,11 +149,19 @@ fn format_code(code: &str) -> String {
     format!("{head}-{tail}")
 }
 
-fn pending_pair() -> PendingPair {
+fn pending_pair(ttl_seconds: u64) -> PendingPair {
     PendingPair {
-        expires_at: Instant::now() + Duration::from_secs(PAIRING_TTL_SECONDS),
+        expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
         attempts: 0,
     }
+}
+
+fn normalized_ttl(ttl_seconds: u64) -> u64 {
+    ttl_seconds.max(1)
+}
+
+fn current_time_seconds() -> u64 {
+    crate::time_util::current_time_seconds()
 }
 
 fn invalid_attempt_key(code: &str) -> String {
@@ -167,6 +182,27 @@ mod tests {
         assert_eq!(format_code(&code).chars().nth(3), Some('-'));
         assert_eq!(normalize_code("abc-234"), Some("ABC234".to_string()));
         assert_eq!(normalize_code("abc-12o"), None);
+    }
+
+    #[test]
+    fn generate_with_custom_ttl_includes_expiry_metadata() {
+        let mut state = PairingState::new();
+        let before = current_time_seconds();
+
+        let pair = state.generate_with_ttl(123);
+
+        assert_eq!(pair.ttl_seconds, 123);
+        assert!(pair.expires_at >= before + 123);
+        assert!(pair.expires_at <= current_time_seconds() + 123);
+    }
+
+    #[test]
+    fn generate_zero_ttl_is_clamped_to_one_second() {
+        let mut state = PairingState::new();
+
+        let pair = state.generate_with_ttl(0);
+
+        assert_eq!(pair.ttl_seconds, 1);
     }
 
     #[test]
