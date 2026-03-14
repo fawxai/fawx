@@ -38,6 +38,7 @@ members = [
     "engine/crates/fx-journal",
     "engine/crates/fx-session",
     "engine/crates/fx-bus",
+    "engine/crates/fx-cron",
     "engine/crates/fx-consensus",
 ]
 exclude = [
@@ -136,4 +137,5 @@ fx-fleet = { path = "engine/crates/fx-fleet" }
 fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
 fx-session = { path = "engine/crates/fx-session" }
 fx-bus = { path = "engine/crates/fx-bus" }
+fx-cron = { path = "engine/crates/fx-cron" }
 fx-consensus = { path = "engine/crates/fx-consensus" }

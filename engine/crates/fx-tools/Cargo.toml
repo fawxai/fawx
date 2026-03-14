@@ -10,6 +10,8 @@ improvement = ["dep:fx-analysis", "dep:fx-improve"]
 
 [dependencies]
 fx-core.workspace = true
+fx-cron.workspace = true
+fx-bus.workspace = true
 fx-session.workspace = true
 fx-fleet.workspace = true
 fx-propose.workspace = true

@@ -1,3 +1,4 @@
+mod cron_skill;
 mod experiment_tool;
 mod git_skill;
 #[cfg(feature = "improvement")]
@@ -7,6 +8,7 @@ mod session_tools;
 mod skill_bridge;
 mod tools;
 
+pub use cron_skill::CronSkill;
 pub use experiment_tool::ExperimentToolState;
 pub use git_skill::GitSkill;
 #[cfg(feature = "improvement")]

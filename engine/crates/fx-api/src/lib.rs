@@ -52,6 +52,7 @@ pub struct RunConfig {
     pub data_dir: PathBuf,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub webhook_channels: Vec<Arc<WebhookChannel>>,
+    pub cron_store: Option<Arc<Mutex<fx_cron::CronStore>>>,
 }
 
 pub async fn run(
@@ -80,6 +81,7 @@ pub async fn run(
         devices_path: Some(devices_path),
         channels: channels.clone(),
         data_dir: config.data_dir.clone(),
+        cron_store: config.cron_store.clone(),
     };
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let router = build_router(state, fleet_manager);

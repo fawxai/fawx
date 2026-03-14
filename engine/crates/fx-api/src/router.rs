@@ -54,7 +54,26 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/auth", get(handle_list_auth))
         .route("/devices", get(handle_list_devices))
         .route("/devices/{id}", delete(handle_delete_device))
-        .route("/pair/generate", post(handle_generate_pair));
+        .route("/pair/generate", post(handle_generate_pair))
+        .route(
+            "/cron/jobs",
+            get(crate::handlers::cron::handle_list_jobs)
+                .post(crate::handlers::cron::handle_create_job),
+        )
+        .route(
+            "/cron/jobs/{id}",
+            get(crate::handlers::cron::handle_get_job)
+                .put(crate::handlers::cron::handle_update_job)
+                .delete(crate::handlers::cron::handle_delete_job),
+        )
+        .route(
+            "/cron/jobs/{id}/run",
+            post(crate::handlers::cron::handle_trigger_job),
+        )
+        .route(
+            "/cron/jobs/{id}/runs",
+            get(crate::handlers::cron::handle_list_runs),
+        );
 
     let authenticated = Router::new()
         .route("/message", post(handle_message))

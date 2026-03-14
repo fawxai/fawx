@@ -1239,6 +1239,7 @@ mod routing_and_status {
             devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
+            cron_store: None,
         }
     }
 
@@ -1266,6 +1267,7 @@ mod routing_and_status {
             devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
+            cron_store: None,
         }
     }
 
@@ -2587,6 +2589,7 @@ allowed_chat_ids = [123]
                 webhooks: Arc::new(webhooks),
             },
             data_dir,
+            cron_store: None,
         };
         let app = build_router(state, None);
         let req = Request::builder()

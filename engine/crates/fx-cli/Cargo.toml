@@ -45,11 +45,13 @@ fx-author = { path = "../fx-author" }
 fx-marketplace = { path = "../fx-marketplace" }
 fx-session.workspace = true
 fx-bus.workspace = true
+fx-cron.workspace = true
 fx-storage.workspace = true
 ring.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
 async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

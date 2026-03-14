@@ -6,6 +6,7 @@ use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_config::HttpConfig;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub async fn run(
     app: HeadlessApp,
@@ -26,7 +27,16 @@ pub async fn run(
         }
     };
 
-    fx_api::run(
+    let cron_store = match fx_cron::CronStore::open(&data_dir.join("cron.redb")) {
+        Ok(store) => Some(Arc::new(tokio::sync::Mutex::new(store))),
+        Err(error) => {
+            tracing::warn!(error = %error, "cron store unavailable");
+            None
+        }
+    };
+    let scheduler_handle = start_scheduler_if_possible(&app, cron_store.as_ref());
+
+    let result = fx_api::run(
         app,
         auth_store
             .as_ref()
@@ -37,7 +47,24 @@ pub async fn run(
             data_dir,
             telegram,
             webhook_channels,
+            cron_store,
         },
     )
-    .await
+    .await;
+
+    drop(scheduler_handle);
+    result
+}
+
+fn start_scheduler_if_possible(
+    app: &HeadlessApp,
+    cron_store: Option<&Arc<tokio::sync::Mutex<fx_cron::CronStore>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let store = cron_store.cloned()?;
+    let Some(bus) = app.session_bus().cloned() else {
+        tracing::warn!("session bus unavailable; cron scheduler not started");
+        return None;
+    };
+    let scheduler = fx_cron::Scheduler::new(store, bus, CancellationToken::new());
+    Some(scheduler.start())
 }
