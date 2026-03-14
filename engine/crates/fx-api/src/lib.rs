@@ -52,7 +52,7 @@ pub struct RunConfig {
     pub data_dir: PathBuf,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub webhook_channels: Vec<Arc<WebhookChannel>>,
-    pub cron_store: Option<Arc<Mutex<fx_cron::CronStore>>>,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 
 pub async fn run(

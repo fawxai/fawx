@@ -27,13 +27,7 @@ pub async fn run(
         }
     };
 
-    let cron_store = match fx_cron::CronStore::open(&data_dir.join("cron.redb")) {
-        Ok(store) => Some(Arc::new(tokio::sync::Mutex::new(store))),
-        Err(error) => {
-            tracing::warn!(error = %error, "cron store unavailable");
-            None
-        }
-    };
+    let cron_store = app.cron_store().cloned();
     let scheduler_handle = start_scheduler_if_possible(&app, cron_store.as_ref());
 
     let result = fx_api::run(
@@ -58,7 +52,7 @@ pub async fn run(
 
 fn start_scheduler_if_possible(
     app: &HeadlessApp,
-    cron_store: Option<&Arc<tokio::sync::Mutex<fx_cron::CronStore>>>,
+    cron_store: Option<&fx_cron::SharedCronStore>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let store = cron_store.cloned()?;
     let Some(bus) = app.session_bus().cloned() else {

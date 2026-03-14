@@ -351,6 +351,7 @@ pub struct LoopEngineBundle {
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     /// Signature policy loaded once at startup, shared with skill watcher.
     pub signature_policy: SignaturePolicy,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 
 #[derive(Clone, Default)]
@@ -362,6 +363,7 @@ pub struct HeadlessLoopBuildOptions {
     pub cancel_token: Option<CancellationToken>,
     pub experiment_progress: Option<ProgressCallback>,
     pub session_registry: Option<fx_session::SessionRegistry>,
+    pub session_bus: Option<SessionBus>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -374,6 +376,7 @@ impl HeadlessLoopBuildOptions {
             cancel_token: None,
             experiment_progress: None,
             session_registry: None,
+            session_bus: None,
         }
     }
 
@@ -386,6 +389,7 @@ impl HeadlessLoopBuildOptions {
             cancel_token: Some(cancel_token),
             experiment_progress: None,
             session_registry: None,
+            session_bus: None,
         }
     }
 }
@@ -398,6 +402,7 @@ struct SkillRegistryBuildOptions {
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     experiment_progress: Option<ProgressCallback>,
     session_registry: Option<fx_session::SessionRegistry>,
+    session_bus: Option<SessionBus>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -511,6 +516,7 @@ fn build_loop_engine_with_options(
         credential_store: skills.credential_store,
         config_manager: options.config_manager.clone(),
         signature_policy: skills.signature_policy,
+        cron_store: skills.cron_store,
     })
 }
 
@@ -528,6 +534,7 @@ fn build_skill_registry_options(
         config_manager: options.config_manager.clone(),
         experiment_progress: options.experiment_progress.clone(),
         session_registry: options.session_registry.clone(),
+        session_bus: options.session_bus.clone(),
     }
 }
 
@@ -712,6 +719,7 @@ struct SkillRegistryBundle {
     /// Signature policy loaded once at startup, shared with the skill watcher
     /// to avoid redundant filesystem reads.
     signature_policy: SignaturePolicy,
+    cron_store: Option<fx_cron::SharedCronStore>,
 }
 
 fn build_skill_registry(
@@ -849,6 +857,23 @@ fn build_skill_registry(
         }
     }
 
+    // Register cron/scheduler skill.
+    let cron_store = match fx_cron::CronStore::open(&data_dir.join("cron.redb")) {
+        Ok(store) => {
+            let arc = Arc::new(tokio::sync::Mutex::new(store));
+            let cron_skill = Arc::new(fx_tools::CronSkill::new(
+                Arc::clone(&arc),
+                options.session_bus.clone(),
+            ));
+            registry.register(cron_skill);
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cron store unavailable");
+            None
+        }
+    };
+
     apply_skill_summaries(&runtime_info, registry.as_ref());
 
     SkillRegistryBundle {
@@ -863,6 +888,7 @@ fn build_skill_registry(
         credential_provider,
         credential_store,
         signature_policy,
+        cron_store,
     }
 }
 
@@ -1965,6 +1991,7 @@ mod tests {
             None,
             HeadlessLoopBuildOptions {
                 session_registry: None,
+                session_bus: None,
                 ..HeadlessLoopBuildOptions::default()
             },
         )

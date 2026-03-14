@@ -1178,6 +1178,7 @@ mod routing_and_status {
             canary_monitor: None,
             session_bus,
             session_key: None,
+            cron_store: None,
         })
         .expect("test app")
     }
@@ -3017,6 +3018,7 @@ mod telegram_update {
             canary_monitor: None,
             session_bus: None,
             session_key: None,
+            cron_store: None,
         })
         .expect("test app")
     }

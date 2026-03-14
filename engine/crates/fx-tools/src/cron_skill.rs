@@ -16,7 +16,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct CronSkill {
     store: Arc<Mutex<CronStore>>,
-    bus: SessionBus,
+    bus: Option<SessionBus>,
     tool_names: HashSet<String>,
 }
 
@@ -27,7 +27,7 @@ impl std::fmt::Debug for CronSkill {
 }
 
 impl CronSkill {
-    pub fn new(store: Arc<Mutex<CronStore>>, bus: SessionBus) -> Self {
+    pub fn new(store: Arc<Mutex<CronStore>>, bus: Option<SessionBus>) -> Self {
         let tool_names = cron_tool_definitions()
             .into_iter()
             .map(|tool| tool.name)
@@ -118,7 +118,11 @@ impl CronSkill {
 
     async fn handle_run(&self, value: serde_json::Value) -> Result<String, SkillError> {
         let id = parse_job_id(value)?;
-        let run = trigger_job(&self.store, &self.bus, id)
+        let bus = self
+            .bus
+            .as_ref()
+            .ok_or_else(|| "session bus unavailable".to_string())?;
+        let run = trigger_job(&self.store, bus, id)
             .await
             .map_err(to_skill_error)?;
         serde_json::to_string_pretty(&run).map_err(|error| format!("serialization failed: {error}"))
@@ -286,15 +290,16 @@ mod tests {
     use fx_bus::{BusStore, SessionBus};
     use fx_storage::Storage;
 
+    fn test_store() -> Arc<Mutex<CronStore>> {
+        Arc::new(Mutex::new(CronStore::new(
+            Storage::open_in_memory().expect("storage"),
+        )))
+    }
+
     fn test_skill() -> (CronSkill, BusStore) {
         let bus_store = BusStore::new(Storage::open_in_memory().expect("bus storage"));
         let bus = SessionBus::new(bus_store.clone());
-        let skill = CronSkill::new(
-            Arc::new(Mutex::new(CronStore::new(
-                Storage::open_in_memory().expect("storage"),
-            ))),
-            bus,
-        );
+        let skill = CronSkill::new(test_store(), Some(bus));
         (skill, bus_store)
     }
 
@@ -319,6 +324,17 @@ mod tests {
             .expect("add");
         let output = skill.execute_tool("cron_list", "{}").await.expect("list");
         assert!(output.contains("ping"));
+    }
+
+    #[tokio::test]
+    async fn cron_run_errors_when_session_bus_is_unavailable() {
+        let skill = CronSkill::new(test_store(), None);
+        let error = skill
+            .execute_tool("cron_run", &format!(r#"{{"id":"{}"}}"#, Uuid::new_v4()))
+            .await
+            .expect_err("missing bus should fail");
+
+        assert!(error.contains("session bus unavailable"));
     }
 
     #[tokio::test]

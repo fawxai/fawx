@@ -135,6 +135,7 @@ fn build_app_with_dependencies(
         parent_loop_build_options(
             &subagent_manager,
             build_config.config_manager.clone(),
+            session_bus.clone(),
             build_config.experiment_progress,
         ),
     )?;
@@ -153,6 +154,7 @@ fn build_app_with_dependencies(
         canary_monitor: Some(build_canary_monitor(&build_config.data_dir)),
         session_bus,
         session_key: Some(headless::main_session_key()),
+        cron_store: bundle.cron_store,
     })
 }
 
@@ -193,6 +195,7 @@ fn build_subagent_manager(
 fn parent_loop_build_options(
     subagent_manager: &Arc<fx_subagent::SubagentManager>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+    session_bus: Option<fx_bus::SessionBus>,
     experiment_progress: Option<ProgressCallback>,
 ) -> startup::HeadlessLoopBuildOptions {
     startup::HeadlessLoopBuildOptions {
@@ -201,6 +204,7 @@ fn parent_loop_build_options(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
         config_manager,
+        session_bus,
         experiment_progress,
         ..startup::HeadlessLoopBuildOptions::default()
     }

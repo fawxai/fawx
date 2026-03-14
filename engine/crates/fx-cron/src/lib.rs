@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 pub mod eval;
 pub mod scheduler;
 pub mod store;
@@ -6,6 +9,7 @@ pub mod types;
 pub use eval::{is_due, next_run_time, validate_schedule};
 pub use scheduler::{execute_job, execute_jobs_due, trigger_job, CronBus, Scheduler};
 pub use store::CronStore;
+pub type SharedCronStore = Arc<Mutex<CronStore>>;
 pub use types::{now_ms, CronJob, JobPayload, JobRun, RunStatus, Schedule};
 
 #[derive(Debug, thiserror::Error)]

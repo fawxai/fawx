@@ -24,7 +24,7 @@ pub struct HttpState {
     pub devices_path: Option<PathBuf>,
     pub channels: ChannelRuntime,
     pub data_dir: PathBuf,
-    pub cron_store: Option<Arc<Mutex<fx_cron::CronStore>>>,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 
 #[derive(Clone)]

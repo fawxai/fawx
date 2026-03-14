@@ -138,6 +138,7 @@ pub struct HeadlessAppDeps {
     pub canary_monitor: Option<CanaryMonitor>,
     pub session_bus: Option<SessionBus>,
     pub session_key: Option<SessionKey>,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -161,6 +162,7 @@ pub struct HeadlessApp {
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     session_bus: Option<SessionBus>,
     session_key: Option<SessionKey>,
+    cron_store: Option<fx_cron::SharedCronStore>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -304,6 +306,7 @@ impl HeadlessApp {
             config_manager: deps.config_manager,
             session_bus: deps.session_bus,
             session_key: deps.session_key,
+            cron_store: deps.cron_store,
             bus_receiver,
         })
     }
@@ -485,6 +488,10 @@ impl HeadlessApp {
 
     pub fn session_bus(&self) -> Option<&SessionBus> {
         self.session_bus.as_ref()
+    }
+
+    pub fn cron_store(&self) -> Option<&fx_cron::SharedCronStore> {
+        self.cron_store.as_ref()
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -1628,6 +1635,7 @@ impl HeadlessSubagentFactory {
             canary_monitor: None,
             session_bus: self.deps.session_bus.clone(),
             session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
+            cron_store: None,
         };
         HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))
     }
@@ -2017,6 +2025,7 @@ mod tests {
             config_manager: None,
             session_bus: None,
             session_key: None,
+            cron_store: None,
             bus_receiver: None,
         }
     }
@@ -2260,6 +2269,7 @@ mod tests {
             canary_monitor: None,
             session_bus: None,
             session_key: None,
+            cron_store: None,
         }
     }
 
@@ -2479,6 +2489,7 @@ mod tests {
             config_manager: Some(manager),
             session_bus: None,
             session_key: None,
+            cron_store: None,
             bus_receiver: None,
         };
 
@@ -2808,6 +2819,7 @@ mod tests {
             config_manager: None,
             session_bus: None,
             session_key: None,
+            cron_store: None,
             bus_receiver: None,
         };
 
@@ -2846,6 +2858,7 @@ mod tests {
             config_manager: None,
             session_bus: None,
             session_key: None,
+            cron_store: None,
             bus_receiver: None,
         };
 
