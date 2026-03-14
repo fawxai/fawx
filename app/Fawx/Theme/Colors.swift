@@ -17,6 +17,8 @@ extension Color {
     static var fawxTextSecondary: Color { palette(light: 0x666666, dark: 0x999999) }
     static var fawxAccent: Color { palette(light: 0xD45E14, dark: 0xE8711A) }
     static var fawxAccentSubtle: Color { palette(light: 0xD45E14, dark: 0xE8711A, lightAlpha: 0.08, darkAlpha: 0.13) }
+    static var fawxUserBubble: Color { palette(light: 0xE8BC9E, dark: 0x4B3022) }
+    static var fawxUserBubbleText: Color { palette(light: 0x24170F, dark: 0xF7ECE4) }
     static var fawxSuccess: Color { palette(light: 0x22C55E, dark: 0x4ADE80) }
     static var fawxWarning: Color { palette(light: 0xD97706, dark: 0xFBBF24) }
     static var fawxError: Color { palette(light: 0xDC2626, dark: 0xF87171) }

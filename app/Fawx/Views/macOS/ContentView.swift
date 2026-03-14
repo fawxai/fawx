@@ -3,7 +3,6 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 #endif
-
 struct ContentView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
@@ -46,7 +45,8 @@ struct ContentView: View {
                 connectionStatus: appState.connectionStatus,
                 permissionPreset: appState.permissionPresetName,
                 modelName: appState.activeModel?.modelID ?? appState.lastHealth?.model,
-                context: appState.currentContext
+                context: appState.currentContext,
+                selectedSessionMessageCount: sessionViewModel.selectedSession?.messageCount ?? 0
             )
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity)
@@ -67,13 +67,12 @@ struct ContentView: View {
         }
         .onChange(of: sessionViewModel.selectedSessionID) { _, newValue in
             Task {
-                guard selectedSessionID != newValue else {
-                    return
-                }
                 if let newValue {
-                    sidebarSelection = .session(newValue)
+                    if sidebarSelection != .session(newValue) {
+                        sidebarSelection = .session(newValue)
+                    }
                     await chatViewModel.loadMessages(for: newValue)
-                } else if selectedSessionID != nil {
+                } else if case .session = sidebarSelection {
                     beginNewSession()
                 }
             }
@@ -133,7 +132,10 @@ struct ContentView: View {
 
     private func openSettingsWindow() {
 #if os(macOS)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        }
 #endif
     }
 

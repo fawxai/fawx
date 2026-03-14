@@ -14,6 +14,7 @@ struct TabRootView: View {
     @Bindable var skillsViewModel: SkillsViewModel
     @Bindable var settingsViewModel: SettingsViewModel
     @State private var selectedTab: RootTab = .chat
+    @State private var skillsSearchText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,35 +26,67 @@ struct TabRootView: View {
                 }
             }
 
-            TabView(selection: $selectedTab) {
-                SessionListView(
-                    appState: appState,
-                    sessionViewModel: sessionViewModel,
-                    chatViewModel: chatViewModel
-                )
-                    .tabItem {
-                        Label("Chat", systemImage: "bubble.left.and.bubble.right")
-                    }
-                    .tag(RootTab.chat)
-
-                NavigationStack {
-                    SkillsView(skillsViewModel: skillsViewModel, showsHeader: false)
-                        .navigationTitle("Skills")
+            ZStack {
+                rootSectionContainer(isActive: selectedTab == .chat) {
+                    SessionListView(
+                        appState: appState,
+                        sessionViewModel: sessionViewModel,
+                        chatViewModel: chatViewModel,
+                        openSkills: {
+                            selectedTab = .skills
+                        },
+                        openSettings: {
+                            selectedTab = .settings
+                        }
+                    )
                 }
-                    .tabItem {
-                        Label("Skills", systemImage: "puzzlepiece.extension")
-                    }
-                    .tag(RootTab.skills)
 
-                iOSSettingsView(
-                    settingsViewModel: settingsViewModel,
-                    appState: appState,
-                    chatViewModel: chatViewModel
-                )
-                    .tabItem {
-                        Label("Settings", systemImage: "gear")
+                rootSectionContainer(isActive: selectedTab == .skills) {
+                    NavigationStack {
+                        SkillsView(
+                            skillsViewModel: skillsViewModel,
+                            showsHeader: false,
+                            searchText: skillsSearchText
+                        )
+                            .navigationTitle("Skills")
+                            .iOSInlineNavigationTitle()
+                            .toolbar {
+                                ToolbarItem(placement: .fawxTopLeading) {
+                                    SectionMenuButton(
+                                        disabledSection: .skills,
+                                        showSessions: {
+                                            selectedTab = .chat
+                                        },
+                                        showSkills: {},
+                                        showSettings: {
+                                            selectedTab = .settings
+                                        }
+                                    )
+                                }
+                            }
+                            .safeAreaInset(edge: .bottom, spacing: 0) {
+                                BottomSearchBar(
+                                    text: $skillsSearchText,
+                                    prompt: "Search skills",
+                                    accessibilityIdentifier: "skillsSearchField"
+                                )
+                            }
                     }
-                    .tag(RootTab.settings)
+                }
+
+                rootSectionContainer(isActive: selectedTab == .settings) {
+                    iOSSettingsView(
+                        settingsViewModel: settingsViewModel,
+                        appState: appState,
+                        chatViewModel: chatViewModel,
+                        openSessions: {
+                            selectedTab = .chat
+                        },
+                        openSkills: {
+                            selectedTab = .skills
+                        }
+                    )
+                }
             }
         }
         .overlay(alignment: .top) {
@@ -67,5 +100,17 @@ struct TabRootView: View {
                 selectedTab = .chat
             }
         }
+    }
+
+    @ViewBuilder
+    private func rootSectionContainer<Content: View>(
+        isActive: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .opacity(isActive ? 1 : 0)
+            .allowsHitTesting(isActive)
+            .accessibilityHidden(!isActive)
+            .zIndex(isActive ? 1 : 0)
     }
 }

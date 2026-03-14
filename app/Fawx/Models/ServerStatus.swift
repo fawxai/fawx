@@ -44,4 +44,15 @@ struct ContextInfo: Codable, Sendable, Hashable {
         case percentage
         case compactionThreshold = "compaction_threshold"
     }
+
+    var normalizedPercentage: Double {
+        let reportedPercentage = percentage <= 1 ? percentage * 100 : percentage
+
+        guard usedTokens > 0, maxTokens > 0 else {
+            return max(0, min(reportedPercentage, 100))
+        }
+
+        let derivedPercentage = (Double(usedTokens) / Double(maxTokens)) * 100
+        return max(0, min(derivedPercentage, 100))
+    }
 }

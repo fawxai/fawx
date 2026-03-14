@@ -45,18 +45,24 @@ struct ChatDetailView: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 composerArea
             }
-            .onChange(of: chatViewModel.transcriptItems.count) { _, _ in
-                scrollToBottom(using: proxy)
+            .onAppear {
+                scheduleScrollToBottom(using: proxy, animated: false)
+            }
+            .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
+                scheduleScrollToBottom(using: proxy)
             }
             .onChange(of: chatViewModel.streamingText) { _, _ in
-                scrollToBottom(using: proxy)
+                scheduleScrollToBottom(using: proxy)
+            }
+            .onChange(of: chatViewModel.isLoadingHistory) { oldValue, newValue in
+                if oldValue && !newValue {
+                    scheduleScrollToBottom(using: proxy, animated: false)
+                }
             }
 #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
             .onReceive(keyboardFrameDidChange) { _ in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    scrollToBottom(using: proxy)
-                }
+                scheduleScrollToBottom(using: proxy)
             }
 #endif
         }
@@ -137,6 +143,10 @@ struct ChatDetailView: View {
                     }
                 }
             )
+
+#if os(iOS)
+            compactStatusRow
+#endif
         }
         .padding(.horizontal, FawxSpacing.paddingXL)
         .padding(.top, FawxSpacing.paddingSM)
@@ -152,7 +162,15 @@ struct ChatDetailView: View {
         }
     }
 
-    private func scrollToBottom(using proxy: ScrollViewProxy) {
+    private func scheduleScrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
+        scrollToBottom(using: proxy, animated: animated)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            scrollToBottom(using: proxy, animated: animated)
+        }
+    }
+
+    private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool) {
         let target = chatViewModel.isStreaming || !chatViewModel.streamingText.isEmpty
             ? "streaming"
             : chatViewModel.transcriptItems.last?.id
@@ -161,7 +179,11 @@ struct ChatDetailView: View {
             return
         }
 
-        withAnimation(.easeOut(duration: 0.2)) {
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(target, anchor: .bottom)
+            }
+        } else {
             proxy.scrollTo(target, anchor: .bottom)
         }
     }
@@ -175,6 +197,85 @@ struct ChatDetailView: View {
     }
 
 #if os(iOS)
+    private var compactStatusRow: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(connectionColor)
+                    .frame(width: 6, height: 6)
+
+                Text(connectionLabel)
+                    .accessibilityIdentifier("connectionIndicator")
+            }
+
+            compactSeparator
+
+            Text(appState.permissionPresetName)
+                .lineLimit(1)
+
+            compactSeparator
+
+            Text(compactContextLabel)
+                .lineLimit(1)
+                .accessibilityIdentifier("contextLabel")
+
+            Spacer(minLength: 0)
+        }
+        .font(FawxTypography.status)
+        .foregroundStyle(Color.fawxTextSecondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, FawxSpacing.paddingXS)
+    }
+
+    private var compactSeparator: some View {
+        Text("·")
+            .foregroundStyle(Color.fawxTextSecondary)
+    }
+
+    private var compactContextLabel: String {
+        guard let context = appState.currentContext else {
+            return "—"
+        }
+
+        if transcriptMessageCount > 0 && context.usedTokens == 0 && context.normalizedPercentage == 0 {
+            return "Ctx unavailable"
+        }
+
+        return "\(Int(context.normalizedPercentage.rounded()))% ctx"
+    }
+
+    private var transcriptMessageCount: Int {
+        chatViewModel.transcriptItems.reduce(into: 0) { count, item in
+            if case .message = item {
+                count += 1
+            }
+        }
+    }
+
+    private var connectionLabel: String {
+        switch appState.connectionStatus {
+        case .connected:
+            return "Connected"
+        case .connecting:
+            return "Connecting"
+        case .reconnecting:
+            return "Reconnecting"
+        case .disconnected:
+            return "Disconnected"
+        }
+    }
+
+    private var connectionColor: Color {
+        switch appState.connectionStatus {
+        case .connected:
+            return .fawxSuccess
+        case .connecting, .reconnecting:
+            return .fawxWarning
+        case .disconnected:
+            return .fawxError
+        }
+    }
+
     private var keyboardFrameDidChange: NotificationCenter.Publisher {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }

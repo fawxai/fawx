@@ -446,14 +446,35 @@ final class AppState {
 
             while !Task.isCancelled && self.isConfigured {
                 let delaySeconds = min(pow(2.0, Double(self.reconnectAttempt)), 30)
-                try? await Task.sleep(for: .seconds(delaySeconds))
+                do {
+                    try await Task.sleep(for: .seconds(delaySeconds))
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
+                }
+
+                guard !Task.isCancelled else {
+                    return
+                }
 
                 do {
                     self.lastHealth = try await self.client.health()
+                    guard !Task.isCancelled else {
+                        return
+                    }
                     try await self.refreshServerState()
+                    guard !Task.isCancelled else {
+                        return
+                    }
                     self.handleConnectionRecovered(showsToast: true)
                     return
+                } catch is CancellationError {
+                    return
                 } catch {
+                    guard !Task.isCancelled else {
+                        return
+                    }
                     self.reconnectAttempt += 1
                     self.connectionError = self.connectionMessage(for: error)
 

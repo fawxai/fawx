@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 @main
 struct FawxApp: App {
@@ -30,6 +33,9 @@ struct FawxApp: App {
         let selectedTheme = AppTheme(rawValue: storedThemeRawValue) ?? .system
         let selectedFontSize = AppFontSize(rawValue: storedFontSizeRawValue) ?? .medium
         let _ = FawxTypography.setScale(selectedFontSize.scale)
+#if os(macOS)
+        let _ = applyMacAppearance(selectedTheme)
+#endif
 
         mainWindowScene(selectedTheme: selectedTheme)
 #if os(macOS)
@@ -45,8 +51,7 @@ struct FawxApp: App {
 
     private func mainWindowScene(selectedTheme: AppTheme) -> some Scene {
         WindowGroup {
-            rootView
-                .preferredColorScheme(selectedTheme.colorScheme)
+            themedRootView(selectedTheme: selectedTheme)
                 .task(id: appState.configurationKey) {
                     await appState.bootstrap()
                     settingsViewModel.reloadStoredValues()
@@ -55,6 +60,9 @@ struct FawxApp: App {
                 }
                 .onChange(of: storedThemeRawValue) { _, newValue in
                     let theme = AppTheme(rawValue: newValue) ?? .system
+#if os(macOS)
+                    applyMacAppearance(theme)
+#endif
                     appState.setTheme(theme)
                 }
                 .onChange(of: storedFontSizeRawValue) { _, newValue in
@@ -128,4 +136,31 @@ struct FawxApp: App {
             OnboardingView(settingsViewModel: settingsViewModel)
         }
     }
+
+    @ViewBuilder
+    private func themedRootView(selectedTheme: AppTheme) -> some View {
+#if os(macOS)
+        rootView
+#else
+        rootView
+            .preferredColorScheme(selectedTheme.colorScheme)
+#endif
+    }
+
+#if os(macOS)
+    @discardableResult
+    private func applyMacAppearance(_ theme: AppTheme) -> Bool {
+        let appearance: NSAppearance? = switch theme {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+
+        NSApp.appearance = appearance
+        return true
+    }
+#endif
 }

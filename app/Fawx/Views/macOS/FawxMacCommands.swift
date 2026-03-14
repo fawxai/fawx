@@ -1,7 +1,6 @@
 #if os(macOS)
 import Observation
 import SwiftUI
-import AppKit
 
 struct FawxMacCommands: Commands {
     @Bindable var appState: AppState
@@ -81,7 +80,10 @@ struct FawxMacCommands: Commands {
     }
 
     private func openSettingsWindow() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        }
     }
 }
 #endif

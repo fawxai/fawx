@@ -5,6 +5,7 @@ struct StatusBar: View {
     let permissionPreset: String
     let modelName: String?
     let context: ContextInfo?
+    let selectedSessionMessageCount: Int
 
     var body: some View {
         HStack(spacing: FawxSpacing.paddingMD) {
@@ -36,17 +37,23 @@ struct StatusBar: View {
 
             Spacer()
 
-            if let context {
+            if let displayContext = displayContext {
                 HStack(spacing: FawxSpacing.paddingSM) {
-                    ContextProgressBar(percentage: context.percentage)
+                    ContextProgressBar(percentage: displayContext.percentage)
                         .frame(width: 42, height: 6)
 
-                    Text("\(Int(context.percentage.rounded()))% ctx")
+                    Text("\(Int(displayContext.percentage.rounded()))% ctx")
                         .font(FawxTypography.status)
                         .foregroundStyle(Color.fawxTextSecondary)
                         .accessibilityIdentifier("contextLabel")
                 }
-                .help("\(context.usedTokens) / \(context.maxTokens) tokens")
+                .help("\(displayContext.usedTokens) / \(displayContext.maxTokens) tokens")
+            } else if shouldHideUnavailableContext {
+                Text("Ctx unavailable")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .accessibilityIdentifier("contextLabel")
+                    .help("The server has not reported usable context metrics for this session yet.")
             } else {
                 Text("—")
                     .font(FawxTypography.status)
@@ -87,6 +94,38 @@ struct StatusBar: View {
             return .fawxError
         }
     }
+
+    private var displayContext: DisplayContext? {
+        guard let context else {
+            return nil
+        }
+
+        guard !(selectedSessionMessageCount > 0 && context.usedTokens == 0 && context.normalizedPercentage == 0) else {
+            return nil
+        }
+
+        return DisplayContext(
+            percentage: context.normalizedPercentage,
+            usedTokens: context.usedTokens,
+            maxTokens: context.maxTokens
+        )
+    }
+
+    private var shouldHideUnavailableContext: Bool {
+        guard let context else {
+            return false
+        }
+
+        return selectedSessionMessageCount > 0
+            && context.usedTokens == 0
+            && context.normalizedPercentage == 0
+    }
+}
+
+private struct DisplayContext {
+    let percentage: Double
+    let usedTokens: Int
+    let maxTokens: Int
 }
 
 private struct ContextProgressBar: View {

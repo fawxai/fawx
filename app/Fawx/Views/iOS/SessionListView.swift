@@ -15,9 +15,13 @@ struct SessionListView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
+    let openSkills: () -> Void
+    let openSettings: () -> Void
 
     @State private var navigationPath: [SessionRoute] = []
     @State private var pendingClearSession: Session?
+    @State private var hasPresentedInitialRoute = false
+    @State private var searchText = ""
 
     var body: some View {
         Group {
@@ -47,8 +51,9 @@ struct SessionListView: View {
         NavigationStack(path: $navigationPath) {
             sessionList
                 .navigationTitle("Sessions")
+                .iOSInlineNavigationTitle()
                 .toolbar {
-                    newSessionToolbarButton
+                    rootMenuToolbarButton
                 }
                 .navigationDestination(for: SessionRoute.self) { route in
                     chatDetailView(for: route)
@@ -62,7 +67,10 @@ struct SessionListView: View {
                 .onAppear {
                     if UITestLaunchOptions.shouldResetState {
                         resetToEmptyConversation()
+                        hasPresentedInitialRoute = false
                     }
+
+                    presentInitialRouteIfNeeded()
                 }
         }
     }
@@ -104,8 +112,16 @@ struct SessionListView: View {
                     actionTitle: "New Session",
                     action: createNewSession
                 )
+            } else if filteredGroupedSections.isEmpty {
+                sessionListPlaceholder(
+                    title: "No matching sessions",
+                    message: "Try a different search term.",
+                    actionTitle: "Clear Search"
+                ) {
+                    searchText = ""
+                }
             } else {
-                ForEach(sessionViewModel.groupedSections) { section in
+                ForEach(filteredGroupedSections) { section in
                     Section(section.title) {
                         ForEach(section.sessions) { session in
                             sessionRow(for: session)
@@ -118,32 +134,43 @@ struct SessionListView: View {
         .refreshable {
             await sessionViewModel.refresh()
         }
+#if os(iOS)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if usesSplitLayout == false {
+                sessionBottomControls
+            }
+        }
+#endif
     }
 
     @ViewBuilder
     private func chatDetailView(for route: SessionRoute) -> some View {
         switch route {
         case .newSession:
-            ChatDetailView(
-                appState: appState,
-                sessionViewModel: sessionViewModel,
-                chatViewModel: chatViewModel,
-                emptyStateTitle: "Conversation",
-                emptyStateMessage: "Start typing to ask Fawx for help."
+            mobileChatShell(
+                ChatDetailView(
+                    appState: appState,
+                    sessionViewModel: sessionViewModel,
+                    chatViewModel: chatViewModel,
+                    emptyStateTitle: "Start a new session",
+                    emptyStateMessage: "Let's get started"
+                )
+                .navigationTitle("New Session")
             )
-            .navigationTitle("Conversation")
 #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
 #endif
         case .session(let sessionID):
-            ChatDetailView(
-                appState: appState,
-                sessionViewModel: sessionViewModel,
-                chatViewModel: chatViewModel,
-                emptyStateTitle: "Conversation",
-                emptyStateMessage: "Start typing to ask Fawx for help."
+            mobileChatShell(
+                ChatDetailView(
+                    appState: appState,
+                    sessionViewModel: sessionViewModel,
+                    chatViewModel: chatViewModel,
+                    emptyStateTitle: "Start a new session",
+                    emptyStateMessage: "Let's get started"
+                )
+                .navigationTitle(sessionTitle(for: sessionID))
             )
-            .navigationTitle(sessionTitle(for: sessionID))
 #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
 #endif
@@ -157,7 +184,7 @@ struct SessionListView: View {
     private var splitDetailTitle: String {
         switch selectedRoute {
         case .newSession:
-            return "Conversation"
+            return "New Session"
         case .session(let sessionID):
             return sessionTitle(for: sessionID)
         }
@@ -197,6 +224,54 @@ struct SessionListView: View {
             return
         }
         navigationPath = []
+    }
+
+    private func presentInitialRouteIfNeeded() {
+        guard hasPresentedInitialRoute == false else {
+            return
+        }
+
+        sessionViewModel.select(nil)
+        chatViewModel.showEmptyState()
+
+        if usesSplitLayout == false {
+            navigationPath = [.newSession]
+        }
+
+        hasPresentedInitialRoute = true
+    }
+
+    private func showSessionsList() {
+        sessionViewModel.select(nil)
+        chatViewModel.showEmptyState()
+        if usesSplitLayout == false {
+            navigationPath = []
+        }
+    }
+
+    @ViewBuilder
+    private func mobileChatShell<Content: View>(_ content: Content) -> some View {
+#if os(iOS)
+        if usesSplitLayout {
+            content
+        } else {
+            content
+                .navigationBarBackButtonHidden(true)
+                .toolbar(.hidden, for: .tabBar)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        SectionMenuButton(
+                            disabledSection: nil,
+                            showSessions: showSessionsList,
+                            showSkills: openSkills,
+                            showSettings: openSettings
+                        )
+                    }
+                }
+        }
+#else
+        content
+#endif
     }
 
     private func clearSession(_ sessionID: String) {
@@ -256,6 +331,47 @@ struct SessionListView: View {
         }
     }
 
+    @ToolbarContentBuilder
+    private var rootMenuToolbarButton: some ToolbarContent {
+        if usesSplitLayout == false {
+            ToolbarItem(placement: .fawxTopLeading) {
+                SectionMenuButton(
+                    disabledSection: .sessions,
+                    showSessions: showSessionsList,
+                    showSkills: openSkills,
+                    showSettings: openSettings
+                )
+            }
+        }
+    }
+
+    private var sessionBottomControls: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            BottomSearchBar(
+                text: $searchText,
+                prompt: "Search sessions",
+                accessibilityIdentifier: "sessionSearchField",
+                includesContainerChrome: false
+            )
+            .frame(maxWidth: .infinity)
+
+            Button(action: createNewSession) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .frame(width: 52, height: 52)
+                    .background(Color.fawxAccent)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("newSessionButton")
+        }
+        .padding(.horizontal, FawxSpacing.paddingLG)
+        .padding(.top, FawxSpacing.paddingSM)
+        .padding(.bottom, FawxSpacing.paddingMD)
+        .background(Color.fawxBackground.opacity(0.96))
+    }
+
     private func sessionListPlaceholder(
         title: String,
         message: String,
@@ -277,6 +393,32 @@ struct SessionListView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 240)
         .listRowBackground(Color.clear)
+    }
+
+    private var filteredGroupedSections: [SessionSection] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.isEmpty == false else {
+            return sessionViewModel.groupedSections
+        }
+
+        let normalizedQuery = query.localizedLowercase
+        return sessionViewModel.groupedSections.compactMap { section in
+            let matchingSessions = section.sessions.filter { session in
+                [
+                    session.displayTitle,
+                    session.subtitlePreview ?? "",
+                    session.model,
+                ].contains { value in
+                    value.localizedLowercase.contains(normalizedQuery)
+                }
+            }
+
+            guard matchingSessions.isEmpty == false else {
+                return nil
+            }
+
+            return SessionSection(title: section.title, sessions: matchingSessions)
+        }
     }
 
     @ViewBuilder

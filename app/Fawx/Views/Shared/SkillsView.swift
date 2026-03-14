@@ -6,10 +6,12 @@ struct SkillsView: View {
 
     @Bindable var skillsViewModel: SkillsViewModel
     let showsHeader: Bool
+    let searchText: String
 
-    init(skillsViewModel: SkillsViewModel, showsHeader: Bool = true) {
+    init(skillsViewModel: SkillsViewModel, showsHeader: Bool = true, searchText: String = "") {
         _skillsViewModel = Bindable(skillsViewModel)
         self.showsHeader = showsHeader
+        self.searchText = searchText
     }
 
     var body: some View {
@@ -71,6 +73,13 @@ struct SkillsView: View {
                 message: "Skills are loaded on the Fawx server. Check your server configuration."
             )
             .frame(maxWidth: .infinity, minHeight: 280)
+        } else if filteredSkills.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "magnifyingglass",
+                title: "No matching skills",
+                message: "Try a different search term."
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
         } else {
             VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
                 if !showsHeader {
@@ -80,12 +89,32 @@ struct SkillsView: View {
                 }
 
                 LazyVGrid(columns: gridColumns, spacing: FawxSpacing.paddingMD) {
-                    ForEach(skillsViewModel.skills) { skill in
+                    ForEach(filteredSkills) { skill in
                         SkillCardView(skill: skill)
                     }
                 }
                 .accessibilityIdentifier("skillsGrid")
                 .accessibilityElement(children: .contain)
+            }
+        }
+    }
+
+    private var filteredSkills: [SkillSummary] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.isEmpty == false else {
+            return skillsViewModel.skills
+        }
+
+        let normalizedQuery = query.localizedLowercase
+        return skillsViewModel.skills.filter { skill in
+            let haystacks = [
+                skill.name,
+                skill.displayDescription ?? "",
+                skill.tools.joined(separator: " "),
+            ]
+
+            return haystacks.contains { value in
+                value.localizedLowercase.contains(normalizedQuery)
             }
         }
     }

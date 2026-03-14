@@ -40,8 +40,7 @@ struct MessageBubble: View {
             }
 
             VStack(alignment: role == .user ? .trailing : .leading, spacing: FawxSpacing.paddingSM) {
-                messageContent
-                    .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: role == .user ? .trailing : .leading)
+                bubbleLabel
                     .padding(.horizontal, FawxSpacing.paddingLG)
                     .padding(.vertical, FawxSpacing.paddingMD)
                     .background(backgroundColor)
@@ -63,17 +62,32 @@ struct MessageBubble: View {
     }
 
     @ViewBuilder
+    private var bubbleLabel: some View {
+        if role == .user {
+            messageContent
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            messageContent
+                .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
     private var messageContent: some View {
         switch role {
         case .user:
             Text(content)
                 .font(FawxTypography.chatBody)
-                .foregroundStyle(Color.white)
+                .foregroundStyle(Color.fawxUserBubbleText)
                 .textSelection(.enabled)
         case .assistant:
             Markdown(content + (isStreaming ? "▍" : ""))
                 .markdownTextStyle {
+                    FontSize(FawxTypography.chatBodyPointSize)
                     ForegroundColor(Color.fawxText)
+                }
+                .markdownTextStyle(\.strong) {
+                    FontWeight(.semibold)
                 }
                 .markdownTextStyle(\.code) {
                     FontFamilyVariant(.monospaced)
@@ -96,7 +110,7 @@ struct MessageBubble: View {
     private var backgroundColor: Color {
         switch role {
         case .user:
-            return Color.fawxAccent.opacity(0.22)
+            return Color.fawxUserBubble
         case .assistant:
             return Color.fawxSurface
         case .system:

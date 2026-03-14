@@ -112,7 +112,8 @@ final class SettingsViewModel {
         defer { isTestingConnection = false }
 
         let client = FawxClient(baseURL: url)
-        let updatesCurrentConnection = appState.isConfigured && appState.serverURLString == canonicalURLString
+        let canonicalCurrentURL = canonicalizeServerURL(appState.serverURLString)
+        let updatesCurrentConnection = appState.isConfigured && canonicalCurrentURL == canonicalURLString
 
         do {
             let health = try await client.health()
