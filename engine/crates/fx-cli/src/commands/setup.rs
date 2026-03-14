@@ -61,7 +61,7 @@ struct SetupWizard {
     config_path: PathBuf,
     auth_store: AuthStore,
     auth_manager: AuthManager,
-    skill_credential_store: EncryptedFileCredentialStore,
+    skill_credential_store: Option<EncryptedFileCredentialStore>,
     config_document: DocumentMut,
     existing_config: bool,
     force: bool,
@@ -192,15 +192,13 @@ impl SetupWizard {
         let auth_manager = auth_store
             .load_auth_manager()
             .map_err(|error| anyhow!(error))?;
-        let skill_credential_store =
-            EncryptedFileCredentialStore::open(&data_dir).map_err(|error| anyhow!(error))?;
         let config_document = load_config_document(&config_path)?;
         Ok(Self {
             data_dir,
             config_path,
             auth_store,
             auth_manager,
-            skill_credential_store,
+            skill_credential_store: None,
             config_document,
             existing_config,
             force,
@@ -406,6 +404,17 @@ impl SetupWizard {
         Ok(state)
     }
 
+    fn skill_credential_store(&mut self) -> anyhow::Result<&EncryptedFileCredentialStore> {
+        if self.skill_credential_store.is_none() {
+            let store = EncryptedFileCredentialStore::open(&self.data_dir)
+                .map_err(|error| anyhow!(error))?;
+            self.skill_credential_store = Some(store);
+        }
+        self.skill_credential_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("skill credential store unavailable"))
+    }
+
     fn run_skill_credentials_phase(&mut self, state: &SkillWizardState) -> anyhow::Result<()> {
         println!("Step 5: Skill Credentials");
         let reuse_messages = provider_reuse_messages(&self.selected_skills, state);
@@ -423,15 +432,15 @@ impl SetupWizard {
         Ok(())
     }
 
-    fn skill_wizard_state(&self) -> anyhow::Result<SkillWizardState> {
+    fn skill_wizard_state(&mut self) -> anyhow::Result<SkillWizardState> {
         let installed_skills = installed_skill_names(&self.data_dir)?;
-        let mut stored_credentials = self
-            .skill_credential_store
+        let store = self.skill_credential_store()?;
+        let mut stored_credentials = store
             .list_generic_names()
             .map_err(|error| anyhow!(error))?
             .into_iter()
             .collect::<BTreeSet<_>>();
-        if github_token_configured(&self.skill_credential_store)? {
+        if github_token_configured(store)? {
             stored_credentials.insert("github_token".to_string());
         }
         Ok(SkillWizardState {
@@ -441,7 +450,7 @@ impl SetupWizard {
         })
     }
 
-    fn prompt_for_skill_credential(&self, prompt: CredentialPrompt) -> anyhow::Result<()> {
+    fn prompt_for_skill_credential(&mut self, prompt: CredentialPrompt) -> anyhow::Result<()> {
         let value = prompt_line(&format!(
             "  {} (optional, press enter to skip): ",
             prompt.label
@@ -458,8 +467,8 @@ impl SetupWizard {
         Ok(())
     }
 
-    fn store_skill_credential(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        Ok(self.skill_credential_store.set_generic(key, value)?)
+    fn store_skill_credential(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
+        Ok(self.skill_credential_store()?.set_generic(key, value)?)
     }
 
     fn run_http_phase(&mut self) -> anyhow::Result<()> {
@@ -1588,14 +1597,19 @@ mod tests {
         let _home_lock = TEST_HOME_LOCK.lock().expect("home lock");
         let temp_home = TempDir::new().expect("temp home");
         let _home = HomeGuard::set(&temp_home);
-        let wizard = SetupWizard::new(false).expect("setup wizard");
+        let mut wizard = SetupWizard::new(false).expect("setup wizard");
+        let data_dir = temp_home.path().join(".fawx");
+
+        EncryptedFileCredentialStore::open(&data_dir)
+            .expect("wizard should not lock credential store during construction");
 
         wizard
             .store_skill_credential("brave_api_key", "brv-test")
             .expect("store skill credential");
 
         let stored = wizard
-            .skill_credential_store
+            .skill_credential_store()
+            .expect("skill credential store")
             .get_generic("brave_api_key")
             .expect("read skill credential")
             .expect("skill credential present");

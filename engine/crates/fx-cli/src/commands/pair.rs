@@ -38,8 +38,22 @@ struct GeneratePairRequest {
     ttl_seconds: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct DeviceInfo {
+    id: String,
+    device_name: String,
+    created_at: u64,
+    last_used_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct DevicesResponse {
+    devices: Vec<DeviceInfo>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairWaitEvent {
+    Paired,
     Tick,
     Cancelled,
 }
@@ -47,13 +61,14 @@ enum PairWaitEvent {
 pub async fn run(args: &PairArgs) -> anyhow::Result<i32> {
     let layout = RuntimeLayout::detect()?;
     let client = http_client()?;
+    let initial_device_count = fetch_device_count(&layout, &client).await?;
     let pair = fetch_pairing_code(&layout, &client, args.ttl).await?;
     if args.json {
         println!("{}", pair_json_string(&pair)?);
         return Ok(0);
     }
     print_pair_box(&pair)?;
-    wait_for_pairing_window(&client, layout.http_port, pair.expires_at).await?;
+    wait_for_pairing_window(&layout, &client, pair.expires_at, initial_device_count).await?;
     Ok(0)
 }
 
@@ -119,9 +134,10 @@ fn box_line(content: &str) -> String {
 }
 
 async fn wait_for_pairing_window(
+    layout: &RuntimeLayout,
     client: &reqwest::Client,
-    port: u16,
     expires_at: u64,
+    initial_device_count: usize,
 ) -> anyhow::Result<()> {
     loop {
         let remaining = remaining_seconds(expires_at);
@@ -131,8 +147,14 @@ async fn wait_for_pairing_window(
                 "Code expired. Run `fawx pair` again to generate a new code.",
             );
         }
-        if next_wait_event(client, port).await == PairWaitEvent::Cancelled {
-            return print_wait_result("Stopped waiting for device pairing.");
+        match next_wait_event(layout, client, initial_device_count).await {
+            PairWaitEvent::Paired => {
+                return print_wait_result("Device paired successfully.");
+            }
+            PairWaitEvent::Cancelled => {
+                return print_wait_result("Stopped waiting for device pairing.");
+            }
+            PairWaitEvent::Tick => {}
         }
     }
 }
@@ -150,13 +172,28 @@ fn print_wait_result(message: &str) -> anyhow::Result<()> {
     io::stdout().flush().context("failed to flush stdout")
 }
 
-async fn next_wait_event(client: &reqwest::Client, port: u16) -> PairWaitEvent {
+async fn next_wait_event(
+    layout: &RuntimeLayout,
+    client: &reqwest::Client,
+    initial_device_count: usize,
+) -> PairWaitEvent {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => PairWaitEvent::Cancelled,
         _ = tokio::time::sleep(Duration::from_secs(1)) => {
-            let _ = ping_health(client, port).await;
-            PairWaitEvent::Tick
+            detect_pairing(client, layout, initial_device_count).await
         }
+    }
+}
+
+async fn detect_pairing(
+    client: &reqwest::Client,
+    layout: &RuntimeLayout,
+    initial_device_count: usize,
+) -> PairWaitEvent {
+    let _ = ping_health(client, layout.http_port).await;
+    match fetch_device_count(layout, client).await {
+        Ok(count) if count > initial_device_count => PairWaitEvent::Paired,
+        _ => PairWaitEvent::Tick,
     }
 }
 
@@ -167,6 +204,41 @@ async fn ping_health(client: &reqwest::Client, port: u16) -> anyhow::Result<()> 
         .await
         .map(|_| ())
         .map_err(anyhow::Error::new)
+}
+
+async fn fetch_device_count(
+    layout: &RuntimeLayout,
+    client: &reqwest::Client,
+) -> anyhow::Result<usize> {
+    Ok(fetch_devices(layout, client).await?.devices.len())
+}
+
+async fn fetch_devices(
+    layout: &RuntimeLayout,
+    client: &reqwest::Client,
+) -> anyhow::Result<DevicesResponse> {
+    let token = bearer_token(layout)?;
+    let response = client
+        .get(devices_url(layout.http_port))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(request_error)?;
+    parse_devices_response(response).await
+}
+
+async fn parse_devices_response(response: reqwest::Response) -> anyhow::Result<DevicesResponse> {
+    if response.status().is_success() {
+        return response
+            .json()
+            .await
+            .context("failed to decode device list response");
+    }
+    Err(anyhow::anyhow!(api_error_message(response).await))
+}
+
+fn devices_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/v1/devices")
 }
 
 fn remaining_seconds(expires_at: u64) -> u64 {
@@ -183,7 +255,7 @@ mod tests {
     use axum::{
         extract::State,
         http::{header, HeaderMap, StatusCode},
-        routing::post,
+        routing::{get, post},
         Json, Router,
     };
     use fx_config::FawxConfig;
@@ -206,7 +278,8 @@ mod tests {
     #[derive(Clone)]
     struct TestPairState {
         sender: Arc<Mutex<Option<oneshot::Sender<CapturedPairRequest>>>>,
-        response: PairCodeResponse,
+        pair_response: PairCodeResponse,
+        device_count: usize,
     }
 
     struct TestPairServer {
@@ -217,12 +290,19 @@ mod tests {
 
     impl TestPairServer {
         async fn spawn(response: PairCodeResponse) -> Self {
+            Self::spawn_with_device_count(response, 0).await
+        }
+
+        async fn spawn_with_device_count(response: PairCodeResponse, device_count: usize) -> Self {
             let (sender, receiver) = oneshot::channel();
             let app = Router::new()
                 .route("/v1/pair/generate", post(capture_pair_request))
+                .route("/v1/devices", get(list_devices))
+                .route("/health", get(health_check))
                 .with_state(TestPairState {
                     sender: Arc::new(Mutex::new(Some(sender))),
-                    response,
+                    pair_response: response,
+                    device_count,
                 });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -272,7 +352,17 @@ mod tests {
                 body,
             });
         }
-        (StatusCode::OK, Json(state.response))
+        (StatusCode::OK, Json(state.pair_response))
+    }
+
+    async fn list_devices(State(state): State<TestPairState>) -> Json<DevicesResponse> {
+        Json(DevicesResponse {
+            devices: test_devices(state.device_count),
+        })
+    }
+
+    async fn health_check() -> StatusCode {
+        StatusCode::OK
     }
 
     fn test_layout(root: &Path, port: u16, token: Option<&str>) -> RuntimeLayout {
@@ -296,6 +386,17 @@ mod tests {
             http_port: port,
             config,
         }
+    }
+
+    fn test_devices(count: usize) -> Vec<DeviceInfo> {
+        (0..count)
+            .map(|index| DeviceInfo {
+                id: format!("dev-{index}"),
+                device_name: format!("Device {index}"),
+                created_at: 1_700_000_000,
+                last_used_at: 1_700_000_000,
+            })
+            .collect()
     }
 
     async fn unused_port() -> u16 {
@@ -349,5 +450,25 @@ mod tests {
             .expect_err("missing server should fail");
 
         assert_eq!(error.to_string(), server_not_running_message());
+    }
+
+    #[tokio::test]
+    async fn detect_pairing_returns_paired_when_device_count_increases() {
+        let temp = tempdir().expect("tempdir");
+        let server = TestPairServer::spawn_with_device_count(
+            PairCodeResponse {
+                code: "A7K-M2X".to_string(),
+                expires_at: 1_773_436_000,
+                ttl_seconds: 123,
+            },
+            2,
+        )
+        .await;
+        let layout = test_layout(temp.path(), server.port, Some("secret-token"));
+        let client = http_client().expect("client");
+
+        let event = detect_pairing(&client, &layout, 1).await;
+
+        assert_eq!(event, PairWaitEvent::Paired);
     }
 }
