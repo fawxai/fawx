@@ -50,6 +50,22 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/sessions/{id}/send", post(handle_send_to_session))
         .route("/sessions/{id}/context", get(handle_get_context))
+        .route(
+            "/proposals/pending",
+            get(handlers::proposals::handle_list_pending),
+        )
+        .route(
+            "/proposals/history",
+            get(handlers::proposals::handle_history),
+        )
+        .route(
+            "/proposals/{id}/decide",
+            post(handlers::proposals::handle_decide),
+        )
+        .route(
+            "/proposals/{id}/diff",
+            get(handlers::proposals::handle_get_diff),
+        )
         .route("/models", get(handle_list_models))
         .route("/model", put(handle_set_model))
         .route(
