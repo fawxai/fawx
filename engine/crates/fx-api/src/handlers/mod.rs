@@ -17,6 +17,7 @@ pub mod marketplace;
 pub mod message;
 pub mod oauth;
 pub mod pairing;
+pub mod permission_prompts;
 pub mod permissions;
 pub mod phase4;
 pub mod proposals;

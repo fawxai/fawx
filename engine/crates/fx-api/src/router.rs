@@ -94,6 +94,10 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
                 .patch(handlers::permissions::handle_patch_permissions),
         )
         .route(
+            "/permissions/prompts/{id}/respond",
+            post(handlers::permission_prompts::handle_respond),
+        )
+        .route(
             "/synthesis",
             get(handlers::synthesis::handle_get_synthesis)
                 .put(handlers::synthesis::handle_set_synthesis)

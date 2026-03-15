@@ -63,6 +63,18 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
                 "is_error": is_error,
             }),
         ),
+        StreamEvent::PermissionPrompt(prompt) => sse_frame(
+            "permission_prompt",
+            serde_json::json!({
+                "id": prompt.id,
+                "tool": prompt.tool,
+                "title": prompt.title,
+                "reason": prompt.reason,
+                "request_summary": prompt.request_summary,
+                "session_scoped_allow_available": prompt.session_scoped_allow_available,
+                "expires_at": prompt.expires_at,
+            }),
+        ),
         StreamEvent::PhaseChange { phase } => {
             sse_frame("phase", serde_json::json!({ "phase": phase }))
         }
@@ -234,5 +246,25 @@ mod tests {
         relay.await.expect("relay task");
 
         assert_eq!(output_rx.recv().await, None);
+    }
+
+    #[test]
+    fn permission_prompt_event_serializes() {
+        let frame =
+            serialize_stream_event(StreamEvent::PermissionPrompt(fx_kernel::PermissionPrompt {
+                id: "prompt-1".to_string(),
+                tool: "shell".to_string(),
+                title: "Allow shell command".to_string(),
+                reason: "Needed to inspect the repo".to_string(),
+                request_summary: "git status --short --branch".to_string(),
+                session_scoped_allow_available: true,
+                expires_at: 1_742_000_000,
+            }))
+            .expect("permission prompt frame");
+
+        assert_eq!(
+            frame,
+            "event: permission_prompt\ndata: {\"expires_at\":1742000000,\"id\":\"prompt-1\",\"reason\":\"Needed to inspect the repo\",\"request_summary\":\"git status --short --branch\",\"session_scoped_allow_available\":true,\"title\":\"Allow shell command\",\"tool\":\"shell\"}\n\n"
+        );
     }
 }

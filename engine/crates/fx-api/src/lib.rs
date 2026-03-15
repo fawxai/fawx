@@ -97,6 +97,7 @@ pub async fn run(
             has_synthesis,
         )),
         oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+        permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
         cron_store: config.cron_store.clone(),
     };
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;

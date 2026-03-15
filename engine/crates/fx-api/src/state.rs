@@ -28,6 +28,7 @@ pub struct HttpState {
     pub data_dir: PathBuf,
     pub synthesis: Arc<crate::handlers::synthesis::SynthesisState>,
     pub oauth_flows: Arc<crate::handlers::oauth::OAuthFlowStore>,
+    pub permission_prompts: Arc<fx_kernel::PermissionPromptState>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 

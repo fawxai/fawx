@@ -43,6 +43,7 @@ pub mod input;
 pub mod learn;
 pub mod loop_engine;
 pub mod perceive;
+pub mod permission_prompt;
 pub mod permissions;
 pub mod policy;
 pub mod process_registry;
@@ -73,6 +74,10 @@ pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSend
 pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
+pub use permission_prompt::{
+    PermissionDecision, PermissionPrompt, PermissionPromptState, PromptError, ResolveResult,
+    PROMPT_TTL,
+};
 pub use process_registry::{
     ListEntry, ProcessConfig, ProcessRegistry, ProcessStatus, SpawnResult, StatusResult,
 };

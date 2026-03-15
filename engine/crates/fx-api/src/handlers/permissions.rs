@@ -775,6 +775,7 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             cron_store: None,
         };
 

@@ -63,6 +63,7 @@ pub enum StreamEvent {
         output: String,
         is_error: bool,
     },
+    PermissionPrompt(crate::permission_prompt::PermissionPrompt),
     PhaseChange {
         phase: Phase,
     },
