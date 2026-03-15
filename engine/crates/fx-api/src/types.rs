@@ -109,6 +109,12 @@ pub struct ServerRestartResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerStopResponse {
+    pub stopped: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SetupTokenRequest {
     pub setup_token: String,

@@ -49,10 +49,10 @@ pub use types::{
     ApiKeyRequest, ApiKeyResponse, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike,
     DeleteProviderResponse, ErrorBody, ErrorRecordDto, HealthResponse, MessageRequest,
     MessageResponse, ModelInfoDto, ModelSwitchDto, RecentErrorsResponse, SendToSessionRequest,
-    SendToSessionResponse, ServerRestartResponse, ServerStatusResponse, SetupAuthStatus,
-    SetupStatusResponse, SetupTailscaleStatus, SetupTokenRequest, SetupTokenResponse,
-    SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto, VerifyRequest,
-    VerifyResponse,
+    SendToSessionResponse, ServerRestartResponse, ServerStatusResponse, ServerStopResponse,
+    SetupAuthStatus, SetupStatusResponse, SetupTailscaleStatus, SetupTokenRequest,
+    SetupTokenResponse, SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
+    VerifyRequest, VerifyResponse,
 };
 
 pub struct RunConfig {
