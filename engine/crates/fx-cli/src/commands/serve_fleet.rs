@@ -202,6 +202,89 @@ struct StubExecutionOutcome {
     error: Option<String>,
 }
 
+/// Real task executor that runs experiment pipeline operations.
+struct ExperimentTaskExecutor {
+    data_dir: std::path::PathBuf,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+}
+
+impl ExperimentTaskExecutor {
+    fn new(
+        data_dir: std::path::PathBuf,
+        improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    ) -> Self {
+        Self {
+            data_dir,
+            improvement_provider,
+        }
+    }
+}
+
+use std::sync::Arc;
+
+#[async_trait]
+impl TaskExecutor for ExperimentTaskExecutor {
+    async fn execute(&self, task: &FleetTaskRequest) -> FleetTaskResult {
+        let started_at = Instant::now();
+        let result = match &self.improvement_provider {
+            Some(provider) => run_task(task, provider.as_ref(), &self.data_dir).await,
+            None => Err("No improvement provider configured".to_string()),
+        };
+        match result {
+            Ok(outcome) => build_result(task, outcome, started_at.elapsed()),
+            Err(error) => FleetTaskResult {
+                task_id: task.task_id.clone(),
+                status: FleetTaskStatus::Failed,
+                candidate_patch: None,
+                evaluation: None,
+                build_log: None,
+                error: Some(error),
+                duration_ms: started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            },
+        }
+    }
+}
+
+async fn run_task(
+    task: &FleetTaskRequest,
+    provider: &dyn fx_llm::CompletionProvider,
+    data_dir: &Path,
+) -> Result<StubExecutionOutcome, String> {
+    let signal_store = fx_memory::SignalStore::new(data_dir, "fleet-worker")
+        .map_err(|e| format!("signal store: {e}"))?;
+    let config = fx_improve::ImprovementConfig::default();
+    let proposals_dir = data_dir.join("proposals");
+    let paths = fx_improve::CyclePaths {
+        data_dir,
+        repo_root: data_dir,
+        proposals_dir: &proposals_dir,
+    };
+
+    tracing::info!(task_id = %task.task_id, task_type = ?task.task_type, "Executing fleet task");
+    let run_result = fx_improve::run_improvement_cycle(&signal_store, provider, &config, &paths)
+        .await
+        .map_err(|e| format!("improvement cycle: {e}"))?;
+
+    Ok(StubExecutionOutcome {
+        status: FleetTaskStatus::Complete,
+        evaluation: Some(json!({
+            "plans_generated": run_result.plans_generated,
+            "proposals_written": run_result.proposals_written.len(),
+            "branches_created": run_result.branches_created.len(),
+        })),
+        build_log: Some(format!(
+            "Fleet task complete: {} plans, {} proposals",
+            run_result.plans_generated,
+            run_result.proposals_written.len(),
+        )),
+        error: None,
+    })
+}
+
 pub async fn run() -> anyhow::Result<i32> {
     #[cfg(test)]
     if let Some(exit_code) = take_test_exit_code() {
@@ -210,10 +293,17 @@ pub async fn run() -> anyhow::Result<i32> {
 
     let shutdown = install_shutdown_token();
     let client = FleetHttpClient::new(DEFAULT_REQUEST_TIMEOUT);
+    let data_dir = crate::startup::fawx_data_dir();
+    let auth_manager = crate::startup::load_auth_manager().ok();
+    let config = crate::startup::load_config().unwrap_or_default();
+    let improvement_provider = auth_manager
+        .as_ref()
+        .and_then(|am| crate::startup::build_improvement_provider(am, &config));
+    let executor = ExperimentTaskExecutor::new(data_dir, improvement_provider);
     run_with_dependencies(
         &default_fleet_dir(),
         client,
-        StubTaskExecutor,
+        executor,
         WorkerLoopConfig::default(),
         shutdown,
     )
