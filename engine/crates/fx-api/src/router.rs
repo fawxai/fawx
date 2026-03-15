@@ -1,3 +1,4 @@
+use crate::handlers;
 use crate::handlers::config::{handle_config_get, handle_config_set};
 use crate::handlers::devices::{handle_delete_device, handle_list_devices};
 use crate::handlers::errors::handle_recent_errors;
@@ -5,10 +6,7 @@ use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
 use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
-use crate::handlers::phase4::{
-    handle_delete_provider, handle_server_restart, handle_server_status, handle_setup_status,
-    handle_setup_token, handle_store_api_key, handle_verify_provider,
-};
+use crate::handlers::phase4::{handle_server_restart, handle_server_status, handle_setup_status};
 use crate::handlers::sessions::{
     handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
     handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
@@ -90,6 +88,22 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/config", get(handle_config_get).post(handle_config_set))
         .route("/webhook/{channel_id}", post(handle_webhook))
         .nest("/v1", v1_router)
+        .route(
+            "/v1/auth/anthropic/setup-token",
+            post(handlers::auth::handle_setup_token),
+        )
+        .route(
+            "/v1/auth/{provider}/api-key",
+            post(handlers::auth::handle_store_api_key),
+        )
+        .route(
+            "/v1/auth/{provider}",
+            delete(handlers::auth::handle_delete_provider),
+        )
+        .route(
+            "/v1/auth/{provider}/verify",
+            post(handlers::auth::handle_verify_provider),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
