@@ -129,13 +129,32 @@
 ## Navigation Flow
 
 ```
-App Launch
-├── First launch (no UserDefaults flag) → SetupWizardView
+App Launch (macOS)
+├── First launch (no UserDefaults flag, no existing config) → SetupWizardView
 │   ├── WelcomeStep → TailscaleStep → ProviderStep → ReadyStep
 │   └── On "Start chatting" → set flag, show main app
+├── Existing config detected (upgrade/reinstall) → skip wizard, show main app
+│   └── Config found at ~/.fawx/config.toml → server already configured
+├── Remote-only user → "Connect to another Fawx server" escape hatch
+│   └── Available from Welcome screen as secondary link
+│   └── Shows existing OnboardingView (server URL + token fields)
 ├── Server unreachable → ConnectionBannerView (existing)
 └── Normal → existing chat/sessions UI
 ```
+
+### First-launch detection logic:
+```swift
+func detectLaunchMode() -> LaunchMode {
+    if hasUserDefaultsFlag("setupComplete") { return .normal }
+    if FileManager.default.fileExists(atPath: fawxConfigPath) { return .existingInstall }
+    if hasStoredServerURL() { return .remoteClient }
+    return .firstLaunch
+}
+```
+- `.firstLaunch` → show setup wizard
+- `.existingInstall` → skip wizard, mark complete, show main app
+- `.remoteClient` → preserve existing remote connection, show main app
+- `.normal` → show main app
 
 ### macOS-specific:
 - Menu bar icon persists after window close
@@ -143,11 +162,12 @@ App Launch
 - Menu bar creates `NSStatusItem` in `FawxApp.swift` init
 
 ### iOS-specific:
-- **Simplified pairing wizard, NOT a server setup wizard.** iPhone doesn't run a server — it pairs to an existing Mac.
-- iOS wizard flow: Welcome → "Connect to Fawx" → scan QR code or enter pairing code → Done
-- No Tailscale step (Mac handles that), no provider step (Mac handles that), no LaunchAgent step
+- **NO setup wizard.** iPhone does not run a server — it pairs to an existing Mac.
+- **Ignore the iOS Welcome/Tailscale/Provider/Ready screens in the mockups** — those are macOS only.
+- iOS first launch: "Connect to Fawx" → scan QR code or enter pairing code → Done
 - Settings shows connection status (connected to X, running/stopped) — view-only, not management
 - Server Settings panel on iOS is read-only status, not restart/stop controls
+- The mockup file shows iOS variants of setup screens — for design language reference only, NOT screens to implement on iOS
 
 ---
 
