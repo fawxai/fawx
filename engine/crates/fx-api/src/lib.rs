@@ -1,4 +1,5 @@
 pub(crate) mod auth_store;
+pub mod bundle;
 pub(crate) mod config_redaction;
 pub mod time_util;
 
