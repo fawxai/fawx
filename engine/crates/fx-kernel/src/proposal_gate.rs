@@ -343,7 +343,11 @@ fn classify_read_call(call: &ToolCall) -> Option<GateDecision> {
         return None;
     }
 
-    if call.name != "read_file" {
+    let is_read_tool = matches!(
+        call.name.as_str(),
+        "read_file" | "search_text" | "list_directory"
+    );
+    if !is_read_tool {
         return None;
     }
 
@@ -677,6 +681,22 @@ mod tests {
         }
     }
 
+    fn search_text_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({"query": "test", "path": path}),
+        }
+    }
+
+    fn list_directory_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "list_directory".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
+
     fn checkpoint_call(id: &str, path: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
@@ -857,21 +877,26 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    fn assert_read_passed_through(result: &ToolResult, tool_call_id: &str) {
+    fn assert_tool_passed_through(result: &ToolResult, tool_call_id: &str, tool_name: &str) {
         assert_eq!(result.tool_call_id, tool_call_id);
-        assert_eq!(result.tool_name, "read_file");
+        assert_eq!(result.tool_name, tool_name);
         assert!(result.success);
-        assert_eq!(result.output, "executed:read_file");
+        assert_eq!(result.output, format!("executed:{tool_name}"));
+    }
+
+    fn assert_read_passed_through(result: &ToolResult, tool_call_id: &str) {
+        assert_tool_passed_through(result, tool_call_id, "read_file");
+    }
+
+    async fn execute_single_tool(call: ToolCall) -> (ToolResult, usize) {
+        let (executor, probe) = make_executor(enabled_config());
+        let results = executor.execute_tools(&[call], None).await.unwrap();
+
+        (results.into_iter().next().unwrap(), probe.call_count())
     }
 
     async fn execute_single_read(path: &str) -> (ToolResult, usize) {
-        let (executor, probe) = make_executor(enabled_config());
-        let results = executor
-            .execute_tools(&[read_call("1", path)], None)
-            .await
-            .unwrap();
-
-        (results.into_iter().next().unwrap(), probe.call_count())
+        execute_single_tool(read_call("1", path)).await
     }
 
     #[test]
@@ -907,17 +932,18 @@ mod tests {
     mod kernel_blind_tests {
         use super::*;
 
-        fn assert_blind_read_denied(result: &ToolResult, tool_call_id: &str) {
+        fn assert_blind_read_denied(result: &ToolResult, tool_call_id: &str, tool_name: &str) {
             assert_eq!(result.tool_call_id, tool_call_id);
-            assert_eq!(result.tool_name, "read_file");
+            assert_eq!(result.tool_name, tool_name);
             assert!(!result.success);
             assert!(result.output.contains("This file is not available."));
         }
 
-        async fn assert_blind_path_denied(path: &str) {
-            let (result, call_count) = execute_single_read(path).await;
+        async fn assert_blind_path_denied(call: ToolCall) {
+            let tool_name = call.name.clone();
+            let (result, call_count) = execute_single_tool(call).await;
 
-            assert_blind_read_denied(&result, "1");
+            assert_blind_read_denied(&result, "1", &tool_name);
             assert_eq!(call_count, 0);
         }
 
@@ -928,53 +954,87 @@ mod tests {
 
             assert!(is_kernel_blind_enforced());
             assert!(is_kernel_blind_path("engine/crates/fx-kernel/src/lib.rs"));
-            assert_blind_read_denied(&result, "1");
+            assert_blind_read_denied(&result, "1", "read_file");
             assert_eq!(call_count, 0);
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_proposal_gate_source() {
-            assert_blind_path_denied("engine/crates/fx-kernel/src/proposal_gate.rs").await;
+            assert_blind_path_denied(read_call(
+                "1",
+                "engine/crates/fx-kernel/src/proposal_gate.rs",
+            ))
+            .await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_auth_keys() {
-            assert_blind_path_denied("engine/crates/fx-auth/src/crypto/keys.rs").await;
+            assert_blind_path_denied(read_call("1", "engine/crates/fx-auth/src/crypto/keys.rs"))
+                .await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_security_layer() {
-            assert_blind_path_denied("engine/crates/fx-security/src/audit/mod.rs").await;
+            assert_blind_path_denied(read_call("1", "engine/crates/fx-security/src/audit/mod.rs"))
+                .await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_consensus_layer() {
-            assert_blind_path_denied("engine/crates/fx-consensus/src/lib.rs").await;
+            assert_blind_path_denied(read_call("1", "engine/crates/fx-consensus/src/lib.rs")).await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_ripcord_shell() {
-            assert_blind_path_denied("fawx-ripcord/src/main.rs").await;
+            assert_blind_path_denied(read_call("1", "fawx-ripcord/src/main.rs")).await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_on_invariant_tests() {
-            assert_blind_path_denied("tests/invariant/tier3_test.rs").await;
+            assert_blind_path_denied(read_call("1", "tests/invariant/tier3_test.rs")).await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_with_dot_slash_prefix() {
-            assert_blind_path_denied("./engine/crates/fx-kernel/src/lib.rs").await;
+            assert_blind_path_denied(read_call("1", "./engine/crates/fx-kernel/src/lib.rs")).await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_with_backslash_separators() {
-            assert_blind_path_denied("engine\\crates\\fx-kernel\\src\\lib.rs").await;
+            assert_blind_path_denied(read_call("1", "engine\\crates\\fx-kernel\\src\\lib.rs"))
+                .await;
         }
 
         #[tokio::test]
         async fn kernel_blind_paths_block_read_file_path_traversal() {
-            assert_blind_path_denied("../../engine/crates/fx-kernel/foo.rs").await;
+            assert_blind_path_denied(read_call("1", "../../engine/crates/fx-kernel/foo.rs")).await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_blocks_search_text_on_kernel_path() {
+            assert_blind_path_denied(search_text_call("1", "engine/crates/fx-kernel/src/")).await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_blocks_list_directory_on_kernel_path() {
+            assert_blind_path_denied(list_directory_call("1", "engine/crates/fx-kernel/")).await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_allows_search_text_on_loadable_path() {
+            let (result, call_count) =
+                execute_single_tool(search_text_call("1", "engine/crates/fx-loadable/src/")).await;
+
+            assert_tool_passed_through(&result, "1", "search_text");
+            assert_eq!(call_count, 1);
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_allows_list_directory_on_docs() {
+            let (result, call_count) = execute_single_tool(list_directory_call("1", "docs/")).await;
+
+            assert_tool_passed_through(&result, "1", "list_directory");
+            assert_eq!(call_count, 1);
         }
     }
 
@@ -1014,20 +1074,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_read_tools_still_pass_through() {
+    async fn allowed_read_tools_and_non_read_tools_still_pass_through() {
         let (executor, probe) = make_executor(enabled_config());
 
         let read_tools = vec![
-            ToolCall {
-                id: "1".to_string(),
-                name: "list_directory".to_string(),
-                arguments: serde_json::json!({"path": ".github/"}),
-            },
-            ToolCall {
-                id: "2".to_string(),
-                name: "search_text".to_string(),
-                arguments: serde_json::json!({"query": "test", "path": "src/"}),
-            },
+            list_directory_call("1", ".github/"),
+            search_text_call("2", "src/"),
             ToolCall {
                 id: "3".to_string(),
                 name: "memory_read".to_string(),
