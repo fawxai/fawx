@@ -139,3 +139,8 @@ fx-session = { path = "engine/crates/fx-session" }
 fx-bus = { path = "engine/crates/fx-bus" }
 fx-cron = { path = "engine/crates/fx-cron" }
 fx-consensus = { path = "engine/crates/fx-consensus" }
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true
