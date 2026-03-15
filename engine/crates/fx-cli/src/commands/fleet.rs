@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const FLEET_DIR_NAME: &str = "fleet";
-const IDENTITY_FILE: &str = "identity.json";
+pub(crate) const FLEET_DIR_NAME: &str = "fleet";
+pub(crate) const IDENTITY_FILE: &str = "identity.json";
 #[cfg(test)]
 const FLEET_KEY_FILE: &str = "fleet.key";
 #[cfg(test)]
@@ -58,7 +58,7 @@ pub async fn handle_fleet_command(command: &FleetCommands) -> anyhow::Result<()>
         .map_err(anyhow::Error::from)
 }
 
-fn default_fleet_dir() -> PathBuf {
+pub(crate) fn default_fleet_dir() -> PathBuf {
     fawx_data_dir().join(FLEET_DIR_NAME)
 }
 
@@ -159,18 +159,27 @@ fn run_list_command(fleet_dir: &Path, writer: &mut impl Write) -> Result<(), Fle
 
 fn build_join_request(token: &str) -> Result<JoinRequest, FleetError> {
     let summary = detect_capability_summary()?;
-    Ok(JoinRequest {
-        request: FleetRegistrationRequest {
-            node_name: summary.node_name.clone(),
-            bearer_token: token.to_string(),
-            capabilities: vec!["agentic_loop".to_string(), summary.platform.clone()],
-            rust_version: None,
-            os: Some(std::env::consts::OS.to_string()),
-            cpus: Some(summary.cpus),
-            ram_gb: None,
-        },
-        summary,
-    })
+    let request = registration_request(token, &summary);
+    Ok(JoinRequest { request, summary })
+}
+
+pub(crate) fn build_registration_request(
+    token: &str,
+) -> Result<FleetRegistrationRequest, FleetError> {
+    let summary = detect_capability_summary()?;
+    Ok(registration_request(token, &summary))
+}
+
+fn registration_request(token: &str, summary: &CapabilitySummary) -> FleetRegistrationRequest {
+    FleetRegistrationRequest {
+        node_name: summary.node_name.clone(),
+        bearer_token: token.to_string(),
+        capabilities: vec!["agentic_loop".to_string(), summary.platform.clone()],
+        rust_version: None,
+        os: Some(std::env::consts::OS.to_string()),
+        cpus: Some(summary.cpus),
+        ram_gb: None,
+    }
 }
 
 fn detect_capability_summary() -> Result<CapabilitySummary, FleetError> {
@@ -215,7 +224,7 @@ fn primary_endpoint(primary: &str) -> String {
     }
 }
 
-fn identity_path(fleet_dir: &Path) -> PathBuf {
+pub(crate) fn identity_path(fleet_dir: &Path) -> PathBuf {
     fleet_dir.join(IDENTITY_FILE)
 }
 

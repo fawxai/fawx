@@ -48,6 +48,8 @@ pub(crate) mod runtime_layout;
 #[allow(dead_code)]
 pub mod security_audit;
 #[allow(dead_code)]
+pub mod serve_fleet;
+#[allow(dead_code)]
 pub mod setup;
 #[allow(dead_code)]
 pub(crate) mod skill_signatures;

@@ -64,20 +64,23 @@ enum Commands {
     /// Run headless mode (stdin/stdout, no TUI)
     Serve {
         /// Process single input and exit
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         single: bool,
         /// JSON input/output mode
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         json: bool,
         /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
         #[arg(long)]
         system_prompt: Option<std::path::PathBuf>,
         /// Start local HTTP API server with SSE streaming
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         http: bool,
         /// HTTP server port (default: 8400)
         #[arg(long, default_value = "8400")]
         port: u16,
+        /// Run as a fleet worker using the saved fleet identity
+        #[arg(long)]
+        fleet: bool,
     },
 
     /// Restart the running agent daemon
