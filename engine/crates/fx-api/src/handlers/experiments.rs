@@ -118,10 +118,20 @@ pub async fn handle_create_experiment(
         if registry.has_running_experiment() {
             return Err(concurrent_experiment_conflict());
         }
-        registry
+        let experiment = registry
             .create(name, kind, config)
-            .map_err(internal_error)?
+            .map_err(internal_error)?;
+        // Transition to Running immediately
+        registry.start(&experiment.id).map_err(internal_error)?;
+        // Re-read after start to get updated status
+        registry.get(&experiment.id).cloned().unwrap_or(experiment)
     };
+
+    // TODO: tokio::spawn background execution with run_improvement_cycle().
+    // Requires exposing SignalStore + CompletionProvider from AppEngine
+    // or creating them independently. For now, the experiment stays in
+    // Running status until manually stopped or the server restarts
+    // (restart recovery transitions it to Failed).
 
     Ok((
         StatusCode::CREATED,
@@ -613,6 +623,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_uses_match_label_for_running_experiment() {
+        let (_temp_dir, state) = test_state();
+        {
+            let mut registry = state.experiment_registry.lock().await;
+            let experiment = registry
+                .create(
+                    "Tournament".to_string(),
+                    ExperimentKind::Tournament,
+                    ExperimentConfig::default(),
+                )
+                .expect("create experiment");
+            registry.start(&experiment.id).expect("start experiment");
+            registry
+                .update_progress(
+                    &experiment.id,
+                    crate::experiment_registry::ExperimentProgress {
+                        completed_matches: 2,
+                        total_matches: 4,
+                    },
+                )
+                .expect("update progress");
+        }
+
+        let Json(list) = handle_list_experiments(State(state), Query(ListParams::default()))
+            .await
+            .expect("list experiments");
+        assert_eq!(list.experiments[0].score_summary, "match 2 of 4");
+    }
+
+    #[tokio::test]
     async fn create_returns_conflict_when_experiment_is_running() {
         let (_temp_dir, state) = test_state();
         {
@@ -729,6 +769,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn results_return_recorded_payload_for_completed_experiment() {
+        let (_temp_dir, state) = test_state();
+        let id = {
+            let mut registry = state.experiment_registry.lock().await;
+            let experiment = registry
+                .create(
+                    "Tournament".to_string(),
+                    ExperimentKind::Tournament,
+                    ExperimentConfig::default(),
+                )
+                .expect("create experiment");
+            registry.start(&experiment.id).expect("start");
+            registry
+                .complete(
+                    &experiment.id,
+                    ExperimentResult {
+                        plans_generated: 2,
+                        proposals_written: vec!["proposal-a.md".to_string()],
+                        branches_created: vec!["feature/proposal-a".to_string()],
+                        skipped: vec![SkippedItem {
+                            name: "candidate-a".to_string(),
+                            reason: "not enough signal".to_string(),
+                        }],
+                    },
+                )
+                .expect("complete");
+            experiment.id
+        };
+
+        let Json(results) = handle_get_experiment_results(State(state), Path(id))
+            .await
+            .expect("results response");
+        assert_eq!(results.status, ExperimentStatus::Completed);
+        assert_eq!(results.plans_generated, 2);
+        assert_eq!(results.proposals_written, vec!["proposal-a.md".to_string()]);
+        assert_eq!(
+            results.branches_created,
+            vec!["feature/proposal-a".to_string()]
+        );
+        assert_eq!(
+            results.skipped,
+            vec![SkippedItem {
+                name: "candidate-a".to_string(),
+                reason: "not enough signal".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn stop_returns_conflict_for_completed_experiment() {
         let (_temp_dir, state) = test_state();
         let id = {
@@ -768,27 +857,31 @@ mod tests {
     #[tokio::test]
     async fn get_returns_404_for_missing_id() {
         let (_temp, state) = test_state();
-        let error = handle_get_experiment(State(state), Path("missing".into()))
-            .await
-            .expect_err("should fail");
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        let status = request_status(experiment_router(state), "GET", "/experiments/missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn results_returns_404_for_missing_id() {
         let (_temp, state) = test_state();
-        let error = handle_get_experiment_results(State(state), Path("missing".into()))
-            .await
-            .expect_err("should fail");
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        let status = request_status(
+            experiment_router(state),
+            "GET",
+            "/experiments/missing/results",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn stop_returns_404_for_missing_id() {
         let (_temp, state) = test_state();
-        let error = handle_stop_experiment(State(state), Path("missing".into()))
-            .await
-            .expect_err("should fail");
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        let status = request_status(
+            experiment_router(state),
+            "POST",
+            "/experiments/missing/stop",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
