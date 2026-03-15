@@ -669,12 +669,10 @@ h1, h2, h3, h4 { color: var(--text); margin: 0; }
               <div class="radio-dot"></div>
               <div class="radio-label">I have an API key</div>
             </div>
-            <div class="field" style="margin-top:16px">
-              <label class="field-label">Paste your setup token</label>
-              <input type="password" class="field-input mono" placeholder="sk-ant-..." />
+            <div style="margin-top:16px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;text-align:center">
+              <div class="text-sm text-secondary" style="margin-bottom:12px">You'll be redirected to sign in with your Anthropic account.</div>
+              <button class="btn primary full">Sign in with Anthropic</button>
             </div>
-            <div class="field-help" style="margin-bottom:12px">Open the Anthropic console, generate a setup token, and paste it here.</div>
-            <button class="btn primary full">Connect</button>
           </div>
           <button class="btn ghost full" style="margin-top:12px">Skip for now</button>
         </div>
@@ -696,9 +694,10 @@ h1, h2, h3, h4 { color: var(--text); margin: 0; }
             <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:10px">How do you want to connect?</div>
             <div class="radio-row sel"><div class="radio-dot"></div><div class="radio-label">I have a subscription</div></div>
             <div class="radio-row"><div class="radio-dot"></div><div class="radio-label">I have an API key</div></div>
-            <div class="field" style="margin-top:12px"><label class="field-label">Paste your setup token</label><input type="password" class="field-input mono" placeholder="sk-ant-..." /></div>
-            <div class="field-help" style="margin-bottom:10px">Generate a token in the Anthropic console.</div>
-            <button class="btn primary full">Connect</button>
+            <div style="margin-top:12px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:10px;text-align:center">
+              <div class="text-sm text-secondary" style="margin-bottom:10px">Sign in with your Anthropic account.</div>
+              <button class="btn primary full">Sign in with Anthropic</button>
+            </div>
           </div>
           <button class="btn ghost full" style="margin-top:12px">Skip</button>
         </div>
@@ -747,16 +746,13 @@ h1, h2, h3, h4 { color: var(--text); margin: 0; }
       <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
       <div class="ios-body flex items-center justify-center p-xl">
         <div class="wiz-card" style="width:100%;border-radius:16px">
-          <div style="font-size:48px;margin-bottom:12px">🎉</div>
-          <div class="wiz-h1" style="font-size:18px;margin-bottom:20px">Fawx is running on this Mac</div>
-          <div class="flex items-center justify-between w-full mb-xl" style="background:var(--bg);border-radius:10px;padding:12px 14px">
-            <span class="text-base" style="color:var(--text)">Start Fawx at login</span>
-            <button class="tog on"></button>
-          </div>
-          <div class="center mb-lg">
-            <div class="qr-box sm"><svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/><rect x="10" y="0" width="2" height="1"/><rect x="14" y="0" width="1" height="1"/><rect x="10" y="3" width="3" height="1"/><rect x="9" y="5" width="2" height="1"/><rect x="13" y="4" width="1" height="3"/></svg></div>
-            <div class="text-base mb-sm" style="color:var(--text)">Scan with your iPhone</div>
-            <div class="mono text-sm text-secondary">joes-mac.tail1234.ts.net:8400</div>
+          <div style="font-size:48px;margin-bottom:12px">✅</div>
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:8px">Connected to Mac</div>
+          <div class="text-sm text-secondary mb-xl">Paired with joes-mac via Tailscale HTTPS</div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:20px;width:100%">
+            <div class="flex items-center justify-between" style="padding:12px 14px;border-bottom:1px solid var(--border)"><span class="text-sm text-secondary">Server</span><span class="mono text-sm" style="color:var(--text)">joes-mac.tail1234.ts.net</span></div>
+            <div class="flex items-center justify-between" style="padding:12px 14px;border-bottom:1px solid var(--border)"><span class="text-sm text-secondary">Port</span><span class="mono text-sm" style="color:var(--text)">8400</span></div>
+            <div class="flex items-center justify-between" style="padding:12px 14px"><span class="text-sm text-secondary">Status</span><span style="color:var(--success);font-size:13px;font-weight:600">● Connected</span></div>
           </div>
           <button class="btn primary full">Start chatting</button>
         </div>
@@ -962,19 +958,21 @@ h1, h2, h3, h4 { color: var(--text); margin: 0; }
     <div class="iphone">
       <div class="notch"></div>
       <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
-      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">iPhone Pairing</div><div style="width:28px"></div></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Server Connection</div><div style="width:28px"></div></div>
       <div class="ios-body overflow-auto p-lg">
+        <!-- Connection status -->
         <div class="center mb-xl">
-          <div class="qr-box" style="margin-bottom:16px">
-            <svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/></svg>
-          </div>
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--success);display:flex;align-items:center;justify-content:center;margin-bottom:12px"><span style="font-size:28px;color:#fff">✓</span></div>
+          <div class="text-base" style="color:var(--text);font-weight:600;margin-bottom:4px">Connected</div>
+          <div class="text-sm text-secondary">Paired via Tailscale HTTPS</div>
         </div>
         <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:16px">
-          <div class="ios-row"><span class="lbl text-secondary">Hostname</span><span class="val mono" style="font-size:12px;color:var(--text)">joes-mac.tail1234.ts.net</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">Server</span><span class="val mono" style="font-size:12px;color:var(--text)">joes-mac.tail1234.ts.net</span></div>
           <div class="ios-row"><span class="lbl text-secondary">Port</span><span class="val mono" style="color:var(--text)">8400</span></div>
-          <div class="ios-row"><span class="lbl text-secondary">Transport</span><span class="badge green">Tailscale HTTPS</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">Latency</span><span class="val text-sm" style="color:var(--success)">2 ms</span></div>
         </div>
-        <button class="btn secondary full">Regenerate QR Code</button>
+        <button class="btn secondary full" style="margin-bottom:12px">Scan New QR Code</button>
+        <button class="btn danger full" style="opacity:0.8">Disconnect</button>
       </div>
       <div class="home-ind"></div>
     </div>
@@ -1555,7 +1553,7 @@ Always explain trade-offs before making architectural decisions.
 Use conventional commits for any git operations.</textarea>
           </div>
           <div class="flex items-center justify-between mb-lg">
-            <span class="mono text-sm text-secondary">156 characters · ~39 tokens</span>
+            <span class="mono text-sm text-secondary">218 characters · ~54 tokens</span>
           </div>
           <div class="flex gap-sm">
             <button class="btn primary">Save</button>
@@ -1578,7 +1576,7 @@ Use conventional commits for any git operations.</textarea>
 Use TypeScript with strict types.
 Explain trade-offs first.</textarea>
         </div>
-        <div class="mono text-sm text-secondary mb-lg">86 characters · ~22 tokens</div>
+        <div class="mono text-sm text-secondary mb-lg">87 characters · ~21 tokens</div>
         <div class="flex-col gap-sm">
           <button class="btn primary full">Save</button>
           <button class="btn secondary full">Reset to default</button>
