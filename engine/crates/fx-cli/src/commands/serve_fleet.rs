@@ -15,6 +15,7 @@ use std::{
 };
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+use tracing;
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -98,8 +99,16 @@ where
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return self.shutdown().await,
-                _ = heartbeats.tick() => self.send_heartbeat().await?,
-                _ = polls.tick() => self.poll_once().await?,
+                _ = heartbeats.tick() => {
+                    if let Err(e) = self.send_heartbeat().await {
+                        tracing::warn!("heartbeat failed, will retry: {e}");
+                    }
+                },
+                _ = polls.tick() => {
+                    if let Err(e) = self.poll_once().await {
+                        tracing::warn!("task poll failed, will retry: {e}");
+                    }
+                },
             }
         }
     }
@@ -110,7 +119,15 @@ where
             .poll_task(&self.identity.primary_endpoint, &self.identity.bearer_token)
             .await?
         {
-            self.handle_task(task).await?;
+            let task_id = task.task_id.clone();
+            tracing::info!(task_id = %task_id, "received task");
+            match self.handle_task(task).await {
+                Ok(()) => tracing::info!(task_id = %task_id, "task completed"),
+                Err(e) => {
+                    tracing::error!(task_id = %task_id, error = %e, "task failed");
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -131,6 +148,7 @@ where
     }
 
     async fn shutdown(&mut self) -> Result<(), FleetError> {
+        tracing::info!("fleet worker shutting down");
         self.set_state(WorkerState::ShuttingDown, None);
         self.send_heartbeat().await
     }
@@ -147,7 +165,9 @@ where
                 &self.identity.bearer_token,
                 &heartbeat,
             )
-            .await
+            .await?;
+        tracing::debug!("heartbeat sent");
+        Ok(())
     }
 
     fn set_state(&mut self, status: WorkerState, current_task: Option<String>) {
@@ -216,7 +236,9 @@ where
     let identity = load_identity(fleet_dir)?;
     let request = build_registration_request(&identity.bearer_token)?;
     let mut worker = FleetWorker::new(client, identity, executor, config);
+    tracing::info!("fleet worker registering with primary");
     worker.register(&request).await?;
+    tracing::info!("registered with primary");
     worker.run_loop(shutdown).await
 }
 
