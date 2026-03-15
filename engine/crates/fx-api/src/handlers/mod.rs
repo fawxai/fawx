@@ -12,6 +12,7 @@ pub mod devices;
 pub mod errors;
 pub mod fleet;
 pub mod health;
+pub mod launchagent_api;
 pub mod message;
 pub mod pairing;
 pub mod phase4;
