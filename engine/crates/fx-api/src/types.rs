@@ -49,6 +49,65 @@ pub struct StatusResponse {
     pub config: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupAuthStatus {
+    pub bearer_token_present: bool,
+    pub providers_configured: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SetupLaunchAgentStatus {
+    pub installed: bool,
+    pub loaded: bool,
+    pub auto_start_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupLocalServerStatus {
+    pub host: String,
+    pub port: u16,
+    pub https_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SetupTailscaleStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub logged_in: bool,
+    pub hostname: Option<String>,
+    pub cert_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupStatusResponse {
+    pub mode: String,
+    pub setup_complete: bool,
+    pub has_valid_config: bool,
+    pub server_running: bool,
+    pub launchagent: SetupLaunchAgentStatus,
+    pub local_server: SetupLocalServerStatus,
+    pub auth: SetupAuthStatus,
+    pub tailscale: SetupTailscaleStatus,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ServerStatusResponse {
+    pub status: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub pid: u32,
+    pub host: String,
+    pub port: u16,
+    pub https_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ServerRestartResponse {
+    pub accepted: bool,
+    pub restart_via: String,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: String,
