@@ -1,7 +1,7 @@
 use crate::server_runtime::{detect_launchagent_state, RestartAction, ServerRuntime};
 use crate::state::HttpState;
 use crate::types::{
-    ErrorBody, ServerRestartResponse, ServerStatusResponse, SetupAuthStatus,
+    ErrorBody, ServerRestartResponse, ServerStatusResponse, ServerStopResponse, SetupAuthStatus,
     SetupLaunchAgentStatus, SetupLocalServerStatus, SetupStatusResponse, SetupTailscaleStatus,
 };
 use axum::extract::State;
@@ -60,6 +60,37 @@ pub async fn handle_server_restart(
         .map_err(restart_task_error)?
         .map_err(restart_error)?;
     Ok(Json(server_restart_response(action)))
+}
+
+pub async fn handle_server_stop(
+    State(_state): State<HttpState>,
+) -> HandlerResult<Json<ServerStopResponse>> {
+    match tokio::task::spawn_blocking(crate::launchagent::uninstall).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "launchagent unload failed (may not be installed)");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "launchagent unload task failed");
+        }
+    }
+
+    tokio::task::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tracing::info!("server stop requested - sending SIGTERM");
+        #[cfg(unix)]
+        {
+            let pid = std::process::id();
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+    });
+
+    Ok(Json(ServerStopResponse {
+        stopped: true,
+        message: "Server stop requested. LaunchAgent unloaded.".to_string(),
+    }))
 }
 
 async fn setup_auth_status(state: &HttpState) -> SetupAuthStatus {
