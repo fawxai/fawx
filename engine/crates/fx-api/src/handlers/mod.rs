@@ -15,6 +15,7 @@ pub mod health;
 pub mod launchagent;
 pub mod message;
 pub mod pairing;
+pub mod permissions;
 pub mod phase4;
 pub mod proposals;
 pub(crate) mod sessions;
