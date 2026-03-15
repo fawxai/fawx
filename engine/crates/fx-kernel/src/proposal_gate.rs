@@ -2,9 +2,9 @@
 //!
 //! `ProposalGateExecutor` wraps any `ToolExecutor` and intercepts read and
 //! write operations against compiled kernel invariants. Reads from blind paths
-//! are blocked; writes to immutable paths are blocked; writes to propose-tier
-//! paths create proposals instead of executing; writes to allow-tier paths pass
-//! through.
+//! are blocked when the `kernel-blind` feature is enabled; writes to immutable
+//! paths are blocked; writes to propose-tier paths create proposals instead of
+//! executing; writes to allow-tier paths pass through.
 
 use crate::act::{
     ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
@@ -34,7 +34,7 @@ const TIER3_PATHS: &[&str] = &[
     "snapshots/",
 ];
 
-/// Kernel-blind paths — blocked for agent read access.
+/// Kernel-blind paths — blocked for agent read access when enforcement is on.
 /// These are compiled invariants and cannot be overridden.
 const KERNEL_BLIND_PATHS: &[&str] = &[
     "engine/crates/fx-kernel/",
@@ -137,6 +137,10 @@ pub fn is_kernel_blind_path(relative_path: &str) -> bool {
     KERNEL_BLIND_PATHS
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn is_kernel_blind_enforced() -> bool {
+    cfg!(feature = "kernel-blind")
 }
 
 fn normalize_relative(path: &str) -> String {
@@ -335,6 +339,10 @@ fn classify_and_gate(
 }
 
 fn classify_read_call(call: &ToolCall) -> Option<GateDecision> {
+    if !is_kernel_blind_enforced() {
+        return None;
+    }
+
     if call.name != "read_file" {
         return None;
     }
@@ -849,183 +857,160 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    fn assert_blind_read_denied(result: &ToolResult, tool_call_id: &str) {
+    fn assert_read_passed_through(result: &ToolResult, tool_call_id: &str) {
         assert_eq!(result.tool_call_id, tool_call_id);
         assert_eq!(result.tool_name, "read_file");
-        assert!(!result.success);
-        assert!(result.output.contains("This file is not available."));
+        assert!(result.success);
+        assert_eq!(result.output, "executed:read_file");
     }
 
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_proposal_gate_source() {
+    async fn execute_single_read(path: &str) -> (ToolResult, usize) {
         let (executor, probe) = make_executor(enabled_config());
-
         let results = executor
-            .execute_tools(
-                &[read_call(
-                    "1",
-                    "engine/crates/fx-kernel/src/proposal_gate.rs",
-                )],
-                None,
-            )
+            .execute_tools(&[read_call("1", path)], None)
             .await
             .unwrap();
 
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
+        (results.into_iter().next().unwrap(), probe.call_count())
     }
 
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_auth_keys() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "engine/crates/fx-auth/src/crypto/keys.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_security_layer() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "engine/crates/fx-security/src/audit/mod.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_consensus_layer() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "engine/crates/fx-consensus/src/lib.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_ripcord_shell() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(&[read_call("1", "fawx-ripcord/src/main.rs")], None)
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_on_invariant_tests() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(&[read_call("1", "tests/invariant/tier3_test.rs")], None)
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_with_dot_slash_prefix() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "./engine/crates/fx-kernel/src/lib.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_with_backslash_separators() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "engine\\crates\\fx-kernel\\src\\lib.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn kernel_blind_paths_block_read_file_path_traversal() {
-        let (executor, probe) = make_executor(enabled_config());
-
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "../../engine/crates/fx-kernel/foo.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_blind_read_denied(&results[0], "1");
-        assert_eq!(probe.call_count(), 0);
+    #[test]
+    fn kernel_blind_path_matching_is_available_without_enforcement() {
+        assert!(is_kernel_blind_path("engine/crates/fx-kernel/src/lib.rs"));
+        assert!(is_kernel_blind_path(
+            "./engine/crates/fx-auth/src/crypto/keys.rs"
+        ));
+        assert!(is_kernel_blind_path(
+            "engine\\crates\\fx-security\\src\\audit\\mod.rs"
+        ));
+        assert!(!is_kernel_blind_path("docs/specs/kernel-blindness.md"));
     }
 
     #[tokio::test]
     async fn kernel_blind_paths_allow_read_file_on_loadable_layer() {
-        let (executor, probe) = make_executor(enabled_config());
+        let (result, call_count) =
+            execute_single_read("engine/crates/fx-loadable/src/lib.rs").await;
 
-        let results = executor
-            .execute_tools(
-                &[read_call("1", "engine/crates/fx-loadable/src/lib.rs")],
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(results[0].success);
-        assert_eq!(results[0].output, "executed:read_file");
-        assert_eq!(probe.call_count(), 1);
+        assert_read_passed_through(&result, "1");
+        assert_eq!(call_count, 1);
     }
 
     #[tokio::test]
     async fn kernel_blind_paths_allow_read_file_on_docs() {
-        let (executor, probe) = make_executor(enabled_config());
+        let (result, call_count) = execute_single_read("docs/specs/kernel-blindness.md").await;
 
-        let results = executor
-            .execute_tools(&[read_call("1", "docs/specs/kernel-blindness.md")], None)
-            .await
-            .unwrap();
+        assert_read_passed_through(&result, "1");
+        assert_eq!(call_count, 1);
+    }
 
-        assert!(results[0].success);
-        assert_eq!(results[0].output, "executed:read_file");
-        assert_eq!(probe.call_count(), 1);
+    #[cfg(feature = "kernel-blind")]
+    mod kernel_blind_tests {
+        use super::*;
+
+        fn assert_blind_read_denied(result: &ToolResult, tool_call_id: &str) {
+            assert_eq!(result.tool_call_id, tool_call_id);
+            assert_eq!(result.tool_name, "read_file");
+            assert!(!result.success);
+            assert!(result.output.contains("This file is not available."));
+        }
+
+        async fn assert_blind_path_denied(path: &str) {
+            let (result, call_count) = execute_single_read(path).await;
+
+            assert_blind_read_denied(&result, "1");
+            assert_eq!(call_count, 0);
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_feature_controls_enforcement() {
+            let (result, call_count) =
+                execute_single_read("engine/crates/fx-kernel/src/lib.rs").await;
+
+            assert!(is_kernel_blind_enforced());
+            assert!(is_kernel_blind_path("engine/crates/fx-kernel/src/lib.rs"));
+            assert_blind_read_denied(&result, "1");
+            assert_eq!(call_count, 0);
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_proposal_gate_source() {
+            assert_blind_path_denied("engine/crates/fx-kernel/src/proposal_gate.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_auth_keys() {
+            assert_blind_path_denied("engine/crates/fx-auth/src/crypto/keys.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_security_layer() {
+            assert_blind_path_denied("engine/crates/fx-security/src/audit/mod.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_consensus_layer() {
+            assert_blind_path_denied("engine/crates/fx-consensus/src/lib.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_ripcord_shell() {
+            assert_blind_path_denied("fawx-ripcord/src/main.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_on_invariant_tests() {
+            assert_blind_path_denied("tests/invariant/tier3_test.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_with_dot_slash_prefix() {
+            assert_blind_path_denied("./engine/crates/fx-kernel/src/lib.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_with_backslash_separators() {
+            assert_blind_path_denied("engine\\crates\\fx-kernel\\src\\lib.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_block_read_file_path_traversal() {
+            assert_blind_path_denied("../../engine/crates/fx-kernel/foo.rs").await;
+        }
+    }
+
+    #[cfg(not(feature = "kernel-blind"))]
+    mod kernel_blind_disabled_tests {
+        use super::*;
+
+        async fn assert_blind_path_allowed(path: &str) {
+            let (result, call_count) = execute_single_read(path).await;
+
+            assert_read_passed_through(&result, "1");
+            assert_eq!(call_count, 1);
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_feature_controls_enforcement() {
+            let (result, call_count) =
+                execute_single_read("engine/crates/fx-kernel/src/lib.rs").await;
+
+            assert!(!is_kernel_blind_enforced());
+            assert!(is_kernel_blind_path("engine/crates/fx-kernel/src/lib.rs"));
+            assert_read_passed_through(&result, "1");
+            assert_eq!(call_count, 1);
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_allow_reads_when_feature_is_disabled() {
+            assert_blind_path_allowed("engine/crates/fx-kernel/src/proposal_gate.rs").await;
+            assert_blind_path_allowed("engine/crates/fx-auth/src/crypto/keys.rs").await;
+            assert_blind_path_allowed("../../engine/crates/fx-kernel/foo.rs").await;
+        }
+
+        #[tokio::test]
+        async fn kernel_blind_paths_allow_backslash_reads_when_feature_is_disabled() {
+            assert_blind_path_allowed("engine\\crates\\fx-kernel\\src\\lib.rs").await;
+        }
     }
 
     #[tokio::test]

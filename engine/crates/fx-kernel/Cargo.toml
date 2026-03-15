@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Fawx kernel — loop orchestration, policy engine, permissions, budget enforcement, verification, rollback, watchdog. Immutable at runtime."
 
+[features]
+kernel-blind = []
+
 [dependencies]
 fx-core = { workspace = true }
 fx-decompose = { workspace = true }
