@@ -13,6 +13,7 @@ pub mod errors;
 pub mod fleet;
 pub mod health;
 pub mod launchagent;
+pub mod marketplace;
 pub mod message;
 pub mod pairing;
 pub mod permissions;

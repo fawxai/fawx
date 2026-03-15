@@ -75,6 +75,18 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             get(handle_get_thinking).put(handle_set_thinking),
         )
         .route("/skills", get(handle_list_skills))
+        .route(
+            "/skills/search",
+            get(handlers::marketplace::handle_search_skills),
+        )
+        .route(
+            "/skills/install",
+            post(handlers::marketplace::handle_install_skill),
+        )
+        .route(
+            "/skills/{name}",
+            delete(handlers::marketplace::handle_remove_skill),
+        )
         .route("/usage", get(handlers::usage::handle_usage))
         .route(
             "/permissions",
