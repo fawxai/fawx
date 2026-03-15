@@ -4,7 +4,10 @@ use crate::types::ErrorBody;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use fx_fleet::{current_time_ms, FleetError, FleetManager, NodeCapability, NodeInfo, NodeStatus};
+use fx_fleet::{
+    current_time_ms, FleetError, FleetHttpClient, FleetManager, FleetTaskRequest, FleetTaskType,
+    NodeCapability, NodeInfo, NodeStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -72,6 +75,7 @@ pub struct DispatchTaskRequest {
 pub struct DispatchTaskResponse {
     pub accepted: bool,
     pub node_id: String,
+    pub task_id: String,
     pub status: String,
 }
 
@@ -124,15 +128,60 @@ pub async fn handle_remove_fleet_node(
 pub async fn handle_dispatch_task(
     State(state): State<HttpState>,
     Path(node_id): Path<String>,
-    Json(_request): Json<DispatchTaskRequest>,
+    Json(request): Json<DispatchTaskRequest>,
 ) -> HandlerResult<Json<DispatchTaskResponse>> {
     let manager = require_fleet_manager(&state)?;
     let manager = manager.lock().await;
-    let _node = find_node(&manager, &node_id).ok_or_else(node_not_found_response)?;
-    Err(error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "task dispatch not yet implemented",
-    ))
+    let node = find_node(&manager, &node_id).ok_or_else(node_not_found_response)?;
+    let endpoint = node.endpoint.clone();
+    let bearer = node
+        .auth_token
+        .clone()
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "Node has no auth token"))?;
+    drop(manager);
+
+    let task_id = generate_task_id();
+    let fleet_request = build_fleet_task_request(&task_id, &request);
+    let client = FleetHttpClient::new(std::time::Duration::from_secs(30));
+    client
+        .send_task(&endpoint, &bearer, &fleet_request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(node_id = %node_id, error = %error, "fleet task dispatch failed");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Task dispatch failed: {error}"),
+            )
+        })?;
+
+    Ok(Json(DispatchTaskResponse {
+        accepted: true,
+        node_id,
+        task_id,
+        status: "dispatched".to_string(),
+    }))
+}
+
+fn generate_task_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("task_{nanos:x}")
+}
+
+fn build_fleet_task_request(task_id: &str, request: &DispatchTaskRequest) -> FleetTaskRequest {
+    FleetTaskRequest {
+        task_id: task_id.to_string(),
+        task_type: FleetTaskType::GenerateAndEvaluate,
+        repo_url: String::new(),
+        branch: String::new(),
+        git_token: None,
+        signal: serde_json::json!({"description": request.task}),
+        config: serde_json::json!({"priority": request.priority}),
+        chain_history: vec![],
+        scope: vec![],
+    }
 }
 
 fn default_priority() -> String {
@@ -403,14 +452,28 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_stub_response_serializes() {
+    fn dispatch_response_serializes() {
         let response = DispatchTaskResponse {
-            accepted: false,
+            accepted: true,
             node_id: "node-1".to_string(),
-            status: "not_implemented".to_string(),
+            task_id: "task_abc".to_string(),
+            status: "dispatched".to_string(),
         };
         let json = serde_json::to_value(response).expect("serialize");
-        assert_eq!(json["accepted"], false);
-        assert_eq!(json["status"], "not_implemented");
+        assert_eq!(json["accepted"], true);
+        assert_eq!(json["task_id"], "task_abc");
+        assert_eq!(json["status"], "dispatched");
+    }
+
+    #[test]
+    fn build_fleet_task_request_maps_fields() {
+        let request = DispatchTaskRequest {
+            task: "Run experiment".to_string(),
+            priority: "high".to_string(),
+        };
+        let fleet_req = build_fleet_task_request("task_123", &request);
+        assert_eq!(fleet_req.task_id, "task_123");
+        assert_eq!(fleet_req.signal["description"], "Run experiment");
+        assert_eq!(fleet_req.config["priority"], "high");
     }
 }
