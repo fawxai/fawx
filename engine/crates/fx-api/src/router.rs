@@ -1,5 +1,8 @@
 use crate::handlers;
-use crate::handlers::config::{handle_config_get, handle_config_set};
+use crate::handlers::config::{
+    handle_apply_config_preset, handle_config_get, handle_config_patch, handle_config_preset_diff,
+    handle_config_presets, handle_config_set,
+};
 use crate::handlers::devices::{handle_delete_device, handle_list_devices};
 use crate::handlers::errors::handle_recent_errors;
 use crate::handlers::fleet::fleet_router;
@@ -21,7 +24,7 @@ use crate::middleware::auth_middleware;
 use crate::state::HttpState;
 use crate::telegram::webhook::handle_telegram_webhook;
 use axum::middleware;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use fx_fleet::FleetManager;
 use std::path::Path;
@@ -54,6 +57,10 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             get(handle_get_thinking).put(handle_set_thinking),
         )
         .route("/skills", get(handle_list_skills))
+        .route("/config", patch(handle_config_patch))
+        .route("/config/presets", get(handle_config_presets))
+        .route("/config/preset/{name}", post(handle_apply_config_preset))
+        .route("/config/preset/{name}/diff", get(handle_config_preset_diff))
         .route("/auth", get(handle_list_auth))
         .route(
             "/auth/anthropic/setup-token",

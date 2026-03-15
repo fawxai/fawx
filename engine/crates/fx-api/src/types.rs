@@ -1,5 +1,6 @@
 use fx_kernel::ErrorCategory;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct MessageRequest {
@@ -154,6 +155,57 @@ pub struct VerifyResponse {
     pub status: String,
     pub message: String,
     pub checked_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ConfigPatchRequest {
+    pub changes: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfigPatchResponse {
+    pub updated: bool,
+    pub restart_required: bool,
+    pub changed_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfigPresetSummary {
+    pub name: String,
+    pub title: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfigPresetsResponse {
+    pub presets: Vec<ConfigPresetSummary>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApplyConfigPresetRequest {
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApplyConfigPresetResponse {
+    pub name: String,
+    pub applied: bool,
+    pub restart_required: bool,
+    pub changed_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ConfigPresetDiffEntry {
+    pub key: String,
+    pub old: Value,
+    pub r#new: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ConfigPresetDiffResponse {
+    pub name: String,
+    pub changes: Vec<ConfigPresetDiffEntry>,
 }
 
 #[derive(Debug, Serialize)]
