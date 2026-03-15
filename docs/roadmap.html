@@ -260,23 +260,30 @@
         <li><span class="planned">○</span> Menu bar status icon (start/stop/restart)</li>
         <li><span class="planned">○</span> iPhone QR code pairing</li>
         <li><span class="planned">○</span> 13 new backend endpoints (setup, auth management, config presets, pairing)</li>
+        <li><span class="planned">○</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
+        <li><span class="planned">○</span> <strong>RE tool deny list</strong> — block strings/objdump/otool targeting binary</li>
+        <li><span class="planned">○</span> <strong>Error sanitization</strong> — strip module paths and enum names from agent-facing errors</li>
+        <li><span class="planned">○</span> <strong>Panic sanitization</strong> — panic=abort, strip location detail in release builds</li>
       </ul>
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Spec Approved (#1407)</h3>
       <ul class="feature-list">
         <li><span class="planned">○</span> Proposal gate — inline permission prompts + modal diff viewer</li>
+        <li><span class="planned">○</span> <strong>Proposal gate hardening</strong> — risk-tiered UX, two-step for sensitive ops, anti-batch bypass, escalation detection</li>
         <li><span class="planned">○</span> Permission system — per-tool settings in Skills menu + global overview</li>
         <li><span class="planned">○</span> OpenAI PKCE OAuth (ChatGPT subscription login)</li>
         <li><span class="planned">○</span> Remote VPS pairing via existing pairing code system</li>
         <li><span class="planned">○</span> Skill marketplace install/remove (signed skills only)</li>
         <li><span class="planned">○</span> Skill building by Fawx (auto-signed)</li>
+        <li><span class="planned">○</span> <strong>WASM security hardening</strong> — default-deny capabilities, network domain allowlist, resource limits, host boundary fuzzing</li>
         <li><span class="planned">○</span> Cost tracking + synthesis/custom instructions</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments (post-publish)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments + Telemetry (post-publish)</h3>
       <ul class="feature-list">
         <li><span class="planned">○</span> Fleet dashboard — node health, task dispatch, workload visualization</li>
         <li><span class="planned">○</span> Experiment monitor — run/chain/scores/tournament</li>
+        <li><span class="planned">○</span> <strong>Behavioral telemetry</strong> — opt-in anonymous signals, granular consent, differential privacy aggregation</li>
       </ul>
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
@@ -284,7 +291,9 @@
         <li><span class="planned">○</span> EULA, Terms of Service, Privacy Policy</li>
         <li><span class="planned">○</span> TestFlight distribution</li>
         <li><span class="planned">○</span> App icon + branding</li>
-        <li><span class="planned">○</span> Sparkle auto-updater</li>
+        <li><span class="planned">○</span> Sparkle auto-updater (with signature verification — security-critical)</li>
+        <li><span class="planned">○</span> <strong>Binary hardening</strong> — symbol stripping, panic location removal, release profile hardening</li>
+        <li><span class="planned">○</span> <strong>Open source launch</strong> — skill SDK, marketplace protocol, channel traits, docs site (Apache 2.0)</li>
         <li><span class="planned">○</span> fawx.ai download page</li>
       </ul>
     </div>
