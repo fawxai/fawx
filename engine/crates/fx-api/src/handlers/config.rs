@@ -348,12 +348,12 @@ fn preset_summaries() -> Vec<ConfigPresetSummary> {
         ConfigPresetSummary {
             name: "safe".to_string(),
             title: "Safe".to_string(),
-            description: "Conservative defaults.".to_string(),
+            description: "Conservative defaults for cautious use.".to_string(),
         },
         ConfigPresetSummary {
             name: "power-user".to_string(),
             title: "Power User".to_string(),
-            description: "Full workspace autonomy defaults.".to_string(),
+            description: "Fewer confirmations, higher autonomy.".to_string(),
         },
     ]
 }
@@ -542,7 +542,15 @@ mod tests {
 
         assert_eq!(json["total"], 2);
         assert_eq!(json["presets"][0]["name"], "safe");
+        assert_eq!(
+            json["presets"][0]["description"],
+            "Conservative defaults for cautious use."
+        );
         assert_eq!(json["presets"][1]["name"], "power-user");
+        assert_eq!(
+            json["presets"][1]["description"],
+            "Fewer confirmations, higher autonomy."
+        );
     }
 
     #[test]

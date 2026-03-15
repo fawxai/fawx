@@ -1641,7 +1641,67 @@ mod routing_and_status {
         let json = response_json(response).await;
         assert_eq!(json["total"], 2);
         assert_eq!(json["presets"][0]["name"], "safe");
+        assert_eq!(
+            json["presets"][0]["description"],
+            "Conservative defaults for cautious use."
+        );
         assert_eq!(json["presets"][1]["name"], "power-user");
+        assert_eq!(
+            json["presets"][1]["description"],
+            "Fewer confirmations, higher autonomy."
+        );
+    }
+
+    #[tokio::test]
+    async fn config_patch_endpoint_rejects_invalid_json_body() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PATCH",
+                "/v1/config",
+                r#"{"changes":{"http":{"port":8401}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn apply_config_preset_endpoint_returns_not_found_for_unknown_preset() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/config/preset/unknown",
+                r#"{"confirm":true}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "unknown config preset: unknown");
+    }
+
+    #[tokio::test]
+    async fn apply_config_preset_endpoint_rejects_confirm_false() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/config/preset/safe",
+                r#"{"confirm":false}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "preset application requires confirm=true");
     }
 
     #[tokio::test]
