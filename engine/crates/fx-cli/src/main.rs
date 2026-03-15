@@ -64,20 +64,23 @@ enum Commands {
     /// Run headless mode (stdin/stdout, no TUI)
     Serve {
         /// Process single input and exit
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         single: bool,
         /// JSON input/output mode
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         json: bool,
         /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
         #[arg(long)]
         system_prompt: Option<std::path::PathBuf>,
         /// Start local HTTP API server with SSE streaming
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fleet")]
         http: bool,
         /// HTTP server port (default: 8400)
         #[arg(long, default_value = "8400")]
         port: u16,
+        /// Run as a fleet worker using the saved fleet identity
+        #[arg(long)]
+        fleet: bool,
     },
 
     /// Restart the running agent daemon
@@ -856,9 +859,12 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             system_prompt,
             http,
             port,
+            fleet,
         } => {
             let _pid_guard = restart::create_serve_pid_file_guard()?;
-            if http {
+            if fleet {
+                commands::serve_fleet::run().await
+            } else if http {
                 run_http_server(system_prompt, port).await
             } else {
                 run_headless(single, json, system_prompt).await
@@ -1213,6 +1219,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_serve_fleet_flag() {
+        let cli = Cli::parse_from(["fawx", "serve", "--fleet"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve {
+                single: false,
+                json: false,
+                system_prompt: None,
+                http: false,
+                port: 8400,
+                fleet: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_serve_fleet_with_http() {
+        match Cli::try_parse_from(["fawx", "serve", "--fleet", "--http"]) {
+            Ok(_) => panic!("serve --fleet --http should be rejected"),
+            Err(error) => {
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            }
+        }
+    }
+
+    #[test]
     fn cli_parses_restart_rebuild_flag() {
         let cli = Cli::parse_from(["fawx", "restart", "--rebuild"]);
         assert!(matches!(
@@ -1455,6 +1487,23 @@ exit 0
             .await
             .expect("dispatch");
         assert_eq!(exit_code, 241);
+    }
+
+    #[tokio::test]
+    async fn serve_fleet_dispatches_to_fleet_worker_runner() {
+        crate::commands::serve_fleet::set_test_exit_code(73);
+        let exit_code = dispatch_command(Commands::Serve {
+            single: false,
+            json: false,
+            system_prompt: None,
+            http: false,
+            port: 8400,
+            fleet: true,
+        })
+        .await
+        .expect("dispatch");
+
+        assert_eq!(exit_code, 73);
     }
 
     #[test]
