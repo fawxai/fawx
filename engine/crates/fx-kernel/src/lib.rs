@@ -57,6 +57,7 @@ pub mod types;
 pub mod user_facing_error;
 pub mod verify;
 pub mod watchdog;
+pub mod yield_primitive;
 
 pub use act::{
     cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
@@ -88,3 +89,4 @@ pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
 pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
 pub use verify::Verification;
+pub use yield_primitive::{WakeCondition, WakeReason, YieldHandle, YieldRequest, YieldWaker};
