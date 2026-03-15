@@ -713,7 +713,7 @@ fn map_message_to_responses_input(
 }
 
 fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
-    let content = response_input_content(blocks);
+    let content = response_input_content(role, blocks);
     if content.is_empty() {
         return;
     }
@@ -721,18 +721,28 @@ fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) 
     input.push(json!({"role": role, "content": content}));
 }
 
-fn response_input_content(blocks: &[ContentBlock]) -> Vec<Value> {
-    blocks.iter().filter_map(response_input_block).collect()
+fn response_input_content(role: &str, blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter_map(|block| response_input_block(role, block))
+        .collect()
 }
 
-fn response_input_block(block: &ContentBlock) -> Option<Value> {
+fn response_input_block(role: &str, block: &ContentBlock) -> Option<Value> {
     match block {
-        ContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
-        ContentBlock::Image { media_type, data } => Some(json!({
+        ContentBlock::Text { text } => {
+            let block_type = match role {
+                "assistant" => "output_text",
+                _ => "input_text",
+            };
+            Some(json!({"type": block_type, "text": text}))
+        }
+        ContentBlock::Image { media_type, data } if role == "user" => Some(json!({
             "type": "input_image",
             "image_url": format!("data:{media_type};base64,{data}")
         })),
         ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        ContentBlock::Image { .. } => None,
     }
 }
 
@@ -1419,6 +1429,75 @@ mod tests {
             serde_json::json!({
                 "type": "input_text",
                 "text": "describe this"
+            })
+        );
+    }
+
+    #[test]
+    fn build_request_body_maps_assistant_text_as_output_text() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Hello"),
+                crate::types::Message::assistant("Hi there"),
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(
+            input[1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there"}]
+            })
+        );
+    }
+
+    #[test]
+    fn build_request_body_drops_image_on_assistant_message() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Hello"),
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: "abc123".to_string(),
+                        },
+                        ContentBlock::Text {
+                            text: "Hi there".to_string(),
+                        },
+                    ],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(
+            input[1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there"}]
             })
         );
     }
