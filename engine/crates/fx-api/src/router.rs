@@ -57,6 +57,7 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             get(handle_get_thinking).put(handle_set_thinking),
         )
         .route("/skills", get(handle_list_skills))
+        .route("/usage", get(handlers::usage::handle_usage))
         .route("/config", patch(handle_config_patch))
         .route("/config/presets", get(handle_config_presets))
         .route("/config/preset/{name}", post(handle_apply_config_preset))
