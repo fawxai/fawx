@@ -125,8 +125,8 @@ impl HostApi for LiveHostApi {
     }
 
     fn http_request(&self, method: &str, url: &str, headers: &str, body: &str) -> Option<String> {
-        if !self.capabilities.contains(&Capability::Network) {
-            tracing::error!("http_request denied: skill lacks Network capability");
+        if !is_network_allowed(url, &self.capabilities) {
+            tracing::error!("http_request denied: domain not in allowlist");
             return None;
         }
         execute_http_request(method, url, headers, body)
@@ -142,6 +142,40 @@ impl HostApi for LiveHostApi {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+fn is_network_allowed(url: &str, capabilities: &[Capability]) -> bool {
+    for cap in capabilities {
+        match cap {
+            Capability::Network => return true,
+            Capability::NetworkRestricted { allowed_domains } => {
+                if let Some(host) = extract_host(url) {
+                    if allowed_domains.iter().any(|domain| {
+                        host == domain.as_str() || host.ends_with(&format!(".{domain}"))
+                    }) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn extract_host(url: &str) -> Option<&str> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    Some(
+        after_scheme
+            .split('/')
+            .next()
+            .unwrap_or(after_scheme)
+            .split(':')
+            .next()
+            .unwrap_or(after_scheme),
+    )
 }
 
 #[cfg(test)]

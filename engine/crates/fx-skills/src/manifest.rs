@@ -5,11 +5,13 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// Capability a skill can request.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// HTTP requests
     Network,
+    /// HTTP requests restricted to specific domains
+    NetworkRestricted { allowed_domains: Vec<String> },
     /// Persistent key-value storage
     Storage,
     /// Send notifications
@@ -29,9 +31,10 @@ pub const ALL_CAPABILITIES: [Capability; 5] = [
 ];
 
 impl Capability {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Capability::Network => "network",
+            Capability::NetworkRestricted { .. } => "network_restricted",
             Capability::Storage => "storage",
             Capability::Notifications => "notifications",
             Capability::Sensors => "sensors",
@@ -312,6 +315,15 @@ capabilities = ["network", "storage", "notifications", "sensors", "phone_actions
     #[test]
     fn test_capability_display() {
         assert_eq!(format!("{}", Capability::Network), "network");
+        assert_eq!(
+            format!(
+                "{}",
+                Capability::NetworkRestricted {
+                    allowed_domains: vec!["api.weather.gov".to_string()],
+                }
+            ),
+            "network_restricted"
+        );
         assert_eq!(format!("{}", Capability::Storage), "storage");
         assert_eq!(format!("{}", Capability::Notifications), "notifications");
         assert_eq!(format!("{}", Capability::Sensors), "sensors");
