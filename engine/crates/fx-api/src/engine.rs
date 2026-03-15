@@ -73,4 +73,9 @@ pub trait AppEngine: Send + Sync {
     }
 
     fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto>;
+
+    /// Session-level token usage (input + output tokens).
+    fn session_token_usage(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }

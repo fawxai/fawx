@@ -186,6 +186,8 @@ pub struct HeadlessApp {
     cron_store: Option<fx_cron::SharedCronStore>,
     startup_warnings: Vec<StartupWarning>,
     error_history: VecDeque<ErrorRecord>,
+    /// Cumulative token usage across all cycles in this session.
+    cumulative_tokens: TokenUsage,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -332,6 +334,7 @@ impl HeadlessApp {
             cron_store: deps.cron_store,
             startup_warnings: deps.startup_warnings,
             error_history: VecDeque::new(),
+            cumulative_tokens: TokenUsage::default(),
             bus_receiver,
         };
         app.record_startup_warning_history();
@@ -892,6 +895,14 @@ impl HeadlessApp {
         let response = extract_response_text(result);
         let iterations = extract_iterations(result);
         let tokens_used = extract_token_usage(result);
+        self.cumulative_tokens.input_tokens = self
+            .cumulative_tokens
+            .input_tokens
+            .saturating_add(tokens_used.input_tokens);
+        self.cumulative_tokens.output_tokens = self
+            .cumulative_tokens
+            .output_tokens
+            .saturating_add(tokens_used.output_tokens);
         self.last_signals = result.signals().to_vec();
         let signals = self.last_signals.clone();
         persist_headless_signals(self, &signals);
@@ -1144,6 +1155,13 @@ impl AppEngine for HeadlessApp {
                 recoverable: record.recoverable,
             })
             .collect()
+    }
+
+    fn session_token_usage(&self) -> (u64, u64) {
+        (
+            self.cumulative_tokens.input_tokens,
+            self.cumulative_tokens.output_tokens,
+        )
     }
 }
 
@@ -2284,6 +2302,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             error_history: VecDeque::new(),
+            cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
         }
     }
@@ -2809,6 +2828,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             error_history: VecDeque::new(),
+            cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
         };
 
@@ -3141,6 +3161,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             error_history: VecDeque::new(),
+            cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
         };
 
@@ -3182,6 +3203,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             error_history: VecDeque::new(),
+            cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
         };
 
