@@ -16,6 +16,7 @@ pub mod launchagent;
 pub mod message;
 pub mod pairing;
 pub mod phase4;
+pub mod proposals;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub mod usage;
