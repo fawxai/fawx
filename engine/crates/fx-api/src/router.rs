@@ -83,19 +83,19 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/server/restart", post(handle_server_restart))
         .route(
             "/launchagent/status",
-            get(handlers::launchagent_api::handle_launchagent_status),
+            get(handlers::launchagent::handle_launchagent_status),
         )
         .route(
             "/launchagent/install",
-            post(handlers::launchagent_api::handle_launchagent_install),
+            post(handlers::launchagent::handle_launchagent_install),
         )
         .route(
             "/launchagent/uninstall",
-            post(handlers::launchagent_api::handle_launchagent_uninstall),
+            post(handlers::launchagent::handle_launchagent_uninstall),
         )
         .route(
             "/launchagent/reload",
-            post(handlers::launchagent_api::handle_launchagent_reload),
+            post(handlers::launchagent::handle_launchagent_reload),
         )
         .route("/devices", get(handle_list_devices))
         .route("/errors/recent", get(handle_recent_errors))
