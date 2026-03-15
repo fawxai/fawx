@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A lightweight, clone-safe token for cooperative cancellation.
 ///
@@ -36,6 +37,13 @@ impl CancellationToken {
     /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait until cancellation has been requested.
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
