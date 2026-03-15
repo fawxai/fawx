@@ -1,0 +1,24 @@
+[package]
+name = "fx-consensus"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+test-support = []
+
+[dependencies]
+async-trait = "0.1"
+fx-llm = { path = "../fx-llm" }
+fx-subagent = { path = "../fx-subagent" }
+tokio = { version = "1", features = ["process", "time", "sync", "rt", "macros"] }
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+futures = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]

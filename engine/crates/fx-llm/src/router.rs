@@ -1,13 +1,15 @@
 //! LLM routing logic for both legacy fallback strategies and model-provider routing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use futures::future::join_all;
 use fx_core::error::LlmError;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::provider::LlmProvider as CompletionProvider;
-use crate::types::{CompletionRequest, CompletionResponse};
+use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+use crate::streaming::StreamCallback;
+use crate::types::{CompletionRequest, CompletionResponse, LlmError as ProviderLlmError};
 use crate::LlmProvider;
 
 /// Routes completion requests to the currently active model provider.
@@ -87,31 +89,53 @@ impl ModelRouter {
         self.active_model.as_deref()
     }
 
+    /// Return the provider for a model identifier, if registered.
+    pub fn provider_for_model(&self, model: &str) -> Option<&str> {
+        self.model_to_provider.get(model).map(String::as_str)
+    }
+
+    /// Return the provider for the active model, if any.
+    pub fn active_provider(&self) -> Option<&str> {
+        self.active_model()
+            .and_then(|model| self.provider_for_model(model))
+    }
+
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
-        let mut models = self
-            .model_to_provider
+        build_model_infos(&self.model_to_provider, &self.provider_auth_methods)
+    }
+
+    /// Fetch available models from all registered providers dynamically.
+    pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
+        let fetches = self
+            .providers
             .iter()
-            .map(|(model_id, provider_name)| ModelInfo {
-                model_id: model_id.clone(),
-                provider_name: provider_name.clone(),
-                auth_method: self
+            .map(|(provider_name, provider)| async move {
+                let auth_method = self
                     .provider_auth_methods
                     .get(provider_name)
                     .cloned()
-                    .unwrap_or_else(|| infer_auth_method(provider_name)),
-            })
-            .collect::<Vec<_>>();
+                    .unwrap_or_else(|| infer_auth_method(provider_name));
+                (
+                    provider_name.clone(),
+                    auth_method,
+                    fetch_provider_models(provider.as_ref()).await,
+                )
+            });
+        let mut model_entries = BTreeMap::new();
 
-        models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
-        models
+        for (provider_name, auth_method, model_ids) in join_all(fetches).await {
+            add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
+        }
+
+        model_entries.into_values().collect()
     }
 
     /// Send a completion request using the currently active model/provider pair.
     pub async fn complete(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse, crate::types::LlmError> {
+    ) -> Result<CompletionResponse, ProviderLlmError> {
         let (provider, normalized_request) = self.request_for_active_provider(request)?;
         provider.complete(normalized_request).await
     }
@@ -120,29 +144,36 @@ impl ModelRouter {
     pub async fn complete_stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<crate::provider::CompletionStream, crate::types::LlmError> {
+    ) -> Result<CompletionStream, ProviderLlmError> {
         let (provider, normalized_request) = self.request_for_active_provider(request)?;
         provider.complete_stream(normalized_request).await
+    }
+
+    /// Send a completion request and emit normalized provider stream events.
+    pub async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, ProviderLlmError> {
+        let (provider, normalized_request) = self.request_for_active_provider(request)?;
+        provider.stream(normalized_request, callback).await
     }
 
     fn request_for_active_provider(
         &self,
         mut request: CompletionRequest,
-    ) -> Result<(&dyn CompletionProvider, CompletionRequest), crate::types::LlmError> {
-        let active_model = self.active_model.clone().ok_or_else(|| {
-            crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
-        })?;
+    ) -> Result<(&dyn CompletionProvider, CompletionRequest), ProviderLlmError> {
+        let active_model = self
+            .active_model
+            .clone()
+            .ok_or_else(|| ProviderLlmError::Config(RouterError::NoActiveModel.to_string()))?;
 
         let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
-            crate::types::LlmError::Config(
-                RouterError::ModelNotFound(active_model.clone()).to_string(),
-            )
+            ProviderLlmError::Config(RouterError::ModelNotFound(active_model.clone()).to_string())
         })?;
 
         let provider = self.providers.get(provider_name).ok_or_else(|| {
-            crate::types::LlmError::Provider(format!(
-                "provider '{provider_name}' was not registered"
-            ))
+            ProviderLlmError::Provider(format!("provider '{provider_name}' was not registered"))
         })?;
 
         request.model = active_model;
@@ -152,6 +183,52 @@ impl ModelRouter {
 
         Ok((provider.as_ref(), request))
     }
+}
+
+async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<String> {
+    match provider.list_models().await {
+        Ok(models) => models,
+        Err(error) => {
+            warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using static fallback");
+            provider.supported_models()
+        }
+    }
+}
+
+fn add_provider_models(
+    model_entries: &mut BTreeMap<String, ModelInfo>,
+    provider_name: &str,
+    auth_method: &str,
+    model_ids: Vec<String>,
+) {
+    for model_id in model_ids {
+        model_entries
+            .entry(model_id.clone())
+            .or_insert_with(|| ModelInfo {
+                model_id,
+                provider_name: provider_name.to_string(),
+                auth_method: auth_method.to_string(),
+            });
+    }
+}
+
+fn build_model_infos(
+    model_to_provider: &HashMap<String, String>,
+    provider_auth_methods: &HashMap<String, String>,
+) -> Vec<ModelInfo> {
+    let mut models = model_to_provider
+        .iter()
+        .map(|(model_id, provider_name)| ModelInfo {
+            model_id: model_id.clone(),
+            provider_name: provider_name.clone(),
+            auth_method: provider_auth_methods
+                .get(provider_name)
+                .cloned()
+                .unwrap_or_else(|| infer_auth_method(provider_name)),
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    models
 }
 
 /// Metadata for an available model.
@@ -182,7 +259,7 @@ pub enum RouterError {
     EmptyModelSelector,
     /// Provider-level request failure.
     #[error("provider error: {0}")]
-    ProviderError(crate::types::LlmError),
+    ProviderError(ProviderLlmError),
 }
 
 fn infer_auth_method(provider_name: &str) -> String {
@@ -535,9 +612,11 @@ mod model_router_tests {
         provider_name: String,
         models: Vec<String>,
         response_text: String,
+        dynamic_models: Result<Vec<String>, String>,
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
         capabilities: ProviderCapabilities,
+        list_models_delay_ms: u64,
     }
 
     impl MockCompletionProvider {
@@ -549,14 +628,27 @@ mod model_router_tests {
             captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
             capabilities: ProviderCapabilities,
         ) -> Self {
+            let model_ids = models.iter().map(ToString::to_string).collect::<Vec<_>>();
             Self {
                 provider_name: provider_name.to_string(),
-                models: models.into_iter().map(ToString::to_string).collect(),
+                models: model_ids.clone(),
                 response_text: response_text.to_string(),
+                dynamic_models: Ok(model_ids),
                 captured_models,
                 captured_temperatures,
                 capabilities,
+                list_models_delay_ms: 0,
             }
+        }
+
+        fn with_dynamic_models(mut self, dynamic_models: Result<Vec<String>, String>) -> Self {
+            self.dynamic_models = dynamic_models;
+            self
+        }
+
+        fn with_list_models_delay_ms(mut self, delay_ms: u64) -> Self {
+            self.list_models_delay_ms = delay_ms;
+            self
         }
     }
 
@@ -603,6 +695,14 @@ mod model_router_tests {
             self.models.clone()
         }
 
+        async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+            if self.list_models_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.list_models_delay_ms))
+                    .await;
+            }
+            self.dynamic_models.clone().map_err(LlmError::Provider)
+        }
+
         fn capabilities(&self) -> ProviderCapabilities {
             self.capabilities
         }
@@ -627,6 +727,7 @@ mod model_router_tests {
     fn first_text(response: &CompletionResponse) -> Option<String> {
         response.content.iter().find_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
     }
@@ -635,6 +736,40 @@ mod model_router_tests {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticOnlyProvider {
+        models: Vec<String>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StaticOnlyProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            "static-only"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            default_capabilities()
         }
     }
 
@@ -683,6 +818,146 @@ mod model_router_tests {
         let models = router.available_models();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].auth_method, "api_key");
+    }
+
+    #[tokio::test]
+    async fn router_fetch_merges_providers() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let openai = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["gpt-4o".to_string(), "gpt-4.1".to_string()]));
+        let anthropic = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-opus-4-1-20250805"],
+            "from anthropic",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec![
+            "claude-opus-4-1-20250805".to_string(),
+            "gpt-4o".to_string(),
+        ]));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(openai));
+        router.register_provider(Box::new(anthropic));
+
+        let models = router.fetch_available_models().await;
+        let ids = models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["claude-opus-4-1-20250805", "gpt-4.1", "gpt-4o"]);
+    }
+
+    #[tokio::test]
+    async fn router_fetches_providers_in_parallel() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let openai = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["gpt-4o".to_string()]))
+        .with_list_models_delay_ms(150);
+        let anthropic = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-opus-4-1-20250805"],
+            "from anthropic",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["claude-opus-4-1-20250805".to_string()]))
+        .with_list_models_delay_ms(150);
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(openai));
+        router.register_provider(Box::new(anthropic));
+
+        let started = tokio::time::Instant::now();
+        let models = router.fetch_available_models().await;
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(275));
+        assert_eq!(models.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn router_fetch_partial_failure() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let openai = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["gpt-4.1".to_string()]));
+        let anthropic = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-opus-4-1-20250805"],
+            "from anthropic",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Err("boom".to_string()));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(openai));
+        router.register_provider(Box::new(anthropic));
+
+        let models = router.fetch_available_models().await;
+        let ids = models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["claude-opus-4-1-20250805", "gpt-4.1"]);
+    }
+
+    #[tokio::test]
+    async fn list_models_default_impl_returns_supported() {
+        let provider = StaticOnlyProvider {
+            models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+        };
+
+        let models = CompletionProvider::list_models(&provider)
+            .await
+            .expect("default list models");
+
+        assert_eq!(
+            models,
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_skips_unconfigured_provider() {
+        let provider = StaticOnlyProvider {
+            models: vec!["claude-opus-4-1-20250805".to_string()],
+        };
+
+        let models = CompletionProvider::list_models(&provider)
+            .await
+            .expect("static fallback without auth");
+
+        assert_eq!(models, vec!["claude-opus-4-1-20250805".to_string()]);
     }
 
     #[test]
@@ -895,5 +1170,92 @@ mod model_router_tests {
         assert!(result.is_ok());
         assert_eq!(calls.lock().unwrap().clone(), vec!["gpt-5".to_string()]);
         assert_eq!(temperatures.lock().unwrap().clone(), vec![None]);
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_tests {
+    use super::ModelRouter;
+    use crate::provider::{
+        CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
+    };
+    use crate::supported_thinking_levels;
+    use crate::types::{CompletionRequest, CompletionResponse, LlmError};
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct StaticProvider {
+        name: &'static str,
+        models: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StaticProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.iter().map(ToString::to_string).collect()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    #[test]
+    fn active_provider_uses_active_model_mapping() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticProvider {
+            name: "anthropic",
+            models: vec!["claude-sonnet-4-20250514"],
+        }));
+        router
+            .set_active("claude-sonnet-4-20250514")
+            .expect("set active");
+
+        assert_eq!(router.active_provider(), Some("anthropic"));
+        assert_eq!(
+            router.provider_for_model("claude-sonnet-4-20250514"),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn supported_thinking_levels_anthropic() {
+        let levels = supported_thinking_levels("anthropic");
+        assert_eq!(levels, vec!["off", "low", "adaptive", "high"]);
+    }
+
+    #[test]
+    fn supported_thinking_levels_openai() {
+        let levels = supported_thinking_levels("openai");
+        assert_eq!(levels, vec!["off", "low", "high"]);
+    }
+
+    #[test]
+    fn supported_thinking_levels_falls_back_to_off_for_unknown_provider() {
+        assert_eq!(
+            supported_thinking_levels("mystery"),
+            vec!["off".to_string()]
+        );
     }
 }

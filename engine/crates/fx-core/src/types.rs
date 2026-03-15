@@ -24,6 +24,15 @@ pub struct ExecutionContext {
     pub api_version: String,
 }
 
+/// A base64-encoded image attachment for multimodal messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageAttachment {
+    /// MIME type (e.g., "image/jpeg").
+    pub media_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+}
+
 /// User input received from voice, text, or other sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInput {
@@ -38,6 +47,10 @@ pub struct UserInput {
 
     /// Optional context from previous conversation
     pub context_id: Option<String>,
+
+    /// Base64-encoded images attached to the input.
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
 }
 
 /// Source of user input.
@@ -251,4 +264,24 @@ pub struct Notification {
 
     /// Unix timestamp in milliseconds since epoch
     pub timestamp: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputSource, UserInput};
+
+    #[test]
+    fn user_input_default_images_empty() {
+        let input: UserInput = serde_json::from_value(serde_json::json!({
+            "text": "hello",
+            "source": "Text",
+            "timestamp": 123,
+            "context_id": null
+        }))
+        .expect("deserialize user input");
+
+        assert_eq!(input.text, "hello");
+        assert_eq!(input.source, InputSource::Text);
+        assert!(input.images.is_empty());
+    }
 }

@@ -174,7 +174,7 @@ impl ModelCatalog {
                 }
             }
             "openai" | "openrouter" => match auth_mode {
-                "bearer" => {
+                "bearer" | "oauth" => {
                     let bearer = format!("Bearer {api_key}");
                     let bearer = HeaderValue::from_str(&bearer)
                         .map_err(|error| format!("invalid authorization header: {error}"))?;
@@ -307,7 +307,14 @@ impl ModelCatalog {
                 "claude-opus-4-20250514",
                 "claude-sonnet-4-20250514",
             ],
-            "openai" => vec!["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+            "openai" => vec![
+                "gpt-5.4",
+                "gpt-4.1",
+                "o3",
+                "o4-mini",
+                "gpt-4o",
+                "gpt-4o-mini",
+            ],
             "openrouter" => vec![
                 "anthropic/claude-sonnet-4",
                 "openai/gpt-4o",
@@ -609,7 +616,10 @@ mod tests {
         assert_eq!(
             openai,
             vec![
+                "gpt-5.4".to_string(),
                 "gpt-4.1".to_string(),
+                "o3".to_string(),
+                "o4-mini".to_string(),
                 "gpt-4o".to_string(),
                 "gpt-4o-mini".to_string(),
             ]
@@ -881,6 +891,31 @@ mod tests {
         let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn build_models_request_accepts_oauth_for_openai() {
+        let catalog = ModelCatalog::new();
+
+        let request = catalog
+            .build_models_request("openai", "oauth-token-123", "oauth")
+            .expect("oauth auth mode should be accepted for openai");
+
+        let headers = request.headers();
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer oauth-token-123"
+        );
+    }
+
+    #[test]
+    fn hardcoded_fallback_includes_modern_models() {
+        let fallback = ModelCatalog::hardcoded_fallback("openai");
+        let ids: Vec<&str> = fallback.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"gpt-5.4"), "fallback should include gpt-5.4");
+        assert!(ids.contains(&"o3"), "fallback should include o3");
+        assert!(ids.contains(&"o4-mini"), "fallback should include o4-mini");
     }
 
     #[test]

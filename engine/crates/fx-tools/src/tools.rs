@@ -1,5 +1,9 @@
+use crate::experiment_tool::{
+    handle_run_experiment, run_experiment_tool_definition, ExperimentToolState,
+};
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
+use fx_consensus::ProgressCallback;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
@@ -8,8 +12,10 @@ use fx_kernel::act::{
     ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{current_file_hash, Proposal, ProposalWriter};
+use fx_memory::embedding_index::EmbeddingIndex;
+use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use fx_subagent::{
     SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
 };
@@ -42,18 +48,30 @@ const MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MEMORY_SEARCH_RESULTS: usize = 5;
+
+fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
+    Arc::new(ProcessRegistry::new(ProcessConfig {
+        allowed_dirs: vec![working_dir.to_path_buf()],
+        ..ProcessConfig::default()
+    }))
+}
 
 #[derive(Clone)]
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
+    process_registry: Arc<ProcessRegistry>,
     memory: Option<Arc<Mutex<dyn MemoryStore>>>,
+    embedding_index: Option<Arc<Mutex<EmbeddingIndex>>>,
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
+    experiment: Option<ExperimentToolState>,
+    experiment_progress: Option<ProgressCallback>,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
@@ -87,16 +105,21 @@ impl Default for ToolConfig {
 
 impl FawxToolExecutor {
     pub fn new(working_dir: PathBuf, config: ToolConfig) -> Self {
+        let process_registry = default_process_registry(&working_dir);
         Self {
             working_dir,
             config,
+            process_registry,
             memory: None,
+            embedding_index: None,
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
             config_manager: None,
             start_time: std::time::Instant::now(),
             subagent_control: None,
+            experiment: None,
+            experiment_progress: None,
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
@@ -113,6 +136,12 @@ impl FawxToolExecutor {
     /// Attach a persistent memory provider.
     pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a semantic embedding index for memory search.
+    pub fn with_embedding_index(mut self, index: Arc<Mutex<EmbeddingIndex>>) -> Self {
+        self.embedding_index = Some(index);
         self
     }
 
@@ -140,9 +169,31 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach experiment execution state for run_experiment.
+    pub fn with_experiment(mut self, state: ExperimentToolState) -> Self {
+        self.experiment = Some(state);
+        self
+    }
+
+    /// Attach an experiment progress callback for run_experiment.
+    pub fn with_experiment_progress(mut self, progress: ProgressCallback) -> Self {
+        self.experiment_progress = Some(progress);
+        self
+    }
+
+    pub fn set_experiment(&mut self, state: ExperimentToolState) {
+        self.experiment = Some(state);
+    }
+
     /// Attach node_run tool state for remote command execution.
     pub fn with_node_run(mut self, state: crate::node_run::NodeRunState) -> Self {
         self.node_run = Some(state);
+        self
+    }
+
+    /// Attach a background process registry shared with the engine lifecycle.
+    pub fn with_process_registry(mut self, registry: Arc<ProcessRegistry>) -> Self {
+        self.process_registry = registry;
         self
     }
 
@@ -164,17 +215,16 @@ impl FawxToolExecutor {
 
     fn cacheability_for(tool_name: &str) -> ToolCacheability {
         match tool_name {
-            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
-                ToolCacheability::Cacheable
-            }
+            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list"
+            | "memory_search" => ToolCacheability::Cacheable,
             "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
-            | "config_set" | "fawx_restart" | "spawn_agent" | "node_run" => {
-                ToolCacheability::SideEffect
-            }
+            | "exec_background" | "exec_kill" | "config_set" | "fawx_restart" | "spawn_agent"
+            | "node_run" | "run_experiment" => ToolCacheability::SideEffect,
             "current_time"
             | "self_info"
             | "config_get"
             | "fawx_status"
+            | "exec_status"
             | "subagent_status"
             | "analyze_signals"
             | "propose_improvement" => ToolCacheability::NeverCache,
@@ -196,6 +246,9 @@ impl FawxToolExecutor {
             "edit_file" => self.handle_edit_file(&call.arguments),
             "list_directory" => self.handle_list_directory(&call.arguments),
             "run_command" => self.handle_run_command(&call.arguments).await,
+            "exec_background" => self.handle_exec_background(&call.arguments),
+            "exec_status" => self.handle_exec_status(&call.arguments),
+            "exec_kill" => self.handle_exec_kill(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
             "self_info" => self.handle_self_info(&call.arguments),
@@ -206,9 +259,11 @@ impl FawxToolExecutor {
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
+            "memory_search" => self.handle_memory_search(&call.arguments),
             "memory_delete" => self.handle_memory_delete(&call.arguments),
             "spawn_agent" => self.handle_spawn_agent(&call.arguments).await,
             "subagent_status" => self.handle_subagent_status(&call.arguments).await,
+            "run_experiment" => self.handle_run_experiment(&call.arguments).await,
             "node_run" => {
                 return self.dispatch_node_run(call).await;
             }
@@ -441,6 +496,37 @@ impl FawxToolExecutor {
             .map_err(|error| error.to_string())?;
         let output = wait_with_timeout(child, self.config.command_timeout).await?;
         Ok(format_command_output(output, parsed.shell.unwrap_or(false)))
+    }
+
+    fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecBackgroundArgs = parse_args(args)?;
+        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
+        let result = self
+            .process_registry
+            .spawn(parsed.command, working_dir, parsed.label)?;
+        serialize_output(exec_spawn_value(result))
+    }
+
+    fn handle_exec_status(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecStatusArgs = parse_args(args)?;
+        let tail = parsed.tail.unwrap_or(20);
+        if let Some(session_id) = parsed.session_id.as_deref() {
+            let status = self
+                .process_registry
+                .status(session_id, tail)
+                .ok_or_else(|| format!("unknown session_id: {session_id}"))?;
+            return serialize_output(exec_status_value(status));
+        }
+        serialize_output(exec_list_value(self.process_registry.list()))
+    }
+
+    async fn handle_exec_kill(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecKillArgs = parse_args(args)?;
+        self.process_registry.kill(&parsed.session_id).await?;
+        serialize_output(serde_json::json!({
+            "session_id": parsed.session_id,
+            "status": "killed",
+        }))
     }
 
     fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
@@ -677,6 +763,8 @@ impl FawxToolExecutor {
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
         let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
         guard.write(&parsed.key, &parsed.value)?;
+        drop(guard);
+        self.upsert_embedding_memory(&parsed.key, &parsed.value)?;
         Ok(format!("stored key '{}'", parsed.key))
     }
 
@@ -705,15 +793,115 @@ impl FawxToolExecutor {
         Ok(lines)
     }
 
+    fn handle_memory_search(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: MemorySearchArgs = parse_args(args)?;
+        let max_results = parsed.max_results.unwrap_or(DEFAULT_MEMORY_SEARCH_RESULTS);
+        let results = self.memory_search_results(&parsed.query, max_results)?;
+        self.touch_memory_search_results(&results)?;
+        Ok(format_memory_search_results(&parsed.query, &results))
+    }
+
     fn handle_memory_delete(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: MemoryDeleteArgs = parse_args(args)?;
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
         let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
-        if guard.delete(&parsed.key) {
+        let deleted = guard.delete(&parsed.key);
+        drop(guard);
+        if deleted {
+            self.remove_embedding_memory(&parsed.key)?;
             Ok(format!("deleted key '{}'", parsed.key))
         } else {
             Ok(format!("key '{}' not found", parsed.key))
         }
+    }
+
+    fn memory_search_results(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        if let Some(index) = &self.embedding_index {
+            match self.semantic_memory_search(index, query, max_results) {
+                Ok(results) => return Ok(results),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "semantic search failed; falling back to keyword search"
+                    );
+                }
+            }
+        }
+        self.keyword_memory_search(query, max_results)
+    }
+
+    fn touch_memory_search_results(&self, results: &[MemorySearchResult]) -> Result<(), String> {
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let mut guard = memory.lock().map_err(|error| format!("{error}"))?;
+        results
+            .iter()
+            .try_for_each(|result| guard.touch(&result.key))
+    }
+
+    fn semantic_memory_search(
+        &self,
+        index: &Arc<Mutex<EmbeddingIndex>>,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        let hits = index
+            .lock()
+            .map_err(|e| format!("{e}"))?
+            .search(query, max_results)
+            .map_err(|error| error.to_string())?;
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|(key, score)| {
+                guard.read(&key).map(|value| MemorySearchResult {
+                    key,
+                    value,
+                    score: Some(score),
+                })
+            })
+            .collect())
+    }
+
+    fn keyword_memory_search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        Ok(guard
+            .search_relevant(query, max_results)
+            .into_iter()
+            .map(|(key, value)| MemorySearchResult {
+                key,
+                value,
+                score: None,
+            })
+            .collect())
+    }
+
+    fn upsert_embedding_memory(&self, key: &str, value: &str) -> Result<(), String> {
+        let Some(index) = &self.embedding_index else {
+            return Ok(());
+        };
+        index
+            .lock()
+            .map_err(|e| format!("{e}"))?
+            .upsert(key, value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_embedding_memory(&self, key: &str) -> Result<(), String> {
+        let Some(index) = &self.embedding_index else {
+            return Ok(());
+        };
+        index.lock().map_err(|e| format!("{e}"))?.remove(key);
+        Ok(())
     }
 
     async fn handle_spawn_agent(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -725,6 +913,21 @@ impl FawxToolExecutor {
             .await
             .map_err(|error| error.to_string())?;
         serialize_output(spawned_handle_value(&handle))
+    }
+
+    async fn handle_run_experiment(&self, args: &serde_json::Value) -> Result<String, String> {
+        let state = self
+            .experiment
+            .as_ref()
+            .ok_or_else(|| "experiment tool not configured".to_string())?;
+        handle_run_experiment(
+            state,
+            self.subagent_control.as_ref(),
+            &self.working_dir,
+            args,
+            self.experiment_progress.clone(),
+        )
+        .await
     }
 
     async fn handle_subagent_status(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -844,19 +1047,12 @@ impl FawxToolExecutor {
 }
 
 fn build_proposed_content(path: &Path, content: &str) -> String {
-    if !path.exists() {
-        return content.to_string();
-    }
-
-    let original =
-        fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string());
-    format!(
-        "--- original ({} bytes) ---\n{}\n--- proposed ({} bytes) ---\n{}",
-        original.len(),
-        original,
-        content.len(),
-        content
-    )
+    let original = if path.exists() {
+        Some(fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string()))
+    } else {
+        None
+    };
+    build_proposal_content(original.as_deref(), content)
 }
 
 struct EditPlan {
@@ -1072,7 +1268,8 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = fawx_tool_definitions(self.subagent_control.is_some());
+        let mut defs =
+            fawx_tool_definitions(self.subagent_control.is_some(), self.experiment.is_some());
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
         }
@@ -1100,12 +1297,16 @@ impl std::fmt::Debug for FawxToolExecutor {
         debug
             .field("working_dir", &self.working_dir)
             .field("config", &self.config)
+            .field("process_registry", &true)
             .field("memory", &self.memory.is_some())
+            .field("embedding_index", &self.embedding_index.is_some())
             .field("runtime_info", &self.runtime_info.is_some())
             .field("self_modify", &self.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
             .field("config_manager", &self.config_manager.is_some())
-            .field("subagent_control", &self.subagent_control.is_some());
+            .field("subagent_control", &self.subagent_control.is_some())
+            .field("experiment", &self.experiment.is_some())
+            .field("experiment_progress", &self.experiment_progress.is_some());
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
         debug.finish()
@@ -1190,7 +1391,10 @@ async fn collect_ordered_results(
     Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
-pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition> {
+pub fn fawx_tool_definitions(
+    include_subagent_tools: bool,
+    include_experiment_tool: bool,
+) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: "read_file".to_string(),
@@ -1267,6 +1471,42 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
             }),
         },
         ToolDefinition {
+            name: "exec_background".to_string(),
+            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "working_dir": { "type": "string" },
+                    "label": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: "exec_status".to_string(),
+            description: "Check one background process or list all background processes.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "tail": { "type": "integer" }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "exec_kill".to_string(),
+            description: "Kill a background process by session ID.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
             name: "search_text".to_string(),
             description:
                 "Search text in files and return file:line matches. Supports `~` to reference the home directory."
@@ -1305,6 +1545,9 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         },
     ];
+    if include_experiment_tool {
+        definitions.insert(0, run_experiment_tool_definition());
+    }
     if include_subagent_tools {
         definitions.extend(subagent_tool_definitions());
     }
@@ -1379,6 +1622,48 @@ fn subagent_status_definition() -> ToolDefinition {
 
 fn serialize_output(value: serde_json::Value) -> Result<String, String> {
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn exec_spawn_value(result: SpawnResult) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": result.session_id,
+        "pid": result.pid,
+        "label": result.label,
+        "status": result.status,
+    })
+}
+
+fn exec_status_value(status: StatusResult) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": status.session_id,
+        "label": status.label,
+        "working_dir": status.working_dir,
+        "status": status.status.name(),
+        "exit_code": status.status.exit_code(),
+        "runtime_seconds": status.runtime_seconds,
+        "output_lines": status.output_lines,
+        "tail": status.tail,
+    })
+}
+
+fn exec_list_value(processes: Vec<ListEntry>) -> serde_json::Value {
+    let items = processes
+        .into_iter()
+        .map(exec_list_entry_value)
+        .collect::<Vec<_>>();
+    serde_json::json!({ "processes": items })
+}
+
+fn exec_list_entry_value(entry: ListEntry) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": entry.session_id,
+        "label": entry.label,
+        "working_dir": entry.working_dir,
+        "status": entry.status.name(),
+        "exit_code": entry.status.exit_code(),
+        "runtime_seconds": entry.runtime_seconds,
+        "output_lines": entry.output_lines,
+    })
 }
 
 fn spawned_handle_value(handle: &SubagentHandle) -> serde_json::Value {
@@ -1552,6 +1837,25 @@ pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["key"]
             }),
         },
+        ToolDefinition {
+            name: "memory_search".to_string(),
+            description: "Search agent memory by meaning. Finds semantically related memories even without exact keyword matches."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default: 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -1567,6 +1871,43 @@ fn format_memory_list(entries: &[(String, String)]) -> String {
             "
 ",
         )
+}
+
+struct MemorySearchResult {
+    key: String,
+    value: String,
+    score: Option<f32>,
+}
+
+fn format_memory_search_results(query: &str, results: &[MemorySearchResult]) -> String {
+    if results.is_empty() {
+        return format!("No relevant memories found for: {query}");
+    }
+
+    let items = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| format_memory_search_item(index + 1, result))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("Found {} relevant memories:\n\n{items}", results.len())
+}
+
+fn format_memory_search_item(index: usize, result: &MemorySearchResult) -> String {
+    let header = match result.score {
+        Some(score) => format!("{index}. [{}] (score: {score:.2})", result.key),
+        None => format!("{index}. [{}]", result.key),
+    };
+    let value = indent_memory_value(&result.value);
+    format!("{header}\n{value}")
+}
+
+fn indent_memory_value(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("   {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate_preview(value: &str, max_len: usize) -> String {
@@ -1826,6 +2167,24 @@ struct RunCommandArgs {
 }
 
 #[derive(Deserialize)]
+struct ExecBackgroundArgs {
+    command: String,
+    working_dir: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExecStatusArgs {
+    session_id: Option<String>,
+    tail: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ExecKillArgs {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
 struct SearchTextArgs {
     pattern: String,
     path: Option<String>,
@@ -1851,6 +2210,12 @@ struct MemoryReadArgs {
 #[derive(Deserialize)]
 struct MemoryDeleteArgs {
     key: String,
+}
+
+#[derive(Deserialize)]
+struct MemorySearchArgs {
+    query: String,
+    max_results: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -2048,7 +2413,12 @@ pub fn config_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_config::FawxConfig;
+    use fx_consensus::ProgressEvent;
     use fx_core::memory::MemoryProvider;
+    use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
+    use fx_llm::ModelRouter;
+    use fx_memory::embedding_index::EmbeddingIndex;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
 
@@ -2078,12 +2448,42 @@ mod tests {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
     }
 
+    fn memory_executor(root: &Path) -> (FawxToolExecutor, Arc<Mutex<fx_memory::JsonFileMemory>>) {
+        let memory = Arc::new(Mutex::new(
+            fx_memory::JsonFileMemory::new(root).expect("memory"),
+        ));
+        let executor = test_executor(root).with_memory(memory.clone());
+        (executor, memory)
+    }
+
+    fn embedding_executor(
+        root: &Path,
+    ) -> (
+        FawxToolExecutor,
+        Arc<Mutex<fx_memory::JsonFileMemory>>,
+        Arc<Mutex<EmbeddingIndex>>,
+    ) {
+        let (executor, memory) = memory_executor(root);
+        let model = test_embedding_model(8);
+        let index = Arc::new(Mutex::new(
+            EmbeddingIndex::build_from(&[], &model).expect("index"),
+        ));
+        let executor = executor.with_embedding_index(index.clone());
+        (executor, memory, index)
+    }
+
+    fn test_embedding_model(dimensions: usize) -> Arc<EmbeddingModel> {
+        let model_dir = create_test_model_dir(dimensions);
+        Arc::new(EmbeddingModel::load(model_dir.path()).expect("load test model"))
+    }
+
     fn sample_runtime_info(model: &str) -> Arc<RwLock<RuntimeInfo>> {
         Arc::new(RwLock::new(RuntimeInfo {
             active_model: model.to_string(),
             provider: "openai".to_string(),
             skills: vec![fx_core::runtime_info::SkillInfo {
                 name: "fawx-builtin".to_string(),
+                description: Some("Built-in runtime tools".to_string()),
                 tool_names: vec!["read_file".to_string(), "self_info".to_string()],
             }],
             config_summary: fx_core::runtime_info::ConfigSummary {
@@ -2108,6 +2508,14 @@ mod tests {
         control: Arc<dyn SubagentControl>,
     ) -> FawxToolExecutor {
         test_executor(root).with_subagent_control(control)
+    }
+
+    fn experiment_state(root: &Path) -> ExperimentToolState {
+        ExperimentToolState {
+            chain_path: root.join("chain.json"),
+            router: Arc::new(ModelRouter::new()),
+            config: FawxConfig::default(),
+        }
     }
 
     #[test]
@@ -2880,6 +3288,95 @@ three
         assert!(output.is_err());
     }
 
+    #[tokio::test]
+    async fn exec_background_returns_session_id_and_status() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "build"}))
+            .expect("background spawn");
+        let value = parse_json_output(&output);
+
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["label"], "build");
+        assert!(value["pid"].is_u64());
+        assert!(value["session_id"]
+            .as_str()
+            .expect("session id")
+            .starts_with("bg_"));
+    }
+
+    #[tokio::test]
+    async fn exec_status_with_session_id_returns_tail() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let created = executor
+            .handle_exec_background(&serde_json::json!({"command": "printf 'hello\\nworld\\n'"}))
+            .expect("background spawn");
+        let session_id = parse_json_output(&created)["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let output = executor
+            .handle_exec_status(&serde_json::json!({"session_id": session_id, "tail": 1}))
+            .expect("status");
+        let value = parse_json_output(&output);
+
+        assert_eq!(value["tail"][0], "world");
+        assert!(value.get("pid").is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_status_without_session_id_lists_all_processes() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "one"}))
+            .expect("first spawn");
+        executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "two"}))
+            .expect("second spawn");
+
+        let output = executor
+            .handle_exec_status(&serde_json::json!({}))
+            .expect("status list");
+        let value = parse_json_output(&output);
+        let processes = value["processes"].as_array().expect("process list");
+
+        assert_eq!(processes.len(), 2);
+        assert!(processes.iter().all(|entry| entry.get("pid").is_none()));
+    }
+
+    #[tokio::test]
+    async fn exec_kill_with_invalid_session_id_returns_error() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_exec_kill(&serde_json::json!({"session_id": "bg_missing"}))
+            .await
+            .expect_err("invalid session should fail");
+
+        assert!(error.contains("unknown session_id"));
+    }
+
+    #[test]
+    fn exec_background_validates_working_directory() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_exec_background(
+                &serde_json::json!({"command": "sleep 1", "working_dir": "../"}),
+            )
+            .expect_err("outside working dir should fail");
+
+        assert!(!error.is_empty());
+    }
+
     #[test]
     fn search_text_finds_pattern_with_file_and_line() {
         let temp = TempDir::new().expect("temp");
@@ -3150,20 +3647,75 @@ three
     }
 
     #[test]
+    fn run_experiment_definition_only_appears_when_enabled() {
+        let without_experiment = fawx_tool_definitions(false, false);
+        assert!(!without_experiment
+            .iter()
+            .any(|tool| tool.name == "run_experiment"));
+
+        let with_experiment = fawx_tool_definitions(false, true);
+        assert!(with_experiment
+            .iter()
+            .any(|tool| tool.name == "run_experiment"));
+    }
+
+    #[tokio::test]
+    async fn run_experiment_uses_executor_progress_callback() {
+        let temp = TempDir::new().expect("tempdir");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::clone(&recorded);
+        let executor = test_executor(temp.path())
+            .with_experiment(experiment_state(temp.path()))
+            .with_experiment_progress(Arc::new(move |event: &ProgressEvent| {
+                events.lock().expect("progress lock").push(event.clone());
+            }));
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_experiment".to_string(),
+            arguments: serde_json::json!({
+                "signal": "signal",
+                "hypothesis": "test hypothesis",
+                "mode": "placeholder",
+                "nodes": 1,
+                "project": temp.path().display().to_string(),
+            }),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let events = recorded.lock().expect("progress lock").clone();
+
+        assert!(result.success, "{}", result.output);
+        assert!(matches!(
+            events.first(),
+            Some(ProgressEvent::RoundStarted { .. })
+        ));
+    }
+
+    #[test]
     fn current_time_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
     #[test]
     fn edit_file_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]
+    fn background_process_tools_appear_in_definitions() {
+        let definitions = fawx_tool_definitions(false, false);
+        assert!(definitions
+            .iter()
+            .any(|tool| tool.name == "exec_background"));
+        assert!(definitions.iter().any(|tool| tool.name == "exec_status"));
+        assert!(definitions.iter().any(|tool| tool.name == "exec_kill"));
+    }
+
+    #[test]
     fn read_file_definition_exposes_offset_and_limit() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         let read_file = definitions
             .iter()
             .find(|tool| tool.name == "read_file")
@@ -3186,6 +3738,10 @@ three
             ToolCacheability::Cacheable
         );
         assert_eq!(
+            executor.cacheability("memory_search"),
+            ToolCacheability::Cacheable
+        );
+        assert_eq!(
             executor.cacheability("write_file"),
             ToolCacheability::SideEffect
         );
@@ -3198,11 +3754,23 @@ three
             ToolCacheability::SideEffect
         );
         assert_eq!(
+            executor.cacheability("exec_background"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            executor.cacheability("exec_kill"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
             executor.cacheability("spawn_agent"),
             ToolCacheability::SideEffect
         );
         assert_eq!(
             executor.cacheability("current_time"),
+            ToolCacheability::NeverCache
+        );
+        assert_eq!(
+            executor.cacheability("exec_status"),
             ToolCacheability::NeverCache
         );
         assert_eq!(
@@ -3483,7 +4051,7 @@ three
 
     #[test]
     fn self_info_appears_in_tool_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "self_info"));
     }
 
@@ -3573,17 +4141,14 @@ three
     #[test]
     fn memory_tools_appear_in_definitions_when_memory_configured() {
         let temp = TempDir::new().expect("temp");
-        let memory = Arc::new(Mutex::new(
-            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
-        ));
-        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
-            .with_memory(memory);
+        let (executor, _memory) = memory_executor(temp.path());
         let defs = executor.tool_definitions();
         let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"memory_write"));
         assert!(names.contains(&"memory_read"));
         assert!(names.contains(&"memory_list"));
         assert!(names.contains(&"memory_delete"));
+        assert!(names.contains(&"memory_search"));
     }
 
     #[test]
@@ -3700,11 +4265,7 @@ three
     #[test]
     fn memory_delete_tool_returns_not_found() {
         let temp = TempDir::new().expect("temp");
-        let memory = Arc::new(Mutex::new(
-            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
-        ));
-        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
-            .with_memory(memory);
+        let (executor, _memory) = memory_executor(temp.path());
         let result = executor
             .handle_memory_delete(&serde_json::json!({"key": "nonexistent"}))
             .expect("delete");
@@ -3712,6 +4273,251 @@ three
             result.contains("not found"),
             "should say not found, got: {result}"
         );
+    }
+
+    #[test]
+    fn memory_search_tool_returns_formatted_results_with_scores() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write(
+                    "auth_decision",
+                    "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                )
+                .expect("write auth");
+            guard
+                .write(
+                    "security_review",
+                    "Bearer token stored in encrypted credential store.",
+                )
+                .expect("write security");
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            guard
+                .upsert(
+                    "auth_decision",
+                    "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                )
+                .expect("index auth");
+            guard
+                .upsert(
+                    "security_review",
+                    "Bearer token stored in encrypted credential store.",
+                )
+                .expect("index security");
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({
+                "query": "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                "max_results": 2
+            }))
+            .expect("memory search");
+
+        assert!(result.contains("Found 2 relevant memories:"), "{result}");
+        assert!(result.contains("[auth_decision]"), "{result}");
+        assert!(result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_tool_returns_helpful_message_when_empty() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, _memory, _index) = embedding_executor(temp.path());
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "oauth"}))
+            .expect("memory search");
+
+        assert_eq!(result, "No relevant memories found for: oauth");
+    }
+
+    #[test]
+    fn memory_search_tool_falls_back_to_keyword_search_without_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory) = memory_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("keyword fallback");
+
+        assert!(result.contains("Found 1 relevant memories:"), "{result}");
+        assert!(result.contains("[project_notes]"), "{result}");
+        assert!(!result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_tool_falls_back_to_keyword_search_when_index_search_fails() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = index.lock().expect("lock");
+            panic!("poison embedding index");
+        }));
+        assert!(panic_result.is_err(), "expected poisoned index");
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("keyword fallback after semantic failure");
+
+        assert!(result.contains("Found 1 relevant memories:"), "{result}");
+        assert!(result.contains("[project_notes]"), "{result}");
+        assert!(!result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_touches_returned_keys() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory) = memory_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard.write("alpha", "general notes").expect("write alpha");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+
+        // Search for "project auth" — should match project_notes and touch it.
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("memory search");
+        assert!(
+            result.contains("project_notes"),
+            "search should find project_notes: {result}"
+        );
+        assert!(
+            !result.contains("[alpha]"),
+            "search should NOT match alpha: {result}"
+        );
+    }
+
+    #[test]
+    fn memory_search_respects_max_results_parameter() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        let entries = [
+            ("alpha", "hello world"),
+            ("beta", "hello world"),
+            ("gamma", "hello world"),
+        ];
+        {
+            let mut guard = memory.lock().expect("lock");
+            for (key, value) in entries {
+                guard.write(key, value).expect("write entry");
+            }
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            for (key, value) in entries {
+                guard.upsert(key, value).expect("index entry");
+            }
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({
+                "query": "hello world",
+                "max_results": 2
+            }))
+            .expect("memory search");
+
+        assert!(result.contains("Found 2 relevant memories:"), "{result}");
+        assert!(!result.contains("3. ["), "{result}");
+    }
+
+    #[test]
+    fn memory_search_uses_default_max_results_of_five() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        let entries = [
+            ("alpha", "hello world"),
+            ("beta", "hello world"),
+            ("gamma", "hello world"),
+            ("delta", "hello world"),
+            ("epsilon", "hello world"),
+            ("zeta", "hello world"),
+        ];
+        {
+            let mut guard = memory.lock().expect("lock");
+            for (key, value) in entries {
+                guard.write(key, value).expect("write entry");
+            }
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            for (key, value) in entries {
+                guard.upsert(key, value).expect("index entry");
+            }
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "hello world"}))
+            .expect("memory search");
+
+        assert!(result.contains("Found 5 relevant memories:"), "{result}");
+        assert!(!result.contains("6. ["), "{result}");
+    }
+
+    #[test]
+    fn memory_write_updates_embedding_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, _memory, index) = embedding_executor(temp.path());
+
+        executor
+            .handle_memory_write(&serde_json::json!({
+                "key": "hello_memory",
+                "value": "hello world"
+            }))
+            .expect("memory write");
+
+        let results = index
+            .lock()
+            .expect("lock")
+            .search("hello world", 5)
+            .expect("search index");
+        assert!(results.iter().any(|(key, _)| key == "hello_memory"));
+    }
+
+    #[test]
+    fn memory_delete_removes_from_embedding_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut memory_guard = memory.lock().expect("lock memory");
+            memory_guard
+                .write("hello_memory", "hello world")
+                .expect("write");
+        }
+        {
+            let mut index_guard = index.lock().expect("lock index");
+            index_guard
+                .upsert("hello_memory", "hello world")
+                .expect("index entry");
+        }
+
+        executor
+            .handle_memory_delete(&serde_json::json!({"key": "hello_memory"}))
+            .expect("memory delete");
+
+        let results = index
+            .lock()
+            .expect("lock")
+            .search("hello world", 5)
+            .expect("search index");
+        assert!(results.iter().all(|(key, _)| key != "hello_memory"));
     }
 
     #[test]
@@ -3749,13 +4555,13 @@ three
         let temp = TempDir::new().expect("temp");
         let config = SelfModifyConfig {
             enabled: true,
-            deny_paths: vec!["*.key".to_string()],
+            deny_paths: vec!["*.txt".to_string()],
             ..SelfModifyConfig::default()
         };
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_self_modify(config);
         let result = executor
-            .handle_write_file(&serde_json::json!({"path": "secret.key", "content": "data"}));
+            .handle_write_file(&serde_json::json!({"path": "secret.txt", "content": "data"}));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -4217,7 +5023,23 @@ three
         let err = exec
             .handle_config_get(&serde_json::json!({"section": "nonexistent"}))
             .expect_err("should fail");
-        assert!(err.contains("unknown config section"));
+        assert!(err.contains("unknown config key or section"));
+    }
+
+    #[test]
+    fn config_get_returns_nested_key() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"my-model\"\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        let result = exec
+            .handle_config_get(&serde_json::json!({"section": "model.default_model"}))
+            .expect("config_get key");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert_eq!(json, "my-model");
     }
 
     // ── config_set tests ────────────────────────────────────────────────

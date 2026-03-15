@@ -70,41 +70,63 @@ struct HealthResponse {
     status: String,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WireEvent {
-    TextDelta {
-        content: String,
-    },
-    ToolUse {
-        name: String,
-        #[serde(default)]
-        arguments: Value,
-    },
-    ToolResult {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default = "default_tool_success")]
-        success: bool,
-        content: String,
-    },
-    Done {
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        iterations: Option<u32>,
-        #[serde(default)]
-        input_tokens: Option<u64>,
-        #[serde(default)]
-        output_tokens: Option<u64>,
-    },
-    Error {
-        error: String,
-    },
+/// SSE event parsed from `event:` + `data:` lines.
+///
+/// Field names match the engine's `serialize_stream_event` output in
+/// `http_serve.rs`.  The `event_type` is set by `parse_sse_frame` from the
+/// `event:` line; per-event data structs are deserialized separately.
+struct SseFrame {
+    event_type: String,
+    data: String,
 }
 
-const fn default_tool_success() -> bool {
-    true
+/// Data payload for `text_delta` events.
+#[derive(Deserialize)]
+struct TextDeltaData {
+    text: String,
+}
+
+/// Data payload for `tool_call_start` events.
+#[derive(Deserialize)]
+struct ToolCallStartData {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Data payload for `tool_call_complete` events.
+#[derive(Deserialize)]
+struct ToolCallCompleteData {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// Data payload for `tool_result` events.
+#[derive(Deserialize)]
+struct ToolResultData {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Data payload for `done` events.
+#[derive(Deserialize)]
+struct DoneData {
+    /// The final response text. For streamed LLM responses this may
+    /// duplicate the accumulated deltas; for slash commands this is
+    /// the only source of the response text.
+    #[serde(default)]
+    response: Option<String>,
+}
+
+/// Data payload for `error` events.
+#[derive(Deserialize)]
+struct ErrorData {
+    error: String,
 }
 
 fn friendly_http_status_message(status: reqwest::StatusCode, body: &str) -> String {
@@ -151,7 +173,8 @@ fn drain_complete_sse_frames(pending: &mut String) -> Vec<String> {
     frames
 }
 
-fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
+fn parse_sse_frame(frame: &str) -> anyhow::Result<Option<SseFrame>> {
+    let mut event_type = String::from("message");
     let mut saw_data = false;
     let mut saw_invalid_content = false;
     let payload = frame
@@ -162,9 +185,12 @@ fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
                 saw_data = true;
                 return Some(data.trim_start());
             }
+            if let Some(evt) = line.strip_prefix("event:") {
+                event_type = evt.trim().to_string();
+                return None;
+            }
             if line.is_empty()
                 || line.starts_with(':')
-                || line.starts_with("event:")
                 || line.starts_with("id:")
                 || line.starts_with("retry:")
             {
@@ -180,7 +206,10 @@ fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(None);
         }
-        return Ok(Some(payload));
+        return Ok(Some(SseFrame {
+            event_type,
+            data: payload,
+        }));
     }
 
     if saw_invalid_content {
@@ -377,6 +406,7 @@ impl HttpBackend {
             .auth_request(
                 self.client
                     .post(format!("{}/message", self.base_url))
+                    .header(reqwest::header::ACCEPT, "text/event-stream")
                     .json(&MessageRequest { message }),
             )
             .send()
@@ -428,18 +458,19 @@ impl HttpBackend {
         tx: UnboundedSender<BackendEvent>,
     ) -> anyhow::Result<()> {
         let mut pending = String::new();
+        let mut saw_text_delta = false;
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read SSE chunk")?;
             let chunk = String::from_utf8_lossy(&chunk);
             for frame in push_sse_chunk(&mut pending, &chunk) {
-                handle_sse_frame(&frame, &tx)?;
+                dispatch_sse_frame(&frame, &tx, &mut saw_text_delta)?;
             }
         }
 
         if !pending.trim().is_empty() {
-            handle_sse_frame(&pending, &tx)?;
+            dispatch_sse_frame(&pending, &tx, &mut saw_text_delta)?;
         }
         Ok(())
     }
@@ -472,54 +503,107 @@ pub(crate) fn try_send(tx: &UnboundedSender<BackendEvent>, event: BackendEvent) 
     true
 }
 
-fn handle_sse_frame(frame: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
-    let Some(payload) = parse_sse_payload(frame)? else {
+fn handle_text_delta(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: TextDeltaData = serde_json::from_str(data).context("decode text_delta")?;
+    try_send(tx, BackendEvent::TextDelta(d.text));
+    Ok(())
+}
+
+fn handle_tool_call_start(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolCallStartData = serde_json::from_str(data).context("decode tool_call_start")?;
+    try_send(
+        tx,
+        BackendEvent::ToolUse {
+            name: d.name.unwrap_or_default(),
+            arguments: Value::Null,
+        },
+    );
+    Ok(())
+}
+
+fn handle_tool_call_complete(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolCallCompleteData =
+        serde_json::from_str(data).context("decode tool_call_complete")?;
+    try_send(
+        tx,
+        BackendEvent::ToolUse {
+            name: d.name.unwrap_or_default(),
+            arguments: d.arguments,
+        },
+    );
+    Ok(())
+}
+
+fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolResultData = serde_json::from_str(data).context("decode tool_result")?;
+    try_send(
+        tx,
+        BackendEvent::ToolResult {
+            name: d.id,
+            success: !d.is_error,
+            content: d.output.unwrap_or_default(),
+        },
+    );
+    Ok(())
+}
+
+fn handle_done(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+    saw_text_delta: bool,
+) -> anyhow::Result<()> {
+    let d: DoneData = serde_json::from_str(data).context("decode done")?;
+    // Slash commands send their response only in the done event
+    // (no text_delta events preceded it). For streamed LLM responses
+    // the text already arrived via text_delta, so emitting
+    // done.response again would duplicate the output.
+    if !saw_text_delta {
+        if let Some(response) = d.response.filter(|r| !r.is_empty()) {
+            try_send(tx, BackendEvent::TextDelta(response));
+        }
+    }
+    try_send(
+        tx,
+        BackendEvent::Done {
+            model: None,
+            iterations: None,
+            input_tokens: None,
+            output_tokens: None,
+        },
+    );
+    Ok(())
+}
+
+fn handle_error(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ErrorData = serde_json::from_str(data).context("decode error")?;
+    try_send(
+        tx,
+        BackendEvent::StreamError(friendly_error_message(&d.error)),
+    );
+    Ok(())
+}
+
+fn dispatch_sse_frame(
+    frame: &str,
+    tx: &UnboundedSender<BackendEvent>,
+    saw_text_delta: &mut bool,
+) -> anyhow::Result<()> {
+    let Some(sse) = parse_sse_frame(frame)? else {
         return Ok(());
     };
 
-    match serde_json::from_str::<WireEvent>(&payload).context("decode SSE frame")? {
-        WireEvent::TextDelta { content } => {
-            try_send(tx, BackendEvent::TextDelta(content));
+    match sse.event_type.as_str() {
+        "text_delta" => {
+            *saw_text_delta = true;
+            handle_text_delta(&sse.data, tx)?;
         }
-        WireEvent::ToolUse { name, arguments } => {
-            try_send(tx, BackendEvent::ToolUse { name, arguments });
-        }
-        WireEvent::ToolResult {
-            name,
-            success,
-            content,
-        } => {
-            try_send(
-                tx,
-                BackendEvent::ToolResult {
-                    name,
-                    success,
-                    content,
-                },
-            );
-        }
-        WireEvent::Done {
-            model,
-            iterations,
-            input_tokens,
-            output_tokens,
-        } => {
-            try_send(
-                tx,
-                BackendEvent::Done {
-                    model,
-                    iterations,
-                    input_tokens,
-                    output_tokens,
-                },
-            );
-        }
-        WireEvent::Error { error } => {
-            try_send(
-                tx,
-                BackendEvent::StreamError(friendly_error_message(&error)),
-            );
-        }
+        "tool_call_start" => handle_tool_call_start(&sse.data, tx)?,
+        "tool_call_complete" => handle_tool_call_complete(&sse.data, tx)?,
+        "tool_result" => handle_tool_result(&sse.data, tx)?,
+        "done" => handle_done(&sse.data, tx, *saw_text_delta)?,
+        "phase" => { /* Phase changes are informational; TUI doesn't need them yet. */ }
+        "error" => handle_error(&sse.data, tx)?,
+        other => tracing::debug!("ignoring unknown SSE event type: {other}"),
     }
 
     Ok(())
@@ -639,21 +723,20 @@ model = "gpt-4"
     fn reassembles_sse_frames_across_multiple_chunks() {
         let mut pending = String::new();
         let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
 
-        assert!(push_sse_chunk(
-            &mut pending,
-            "data: {\"type\":\"text_delta\",\"content\":\"Hel"
-        )
-        .is_empty());
+        assert!(
+            push_sse_chunk(&mut pending, "event: text_delta\ndata: {\"text\":\"Hel").is_empty()
+        );
         let frames = push_sse_chunk(&mut pending, "lo\"}\n");
         assert!(frames.is_empty());
         let frames = push_sse_chunk(&mut pending, "\n");
         assert_eq!(
             frames,
-            vec!["data: {\"type\":\"text_delta\",\"content\":\"Hello\"}"]
+            vec!["event: text_delta\ndata: {\"text\":\"Hello\"}"]
         );
 
-        handle_sse_frame(&frames[0], &tx).expect("frame should decode");
+        dispatch_sse_frame(&frames[0], &tx, &mut saw).expect("frame should decode");
         match rx.try_recv().expect("event should be sent") {
             BackendEvent::TextDelta(content) => assert_eq!(content, "Hello"),
             other => panic!("unexpected event: {other:?}"),
@@ -665,19 +748,19 @@ model = "gpt-4"
         let mut pending = String::new();
         let frames = push_sse_chunk(
             &mut pending,
-            "data: {\"type\":\"text_delta\",\"content\":\"A\"}\r\n",
+            "event: text_delta\r\ndata: {\"text\":\"A\"}\r\n",
         );
         assert!(frames.is_empty());
 
         let frames = push_sse_chunk(
             &mut pending,
-            "\r\ndata: {\"type\":\"text_delta\",\"content\":\"B\"}\r\n\r\n",
+            "\r\nevent: text_delta\r\ndata: {\"text\":\"B\"}\r\n\r\n",
         );
         assert_eq!(
             frames,
             vec![
-                "data: {\"type\":\"text_delta\",\"content\":\"A\"}",
-                "data: {\"type\":\"text_delta\",\"content\":\"B\"}",
+                "event: text_delta\ndata: {\"text\":\"A\"}",
+                "event: text_delta\ndata: {\"text\":\"B\"}",
             ]
         );
         assert!(pending.is_empty());
@@ -686,30 +769,207 @@ model = "gpt-4"
     #[test]
     fn done_frame_is_ignored() {
         let (tx, mut rx) = unbounded_channel();
-        handle_sse_frame("data: [DONE]", &tx).expect("done frame should be ignored");
+        let mut saw = false;
+        dispatch_sse_frame("data: [DONE]", &tx, &mut saw).expect("done frame should be ignored");
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn invalid_json_frame_returns_error() {
         let (tx, _rx) = unbounded_channel();
-        let error =
-            handle_sse_frame("data: {not valid json}", &tx).expect_err("invalid JSON must fail");
-        assert!(error.to_string().contains("decode SSE frame"));
+        let mut saw = false;
+        let error = dispatch_sse_frame("event: text_delta\ndata: {not valid json}", &tx, &mut saw)
+            .expect_err("invalid JSON must fail");
+        assert!(error.to_string().contains("decode text_delta"));
     }
 
     #[test]
     fn frame_without_data_prefix_returns_error() {
         let (tx, _rx) = unbounded_channel();
-        let error = handle_sse_frame("payload: nope", &tx).expect_err("malformed frame must fail");
+        let mut saw = false;
+        let error = dispatch_sse_frame("payload: nope", &tx, &mut saw)
+            .expect_err("malformed frame must fail");
         assert!(error.to_string().contains("missing SSE data prefix"));
     }
 
     #[test]
     fn keepalive_comment_frame_is_ignored() {
         let (tx, mut rx) = unbounded_channel();
-        handle_sse_frame(": keep-alive", &tx).expect("comment frame should be ignored");
+        let mut saw = false;
+        dispatch_sse_frame(": keep-alive", &tx, &mut saw).expect("comment frame should be ignored");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_tool_call_start_produces_tool_use_event() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: tool_call_start\ndata: {\"id\":\"c1\",\"name\":\"read_file\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolUse { name, .. } => assert_eq!(name, "read_file"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_call_complete_produces_tool_use_with_arguments() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: tool_call_complete\ndata: {\"id\":\"c1\",\"name\":\"read_file\",\"arguments\":{\"path\":\"foo.txt\"}}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolUse { name, arguments } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "foo.txt");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_result_maps_fields_correctly() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: tool_result\ndata: {\"id\":\"c1\",\"output\":\"file contents\",\"is_error\":false}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolResult {
+                name,
+                success,
+                content,
+            } => {
+                assert_eq!(name.as_deref(), Some("c1"));
+                assert!(success);
+                assert_eq!(content, "file contents");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_result_error_maps_is_error_to_success_false() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: tool_result\ndata: {\"id\":\"c1\",\"output\":\"not found\",\"is_error\":true}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolResult { success, .. } => assert!(!success),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_done_emits_response_as_text_delta_then_done() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: done\ndata: {\"response\":\"hello world\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        // Response text emitted as TextDelta first (for slash commands)
+        match rx.try_recv().expect("text delta event") {
+            BackendEvent::TextDelta(text) => assert_eq!(text, "hello world"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Then Done signal
+        match rx.try_recv().expect("done event") {
+            BackendEvent::Done { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_done_without_response_skips_text_delta() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame("event: done\ndata: {}", &tx, &mut saw).expect("should decode");
+        match rx.try_recv().expect("done event") {
+            BackendEvent::Done { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        // No extra TextDelta
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_done_skips_response_when_text_already_streamed() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = true; // simulate text_delta events already received
+        dispatch_sse_frame(
+            "event: done\ndata: {\"response\":\"hello world\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        // Only Done, no TextDelta (response already streamed via text_delta)
+        match rx.try_recv().expect("done event") {
+            BackendEvent::Done { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_phase_is_silent() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame("event: phase\ndata: {\"phase\":\"reason\"}", &tx, &mut saw)
+            .expect("should decode");
+        assert!(
+            rx.try_recv().is_err(),
+            "phase events should not produce backend events"
+        );
+    }
+
+    #[test]
+    fn dispatch_error_produces_stream_error() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: error\ndata: {\"error\":\"rate limited\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::StreamError(msg) => assert!(msg.contains("rate limited")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_event_type_is_silent() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: future_event\ndata: {\"foo\":\"bar\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should not error on unknown events");
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown events should be silently ignored"
+        );
     }
 
     #[test]

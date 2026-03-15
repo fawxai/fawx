@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub use fx_core::types::ImageAttachment;
+
 /// Token budget for "high" thinking mode.
 pub const THINKING_BUDGET_HIGH: u32 = 10_000;
 /// Token budget for "adaptive" thinking mode.
@@ -81,6 +83,25 @@ impl Message {
         }
     }
 
+    /// Create a user message with text and optional images.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        let mut content: Vec<ContentBlock> = images
+            .into_iter()
+            .map(|image| ContentBlock::Image {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
+        let text = text.into();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        Self {
+            role: MessageRole::User,
+            content,
+        }
+    }
+
     /// Create an assistant text message.
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
@@ -136,6 +157,13 @@ pub enum ContentBlock {
         tool_use_id: String,
         /// Tool output content.
         content: Value,
+    },
+    /// Base64-encoded image content block for vision-capable models.
+    Image {
+        /// MIME type (e.g., "image/jpeg", "image/png").
+        media_type: String,
+        /// Base64-encoded image data (no data URI prefix).
+        data: String,
     },
 }
 
@@ -271,6 +299,65 @@ mod tests {
         assert_eq!(user.content.len(), 1);
         assert_eq!(assistant.content.len(), 1);
         assert_eq!(system.content.len(), 1);
+    }
+
+    #[test]
+    fn user_with_images_creates_correct_blocks() {
+        let message = Message::user_with_images(
+            "describe this",
+            vec![ImageAttachment {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content.len(), 2);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }
+        );
+        assert_eq!(
+            message.content[1],
+            ContentBlock::Text {
+                text: "describe this".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_with_images_empty_text_omits_text_block() {
+        let message = Message::user_with_images(
+            "",
+            vec![ImageAttachment {
+                media_type: "image/jpeg".to_string(),
+                data: "xyz789".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content.len(), 1);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Image {
+                media_type: "image/jpeg".to_string(),
+                data: "xyz789".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn image_content_block_serde_round_trip() {
+        let block = ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, deserialized);
     }
 
     #[test]

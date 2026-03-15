@@ -3,15 +3,22 @@
 mod auth_store;
 mod commands;
 mod config_bridge;
+mod config_redaction;
 mod confirmation;
+mod context;
 mod headless;
 pub(crate) mod helpers;
 #[cfg(feature = "http")]
 mod http_serve;
 #[cfg(test)]
 mod markdown;
+mod persisted_memory;
 mod prompts;
 mod proposal_review;
+#[allow(dead_code)]
+mod repo_root;
+#[allow(dead_code)]
+mod restart;
 #[allow(dead_code)]
 // TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
 mod startup;
@@ -73,8 +80,38 @@ enum Commands {
         port: u16,
     },
 
+    /// Restart the running agent daemon
+    Restart(restart::RestartArgs),
+
+    /// Pull latest code, rebuild, and restart
+    Update(commands::update::UpdateArgs),
+
     /// Run system diagnostics
     Doctor,
+
+    /// Show runtime status for a running Fawx instance
+    Status,
+
+    /// Generate a device pairing code for the local HTTP server
+    Pair(commands::pair::PairArgs),
+
+    /// List or revoke paired devices
+    Devices(commands::devices::DevicesArgs),
+
+    /// Show CLI build information
+    Version,
+
+    /// Inspect persistent log files
+    Logs(commands::logs::LogsArgs),
+
+    /// Run Fawx-specific security checks
+    SecurityAudit(commands::security_audit::SecurityAuditArgs),
+
+    /// Create a compressed backup of ~/.fawx
+    Backup(commands::backup::BackupArgs),
+
+    /// Import memory and context from another workspace
+    Import(commands::import::ImportArgs),
 
     /// Interactive first-run setup wizard
     Setup {
@@ -89,8 +126,21 @@ enum Commands {
         command: commands::auth::AuthCommands,
     },
 
-    /// Show current configuration
-    Config,
+    /// Show or update configuration
+    Config {
+        #[command(subcommand)]
+        command: Option<commands::config::ConfigCommands>,
+    },
+
+    /// Reset managed Fawx runtime state while preserving credentials
+    Reset(commands::reset::ResetArgs),
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate for (bash, zsh, fish)
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 
     /// Manage audit logs
     Audit {
@@ -173,6 +223,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         fail_on_regression: bool,
     },
+
+    /// Run proof-of-fitness experiments
+    Experiment {
+        #[command(subcommand)]
+        command: commands::experiment::ExperimentCommands,
+    },
+
+    /// Manage the distributed fleet
+    Fleet {
+        #[command(subcommand)]
+        command: commands::fleet::FleetCommands,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -233,9 +295,18 @@ enum SkillCommands {
     },
 
     /// Scaffold a new skill project
-    New {
+    Create {
         /// Name for the new skill
         name: String,
+        /// Comma-separated capabilities to pre-fill in the manifest
+        #[arg(long)]
+        capabilities: Option<String>,
+        /// Primary tool name in the manifest
+        #[arg(long)]
+        tool_name: Option<String>,
+        /// Directory to create the project in
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -259,11 +330,13 @@ fn build_subagent_manager(
     router: Arc<fx_llm::ModelRouter>,
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    session_bus: Option<fx_bus::SessionBus>,
 ) -> Arc<fx_subagent::SubagentManager> {
     let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
         router,
         config: config.clone(),
         improvement_provider,
+        session_bus,
     });
     Arc::new(fx_subagent::SubagentManager::new(
         fx_subagent::SubagentManagerDeps {
@@ -276,6 +349,7 @@ fn build_subagent_manager(
 fn parent_loop_build_options(
     subagent_manager: &Arc<fx_subagent::SubagentManager>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+    session_bus: Option<fx_bus::SessionBus>,
 ) -> startup::HeadlessLoopBuildOptions {
     startup::HeadlessLoopBuildOptions {
         memory_enabled: true,
@@ -283,6 +357,7 @@ fn parent_loop_build_options(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
         config_manager,
+        session_bus,
         ..startup::HeadlessLoopBuildOptions::default()
     }
 }
@@ -293,6 +368,14 @@ fn launch_fawx_tui(args: &[String]) -> anyhow::Result<i32> {
         .args(args)
         .status()?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn launch_embedded_tui() -> anyhow::Result<i32> {
+    launch_fawx_tui(&embedded_tui_args())
+}
+
+fn embedded_tui_args() -> Vec<String> {
+    vec!["--embedded".to_string()]
 }
 
 fn find_fawx_tui_binary() -> anyhow::Result<PathBuf> {
@@ -353,11 +436,14 @@ struct HeadlessStartup {
 
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
+    skip_session_db: bool,
 ) -> anyhow::Result<HeadlessStartup> {
     let config = startup::load_config()?;
     let logging_guard = headless::init_serve_logging(&config)?;
     let auth_manager = startup::load_auth_manager()?;
-    let router = Arc::new(startup::build_router(&auth_manager)?);
+    let mut router = startup::build_router(&auth_manager)?;
+    headless::seed_headless_router_active_model(&mut router, &config);
+    let router = Arc::new(router);
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
@@ -374,6 +460,7 @@ fn build_headless_startup(
         system_prompt,
         config_manager,
         data_dir.clone(),
+        skip_session_db,
     )?;
     Ok(HeadlessStartup {
         app,
@@ -396,24 +483,44 @@ fn build_headless_app(
     system_prompt: Option<std::path::PathBuf>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
     data_dir: PathBuf,
+    skip_session_db: bool,
 ) -> anyhow::Result<headless::HeadlessApp> {
-    let subagent_manager =
-        build_subagent_manager(Arc::clone(&router), &config, improvement_provider.clone());
-    let bundle = startup::build_headless_loop_engine_bundle(
+    let session_bus = startup::build_session_bus_for_data_dir(&data_dir);
+    let subagent_manager = build_subagent_manager(
+        Arc::clone(&router),
         &config,
-        improvement_provider,
-        parent_loop_build_options(&subagent_manager, config_manager.clone()),
-    )?;
+        improvement_provider.clone(),
+        session_bus.clone(),
+    );
+    let session_registry = (!skip_session_db)
+        .then(|| startup::open_session_registry(&data_dir))
+        .flatten();
+    let options = startup::HeadlessLoopBuildOptions {
+        session_registry,
+        ..parent_loop_build_options(
+            &subagent_manager,
+            config_manager.clone(),
+            session_bus.clone(),
+        )
+    };
+    let bundle =
+        startup::build_headless_loop_engine_bundle(&config, improvement_provider, options)?;
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
         router,
+        runtime_info: bundle.runtime_info,
         config,
         memory: bundle.memory,
+        embedding_index_persistence: bundle.embedding_index_persistence,
         system_prompt_path: system_prompt,
         config_manager,
         system_prompt_text: None,
         subagent_manager,
         canary_monitor: Some(build_canary_monitor(&data_dir)),
+        session_bus,
+        session_key: Some(headless::main_session_key()),
+        cron_store: bundle.cron_store,
+        startup_warnings: bundle.startup_warnings,
     })
 }
 
@@ -486,7 +593,7 @@ async fn run_headless(
         mut app,
         _logging_guard,
         ..
-    } = build_headless_startup(system_prompt)?;
+    } = build_headless_startup(system_prompt, false)?;
     if single {
         app.run_single(json).await
     } else {
@@ -506,7 +613,7 @@ async fn run_http_server(
         telegram_config,
         webhook_config,
         data_dir,
-    } = build_headless_startup(system_prompt)?;
+    } = build_headless_startup(system_prompt, true)?;
     app.initialize();
     app.apply_http_defaults();
 
@@ -688,12 +795,6 @@ async fn run_http_server(
     Ok(1)
 }
 
-fn run_stub(action: &str) -> i32 {
-    println!("{action} Fawx agent daemon...");
-    println!("(Implementation pending - Epic 9)");
-    0
-}
-
 async fn dispatch_audit(command: AuditCommands) -> anyhow::Result<i32> {
     match command {
         AuditCommands::Show { limit } => {
@@ -726,8 +827,18 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
             commands::skills::build(&path, no_sign, no_install)?;
             Ok(0)
         }
-        SkillCommands::New { name } => {
-            commands::skills::scaffold(&name)?;
+        SkillCommands::Create {
+            name,
+            capabilities,
+            tool_name,
+            path,
+        } => {
+            commands::skills::create(
+                &name,
+                capabilities.as_deref(),
+                tool_name.as_deref(),
+                path.as_deref(),
+            )?;
             Ok(0)
         }
     }
@@ -736,9 +847,9 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
         Commands::Tui { args } => launch_fawx_tui(&args),
-        Commands::Start => Ok(run_stub("Starting")),
-        Commands::Stop => Ok(run_stub("Stopping")),
-        Commands::Chat => Ok(commands::chat::run().await?),
+        Commands::Start => commands::start_stop::run_start(),
+        Commands::Stop => commands::start_stop::run_stop(),
+        Commands::Chat => launch_embedded_tui(),
         Commands::Serve {
             single,
             json,
@@ -746,19 +857,32 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             http,
             port,
         } => {
+            let _pid_guard = restart::create_serve_pid_file_guard()?;
             if http {
                 run_http_server(system_prompt, port).await
             } else {
                 run_headless(single, json, system_prompt).await
             }
         }
+        Commands::Restart(args) => restart::run(args),
+        Commands::Update(args) => commands::update::run(args),
         Commands::Doctor => Ok(commands::doctor::run().await?),
+        Commands::Status => Ok(commands::status::run().await?),
+        Commands::Pair(args) => Ok(commands::pair::run(&args).await?),
+        Commands::Devices(args) => Ok(commands::devices::run(&args).await?),
+        Commands::Version => Ok(commands::version::run()),
+        Commands::Logs(args) => commands::logs::run(&args),
+        Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
+        Commands::Backup(args) => commands::backup::run(&args),
+        Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
-        Commands::Config => {
-            commands::config::run().await?;
+        Commands::Config { command } => {
+            commands::config::run(command).await?;
             Ok(0)
         }
+        Commands::Reset(args) => commands::reset::run(&args),
+        Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
         Commands::Search { query } => {
@@ -798,6 +922,15 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             update_baseline,
             fail_on_regression,
         } => dispatch_eval(mode, output, baseline, update_baseline, fail_on_regression),
+        Commands::Experiment { command } => {
+            let result = commands::experiment::run(command).await?;
+            println!("{result}");
+            Ok(0)
+        }
+        Commands::Fleet { command } => {
+            commands::fleet::handle_fleet_command(&command).await?;
+            Ok(0)
+        }
     }
 }
 
@@ -869,13 +1002,21 @@ mod tests {
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
         dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SkillCommands,
+        FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
+    use crate::restart;
     use clap::Parser;
+    use clap_complete::Shell;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{fs, path::Path};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::Path,
+        sync::{Mutex, OnceLock},
+    };
 
     fn test_auth_store() -> AuthStore {
         AuthStore::open_for_testing().expect("test auth store")
@@ -965,12 +1106,210 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_pair_command() {
+        let cli = Cli::parse_from(["fawx", "pair", "--ttl", "90", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pair(crate::commands::pair::PairArgs {
+                ttl: 90,
+                json: true
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_devices_revoke_command_with_json_flag_after_subcommand() {
+        let cli = Cli::parse_from(["fawx", "devices", "revoke", "dev-123", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Devices(crate::commands::devices::DevicesArgs {
+                json: true,
+                command: Some(crate::commands::devices::DevicesCommand::Revoke { device_id })
+            })) if device_id == "dev-123"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_skill_create_command() {
+        let cli = Cli::parse_from([
+            "fawx",
+            "skill",
+            "create",
+            "weather-skill",
+            "--capabilities",
+            "network,storage",
+            "--tool-name",
+            "weather_tool",
+            "--path",
+            "/tmp/skills",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Create {
+                    name,
+                    capabilities,
+                    tool_name,
+                    path,
+                }
+            }) if name == "weather-skill"
+                && capabilities.as_deref() == Some("network,storage")
+                && tool_name.as_deref() == Some("weather_tool")
+                && path.as_deref() == Some("/tmp/skills")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_completions_command() {
+        let cli = Cli::parse_from(["fawx", "completions", "bash"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Completions { shell: Shell::Bash })
+        ));
+    }
+
+    #[test]
+    fn cli_parses_bare_config_command() {
+        let cli = Cli::parse_from(["fawx", "config"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config { command: None })
+        ));
+    }
+
+    #[test]
+    fn cli_parses_config_get_command() {
+        let cli = Cli::parse_from(["fawx", "config", "get", "model.default_model"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config {
+                command: Some(crate::commands::config::ConfigCommands::Get { key })
+            }) if key == "model.default_model"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_reset_command() {
+        let cli = Cli::parse_from(["fawx", "reset", "--memory", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Reset(crate::commands::reset::ResetArgs {
+                memory: true,
+                conversations: false,
+                config: false,
+                all: false,
+                force: true,
+            }))
+        ));
+    }
+
+    #[test]
     fn cli_parses_tui_passthrough_args() {
         let cli = Cli::parse_from(["fawx", "tui", "--host", "http://127.0.0.1:8400"]);
         assert!(matches!(
             cli.command,
             Some(Commands::Tui { args }) if args == vec!["--host", "http://127.0.0.1:8400"]
         ));
+    }
+
+    #[test]
+    fn cli_parses_restart_rebuild_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--rebuild"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: true,
+                hard: false,
+                no_skills: false,
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_restart_rebuild_no_skills_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--rebuild", "--no-skills"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: true,
+                hard: false,
+                no_skills: true,
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_restart_hard_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--hard"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: false,
+                hard: true,
+                no_skills: false,
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_update_command() {
+        let cli = Cli::parse_from(["fawx", "update", "dev", "--no-skills", "--no-restart"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Update(crate::commands::update::UpdateArgs {
+                branch,
+                no_pull: false,
+                no_skills: true,
+                no_restart: true,
+                force: false,
+            })) if branch.as_deref() == Some("dev")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_logs_command() {
+        let cli = Cli::parse_from(["fawx", "logs", "--lines", "100"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs(crate::commands::logs::LogsArgs {
+                lines: 100,
+                list: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_security_audit_flag() {
+        let cli = Cli::parse_from(["fawx", "security-audit", "--update-baseline"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::SecurityAudit(
+                crate::commands::security_audit::SecurityAuditArgs {
+                    update_baseline: true
+                }
+            ))
+        ));
+    }
+
+    fn assert_completion_output(shell: Shell) {
+        let output = crate::commands::completions::render(shell).expect("generate completions");
+        assert!(!output.trim().is_empty());
+        assert!(output.contains("fawx"));
+    }
+
+    #[test]
+    fn bash_completions_are_generated() {
+        assert_completion_output(Shell::Bash);
+    }
+
+    #[test]
+    fn zsh_completions_are_generated() {
+        assert_completion_output(Shell::Zsh);
+    }
+
+    #[test]
+    fn fish_completions_are_generated() {
+        assert_completion_output(Shell::Fish);
     }
 
     #[test]
@@ -1046,6 +1385,67 @@ exit 0
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("set permissions");
         }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct PathGuard {
+        previous: Option<OsString>,
+    }
+
+    impl PathGuard {
+        fn set(path: &Path) -> (std::sync::MutexGuard<'static, ()>, Self) {
+            let guard = env_lock().lock().expect("PATH env lock");
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", path);
+            (guard, Self { previous })
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("PATH", previous),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_argument_recording_executable(path: &Path, args_log: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "{}"
+exit 0
+"#,
+            args_log.display()
+        );
+        fs::write(path, script).expect("write executable");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("set permissions");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // PathGuard must live across async dispatch in test
+    async fn chat_command_launches_tui_in_embedded_mode() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path_dir = tempdir.path().join("path");
+        let args_log = tempdir.path().join("chat-args.log");
+        let tui = path_dir.join(fawx_tui_binary_name());
+        write_argument_recording_executable(&tui, &args_log);
+        let (_guard, _path_guard) = PathGuard::set(&path_dir);
+
+        let exit_code = dispatch_command(Commands::Chat).await.expect("dispatch");
+        let args = fs::read_to_string(&args_log).expect("read args log");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(args.lines().collect::<Vec<_>>(), vec!["--embedded"]);
     }
 
     #[tokio::test]

@@ -13,6 +13,10 @@ pub enum ImprovementError {
     #[error("planning error: {0}")]
     Planning(String),
 
+    /// The planner model failed to call the required plan-generation tool.
+    #[error("planning error: model did not call generate_fix_plan tool")]
+    MissingPlanToolCall,
+
     /// Error writing a proposal to disk.
     #[error("proposal error: {0}")]
     Proposal(#[from] fx_propose::ProposalError),

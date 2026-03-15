@@ -21,6 +21,23 @@ pub enum PathTier {
 /// Default deny patterns shared between core and CLI configs.
 pub const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
 
+/// Paths that always require proposal+approval, regardless of `self_modify.enabled`.
+/// These are security-sensitive data files that the agent should never modify freely.
+///
+/// `*.key` and `*.pem` intentionally overlap with `DEFAULT_DENY_PATHS`: when
+/// self-modify is enabled, always-propose wins so those files become human-gated
+/// proposals instead of unconditional denies. That softer gate is intentional.
+const ALWAYS_PROPOSE_PATTERNS: &[&str] = &[
+    "config.toml",
+    "credentials.db",
+    "auth.db",
+    "*.key",
+    "*.pem",
+    ".auth-salt",
+    ".credentials-salt",
+    ".bearer-token-ref",
+];
+
 /// Default proposals directory: `$HOME/.fawx/proposals`.
 ///
 /// Falls back to `.fawx/proposals` (relative) when `HOME` is unset.
@@ -64,22 +81,26 @@ impl Default for SelfModifyConfig {
 /// made relative to `base_dir` before matching against glob patterns so
 /// that absolute paths match patterns written as relative (e.g. `.git/**`).
 ///
-/// When the policy is disabled (`!config.enabled`), every path is
+/// When the policy is disabled (`!config.enabled`), security-sensitive
+/// paths still require proposals while everything else remains
 /// [`PathTier::Allow`] for backward compatibility.
 ///
 /// Precedence: deny wins over propose/allow; propose wins over allow;
 /// unknown paths default to [`PathTier::Deny`].
 #[must_use]
 pub fn classify_path(path: &Path, base_dir: &Path, config: &SelfModifyConfig) -> PathTier {
-    if !config.enabled {
-        return PathTier::Allow;
-    }
     let normalized = normalize_for_classification(path, base_dir);
     let filename = normalized
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
 
+    if matches_always_propose(&normalized, filename) {
+        return PathTier::Propose;
+    }
+    if !config.enabled {
+        return PathTier::Allow;
+    }
     if matches_any(&normalized, filename, &config.deny_paths) {
         return PathTier::Deny;
     }
@@ -135,6 +156,14 @@ pub fn validate_glob_patterns(config: &SelfModifyConfig) -> Result<(), String> {
 fn matches_any(path: &Path, filename: &str, patterns: &[String]) -> bool {
     let path_str = path.to_string_lossy();
     patterns.iter().any(|pattern| {
+        matches_literal_suffix(path, filename, pattern)
+            || matches_glob(&path_str, filename, pattern)
+    })
+}
+
+fn matches_always_propose(path: &Path, filename: &str) -> bool {
+    let path_str = path.to_string_lossy();
+    ALWAYS_PROPOSE_PATTERNS.iter().any(|pattern| {
         matches_literal_suffix(path, filename, pattern)
             || matches_glob(&path_str, filename, pattern)
     })
@@ -246,6 +275,16 @@ mod tests {
         }
     }
 
+    fn assert_path_tier(path: &str, enabled: bool, expected: PathTier) {
+        let config = if enabled {
+            enabled_config()
+        } else {
+            SelfModifyConfig::default()
+        };
+        let tier = classify_path(Path::new(path), Path::new(""), &config);
+        assert_eq!(tier, expected);
+    }
+
     #[test]
     fn classify_allow_path() {
         let mut config = enabled_config();
@@ -257,7 +296,7 @@ mod tests {
     #[test]
     fn classify_deny_path() {
         let config = enabled_config();
-        let tier = classify_path(Path::new("secret.key"), Path::new(""), &config);
+        let tier = classify_path(Path::new("credentials.json"), Path::new(""), &config);
         assert_eq!(tier, PathTier::Deny);
     }
 
@@ -270,12 +309,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_deny_wins_over_allow() {
+    fn classify_always_propose_wins_over_allow_and_default_deny() {
         let mut config = enabled_config();
         config.allow_paths = vec!["*.key".to_string()];
-        // deny_paths already contains *.key via default
         let tier = classify_path(Path::new("server.key"), Path::new(""), &config);
-        assert_eq!(tier, PathTier::Deny);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_config_toml_proposes_even_when_explicitly_allowed() {
+        let mut config = enabled_config();
+        config.allow_paths = vec!["config.toml".to_string()];
+        let tier = classify_path(Path::new("config.toml"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
     }
 
     #[test]
@@ -286,10 +332,94 @@ mod tests {
     }
 
     #[test]
-    fn classify_disabled_returns_allow() {
+    fn classify_disabled_returns_allow_for_normal_files() {
         let config = SelfModifyConfig::default(); // enabled=false
-        let tier = classify_path(Path::new("secret.key"), Path::new(""), &config);
+        let tier = classify_path(Path::new("docs/readme.md"), Path::new(""), &config);
         assert_eq!(tier, PathTier::Allow);
+    }
+
+    #[test]
+    fn classify_disabled_config_toml_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let tier = classify_path(Path::new("config.toml"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_credentials_db_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let tier = classify_path(Path::new("credentials.db"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_auth_db_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let tier = classify_path(Path::new("auth.db"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_enabled_credentials_db_returns_propose() {
+        assert_path_tier("credentials.db", true, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_enabled_auth_db_returns_propose() {
+        assert_path_tier("auth.db", true, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_auth_salt_returns_propose() {
+        assert_path_tier(".auth-salt", false, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_enabled_auth_salt_returns_propose() {
+        assert_path_tier(".auth-salt", true, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_credentials_salt_returns_propose() {
+        assert_path_tier(".credentials-salt", false, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_enabled_credentials_salt_returns_propose() {
+        assert_path_tier(".credentials-salt", true, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_bearer_token_ref_returns_propose() {
+        assert_path_tier(".bearer-token-ref", false, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_enabled_bearer_token_ref_returns_propose() {
+        assert_path_tier(".bearer-token-ref", true, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_key_file_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let tier = classify_path(Path::new("keys/server.key"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_pem_file_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let tier = classify_path(Path::new("certs/server.pem"), Path::new(""), &config);
+        assert_eq!(tier, PathTier::Propose);
+    }
+
+    #[test]
+    fn classify_disabled_absolute_fawx_config_returns_propose() {
+        let config = SelfModifyConfig::default();
+        let base = PathBuf::from("/home/test/.fawx");
+        let absolute = base.join("config.toml");
+        let tier = classify_path(&absolute, &base, &config);
+        assert_eq!(tier, PathTier::Propose);
     }
 
     #[test]
@@ -364,10 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_pem_file_denied() {
+    fn classify_pem_file_requires_proposal() {
         let config = enabled_config();
         let tier = classify_path(Path::new("certs/server.pem"), Path::new(""), &config);
-        assert_eq!(tier, PathTier::Deny);
+        assert_eq!(tier, PathTier::Propose);
     }
 
     #[test]

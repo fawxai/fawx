@@ -1,0 +1,67 @@
+name = "browser"
+version = "1.0.0"
+description = "Fetch web pages, extract content, and search the web"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
+
+[[tools]]
+name = "web_fetch"
+description = "Fetch a web page and extract its readable content as markdown or plain text"
+
+[[tools.parameters]]
+name = "url"
+type = "string"
+description = "URL to fetch"
+required = true
+
+[[tools.parameters]]
+name = "format"
+type = "string"
+description = "Output format: 'markdown' (default) or 'text'"
+required = false
+
+[[tools.parameters]]
+name = "max_length"
+type = "string"
+description = "Maximum content length in characters (default: '10000')"
+required = false
+
+[[tools]]
+name = "web_search"
+description = "Search the web using a search engine API and return results with titles, URLs, and snippets"
+
+[[tools.parameters]]
+name = "query"
+type = "string"
+description = "Search query"
+required = true
+
+[[tools.parameters]]
+name = "count"
+type = "string"
+description = "Number of results (default: '5', max: 10)"
+required = false
+
+[[tools]]
+name = "web_screenshot"
+description = "Take a screenshot of a web page (requires a screenshot service URL in config)"
+
+[[tools.parameters]]
+name = "url"
+type = "string"
+description = "URL to screenshot"
+required = true
+
+[[tools.parameters]]
+name = "width"
+type = "string"
+description = "Viewport width in pixels (default: '1280')"
+required = false
+
+[[tools.parameters]]
+name = "height"
+type = "string"
+description = "Viewport height in pixels (default: '720')"
+required = false

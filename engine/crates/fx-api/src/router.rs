@@ -1,0 +1,120 @@
+use crate::handlers::config::{handle_config_get, handle_config_set};
+use crate::handlers::devices::{handle_delete_device, handle_list_devices};
+use crate::handlers::errors::handle_recent_errors;
+use crate::handlers::fleet::fleet_router;
+use crate::handlers::health::{handle_health, handle_status};
+use crate::handlers::message::handle_message;
+use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
+use crate::handlers::sessions::{
+    handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
+    handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
+    handle_send_to_session,
+};
+use crate::handlers::settings::{
+    handle_get_thinking, handle_list_auth, handle_list_models, handle_list_skills,
+    handle_set_model, handle_set_thinking,
+};
+use crate::handlers::webhook::handle_webhook;
+use crate::middleware::auth_middleware;
+use crate::state::HttpState;
+use crate::telegram::webhook::handle_telegram_webhook;
+use axum::middleware;
+use axum::routing::{delete, get, post, put};
+use axum::Router;
+use fx_fleet::FleetManager;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+
+pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
+    let v1_router = Router::new()
+        .route(
+            "/sessions",
+            post(handle_create_session).get(handle_list_sessions),
+        )
+        .route(
+            "/sessions/{id}",
+            get(handle_get_session).delete(handle_delete_session),
+        )
+        .route("/sessions/{id}/clear", post(handle_clear_session))
+        .route(
+            "/sessions/{id}/messages",
+            get(handle_get_messages).post(handle_send_message),
+        )
+        .route("/sessions/{id}/send", post(handle_send_to_session))
+        .route("/sessions/{id}/context", get(handle_get_context))
+        .route("/models", get(handle_list_models))
+        .route("/model", put(handle_set_model))
+        .route(
+            "/thinking",
+            get(handle_get_thinking).put(handle_set_thinking),
+        )
+        .route("/skills", get(handle_list_skills))
+        .route("/auth", get(handle_list_auth))
+        .route("/devices", get(handle_list_devices))
+        .route("/errors/recent", get(handle_recent_errors))
+        .route("/devices/{id}", delete(handle_delete_device))
+        .route("/pair/generate", post(handle_generate_pair))
+        .route(
+            "/cron/jobs",
+            get(crate::handlers::cron::handle_list_jobs)
+                .post(crate::handlers::cron::handle_create_job),
+        )
+        .route(
+            "/cron/jobs/{id}",
+            get(crate::handlers::cron::handle_get_job)
+                .put(crate::handlers::cron::handle_update_job)
+                .delete(crate::handlers::cron::handle_delete_job),
+        )
+        .route(
+            "/cron/jobs/{id}/run",
+            post(crate::handlers::cron::handle_trigger_job),
+        )
+        .route(
+            "/cron/jobs/{id}/runs",
+            get(crate::handlers::cron::handle_list_runs),
+        );
+
+    let authenticated = Router::new()
+        .route("/message", post(handle_message))
+        .route("/status", get(handle_status))
+        .route("/config", get(handle_config_get).post(handle_config_set))
+        .route("/webhook/{channel_id}", post(handle_webhook))
+        .nest("/v1", v1_router)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let public = Router::new()
+        .route("/health", get(handle_health))
+        .route("/v1/pair", post(handle_exchange_pair))
+        .route("/telegram/webhook", post(handle_telegram_webhook));
+    let router = authenticated.merge(public).with_state(state);
+
+    merge_fleet_router(router, fleet_manager)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+}
+
+pub fn merge_fleet_router(
+    router: Router,
+    fleet_manager: Option<Arc<Mutex<FleetManager>>>,
+) -> Router {
+    match fleet_manager {
+        Some(manager) => router.merge(fleet_router(manager)),
+        None => router,
+    }
+}
+
+pub fn load_fleet_manager_if_initialized(
+    data_dir: &Path,
+) -> anyhow::Result<Option<Arc<Mutex<FleetManager>>>> {
+    let fleet_dir = data_dir.join("fleet");
+    if !fleet_dir.join("fleet.key").is_file() {
+        return Ok(None);
+    }
+    let manager = FleetManager::load(&fleet_dir)?;
+    Ok(Some(Arc::new(Mutex::new(manager))))
+}

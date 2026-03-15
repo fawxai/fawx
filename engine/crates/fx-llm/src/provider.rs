@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
 
+use crate::streaming::{emit_default_stream_response, StreamCallback};
 use crate::types::{CompletionRequest, CompletionResponse, LlmError, StreamChunk};
 
 /// Streaming response type for completion APIs.
@@ -30,11 +31,30 @@ pub trait LlmProvider: Send + Sync {
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError>;
 
+    /// Send a completion request and emit normalized stream events.
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, LlmError> {
+        let response = self.complete(request).await?;
+        emit_default_stream_response(&response, &callback);
+        Ok(response)
+    }
+
     /// Provider name for logging/routing.
     fn name(&self) -> &str;
 
     /// Models supported by this provider.
     fn supported_models(&self) -> Vec<String>;
+
+    /// Fetch available models dynamically from the provider API.
+    ///
+    /// Returns model IDs the current credential has access to. Providers
+    /// without a dynamic catalog override fall back to their static support list.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Ok(self.supported_models())
+    }
 
     /// Provider feature support contract.
     fn capabilities(&self) -> ProviderCapabilities;

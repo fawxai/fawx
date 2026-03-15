@@ -3,11 +3,16 @@ use crate::startup::fawx_data_dir;
 use anyhow::anyhow;
 use clap::Subcommand;
 use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::credential_store::EncryptedFileCredentialStore;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommands {
     /// Store an LLM provider token or Telegram bot token
     SetToken { provider: String, key: String },
+    /// Store a credential for WASM skills (e.g., brave_api_key, openai_tts_key)
+    SetCredential { name: String, value: String },
+    /// List stored skill credentials (names only, not values)
+    ListCredentials,
     /// Store the HTTP bearer token used by `fawx serve --http`
     SetBearer { token: String },
     /// Show configured auth providers
@@ -19,6 +24,15 @@ pub async fn run(command: AuthCommands) -> anyhow::Result<i32> {
         AuthCommands::SetToken { provider, key } => {
             eprintln!("{}", cli_argument_warning());
             set_token(&provider, &key)?;
+            Ok(0)
+        }
+        AuthCommands::SetCredential { name, value } => {
+            eprintln!("{}", cli_argument_warning());
+            set_credential(&name, &value)?;
+            Ok(0)
+        }
+        AuthCommands::ListCredentials => {
+            print_credentials()?;
             Ok(0)
         }
         AuthCommands::SetBearer { token } => {
@@ -64,6 +78,13 @@ fn set_token(provider: &str, key: &str) -> anyhow::Result<()> {
     }
 }
 
+pub(crate) fn set_credential(name: &str, value: &str) -> anyhow::Result<()> {
+    let store = open_skill_credential_store()?;
+    store
+        .set_generic(name, value)
+        .map_err(|error| anyhow!(error))
+}
+
 fn set_bearer(token: &str) -> anyhow::Result<()> {
     let data_dir = fawx_data_dir();
     let recovered = open_auth_store_with_recovery(&data_dir).map_err(|error| anyhow!(error))?;
@@ -80,18 +101,37 @@ fn print_status() -> anyhow::Result<()> {
         .store
         .load_auth_manager()
         .map_err(|error| anyhow!(error))?;
-    for line in status_lines(&manager, &recovered.store)? {
+    let skill_credentials = open_skill_credential_store()?
+        .list_generic_names()
+        .map_err(|error| anyhow!(error))?;
+    for line in status_lines(&manager, &recovered.store, &skill_credentials)? {
         println!("{line}");
     }
     Ok(())
 }
 
+fn print_credentials() -> anyhow::Result<()> {
+    let names = open_skill_credential_store()?
+        .list_generic_names()
+        .map_err(|error| anyhow!(error))?;
+    for line in credential_listing_lines(&names) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub(crate) fn open_skill_credential_store() -> anyhow::Result<EncryptedFileCredentialStore> {
+    EncryptedFileCredentialStore::open(&fawx_data_dir()).map_err(|error| anyhow!(error))
+}
+
 fn status_lines(
     manager: &AuthManager,
     store: &crate::auth_store::AuthStore,
+    skill_credentials: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut lines = manager_status_lines(manager);
     lines.extend(provider_token_status_lines(store)?);
+    lines.extend(skill_credential_status_lines(skill_credentials));
     Ok(lines)
 }
 
@@ -115,6 +155,27 @@ fn provider_token_status_lines(
         lines.push("telegram: configured".to_string());
     }
     Ok(lines)
+}
+
+fn skill_credential_status_lines(names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec!["Skill credentials:".to_string()];
+    lines.extend(names.iter().map(|name| format!("  ✓ {name}")));
+    lines
+}
+
+fn credential_listing_lines(names: &[String]) -> Vec<String> {
+    let mut lines = vec!["Skill credentials:".to_string()];
+    if names.is_empty() {
+        lines.push("  (none)".to_string());
+        return lines;
+    }
+
+    lines.extend(names.iter().map(|name| format!("  {name}")));
+    lines
 }
 
 fn provider_token_present(
@@ -215,6 +276,35 @@ mod tests {
     }
 
     #[test]
+    fn credential_listing_lines_show_names_only() {
+        let lines = credential_listing_lines(&[
+            "brave_api_key".to_string(),
+            "custom_webhook_token".to_string(),
+        ]);
+
+        assert_eq!(lines[0], "Skill credentials:");
+        assert!(lines.iter().any(|line| line == "  brave_api_key"));
+        assert!(lines.iter().any(|line| line == "  custom_webhook_token"));
+        assert!(!lines.iter().any(|line| line.contains("sk-test-secret")));
+    }
+
+    #[test]
+    fn status_lines_include_skill_credential_names() {
+        let store = crate::auth_store::AuthStore::open_for_testing().expect("test auth store");
+        let manager = AuthManager::new();
+        let lines = status_lines(
+            &manager,
+            &store,
+            &["brave_api_key".to_string(), "openai_tts_key".to_string()],
+        )
+        .expect("status lines");
+
+        assert!(lines.iter().any(|line| line == "Skill credentials:"));
+        assert!(lines.iter().any(|line| line == "  ✓ brave_api_key"));
+        assert!(lines.iter().any(|line| line == "  ✓ openai_tts_key"));
+    }
+
+    #[test]
     fn auth_cli_parses_set_token_command() {
         let cli = Cli::try_parse_from(["fawx", "auth", "set-token", "anthropic", "sk-test"])
             .expect("parse auth command");
@@ -224,6 +314,20 @@ mod tests {
             Some(Commands::Auth {
                 command: AuthCommands::SetToken { provider, key }
             }) if provider == "anthropic" && key == "sk-test"
+        ));
+    }
+
+    #[test]
+    fn auth_cli_parses_set_credential_command() {
+        let cli =
+            Cli::try_parse_from(["fawx", "auth", "set-credential", "brave_api_key", "sk-test"])
+                .expect("parse auth set-credential command");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommands::SetCredential { name, value }
+            }) if name == "brave_api_key" && value == "sk-test"
         ));
     }
 
@@ -259,10 +363,33 @@ mod tests {
             .store
             .load_auth_manager()
             .expect("auth manager should load");
-        let lines = status_lines(&manager, &recovered.store).expect("status lines");
+        let lines = status_lines(&manager, &recovered.store, &[]).expect("status lines");
 
         assert!(lines
             .iter()
             .any(|line| line == "anthropic: configured (API key)"));
+    }
+
+    #[tokio::test]
+    async fn run_set_credential_persists_generic_skill_credential() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("temp home");
+        let _home = HomeGuard::set(&temp_home);
+
+        run(AuthCommands::SetCredential {
+            name: "brave_api_key".to_string(),
+            value: "sk-brave-test".to_string(),
+        })
+        .await
+        .expect("set credential");
+
+        let store = EncryptedFileCredentialStore::open(&temp_home.path().join(".fawx"))
+            .expect("credential store should open");
+        let stored = store
+            .get_generic("brave_api_key")
+            .expect("read generic credential")
+            .expect("generic credential should exist");
+
+        assert_eq!(*stored, "sk-brave-test");
     }
 }

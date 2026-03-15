@@ -17,7 +17,7 @@ pub struct ExecutionResult {
     pub proposals_written: Vec<PathBuf>,
     /// Branches created in ProposalWithBranch mode.
     pub branches_created: Vec<String>,
-    /// Candidates skipped, with reasons.
+    /// Candidates skipped during execution, with reasons.
     pub skipped: Vec<(String, String)>,
 }
 

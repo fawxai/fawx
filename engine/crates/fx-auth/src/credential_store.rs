@@ -167,6 +167,25 @@ fn metadata_key(provider: AuthProvider, method: CredentialMethod) -> String {
     format!("{}_{}_metadata", provider.key_prefix(), method)
 }
 
+const GENERIC_CREDENTIAL_PREFIX: &str = "generic::";
+
+fn generic_key(name: &str) -> String {
+    format!("{GENERIC_CREDENTIAL_PREFIX}{name}")
+}
+
+fn generic_names(keys: Vec<String>) -> Vec<String> {
+    let mut names = keys
+        .into_iter()
+        .filter_map(|key| {
+            key.strip_prefix(GENERIC_CREDENTIAL_PREFIX)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Encrypted file-backed credential store.
 ///
 /// Reuses the existing `fx-storage` encrypted store infrastructure
@@ -201,6 +220,31 @@ impl EncryptedFileCredentialStore {
         Ok(Self {
             store: fx_storage::CredentialStore::new(encrypted),
         })
+    }
+
+    pub fn set_generic(&self, name: &str, value: &str) -> Result<(), CredentialStoreError> {
+        self.store
+            .store_credential(&generic_key(name), value)
+            .map_err(|e| CredentialStoreError::Encryption(format!("store generic credential: {e}")))
+    }
+
+    pub fn get_generic(
+        &self,
+        name: &str,
+    ) -> Result<Option<Zeroizing<String>>, CredentialStoreError> {
+        self.store
+            .get_credential(&generic_key(name))
+            .map(|value| value.map(Zeroizing::new))
+            .map_err(|e| {
+                CredentialStoreError::Encryption(format!("retrieve generic credential: {e}"))
+            })
+    }
+
+    pub fn list_generic_names(&self) -> Result<Vec<String>, CredentialStoreError> {
+        self.store
+            .list_credentials()
+            .map(generic_names)
+            .map_err(|e| CredentialStoreError::Io(format!("list generic credentials: {e}")))
     }
 }
 
@@ -456,6 +500,64 @@ mod tests {
             .clear(AuthProvider::GitHub, CredentialMethod::Pat)
             .expect("clear nonexistent");
         assert!(!existed);
+    }
+
+    #[test]
+    fn set_get_generic_roundtrip() {
+        let store = test_store();
+
+        store
+            .set_generic("brave_api_key", "brv_test_123")
+            .expect("set generic");
+
+        let retrieved = store
+            .get_generic("brave_api_key")
+            .expect("get generic")
+            .expect("should have generic value");
+
+        assert_eq!(*retrieved, "brv_test_123");
+    }
+
+    #[test]
+    fn get_generic_nonexistent_returns_none() {
+        let store = test_store();
+
+        let retrieved = store
+            .get_generic("nonexistent")
+            .expect("get missing generic");
+
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn list_generic_names_filters_non_generic_entries() {
+        let store = test_store();
+        let metadata = test_metadata();
+
+        store
+            .set_generic("brave_api_key", "brv_test_123")
+            .expect("set brave credential");
+        store
+            .set_generic("custom_webhook_token", "hook_test_456")
+            .expect("set webhook credential");
+        store
+            .set(
+                AuthProvider::GitHub,
+                CredentialMethod::Pat,
+                &Zeroizing::new("ghp_token".to_string()),
+                &metadata,
+            )
+            .expect("set github credential");
+
+        let names = store.list_generic_names().expect("list generic names");
+
+        assert_eq!(
+            names,
+            vec![
+                "brave_api_key".to_string(),
+                "custom_webhook_token".to_string(),
+            ]
+        );
     }
 
     #[test]

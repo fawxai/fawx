@@ -281,8 +281,8 @@ pub struct LearningOutcome {
 /// Decision emitted by Continue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContinuationDecision {
-    /// Goal completed with evidence.
-    Complete(LoopEvidence),
+    /// Goal completed with evidence (boxed to reduce enum size).
+    Complete(Box<LoopEvidence>),
     /// Continue the loop, optionally refreshing perception.
     Continue { next_perception: bool },
     /// Loop failed with unrecoverable error.
@@ -464,6 +464,7 @@ mod tests {
                 source: InputSource::Voice,
                 timestamp: 1_700_000_000_122,
                 context_id: Some("ctx-123".to_owned()),
+                images: Vec::new(),
             }),
             conversation_history: Vec::new(),
             steer_context: None,
@@ -555,14 +556,14 @@ mod tests {
     fn continuation_decision_variants_are_constructible() {
         let goal = Goal::new("Complete task", vec!["Task complete".to_owned()], Some(3));
 
-        let complete = ContinuationDecision::Complete(LoopEvidence {
+        let complete = ContinuationDecision::Complete(Box::new(LoopEvidence {
             goal: goal.clone(),
             final_perception: None,
             verification: Some(VerificationResult::Confirmed {
                 evidence: vec!["Task marker detected".to_owned()],
             }),
             evidence: vec!["marker:task_complete".to_owned()],
-        });
+        }));
         assert!(matches!(complete, ContinuationDecision::Complete(_)));
 
         let continue_decision = ContinuationDecision::Continue {

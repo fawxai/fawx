@@ -69,6 +69,7 @@ fn create_user_input(text: &str) -> UserInput {
             .expect("Failed to get system time")
             .as_millis() as u64,
         context_id: None,
+        images: Vec::new(),
     }
 }
 

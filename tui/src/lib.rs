@@ -6,6 +6,8 @@ mod app;
 pub(crate) mod credential_reader;
 #[cfg(feature = "embedded")]
 mod embedded_backend;
+#[cfg_attr(not(feature = "embedded"), allow(dead_code))]
+pub(crate) mod experiment_panel;
 mod fawx_backend;
 mod markdown_render;
 mod render {

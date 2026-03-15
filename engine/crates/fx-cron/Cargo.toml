@@ -1,0 +1,27 @@
+[package]
+name = "fx-cron"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono = { version = "0.4", features = ["clock"] }
+# Cron expression parsing — standard 5-field syntax is non-trivial (~300 lines). Well-maintained, no unsafe, no transitive deps beyond chrono.
+cron = "0.12"
+fx-bus.workspace = true
+fx-core.workspace = true
+fx-session.workspace = true
+fx-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+tracing.workspace = true
+uuid = { version = "1.13", features = ["v4", "serde"] }
+
+[dev-dependencies]
+fx-storage.workspace = true
+tempfile = "3.14"

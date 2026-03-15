@@ -466,6 +466,7 @@ mod tests {
         let block = message.content.first()?;
         match block {
             ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         }
     }

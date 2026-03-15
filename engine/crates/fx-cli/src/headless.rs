@@ -7,9 +7,18 @@
 
 use async_trait::async_trait;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
+#[cfg(feature = "http")]
+use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+#[cfg(feature = "http")]
+use fx_api::{
+    AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
+    ThinkingAdjustedDto, ThinkingLevelDto,
+};
+use fx_bus::{Envelope, SessionBus};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
-use fx_config::FawxConfig;
+use fx_config::{FawxConfig, ThinkingBudget};
+use fx_core::runtime_info::RuntimeInfo;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
@@ -17,17 +26,21 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
+use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{Message, ModelInfo, ModelRouter};
+use fx_llm::{supported_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
+use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::commands::slash::{
@@ -37,6 +50,7 @@ use crate::commands::slash::{
     render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
     DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
+use crate::context::load_context_files;
 use crate::helpers::{
     available_provider_names, format_memory_for_prompt, render_model_menu_text, render_status_text,
     resolve_model_alias, thinking_config_from_budget, trim_history, AnalysisCompletionProvider,
@@ -44,8 +58,9 @@ use crate::helpers::{
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::startup::{
-    build_headless_loop_engine_bundle, configured_data_dir, configured_working_dir, fawx_data_dir,
-    HeadlessLoopBuildOptions, SharedMemoryStore,
+    build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
+    configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,
+    SharedMemoryStore,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
@@ -61,7 +76,23 @@ use fx_subagent::{
 #[cfg(feature = "http")]
 const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
 
+pub const MAIN_SESSION_KEY: &str = "main";
 const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
+
+pub fn main_session_key() -> SessionKey {
+    match SessionKey::new(MAIN_SESSION_KEY) {
+        Ok(key) => key,
+        Err(_) => unreachable!("main session key constant must be valid"),
+    }
+}
+
+pub fn fawx_data_dir() -> PathBuf {
+    startup_fawx_data_dir()
+}
+
+pub fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
+    startup_configured_data_dir(base_data_dir, config)
+}
 
 // ── JSON I/O types ──────────────────────────────────────────────────────────
 
@@ -82,6 +113,23 @@ struct JsonOutput {
 // ── CycleResult ─────────────────────────────────────────────────────────────
 
 /// Result of a single agentic cycle, returned by [`HeadlessApp::process_message`].
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    pub category: ErrorCategory,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ErrorRecord {
+    pub timestamp: String,
+    pub category: ErrorCategory,
+    pub message: String,
+    pub recoverable: bool,
+}
+
+const MAX_ERROR_HISTORY: usize = 50;
+
 pub struct CycleResult {
     /// The assistant's response text.
     pub response: String,
@@ -99,21 +147,29 @@ pub struct CycleResult {
 pub struct HeadlessAppDeps {
     pub loop_engine: LoopEngine,
     pub router: Arc<ModelRouter>,
+    pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub config: FawxConfig,
     pub memory: Option<SharedMemoryStore>,
+    pub embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     pub system_prompt_path: Option<PathBuf>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub system_prompt_text: Option<String>,
     pub subagent_manager: Arc<SubagentManager>,
     pub canary_monitor: Option<CanaryMonitor>,
+    pub session_bus: Option<SessionBus>,
+    pub session_key: Option<SessionKey>,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub startup_warnings: Vec<StartupWarning>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
 pub struct HeadlessApp {
     loop_engine: LoopEngine,
     router: Arc<ModelRouter>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
     config: FawxConfig,
     memory: Option<SharedMemoryStore>,
+    embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     _subagent_manager: Arc<SubagentManager>,
     active_model: String,
     conversation_history: Vec<Message>,
@@ -125,6 +181,16 @@ pub struct HeadlessApp {
     /// when the `http` feature is enabled.
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    session_bus: Option<SessionBus>,
+    session_key: Option<SessionKey>,
+    cron_store: Option<fx_cron::SharedCronStore>,
+    startup_warnings: Vec<StartupWarning>,
+    error_history: VecDeque<ErrorRecord>,
+    /// Bus message receiver. Stored for Phase 2 loop integration —
+    /// will be polled via `tokio::select!` alongside user input to
+    /// process incoming cross-session messages during conversation.
+    #[allow(dead_code)]
+    bus_receiver: Option<mpsc::Receiver<Envelope>>,
 }
 
 #[derive(Clone)]
@@ -132,6 +198,7 @@ pub struct HeadlessSubagentFactoryDeps {
     pub router: Arc<ModelRouter>,
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
+    pub session_bus: Option<SessionBus>,
 }
 
 #[derive(Clone)]
@@ -148,10 +215,37 @@ struct HeadlessSubagentSession {
 struct DisabledSubagentFactory;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AuthProviderStatus {
-    provider: String,
-    auth_methods: BTreeSet<String>,
-    model_count: usize,
+pub struct AuthProviderStatus {
+    pub provider: String,
+    pub auth_methods: BTreeSet<String>,
+    pub model_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextInfoSnapshot {
+    pub used_tokens: usize,
+    pub max_tokens: usize,
+    pub percentage: f32,
+    pub compaction_threshold: f32,
+}
+
+#[cfg(feature = "http")]
+impl fx_api::ContextInfoSnapshotLike for ContextInfoSnapshot {
+    fn used_tokens(&self) -> usize {
+        self.used_tokens
+    }
+
+    fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    fn percentage(&self) -> f32 {
+        self.percentage
+    }
+
+    fn compaction_threshold(&self) -> f32 {
+        self.compaction_threshold
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,21 +261,64 @@ pub fn init_serve_logging(
     crate::startup::init_logging(&config.logging, crate::startup::LoggingMode::Serve)
 }
 
+impl Drop for HeadlessApp {
+    fn drop(&mut self) {
+        self.unsubscribe_from_session_bus();
+        self.persist_embedding_index();
+    }
+}
+
+fn headless_stream_callback(callback: StreamCallback) -> StreamCallback {
+    Arc::new(move |event| {
+        HeadlessApp::report_stream_error(&event);
+        callback(event);
+    })
+}
+
 impl HeadlessApp {
+    fn initial_bus_receiver(deps: &HeadlessAppDeps) -> Option<mpsc::Receiver<Envelope>> {
+        match (deps.session_bus.as_ref(), deps.session_key.as_ref()) {
+            (Some(bus), Some(session_key)) => Some(bus.subscribe(session_key)),
+            _ => None,
+        }
+    }
+
+    fn persist_embedding_index(&self) {
+        let Some(persistence) = &self.embedding_index_persistence else {
+            return;
+        };
+        if let Err(error) = persistence.save_if_dirty() {
+            tracing::warn!(error = %error, "failed to save embedding index on shutdown");
+        }
+    }
+
+    fn unsubscribe_from_session_bus(&self) {
+        let (Some(bus), Some(session_key)) = (&self.session_bus, self.session_key.as_ref()) else {
+            return;
+        };
+        bus.unsubscribe(session_key);
+    }
+
     /// Build from the standard startup bundle + router + config.
-    pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
-        let active_model = resolve_active_model(&deps.router, &deps.config);
-        seed_router_default_model(&mut deps.router, &active_model);
-
+    pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+        // Callers must seed the router's active model before construction.
+        let active_model = resolve_active_model(&deps.router, &deps.config)?;
+        let bus_receiver = Self::initial_bus_receiver(&deps);
         let max_history = deps.config.general.max_history;
-        let custom_system_prompt =
-            resolve_system_prompt(deps.system_prompt_text, deps.system_prompt_path.as_deref());
+        let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
+        let custom_system_prompt = resolve_system_prompt(
+            deps.system_prompt_text,
+            deps.system_prompt_path.as_deref(),
+            &data_dir,
+        );
 
-        Ok(Self {
+        let mut app = Self {
             loop_engine: deps.loop_engine,
             router: deps.router,
+            runtime_info: deps.runtime_info,
             config: deps.config,
             memory: deps.memory,
+            embedding_index_persistence: deps.embedding_index_persistence,
             _subagent_manager: deps.subagent_manager,
             active_model,
             conversation_history: Vec::new(),
@@ -190,7 +327,87 @@ impl HeadlessApp {
             custom_system_prompt,
             canary_monitor: deps.canary_monitor,
             config_manager: deps.config_manager,
-        })
+            session_bus: deps.session_bus,
+            session_key: deps.session_key,
+            cron_store: deps.cron_store,
+            startup_warnings: deps.startup_warnings,
+            error_history: VecDeque::new(),
+            bus_receiver,
+        };
+        app.record_startup_warning_history();
+        Ok(app)
+    }
+
+    fn record_startup_warning_history(&mut self) {
+        let warnings: Vec<_> = self
+            .startup_warnings
+            .iter()
+            .map(|warning| (warning.category, warning.message.clone()))
+            .collect();
+        for (category, message) in warnings {
+            self.record_error(category, message, true);
+        }
+    }
+
+    fn emit_startup_warnings(&mut self, callback: Option<&StreamCallback>) {
+        let Some(callback) = callback else {
+            return;
+        };
+        for warning in std::mem::take(&mut self.startup_warnings) {
+            let event = StreamEvent::Error {
+                category: warning.category,
+                message: warning.message,
+                recoverable: true,
+            };
+            Self::report_stream_error(&event);
+            callback(event);
+        }
+    }
+
+    fn clear_startup_warnings(&mut self) {
+        self.startup_warnings.clear();
+    }
+
+    fn emit_error(
+        &mut self,
+        callback: Option<&StreamCallback>,
+        category: ErrorCategory,
+        message: String,
+        recoverable: bool,
+    ) {
+        self.record_error(category, message.clone(), recoverable);
+        let Some(callback) = callback else {
+            return;
+        };
+        let event = StreamEvent::Error {
+            category,
+            message,
+            recoverable,
+        };
+        Self::report_stream_error(&event);
+        callback(event);
+    }
+
+    fn record_error(&mut self, category: ErrorCategory, message: String, recoverable: bool) {
+        if self.error_history.len() == MAX_ERROR_HISTORY {
+            self.error_history.pop_front();
+        }
+        self.error_history.push_back(ErrorRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            category,
+            message,
+            recoverable,
+        });
+    }
+
+    pub fn recent_errors(&self, limit: usize) -> Vec<ErrorRecord> {
+        let capped = limit.min(MAX_ERROR_HISTORY);
+        self.error_history
+            .iter()
+            .rev()
+            .take(capped)
+            .cloned()
+            .collect()
     }
 
     /// REPL mode: read lines from stdin, run the loop, print to stdout.
@@ -270,6 +487,16 @@ impl HeadlessApp {
         self.process_message_for_source(input, &source).await
     }
 
+    pub async fn process_message_streaming(
+        &mut self,
+        input: &str,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        let source = InputSource::Text;
+        self.process_message_for_source_streaming(input, &source, callback)
+            .await
+    }
+
     pub async fn process_message_for_source(
         &mut self,
         input: &str,
@@ -278,15 +505,245 @@ impl HeadlessApp {
         self.run_cycle_result(input, source).await
     }
 
+    pub async fn process_message_with_images(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        source: &InputSource,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.clear_startup_warnings();
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot_with_images(input, source, images);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let result = self
+            .loop_engine
+            .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle(input, &result))
+    }
+
+    pub async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
+        let original_history = std::mem::replace(&mut self.conversation_history, context);
+        let result = match (images.is_empty(), callback) {
+            (true, Some(callback)) => {
+                process_input_with_commands_streaming(self, input, Some(source), callback).await
+            }
+            (true, None) => process_input_with_commands(self, input, Some(source)).await,
+            (false, _) => {
+                self.process_message_with_images(input, &images, source)
+                    .await
+            }
+        };
+        let updated_history = self.conversation_history.clone();
+        self.conversation_history = original_history;
+        result.map(|cycle| (cycle, updated_history))
+    }
+
+    pub async fn process_message_for_source_streaming(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.run_cycle_result_streaming(input, source, callback)
+            .await
+    }
+
     /// Return the active model identifier.
     pub fn active_model(&self) -> &str {
         &self.active_model
     }
 
+    pub fn available_models(&self) -> Vec<ModelInfo> {
+        self.router.available_models()
+    }
+
+    pub fn thinking_budget(&self) -> fx_config::ThinkingBudget {
+        self.current_thinking_budget()
+    }
+
+    pub fn auth_provider_statuses(&self) -> Vec<AuthProviderStatus> {
+        auth_provider_statuses(self.available_models())
+    }
+
+    /// Return the loaded configuration.
+    #[allow(dead_code)]
+    pub fn config(&self) -> &FawxConfig {
+        &self.config
+    }
+
     /// Return the shared config manager (if configured).
-    #[cfg(feature = "http")]
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
+    }
+
+    pub fn session_bus(&self) -> Option<&SessionBus> {
+        self.session_bus.as_ref()
+    }
+
+    pub fn cron_store(&self) -> Option<&fx_cron::SharedCronStore> {
+        self.cron_store.as_ref()
+    }
+
+    pub fn thinking_available_levels(&self) -> Vec<String> {
+        self.active_provider_name()
+            .map(supported_thinking_levels)
+            .unwrap_or_else(|| supported_thinking_levels(""))
+    }
+
+    pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
+        self.switch_active_model(selector)
+            .map(|result| result.active_model)
+    }
+
+    #[cfg(feature = "http")]
+    pub fn switch_active_model(&mut self, selector: &str) -> anyhow::Result<ModelSwitchDto> {
+        let previous_model = self.active_model.clone();
+        let resolved = resolve_headless_model_selector(&self.router, selector)?;
+        apply_headless_active_model(self, &resolved);
+        persist_default_model(
+            &mut self.config,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            &resolved,
+        )?;
+        let thinking_adjusted = self.adjust_thinking_for_active_model()?;
+        Ok(ModelSwitchDto {
+            previous_model,
+            active_model: resolved,
+            thinking_adjusted,
+        })
+    }
+
+    pub fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
+        let Some(level) = level else {
+            return Ok(format!(
+                "Current thinking budget: {}",
+                self.config.general.thinking.unwrap_or_default()
+            ));
+        };
+        self.set_supported_thinking_level(level)?;
+        Ok(format!(
+            "Thinking budget set to: {}",
+            self.thinking_budget()
+        ))
+    }
+
+    fn active_provider_name(&self) -> Option<&str> {
+        self.router.provider_for_model(&self.active_model)
+    }
+
+    fn current_thinking_budget(&self) -> ThinkingBudget {
+        self.config.general.thinking.unwrap_or_default()
+    }
+
+    pub fn set_supported_thinking_level(
+        &mut self,
+        level: &str,
+    ) -> anyhow::Result<ThinkingLevelDto> {
+        let budget: ThinkingBudget = level
+            .parse()
+            .map_err(|error: String| anyhow::anyhow!(error))?;
+        self.ensure_supported_thinking_budget(budget)?;
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            Some(&budget.to_string()),
+        )?;
+        Ok(self.thinking_level_dto())
+    }
+
+    fn ensure_supported_thinking_budget(&self, budget: ThinkingBudget) -> anyhow::Result<()> {
+        let level = budget.to_string();
+        let available = self.thinking_available_levels();
+        if available.iter().any(|candidate| candidate == &level) {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "Thinking level '{}' is not supported by the current model. Available: {}",
+            level,
+            available.join(", ")
+        ))
+    }
+
+    #[cfg(feature = "http")]
+    pub fn thinking_level_dto(&self) -> ThinkingLevelDto {
+        ThinkingLevelDto {
+            level: self.current_thinking_budget().to_string(),
+            budget_tokens: self.current_thinking_budget().budget_tokens(),
+            available: self.thinking_available_levels(),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn adjust_thinking_for_active_model(&mut self) -> anyhow::Result<Option<ThinkingAdjustedDto>> {
+        let current = self.current_thinking_budget();
+        if self.is_supported_thinking_budget(current) {
+            return Ok(None);
+        }
+        let adjusted = preferred_supported_budget(&self.thinking_available_levels());
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            Some(&adjusted.to_string()),
+        )?;
+        Ok(Some(ThinkingAdjustedDto {
+            from: current.to_string(),
+            to: adjusted.to_string(),
+            reason: thinking_adjustment_reason(current, adjusted, self.active_provider_name()),
+        }))
+    }
+
+    fn is_supported_thinking_budget(&self, budget: ThinkingBudget) -> bool {
+        let level = budget.to_string();
+        self.thinking_available_levels()
+            .iter()
+            .any(|candidate| candidate == &level)
+    }
+
+    pub fn context_info_snapshot(&self) -> ContextInfoSnapshot {
+        self.context_info_snapshot_for_messages(&self.conversation_history)
+    }
+
+    pub fn context_info_snapshot_for_messages(&self, messages: &[Message]) -> ContextInfoSnapshot {
+        let budget = self.loop_engine.conversation_budget_ref();
+        let used_tokens =
+            fx_kernel::conversation_compactor::ConversationBudget::estimate_tokens(messages);
+        let max_tokens = budget.conversation_budget();
+        ContextInfoSnapshot {
+            used_tokens,
+            max_tokens,
+            percentage: context_usage_percentage(used_tokens, max_tokens),
+            compaction_threshold: budget.compaction_threshold_value(),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    pub fn context_info(&self) -> ContextInfoDto {
+        ContextInfoDto::from_snapshot(&self.context_info_snapshot())
+    }
+
+    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>)> {
+        match self.runtime_info.read() {
+            Ok(info) => runtime_skill_summaries(&info),
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                Vec::new()
+            }
+        }
     }
 
     /// Apply the custom system prompt (if any). Must be called once
@@ -386,6 +843,7 @@ impl HeadlessApp {
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
+        self.clear_startup_warnings();
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
@@ -398,12 +856,45 @@ impl HeadlessApp {
         Ok(self.finalize_cycle(input, &result))
     }
 
+    async fn run_cycle_result_streaming(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        let callback = headless_stream_callback(callback);
+        self.emit_startup_warnings(Some(&callback));
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot(input, source);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let result = self
+            .loop_engine
+            .run_cycle_streaming(snapshot, &llm, Some(callback))
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle(input, &result))
+    }
+
+    fn report_stream_error(event: &StreamEvent) {
+        if let StreamEvent::Error {
+            category,
+            message,
+            recoverable,
+        } = event
+        {
+            let level = if *recoverable { "warning" } else { "error" };
+            eprintln!("[{level}] [{category}] {message}");
+        }
+    }
+
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
         let response = extract_response_text(result);
         let iterations = extract_iterations(result);
         let tokens_used = extract_token_usage(result);
         self.last_signals = result.signals().to_vec();
-        persist_headless_signals(&self.config, &self.last_signals);
+        let signals = self.last_signals.clone();
+        persist_headless_signals(self, &signals);
         self.record_turn(input, &response);
         CycleResult {
             response,
@@ -434,7 +925,7 @@ impl HeadlessApp {
         eprintln!("fawx serve — headless mode");
         eprintln!("model: {}", self.active_model);
         if self.custom_system_prompt.is_some() {
-            eprintln!("system prompt: ~/.fawx/system_prompt.md loaded");
+            eprintln!("system prompt: custom prompt/context loaded");
         }
         eprintln!("ready (type /quit to exit)");
     }
@@ -474,7 +965,17 @@ impl HeadlessApp {
     }
 
     fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
+        self.build_perception_snapshot_with_images(input, source, &[])
+    }
+
+    fn build_perception_snapshot_with_images(
+        &self,
+        input: &str,
+        source: &InputSource,
+        images: &[ImageAttachment],
+    ) -> PerceptionSnapshot {
         let timestamp_ms = current_time_ms();
+        let image_pairs = images.to_vec();
         PerceptionSnapshot {
             screen: ScreenState {
                 current_app: "fawx.headless".to_string(),
@@ -490,6 +991,7 @@ impl HeadlessApp {
                 source: source.clone(),
                 timestamp: timestamp_ms,
                 context_id: None,
+                images: image_pairs,
             }),
             conversation_history: self.conversation_history.clone(),
             steer_context: None,
@@ -508,6 +1010,141 @@ impl HeadlessApp {
         let parsed: JsonInput = serde_json::from_str(raw)?;
         Ok(parsed.message)
     }
+
+    async fn list_models_dynamic(&self) -> anyhow::Result<String> {
+        let models = self.dynamic_models_or_fallback().await;
+        Ok(render_model_menu_text(
+            Some(self.active_model.as_str()),
+            &models,
+        ))
+    }
+
+    async fn dynamic_models_or_fallback(&self) -> Vec<ModelInfo> {
+        let models = self.router.fetch_available_models().await;
+        if models.is_empty() {
+            return self.router.available_models();
+        }
+        models
+    }
+}
+
+#[cfg(feature = "http")]
+#[async_trait]
+impl AppEngine for HeadlessApp {
+    async fn process_message(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<ApiCycleResult, anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self,
+            input,
+            images,
+            self.conversation_history.clone(),
+            &source,
+            callback,
+        )
+        .await?;
+        self.conversation_history = updated_history;
+
+        Ok(ApiCycleResult {
+            response: result.response,
+            model: result.model,
+            iterations: result.iterations,
+        })
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context(
+            self, input, images, context, &source, callback,
+        )
+        .await?;
+
+        Ok((
+            ApiCycleResult {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            },
+            updated_history,
+        ))
+    }
+
+    fn active_model(&self) -> &str {
+        HeadlessApp::active_model(self)
+    }
+
+    fn available_models(&self) -> Vec<ModelInfoDto> {
+        HeadlessApp::available_models(self)
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
+    fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+        HeadlessApp::switch_active_model(self, selector)
+    }
+
+    fn thinking_level(&self) -> ThinkingLevelDto {
+        HeadlessApp::thinking_level_dto(self)
+    }
+
+    fn context_info(&self) -> ContextInfoDto {
+        HeadlessApp::context_info(self)
+    }
+
+    fn context_info_for_messages(&self, messages: &[Message]) -> ContextInfoDto {
+        ContextInfoDto::from_snapshot(&HeadlessApp::context_info_snapshot_for_messages(
+            self, messages,
+        ))
+    }
+
+    fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+        HeadlessApp::set_supported_thinking_level(self, level)
+    }
+
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+        HeadlessApp::skill_summaries(self)
+            .into_iter()
+            .map(SkillSummaryDto::from)
+            .collect()
+    }
+
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+        HeadlessApp::auth_provider_statuses(self)
+            .into_iter()
+            .map(auth_provider_dto)
+            .collect()
+    }
+
+    fn config_manager(&self) -> Option<ConfigManagerHandle> {
+        HeadlessApp::config_manager(self).cloned()
+    }
+
+    fn session_bus(&self) -> Option<&SessionBus> {
+        HeadlessApp::session_bus(self)
+    }
+
+    fn recent_errors(&self, limit: usize) -> Vec<fx_api::ErrorRecordDto> {
+        HeadlessApp::recent_errors(self, limit)
+            .into_iter()
+            .map(|record| fx_api::ErrorRecordDto {
+                timestamp: record.timestamp,
+                category: record.category,
+                message: record.message,
+                recoverable: record.recoverable,
+            })
+            .collect()
+    }
 }
 
 impl CommandHost for HeadlessApp {
@@ -523,19 +1160,11 @@ impl CommandHost for HeadlessApp {
     }
 
     fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
-        let resolved = resolve_headless_model_selector(&self.router, selector)?;
-        self.active_model = resolved.clone();
-        persist_default_model(
-            &mut self.config,
-            self.config_manager.as_ref(),
-            &fawx_data_dir(),
-            &resolved,
-        )?;
-        Ok(resolved)
+        HeadlessApp::set_active_model(self, selector)
     }
 
-    fn proposals(&self) -> anyhow::Result<String> {
-        render_pending(headless_review_context(&self.config)).map_err(anyhow::Error::new)
+    fn proposals(&self, selector: Option<&str>) -> anyhow::Result<String> {
+        render_pending(headless_review_context(&self.config), selector).map_err(anyhow::Error::new)
     }
 
     fn approve(&self, selector: &str, force: bool) -> anyhow::Result<String> {
@@ -587,13 +1216,7 @@ impl CommandHost for HeadlessApp {
     }
 
     fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
-        apply_thinking_budget(
-            &mut self.config,
-            &mut self.loop_engine,
-            self.config_manager.as_ref(),
-            &fawx_data_dir(),
-            level,
-        )
+        HeadlessApp::handle_thinking(self, level)
     }
 
     fn show_history(&self) -> anyhow::Result<String> {
@@ -646,6 +1269,30 @@ impl CommandHost for HeadlessApp {
     fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
         Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
     }
+}
+
+fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {
+    for budget in [
+        ThinkingBudget::High,
+        ThinkingBudget::Adaptive,
+        ThinkingBudget::Low,
+        ThinkingBudget::Off,
+    ] {
+        if levels.iter().any(|level| level == &budget.to_string()) {
+            return budget;
+        }
+    }
+    ThinkingBudget::Off
+}
+
+#[cfg(feature = "http")]
+fn thinking_adjustment_reason(
+    from: ThinkingBudget,
+    to: ThinkingBudget,
+    provider: Option<&str>,
+) -> String {
+    let provider = provider.unwrap_or("unknown");
+    format!("{} not supported by {}; adjusted to {}", from, provider, to)
 }
 
 fn handle_headless_synthesis_command(
@@ -753,6 +1400,37 @@ fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
         update_auth_provider_status(&mut statuses, model);
     }
     statuses.into_values().collect()
+}
+
+fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>)> {
+    info.skills
+        .iter()
+        .map(|skill| {
+            (
+                skill.name.clone(),
+                skill.description.clone().unwrap_or_default(),
+                skill.tool_names.clone(),
+            )
+        })
+        .collect()
+}
+
+fn context_usage_percentage(used_tokens: usize, max_tokens: usize) -> f32 {
+    if max_tokens == 0 {
+        0.0
+    } else {
+        (used_tokens as f32 / max_tokens as f32) * 100.0
+    }
+}
+
+#[cfg(feature = "http")]
+fn auth_provider_dto(status: AuthProviderStatus) -> AuthProviderDto {
+    AuthProviderDto {
+        provider: status.provider,
+        auth_methods: status.auth_methods.into_iter().collect(),
+        model_count: status.model_count,
+        status: "registered".to_string(),
+    }
 }
 
 fn update_auth_provider_status(
@@ -909,10 +1587,7 @@ fn sync_headless_model_from_config(
     app: &mut HeadlessApp,
     default_model: Option<String>,
 ) -> anyhow::Result<()> {
-    let Some(selector) = default_model else {
-        return Ok(());
-    };
-    let resolved = resolve_headless_model_selector(&app.router, &selector)?;
+    let resolved = resolve_requested_model(&app.router, default_model.as_deref())?;
     apply_headless_active_model(app, &resolved);
     Ok(())
 }
@@ -920,7 +1595,9 @@ fn sync_headless_model_from_config(
 fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
     if let Some(router) = Arc::get_mut(&mut app.router) {
         if let Err(error) = router.set_active(model) {
+            let message = format!("Model reload failed after config change: {error}");
             tracing::warn!(error = %error, model, "failed to apply reloaded model to router");
+            app.record_error(ErrorCategory::System, message, true);
         }
     }
     app.active_model = model.to_string();
@@ -931,14 +1608,22 @@ fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
     SignalStore::new(&data_dir, HEADLESS_SIGNAL_SESSION_ID).map_err(anyhow::Error::new)
 }
 
-fn persist_headless_signals(config: &FawxConfig, signals: &[Signal]) {
-    if let Ok(signal_store) = headless_signal_store(config) {
+fn persist_headless_signals(app: &mut HeadlessApp, signals: &[Signal]) {
+    if let Ok(signal_store) = headless_signal_store(&app.config) {
         if let Err(error) = signal_store.persist(signals) {
+            let message = format!("Signal persist failed: {error}");
             eprintln!("warning: signal persist failed: {error}");
+            app.emit_error(None, ErrorCategory::System, message, true);
         }
         return;
     }
     eprintln!("warning: signal store unavailable for headless session");
+    app.emit_error(
+        None,
+        ErrorCategory::System,
+        "Signal store unavailable for headless session".to_string(),
+        true,
+    );
 }
 
 fn build_headless_improve_context(
@@ -1078,19 +1763,21 @@ fn analysis_confidence_badge(confidence: Confidence) -> &'static str {
     }
 }
 
-fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) -> String {
+fn render_improve_output(result: &fx_improve::ImprovementRunResult, dry_run: bool) -> String {
     let mut lines = vec![if dry_run {
         "⚡ Dry run complete.".to_string()
     } else {
         "⚡ Improvement cycle complete.".to_string()
     }];
-    if result.proposals_written.is_empty()
-        && result.branches_created.is_empty()
-        && result.skipped.is_empty()
-    {
+
+    if let Some(summary) = render_improve_summary(result) {
+        lines.push(summary);
+    }
+    if improve_result_is_empty(result) {
         lines.push("  No actionable improvements found.".to_string());
         return lines.join("\n");
     }
+
     lines.extend(
         result
             .proposals_written
@@ -1103,6 +1790,7 @@ fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) ->
             .iter()
             .map(|branch| format!("  Branch: {branch}")),
     );
+    lines.extend(render_skipped_candidates(&result.skipped_candidates));
     lines.extend(
         result
             .skipped
@@ -1112,12 +1800,100 @@ fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) ->
     lines.join("\n")
 }
 
+fn render_skipped_candidates(skipped_candidates: &[fx_improve::SkippedCandidate]) -> Vec<String> {
+    skipped_candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "  Skipped candidate: {} — {}",
+                candidate.name, candidate.reason
+            )
+        })
+        .collect()
+}
+
+fn render_improve_summary(result: &fx_improve::ImprovementRunResult) -> Option<String> {
+    if result.plans_generated == 0 && result.skipped_candidates.is_empty() {
+        return None;
+    }
+
+    let mut summary = format!(
+        "  {} {} generated",
+        result.plans_generated,
+        pluralize(result.plans_generated, "plan", "plans")
+    );
+    if !result.skipped_candidates.is_empty() {
+        summary.push_str(&format!(
+            ", {}",
+            fx_improve::skipped_candidate_summary(&result.skipped_candidates)
+        ));
+    }
+    Some(summary)
+}
+
+fn improve_result_is_empty(result: &fx_improve::ImprovementRunResult) -> bool {
+    result.plans_generated == 0
+        && result.proposals_written.is_empty()
+        && result.branches_created.is_empty()
+        && result.skipped.is_empty()
+        && result.skipped_candidates.is_empty()
+}
+
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
+
+fn new_subagent_session_key(bus: Option<&SessionBus>) -> Result<Option<SessionKey>, SubagentError> {
+    if bus.is_none() {
+        return Ok(None);
+    }
+    SessionKey::new(format!("subagent-{}", Uuid::new_v4()))
+        .map(Some)
+        .map_err(|error| SubagentError::Spawn(error.to_string()))
+}
+
 impl HeadlessSubagentFactory {
     pub fn new(deps: HeadlessSubagentFactoryDeps) -> Self {
         Self {
             deps,
             disabled_manager: new_disabled_subagent_manager(),
         }
+    }
+
+    fn build_app(
+        &self,
+        config: &SpawnConfig,
+        cancel_token: CancellationToken,
+    ) -> Result<HeadlessApp, SubagentError> {
+        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        let bundle = build_headless_loop_engine_bundle(
+            &self.deps.config,
+            self.deps.improvement_provider.clone(),
+            options,
+        )
+        .map_err(|error| SubagentError::Spawn(error.to_string()))?;
+        let deps = HeadlessAppDeps {
+            loop_engine: bundle.engine,
+            router: Arc::clone(&self.deps.router),
+            runtime_info: bundle.runtime_info,
+            config: self.deps.config.clone(),
+            memory: bundle.memory,
+            embedding_index_persistence: bundle.embedding_index_persistence,
+            system_prompt_path: None,
+            config_manager: None,
+            system_prompt_text: config.system_prompt.clone(),
+            subagent_manager: Arc::clone(&self.disabled_manager),
+            canary_monitor: None,
+            session_bus: self.deps.session_bus.clone(),
+            session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
+            cron_store: None,
+            startup_warnings: bundle.startup_warnings,
+        };
+        HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))
     }
 }
 
@@ -1158,26 +1934,7 @@ impl SubagentFactory for HeadlessSubagentFactory {
             ));
         }
         let cancel_token = CancellationToken::new();
-        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token.clone());
-        let bundle = build_headless_loop_engine_bundle(
-            &self.deps.config,
-            self.deps.improvement_provider.clone(),
-            options,
-        )
-        .map_err(|error| SubagentError::Spawn(error.to_string()))?;
-        let deps = HeadlessAppDeps {
-            loop_engine: bundle.engine,
-            router: Arc::clone(&self.deps.router),
-            config: self.deps.config.clone(),
-            memory: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: config.system_prompt.clone(),
-            subagent_manager: Arc::clone(&self.disabled_manager),
-            canary_monitor: None,
-        };
-        let app =
-            HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
+        let app = self.build_app(config, cancel_token.clone())?;
         Ok(CreatedSubagentSession {
             session: Box::new(HeadlessSubagentSession { app }),
             cancel_token,
@@ -1214,6 +1971,28 @@ pub async fn process_input_with_commands(
     }
 }
 
+pub async fn process_input_with_commands_streaming(
+    app: &mut HeadlessApp,
+    input: &str,
+    source: Option<&InputSource>,
+    callback: StreamCallback,
+) -> Result<CycleResult, anyhow::Error> {
+    if is_command_input(input) {
+        let result = process_command_input(app, input).await?;
+        callback(fx_kernel::StreamEvent::Done {
+            response: result.response.clone(),
+        });
+        return Ok(result);
+    }
+    match source {
+        Some(source) => {
+            app.process_message_for_source_streaming(input, source, callback)
+                .await
+        }
+        None => app.process_message_streaming(input, callback).await,
+    }
+}
+
 async fn process_command_input(
     app: &mut HeadlessApp,
     input: &str,
@@ -1242,6 +2021,7 @@ async fn execute_headless_async_command(
     parsed: &ParsedCommand,
 ) -> Result<Option<String>, anyhow::Error> {
     match parsed {
+        ParsedCommand::Model(None) => app.list_models_dynamic().await.map(Some),
         ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
         ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
         _ => Ok(None),
@@ -1300,34 +2080,99 @@ fn load_system_prompt(explicit_path: Option<&std::path::Path>) -> Option<String>
 fn resolve_system_prompt(
     inline_prompt: Option<String>,
     explicit_path: Option<&std::path::Path>,
+    data_dir: &Path,
 ) -> Option<String> {
-    inline_prompt
+    let base_prompt = inline_prompt
         .filter(|prompt| !prompt.trim().is_empty())
-        .or_else(|| load_system_prompt(explicit_path))
+        .or_else(|| load_system_prompt(explicit_path));
+    let context_dir = data_dir.join("context");
+    append_context_files(base_prompt, load_context_files(&context_dir))
 }
 
-fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> String {
-    router
-        .active_model()
-        .map(ToString::to_string)
-        .or_else(|| config.model.default_model.clone())
-        .unwrap_or_default()
-}
-
-fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) {
-    if active_model.is_empty() || router.active_model().is_some() {
-        return;
+fn append_context_files(
+    base_prompt: Option<String>,
+    context_files: Option<String>,
+) -> Option<String> {
+    match (base_prompt, context_files) {
+        (Some(prompt), Some(context)) => Some(format!("{prompt}{context}")),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(context)) => Some(context),
+        (None, None) => None,
     }
-    let Some(router) = Arc::get_mut(router) else {
+}
+
+pub fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> anyhow::Result<String> {
+    resolve_requested_model(router, config.model.default_model.as_deref())
+}
+
+pub fn seed_headless_router_active_model(router: &mut ModelRouter, config: &FawxConfig) {
+    let Ok(active_model) = resolve_active_model(router, config) else {
         return;
     };
-    if let Err(error) = router.set_active(active_model) {
+    if let Err(error) = router.set_active(&active_model) {
         tracing::warn!(
             error = %error,
             model = %active_model,
-            "config default_model not available in router"
+            "failed to set default model"
         );
     }
+}
+
+fn resolve_requested_model(
+    router: &ModelRouter,
+    configured_default: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(model) = configured_default.filter(|model| !model.is_empty()) {
+        return resolve_configured_model_or_fallback(router, model);
+    }
+    first_runtime_model(router)
+}
+
+fn resolve_configured_model_or_fallback(
+    router: &ModelRouter,
+    configured_model: &str,
+) -> anyhow::Result<String> {
+    match resolve_headless_model_selector(router, configured_model) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "configured default_model '{}' not available, falling back",
+                configured_model
+            );
+            first_runtime_model(router)
+        }
+    }
+}
+
+fn first_runtime_model(router: &ModelRouter) -> anyhow::Result<String> {
+    router
+        .active_model()
+        .filter(|model| headless_model_available(router, model))
+        .map(ToString::to_string)
+        .or_else(|| first_available_model(router))
+        .ok_or_else(no_headless_models_available)
+}
+
+fn first_available_model(router: &ModelRouter) -> Option<String> {
+    router
+        .available_models()
+        .into_iter()
+        .next()
+        .map(|model| model.model_id)
+}
+
+fn headless_model_available(router: &ModelRouter, model: &str) -> bool {
+    router
+        .available_models()
+        .iter()
+        .any(|candidate| candidate.model_id == model)
+}
+
+fn no_headless_models_available() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no models available in router; configure a provider and authenticate it before starting headless mode"
+    )
 }
 
 /// Reset SIGPIPE to default behavior on Unix so piped output
@@ -1377,12 +2222,18 @@ fn extract_token_usage(result: &LoopResult) -> TokenUsage {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    #[cfg(feature = "http")]
+    use fx_api::engine::AppEngine;
+    use fx_bus::{BusStore, Payload};
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
     use fx_kernel::cancellation::CancellationToken;
     use fx_kernel::context_manager::ContextCompactor;
     use fx_kernel::loop_engine::LoopEngine;
-    use std::sync::Arc;
+    use fx_session::SessionKey;
+    use fx_subagent::SpawnConfig;
+    use std::sync::{Arc, Mutex};
+    use tokio::time::Duration;
 
     // ── Test helpers ────────────────────────────────────────────────────
 
@@ -1416,8 +2267,10 @@ mod tests {
         HeadlessApp {
             loop_engine: test_engine(),
             router: Arc::new(ModelRouter::new()),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -1426,6 +2279,12 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
+            bus_receiver: None,
         }
     }
 
@@ -1505,6 +2364,241 @@ mod tests {
         Arc::new(router)
     }
 
+    #[derive(Debug)]
+    struct StaticModelsProvider {
+        name: &'static str,
+        models: Vec<&'static str>,
+        dynamic_models: Option<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for StaticModelsProvider {
+        async fn complete(
+            &self,
+            _request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Ok(mock_completion_response())
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(mock_completion_text()),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect()
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, fx_llm::ProviderError> {
+            Ok(self
+                .dynamic_models
+                .clone()
+                .unwrap_or_else(|| self.supported_models()))
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[derive(Debug)]
+    struct ConversationMemoryProvider;
+
+    #[cfg(feature = "http")]
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ConversationMemoryProvider {
+        async fn complete(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Ok(fx_llm::CompletionResponse {
+                content: vec![fx_llm::ContentBlock::Text {
+                    text: conversation_response(&request),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(conversation_response(&request)),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            "conversation-memory"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec!["conversation-memory".to_string()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn conversation_response(request: &fx_llm::CompletionRequest) -> String {
+        let response = if request_contains_text(request, "remember cats")
+            && request_contains_text(request, "what did I say?")
+        {
+            "You said remember cats"
+        } else {
+            "I'll remember cats"
+        };
+        response_payload(response)
+    }
+
+    #[cfg(feature = "http")]
+    fn request_contains_text(request: &fx_llm::CompletionRequest, needle: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, fx_llm::ContentBlock::Text { text } if text == needle))
+        })
+    }
+
+    #[cfg(feature = "http")]
+    fn response_payload(response: &str) -> String {
+        serde_json::json!({
+            "action": {"Respond": {"text": response}},
+            "rationale": "r",
+            "confidence": 0.9,
+            "expected_outcome": null,
+            "sub_goals": []
+        })
+        .to_string()
+    }
+
+    fn static_model_router(models: &[&'static str]) -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticModelsProvider {
+            name: "static-models",
+            models: models.to_vec(),
+            dynamic_models: None,
+        }));
+        router
+    }
+
+    fn headless_deps(mut router: ModelRouter, config: FawxConfig) -> HeadlessAppDeps {
+        seed_headless_router_active_model(&mut router, &config);
+        HeadlessAppDeps {
+            loop_engine: test_engine(),
+            router: Arc::new(router),
+            runtime_info: test_runtime_info(),
+            config,
+            memory: None,
+            embedding_index_persistence: None,
+            system_prompt_path: None,
+            config_manager: None,
+            system_prompt_text: None,
+            subagent_manager: new_disabled_subagent_manager(),
+            canary_monitor: None,
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+        }
+    }
+
+    fn test_runtime_info() -> Arc<RwLock<RuntimeInfo>> {
+        Arc::new(RwLock::new(RuntimeInfo {
+            active_model: String::new(),
+            provider: String::new(),
+            skills: Vec::new(),
+            config_summary: fx_core::runtime_info::ConfigSummary {
+                max_iterations: 3,
+                max_history: 20,
+                memory_enabled: false,
+            },
+            version: "test".to_string(),
+        }))
+    }
+
+    fn headless_app_with_router(router: ModelRouter, active_model: &str) -> HeadlessApp {
+        let mut app = test_app();
+        app.router = Arc::new(router);
+        app.active_model = active_model.to_string();
+        app
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log buffer lock").clone())
+                .expect("log buffer utf8")
+        }
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log writer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    fn with_warn_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, action);
+        (result, logs.contents())
+    }
+
     // ── Unit tests (10) ─────────────────────────────────────────────────
 
     #[test]
@@ -1520,6 +2614,28 @@ mod tests {
         assert!(!is_quit_command(""));
     }
 
+    #[tokio::test]
+    async fn headless_model_menu_uses_dynamic_when_available() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticModelsProvider {
+            name: "dynamic-models",
+            models: vec!["static-model"],
+            dynamic_models: Some(
+                vec!["dynamic-model"]
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+        }));
+        let mut app = headless_app_with_router(router, "dynamic-model");
+
+        let rendered = process_command_input(&mut app, "/model").await;
+        let rendered = rendered.expect("command result").response;
+
+        assert!(rendered.contains("dynamic-model"));
+        assert!(!rendered.contains("static-model (api_key)"));
+    }
+
     #[test]
     fn list_models_uses_shared_renderer() {
         let mut app = test_app();
@@ -1533,6 +2649,64 @@ mod tests {
     }
 
     #[test]
+    fn recent_errors_is_bounded_to_fifty_records() {
+        let warnings = (0..55)
+            .map(|idx| StartupWarning {
+                category: ErrorCategory::System,
+                message: format!("warning #{idx}"),
+            })
+            .collect();
+        let mut deps = headless_deps(static_model_router(&["mock-model"]), FawxConfig::default());
+        deps.startup_warnings = warnings;
+
+        let app = HeadlessApp::new(deps).expect("app");
+        let recent = app.recent_errors(100);
+
+        assert_eq!(recent.len(), 50);
+        assert_eq!(recent[0].message, "warning #54");
+        assert_eq!(recent[49].message, "warning #5");
+    }
+
+    #[tokio::test]
+    async fn streaming_message_emits_startup_warnings_before_done() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let mut app = test_app();
+        let mut router = static_model_router(&["mock-model"]);
+        router.set_active("mock-model").expect("set active");
+        app.router = Arc::new(router);
+        app.startup_warnings.push(StartupWarning {
+            category: ErrorCategory::Memory,
+            message: "Failed to initialize memory: broken store".to_string(),
+        });
+
+        let result = app
+            .process_message_streaming(
+                "hello",
+                Arc::new(move |event| {
+                    callback_events.lock().expect("events lock").push(event);
+                }),
+            )
+            .await
+            .expect("streaming result");
+
+        assert_eq!(result.response, mock_completion_text());
+        let events = events.lock().expect("events lock");
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::Error {
+                category: ErrorCategory::Memory,
+                message,
+                recoverable: true,
+            }) if message == "Failed to initialize memory: broken store"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { response }) if *response == mock_completion_text()
+        ));
+    }
+
+    #[test]
     fn proposal_commands_propagate_errors() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp_dir.path().join("proposals"), "not a directory")
@@ -1540,7 +2714,7 @@ mod tests {
         let mut app = test_app();
         app.config.general.data_dir = Some(temp_dir.path().to_path_buf());
 
-        assert!(CommandHost::proposals(&app).is_err());
+        assert!(CommandHost::proposals(&app, None).is_err());
         assert!(CommandHost::approve(&app, "1", false).is_err());
         assert!(CommandHost::reject(&app, "1").is_err());
     }
@@ -1618,8 +2792,10 @@ mod tests {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: Arc::new(router),
+            runtime_info: test_runtime_info(),
             config,
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "old-model".to_string(),
             conversation_history: Vec::new(),
@@ -1628,6 +2804,12 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: Some(manager),
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
+            bus_receiver: None,
         };
 
         std::fs::write(
@@ -1724,6 +2906,26 @@ mod tests {
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
+    }
+
+    #[test]
+    fn render_improve_output_includes_skipped_candidate_summary() {
+        let result = fx_improve::ImprovementRunResult {
+            plans_generated: 2,
+            proposals_written: vec![PathBuf::from("/tmp/proposal.md")],
+            branches_created: Vec::new(),
+            skipped: Vec::new(),
+            skipped_candidates: vec![fx_improve::SkippedCandidate {
+                name: "timeout-loop".to_string(),
+                reason: "model did not produce a plan".to_string(),
+            }],
+        };
+
+        let rendered = render_improve_output(&result, false);
+
+        assert!(rendered
+            .contains("2 plans generated, 1 candidate skipped (model did not produce a plan)"));
+        assert!(rendered.contains("Skipped candidate: timeout-loop — model did not produce a plan"));
     }
 
     #[tokio::test]
@@ -1879,13 +3081,53 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_process_message_preserves_history_for_implicit_message_endpoint() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ConversationMemoryProvider));
+        router
+            .set_active("conversation-memory")
+            .expect("set active conversation model");
+
+        let mut app = test_app();
+        app.router = Arc::new(router);
+        app.active_model = "conversation-memory".to_string();
+
+        let first = AppEngine::process_message(
+            &mut app,
+            "remember cats",
+            Vec::new(),
+            InputSource::Http,
+            None,
+        )
+        .await
+        .expect("first http message");
+        assert!(first.response.contains("I'll remember cats"));
+        assert_eq!(app.conversation_history.len(), 2);
+
+        let second = AppEngine::process_message(
+            &mut app,
+            "what did I say?",
+            Vec::new(),
+            InputSource::Http,
+            None,
+        )
+        .await
+        .expect("second http message");
+        assert!(second.response.contains("You said remember cats"));
+        assert_eq!(app.conversation_history.len(), 4);
+    }
+
     #[tokio::test]
     async fn process_message_reports_token_counts() {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: test_router(),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -1894,6 +3136,12 @@ mod tests {
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
+            bus_receiver: None,
         };
 
         let result = app.process_message("hello").await.expect("process message");
@@ -1908,8 +3156,10 @@ mod tests {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
             router: test_router(),
+            runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -1927,6 +3177,12 @@ mod tests {
                 .with_intervals(1, 1),
             ),
             config_manager: None,
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+            error_history: VecDeque::new(),
+            bus_receiver: None,
         };
 
         app.process_message("hello")
@@ -2042,73 +3298,34 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("prompt.md");
         std::fs::write(&path, "from file").expect("write");
-        let prompt = resolve_system_prompt(Some("inline".to_string()), Some(&path));
+        let prompt = resolve_system_prompt(Some("inline".to_string()), Some(&path), dir.path());
         assert_eq!(prompt.as_deref(), Some("inline"));
     }
 
     #[test]
-    fn new_falls_back_to_config_default_model() {
-        let mut config = FawxConfig::default();
-        config.model.default_model = Some("test-model-fallback".to_string());
+    fn new_appends_context_files_to_system_prompt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(data_dir.join("context")).expect("context dir");
+        std::fs::write(data_dir.join("context").join("SOUL.md"), "be helpful")
+            .expect("write context");
 
-        let deps = HeadlessAppDeps {
-            loop_engine: test_engine(),
-            router: Arc::new(ModelRouter::new()),
-            config,
-            memory: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: None,
-            subagent_manager: new_disabled_subagent_manager(),
-            canary_monitor: None,
-        };
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(data_dir);
+
+        let mut deps = headless_deps(static_model_router(&["test-model"]), config);
+        deps.system_prompt_text = Some("base prompt".to_string());
 
         let app = HeadlessApp::new(deps).expect("should build");
-        // Router has no providers so set_active will fail, but the
-        // active_model string should still be populated from config.
-        assert_eq!(app.active_model, "test-model-fallback");
+        let prompt = app.custom_system_prompt.clone().expect("system prompt");
+
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("--- SOUL.md ---\nbe helpful\n"));
     }
 
     #[test]
-    fn new_uses_router_model_over_config_default() {
-        use fx_llm::{
-            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
-            ProviderCapabilities, ProviderError,
-        };
-
-        #[derive(Debug)]
-        struct FakeProvider;
-
-        #[async_trait]
-        impl CompletionProvider for FakeProvider {
-            async fn complete(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionResponse, ProviderError> {
-                unimplemented!()
-            }
-            async fn complete_stream(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionStream, ProviderError> {
-                unimplemented!()
-            }
-            fn name(&self) -> &str {
-                "fake"
-            }
-            fn supported_models(&self) -> Vec<String> {
-                vec!["router-model".to_string()]
-            }
-            fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities {
-                    supports_temperature: false,
-                    requires_streaming: false,
-                }
-            }
-        }
-
-        let mut router = ModelRouter::new();
-        router.register_provider(Box::new(FakeProvider));
+    fn new_uses_available_config_default_model() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
         router
             .set_active("router-model")
             .expect("set active should work");
@@ -2116,21 +3333,176 @@ mod tests {
         let mut config = FawxConfig::default();
         config.model.default_model = Some("config-model".to_string());
 
-        let deps = HeadlessAppDeps {
-            loop_engine: test_engine(),
-            router: Arc::new(router),
-            config,
-            memory: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: None,
-            subagent_manager: new_disabled_subagent_manager(),
-            canary_monitor: None,
-        };
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
 
-        let app = HeadlessApp::new(deps).expect("should build");
-        // Router's explicit model wins over config default.
-        assert_eq!(app.active_model, "router-model");
+        assert_eq!(app.active_model, "config-model");
+        assert_eq!(app.router.active_model(), Some("config-model"));
+    }
+
+    #[test]
+    fn active_model_remains_set_after_router_arc_is_cloned() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("config-model".to_string());
+
+        let active_model = resolve_active_model(&router, &config).expect("resolve active model");
+        router
+            .set_active(&active_model)
+            .expect("set active before Arc sharing");
+
+        let router = Arc::new(router);
+        let cloned_router = Arc::clone(&router);
+
+        assert_eq!(router.active_model(), Some("config-model"));
+        assert_eq!(cloned_router.active_model(), Some("config-model"));
+    }
+
+    #[test]
+    fn new_falls_back_when_config_default_model_is_unavailable() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("missing-model".to_string());
+
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(router, config)).expect("should build")
+        });
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert!(
+            logs.contains("configured default_model 'missing-model' not available, falling back")
+        );
+        assert!(logs.contains("error=model not found: missing-model"));
+    }
+
+    #[test]
+    fn new_treats_empty_config_default_model_like_none() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some(String::new());
+
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(router, config)).expect("should build")
+        });
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert!(logs.is_empty(), "unexpected warnings: {logs}");
+    }
+
+    #[test]
+    fn sync_headless_model_from_config_updates_active_model() {
+        let mut router = static_model_router(&["old-model", "new-model"]);
+        router.set_active("old-model").expect("set active");
+        let mut app = headless_app_with_router(router, "old-model");
+
+        sync_headless_model_from_config(&mut app, Some("new-model".to_string())).expect("sync");
+
+        assert_eq!(app.active_model, "new-model");
+        assert_eq!(app.router.active_model(), Some("new-model"));
+    }
+
+    #[test]
+    fn sync_headless_model_from_config_falls_back_gracefully() {
+        let mut router = static_model_router(&["old-model", "new-model"]);
+        router.set_active("old-model").expect("set active");
+        let mut app = headless_app_with_router(router, "old-model");
+
+        let (_, logs) = with_warn_logs(|| {
+            sync_headless_model_from_config(&mut app, Some("missing-model".to_string()))
+                .expect("sync");
+        });
+
+        assert_eq!(app.active_model, "old-model");
+        assert_eq!(app.router.active_model(), Some("old-model"));
+        assert!(
+            logs.contains("configured default_model 'missing-model' not available, falling back")
+        );
+    }
+
+    #[test]
+    fn new_uses_first_available_model_when_config_default_missing() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let config = FawxConfig::default();
+
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+    }
+
+    #[test]
+    fn new_overrides_preselected_router_model_with_config_default_model() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
+        router
+            .set_active("router-model")
+            .expect("set active should work");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("config-model".to_string());
+
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
+
+        assert_eq!(app.active_model, "config-model");
+        assert_eq!(app.router.active_model(), Some("config-model"));
+    }
+
+    #[test]
+    fn new_returns_clear_error_when_no_models_are_available() {
+        let result = HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()));
+        assert!(result.is_err(), "should fail without any models");
+
+        let error = result.err().expect("missing error");
+        assert_eq!(
+            error.to_string(),
+            "no models available in router; configure a provider and authenticate it before starting headless mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_sends_status_to_parent() {
+        let store = BusStore::new(fx_storage::Storage::open_in_memory().expect("in-memory bus"));
+        let bus = SessionBus::new(store);
+        let parent_key = SessionKey::new("parent-session").expect("parent key");
+        let mut parent_receiver = bus.subscribe(&parent_key);
+        let factory = HeadlessSubagentFactory::new(HeadlessSubagentFactoryDeps {
+            router: test_router(),
+            config: FawxConfig::default(),
+            improvement_provider: None,
+            session_bus: Some(bus.clone()),
+        });
+        let app = factory
+            .build_app(&SpawnConfig::new("report status"), CancellationToken::new())
+            .expect("build app");
+        let child_key = app.session_key.clone().expect("child session key");
+        let result = app
+            .session_bus()
+            .expect("child session bus")
+            .send(Envelope::new(
+                Some(child_key.clone()),
+                parent_key.clone(),
+                Payload::StatusUpdate {
+                    task_id: "task-1".to_string(),
+                    progress: "50%".to_string(),
+                },
+            ))
+            .await
+            .expect("send status");
+        let envelope = tokio::time::timeout(Duration::from_secs(1), parent_receiver.recv())
+            .await
+            .expect("status update should arrive")
+            .expect("parent receiver should stay open");
+
+        assert!(result.delivered);
+        assert_eq!(envelope.from, Some(child_key));
+        assert_eq!(envelope.to, parent_key);
+        assert_eq!(
+            envelope.payload,
+            Payload::StatusUpdate {
+                task_id: "task-1".to_string(),
+                progress: "50%".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2139,6 +3511,7 @@ mod tests {
             router: Arc::new(ModelRouter::new()),
             config: FawxConfig::default(),
             improvement_provider: None,
+            session_bus: None,
         };
         let factory = HeadlessSubagentFactory::new(deps);
         let debug = format!("{factory:?}");

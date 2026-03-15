@@ -15,7 +15,7 @@ struct CalculatorResponse {
     expression: String,
 }
 
-/// Host API imports — linked to the "host_api_v1" WASM import module.
+// Host API imports — linked to the "host_api_v1" WASM import module.
 #[link(wasm_import_module = "host_api_v1")]
 extern "C" {
     #[link_name = "log"]

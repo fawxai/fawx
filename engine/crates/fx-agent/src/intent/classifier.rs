@@ -288,6 +288,7 @@ mod tests {
             source: fx_core::types::InputSource::Text,
             timestamp: 1234567890,
             context_id: None,
+            images: Vec::new(),
         }
     }
 

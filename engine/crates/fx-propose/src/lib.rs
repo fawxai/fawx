@@ -166,6 +166,58 @@ pub(crate) fn format_proposal(proposal: &Proposal) -> String {
     )
 }
 
+const ORIGINAL_HEADER_PREFIX: &str = "--- original (";
+const PROPOSED_HEADER_PREFIX: &str = "--- proposed (";
+const HEADER_SUFFIX: &str = " bytes) ---";
+
+#[must_use]
+pub fn build_proposal_content(original: Option<&str>, proposed: &str) -> String {
+    match original {
+        Some(content) => format!(
+            "{ORIGINAL_HEADER_PREFIX}{}{}\n{}\n{PROPOSED_HEADER_PREFIX}{}{}\n{}",
+            content.len(),
+            HEADER_SUFFIX,
+            content,
+            proposed.len(),
+            HEADER_SUFFIX,
+            proposed
+        ),
+        None => proposed.to_string(),
+    }
+}
+
+#[must_use]
+pub fn extract_proposed_content(content: &str) -> String {
+    split_proposal_content(content)
+        .map(|(_, proposed)| proposed)
+        .unwrap_or_else(|| content.to_string())
+}
+
+#[must_use]
+pub fn split_proposal_content(content: &str) -> Option<(String, String)> {
+    let (original_len, rest) = parse_content_header(content, ORIGINAL_HEADER_PREFIX)?;
+    let rest = rest.strip_prefix('\n')?;
+    let original = rest.get(..original_len)?;
+    let rest = rest.get(original_len..)?.strip_prefix('\n')?;
+    let (proposed_len, rest) = parse_content_header(rest, PROPOSED_HEADER_PREFIX)?;
+    let rest = rest.strip_prefix('\n')?;
+    if rest.len() != proposed_len {
+        return None;
+    }
+    Some((original.to_string(), rest.to_string()))
+}
+
+fn parse_content_header<'a>(content: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+    let newline = content.find('\n')?;
+    let header = content.get(..newline)?;
+    let length = header
+        .strip_prefix(prefix)?
+        .strip_suffix(HEADER_SUFFIX)?
+        .parse::<usize>()
+        .ok()?;
+    Some((length, content.get(newline..)?))
+}
+
 fn proposal_fence(content: &str) -> String {
     let longest_run = content.lines().map(longest_backtick_run).max().unwrap_or(0);
     "`".repeat((longest_run + 1).max(3))
@@ -255,6 +307,21 @@ mod tests {
             timestamp: 1_710_000_000,
             file_hash: Some("sha256:abcdef1234".to_string()),
         }
+    }
+
+    #[test]
+    fn proposal_content_round_trips_original_and_proposed_sections() {
+        let content = build_proposal_content(Some("old = true\n"), "new = true\n");
+        let (original, proposed) = split_proposal_content(&content).expect("split content");
+
+        assert_eq!(original, "old = true\n");
+        assert_eq!(proposed, "new = true\n");
+        assert_eq!(extract_proposed_content(&content), "new = true\n");
+    }
+
+    #[test]
+    fn extract_proposed_content_leaves_raw_content_unchanged() {
+        assert_eq!(extract_proposed_content("plain text"), "plain text");
     }
 
     #[test]

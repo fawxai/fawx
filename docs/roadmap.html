@@ -48,6 +48,20 @@
     .feature-list .planned { color: var(--charcoal-muted); flex-shrink: 0; }
     .divider { border: none; border-top: 1px solid var(--orange-100); margin: 0; }
     @media (prefers-color-scheme: dark) { .divider { border-top-color: #44403C; } }
+
+    details.phase-collapsible { margin-bottom: 48px; }
+    details.phase-collapsible summary { cursor: pointer; list-style: none; }
+    details.phase-collapsible summary::-webkit-details-marker { display: none; }
+    details.phase-collapsible summary::marker { display: none; content: ""; }
+    details.phase-collapsible summary .phase-header { position: relative; }
+    details.phase-collapsible summary .phase-header::after {
+      content: "▸"; font-size: 0.9rem; color: var(--charcoal-muted);
+      position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+      transition: transform 0.2s;
+    }
+    details.phase-collapsible[open] summary .phase-header::after {
+      transform: translateY(-50%) rotate(90deg);
+    }
   </style>
 </head>
 <body>
@@ -59,11 +73,13 @@
 
   <div class="timeline">
 
-    <div class="phase">
+    <details class="phase-collapsible">
+      <summary>
       <div class="phase-header">
         <span class="phase-badge badge-shipped">Shipped</span>
         <h2 class="phase-title">Core Engine</h2>
       </div>
+      </summary>
       <p class="phase-desc">Single Rust binary. Agentic loop with tool calling, memory, and multi-provider support.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> 7-step agentic loop with multi-tool calls</li>
@@ -71,33 +87,43 @@
         <li><span class="check">✓</span> Persistent memory with semantic search</li>
         <li><span class="check">✓</span> Multi-provider (Claude, GPT, local models)</li>
         <li><span class="check">✓</span> Encrypted credential store (AES-256-GCM)</li>
-        <li><span class="check">✓</span> Config management with hot-reload</li>
+        <li><span class="check">✓</span> Config management with hot-reload (SIGHUP restart)</li>
         <li><span class="check">✓</span> Token-by-token streaming over SSE</li>
+        <li><span class="check">✓</span> Reflective memory (fx-journal crate)</li>
+        <li><span class="check">✓</span> Conversation compaction (sliding window + LLM summarization)</li>
       </ul>
-    </div>
+    </details>
     <hr class="divider">
 
-    <div class="phase">
+    <details class="phase-collapsible">
+      <summary>
       <div class="phase-header">
         <span class="phase-badge badge-shipped">Shipped</span>
         <h2 class="phase-title">TUI + Multi-Channel</h2>
       </div>
+      </summary>
       <p class="phase-desc">Terminal UI (ratatui), Telegram bot, HTTP API. Same engine, same memory, different surfaces.</p>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Full terminal UI with streaming and markdown</li>
-        <li><span class="check">✓</span> Telegram bot channel</li>
-        <li><span class="check">✓</span> HTTP API (headless mode)</li>
-        <li><span class="check">✓</span> Interactive setup wizard</li>
+        <li><span class="check">✓</span> Full terminal UI with streaming, markdown, and tool rendering</li>
+        <li><span class="check">✓</span> Telegram bot channel with image support</li>
+        <li><span class="check">✓</span> Webhook channel for external integrations</li>
+        <li><span class="check">✓</span> HTTP API (headless mode, dual-bind localhost + Tailscale)</li>
+        <li><span class="check">✓</span> Interactive setup wizard with credential store + permission presets</li>
         <li><span class="check">✓</span> Model switching mid-conversation</li>
+        <li><span class="check">✓</span> Multi-session management</li>
+        <li><span class="check">✓</span> OAuth + API key + setup token authentication flows</li>
+        <li><span class="check">✓</span> CronSkill registered in startup (TUI + HTTP parity)</li>
       </ul>
-    </div>
+    </details>
     <hr class="divider">
 
-    <div class="phase">
+    <details class="phase-collapsible">
+      <summary>
       <div class="phase-header">
         <span class="phase-badge badge-shipped">Shipped</span>
         <h2 class="phase-title">Kernel Safety Architecture</h2>
       </div>
+      </summary>
       <p class="phase-desc">Hard kernel/loadable separation. Compiled safety invariants that the agent cannot modify.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> Proposal gates (human approval for writes)</li>
@@ -105,22 +131,108 @@
         <li><span class="check">✓</span> Tool execution sandbox</li>
         <li><span class="check">✓</span> Retry budget and loop guards</li>
         <li><span class="check">✓</span> Memory decay and boundary enforcement</li>
+        <li><span class="check">✓</span> Permission presets (Power / Cautious / Experimental)</li>
       </ul>
-    </div>
+    </details>
     <hr class="divider">
 
-    <div class="phase">
+    <details class="phase-collapsible">
+      <summary>
       <div class="phase-header">
         <span class="phase-badge badge-shipped">Shipped</span>
         <h2 class="phase-title">WASM Skill Plugins</h2>
       </div>
+      </summary>
       <p class="phase-desc">Hot-loadable WebAssembly skills with cryptographic signature verification.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> WASI runtime with sandboxing</li>
         <li><span class="check">✓</span> Ed25519 signature verification</li>
         <li><span class="check">✓</span> Hot-reload without restart</li>
-        <li><span class="check">✓</span> Skill creation CLI</li>
-        <li><span class="check">✓</span> Marketplace skills: weather, vision, TTS, browser</li>
+        <li><span class="check">✓</span> Skill creation CLI (`fawx skill create`)</li>
+        <li><span class="check">✓</span> Marketplace skills: weather, TTS, calculator, GitHub</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Goal-agnostic experimentation that works end-to-end.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Core protocol engine (fx-consensus crate, 74+ tests)</li>
+        <li><span class="check">✓</span> Orchestrator with cross-evaluation and safety gates</li>
+        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
+        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
+        <li><span class="check">✓</span> Subagent-driven nodes (full Fawx agents as experiment nodes)</li>
+        <li><span class="check">✓</span> Experiment tool callable from chat and channels</li>
+        <li><span class="check">✓</span> Post-hoc build verification with retry</li>
+        <li><span class="check">✓</span> Recursive learning (chain history feeds into prompts)</li>
+        <li><span class="check">✓</span> Auto-chain iterative refinement (--max-rounds)</li>
+        <li><span class="check">✓</span> Canonical chain hashing with legacy fallback</li>
+        <li><span class="check">✓</span> Cargo-scoped evaluation (-p target crate only)</li>
+        <li><span class="check">✓</span> Candidate patch persistence in chain</li>
+        <li><span class="check">✓</span> Sequential node execution (--sequential)</li>
+        <li><span class="check">✓</span> Diagnostics (--detail, --raw)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Experiment UX</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Live progress streaming to every surface. Channel-appropriate rendering: side panel in TUI, edit_message on Telegram.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Verbose mode with progress callbacks (--verbose)</li>
+        <li><span class="check">✓</span> TUI side panel with live experiment progress (70/30 split)</li>
+        <li><span class="check">✓</span> Telegram edit_message progress updates (mpsc bridge)</li>
+        <li><span class="check">✓</span> Remote evaluation via SSH (--eval-node, cross-machine)</li>
+        <li><span class="check">✓</span> Progress callback wired through FawxToolExecutor</li>
+        <li><span class="check">✓</span> TUI experiment panel widget with auto-hide</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Distributed Fleet</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Tailnet-only distributed fleet. Token-based auth, fleet management CLI, worker registration across machines.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Fleet signing key (HMAC-SHA256) + bearer tokens</li>
+        <li><span class="check">✓</span> FleetManager with file persistence (nodes.json, tokens.json)</li>
+        <li><span class="check">✓</span> Fleet CLI: fawx fleet init / add / remove / list</li>
+        <li><span class="check">✓</span> Secure file permissions (0600) + atomic persist</li>
+        <li><span class="check">✓</span> Node registry with capability-based routing</li>
+        <li><span class="check">✓</span> HTTP fleet endpoints (register, heartbeat, result)</li>
+        <li><span class="check">✓</span> Worker join flow (fawx fleet join — tested MacBook → Mac Mini over Tailscale, confirmed working 2026-03-13)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Agent Foundation — Migration Readiness</h2>
+      </div>
+      <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, cross-session communication, device pairing, and scheduled tasks.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Context compaction w/ memory flush — SHIPPED (JournalCompactionFlush)</li>
+        <li><span class="check">✓</span> Error surfacing — startup warnings, SSE error emission, /v1/errors/recent endpoint — StreamEvent::Error exists, but async failures still need to surface to users instead of being swallowed</li>
+        <li><span class="check">✓</span> Cross-session messaging — SHIPPED (fx-bus crate)</li>
+        <li><span class="check">✓</span> Device pairing — SHIPPED (fawx pair, fawx devices, /v1/devices endpoints)</li>
+        <li><span class="check">✓</span> Cron / scheduled tasks — SHIPPED (fx-cron crate merged, 7 HTTP endpoints, 6 agent tools, CronSkill registered in startup)</li>
+        <li><span class="planned">○</span> Fleet worker mode — serve --fleet for distributed task execution</li>
       </ul>
     </div>
     <hr class="divider">
@@ -128,21 +240,61 @@
     <div class="phase">
       <div class="phase-header">
         <span class="phase-badge badge-building">Building</span>
-        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+        <h2 class="phase-title">Native GUI (macOS + iOS)</h2>
       </div>
-      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Goal-agnostic experimentation.</p>
+      <p class="phase-desc">Swift native app for macOS and iOS. Phases 1-3 complete (chat client). Phase 4 (self-contained install) and Phase 5 (full TUI parity) specs approved and merged. Codex builds SwiftUI, engine team builds backend endpoints.</p>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">SwiftUI App</h3>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Core protocol (fx-consensus crate, 62+ tests)</li>
-        <li><span class="check">✓</span> Protocol engine + orchestrator + cross-evaluation</li>
-        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
-        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
-        <li><span class="check">✓</span> Subagent-driven nodes (full Fawx agents)</li>
-        <li><span class="check">✓</span> Experiment tool in agentic loop</li>
-        <li><span class="wip">◐</span> Diagnostics (--detail, --raw)</li>
-        <li><span class="wip">◐</span> Agent-aware prompts (read before patch)</li>
-        <li><span class="planned">○</span> Candidate patch persistence in chain</li>
-        <li><span class="planned">○</span> TUI side panel with live progress</li>
-        <li><span class="planned">○</span> Canonical chain serialization</li>
+        <li><span class="check">✓</span> Phase 1: Project setup, networking (FawxClient + SSE), onboarding, basic chat</li>
+        <li><span class="check">✓</span> Phase 2: Markdown rendering, session management, model/thinking pickers, code blocks</li>
+        <li><span class="check">✓</span> Phase 3: Skills browser, settings, error handling, iOS adaptations, keyboard shortcuts</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 4: Self-Contained Install — Spec Approved (#1406)</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Notarized DMG distribution (not App Store)</li>
+        <li><span class="planned">○</span> Setup wizard — skippable, non-destructive, re-enterable from Settings</li>
+        <li><span class="planned">○</span> Tailscale-first networking with auto HTTPS via tailscale cert</li>
+        <li><span class="planned">○</span> LaunchAgent daemon — GUI is just a client + manager</li>
+        <li><span class="planned">○</span> Menu bar status icon (start/stop/restart)</li>
+        <li><span class="planned">○</span> iPhone QR code pairing</li>
+        <li><span class="planned">○</span> 13 new backend endpoints (setup, auth management, config presets, pairing)</li>
+        <li><span class="planned">○</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
+        <li><span class="planned">○</span> <strong>RE tool deny list</strong> — block strings/objdump/otool targeting binary</li>
+        <li><span class="planned">○</span> <strong>Error sanitization</strong> — strip module paths and enum names from agent-facing errors</li>
+        <li><span class="planned">○</span> <strong>Panic sanitization</strong> — panic=abort, strip location detail in release builds</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Spec Approved (#1407)</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Proposal gate — inline permission prompts + modal diff viewer</li>
+        <li><span class="planned">○</span> <strong>Proposal gate hardening</strong> — risk-tiered UX, two-step for sensitive ops, anti-batch bypass, escalation detection</li>
+        <li><span class="planned">○</span> Permission system — per-tool settings in Skills menu + global overview</li>
+        <li><span class="planned">○</span> OpenAI PKCE OAuth (ChatGPT subscription login)</li>
+        <li><span class="planned">○</span> Remote VPS pairing via existing pairing code system</li>
+        <li><span class="planned">○</span> Skill marketplace install/remove (signed skills only)</li>
+        <li><span class="planned">○</span> Skill building by Fawx (auto-signed)</li>
+        <li><span class="planned">○</span> <strong>WASM security hardening</strong> — default-deny capabilities, network domain allowlist, resource limits, host boundary fuzzing</li>
+        <li><span class="planned">○</span> Cost tracking + synthesis/custom instructions</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments + Telemetry (post-publish)</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Fleet dashboard — node health, task dispatch, workload visualization</li>
+        <li><span class="planned">○</span> Experiment monitor — run/chain/scores/tournament</li>
+        <li><span class="planned">○</span> <strong>Behavioral telemetry</strong> — opt-in anonymous signals, granular consent, differential privacy aggregation</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> EULA, Terms of Service, Privacy Policy</li>
+        <li><span class="planned">○</span> TestFlight distribution</li>
+        <li><span class="planned">○</span> App icon + branding</li>
+        <li><span class="planned">○</span> Sparkle auto-updater (with signature verification — security-critical)</li>
+        <li><span class="planned">○</span> <strong>Binary hardening</strong> — symbol stripping, panic location removal, release profile hardening</li>
+        <li><span class="planned">○</span> <strong>Open source launch</strong> — skill SDK, marketplace protocol, channel traits, docs site (Apache 2.0)</li>
+        <li><span class="planned">○</span> fawx.ai download page</li>
       </ul>
     </div>
     <hr class="divider">
@@ -150,16 +302,39 @@
     <div class="phase">
       <div class="phase-header">
         <span class="phase-badge badge-planned">Planned</span>
-        <h2 class="phase-title">Distributed Fleet</h2>
+        <h2 class="phase-title">Fleet Task Execution</h2>
       </div>
-      <p class="phase-desc">Experiments across multiple machines. Node registry, task distribution, remote evaluation.</p>
+      <p class="phase-desc">Distributed task dispatch. Workers receive and execute tasks from the primary, report results. Fleet-aware experiment scheduling.</p>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Fleet primitives: Channel, NodeRegistry, TaskRouter</li>
-        <li><span class="check">✓</span> SSH transport for remote commands</li>
-        <li><span class="check">✓</span> Subagent spawning and lifecycle</li>
-        <li><span class="planned">○</span> Fleet-aware experiment node placement</li>
-        <li><span class="planned">○</span> Cross-machine evaluation</li>
-        <li><span class="planned">○</span> Binary rollback via ripcord</li>
+        <li><span class="planned">○</span> Worker mode (fawx serve --fleet)</li>
+        <li><span class="planned">○</span> Task dispatch over Tailscale HTTP</li>
+        <li><span class="planned">○</span> Heartbeat monitoring + health checks</li>
+        <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)
+          <ul>
+            <li><strong>Security note:</strong> GitHub PATs with <code>contents:write</code> can merge PRs, not just push branches. When implementing PAT sharing to subagents/workers:
+              <br>① Branch protection on <code>staging</code> + <code>main</code> — require review from repo owner before merge (GitHub-level enforcement, not policy)
+              <br>② Fine-grained PAT scoped to fawx repo only (limits blast radius)
+              <br>③ No <code>administration</code> permission on the PAT (prevents subagents from weakening branch protection)
+              <br>④ Result: subagents can push branches + create PRs + comment, but cannot merge to protected branches without owner review approval. <code>dev</code> stays open for automated pipeline.
+            </li>
+          </ul>
+        </li>
+        <li><span class="planned">○</span> Fleet-aware experiment scheduling (--fleet flag)</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Self-Improving Fleet Coordination</h2>
+      </div>
+      <p class="phase-desc">Hybrid DAG decomposition + linear refinement chains. Git IS the version control — branches are decomposition, commits are chains, PRs are proposals, merges are composition.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Cross-branch tournament scoring</li>
+        <li><span class="planned">○</span> Auto-decomposition (break complex problems into subtasks)</li>
+        <li><span class="planned">○</span> Semantic merge validation</li>
+        <li><span class="planned">○</span> Fitness backpropagation (scores flow back to inform decomposition)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -173,7 +348,7 @@
       <ul class="feature-list">
         <li><span class="planned">○</span> BitNet provider (1-bit LLM on CPU)</li>
         <li><span class="planned">○</span> Model download + setup wizard</li>
-        <li><span class="planned">○</span> Hardware-aware kernel selection</li>
+        <li><span class="planned">○</span> Hardware-aware model selection</li>
         <li><span class="planned">○</span> Continuous local experimentation</li>
       </ul>
     </div>
@@ -186,10 +361,42 @@
       </div>
       <p class="phase-desc">Recursive improvement: experiments generate training data, fine-tune the local model, better model runs better experiments.</p>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Training data curation from winners</li>
+        <li><span class="planned">○</span> Training data curation from chain winners</li>
         <li><span class="planned">○</span> LoRA fine-tuning orchestration</li>
         <li><span class="planned">○</span> Model evaluation as fitness criterion</li>
         <li><span class="planned">○</span> Signed adapter deployment via chain</li>
+      </ul>
+    </div>
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Android — Embedded Engine</h2>
+      </div>
+      <p class="phase-desc">Fawx engine running on Android devices. No root required — engine runs inside the app as a foreground service. Connect from any client on the Tailnet.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Cross-compile engine to aarch64-linux-android</li>
+        <li><span class="planned">○</span> Embedded engine as Android foreground service</li>
+        <li><span class="planned">○</span> Jetpack Compose UI (mirroring SwiftUI app)</li>
+        <li><span class="planned">○</span> App-first setup (no terminal required)</li>
+        <li><span class="planned">○</span> Localhost HTTP API binding</li>
+        <li><span class="planned">○</span> Tailscale fleet integration from phone</li>
+      </ul>
+    </div>
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Fawx OS — AOSP Fork</h2>
+      </div>
+      <p class="phase-desc">A phone OS where the AI is the operating system, not an app. Custom AOSP fork with Fawx as a first-class system service, purpose-built launcher, root by default.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> AOSP fork with Fawx system service</li>
+        <li><span class="planned">○</span> Custom launcher — AI is the home screen</li>
+        <li><span class="planned">○</span> Root by default, no bootloader dance</li>
+        <li><span class="planned">○</span> Pixel device support (reference hardware)</li>
+        <li><span class="planned">○</span> On-device local model support (GPU inference)</li>
+        <li><span class="planned">○</span> OTA updates with signed builds</li>
       </ul>
     </div>
 

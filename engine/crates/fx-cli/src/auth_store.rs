@@ -121,7 +121,7 @@ impl AuthStore {
     }
 
     /// Store a provider token under the `<provider>_token` key.
-    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    #[allow(dead_code)] // Used by binary-only setup/auth command flows
     pub fn store_provider_token(&self, provider: &str, token: &str) -> Result<(), String> {
         let store = self.open_store()?;
         let key = provider_token_key(provider);
@@ -135,7 +135,6 @@ impl AuthStore {
     /// Returns the token wrapped in [`Zeroizing`] so it is automatically
     /// zeroed when dropped, preventing secret material from lingering in
     /// memory.
-    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn get_provider_token(&self, provider: &str) -> Result<Option<Zeroizing<String>>, String> {
         let store = self.open_store()?;
         let key = provider_token_key(provider);
@@ -171,6 +170,14 @@ impl AuthStore {
         providers.sort();
         providers.dedup();
         Ok(providers)
+    }
+}
+
+#[cfg(feature = "http")]
+impl fx_api::token::BearerTokenStore for AuthStore {
+    fn get_provider_token(&self, provider: &str) -> Result<Option<String>, String> {
+        AuthStore::get_provider_token(self, provider)
+            .map(|token| token.map(|token| token.to_string()))
     }
 }
 

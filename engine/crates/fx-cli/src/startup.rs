@@ -1,17 +1,21 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::headless::StartupWarning;
 use crate::helpers::{format_memory_for_prompt, thinking_config_from_budget};
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use fx_analysis::AnalysisError;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
+use fx_bus::{BusStore, SessionBus};
 use fx_config::manager::ConfigManager;
 use fx_config::{
     parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
 };
+use fx_consensus::ProgressCallback;
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::EventBus;
+use fx_embeddings::EmbeddingModel;
 use fx_fleet::{NodeRegistry, NodeTransport, SshTransport};
 use fx_journal::JournalSkill;
 use fx_kernel::act::ToolExecutor;
@@ -19,19 +23,23 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
-use fx_kernel::{CachingExecutor, ProposalGateExecutor, ProposalGateState};
+use fx_kernel::ErrorCategory;
+use fx_kernel::{
+    CachingExecutor, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+};
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
 use fx_loadable::{SignaturePolicy, SkillRegistry, TransactionSkill};
+use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_subagent::SubagentControl;
 use fx_tools::{
-    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, NodeRunState,
-    SessionToolsSkill, ToolConfig,
+    BuiltinToolsSkill, ExperimentToolState, FawxToolExecutor, GitSkill, ImprovementToolsState,
+    NodeRunState, SessionToolsSkill, ToolConfig,
 };
 use std::fmt;
 use std::fs;
@@ -68,7 +76,17 @@ const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-opus-4-20250514",
     "claude-sonnet-4-20250514",
 ];
-const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
+const DEFAULT_OPENAI_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "o3",
+    "o4-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-mini",
+];
 const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
     &["gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "o4-mini"];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
@@ -84,6 +102,26 @@ const LOG_FILE_PREFIX: &str = "fawx";
 const LOG_FILE_SUFFIX: &str = "log";
 
 pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+pub(crate) type SharedEmbeddingIndex = Arc<Mutex<EmbeddingIndex>>;
+
+#[derive(Clone)]
+pub struct EmbeddingIndexPersistence {
+    pub index: SharedEmbeddingIndex,
+    pub path: PathBuf,
+}
+
+impl EmbeddingIndexPersistence {
+    pub fn save_if_dirty(&self) -> Result<(), String> {
+        let guard = self
+            .index
+            .lock()
+            .map_err(|error| format!("embedding index lock poisoned: {error}"))?;
+        if !guard.is_dirty() {
+            return Ok(());
+        }
+        guard.save(&self.path).map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoggingMode {
@@ -263,7 +301,7 @@ fn resolve_file_logging(config: &LoggingConfig, mode: LoggingMode) -> bool {
         .unwrap_or(matches!(mode, LoggingMode::Serve))
 }
 
-fn resolve_log_dir(config: &LoggingConfig) -> PathBuf {
+pub(crate) fn resolve_log_dir(config: &LoggingConfig) -> PathBuf {
     config
         .log_dir
         .as_deref()
@@ -304,6 +342,7 @@ fn build_loop_engine_bundle() -> LoopEngineBundle {
 pub struct LoopEngineBundle {
     pub engine: LoopEngine,
     pub memory: Option<SharedMemoryStore>,
+    pub embedding_index_persistence: Option<EmbeddingIndexPersistence>,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
@@ -314,6 +353,8 @@ pub struct LoopEngineBundle {
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     /// Signature policy loaded once at startup, shared with skill watcher.
     pub signature_policy: SignaturePolicy,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub startup_warnings: Vec<StartupWarning>,
 }
 
 #[derive(Clone, Default)]
@@ -323,6 +364,9 @@ pub struct HeadlessLoopBuildOptions {
     pub subagent_control: Option<Arc<dyn SubagentControl>>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub cancel_token: Option<CancellationToken>,
+    pub experiment_progress: Option<ProgressCallback>,
+    pub session_registry: Option<fx_session::SessionRegistry>,
+    pub session_bus: Option<SessionBus>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -333,6 +377,9 @@ impl HeadlessLoopBuildOptions {
             subagent_control: Some(subagent_control),
             config_manager: None,
             cancel_token: None,
+            experiment_progress: None,
+            session_registry: None,
+            session_bus: None,
         }
     }
 
@@ -343,6 +390,9 @@ impl HeadlessLoopBuildOptions {
             subagent_control: None,
             config_manager: None,
             cancel_token: Some(cancel_token),
+            experiment_progress: None,
+            session_registry: None,
+            session_bus: None,
         }
     }
 }
@@ -353,6 +403,9 @@ struct SkillRegistryBuildOptions {
     memory_enabled: bool,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    experiment_progress: Option<ProgressCallback>,
+    session_registry: Option<fx_session::SessionRegistry>,
+    session_bus: Option<SessionBus>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -445,11 +498,18 @@ fn build_loop_engine_with_options(
     if let Some(thinking) = thinking_config_from_budget(&thinking_budget) {
         builder = builder.thinking_config(thinking);
     }
+    if let Some(journal) = &skills.journal {
+        builder = builder.memory_flush(Arc::new(fx_journal::JournalCompactionFlush::new(
+            Arc::clone(journal),
+        ))
+            as Arc<dyn fx_kernel::conversation_compactor::CompactionMemoryFlush>);
+    }
 
     let engine = build_loop_engine_from_builder(builder)?;
     Ok(LoopEngineBundle {
         engine,
         memory: skills.memory,
+        embedding_index_persistence: skills.embedding_index_persistence,
         runtime_info: skills.runtime_info,
         event_bus,
         scratchpad: skills.scratchpad,
@@ -459,6 +519,8 @@ fn build_loop_engine_with_options(
         credential_store: skills.credential_store,
         config_manager: options.config_manager.clone(),
         signature_policy: skills.signature_policy,
+        cron_store: skills.cron_store,
+        startup_warnings: skills.startup_warnings,
     })
 }
 
@@ -474,7 +536,14 @@ fn build_skill_registry_options(
         memory_enabled: options.memory_enabled,
         subagent_control: options.subagent_control.clone(),
         config_manager: options.config_manager.clone(),
+        experiment_progress: options.experiment_progress.clone(),
+        session_registry: options.session_registry.clone(),
+        session_bus: options.session_bus.clone(),
     }
+}
+
+pub fn open_session_registry(data_dir: &Path) -> Option<fx_session::SessionRegistry> {
+    fx_session::SessionRegistry::open(&data_dir.join("sessions.redb"))
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, StartupError> {
@@ -515,26 +584,88 @@ impl ScratchpadProvider for ScratchpadBridge {
     }
 }
 
-/// Bridges the encrypted credential store to the [`CredentialProvider`]
-/// trait so WASM skills can retrieve secrets via `kv_get`.
+/// Bridges stored auth and encrypted skill credentials into the
+/// [`CredentialProvider`] trait so WASM skills can retrieve secrets via
+/// `kv_get`.
 ///
-/// Maps well-known key names to credential store lookups:
-/// - `"github_token"` → GitHub PAT from the encrypted store
+/// Well-known mappings:
+/// - `"openai_api_key"` → OpenAI API key from the auth manager
+/// - `"anthropic_api_key"` → Anthropic API key from the auth manager
+/// - `"github_token"` → GitHub PAT from the credential store
+///
+/// Unknown keys fall back to generic encrypted skill credentials.
 struct CredentialStoreBridge {
+    data_dir: PathBuf,
     store: Arc<fx_auth::credential_store::EncryptedFileCredentialStore>,
+}
+
+impl CredentialStoreBridge {
+    fn well_known_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        match key {
+            "openai_api_key" => self.auth_api_key("openai"),
+            "anthropic_api_key" => self.auth_api_key("anthropic"),
+            "github_token" => self.github_token(),
+            _ => None,
+        }
+    }
+
+    fn auth_api_key(&self, provider: &str) -> Option<zeroize::Zeroizing<String>> {
+        let manager = match self.load_auth_manager() {
+            Ok(manager) => manager,
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    error = %error,
+                    "failed to load auth manager while resolving credential bridge API key"
+                );
+                return None;
+            }
+        };
+
+        match manager.get(provider) {
+            Some(AuthMethod::ApiKey { key, .. }) => Some(zeroize::Zeroizing::new(key.clone())),
+            _ => None,
+        }
+    }
+
+    fn github_token(&self) -> Option<zeroize::Zeroizing<String>> {
+        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
+
+        match self.store.get(AuthProvider::GitHub, CredentialMethod::Pat) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to read GitHub token while resolving credential bridge credential"
+                );
+                None
+            }
+        }
+    }
+
+    fn generic_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        match self.store.get_generic(key) {
+            Ok(credential) => credential,
+            Err(error) => {
+                tracing::warn!(
+                    credential = key,
+                    error = %error,
+                    "failed to read generic credential while resolving credential bridge credential"
+                );
+                None
+            }
+        }
+    }
+
+    fn load_auth_manager(&self) -> Result<AuthManager, String> {
+        AuthStore::open(&self.data_dir)?.load_auth_manager()
+    }
 }
 
 impl CredentialProvider for CredentialStoreBridge {
     fn get_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
-        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
-        match key {
-            "github_token" => self
-                .store
-                .get(AuthProvider::GitHub, CredentialMethod::Pat)
-                .ok()
-                .flatten(),
-            _ => None,
-        }
+        self.well_known_credential(key)
+            .or_else(|| self.generic_credential(key))
     }
 }
 
@@ -581,15 +712,19 @@ impl ToolExecutor for SharedSkillRegistry {
 struct SkillRegistryBundle {
     registry: Arc<SkillRegistry>,
     memory: Option<SharedMemoryStore>,
+    embedding_index_persistence: Option<EmbeddingIndexPersistence>,
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    journal: Option<Arc<Mutex<fx_journal::Journal>>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Signature policy loaded once at startup, shared with the skill watcher
     /// to avoid redundant filesystem reads.
     signature_policy: SignaturePolicy,
+    cron_store: Option<fx_cron::SharedCronStore>,
+    startup_warnings: Vec<StartupWarning>,
 }
 
 fn build_skill_registry(
@@ -603,9 +738,21 @@ fn build_skill_registry(
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config);
-    let (mut executor, memory, snapshot_text, memory_enabled) =
-        attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
+    let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {
+        allowed_dirs: vec![options.working_dir.clone()],
+        ..ProcessConfig::default()
+    }));
+    ProcessRegistry::spawn_cleanup_task(&process_registry);
+    let mut startup_warnings = Vec::new();
+    let executor = build_tool_executor(&options, tool_config, process_registry);
+    let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
+        attach_memory_if_enabled(
+            executor,
+            data_dir,
+            config,
+            options.memory_enabled,
+            &mut startup_warnings,
+        );
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
@@ -620,6 +767,20 @@ fn build_skill_registry(
     }
     if let Some(control) = options.subagent_control {
         executor = executor.with_subagent_control(control);
+    }
+    if let Ok(auth_manager) = load_auth_manager() {
+        match build_router(&auth_manager) {
+            Ok(router) => {
+                executor = executor.with_experiment(ExperimentToolState {
+                    chain_path: data_dir.join("consensus").join("chain.json"),
+                    router: Arc::new(router),
+                    config: config.clone(),
+                });
+            }
+            Err(error) => {
+                eprintln!("warning: experiment tool unavailable: {error}");
+            }
+        }
     }
     executor = attach_node_run_if_configured(executor, config);
 
@@ -649,37 +810,25 @@ fn build_skill_registry(
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
 
-    // Register session management tools.
-    let session_db_path = data_dir.join("sessions.redb");
-    match fx_storage::Storage::open(&session_db_path) {
-        Ok(storage) => {
-            let store = fx_session::SessionStore::new(storage);
-            match fx_session::SessionRegistry::new(store) {
-                Ok(session_registry) => {
-                    let session_skill = SessionToolsSkill::new(session_registry);
-                    registry.register(Arc::new(session_skill));
-                }
-                Err(e) => {
-                    tracing::warn!("session registry unavailable: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("session storage unavailable: {e}");
-        }
+    if let Some(session_registry) = options.session_registry.clone() {
+        let session_skill = SessionToolsSkill::new(session_registry);
+        registry.register(Arc::new(session_skill));
     }
 
     // Load reflective journal for cross-session learning.
     let journal_path = data_dir.join("journal.jsonl");
-    match fx_journal::Journal::load(journal_path) {
+    let journal_arc = match fx_journal::Journal::load(journal_path) {
         Ok(journal) => {
-            let journal_skill = JournalSkill::new(Arc::new(Mutex::new(journal)));
+            let arc = Arc::new(Mutex::new(journal));
+            let journal_skill = JournalSkill::new(Arc::clone(&arc));
             registry.register(Arc::new(journal_skill));
+            Some(arc)
         }
         Err(e) => {
             tracing::warn!("journal unavailable: {e}");
+            None
         }
-    }
+    };
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
@@ -694,6 +843,7 @@ fn build_skill_registry(
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
             Arc::new(CredentialStoreBridge {
+                data_dir: data_dir.to_path_buf(),
                 store: Arc::clone(store),
             }) as Arc<dyn CredentialProvider>
         });
@@ -719,18 +869,56 @@ fn build_skill_registry(
         }
     }
 
+    // Register cron/scheduler skill.
+    let cron_store = match fx_cron::CronStore::open(&data_dir.join("cron.redb")) {
+        Ok(store) => {
+            let arc = Arc::new(tokio::sync::Mutex::new(store));
+            let cron_skill = Arc::new(fx_tools::CronSkill::new(
+                Arc::clone(&arc),
+                options.session_bus.clone(),
+            ));
+            registry.register(cron_skill);
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cron store unavailable");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::System,
+                message: format!("Cron store unavailable: {e}"),
+            });
+            None
+        }
+    };
+
     apply_skill_summaries(&runtime_info, registry.as_ref());
 
     SkillRegistryBundle {
         registry,
         memory,
+        embedding_index_persistence,
         memory_snapshot: snapshot_text,
         runtime_info,
         scratchpad,
         iteration_counter,
+        journal: journal_arc,
         credential_provider,
         credential_store,
         signature_policy,
+        cron_store,
+        startup_warnings,
+    }
+}
+
+fn build_tool_executor(
+    options: &SkillRegistryBuildOptions,
+    tool_config: ToolConfig,
+    process_registry: Arc<ProcessRegistry>,
+) -> FawxToolExecutor {
+    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
+        .with_process_registry(process_registry);
+    match options.experiment_progress.clone() {
+        Some(progress) => executor.with_experiment_progress(progress),
+        None => executor,
     }
 }
 
@@ -796,37 +984,213 @@ fn attach_memory_if_enabled(
     data_dir: &Path,
     config: &FawxConfig,
     enabled: bool,
+    startup_warnings: &mut Vec<StartupWarning>,
 ) -> (
     FawxToolExecutor,
     Option<SharedMemoryStore>,
+    Option<EmbeddingIndexPersistence>,
     Option<String>,
     bool,
 ) {
     if !enabled {
-        return (executor, None, None, false);
+        return (executor, None, None, None, false);
     }
-    let memory_config = JsonMemoryConfig {
-        max_entries: config.memory.max_entries,
-        max_value_size: config.memory.max_value_size,
-        decay_config: fx_memory::DecayConfig::default(),
-    };
-    match JsonFileMemory::new_with_config(data_dir, memory_config) {
-        Ok(mut memory_store) => {
-            let pruned = memory_store.prune();
-            if pruned > 0 {
-                eprintln!("memory: pruned {pruned} stale entries at session start");
-            }
-            let snapshot = memory_store.snapshot();
-            let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
+    match build_memory_state(data_dir, config, startup_warnings) {
+        Ok((memory_store, snapshot_text, persistence)) => {
             let memory: SharedMemoryStore = Arc::new(Mutex::new(memory_store));
             executor = executor.with_memory(Arc::clone(&memory));
-            (executor, Some(memory), text, true)
+            if let Some(persistence) = &persistence {
+                executor = executor.with_embedding_index(Arc::clone(&persistence.index));
+            }
+            (executor, Some(memory), persistence, snapshot_text, true)
         }
         Err(error) => {
             eprintln!("warning: failed to initialize memory: {error}");
-            (executor, None, None, false)
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize memory: {error}"),
+            });
+            (executor, None, None, None, false)
         }
     }
+}
+
+fn build_memory_state(
+    data_dir: &Path,
+    config: &FawxConfig,
+    startup_warnings: &mut Vec<StartupWarning>,
+) -> Result<
+    (
+        JsonFileMemory,
+        Option<String>,
+        Option<EmbeddingIndexPersistence>,
+    ),
+    String,
+> {
+    let mut memory_store = JsonFileMemory::new_with_config(data_dir, memory_config(config))?;
+    log_pruned_memories(&mut memory_store);
+    let persistence =
+        load_embedding_index_persistence(data_dir, config, &memory_store, startup_warnings)?;
+    let snapshot = memory_store.snapshot();
+    let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
+    Ok((memory_store, text, persistence))
+}
+
+fn memory_config(config: &FawxConfig) -> JsonMemoryConfig {
+    JsonMemoryConfig {
+        max_entries: config.memory.max_entries,
+        max_value_size: config.memory.max_value_size,
+        decay_config: fx_memory::DecayConfig::default(),
+    }
+}
+
+fn log_pruned_memories(memory_store: &mut JsonFileMemory) {
+    let pruned = memory_store.prune();
+    if pruned > 0 {
+        eprintln!("memory: pruned {pruned} stale entries at session start");
+    }
+}
+
+fn load_embedding_index_persistence(
+    data_dir: &Path,
+    config: &FawxConfig,
+    memory_store: &JsonFileMemory,
+    startup_warnings: &mut Vec<StartupWarning>,
+) -> Result<Option<EmbeddingIndexPersistence>, String> {
+    if !config.memory.embeddings_enabled {
+        tracing::info!("memory embeddings disabled in config");
+        return Ok(None);
+    }
+    let paths = embedding_paths(data_dir);
+    let Some(model) = load_embedding_model_or_warn(&paths.model_dir, startup_warnings) else {
+        return Ok(None);
+    };
+    let Some(index) = load_or_build_embedding_index_or_warn(
+        memory_store,
+        &paths.index_path,
+        model,
+        startup_warnings,
+    ) else {
+        return Ok(None);
+    };
+    log_embedding_index_status(&index, &paths.index_path)?;
+    Ok(Some(EmbeddingIndexPersistence {
+        index,
+        path: paths.index_path,
+    }))
+}
+
+struct EmbeddingPaths {
+    model_dir: PathBuf,
+    index_path: PathBuf,
+}
+
+fn embedding_paths(data_dir: &Path) -> EmbeddingPaths {
+    EmbeddingPaths {
+        model_dir: data_dir.join("models").join("nomic-embed-text-v1.5"),
+        index_path: data_dir.join("memory").join("embeddings.bin"),
+    }
+}
+
+fn load_embedding_model_or_warn(
+    model_dir: &Path,
+    startup_warnings: &mut Vec<StartupWarning>,
+) -> Option<Arc<EmbeddingModel>> {
+    match load_embedding_model(model_dir) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(path = %model_dir.display(), error = %error, "failed to initialize memory embeddings");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize memory embeddings: {error}"),
+            });
+            None
+        }
+    }
+}
+
+fn load_embedding_model(model_dir: &Path) -> Result<Option<Arc<EmbeddingModel>>, String> {
+    if !model_dir.exists() {
+        tracing::info!(path = %model_dir.display(), "memory embedding model not found; skipping semantic memory search");
+        return Ok(None);
+    }
+    EmbeddingModel::load(model_dir)
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|error| format!("failed to load embedding model: {error}"))
+}
+
+fn load_or_build_embedding_index_or_warn(
+    memory_store: &JsonFileMemory,
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+    startup_warnings: &mut Vec<StartupWarning>,
+) -> Option<SharedEmbeddingIndex> {
+    match load_or_build_embedding_index(memory_store, index_path, model) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            tracing::warn!(path = %index_path.display(), error = %error, "failed to initialize embedding index");
+            startup_warnings.push(StartupWarning {
+                category: ErrorCategory::Memory,
+                message: format!("Failed to initialize embedding index: {error}"),
+            });
+            None
+        }
+    }
+}
+
+fn load_or_build_embedding_index(
+    memory_store: &JsonFileMemory,
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Result<SharedEmbeddingIndex, String> {
+    let index = match try_load_embedding_index(index_path, Arc::clone(&model)) {
+        Some(Ok(index)) => index,
+        Some(Err(error)) => {
+            tracing::warn!(path = %index_path.display(), error = %error, "failed to load embedding index; rebuilding from memory");
+            build_embedding_index(memory_store, &model)?
+        }
+        None => build_embedding_index(memory_store, &model)?,
+    };
+    Ok(Arc::new(Mutex::new(index)))
+}
+
+fn try_load_embedding_index(
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Option<Result<EmbeddingIndex, String>> {
+    if !index_path.exists() {
+        return None;
+    }
+    Some(load_embedding_index(index_path, model))
+}
+
+fn load_embedding_index(
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Result<EmbeddingIndex, String> {
+    EmbeddingIndex::load(index_path, model).map_err(|error| error.to_string())
+}
+
+fn build_embedding_index(
+    memory_store: &JsonFileMemory,
+    model: &Arc<EmbeddingModel>,
+) -> Result<EmbeddingIndex, String> {
+    let entries = memory_store.list();
+    EmbeddingIndex::build_from(&entries, model).map_err(|error| error.to_string())
+}
+
+fn log_embedding_index_status(
+    index: &SharedEmbeddingIndex,
+    index_path: &Path,
+) -> Result<(), String> {
+    let entries = index.lock().map_err(|error| format!("{error}"))?.len();
+    tracing::info!(
+        entries,
+        path = %index_path.display(),
+        "memory embeddings enabled"
+    );
+    Ok(())
 }
 
 fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<RuntimeInfo>> {
@@ -847,7 +1211,11 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
     let skills = registry
         .skill_summaries()
         .into_iter()
-        .map(|(name, tool_names)| SkillInfo { name, tool_names })
+        .map(|(name, description, tool_names)| SkillInfo {
+            name,
+            description: Some(description),
+            tool_names,
+        })
         .collect::<Vec<_>>();
 
     match runtime_info.write() {
@@ -919,6 +1287,18 @@ pub(crate) fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> 
         .data_dir
         .clone()
         .unwrap_or_else(|| base_data_dir.to_path_buf())
+}
+
+pub(crate) fn build_session_bus_for_data_dir(data_dir: &Path) -> Option<SessionBus> {
+    let bus_db_path = data_dir.join("bus.redb");
+    let storage = match fx_storage::Storage::open(&bus_db_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(path = %bus_db_path.display(), error = %error, "session bus unavailable");
+            return None;
+        }
+    };
+    Some(SessionBus::new(BusStore::new(storage)))
 }
 
 pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
@@ -1028,17 +1408,6 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupEr
     for provider in auth_manager.providers() {
         if let Some(auth_method) = auth_manager.get(&provider) {
             register_auth_provider(&mut router, auth_method)?;
-        }
-    }
-
-    if let Some(first_model) = router
-        .available_models()
-        .into_iter()
-        .next()
-        .map(|model| model.model_id)
-    {
-        if let Err(error) = router.set_active(&first_model) {
-            eprintln!("failed to set initial model {first_model}: {error}");
         }
     }
 
@@ -1237,9 +1606,15 @@ fn duration_millis_u64(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
     use fx_config::manager::ConfigManager;
+    use fx_core::memory::MemoryProvider;
+    use fx_embeddings::test_support::create_test_model_dir;
     use fx_subagent::test_support::StubSubagentControl;
+    use std::io;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
+    use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::fmt::writer::MakeWriter;
 
     fn test_config_with_temp_dir() -> (FawxConfig, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1261,6 +1636,99 @@ mod tests {
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn session_bus_uses_dedicated_bus_database_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let bus = build_session_bus_for_data_dir(temp_dir.path());
+
+        assert!(bus.is_some(), "expected session bus to initialize");
+        assert!(temp_dir.path().join("bus.redb").exists());
+        assert!(!temp_dir.path().join("sessions.redb").exists());
+    }
+
+    fn create_embedding_model_dir(base: &Path, dimensions: usize) {
+        let source = create_test_model_dir(dimensions);
+        let model_dir = base.join("models").join("nomic-embed-text-v1.5");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        for file_name in [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "checksums.sha256",
+        ] {
+            std::fs::copy(source.path().join(file_name), model_dir.join(file_name))
+                .expect("copy model file");
+        }
+    }
+
+    fn bridge_for(data_dir: &Path) -> CredentialStoreBridge {
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
+            .expect("credential store");
+        CredentialStoreBridge {
+            data_dir: data_dir.to_path_buf(),
+            store: Arc::new(store),
+        }
+    }
+
+    fn store_auth_api_key(data_dir: &Path, provider: &str, key: &str) {
+        let store = AuthStore::open(data_dir).expect("auth store");
+        let mut manager = AuthManager::new();
+        manager.store(
+            provider,
+            AuthMethod::ApiKey {
+                provider: provider.to_string(),
+                key: key.to_string(),
+            },
+        );
+        store
+            .save_auth_manager(&manager)
+            .expect("save auth manager");
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedMakeWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_warn_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(SharedMakeWriter(Arc::clone(&buffer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = action();
+        let logs = String::from_utf8(buffer.lock().expect("capture logs").clone())
+            .expect("captured logs should be utf8");
+        (result, logs)
+    }
+
+    fn remove_credential_salt(data_dir: &Path) {
+        std::fs::remove_file(data_dir.join(".credentials-salt")).expect("remove salt");
     }
 
     fn bundle_tool_names(bundle: &LoopEngineBundle) -> Vec<String> {
@@ -1556,6 +2024,131 @@ mod tests {
     }
 
     #[test]
+    fn headless_bundle_without_session_registry_skips_session_tools_and_lock() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = configured_data_dir(&fawx_data_dir(), &config);
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                session_registry: None,
+                session_bus: None,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        for session_tool_name in ["session_list", "session_history", "session_send"] {
+            assert!(!names.contains(&session_tool_name.to_string()));
+        }
+
+        let registry = open_session_registry(&data_dir);
+        assert!(
+            registry.is_some(),
+            "session database should remain unlockable"
+        );
+    }
+
+    #[test]
+    fn headless_bundle_with_session_registry_registers_session_tools() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = configured_data_dir(&fawx_data_dir(), &config);
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                session_registry: open_session_registry(&data_dir),
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        for session_tool_name in ["session_list", "session_history", "session_send"] {
+            assert!(names.contains(&session_tool_name.to_string()));
+        }
+    }
+
+    #[test]
+    fn headless_bundle_accumulates_startup_warning_for_broken_memory_path() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let memory_dir = data_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        std::fs::write(memory_dir.join("memory.json"), b"not valid json")
+            .expect("write broken memory");
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+
+        assert!(bundle.startup_warnings.iter().any(|warning| {
+            warning.category == ErrorCategory::Memory
+                && warning.message.contains("Failed to initialize memory")
+        }));
+    }
+
+    #[test]
+    fn headless_bundle_builds_embedding_index_from_existing_memory() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let mut memory = JsonFileMemory::new(&data_dir).expect("memory");
+        memory.write("auth", "hello world").expect("write memory");
+        create_embedding_model_dir(&data_dir, 8);
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+        let persistence = bundle
+            .embedding_index_persistence
+            .as_ref()
+            .expect("embedding index should be configured");
+        let results = persistence
+            .index
+            .lock()
+            .expect("lock index")
+            .search("hello world", 5)
+            .expect("search index");
+
+        assert!(results.iter().any(|(key, _)| key == "auth"));
+        assert!(names.contains(&"memory_search".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_skips_embedding_index_when_disabled_in_config() {
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        create_embedding_model_dir(&data_dir, 8);
+        config.memory.embeddings_enabled = false;
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+
+        assert!(bundle.embedding_index_persistence.is_none());
+    }
+
+    #[test]
     fn build_loop_engine_from_builder_returns_startup_error_on_failure() {
         let error = build_loop_engine_from_builder(LoopEngine::builder())
             .expect_err("missing required fields should return an error");
@@ -1629,6 +2222,141 @@ mod tests {
         assert!(openai_models
             .iter()
             .any(|model| model.model_id == "gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn build_router_does_not_preselect_active_model() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-no-default".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+
+        assert!(
+            !router.available_models().is_empty(),
+            "router should expose available models"
+        );
+        assert_eq!(router.active_model(), None);
+    }
+
+    #[test]
+    fn credential_bridge_returns_openai_api_key_from_auth_manager() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_auth_api_key(&data_dir, "openai", "sk-openai-123");
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("openai_api_key")
+            .expect("openai api key should be available");
+
+        assert_eq!(*value, "sk-openai-123");
+    }
+
+    #[test]
+    fn credential_bridge_returns_anthropic_api_key_from_auth_manager() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_auth_api_key(&data_dir, "anthropic", "sk-ant-123");
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("anthropic_api_key")
+            .expect("anthropic api key should be available");
+
+        assert_eq!(*value, "sk-ant-123");
+    }
+
+    #[test]
+    fn credential_bridge_returns_none_for_missing_unknown_key() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let bridge = bridge_for(&data_dir);
+
+        assert!(bridge.get_credential("missing_skill_key").is_none());
+    }
+
+    #[test]
+    fn credential_bridge_falls_back_to_generic_skill_credentials() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        store
+            .set_generic("brave_api_key", "brv-bridge-test")
+            .expect("set generic credential");
+        drop(store);
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("brave_api_key")
+            .expect("generic skill credential should be available");
+
+        assert_eq!(*value, "brv-bridge-test");
+    }
+
+    #[test]
+    fn credential_bridge_warns_when_github_token_read_fails() {
+        use fx_auth::credential_store::{
+            AuthProvider, CredentialMetadata, CredentialMethod, CredentialStore,
+        };
+        use zeroize::Zeroizing;
+
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        let metadata = CredentialMetadata {
+            provider: AuthProvider::GitHub,
+            method: CredentialMethod::Pat,
+            last_validated_ms: 0,
+            login: None,
+            scopes: Vec::new(),
+            token_kind: None,
+        };
+        store
+            .set(
+                AuthProvider::GitHub,
+                CredentialMethod::Pat,
+                &Zeroizing::new("ghp-bridge-test".to_string()),
+                &metadata,
+            )
+            .expect("set github token");
+        drop(store);
+        remove_credential_salt(&data_dir);
+
+        let bridge = bridge_for(&data_dir);
+        let (value, logs) = capture_warn_logs(|| bridge.github_token());
+
+        assert!(value.is_none());
+        assert!(logs
+            .contains("failed to read GitHub token while resolving credential bridge credential"));
+    }
+
+    #[test]
+    fn credential_bridge_warns_when_generic_credential_read_fails() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        store
+            .set_generic("brave_api_key", "brv-bridge-test")
+            .expect("set generic credential");
+        drop(store);
+        remove_credential_salt(&data_dir);
+
+        let bridge = bridge_for(&data_dir);
+        let (value, logs) = capture_warn_logs(|| bridge.get_credential("brave_api_key"));
+
+        assert!(value.is_none());
+        assert!(logs.contains(
+            "failed to read generic credential while resolving credential bridge credential"
+        ));
+        assert!(logs.contains("brave_api_key"));
     }
 
     #[test]

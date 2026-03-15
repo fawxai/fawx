@@ -45,10 +45,12 @@ pub mod loop_engine;
 pub mod perceive;
 pub mod permissions;
 pub mod policy;
+pub mod process_registry;
 pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
 pub mod signals;
+pub mod streaming;
 pub mod types;
 pub mod verify;
 pub mod watchdog;
@@ -70,7 +72,11 @@ pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSend
 pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
+pub use process_registry::{
+    ListEntry, ProcessConfig, ProcessRegistry, ProcessStatus, SpawnResult, StatusResult,
+};
 pub use proposal_gate::{is_tier3_path, ProposalGateExecutor, ProposalGateState};
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
+pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
 pub use verify::Verification;

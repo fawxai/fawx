@@ -23,7 +23,7 @@ pub trait CommandHost {
     }
     fn list_models(&self) -> String;
     fn set_active_model(&mut self, selector: &str) -> Result<String>;
-    fn proposals(&self) -> Result<String>;
+    fn proposals(&self, selector: Option<&str>) -> Result<String>;
     fn approve(&self, selector: &str, force: bool) -> Result<String>;
     fn reject(&self, selector: &str) -> Result<String>;
     fn show_config(&self) -> Result<String>;
@@ -105,7 +105,10 @@ pub enum ParsedCommand {
     Debug,
     Analyze,
     Improve(ImproveFlags),
-    Proposals,
+    Proposals {
+        id: Option<String>,
+        has_extra_args: bool,
+    },
     Approve {
         id: Option<String>,
         force: bool,
@@ -162,7 +165,7 @@ pub fn parse_command(value: &str) -> ParsedCommand {
         "debug" => ParsedCommand::Debug,
         "analyze" => ParsedCommand::Analyze,
         "improve" => ParsedCommand::Improve(parse_improve_flags(&mut parts)),
-        "proposals" => ParsedCommand::Proposals,
+        "proposals" => parse_proposals_command(&mut parts),
         "approve" => parse_approve_command(&mut parts),
         "reject" => parse_reject_command(&mut parts),
         "synthesis" => parse_synthesis_command(input, command),
@@ -232,7 +235,9 @@ pub fn execute_command<H: CommandHost>(
         }
         ParsedCommand::Analyze => None,
         ParsedCommand::Improve(_) => None,
-        ParsedCommand::Proposals => Some(ctx.app.proposals().map(response)),
+        ParsedCommand::Proposals { id, has_extra_args } => {
+            Some(execute_proposals(ctx.app, id.as_deref(), *has_extra_args))
+        }
         ParsedCommand::Approve {
             id,
             force,
@@ -440,6 +445,7 @@ pub fn help_text() -> &'static str {
         "  /analyze       Analyze persisted signals across sessions\n",
         "  /improve       Run self-improvement cycle\n",
         "  /proposals     List pending self-modification proposals\n",
+        "  /proposals <id> Show a proposal diff preview\n",
         "  /approve       Apply a pending proposal (/approve <id> [--force])\n",
         "  /reject        Archive a pending proposal (/reject <id>)\n",
         "  /synthesis     Set or reset synthesis instruction\n",
@@ -496,6 +502,17 @@ fn response(text: String) -> CommandResult {
 
 fn model_set_response(model: String) -> CommandResult {
     response(format!("Active model set to: {model}"))
+}
+
+fn execute_proposals<H: CommandHost>(
+    app: &mut H,
+    id: Option<&str>,
+    has_extra_args: bool,
+) -> Result<CommandResult> {
+    match has_extra_args {
+        false => app.proposals(id).map(response),
+        true => Ok(response("Usage: /proposals [id]".to_string())),
+    }
 }
 
 fn execute_approve<H: CommandHost>(
@@ -591,6 +608,13 @@ fn parse_improve_flags(parts: &mut std::str::SplitWhitespace<'_>) -> ImproveFlag
     flags
 }
 
+fn parse_proposals_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
+    ParsedCommand::Proposals {
+        id: parts.next().map(ToString::to_string),
+        has_extra_args: parts.next().is_some(),
+    }
+}
+
 fn parse_approve_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
     let first = parts.next();
     let (id, mut force) = match first {
@@ -668,8 +692,11 @@ mod tests {
             Ok(selector.to_string())
         }
 
-        fn proposals(&self) -> Result<String> {
-            Ok(self.proposals.clone())
+        fn proposals(&self, selector: Option<&str>) -> Result<String> {
+            Ok(match selector {
+                Some(value) => format!("{}:{value}", self.proposals),
+                None => self.proposals.clone(),
+            })
         }
 
         fn approve(&self, selector: &str, force: bool) -> Result<String> {
@@ -820,6 +847,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_proposals_accepts_optional_id() {
+        assert_eq!(
+            parse_command("/proposals"),
+            ParsedCommand::Proposals {
+                id: None,
+                has_extra_args: false,
+            }
+        );
+        assert_eq!(
+            parse_command("/proposals abc123"),
+            ParsedCommand::Proposals {
+                id: Some("abc123".to_string()),
+                has_extra_args: false,
+            }
+        );
+    }
+
+    #[test]
     fn execute_command_routes_server_side_commands() {
         let mut host = StubHost {
             models: "Available models".to_string(),
@@ -900,6 +945,26 @@ mod tests {
 
         assert_eq!(result.response, "Active model set to: claude-opus-4-6");
         assert_eq!(host.last_model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn execute_command_routes_proposals_detail_requests() {
+        let mut host = StubHost {
+            proposals: "proposals".to_string(),
+            ..StubHost::default()
+        };
+        let mut context = CommandContext { app: &mut host };
+        let result = execute_command(
+            &mut context,
+            &ParsedCommand::Proposals {
+                id: Some("abc123".to_string()),
+                has_extra_args: false,
+            },
+        )
+        .expect("server-side")
+        .expect("ok");
+
+        assert_eq!(result.response, "proposals:abc123");
     }
 
     #[test]
