@@ -9,8 +9,7 @@ use serde_json::json;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 use tokio::time::{self, MissedTickBehavior};

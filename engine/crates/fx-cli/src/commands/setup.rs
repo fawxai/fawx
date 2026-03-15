@@ -38,6 +38,7 @@ pub async fn run(force: bool) -> anyhow::Result<i32> {
 
     let mut wizard = SetupWizard::new(force)?;
     wizard.print_system_check();
+    wizard.run_tailscale_phase();
     if !wizard.confirm_existing_config()? {
         println!("Setup cancelled.");
         return Ok(0);
@@ -51,6 +52,7 @@ pub async fn run(force: bool) -> anyhow::Result<i32> {
     wizard.run_http_phase()?;
     wizard.run_channels_phase().await?;
     wizard.run_validation_phase().await?;
+    wizard.run_launchagent_phase();
     wizard.write_config()?;
     wizard.print_completion();
     Ok(0)
@@ -636,6 +638,105 @@ impl SetupWizard {
         self.auth_store
             .save_auth_manager(&self.auth_manager)
             .map_err(|error| anyhow!(error))
+    }
+
+    fn run_tailscale_phase(&self) {
+        println!("\n── Tailscale ──\n");
+        match std::process::Command::new("which")
+            .arg("tailscale")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                match std::process::Command::new("tailscale")
+                    .args(["status", "--json"])
+                    .output()
+                {
+                    Ok(status_output) if status_output.status.success() => {
+                        let json: serde_json::Value =
+                            serde_json::from_slice(&status_output.stdout).unwrap_or_default();
+                        let backend = json
+                            .get("BackendState")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown");
+                        if backend == "Running" {
+                            println!("  ✅ Tailscale is running");
+                            println!("  Running tailscale cert...");
+                            let hostname = json
+                                .pointer("/Self/DNSName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim_end_matches('.');
+                            if !hostname.is_empty() {
+                                let cert_result = std::process::Command::new("tailscale")
+                                    .args(["cert", "--", hostname])
+                                    .output();
+                                match cert_result {
+                                    Ok(out) if out.status.success() => {
+                                        println!("  ✅ HTTPS certificate ready for {hostname}");
+                                    }
+                                    _ => {
+                                        println!(
+                                            "  ⚠ Could not generate certificate. You can set this up later."
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("  Tailscale is installed but not logged in.");
+                            println!("  Run 'tailscale login' to enable secure remote access.");
+                        }
+                    }
+                    _ => {
+                        println!("  Tailscale is installed but status unavailable.");
+                    }
+                }
+            }
+            _ => {
+                println!("  Tailscale not found.");
+                println!("  Install from https://tailscale.com/download for secure remote access.");
+                println!("  (Optional — Fawx works without it for local use.)");
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "http"))]
+    fn run_launchagent_phase(&self) {
+        println!("\n── Auto-Start ──\n");
+        let answer =
+            prompt_line("  Start Fawx automatically when you log in? [Y/n] ").unwrap_or_default();
+        let should_install =
+            answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y');
+        if should_install {
+            let config = fx_api::launchagent::LaunchAgentConfig {
+                server_binary_path: std::env::current_exe().unwrap_or_default(),
+                port: if self.http.enabled {
+                    self.http.port
+                } else {
+                    DEFAULT_HTTP_PORT
+                },
+                data_dir: self.data_dir.clone(),
+                log_path: self.data_dir.join("server.log"),
+                auto_start: true,
+                keep_alive: true,
+            };
+            match fx_api::launchagent::install(&config) {
+                Ok(()) => println!("  ✅ LaunchAgent installed — Fawx will start on login"),
+                Err(e) => println!("  ⚠ Could not install LaunchAgent: {e}"),
+            }
+        } else {
+            println!("  Skipped auto-start.");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "http")))]
+    fn run_launchagent_phase(&self) {
+        println!("\n── Auto-Start ──\n");
+        println!("  Auto-start setup is unavailable in this build.");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn run_launchagent_phase(&self) {
+        // LaunchAgent is macOS-only; skip silently on other platforms
     }
 }
 
