@@ -77,6 +77,13 @@ struct ClearSessionResponse: Codable, Sendable, Hashable {
 }
 
 extension Session {
+    static func sidebarSort(_ lhs: Session, _ rhs: Session) -> Bool {
+        if lhs.updatedAt == rhs.updatedAt {
+            return lhs.key < rhs.key
+        }
+        return lhs.updatedAt > rhs.updatedAt
+    }
+
     mutating func applyPreview(_ previewText: String, model newModel: String?) {
         let trimmed = previewText.trimmingCharacters(in: .whitespacesAndNewlines)
         preview = trimmed.isEmpty ? nil : trimmed
@@ -93,7 +100,7 @@ extension Session {
     }
 }
 
-private func summarizedSessionTitle(from text: String) -> String {
+func summarizedSessionTitle(from text: String) -> String {
     let normalized = normalizedSessionTitleText(text)
     guard normalized.isEmpty == false else {
         return "New Session"
@@ -114,7 +121,7 @@ private func normalizedSessionTitleText(_ text: String) -> String {
         .trimmingCharacters(in: CharacterSet(charactersIn: " .,!?:;-"))
 }
 
-private func strippedSessionPromptPrefix(from text: String) -> String {
+func strippedSessionPromptPrefix(from text: String) -> String {
     let patterns = [
         #"^hey\s+fawx[!,]?\s*"#,
         #"^(?:can|could|would)\s+you\s+"#,
@@ -158,7 +165,7 @@ private func sentenceCase(_ text: String) -> String {
     return String(first).uppercased() + text.dropFirst()
 }
 
-private func truncateSessionTitle(_ text: String, maxLength: Int = 44) -> String {
+func truncateSessionTitle(_ text: String, maxLength: Int = 44) -> String {
     let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard cleaned.count > maxLength else {
         return cleaned
@@ -168,10 +175,4 @@ private func truncateSessionTitle(_ text: String, maxLength: Int = 44) -> String
     let truncatedSlice = cleaned[..<cutoff]
     let wordBoundary = truncatedSlice.lastIndex(of: " ") ?? cutoff
     return String(cleaned[..<wordBoundary]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
-}
-
-private extension String {
-    var nonEmpty: String? {
-        isEmpty ? nil : self
-    }
 }

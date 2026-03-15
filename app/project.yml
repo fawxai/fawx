@@ -1,3 +1,4 @@
+# Canonical app build definition. Regenerate Fawx.xcodeproj with xcodegen after edits.
 name: Fawx
 options:
   minimumXcodeGenVersion: 2.45.3
@@ -64,11 +65,44 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.iosUITests
         TEST_TARGET_NAME: Fawx-iOS
+  FawxTests-macOS:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: FawxTests
+    dependencies:
+      - target: Fawx-macOS
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.macTests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Fawx.app/Contents/MacOS/Fawx"
+  FawxTests-iOS:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: FawxTests
+    dependencies:
+      - target: Fawx-iOS
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.iosTests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Fawx.app/Fawx"
+        TEST_TARGET_NAME: Fawx-iOS
 schemes:
   Fawx-macOS:
     build:
       targets:
         Fawx-macOS: all
+    test:
+      config: Debug
+      targets:
+        - FawxTests-macOS
     run:
       config: Debug
   Fawx-iOS:
@@ -78,6 +112,7 @@ schemes:
     test:
       config: Debug
       targets:
+        - FawxTests-iOS
         - FawxUITests
     run:
       config: Debug

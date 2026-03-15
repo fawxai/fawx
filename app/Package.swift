@@ -1,6 +1,9 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+// project.yml + XcodeGen are the canonical app build definition.
+// This package manifest exists only for package-aware tooling around shared sources.
+
 let package = Package(
     name: "Fawx",
     platforms: [
@@ -23,6 +26,14 @@ let package = Package(
             exclude: [
                 "Assets.xcassets",
                 "Info.plist",
+            ]
+        ),
+        .testTarget(
+            name: "FawxTests",
+            dependencies: ["Fawx"],
+            path: "FawxTests",
+            exclude: [
+                "README.md",
             ]
         ),
     ]

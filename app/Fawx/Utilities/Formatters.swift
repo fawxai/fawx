@@ -1,18 +1,28 @@
 import Foundation
 
+private enum FormatterCache {
+    nonisolated(unsafe) static let relativeTimestamp: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    static let time: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
+}
+
 func relativeTimestampString(_ epochSeconds: Int) -> String {
     let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
-    let formatter = RelativeDateTimeFormatter()
-    formatter.unitsStyle = .short
-    return formatter.localizedString(for: date, relativeTo: .now)
+    return FormatterCache.relativeTimestamp.localizedString(for: date, relativeTo: .now)
 }
 
 func timeString(_ epochSeconds: Int) -> String {
     let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
-    let formatter = DateFormatter()
-    formatter.timeStyle = .short
-    formatter.dateStyle = .none
-    return formatter.string(from: date)
+    return FormatterCache.time.string(from: date)
 }
 
 func abbreviateModelName(_ modelID: String) -> String {
@@ -99,9 +109,9 @@ func canonicalizeServerURL(_ input: String) -> String? {
         return nil
     }
 
-    if components.path == "/" {
-        components.path = ""
-    }
+    components.path = ""
+    components.query = nil
+    components.fragment = nil
 
     return components.string
 }

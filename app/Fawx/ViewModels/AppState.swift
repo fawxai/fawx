@@ -258,10 +258,6 @@ final class AppState {
         await client.updateConfiguration(baseURL: URL(string: serverURLString), bearerToken: nil)
     }
 
-    func storedToken() -> String {
-        authToken ?? ""
-    }
-
     func refreshServerState() async throws {
         async let modelsTask = client.listModels()
         async let statusTask = client.serverStatus()
@@ -336,7 +332,7 @@ final class AppState {
     }
 
     func noteRecoverableRequestFailure(_ error: Error) async {
-        guard shouldReconnect(for: error) else {
+        guard ConnectionStateMachine.shouldHandleAsConnectionIssue(error) else {
             return
         }
 
@@ -434,17 +430,13 @@ final class AppState {
     private func handleConnectionFailure(_ error: Error, allowReconnect: Bool) async {
         connectionError = connectionMessage(for: error)
 
-        if isAuthenticationFailure(error) {
-            reconnectTask?.cancel()
-            reconnectTask = nil
-            connectionStatus = .disconnected
-            return
-        }
-
-        if allowReconnect {
+        switch ConnectionStateMachine.failureStatus(for: error, allowReconnect: allowReconnect) {
+        case .reconnecting:
             connectionStatus = .reconnecting
             scheduleReconnectIfNeeded()
-        } else {
+        case .disconnected, .connecting, .connected:
+            reconnectTask?.cancel()
+            reconnectTask = nil
             connectionStatus = .disconnected
         }
     }
@@ -492,54 +484,27 @@ final class AppState {
                     }
                     self.reconnectAttempt += 1
                     self.connectionError = self.connectionMessage(for: error)
+                    let nextStatus = ConnectionStateMachine.retryFailureStatus(
+                        for: error,
+                        reconnectAttempt: self.reconnectAttempt
+                    )
+                    self.connectionStatus = nextStatus
 
-                    if self.isAuthenticationFailure(error) || self.reconnectAttempt >= 5 {
-                        self.connectionStatus = .disconnected
+                    if nextStatus == .disconnected {
                         self.reconnectTask = nil
                         return
                     }
-
-                    self.connectionStatus = .reconnecting
                 }
             }
         }
     }
 
-    private func shouldReconnect(for error: Error) -> Bool {
-        isAuthenticationFailure(error) || isConnectivityFailure(error)
-    }
-
     private func isAuthenticationFailure(_ error: Error) -> Bool {
-        if case APIError.httpStatus(let code, _) = error, code == 401 {
-            return true
-        }
-        return false
+        ConnectionStateMachine.issueKind(for: error) == .authentication
     }
 
     private func isConnectivityFailure(_ error: Error) -> Bool {
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .timedOut,
-                    .cannotFindHost,
-                    .cannotConnectToHost,
-                    .networkConnectionLost,
-                    .dnsLookupFailed,
-                    .notConnectedToInternet:
-                return true
-            default:
-                return false
-            }
-        }
-
-        if case APIError.invalidResponse = error {
-            return true
-        }
-
-        if case APIError.httpStatus(let code, _) = error, code == 408 || (500 ... 599).contains(code) {
-            return true
-        }
-
-        return false
+        ConnectionStateMachine.issueKind(for: error) == .connectivity
     }
 
     private func connectionMessage(for error: Error) -> String {

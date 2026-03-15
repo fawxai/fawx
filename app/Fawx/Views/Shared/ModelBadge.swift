@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ModelBadge: View {
     let title: String
+    var accessibilityLabel: String?
 
     var body: some View {
         Text(title)
@@ -16,5 +17,6 @@ struct ModelBadge: View {
                     .stroke(Color.fawxBorder, lineWidth: 1)
             )
             .clipShape(Capsule())
+            .accessibilityLabel(accessibilityLabel ?? title)
     }
 }

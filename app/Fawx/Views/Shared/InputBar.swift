@@ -110,7 +110,10 @@ struct InputBar: View {
                 }
             }
         } label: {
-            ModelBadge(title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20))
+            ModelBadge(
+                title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20),
+                accessibilityLabel: "Selected model \(abbreviateModelName(activeModel?.modelID ?? "Unavailable"))"
+            )
         }
         .disabled(modelMenuDisabled)
         .help(modelHelpText)
@@ -124,7 +127,10 @@ struct InputBar: View {
                 }
             }
         } label: {
-            ModelBadge(title: displayThinkingLevel(thinkingLevel))
+            ModelBadge(
+                title: displayThinkingLevel(thinkingLevel),
+                accessibilityLabel: "Thinking level \(displayThinkingLevel(thinkingLevel))"
+            )
         }
         .disabled(thinkingMenuDisabled)
         .help(isStreaming ? "Cannot change thinking while a response is streaming." : "Server thinking level")
@@ -138,6 +144,7 @@ struct InputBar: View {
         .tint(primaryButtonTint)
         .keyboardShortcut(.return, modifiers: .command)
         .accessibilityIdentifier("sendButton")
+        .accessibilityLabel(primaryButtonTitle)
         .disabled(primaryButtonDisabled)
         .frame(minWidth: 72)
     }

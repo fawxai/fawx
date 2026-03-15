@@ -6,8 +6,6 @@ import AppKit
 @main
 struct FawxApp: App {
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("theme") private var storedThemeRawValue = AppTheme.system.rawValue
-    @AppStorage("font_size") private var storedFontSizeRawValue = AppFontSize.medium.rawValue
 
     @State private var appState: AppState
     @State private var sessionViewModel: SessionViewModel
@@ -30,8 +28,8 @@ struct FawxApp: App {
     }
 
     var body: some Scene {
-        let selectedTheme = AppTheme(rawValue: storedThemeRawValue) ?? .system
-        let selectedFontSize = AppFontSize(rawValue: storedFontSizeRawValue) ?? .medium
+        let selectedTheme = appState.theme
+        let selectedFontSize = appState.fontSize
         let _ = FawxTypography.setScale(selectedFontSize.scale)
 #if os(macOS)
         let _ = applyMacAppearance(selectedTheme)
@@ -48,17 +46,6 @@ struct FawxApp: App {
                     settingsViewModel.reloadStoredValues()
                     await sessionViewModel.refresh()
                     await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
-                }
-                .onChange(of: storedThemeRawValue) { _, newValue in
-                    let theme = AppTheme(rawValue: newValue) ?? .system
-#if os(macOS)
-                    applyMacAppearance(theme)
-#endif
-                    appState.setTheme(theme)
-                }
-                .onChange(of: storedFontSizeRawValue) { _, newValue in
-                    let fontSize = AppFontSize(rawValue: newValue) ?? .medium
-                    appState.setFontSize(fontSize)
                 }
                 .task(id: appState.configurationKey + "|polling") {
                     guard appState.isConfigured else {

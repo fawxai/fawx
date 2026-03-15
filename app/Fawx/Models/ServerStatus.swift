@@ -47,9 +47,12 @@ struct ContextInfo: Codable, Sendable, Hashable {
 
     var normalizedPercentage: Double {
         let reportedPercentage = percentage <= 1 ? percentage * 100 : percentage
+        if reportedPercentage.isFinite {
+            return max(0, min(reportedPercentage, 100))
+        }
 
         guard usedTokens > 0, maxTokens > 0 else {
-            return max(0, min(reportedPercentage, 100))
+            return 0
         }
 
         let derivedPercentage = (Double(usedTokens) / Double(maxTokens)) * 100

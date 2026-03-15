@@ -2,9 +2,6 @@ import Observation
 import SwiftUI
 
 struct AppearanceSettingsPanel: View {
-    @AppStorage("theme") private var storedThemeRawValue = AppTheme.system.rawValue
-    @AppStorage("font_size") private var storedFontSizeRawValue = AppFontSize.medium.rawValue
-
     @Bindable var appState: AppState
 
     var body: some View {
@@ -19,7 +16,7 @@ struct AppearanceSettingsPanel: View {
                 HStack {
                     Text("Font Size")
                     Spacer()
-                    Text(currentFontSize.displayName)
+                    Text(appState.fontSize.displayName)
                         .foregroundStyle(Color.fawxTextSecondary)
                 }
 
@@ -41,7 +38,7 @@ struct AppearanceSettingsPanel: View {
                     .foregroundStyle(Color.fawxTextSecondary)
 
                 Text("The quick brown fox jumps over the lazy dog.")
-                    .font(.system(size: 14 * currentFontSize.scale, weight: .regular))
+                    .font(.system(size: 14 * appState.fontSize.scale, weight: .regular))
                     .foregroundStyle(Color.fawxText)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(FawxSpacing.paddingMD)
@@ -53,25 +50,12 @@ struct AppearanceSettingsPanel: View {
                     )
             }
         }
-        .onAppear {
-            appState.setTheme(currentTheme)
-            appState.setFontSize(currentFontSize)
-        }
-    }
-
-    private var currentTheme: AppTheme {
-        AppTheme(rawValue: storedThemeRawValue) ?? .system
-    }
-
-    private var currentFontSize: AppFontSize {
-        AppFontSize(rawValue: storedFontSizeRawValue) ?? .medium
     }
 
     private var themeBinding: Binding<AppTheme> {
         Binding(
-            get: { currentTheme },
+            get: { appState.theme },
             set: { newValue in
-                storedThemeRawValue = newValue.rawValue
                 appState.setTheme(newValue)
             }
         )
@@ -79,10 +63,9 @@ struct AppearanceSettingsPanel: View {
 
     private var fontSizeSliderBinding: Binding<Double> {
         Binding(
-            get: { currentFontSize.sliderValue },
+            get: { appState.fontSize.sliderValue },
             set: { newValue in
                 let selectedFontSize = AppFontSize.fromSliderValue(newValue)
-                storedFontSizeRawValue = selectedFontSize.rawValue
                 appState.setFontSize(selectedFontSize)
             }
         )

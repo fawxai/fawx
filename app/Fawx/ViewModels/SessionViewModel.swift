@@ -68,12 +68,7 @@ final class SessionViewModel {
 
         do {
             let response = try await appState.client.listSessions(limit: 50)
-            sessions = response.sessions.sorted { lhs, rhs in
-                if lhs.updatedAt == rhs.updatedAt {
-                    return lhs.key < rhs.key
-                }
-                return lhs.updatedAt > rhs.updatedAt
-            }
+            sessions = response.sessions.sorted(by: Session.sidebarSort)
             if let selectedSessionID, !sessions.contains(where: { $0.id == selectedSessionID }) {
                 self.selectedSessionID = nil
             }
@@ -148,12 +143,7 @@ final class SessionViewModel {
         } else {
             sessions.append(session)
         }
-        sessions.sort { lhs, rhs in
-            if lhs.updatedAt == rhs.updatedAt {
-                return lhs.key < rhs.key
-            }
-            return lhs.updatedAt > rhs.updatedAt
-        }
+        sessions.sort(by: Session.sidebarSort)
     }
 
     func removeSession(_ sessionID: String) {
@@ -172,11 +162,6 @@ final class SessionViewModel {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             sessions[index].messageCount += 1
         }
-        sessions.sort { lhs, rhs in
-            if lhs.updatedAt == rhs.updatedAt {
-                return lhs.key < rhs.key
-            }
-            return lhs.updatedAt > rhs.updatedAt
-        }
+        sessions.sort(by: Session.sidebarSort)
     }
 }

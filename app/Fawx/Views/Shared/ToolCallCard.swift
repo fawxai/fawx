@@ -46,6 +46,8 @@ struct ToolCallCard: View {
                 }
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(toolCallAccessibilityLabel)
+            .accessibilityHint(isExpanded ? "Collapse tool details" : "Expand tool details")
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
@@ -71,5 +73,15 @@ struct ToolCallCard: View {
                 isExpanded = false
             }
         }
+    }
+
+    private var toolCallAccessibilityLabel: String {
+        if toolCall.isRunning {
+            return "\(toolCall.displayName), running"
+        }
+        if toolCall.isError {
+            return "\(toolCall.displayName), error"
+        }
+        return toolCall.displayName
     }
 }

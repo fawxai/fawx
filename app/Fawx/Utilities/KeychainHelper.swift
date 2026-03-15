@@ -2,16 +2,10 @@ import Foundation
 import Security
 
 enum KeychainHelper {
-    static let service = "ai.fawx.app"
+    static let defaultService = "ai.fawx.app"
 
-    static func token(forServer account: String) throws -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
+    static func token(forServer account: String, service: String = defaultService) throws -> String? {
+        let query = tokenQuery(forServer: account, service: service, includeData: true)
 
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
@@ -31,13 +25,9 @@ enum KeychainHelper {
         }
     }
 
-    static func saveToken(_ token: String, forServer account: String) throws {
+    static func saveToken(_ token: String, forServer account: String, service: String = defaultService) throws {
         let data = Data(token.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let query = tokenQuery(forServer: account, service: service)
 
         let attributes: [String: Any] = [
             kSecValueData as String: data,
@@ -63,17 +53,31 @@ enum KeychainHelper {
         }
     }
 
-    static func deleteToken(forServer account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+    static func deleteToken(forServer account: String, service: String = defaultService) throws {
+        let query = tokenQuery(forServer: account, service: service)
 
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.operationFailed(status)
         }
+    }
+
+    private static func tokenQuery(
+        forServer account: String,
+        service: String,
+        includeData: Bool = false
+    ) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+
+        if includeData {
+            query[kSecReturnData as String] = true
+        }
+        return query
     }
 }
 

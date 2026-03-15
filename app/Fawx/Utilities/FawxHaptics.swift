@@ -8,9 +8,16 @@ enum FawxHaptics {
     @MainActor
     static func lightImpact() {
 #if os(iOS)
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.prepare()
-        generator.impactOccurred()
+        lightGenerator.impactOccurred()
+        lightGenerator.prepare()
 #endif
     }
+
+#if os(iOS)
+    @MainActor private static let lightGenerator: UIImpactFeedbackGenerator = {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        return generator
+    }()
+#endif
 }

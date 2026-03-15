@@ -18,6 +18,7 @@ struct ConnectionBannerView: View {
                 Button("Retry", action: retryAction)
                     .buttonStyle(.borderedProminent)
                     .tint(.fawxAccent)
+                    .accessibilityLabel("Retry connection")
             }
         }
         .padding(.horizontal, FawxSpacing.paddingLG)
@@ -29,6 +30,9 @@ struct ConnectionBannerView: View {
                 .frame(height: 1),
             alignment: .bottom
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(banner.tone == .warning ? "Connection warning" : "Connection error")
+        .accessibilityValue(banner.message)
     }
 
     private var backgroundColor: Color {

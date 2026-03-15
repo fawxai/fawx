@@ -22,6 +22,7 @@ struct QueuedMessageChip: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.fawxTextSecondary)
+            .accessibilityLabel("Dismiss queued message")
         }
         .padding(.horizontal, FawxSpacing.paddingMD)
         .padding(.vertical, FawxSpacing.paddingSM)
@@ -31,5 +32,8 @@ struct QueuedMessageChip: View {
                 .stroke(Color.fawxAccent.opacity(0.3), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Queued message")
+        .accessibilityValue(text)
     }
 }

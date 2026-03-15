@@ -44,6 +44,17 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "5D053DF9CA2EEEDED1EB945E"
+               BuildableName = "FawxTests-iOS.xctest"
+               BlueprintName = "FawxTests-iOS"
+               ReferencedContainer = "container:Fawx.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "1381E33C7A04F90DB642E386"
                BuildableName = "FawxUITests.xctest"
                BlueprintName = "FawxUITests"
