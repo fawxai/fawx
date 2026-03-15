@@ -110,6 +110,7 @@ final class AppState {
     var pairedDeviceName: String?
     var activeModel: ModelInfo?
     var thinkingLevel: ThinkingLevel?
+    var availableThinkingLevels: [ThinkingLevel] = ThinkingLevel.defaultOptions
     var availableModels: [ModelInfo] = []
     var skills: [SkillSummary] = []
     var authProviders: [AuthProvider] = []
@@ -244,6 +245,7 @@ final class AppState {
         lastHealth = nil
         activeModel = nil
         thinkingLevel = nil
+        availableThinkingLevels = ThinkingLevel.defaultOptions
         currentContext = nil
         availableModels = []
         skills = []
@@ -269,6 +271,7 @@ final class AppState {
         do {
             let thinking = try await client.thinking()
             thinkingLevel = thinking.level
+            availableThinkingLevels = thinking.available
         } catch {
             thinkingLevel = nil
         }
@@ -361,7 +364,17 @@ final class AppState {
         isUpdatingServerSettings = true
         defer { isUpdatingServerSettings = false }
 
-        _ = try await client.setModel(modelID)
+        let response = try await client.setModel(modelID)
+        activeModel = availableModels.first(where: { $0.modelID == response.activeModel }) ?? activeModel
+
+        if let thinkingAdjusted = response.thinkingAdjusted {
+            thinkingLevel = thinkingAdjusted.to
+            showToast(
+                message: "Thinking adjusted to \(thinkingAdjusted.to.displayName).",
+                style: .info
+            )
+        }
+
         try await refreshServerState()
     }
 
@@ -369,7 +382,9 @@ final class AppState {
         isUpdatingServerSettings = true
         defer { isUpdatingServerSettings = false }
 
-        _ = try await client.setThinking(level)
+        let response = try await client.setThinking(level)
+        thinkingLevel = response.level
+        availableThinkingLevels = response.available
         try await refreshServerState()
     }
 

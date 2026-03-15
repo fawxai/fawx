@@ -127,6 +127,7 @@ struct ChatDetailView: View {
                 activeModel: appState.activeModel,
                 availableModels: appState.availableModels,
                 thinkingLevel: appState.thinkingLevel,
+                availableThinkingLevels: appState.availableThinkingLevels,
                 isUpdatingServerSettings: appState.isUpdatingServerSettings,
                 placeholder: sessionViewModel.selectedSessionID == nil ? "What are you working on?" : "Message Fawx...",
                 sendAction: chatViewModel.sendDraft,

@@ -27,9 +27,17 @@ struct ModelInfo: Codable, Identifiable, Sendable, Hashable {
 struct SetModelResponse: Codable, Sendable, Hashable {
     let previousModel: String
     let activeModel: String
+    let thinkingAdjusted: ThinkingAdjusted?
 
     enum CodingKeys: String, CodingKey {
         case previousModel = "previous_model"
         case activeModel = "active_model"
+        case thinkingAdjusted = "thinking_adjusted"
     }
+}
+
+struct ThinkingAdjusted: Codable, Sendable, Hashable {
+    let from: ThinkingLevel
+    let to: ThinkingLevel
+    let reason: String
 }

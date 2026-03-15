@@ -131,12 +131,12 @@ struct SettingsView: View {
                             }
                         }
                     )) {
-                        ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
-                            Text(level.rawValue.capitalized).tag(level.rawValue)
+                        ForEach(appState.availableThinkingLevels, id: \.self) { level in
+                            Text(level.displayName).tag(level.rawValue)
                         }
                     }
                     .pickerStyle(.segmented)
-                    .disabled(disableServerControls)
+                    .disabled(disableServerControls || appState.availableThinkingLevels.isEmpty)
                     .accessibilityIdentifier("thinkingPicker")
 
                     if disableServerControls {

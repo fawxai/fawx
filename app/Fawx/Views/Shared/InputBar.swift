@@ -15,6 +15,7 @@ struct InputBar: View {
     let activeModel: ModelInfo?
     let availableModels: [ModelInfo]
     let thinkingLevel: ThinkingLevel?
+    let availableThinkingLevels: [ThinkingLevel]
     let isUpdatingServerSettings: Bool
     let placeholder: String
     let sendAction: () -> Void
@@ -70,14 +71,35 @@ struct InputBar: View {
         return placeholder
     }
 
+    @ViewBuilder
     private var messageField: some View {
+#if os(macOS)
+        baseMessageField
+            .onSubmit {
+                performPrimaryAction()
+            }
+#else
+        baseMessageField
+#endif
+    }
+
+    private var baseMessageField: some View {
         TextField(effectivePlaceholder, text: $text, axis: .vertical)
             .textFieldStyle(.plain)
             .font(FawxTypography.input)
             .foregroundStyle(Color.fawxText)
             .lineLimit(1 ... 6)
             .accessibilityIdentifier("messageInput")
+#if os(macOS)
+            .padding(.vertical, FawxSpacing.paddingXS)
+            .frame(
+                maxWidth: .infinity,
+                minHeight: FawxSpacing.inputBarMinHeight - (FawxSpacing.paddingMD * 2),
+                alignment: .leading
+            )
+#else
             .frame(maxWidth: .infinity, alignment: .leading)
+#endif
     }
 
     private var modelMenu: some View {
@@ -96,8 +118,8 @@ struct InputBar: View {
 
     private var thinkingMenu: some View {
         Menu {
-            ForEach(ThinkingLevel.phaseOneOptions, id: \.self) { level in
-                Button(level.rawValue.capitalized) {
+            ForEach(availableThinkingLevels, id: \.self) { level in
+                Button(level.displayName) {
                     selectThinking(level)
                 }
             }
@@ -125,7 +147,7 @@ struct InputBar: View {
     }
 
     private var thinkingMenuDisabled: Bool {
-        isStreaming || isUpdatingServerSettings
+        isStreaming || isUpdatingServerSettings || availableThinkingLevels.isEmpty
     }
 
     private var primaryButtonTitle: String {
@@ -166,6 +188,10 @@ struct InputBar: View {
     }
 
     private func performPrimaryAction() {
+        guard !primaryButtonDisabled else {
+            return
+        }
+
         if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             stopAction()
             return
