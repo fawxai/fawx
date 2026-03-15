@@ -18,4 +18,5 @@ pub mod pairing;
 pub mod phase4;
 pub(crate) mod sessions;
 pub(crate) mod settings;
+pub mod usage;
 pub mod webhook;
