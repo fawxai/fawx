@@ -859,9 +859,12 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             system_prompt,
             http,
             port,
+            fleet,
         } => {
             let _pid_guard = restart::create_serve_pid_file_guard()?;
-            if http {
+            if fleet {
+                commands::serve_fleet::run().await
+            } else if http {
                 run_http_server(system_prompt, port).await
             } else {
                 run_headless(single, json, system_prompt).await
@@ -1216,6 +1219,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_serve_fleet_flag() {
+        let cli = Cli::parse_from(["fawx", "serve", "--fleet"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve {
+                single: false,
+                json: false,
+                system_prompt: None,
+                http: false,
+                port: 8400,
+                fleet: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_serve_fleet_with_http() {
+        match Cli::try_parse_from(["fawx", "serve", "--fleet", "--http"]) {
+            Ok(_) => panic!("serve --fleet --http should be rejected"),
+            Err(error) => {
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            }
+        }
+    }
+
+    #[test]
     fn cli_parses_restart_rebuild_flag() {
         let cli = Cli::parse_from(["fawx", "restart", "--rebuild"]);
         assert!(matches!(
@@ -1458,6 +1487,23 @@ exit 0
             .await
             .expect("dispatch");
         assert_eq!(exit_code, 241);
+    }
+
+    #[tokio::test]
+    async fn serve_fleet_dispatches_to_fleet_worker_runner() {
+        crate::commands::serve_fleet::set_test_exit_code(73);
+        let exit_code = dispatch_command(Commands::Serve {
+            single: false,
+            json: false,
+            system_prompt: None,
+            http: false,
+            port: 8400,
+            fleet: true,
+        })
+        .await
+        .expect("dispatch");
+
+        assert_eq!(exit_code, 73);
     }
 
     #[test]

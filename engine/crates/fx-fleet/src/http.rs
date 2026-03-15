@@ -175,6 +175,28 @@ impl FleetHttpClient {
         self.send_without_response(request, "task dispatch").await
     }
 
+    pub async fn poll_task(
+        &self,
+        endpoint: &str,
+        bearer: &str,
+    ) -> Result<Option<FleetTaskRequest>, FleetError> {
+        let url = fleet_url(endpoint, TASK_PATH);
+        let response = self
+            .authorized_request(Method::GET, &url, bearer)
+            .send()
+            .await
+            .map_err(|error| request_failed_error("task poll", error))?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        let response = ensure_success("task poll", response).await?;
+        response
+            .json()
+            .await
+            .map(Some)
+            .map_err(|error| invalid_json_error("task poll", error))
+    }
+
     pub async fn worker_status(
         &self,
         endpoint: &str,
@@ -393,7 +415,7 @@ mod tests {
                 response,
             };
             let app = Router::new()
-                .route(TASK_PATH, post(capture_request))
+                .route(TASK_PATH, get(capture_request).post(capture_request))
                 .route(STATUS_PATH, get(capture_request))
                 .route(REGISTER_PATH, post(capture_request))
                 .route(HEARTBEAT_PATH, post(capture_request))
@@ -702,6 +724,46 @@ mod tests {
             captured.json_body(),
             serde_json::to_value(&request).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn poll_task_reads_json_response_with_bearer_auth() {
+        let response = sample_task_request();
+        let mut server = TestServer::spawn(TestResponse::json(
+            serde_json::to_value(&response).expect("task should serialize"),
+        ))
+        .await;
+        let client = FleetHttpClient::new(Duration::from_secs(2));
+
+        let task = client
+            .poll_task(&server.base_url, "poll-token")
+            .await
+            .expect("poll_task should succeed");
+
+        let captured = server.capture_request().await;
+        assert_eq!(captured.method, Method::GET);
+        assert_eq!(captured.path, TASK_PATH);
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer poll-token"));
+        assert!(captured.body.is_empty());
+        assert_eq!(task, Some(response));
+    }
+
+    #[tokio::test]
+    async fn poll_task_returns_none_for_no_content() {
+        let mut server = TestServer::spawn(TestResponse::no_content()).await;
+        let client = FleetHttpClient::new(Duration::from_secs(2));
+
+        let task = client
+            .poll_task(&server.base_url, "poll-token")
+            .await
+            .expect("poll_task should succeed");
+
+        let captured = server.capture_request().await;
+        assert_eq!(captured.method, Method::GET);
+        assert_eq!(captured.path, TASK_PATH);
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer poll-token"));
+        assert!(captured.body.is_empty());
+        assert_eq!(task, None);
     }
 
     #[tokio::test]

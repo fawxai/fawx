@@ -6,6 +6,8 @@ use fx_fleet::{
     WorkerState,
 };
 use serde_json::json;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -17,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+static TEST_EXIT_CODE: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy)]
 struct WorkerLoopConfig {
@@ -180,6 +184,11 @@ struct StubExecutionOutcome {
 }
 
 pub async fn run() -> anyhow::Result<i32> {
+    #[cfg(test)]
+    if let Some(exit_code) = take_test_exit_code() {
+        return Ok(exit_code);
+    }
+
     let shutdown = install_shutdown_token();
     let client = FleetHttpClient::new(DEFAULT_REQUEST_TIMEOUT);
     run_with_dependencies(
@@ -338,6 +347,21 @@ fn build_result(
         error: outcome.error,
         duration_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_exit_code(exit_code: i32) {
+    *TEST_EXIT_CODE
+        .lock()
+        .expect("fleet worker test exit code lock") = Some(exit_code);
+}
+
+#[cfg(test)]
+fn take_test_exit_code() -> Option<i32> {
+    TEST_EXIT_CODE
+        .lock()
+        .expect("fleet worker test exit code lock")
+        .take()
 }
 
 #[cfg(test)]
