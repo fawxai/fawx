@@ -43,17 +43,14 @@ pub struct LaunchAgentReloadResponse {
 }
 
 // GET /v1/launchagent/status
-pub async fn handle_launchagent_status() -> Json<LaunchAgentStatusResponse> {
+pub async fn handle_launchagent_status() -> HandlerResult<Json<LaunchAgentStatusResponse>> {
     let status = tokio::task::spawn_blocking(launchagent::status)
         .await
-        .unwrap_or(launchagent::LaunchAgentStatus {
-            installed: false,
-            loaded: false,
-        });
-    Json(LaunchAgentStatusResponse {
+        .map_err(|e| agent_error(format!("status check failed: {e}")))?;
+    Ok(Json(LaunchAgentStatusResponse {
         installed: status.installed,
         loaded: status.loaded,
-    })
+    }))
 }
 
 // POST /v1/launchagent/install
