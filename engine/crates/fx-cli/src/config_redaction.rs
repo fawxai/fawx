@@ -3,6 +3,7 @@ use toml::{map::Map as TomlMap, Value as TomlValue};
 
 pub(crate) const REDACTED_SECRET: &str = "[REDACTED]";
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sanitize_json(value: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => JsonValue::Object(sanitize_json_object(map)),
@@ -34,12 +35,14 @@ fn has_secret_suffix(key: &str, marker: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('_'))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_json_object(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
     map.into_iter()
         .map(|(key, value)| (key.clone(), sanitize_json_entry(&key, value)))
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_json_entry(key: &str, value: JsonValue) -> JsonValue {
     if is_secret_key(key) {
         JsonValue::String(REDACTED_SECRET.to_string())

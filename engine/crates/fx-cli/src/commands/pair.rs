@@ -1,5 +1,5 @@
 use super::api_client::{
-    api_error_message, bearer_token, http_client, request_error, server_not_running_message,
+    api_error_message, bearer_token, http_client, request_error,
 };
 use super::runtime_layout::RuntimeLayout;
 use anyhow::Context;
