@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -63,8 +64,7 @@ impl RestartController {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn new(inner: Arc<dyn RestartRequestor>) -> Self {
+    pub(crate) fn from_requestor(inner: Arc<dyn RestartRequestor>) -> Self {
         Self { inner }
     }
 
@@ -73,15 +73,30 @@ impl RestartController {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchAgentState {
     pub installed: bool,
     pub loaded: bool,
     pub auto_start_enabled: bool,
 }
 
+#[cfg(target_os = "macos")]
 pub fn detect_launchagent_state() -> LaunchAgentState {
-    let installed = launchagent_plist_path().is_file();
+    let Some(plist_path) = launchagent_plist_path() else {
+        tracing::warn!("HOME unset; skipping LaunchAgent detection");
+        return LaunchAgentState::default();
+    };
+    build_launchagent_state(plist_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn detect_launchagent_state() -> LaunchAgentState {
+    LaunchAgentState::default()
+}
+
+#[cfg(target_os = "macos")]
+fn build_launchagent_state(plist_path: PathBuf) -> LaunchAgentState {
+    let installed = plist_path.is_file();
     let loaded = installed && launchagent_loaded();
     LaunchAgentState {
         installed,
@@ -177,27 +192,19 @@ fn signal_flag(signal: RestartSignal) -> &'static str {
     }
 }
 
-fn launchagent_plist_path() -> PathBuf {
-    home_dir()
-        .join("Library")
-        .join("LaunchAgents")
-        .join("ai.fawx.server.plist")
+#[cfg(target_os = "macos")]
+fn launchagent_plist_path() -> Option<PathBuf> {
+    Some(home_dir()?.join("Library/LaunchAgents/ai.fawx.server.plist"))
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+#[cfg(target_os = "macos")]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(target_os = "macos")]
 fn launchagent_loaded() -> bool {
     command_output_contains("launchctl", &["list"], LAUNCHAGENT_LABEL)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn launchagent_loaded() -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]

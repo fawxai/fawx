@@ -1028,6 +1028,7 @@ fn validate_bearer_token_store_ignores_empty() {
 
 mod routing_and_status {
     use super::*;
+    use crate::server_runtime::{RestartAction, RestartController, RestartRequestor};
     use async_trait::async_trait;
     use fx_bus::{BusStore, Payload, SessionBus};
     use fx_config::manager::ConfigManager;
@@ -1061,6 +1062,17 @@ mod routing_and_status {
             _cancel: Option<&CancellationToken>,
         ) -> Result<Vec<ToolResult>, ToolExecutorError> {
             Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubRestartRequestor {
+        action: RestartAction,
+    }
+
+    impl RestartRequestor for StubRestartRequestor {
+        fn request_restart(&self) -> Result<RestartAction, String> {
+            Ok(self.action.clone())
         }
     }
 
@@ -1270,6 +1282,15 @@ mod routing_and_status {
         ServerRuntime::local(8400)
     }
 
+    fn test_server_runtime_with_restart(action: RestartAction) -> ServerRuntime {
+        ServerRuntime::new(
+            "127.0.0.1",
+            8400,
+            false,
+            RestartController::from_requestor(Arc::new(StubRestartRequestor { action })),
+        )
+    }
+
     fn test_state_with_app(app: HeadlessApp, webhooks: Vec<Arc<WebhookChannel>>) -> HttpState {
         let data_dir = app
             .config()
@@ -1325,6 +1346,12 @@ mod routing_and_status {
     fn test_state_with_devices(devices: DeviceStore) -> HttpState {
         let mut state = test_state(None, Vec::new());
         state.devices = Arc::new(Mutex::new(devices));
+        state
+    }
+
+    fn test_state_with_server_runtime(server_runtime: ServerRuntime) -> HttpState {
+        let mut state = test_state(None, Vec::new());
+        state.server_runtime = server_runtime;
         state
     }
 
@@ -1472,6 +1499,81 @@ mod routing_and_status {
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn setup_status_endpoint_returns_expected_shape() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"mock-model\"\n",
+        )
+        .expect("write config");
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/setup/status"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["mode"], "local");
+        assert_eq!(json["setup_complete"], true);
+        assert_eq!(json["has_valid_config"], true);
+        assert_eq!(json["server_running"], true);
+        assert_eq!(json["local_server"]["host"], "127.0.0.1");
+        assert_eq!(json["local_server"]["port"], 8400);
+        assert_eq!(json["local_server"]["https_enabled"], false);
+        assert!(json["launchagent"]["installed"].is_boolean());
+        assert!(json["launchagent"]["loaded"].is_boolean());
+        assert!(json["launchagent"]["auto_start_enabled"].is_boolean());
+        assert_eq!(json["auth"]["bearer_token_present"], true);
+        assert!(json["auth"]["providers_configured"].is_array());
+        assert!(json["tailscale"]["installed"].is_boolean());
+        assert!(json["tailscale"]["running"].is_boolean());
+        assert!(json["tailscale"]["logged_in"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn server_status_endpoint_returns_expected_shape() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/server/status"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["host"], "127.0.0.1");
+        assert_eq!(json["port"], 8400);
+        assert_eq!(json["https_enabled"], false);
+        assert!(json["uptime_seconds"].as_u64().is_some());
+        assert!(json["pid"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn server_restart_endpoint_returns_accepted_response() {
+        let server_runtime = test_server_runtime_with_restart(RestartAction {
+            restart_via: "launchagent_keepalive",
+            message: "Server restart requested.",
+        });
+        let app = build_router(test_state_with_server_runtime(server_runtime), None);
+
+        let response = app
+            .oneshot(authed_request("POST", "/v1/server/restart"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["accepted"], true);
+        assert_eq!(json["restart_via"], "launchagent_keepalive");
+        assert_eq!(json["message"], "Server restart requested.");
     }
 
     fn make_session_registry() -> SessionRegistry {

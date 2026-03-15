@@ -56,6 +56,20 @@ pub struct SetupAuthStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SetupLaunchAgentStatus {
+    pub installed: bool,
+    pub loaded: bool,
+    pub auto_start_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupLocalServerStatus {
+    pub host: String,
+    pub port: u16,
+    pub https_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct SetupTailscaleStatus {
     pub installed: bool,
     pub running: bool,
@@ -70,6 +84,8 @@ pub struct SetupStatusResponse {
     pub setup_complete: bool,
     pub has_valid_config: bool,
     pub server_running: bool,
+    pub launchagent: SetupLaunchAgentStatus,
+    pub local_server: SetupLocalServerStatus,
     pub auth: SetupAuthStatus,
     pub tailscale: SetupTailscaleStatus,
 }

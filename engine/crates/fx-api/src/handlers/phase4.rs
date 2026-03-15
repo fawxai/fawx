@@ -1,8 +1,8 @@
-use crate::server_runtime::RestartAction;
+use crate::server_runtime::{detect_launchagent_state, RestartAction, ServerRuntime};
 use crate::state::HttpState;
 use crate::types::{
-    ErrorBody, ServerRestartResponse, ServerStatusResponse, SetupAuthStatus, SetupStatusResponse,
-    SetupTailscaleStatus,
+    ErrorBody, ServerRestartResponse, ServerStatusResponse, SetupAuthStatus,
+    SetupLaunchAgentStatus, SetupLocalServerStatus, SetupStatusResponse, SetupTailscaleStatus,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,18 +15,26 @@ use std::process::Command;
 use super::HandlerResult;
 
 const LOCAL_MODE: &str = "local";
-const READY_STATUS: &str = "ok";
+const READY_STATUS: &str = "running";
 
 pub async fn handle_setup_status(State(state): State<HttpState>) -> Json<SetupStatusResponse> {
-    let auth = setup_auth_status(&state).await;
     let has_valid_config = has_valid_config(&state);
+    let local_server = local_server_status(&state.server_runtime);
+    let (auth, launchagent, tailscale) = tokio::join!(
+        setup_auth_status(&state),
+        detect_launchagent_status(),
+        detect_tailscale_status(),
+    );
+
     Json(SetupStatusResponse {
         mode: LOCAL_MODE.to_string(),
         setup_complete: has_valid_config && auth.bearer_token_present,
         has_valid_config,
         server_running: true,
+        launchagent,
+        local_server,
         auth,
-        tailscale: detect_tailscale_status(),
+        tailscale,
     })
 }
 
@@ -46,9 +54,10 @@ pub async fn handle_server_status(State(state): State<HttpState>) -> Json<Server
 pub async fn handle_server_restart(
     State(state): State<HttpState>,
 ) -> HandlerResult<Json<ServerRestartResponse>> {
-    let action = state
-        .server_runtime
-        .request_restart()
+    let runtime = state.server_runtime.clone();
+    let action = tokio::task::spawn_blocking(move || runtime.request_restart())
+        .await
+        .map_err(restart_task_error)?
         .map_err(restart_error)?;
     Ok(Json(server_restart_response(action)))
 }
@@ -70,7 +79,39 @@ fn has_valid_config(state: &HttpState) -> bool {
     config_path.is_file() && FawxConfig::load(&state.data_dir).is_ok()
 }
 
-fn detect_tailscale_status() -> SetupTailscaleStatus {
+fn local_server_status(runtime: &ServerRuntime) -> SetupLocalServerStatus {
+    SetupLocalServerStatus {
+        host: runtime.host.clone(),
+        port: runtime.port,
+        https_enabled: runtime.https_enabled,
+    }
+}
+
+async fn detect_launchagent_status() -> SetupLaunchAgentStatus {
+    match tokio::task::spawn_blocking(detect_launchagent_state).await {
+        Ok(state) => SetupLaunchAgentStatus {
+            installed: state.installed,
+            loaded: state.loaded,
+            auto_start_enabled: state.auto_start_enabled,
+        },
+        Err(error) => {
+            tracing::error!(error = %error, "launchagent detection task failed");
+            SetupLaunchAgentStatus::default()
+        }
+    }
+}
+
+async fn detect_tailscale_status() -> SetupTailscaleStatus {
+    match tokio::task::spawn_blocking(detect_tailscale_status_sync).await {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::error!(error = %error, "tailscale detection task failed");
+            SetupTailscaleStatus::default()
+        }
+    }
+}
+
+fn detect_tailscale_status_sync() -> SetupTailscaleStatus {
     match probe_tailscale_status() {
         TailscaleProbe::NotInstalled => SetupTailscaleStatus::default(),
         TailscaleProbe::Unavailable => SetupTailscaleStatus {
@@ -143,6 +184,12 @@ fn restart_error(error: String) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error }))
 }
 
+fn restart_task_error(error: tokio::task::JoinError) -> (StatusCode, Json<ErrorBody>) {
+    let error = format!("server restart task failed: {error}");
+    tracing::error!(error = %error, "server restart request failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error }))
+}
+
 enum TailscaleProbe {
     NotInstalled,
     Unavailable,
@@ -160,6 +207,16 @@ mod tests {
             setup_complete: true,
             has_valid_config: true,
             server_running: true,
+            launchagent: SetupLaunchAgentStatus {
+                installed: true,
+                loaded: true,
+                auto_start_enabled: true,
+            },
+            local_server: SetupLocalServerStatus {
+                host: "127.0.0.1".to_string(),
+                port: 8400,
+                https_enabled: true,
+            },
             auth: SetupAuthStatus {
                 bearer_token_present: true,
                 providers_configured: vec!["anthropic".to_string()],
@@ -177,6 +234,8 @@ mod tests {
 
         assert_eq!(json["mode"], "local");
         assert_eq!(json["setup_complete"], true);
+        assert_eq!(json["launchagent"]["loaded"], true);
+        assert_eq!(json["local_server"]["port"], 8400);
         assert_eq!(json["auth"]["providers_configured"][0], "anthropic");
         assert_eq!(json["tailscale"]["hostname"], "joes-mac.tail1234.ts.net");
     }
@@ -184,7 +243,7 @@ mod tests {
     #[test]
     fn server_status_response_serializes_expected_shape() {
         let response = ServerStatusResponse {
-            status: "ok".to_string(),
+            status: "running".to_string(),
             version: "1.2.3".to_string(),
             uptime_seconds: 42,
             pid: 1234,
@@ -195,7 +254,7 @@ mod tests {
 
         let json = serde_json::to_value(response).expect("serialize");
 
-        assert_eq!(json["status"], "ok");
+        assert_eq!(json["status"], "running");
         assert_eq!(json["version"], "1.2.3");
         assert_eq!(json["pid"], 1234);
         assert_eq!(json["port"], 8400);
