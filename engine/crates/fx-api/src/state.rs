@@ -32,6 +32,8 @@ pub struct HttpState {
     pub permission_prompts: Arc<fx_kernel::PermissionPromptState>,
     pub fleet_manager: Option<Arc<Mutex<FleetManager>>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub experiment_registry:
+        Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
 }
 
 #[derive(Clone)]

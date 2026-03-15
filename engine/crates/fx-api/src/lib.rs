@@ -6,6 +6,7 @@ pub mod time_util;
 pub(crate) mod devices;
 pub mod engine;
 pub(crate) mod error;
+pub mod experiment_registry;
 pub(crate) mod handlers;
 pub mod launchagent;
 pub(crate) mod listener;
@@ -77,6 +78,8 @@ pub async fn run(
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(config.telegram.clone(), config.webhook_channels);
     let session_registry = init_session_registry(&config.data_dir);
+    let experiment_registry = crate::experiment_registry::ExperimentRegistry::new(&config.data_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to load experiment registry: {e}"))?;
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
@@ -101,6 +104,7 @@ pub async fn run(
         permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
+        experiment_registry: Arc::new(Mutex::new(experiment_registry)),
     };
     let router = build_router(state, fleet_manager);
 

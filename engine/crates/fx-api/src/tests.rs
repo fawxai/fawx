@@ -2,6 +2,7 @@ use crate::config_redaction;
 use crate::devices::DeviceStore;
 use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
 use crate::error::HttpError;
+use crate::experiment_registry::ExperimentRegistry;
 use crate::handlers::health::sanitize_config;
 use crate::listener::{
     bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip, run_listeners,
@@ -1338,6 +1339,10 @@ mod routing_and_status {
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             fleet_manager: None,
             cron_store: None,
+            experiment_registry: {
+                let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                Arc::new(tokio::sync::Mutex::new(registry))
+            },
         }
     }
 
@@ -1372,6 +1377,10 @@ mod routing_and_status {
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             fleet_manager: None,
             cron_store: None,
+            experiment_registry: {
+                let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                Arc::new(tokio::sync::Mutex::new(registry))
+            },
         }
     }
 
@@ -3182,6 +3191,10 @@ thinking = "adaptive"
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             fleet_manager: None,
             cron_store: None,
+            experiment_registry: {
+                let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                Arc::new(tokio::sync::Mutex::new(registry))
+            },
         };
         let app = build_router(state, None);
         let req = Request::builder()
