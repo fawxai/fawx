@@ -5,8 +5,8 @@
 //! using `toml_edit`.
 
 use crate::{
-    parse_config_document, parse_log_level, set_typed_field, write_config_file, FawxConfig,
-    VALID_LOG_LEVELS,
+    parse_config_document, parse_log_level, set_typed_field, validate_synthesis_instruction,
+    write_config_file, FawxConfig, VALID_LOG_LEVELS,
 };
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,14 @@ impl ConfigManager {
         self.reload()
     }
 
+    /// Remove a config key by dot-separated path.
+    pub fn clear(&mut self, key: &str) -> Result<(), String> {
+        reject_immutable(key)?;
+        let (sections, field) = parse_key_path(key)?;
+        self.clear_from_file(&sections, field)?;
+        self.reload()
+    }
+
     /// Persist the current in-memory config to disk.
     ///
     /// If a config file already exists on disk, the write is done via
@@ -123,6 +131,16 @@ impl ConfigManager {
         set_typed_field(&mut document, sections, field, value)?;
         write_config_file(&self.config_path, document.to_string())
     }
+
+    fn clear_from_file(&self, sections: &[&str], field: &str) -> Result<(), String> {
+        let content = read_or_default(&self.config_path)?;
+        if content.is_empty() {
+            return Ok(());
+        }
+        let mut document = parse_config_document(&content)?;
+        remove_field(document.as_table_mut(), sections, field)?;
+        write_config_file(&self.config_path, document.to_string())
+    }
 }
 
 // ── Free functions ──────────────────────────────────────────────────────────
@@ -142,7 +160,7 @@ fn reject_immutable(key: &str) -> Result<(), String> {
 /// Example: `"model.default_model"` → `(["model"], "default_model")`
 fn parse_key_path(key: &str) -> Result<(Vec<&str>, &str), String> {
     let parts: Vec<&str> = key.split('.').collect();
-    if parts.len() < 2 {
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
         return Err(format!(
             "key must be dot-separated (e.g. 'model.default_model'), got '{key}'"
         ));
@@ -161,6 +179,7 @@ fn validate_field_value(key: &str, value: &str) -> Result<(), String> {
         "tools.max_read_size" => validate_min_u64(key, value, 1024),
         "memory.max_entries" => validate_positive_usize(key, value),
         "model.default_model" => validate_model_name(value),
+        "model.synthesis_instruction" => validate_synthesis_instruction(value),
         "logging.max_files" => validate_positive_usize(key, value),
         "logging.file_level" | "logging.stderr_level" => validate_log_level(value),
         _ => Ok(()),
@@ -297,6 +316,33 @@ fn toml_value_to_edit_item(val: &toml::Value) -> toml_edit::Item {
     }
 }
 
+fn remove_field(
+    table: &mut toml_edit::Table,
+    sections: &[&str],
+    field: &str,
+) -> Result<(), String> {
+    if let Some(target) = table_for_path(table, sections)? {
+        target.remove(field);
+    }
+    Ok(())
+}
+
+fn table_for_path<'a>(
+    table: &'a mut toml_edit::Table,
+    sections: &[&str],
+) -> Result<Option<&'a mut toml_edit::Table>, String> {
+    let Some((section, rest)) = sections.split_first() else {
+        return Ok(Some(table));
+    };
+    let Some(item) = table.get_mut(section) else {
+        return Ok(None);
+    };
+    let child = item
+        .as_table_mut()
+        .ok_or_else(|| format!("config section '{section}' must be a table"))?;
+    table_for_path(child, rest)
+}
+
 /// Read config file contents, or return an empty string if it doesn't exist.
 fn read_or_default(path: &Path) -> Result<String, String> {
     if path.exists() {
@@ -424,6 +470,42 @@ mod tests {
     }
 
     #[test]
+    fn clear_removes_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(
+            temp.path(),
+            "[model]\ndefault_model = \"test-model\"\nsynthesis_instruction = \"Stay concise\"\n",
+        );
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.clear("model.synthesis_instruction")
+            .expect("clear synthesis");
+
+        assert_eq!(mgr.config().model.synthesis_instruction, None);
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(!content.contains("synthesis_instruction"));
+        assert!(content.contains("default_model = \"test-model\""));
+    }
+
+    #[test]
+    fn clear_preserves_comments() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(
+            temp.path(),
+            "# header comment\n[model]\n# keep this comment\ndefault_model = \"test-model\"\nsynthesis_instruction = \"Stay concise\"\n",
+        );
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.clear("model.synthesis_instruction")
+            .expect("clear synthesis");
+
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(content.contains("# header comment"));
+        assert!(content.contains("# keep this comment"));
+        assert!(content.contains("default_model = \"test-model\""));
+    }
+
+    #[test]
     fn set_rejects_immutable_data_dir() {
         let temp = TempDir::new().expect("tempdir");
         let mut mgr = ConfigManager::new(temp.path()).expect("manager");
@@ -455,6 +537,16 @@ mod tests {
 
         let err = mgr.set("general.max_iterations", "0").unwrap_err();
         assert!(err.contains("must be >= 1"));
+    }
+
+    #[test]
+    fn set_rejects_empty_synthesis_instruction() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[model]\ndefault_model = \"test-model\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        let err = mgr.set("model.synthesis_instruction", "   ").unwrap_err();
+        assert!(err.contains("synthesis_instruction must not be empty"));
     }
 
     #[test]

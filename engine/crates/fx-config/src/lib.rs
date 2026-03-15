@@ -7,9 +7,22 @@ use std::str::FromStr;
 use toml_edit::{value, DocumentMut, Item, Table};
 use tracing_subscriber::filter::LevelFilter;
 
-const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
+pub const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const MIN_MAX_READ_SIZE: u64 = 1024;
 pub(crate) const VALID_LOG_LEVELS: &str = "error, warn, info, debug, trace";
+
+pub fn validate_synthesis_instruction(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("synthesis_instruction must not be empty".to_string());
+    }
+    if trimmed.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
+        return Err(format!(
+            "synthesis_instruction exceeds {MAX_SYNTHESIS_INSTRUCTION_LENGTH} characters"
+        ));
+    }
+    Ok(())
+}
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -858,12 +871,7 @@ impl FawxConfig {
             return Err("memory.max_entries must be >= 1".to_string());
         }
         if let Some(instruction) = &self.model.synthesis_instruction {
-            if instruction.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
-                return Err(format!(
-                    "model.synthesis_instruction exceeds {} characters",
-                    MAX_SYNTHESIS_INSTRUCTION_LENGTH
-                ));
-            }
+            validate_synthesis_instruction(instruction)?;
         }
         if let Some(max_files) = self.logging.max_files {
             if max_files == 0 {
@@ -1589,6 +1597,14 @@ default_model = "old-model"
         write_config(&temp, &content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject long instruction");
         assert!(error.contains("synthesis_instruction exceeds 500 characters"));
+    }
+
+    #[test]
+    fn load_rejects_empty_synthesis_instruction() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[model]\nsynthesis_instruction = \"\"\n");
+        let error = FawxConfig::load(temp.path()).expect_err("should reject empty instruction");
+        assert!(error.contains("synthesis_instruction must not be empty"));
     }
 
     #[test]

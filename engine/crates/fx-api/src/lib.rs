@@ -80,6 +80,7 @@ pub async fn run(
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
     let server_runtime = ServerRuntime::local(config.port);
+    let has_synthesis = has_synthesis_config(&shared_app).await;
     let state = HttpState {
         app: Arc::clone(&shared_app),
         session_registry,
@@ -92,6 +93,9 @@ pub async fn run(
         devices_path: Some(devices_path),
         channels: channels.clone(),
         data_dir: config.data_dir.clone(),
+        synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(
+            has_synthesis,
+        )),
         cron_store: config.cron_store.clone(),
     };
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
@@ -104,6 +108,18 @@ pub async fn run(
 
     run_listeners(router, listeners).await?;
     Ok(0)
+}
+
+async fn has_synthesis_config(app: &Arc<Mutex<dyn AppEngine>>) -> bool {
+    let app_guard = app.lock().await;
+    let Some(manager) = app_guard.config_manager() else {
+        return false;
+    };
+    let has_value = manager
+        .lock()
+        .map(|guard| guard.config().model.synthesis_instruction.is_some())
+        .unwrap_or(false);
+    has_value
 }
 
 fn init_session_registry(data_dir: &Path) -> Option<SessionRegistry> {

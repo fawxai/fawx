@@ -1287,6 +1287,12 @@ mod routing_and_status {
         (temp, config, manager)
     }
 
+    fn synthesis_state(has_initial_value: bool) -> Arc<crate::handlers::synthesis::SynthesisState> {
+        Arc::new(crate::handlers::synthesis::SynthesisState::new(
+            has_initial_value,
+        ))
+    }
+
     fn test_state(
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
         webhooks: Vec<Arc<WebhookChannel>>,
@@ -1314,6 +1320,7 @@ mod routing_and_status {
             .data_dir
             .clone()
             .unwrap_or_else(std::env::temp_dir);
+        let has_synthesis = app.config().model.synthesis_instruction.is_some();
         HttpState {
             app: Arc::new(Mutex::new(app)),
             session_registry: None,
@@ -1326,6 +1333,7 @@ mod routing_and_status {
             devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
+            synthesis: synthesis_state(has_synthesis),
             cron_store: None,
         }
     }
@@ -1340,6 +1348,7 @@ mod routing_and_status {
             .data_dir
             .clone()
             .unwrap_or_else(std::env::temp_dir);
+        let has_synthesis = config.model.synthesis_instruction.is_some();
         HttpState {
             app: Arc::new(Mutex::new(make_test_app_with_config(
                 config,
@@ -1355,6 +1364,7 @@ mod routing_and_status {
             devices_path: None,
             channels: build_channel_runtime(None, webhooks),
             data_dir,
+            synthesis: synthesis_state(has_synthesis),
             cron_store: None,
         }
     }
@@ -3161,6 +3171,7 @@ thinking = "adaptive"
                 webhooks: Arc::new(webhooks),
             },
             data_dir,
+            synthesis: synthesis_state(false),
             cron_store: None,
         };
         let app = build_router(state, None);
@@ -3174,6 +3185,264 @@ thinking = "adaptive"
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_synthesis_returns_current_value_and_metadata() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let app = build_router(
+            test_state_with_app(make_test_app_with_config(config, Some(manager)), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/synthesis"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["synthesis"], "Be concise");
+        assert_eq!(json["source"], "config");
+        assert_eq!(json["version"], 1);
+        assert_eq!(
+            json["max_length"],
+            fx_config::MAX_SYNTHESIS_INSTRUCTION_LENGTH
+        );
+        assert!(json["updated_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn get_synthesis_returns_null_when_unset() {
+        let (_temp, config, manager) =
+            temp_config_manager("[model]\ndefault_model = \"mock-model\"\n");
+        let app = build_router(
+            test_state_with_app(make_test_app_with_config(config, Some(manager)), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/synthesis"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["synthesis"].is_null());
+        assert!(json["updated_at"].is_null());
+        assert_eq!(json["version"], 0);
+    }
+
+    #[tokio::test]
+    async fn put_synthesis_updates_config_and_bumps_version() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let router = build_router(
+            test_state_with_app(
+                make_test_app_with_config(config, Some(Arc::clone(&manager))),
+                Vec::new(),
+            ),
+            None,
+        );
+
+        let response = router
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/synthesis",
+                r#"{"synthesis":"Ask one clarifying question if needed.","version":1}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["updated"], true);
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["synthesis"], "Ask one clarifying question if needed.");
+        assert!(json["updated_at"].is_number());
+
+        let synthesis = manager
+            .lock()
+            .expect("config manager")
+            .config()
+            .model
+            .synthesis_instruction
+            .clone();
+        assert_eq!(
+            synthesis,
+            Some("Ask one clarifying question if needed.".to_string())
+        );
+
+        let get_response = router
+            .oneshot(authed_request("GET", "/v1/synthesis"))
+            .await
+            .expect("response");
+        let get_json = response_json(get_response).await;
+        assert_eq!(get_json["version"], 2);
+        assert_eq!(
+            get_json["synthesis"],
+            "Ask one clarifying question if needed."
+        );
+    }
+
+    #[tokio::test]
+    async fn put_synthesis_validates_length() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let app = build_router(
+            test_state_with_app(make_test_app_with_config(config, Some(manager)), Vec::new()),
+            None,
+        );
+        let synthesis = "a".repeat(fx_config::MAX_SYNTHESIS_INSTRUCTION_LENGTH + 1);
+        let body = serde_json::json!({ "synthesis": synthesis }).to_string();
+
+        let response = app
+            .oneshot(authed_json_request("PUT", "/v1/synthesis", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            format!(
+                "synthesis_instruction exceeds {} characters",
+                fx_config::MAX_SYNTHESIS_INSTRUCTION_LENGTH
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn put_synthesis_without_version_succeeds_when_server_version_is_nonzero() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let router = build_router(
+            test_state_with_app(
+                make_test_app_with_config(config, Some(Arc::clone(&manager))),
+                Vec::new(),
+            ),
+            None,
+        );
+
+        let response = router
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/synthesis",
+                r#"{"synthesis":"New value without version"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["synthesis"], "New value without version");
+
+        let synthesis = manager
+            .lock()
+            .expect("config manager")
+            .config()
+            .model
+            .synthesis_instruction
+            .clone();
+        assert_eq!(synthesis, Some("New value without version".to_string()));
+    }
+
+    #[tokio::test]
+    async fn put_synthesis_rejects_stale_version() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let app = build_router(
+            test_state_with_app(make_test_app_with_config(config, Some(manager)), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/synthesis",
+                r#"{"synthesis":"New value","version":99}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "Version mismatch: expected 1, got 99");
+    }
+
+    #[tokio::test]
+    async fn put_synthesis_rejects_invalid_value() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let app = build_router(
+            test_state_with_app(make_test_app_with_config(config, Some(manager)), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/synthesis",
+                r#"{"synthesis":"   "}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "synthesis_instruction must not be empty");
+    }
+
+    #[tokio::test]
+    async fn delete_synthesis_clears_config_and_bumps_version() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\nsynthesis_instruction = \"Be concise\"\n",
+        );
+        let router = build_router(
+            test_state_with_app(
+                make_test_app_with_config(config, Some(Arc::clone(&manager))),
+                Vec::new(),
+            ),
+            None,
+        );
+
+        let response = router
+            .clone()
+            .oneshot(authed_request("DELETE", "/v1/synthesis"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["cleared"], true);
+        assert_eq!(json["version"], 2);
+        let synthesis = manager
+            .lock()
+            .expect("config manager")
+            .config()
+            .model
+            .synthesis_instruction
+            .clone();
+        assert_eq!(synthesis, None);
+
+        let get_response = router
+            .oneshot(authed_request("GET", "/v1/synthesis"))
+            .await
+            .expect("response");
+        let get_json = response_json(get_response).await;
+        assert!(get_json["synthesis"].is_null());
+        assert!(get_json["updated_at"].is_null());
+        assert_eq!(get_json["version"], 2);
     }
 }
 

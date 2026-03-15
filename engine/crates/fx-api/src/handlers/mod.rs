@@ -20,5 +20,6 @@ pub mod phase4;
 pub mod proposals;
 pub(crate) mod sessions;
 pub(crate) mod settings;
+pub mod synthesis;
 pub mod usage;
 pub mod webhook;

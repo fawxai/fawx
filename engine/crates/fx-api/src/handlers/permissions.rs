@@ -773,6 +773,7 @@ mod tests {
             devices_path: None,
             channels: build_channel_runtime(None, vec![]),
             data_dir: temp.path().to_path_buf(),
+            synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
             cron_store: None,
         };
 
