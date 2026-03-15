@@ -111,7 +111,6 @@ pub struct ServerRestartResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SetupTokenRequest {
     pub setup_token: String,
-    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -126,7 +125,6 @@ pub struct SetupTokenResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApiKeyRequest {
     pub api_key: String,
-    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -55,6 +55,22 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/skills", get(handle_list_skills))
         .route("/auth", get(handle_list_auth))
+        .route(
+            "/auth/anthropic/setup-token",
+            post(handlers::auth::handle_setup_token),
+        )
+        .route(
+            "/auth/{provider}/api-key",
+            post(handlers::auth::handle_store_api_key),
+        )
+        .route(
+            "/auth/{provider}",
+            delete(handlers::auth::handle_delete_provider),
+        )
+        .route(
+            "/auth/{provider}/verify",
+            post(handlers::auth::handle_verify_provider),
+        )
         .route("/setup/status", get(handle_setup_status))
         .route("/server/status", get(handle_server_status))
         .route("/server/restart", post(handle_server_restart))
@@ -88,22 +104,6 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/config", get(handle_config_get).post(handle_config_set))
         .route("/webhook/{channel_id}", post(handle_webhook))
         .nest("/v1", v1_router)
-        .route(
-            "/v1/auth/anthropic/setup-token",
-            post(handlers::auth::handle_setup_token),
-        )
-        .route(
-            "/v1/auth/{provider}/api-key",
-            post(handlers::auth::handle_store_api_key),
-        )
-        .route(
-            "/v1/auth/{provider}",
-            delete(handlers::auth::handle_delete_provider),
-        )
-        .route(
-            "/v1/auth/{provider}/verify",
-            post(handlers::auth::handle_verify_provider),
-        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
