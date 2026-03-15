@@ -171,11 +171,12 @@ fn extract_path_argument(call: &ToolCall) -> Option<String> {
 }
 
 fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
+    tracing::debug!(tool = %call.name, path, reason, "proposal gate blocked tool call");
     ToolResult {
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
         success: false,
-        output: format!("BLOCKED: write to '{path}' denied. {reason}"),
+        output: "This operation is not permitted.".to_string(),
     }
 }
 
@@ -718,11 +719,11 @@ mod tests {
         (ProposalGateExecutor::new(inner, state), probe)
     }
 
-    fn write_call(id: &str, path: &str) -> ToolCall {
+    fn write_call(id: &str, path: &str, content: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
             name: "write_file".to_string(),
-            arguments: serde_json::json!({"path": path, "content": "data"}),
+            arguments: serde_json::json!({"path": path, "content": content}),
         }
     }
 
@@ -779,6 +780,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn blocked_result_does_not_contain_path() {
+        let call = write_call("t1", "sensitive/path/file.rs", "content");
+        let result = blocked_result(&call, "sensitive/path/file.rs", "Tier3 violation");
+
+        assert!(!result.output.contains("sensitive/path"));
+        assert!(!result.output.contains("Tier3"));
+        assert_eq!(result.output, "This operation is not permitted.");
+    }
+
+    #[test]
+    fn blind_read_result_does_not_contain_path() {
+        let call = read_call("t1", "engine/crates/fx-kernel/src/lib.rs");
+        let result = blind_read_result(&call);
+
+        assert!(!result.output.contains("fx-kernel"));
+        assert_eq!(result.output, "This file is not available.");
+    }
+
     // Test 1: Tier 3 path always blocked regardless of config
     #[tokio::test]
     async fn tier3_path_always_blocked_regardless_of_config() {
@@ -788,15 +808,17 @@ mod tests {
 
         let results = executor
             .execute_tools(
-                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                &[write_call(
+                    "1",
+                    "engine/crates/fx-kernel/src/lib.rs",
+                    "data",
+                )],
                 None,
             )
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -806,7 +828,7 @@ mod tests {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
-            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
             .await
             .unwrap();
 
@@ -826,7 +848,7 @@ mod tests {
 
         let (executor, _) = make_executor_in(enabled_config(), working_dir.clone(), proposals_dir);
         let results = executor
-            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
             .await
             .unwrap();
 
@@ -900,7 +922,7 @@ mod tests {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
-            .execute_tools(&[write_call("1", "docs/readme.md")], None)
+            .execute_tools(&[write_call("1", "docs/readme.md", "data")], None)
             .await
             .unwrap();
 
@@ -915,13 +937,11 @@ mod tests {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
-            .execute_tools(&[write_call("1", "credentials.json")], None)
+            .execute_tools(&[write_call("1", "credentials.json", "data")], None)
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("deny tier"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -930,7 +950,7 @@ mod tests {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
-            .execute_tools(&[write_call("1", "server.key")], None)
+            .execute_tools(&[write_call("1", "server.key", "data")], None)
             .await
             .unwrap();
 
@@ -948,6 +968,11 @@ mod tests {
 
     fn assert_read_passed_through(result: &ToolResult, tool_call_id: &str) {
         assert_tool_passed_through(result, tool_call_id, "read_file");
+    }
+
+    fn assert_operation_not_permitted(result: &ToolResult) {
+        assert!(!result.success);
+        assert_eq!(result.output, "This operation is not permitted.");
     }
 
     async fn execute_single_tool(call: ToolCall) -> (ToolResult, usize) {
@@ -1226,9 +1251,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -1241,8 +1264,8 @@ mod tests {
         let results = executor
             .execute_tools(
                 &[
-                    write_call("1", "docs/readme.md"),
-                    write_call("2", "notes/todo.txt"),
+                    write_call("1", "docs/readme.md", "data"),
+                    write_call("2", "notes/todo.txt", "data"),
                 ],
                 None,
             )
@@ -1262,11 +1285,11 @@ mod tests {
         let results = executor
             .execute_tools(
                 &[
-                    write_call("1", "config.toml"),
-                    write_call("2", "credentials.db"),
-                    write_call("3", "auth.db"),
-                    write_call("4", "keys/server.key"),
-                    write_call("5", "certs/server.pem"),
+                    write_call("1", "config.toml", "data"),
+                    write_call("2", "credentials.db", "data"),
+                    write_call("3", "auth.db", "data"),
+                    write_call("4", "keys/server.key", "data"),
+                    write_call("5", "certs/server.pem", "data"),
                 ],
                 None,
             )
@@ -1297,7 +1320,11 @@ mod tests {
 
         let results = executor
             .execute_tools(
-                &[write_call("1", absolute_path.to_string_lossy().as_ref())],
+                &[write_call(
+                    "1",
+                    absolute_path.to_string_lossy().as_ref(),
+                    "data",
+                )],
                 None,
             )
             .await
@@ -1316,15 +1343,17 @@ mod tests {
 
         let results = executor
             .execute_tools(
-                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                &[write_call(
+                    "1",
+                    "engine/crates/fx-kernel/src/lib.rs",
+                    "data",
+                )],
                 None,
             )
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -1335,8 +1364,8 @@ mod tests {
 
         let calls = vec![
             read_call("1", "docs/readme.md"),
-            write_call("2", "docs/guide.md"),
-            write_call("3", "credentials.json"),
+            write_call("2", "docs/guide.md", "data"),
+            write_call("3", "credentials.json", "data"),
         ];
 
         let results = executor.execute_tools(&calls, None).await.unwrap();
@@ -1350,9 +1379,8 @@ mod tests {
         assert_eq!(results[1].tool_call_id, "2");
         assert!(results[1].output.contains("executed:write_file"));
         // deny-tier write blocked
-        assert!(!results[2].success);
         assert_eq!(results[2].tool_call_id, "3");
-        assert!(results[2].output.contains("BLOCKED"));
+        assert_operation_not_permitted(&results[2]);
         // Inner only saw 2 calls (read + allow write)
         assert_eq!(probe.call_count(), 2);
     }
@@ -1401,7 +1429,7 @@ mod tests {
         let executor = ProposalGateExecutor::new(inner, state);
 
         let results = executor
-            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
             .await
             .unwrap();
 
@@ -1427,7 +1455,7 @@ mod tests {
         let executor = ProposalGateExecutor::new(inner, state);
 
         let results = executor
-            .execute_tools(&[write_call("1", "config/b.toml")], None)
+            .execute_tools(&[write_call("1", "config/b.toml", "data")], None)
             .await
             .unwrap();
 
@@ -1454,7 +1482,7 @@ mod tests {
         let executor = ProposalGateExecutor::new(inner, state);
 
         let results = executor
-            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
             .await
             .unwrap();
 
@@ -1484,15 +1512,17 @@ mod tests {
 
         let results = executor
             .execute_tools(
-                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                &[write_call(
+                    "1",
+                    "engine/crates/fx-kernel/src/lib.rs",
+                    "data",
+                )],
                 None,
             )
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -1506,15 +1536,14 @@ mod tests {
                 &[write_call(
                     "1",
                     "engine/../engine/crates/fx-kernel/src/lib.rs",
+                    "data",
                 )],
                 None,
             )
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -1525,15 +1554,17 @@ mod tests {
 
         let results = executor
             .execute_tools(
-                &[write_call("1", "/engine/crates/fx-kernel/src/lib.rs")],
+                &[write_call(
+                    "1",
+                    "/engine/crates/fx-kernel/src/lib.rs",
+                    "data",
+                )],
                 None,
             )
             .await
             .unwrap();
 
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("BLOCKED"));
-        assert!(results[0].output.contains("Tier 3"));
+        assert_operation_not_permitted(&results[0]);
         assert_eq!(probe.call_count(), 0);
     }
 
