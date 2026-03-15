@@ -6,6 +6,7 @@ pub(crate) mod devices;
 pub mod engine;
 pub(crate) mod error;
 pub(crate) mod handlers;
+pub mod launchagent;
 pub(crate) mod listener;
 pub(crate) mod middleware;
 pub(crate) mod pairing;
