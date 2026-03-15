@@ -428,6 +428,10 @@ pub struct LoopEngine {
     thinking_config: Option<fx_llm::ThinkingConfig>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
+    /// Whether the loop should check for yield requests between iterations.
+    yield_between_iterations: bool,
+    /// Pending yield handle — if set, the loop parks on this between iterations.
+    pending_yield: Option<crate::yield_primitive::YieldHandle>,
 }
 
 impl std::fmt::Debug for LoopEngine {
@@ -499,6 +503,7 @@ pub struct LoopEngineBuilder {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    yield_between_iterations: bool,
 }
 
 impl std::fmt::Debug for LoopEngineBuilder {
@@ -630,6 +635,13 @@ impl LoopEngineBuilder {
         self
     }
 
+    /// Enable yielding between iterations. When enabled, the loop checks
+    /// for pending yield requests after each iteration and parks until woken.
+    pub fn yield_between_iterations(mut self, enabled: bool) -> Self {
+        self.yield_between_iterations = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<LoopEngine, LoopError> {
         let budget = required_builder_field(self.budget, "budget")?;
         let context = required_builder_field(self.context, "context")?;
@@ -667,6 +679,8 @@ impl LoopEngineBuilder {
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
+            yield_between_iterations: self.yield_between_iterations,
+            pending_yield: None,
         })
     }
 }
@@ -947,6 +961,22 @@ impl LoopEngine {
         self.input_channel = Some(channel);
     }
 
+    /// Set a pending yield handle. The loop will park on this between iterations.
+    pub fn set_pending_yield(&mut self, handle: crate::yield_primitive::YieldHandle) {
+        self.pending_yield = Some(handle);
+    }
+
+    /// Check and consume any pending yield. Returns the wake reason if yielded.
+    async fn check_yield_between_iterations(
+        &mut self,
+    ) -> Option<crate::yield_primitive::WakeReason> {
+        if !self.yield_between_iterations {
+            return None;
+        }
+        let handle = self.pending_yield.take()?;
+        Some(handle.wait().await)
+    }
+
     pub fn set_synthesis_instruction(&mut self, instruction: String) -> Result<(), LoopError> {
         let trimmed = instruction.trim();
         if trimmed.is_empty() {
@@ -1137,6 +1167,26 @@ impl LoopEngine {
                         self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
                     {
                         return Ok(self.finalize_result(result));
+                    }
+
+                    // Yield between iterations if configured and requested
+                    if let Some(reason) = self.check_yield_between_iterations().await {
+                        use crate::yield_primitive::WakeReason;
+                        match reason {
+                            WakeReason::Cancelled | WakeReason::Timeout => {
+                                return Ok(self.finish_streaming_result(
+                                    LoopResult::UserStopped {
+                                        partial_response: state.partial_response.clone(),
+                                        iterations: self.iteration_count,
+                                        signals: Vec::new(),
+                                    },
+                                    stream,
+                                ));
+                            }
+                            _ => {
+                                // UserMessage, TimerFired, Signal, etc. — continue loop
+                            }
+                        }
                     }
                 }
             }
