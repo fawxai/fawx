@@ -54,6 +54,12 @@ impl PkceFlow {
         })
     }
 
+    /// Override the redirect URI (e.g. for native app callback schemes).
+    pub fn with_redirect_uri(mut self, uri: impl Into<String>) -> Self {
+        self.redirect_uri = uri.into();
+        self
+    }
+
     /// Build the authorization URL with all required OAuth + OpenAI params.
     pub fn authorization_url(&self, client_id: &str) -> String {
         format!(
@@ -428,6 +434,17 @@ mod tests {
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope="));
         assert!(url.contains("originator=codex_cli_rs"));
+    }
+
+    #[test]
+    fn pkce_flow_with_custom_redirect_uri() {
+        let flow = PkceFlow::try_new()
+            .expect("pkce flow")
+            .with_redirect_uri("fawx-auth://openai/callback");
+
+        assert_eq!(flow.redirect_uri(), "fawx-auth://openai/callback");
+        let url = flow.authorization_url("test-client");
+        assert!(url.contains("fawx-auth"));
     }
 
     #[test]

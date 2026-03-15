@@ -92,7 +92,7 @@ pub async fn handle_verify_provider(
     }))
 }
 
-fn save_auth_method(
+pub(super) fn save_auth_method(
     state: &HttpState,
     provider: &str,
     auth_method: fx_auth::auth::AuthMethod,

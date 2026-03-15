@@ -774,6 +774,7 @@ mod tests {
             channels: build_channel_runtime(None, vec![]),
             data_dir: temp.path().to_path_buf(),
             synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             cron_store: None,
         };
 

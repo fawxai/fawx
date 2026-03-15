@@ -27,6 +27,7 @@ pub struct HttpState {
     pub channels: ChannelRuntime,
     pub data_dir: PathBuf,
     pub synthesis: Arc<crate::handlers::synthesis::SynthesisState>,
+    pub oauth_flows: Arc<crate::handlers::oauth::OAuthFlowStore>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 

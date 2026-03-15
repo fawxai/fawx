@@ -1334,6 +1334,7 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
             synthesis: synthesis_state(has_synthesis),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             cron_store: None,
         }
     }
@@ -1365,6 +1366,7 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
             synthesis: synthesis_state(has_synthesis),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             cron_store: None,
         }
     }
@@ -3172,6 +3174,7 @@ thinking = "adaptive"
             },
             data_dir,
             synthesis: synthesis_state(false),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             cron_store: None,
         };
         let app = build_router(state, None);

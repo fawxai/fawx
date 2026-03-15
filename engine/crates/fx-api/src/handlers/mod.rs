@@ -15,6 +15,7 @@ pub mod health;
 pub mod launchagent;
 pub mod marketplace;
 pub mod message;
+pub mod oauth;
 pub mod pairing;
 pub mod permissions;
 pub mod phase4;

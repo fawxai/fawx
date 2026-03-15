@@ -120,6 +120,14 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/auth/{provider}/verify",
             post(handlers::auth::handle_verify_provider),
         )
+        .route(
+            "/auth/{provider}/oauth-start",
+            get(handlers::oauth::handle_oauth_start),
+        )
+        .route(
+            "/auth/{provider}/oauth-callback",
+            post(handlers::oauth::handle_oauth_callback),
+        )
         .route("/setup/status", get(handle_setup_status))
         .route("/server/status", get(handle_server_status))
         .route("/server/restart", post(handle_server_restart))

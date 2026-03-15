@@ -25,6 +25,7 @@ fx-session.workspace = true
 fx-storage.workspace = true
 fx-tools.workspace = true
 rand = "0.8"
+reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -38,7 +39,6 @@ fx-cli = { path = "../fx-cli", default-features = false }
 fx-subagent = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"
 hyper = "1.0"
-reqwest.workspace = true
 tempfile = "3.14"
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
