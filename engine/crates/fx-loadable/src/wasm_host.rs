@@ -150,8 +150,11 @@ fn is_network_allowed(url: &str, capabilities: &[Capability]) -> bool {
             Capability::Network => return true,
             Capability::NetworkRestricted { allowed_domains } => {
                 if let Some(host) = extract_host(url) {
+                    let host_lower = host.to_ascii_lowercase();
                     if allowed_domains.iter().any(|domain| {
-                        host == domain.as_str() || host.ends_with(&format!(".{domain}"))
+                        let domain_lower = domain.to_ascii_lowercase();
+                        host_lower == domain_lower
+                            || host_lower.ends_with(&format!(".{domain_lower}"))
                     }) {
                         return true;
                     }
@@ -164,18 +167,22 @@ fn is_network_allowed(url: &str, capabilities: &[Capability]) -> bool {
 }
 
 fn extract_host(url: &str) -> Option<&str> {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    Some(
-        after_scheme
-            .split('/')
-            .next()
-            .unwrap_or(after_scheme)
-            .split(':')
-            .next()
-            .unwrap_or(after_scheme),
-    )
+    let start = if url.get(..8)?.eq_ignore_ascii_case("https://") {
+        8
+    } else if url.get(..7)?.eq_ignore_ascii_case("http://") {
+        7
+    } else {
+        return None;
+    };
+    let rest = &url[start..];
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host_port = &rest[..host_end];
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +336,106 @@ mod tests {
         assert_eq!(
             api.kv_get("github_token"),
             Some("from_provider".to_string())
+        );
+    }
+
+    #[test]
+    fn network_allowed_unrestricted() {
+        assert!(is_network_allowed(
+            "https://anything.com",
+            &[Capability::Network]
+        ));
+    }
+
+    #[test]
+    fn network_allowed_exact_domain() {
+        let caps = vec![Capability::NetworkRestricted {
+            allowed_domains: vec!["api.weather.gov".into()],
+        }];
+        assert!(is_network_allowed("https://api.weather.gov/points", &caps));
+    }
+
+    #[test]
+    fn network_denied_wrong_domain() {
+        let caps = vec![Capability::NetworkRestricted {
+            allowed_domains: vec!["api.weather.gov".into()],
+        }];
+        assert!(!is_network_allowed("https://evil.com/exfil", &caps));
+    }
+
+    #[test]
+    fn network_allowed_subdomain() {
+        let caps = vec![Capability::NetworkRestricted {
+            allowed_domains: vec!["weather.gov".into()],
+        }];
+        assert!(is_network_allowed("https://api.weather.gov/points", &caps));
+    }
+
+    #[test]
+    fn network_denied_partial_suffix() {
+        let caps = vec![Capability::NetworkRestricted {
+            allowed_domains: vec!["weather.gov".into()],
+        }];
+        assert!(!is_network_allowed("https://badweather.gov/attack", &caps));
+    }
+
+    #[test]
+    fn network_denied_no_capability() {
+        assert!(!is_network_allowed(
+            "https://anything.com",
+            &[Capability::Storage]
+        ));
+    }
+
+    #[test]
+    fn network_denied_empty_caps() {
+        assert!(!is_network_allowed("https://anything.com", &[]));
+    }
+
+    #[test]
+    fn network_allowed_case_insensitive() {
+        let caps = vec![Capability::NetworkRestricted {
+            allowed_domains: vec!["WEATHER.GOV".into()],
+        }];
+        assert!(is_network_allowed("https://Api.Weather.Gov/points", &caps));
+    }
+
+    #[test]
+    fn extract_host_https() {
+        assert_eq!(
+            extract_host("https://api.weather.gov/foo"),
+            Some("api.weather.gov")
+        );
+    }
+
+    #[test]
+    fn extract_host_with_port() {
+        assert_eq!(
+            extract_host("https://localhost:8080/path"),
+            Some("localhost")
+        );
+    }
+
+    #[test]
+    fn extract_host_http() {
+        assert_eq!(extract_host("http://example.com/path"), Some("example.com"));
+    }
+
+    #[test]
+    fn extract_host_no_scheme() {
+        assert_eq!(extract_host("ftp://example.com"), None);
+    }
+
+    #[test]
+    fn extract_host_empty() {
+        assert_eq!(extract_host(""), None);
+    }
+
+    #[test]
+    fn extract_host_uppercase_scheme() {
+        assert_eq!(
+            extract_host("HTTPS://api.weather.gov/foo"),
+            Some("api.weather.gov")
         );
     }
 
