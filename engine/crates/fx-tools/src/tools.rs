@@ -2305,6 +2305,7 @@ impl SpawnAgentArgs {
             label: self.label,
             task: self.task,
             model: None,
+            thinking: None,
             mode: parse_spawn_mode(self.mode.as_deref())?,
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(600)),
             max_tokens: None,

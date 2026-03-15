@@ -1911,7 +1911,15 @@ impl HeadlessSubagentFactory {
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
         };
-        HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))
+        let mut app =
+            HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
+        if let Some(model) = &config.model {
+            let _ = app.set_active_model(model);
+        }
+        if let Some(thinking) = &config.thinking {
+            let _ = app.set_thinking_level(thinking);
+        }
+        Ok(app)
     }
 }
 
