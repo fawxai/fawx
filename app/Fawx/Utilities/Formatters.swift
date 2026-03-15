@@ -7,7 +7,7 @@ private enum FormatterCache {
         return formatter
     }()
 
-    static let time: DateFormatter = {
+    nonisolated(unsafe) static let time: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         formatter.dateStyle = .none
