@@ -429,44 +429,23 @@ struct SessionListView: View {
             isStreaming: session.id == chatViewModel.activeStreamSessionID
         )
 
-        if usesSplitLayout {
-            Button {
-                selectSession(session.id)
-            } label: {
-                rowContent
+        Button {
+            selectSession(session.id)
+        } label: {
+            rowContent
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("sessionRow_\(session.id)")
+        .accessibilityElement(children: .contain)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button("Delete", role: .destructive) {
+                deleteSession(session.id)
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("sessionRow_\(session.id)")
-            .accessibilityElement(children: .contain)
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button("Delete", role: .destructive) {
-                    deleteSession(session.id)
-                }
 
-                Button("Clear") {
-                    pendingClearSession = session
-                }
-                .tint(.fawxWarning)
+            Button("Clear") {
+                pendingClearSession = session
             }
-        } else {
-            Button {
-                selectSession(session.id)
-            } label: {
-                rowContent
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("sessionRow_\(session.id)")
-            .accessibilityElement(children: .contain)
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button("Delete", role: .destructive) {
-                    deleteSession(session.id)
-                }
-
-                Button("Clear") {
-                    pendingClearSession = session
-                }
-                .tint(.fawxWarning)
-            }
+            .tint(.fawxWarning)
         }
     }
 

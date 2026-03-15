@@ -18,76 +18,47 @@ struct iOSSettingsView: View {
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
-                if showsConnectionSection {
-                    Section("Connection") {
-                        if matchesSettingsSearch(
-                            "server url",
-                            "server",
-                            settingsViewModel.serverURL,
-                            "connection"
-                        ) {
-                            LabeledContent("Server URL") {
-                                Text(settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL)
-                                    .foregroundStyle(settingsViewModel.serverURL.isEmpty ? Color.fawxTextSecondary : Color.fawxText)
-                            }
-                        }
+                Section("Connection") {
+                    LabeledContent("Server URL") {
+                        Text(settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL)
+                            .foregroundStyle(settingsViewModel.serverURL.isEmpty ? Color.fawxTextSecondary : Color.fawxText)
+                    }
 
-                        if matchesSettingsSearch(
-                            "paired as",
-                            "pairing",
-                            "device",
-                            settingsViewModel.pairedDeviceName ?? "",
-                            "connection"
-                        ) {
-                            LabeledContent("Paired as") {
-                                Text(settingsViewModel.pairedDeviceName ?? "Not paired")
-                                    .foregroundStyle(settingsViewModel.pairedDeviceName == nil ? Color.fawxTextSecondary : Color.fawxText)
-                            }
-                        }
+                    LabeledContent("Paired as") {
+                        Text(settingsViewModel.pairedDeviceName ?? "Not paired")
+                            .foregroundStyle(settingsViewModel.pairedDeviceName == nil ? Color.fawxTextSecondary : Color.fawxText)
+                    }
 
-                        if matchesSettingsSearch("test connection", "check connection", "connection") {
-                            Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
-                                Task {
-                                    await settingsViewModel.testConnection()
-                                }
-                            }
-                            .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
+                    Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
+                        Task {
+                            await settingsViewModel.testConnection()
                         }
+                    }
+                    .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
 
-                        if matchesSettingsSearch("unpair", "remove pairing", "device") {
-                            Button("Unpair", role: .destructive) {
-                                Task {
-                                    await settingsViewModel.unpair()
-                                }
-                            }
-                            .disabled(!settingsViewModel.isPaired)
+                    Button("Unpair", role: .destructive) {
+                        Task {
+                            await settingsViewModel.unpair()
                         }
+                    }
+                    .disabled(!settingsViewModel.isPaired)
+                }
+
+                Section("Server") {
+                    NavigationLink(value: SettingsRoute.modelThinking) {
+                        Text("Model & Thinking")
+                    }
+
+                    NavigationLink(value: SettingsRoute.authentication) {
+                        Text("Authentication")
                     }
                 }
 
-                if showsServerSection {
-                    Section("Server") {
-                        if matchesSettingsSearch("model", "thinking", "server model") {
-                            NavigationLink(value: SettingsRoute.modelThinking) {
-                                Text("Model & Thinking")
-                            }
-                        }
-
-                        if matchesSettingsSearch("authentication", "auth", "providers") {
-                            NavigationLink(value: SettingsRoute.authentication) {
-                                Text("Authentication")
-                            }
-                        }
-                    }
+                Section("Appearance") {
+                    AppearanceSettingsPanel(appState: appState)
                 }
 
-                if showsAppearanceSection {
-                    Section("Appearance") {
-                        AppearanceSettingsPanel(appState: appState)
-                    }
-                }
-
-                if let status = settingsViewModel.testStatusMessage, showsStatusSection {
+                if let status = settingsViewModel.testStatusMessage {
                     Section("Status") {
                         Text(status)
                             .foregroundStyle(testStatusColor)
@@ -122,26 +93,6 @@ struct iOSSettingsView: View {
                 }
             }
         }
-    }
-
-    private var showsConnectionSection: Bool {
-        true
-    }
-
-    private var showsServerSection: Bool {
-        true
-    }
-
-    private var showsAppearanceSection: Bool {
-        true
-    }
-
-    private var showsStatusSection: Bool {
-        true
-    }
-
-    private func matchesSettingsSearch(_ values: String...) -> Bool {
-        true
     }
 
     private var testStatusColor: Color {
