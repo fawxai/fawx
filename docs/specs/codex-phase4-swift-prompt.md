@@ -101,7 +101,7 @@
 - **Menu items:**
   - "Open Fawx" → `NSApp.activate(ignoringOtherApps: true)`, bring window front
   - "Restart Server" → `POST /v1/server/restart`
-  - "Stop Server" → `POST /v1/server/stop` (bootout LaunchAgent + SIGTERM — server stays dead until manually started)
+  - "Stop Server" → `POST /v1/server/stop` (bootout LaunchAgent + SIGTERM — server stays dead until manually started). **This endpoint exists on dev (PR #1436). Response: `{ "stopped": true, "message": "..." }`**
   - "Quit" → `NSApp.terminate(nil)` (GUI only, server continues if LaunchAgent active)
   - "Stop Server & Quit" → `POST /v1/server/stop` then `NSApp.terminate(nil)`
 
