@@ -25,7 +25,8 @@ use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
-    CachingExecutor, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+    CachingExecutor, PermissionGateExecutor, PermissionPolicy, PermissionPromptState,
+    ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
 };
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
@@ -367,6 +368,7 @@ pub struct HeadlessLoopBuildOptions {
     pub experiment_progress: Option<ProgressCallback>,
     pub session_registry: Option<fx_session::SessionRegistry>,
     pub session_bus: Option<SessionBus>,
+    pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -380,6 +382,7 @@ impl HeadlessLoopBuildOptions {
             experiment_progress: None,
             session_registry: None,
             session_bus: None,
+            permission_prompt_state: None,
         }
     }
 
@@ -393,6 +396,7 @@ impl HeadlessLoopBuildOptions {
             experiment_progress: None,
             session_registry: None,
             session_bus: None,
+            permission_prompt_state: None,
         }
     }
 }
@@ -471,13 +475,21 @@ fn build_loop_engine_with_options(
     let caching_registry =
         CachingExecutor::new(SharedSkillRegistry::new(Arc::clone(&skills.registry)));
 
-    // Build ProposalGateExecutor to wrap the CachingExecutor.
-    // Chain: kernel → ProposalGateExecutor → CachingExecutor → SkillRegistry
+    // Build executor chain:
+    // PermissionGateExecutor → ProposalGateExecutor → CachingExecutor → SkillRegistry
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
-    let tool_executor: Arc<dyn ToolExecutor> =
-        Arc::new(ProposalGateExecutor::new(caching_registry, gate_state));
+    let proposal_gate = ProposalGateExecutor::new(caching_registry, gate_state);
+    let permission_policy = permissions_to_policy(&config.permissions);
+    let prompt_state = options
+        .permission_prompt_state
+        .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
+    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(PermissionGateExecutor::new(
+        proposal_gate,
+        permission_policy,
+        prompt_state,
+    ));
 
     let mut builder = LoopEngine::builder()
         .budget(budget)
@@ -1602,6 +1614,26 @@ fn duration_millis_u64(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Convert fx-config `PermissionsConfig` to fx-kernel `PermissionPolicy`.
+fn permissions_to_policy(config: &fx_config::PermissionsConfig) -> PermissionPolicy {
+    let unrestricted = config
+        .unrestricted
+        .iter()
+        .map(|action| action.as_str().to_string())
+        .collect();
+    let ask_required = config
+        .proposal_required
+        .iter()
+        .map(|action| action.as_str().to_string())
+        .collect();
+    let has_ask_entries = !config.proposal_required.is_empty();
+    PermissionPolicy {
+        unrestricted,
+        ask_required,
+        default_ask: has_ask_entries,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2033,6 +2065,7 @@ mod tests {
             HeadlessLoopBuildOptions {
                 session_registry: None,
                 session_bus: None,
+                permission_prompt_state: None,
                 ..HeadlessLoopBuildOptions::default()
             },
         )
