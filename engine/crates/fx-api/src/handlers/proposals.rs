@@ -56,6 +56,7 @@ pub struct ProposalHistoryEntry {
     pub tier: ProposalTier,
     pub action: String,
     pub target: String,
+    pub agent_reason: String,
     pub approved: bool,
     pub decided_at: u64,
 }
@@ -155,8 +156,63 @@ mod tests {
     }
 
     #[test]
+    fn proposal_tier_serializes_standard() {
+        assert_eq!(
+            serde_json::to_value(ProposalTier::Standard).unwrap(),
+            "standard"
+        );
+    }
+
+    #[test]
+    fn proposal_tier_serializes_elevated() {
+        assert_eq!(
+            serde_json::to_value(ProposalTier::Elevated).unwrap(),
+            "elevated"
+        );
+    }
+
+    #[test]
     fn proposal_tier_serializes_as_snake_case() {
         let json = serde_json::to_value(ProposalTier::Sensitive).unwrap();
         assert_eq!(json, "sensitive");
+    }
+
+    #[test]
+    fn pending_proposal_serializes_full() {
+        let proposal = PendingProposal {
+            id: "p1".into(),
+            tier: ProposalTier::Elevated,
+            action: "write_file".into(),
+            target: "/etc/config".into(),
+            agent_reason: "Need to update config".into(),
+            diff: Some("+new line".into()),
+            created_at: 1_700_000_000,
+        };
+        let json = serde_json::to_value(proposal).unwrap();
+        assert_eq!(json["tier"], "elevated");
+        assert_eq!(json["action"], "write_file");
+        assert!(json["diff"].is_string());
+    }
+
+    #[test]
+    fn decision_request_deserializes() {
+        let json = r#"{"approved": true}"#;
+        let request: ProposalDecisionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.approved);
+    }
+
+    #[test]
+    fn history_entry_serializes_agent_reason() {
+        let entry = ProposalHistoryEntry {
+            id: "p1".into(),
+            tier: ProposalTier::Elevated,
+            action: "write_file".into(),
+            target: "/etc/config".into(),
+            agent_reason: "Need to update config".into(),
+            approved: true,
+            decided_at: 1_700_000_001,
+        };
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["agent_reason"], "Need to update config");
     }
 }
