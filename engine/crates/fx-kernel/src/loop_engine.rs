@@ -905,6 +905,12 @@ Your file access is restricted to the working_dir set in config. \
 If a path is outside that directory, you cannot read or write it. \
 Do not retry blocked paths. Tell the user the path is outside your working directory and suggest alternatives.";
 
+const TOOL_CONTINUATION_DIRECTIVE: &str = "\n\nYou are continuing after one or more tool calls. \
+Treat successful tool results as the primary evidence for your next response. \
+If the existing tool results already answer the user's request, answer immediately instead of calling more tools. \
+Only call another tool when the current results are missing critical information, are contradictory, or the user explicitly asked you to refresh/re-check something. \
+Never repeat an identical successful tool call in the same cycle. Reuse the result you already have and answer from it.";
+
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
 and project context. Use memory_read to recall specific details. \
@@ -4244,7 +4250,7 @@ fn build_continuation_request(
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_tool_continuation_system_prompt(memory_context, scratchpad_context);
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -4266,6 +4272,9 @@ fn build_truncation_continuation_request(
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
+    // Intentional: truncation continuations resume a cut-off response after context
+    // overflow. They are not the post-tool-result path, so they keep the plain
+    // reasoning prompt instead of the tool continuation directive.
     let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
     CompletionRequest {
         model: model.to_string(),
@@ -4778,7 +4787,29 @@ fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
+    build_system_prompt(memory_context, scratchpad_context, None)
+}
+
+fn build_tool_continuation_system_prompt(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+) -> String {
+    build_system_prompt(
+        memory_context,
+        scratchpad_context,
+        Some(TOOL_CONTINUATION_DIRECTIVE),
+    )
+}
+
+fn build_system_prompt(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    extra_directive: Option<&str>,
+) -> String {
     let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    if let Some(extra_directive) = extra_directive {
+        prompt.push_str(extra_directive);
+    }
     if let Some(sp) = scratchpad_context {
         prompt.push_str("\n\n");
         prompt.push_str(sp);
@@ -5082,6 +5113,43 @@ mod tests {
         assert!(
             !prompt_with_memory.contains("Available tools:"),
             "system prompt with memory must not contain 'Available tools:' text"
+        );
+    }
+
+    #[test]
+    fn tool_continuation_prompt_prioritizes_answering_from_existing_results() {
+        let prompt = build_tool_continuation_system_prompt(None, None);
+        assert!(
+            prompt.contains("Treat successful tool results as the primary evidence"),
+            "tool continuation prompt should prioritize existing tool results"
+        );
+        assert!(
+            prompt.contains("answer immediately instead of calling more tools"),
+            "tool continuation prompt should prefer answering once results suffice"
+        );
+        assert!(
+            prompt.contains("Never repeat an identical successful tool call in the same cycle"),
+            "tool continuation prompt should discourage redundant tool retries"
+        );
+    }
+
+    #[test]
+    fn continuation_request_includes_tool_continuation_directive_once() {
+        let request = build_continuation_request(
+            &[Message::assistant("intermediate")],
+            "mock-model",
+            vec![],
+            None,
+            None,
+            None,
+        );
+        let prompt = request
+            .system_prompt
+            .expect("continuation request should include a system prompt");
+        assert_eq!(
+            prompt.matches(TOOL_CONTINUATION_DIRECTIVE).count(),
+            1,
+            "continuation request should include the tool continuation directive exactly once"
         );
     }
 
