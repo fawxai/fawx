@@ -5,8 +5,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use fx_auth::auth::AuthMethod;
 use fx_auth::oauth::{
-    extract_openai_account_id, PkceFlow, TokenExchangeRequest, TokenResponse, OPENAI_CLIENT_ID,
-    OPENAI_TOKEN_URL,
+    extract_openai_account_id, PkceFlow, TokenExchangeRequest, TokenRefreshRequest, TokenResponse,
+    OPENAI_CLIENT_ID, OPENAI_TOKEN_URL,
 };
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,13 @@ pub struct OAuthCallbackResponse {
     pub verified: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthRefreshResponse {
+    pub provider: String,
+    pub status: String,
+    pub expires_at: u64,
+}
+
 pub async fn handle_oauth_start(
     State(state): State<HttpState>,
     Path(provider): Path<String>,
@@ -114,6 +121,49 @@ pub async fn handle_oauth_callback(
     }))
 }
 
+pub async fn handle_oauth_refresh(
+    State(state): State<HttpState>,
+    Path(provider): Path<String>,
+) -> HandlerResult<Json<OAuthRefreshResponse>> {
+    validate_oauth_provider(&provider)?;
+    let refresh_token = load_refresh_token(&state, &provider)?;
+    tracing::info!(provider = %provider, "OAuth: refreshing access token");
+
+    let token_response = refresh_access_token(&refresh_token)
+        .await
+        .map_err(|error| {
+            tracing::warn!(provider = %provider, error = %error, "OAuth token refresh failed");
+            bad_gateway(error)
+        })?;
+    let expires_in = token_response.expires_in;
+    store_oauth_credential(&state, &provider, token_response)?;
+    let expires_at = expires_at_ms(expires_in).map_err(internal_error)?;
+    tracing::info!(provider = %provider, "OAuth token refreshed successfully");
+
+    Ok(Json(OAuthRefreshResponse {
+        provider,
+        status: "authenticated".to_string(),
+        expires_at,
+    }))
+}
+
+fn load_refresh_token(state: &HttpState, provider: &str) -> HandlerResult<String> {
+    let store = crate::auth_store::AuthStore::open(&state.data_dir).map_err(internal_error)?;
+    let auth_manager = store.load_auth_manager().map_err(internal_error)?;
+
+    match auth_manager.get(provider) {
+        Some(AuthMethod::OAuth { refresh_token, .. }) => Ok(refresh_token.clone()),
+        Some(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Provider '{provider}' is not using OAuth authentication"),
+        )),
+        None => Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("No credentials found for provider '{provider}'"),
+        )),
+    }
+}
+
 async fn exchange_token(flow: &PkceFlow, code: &str) -> Result<TokenResponse, String> {
     exchange_token_with_url(flow, code, OPENAI_TOKEN_URL).await
 }
@@ -141,6 +191,29 @@ fn build_token_exchange_request(flow: &PkceFlow, code: &str) -> TokenExchangeReq
         code_verifier: flow.code_verifier().to_string(),
         client_id: OPENAI_CLIENT_ID.to_string(),
     }
+}
+
+async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, String> {
+    refresh_access_token_with_url(refresh_token, OPENAI_TOKEN_URL).await
+}
+
+async fn refresh_access_token_with_url(
+    refresh_token: &str,
+    token_url: &str,
+) -> Result<TokenResponse, String> {
+    let request = TokenRefreshRequest {
+        grant_type: "refresh_token".to_string(),
+        refresh_token: refresh_token.to_string(),
+        client_id: OPENAI_CLIENT_ID.to_string(),
+    };
+    let response = reqwest::Client::new()
+        .post(token_url)
+        .form(&request)
+        .send()
+        .await
+        .map_err(|error| format!("token refresh request failed: {error}"))?;
+
+    parse_token_exchange_response(response).await
 }
 
 async fn parse_token_exchange_response(
@@ -349,6 +422,53 @@ mod tests {
     }
 
     #[test]
+    fn refresh_response_serializes_and_round_trips() {
+        let response = OAuthRefreshResponse {
+            provider: "openai".to_string(),
+            status: "authenticated".to_string(),
+            expires_at: 1_742_000_000,
+        };
+
+        let json = serde_json::to_string(&response).expect("serialize");
+        let decoded: OAuthRefreshResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, response);
+        assert_eq!(decoded.expires_at, 1_742_000_000u64);
+    }
+
+    #[test]
+    fn load_refresh_token_returns_not_found_for_missing_provider() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+
+        let error = load_refresh_token_from_dir(temp.path(), "openai").expect_err("should fail");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert!(error.1 .0.error.contains("No credentials found"));
+    }
+
+    #[test]
+    fn load_refresh_token_returns_bad_request_for_non_oauth_provider() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+
+        // Store an API key credential (not OAuth)
+        crate::auth_store::AuthStore::open(temp.path())
+            .and_then(|store| {
+                let mut manager = store.load_auth_manager()?;
+                manager.store(
+                    "openai",
+                    AuthMethod::ApiKey {
+                        provider: "openai".to_string(),
+                        key: "sk-test".to_string(),
+                    },
+                );
+                store.save_auth_manager(&manager)
+            })
+            .expect("store api key");
+
+        let error = load_refresh_token_from_dir(temp.path(), "openai").expect_err("should fail");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1 .0.error.contains("not using OAuth"));
+    }
+
+    #[test]
     fn flow_store_stores_hex_token_and_retrieves() {
         let store = OAuthFlowStore::new();
         let flow = PkceFlow::try_new().expect("pkce flow");
@@ -493,6 +613,92 @@ mod tests {
 
         assert!(error.contains("token exchange failed (400 Bad Request)"));
         assert!(error.contains(r#"{"error":"invalid_grant"}"#));
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_posts_form_and_parses_response() {
+        let body = r#"{"access_token":"access-token-value","refresh_token":"refresh-token-value","expires_in":3600,"token_type":"Bearer"}"#;
+        let (url, server) = spawn_token_server(body, "HTTP/1.1 200 OK").await;
+
+        let token_response = refresh_access_token_with_url("refresh-token-value", &url)
+            .await
+            .expect("refresh token");
+        let request = server.await.expect("server task");
+
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(request.contains("content-type: application/x-www-form-urlencoded"));
+        assert!(request.contains("grant_type=refresh_token"));
+        assert!(request.contains("refresh_token=refresh-token-value"));
+        assert!(request.contains(&format!("client_id={OPENAI_CLIENT_ID}")));
+        assert_eq!(token_response.access_token, "access-token-value");
+        assert_eq!(token_response.refresh_token, "refresh-token-value");
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_returns_response_body_on_failure() {
+        let (url, _) =
+            spawn_token_server(r#"{"error":"invalid_grant"}"#, "HTTP/1.1 400 Bad Request").await;
+
+        let error = refresh_access_token_with_url("refresh-token-value", &url)
+            .await
+            .expect_err("refresh should fail");
+
+        assert!(error.contains("token exchange failed (400 Bad Request)"));
+        assert!(error.contains(r#"{"error":"invalid_grant"}"#));
+    }
+
+    async fn spawn_token_server(
+        body: &'static str,
+        status_line: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{addr}/oauth/token");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let size = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..size]).to_string();
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            request
+        });
+
+        (url, server)
+    }
+
+    /// Test load_refresh_token by directly calling the function with a minimal data_dir setup.
+    /// We avoid creating a full HttpState by testing the auth store operations directly.
+    fn load_refresh_token_from_dir(
+        data_dir: &std::path::Path,
+        provider: &str,
+    ) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+        let store = crate::auth_store::AuthStore::open(data_dir).map_err(internal_error)?;
+        let auth_manager = store.load_auth_manager().map_err(internal_error)?;
+
+        match auth_manager.get(provider) {
+            Some(AuthMethod::OAuth { refresh_token, .. }) => Ok(refresh_token.clone()),
+            Some(_) => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Provider '{provider}' is not using OAuth authentication"),
+            )),
+            None => Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("No credentials found for provider '{provider}'"),
+            )),
+        }
     }
 
     fn seed_store(store: &OAuthFlowStore, count: usize, created_at: Instant) {

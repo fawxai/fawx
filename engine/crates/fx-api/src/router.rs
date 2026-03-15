@@ -125,6 +125,10 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             post(handlers::auth::handle_verify_provider),
         )
         .route(
+            "/auth/{provider}/refresh",
+            post(handlers::oauth::handle_oauth_refresh),
+        )
+        .route(
             "/auth/{provider}/oauth-start",
             get(handlers::oauth::handle_oauth_start),
         )
