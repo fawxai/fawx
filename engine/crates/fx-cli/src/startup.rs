@@ -23,6 +23,7 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
+use fx_kernel::streaming::StreamCallback;
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
     CachingExecutor, PermissionGateExecutor, PermissionPolicy, PermissionPromptState,
@@ -356,6 +357,9 @@ pub struct LoopEngineBundle {
     pub signature_policy: SignaturePolicy,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
+    /// Shared callback slot for permission prompts SSE.
+    /// Set per-cycle by HeadlessApp before running the loop.
+    pub permission_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
 }
 
 #[derive(Clone, Default)]
@@ -485,11 +489,10 @@ fn build_loop_engine_with_options(
     let prompt_state = options
         .permission_prompt_state
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
-    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(PermissionGateExecutor::new(
-        proposal_gate,
-        permission_policy,
-        prompt_state,
-    ));
+    let permission_gate =
+        PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state);
+    let permission_callback_slot = permission_gate.stream_callback_slot();
+    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(permission_gate);
 
     let mut builder = LoopEngine::builder()
         .budget(budget)
@@ -533,6 +536,7 @@ fn build_loop_engine_with_options(
         signature_policy: skills.signature_policy,
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
+        permission_callback_slot,
     })
 }
 

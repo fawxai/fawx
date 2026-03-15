@@ -89,7 +89,7 @@ pub struct PermissionGateExecutor<T: ToolExecutor> {
     inner: T,
     permissions: PermissionPolicy,
     prompt_state: Arc<PermissionPromptState>,
-    stream_callback: Option<StreamCallback>,
+    stream_callback: Arc<std::sync::Mutex<Option<StreamCallback>>>,
 }
 
 impl<T: ToolExecutor> std::fmt::Debug for PermissionGateExecutor<T> {
@@ -108,14 +108,28 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             inner,
             permissions,
             prompt_state,
-            stream_callback: None,
+            stream_callback: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     /// Set the stream callback for emitting permission prompt SSE events.
-    pub fn with_stream_callback(mut self, callback: StreamCallback) -> Self {
-        self.stream_callback = Some(callback);
+    pub fn with_stream_callback(self, callback: StreamCallback) -> Self {
+        if let Ok(mut guard) = self.stream_callback.lock() {
+            *guard = Some(callback);
+        }
         self
+    }
+
+    /// Swap the stream callback (used per-cycle when executor is shared).
+    pub fn set_stream_callback(&self, callback: Option<StreamCallback>) {
+        if let Ok(mut guard) = self.stream_callback.lock() {
+            *guard = callback;
+        }
+    }
+
+    /// Get a reference to the shared callback slot for external callers.
+    pub fn stream_callback_slot(&self) -> Arc<std::sync::Mutex<Option<StreamCallback>>> {
+        Arc::clone(&self.stream_callback)
     }
 }
 
@@ -245,9 +259,14 @@ fn build_prompt(call: &ToolCall, category: &str) -> PermissionPrompt {
     }
 }
 
-fn emit_prompt(callback: &Option<StreamCallback>, prompt: PermissionPrompt) {
-    if let Some(cb) = callback {
-        cb(StreamEvent::PermissionPrompt(prompt));
+fn emit_prompt(
+    callback_slot: &Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    prompt: PermissionPrompt,
+) {
+    if let Ok(guard) = callback_slot.lock() {
+        if let Some(cb) = guard.as_ref() {
+            cb(StreamEvent::PermissionPrompt(prompt));
+        }
     }
 }
 

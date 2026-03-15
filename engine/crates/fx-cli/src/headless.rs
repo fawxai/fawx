@@ -160,6 +160,8 @@ pub struct HeadlessAppDeps {
     pub session_key: Option<SessionKey>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
+    pub permission_callback_slot:
+        Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -188,6 +190,8 @@ pub struct HeadlessApp {
     error_history: VecDeque<ErrorRecord>,
     /// Cumulative token usage across all cycles in this session.
     cumulative_tokens: TokenUsage,
+    /// Shared callback slot for permission prompt SSE events.
+    permission_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -335,6 +339,7 @@ impl HeadlessApp {
             startup_warnings: deps.startup_warnings,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            permission_callback_slot: deps.permission_callback_slot,
             bus_receiver,
         };
         app.record_startup_warning_history();
@@ -866,6 +871,8 @@ impl HeadlessApp {
         callback: StreamCallback,
     ) -> Result<CycleResult, anyhow::Error> {
         let callback = headless_stream_callback(callback);
+        // Set permission prompt callback for this cycle so SSE events fire
+        self.set_permission_callback(Some(Arc::clone(&callback)));
         self.emit_startup_warnings(Some(&callback));
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
@@ -875,6 +882,7 @@ impl HeadlessApp {
             .run_cycle_streaming(snapshot, &llm, Some(callback))
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.set_permission_callback(None); // Clear after cycle
         self.evaluate_canary(&result);
         Ok(self.finalize_cycle(input, &result))
     }
@@ -912,6 +920,12 @@ impl HeadlessApp {
             model: self.active_model.clone(),
             iterations,
             tokens_used,
+        }
+    }
+
+    fn set_permission_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
+        if let Ok(mut guard) = self.permission_callback_slot.lock() {
+            *guard = callback;
         }
     }
 
@@ -1910,6 +1924,7 @@ impl HeadlessSubagentFactory {
             session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
+            permission_callback_slot: bundle.permission_callback_slot,
         };
         let mut app =
             HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
@@ -2556,6 +2571,7 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

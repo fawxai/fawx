@@ -156,6 +156,7 @@ fn build_app_with_dependencies(
         session_key: Some(headless::main_session_key()),
         cron_store: bundle.cron_store,
         startup_warnings: bundle.startup_warnings,
+        permission_callback_slot: bundle.permission_callback_slot,
     })
 }
 
