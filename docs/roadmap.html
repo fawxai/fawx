@@ -231,8 +231,9 @@
         <li><span class="check">✓</span> Error surfacing — startup warnings, SSE error emission, /v1/errors/recent endpoint — StreamEvent::Error exists, but async failures still need to surface to users instead of being swallowed</li>
         <li><span class="check">✓</span> Cross-session messaging — SHIPPED (fx-bus crate)</li>
         <li><span class="check">✓</span> Device pairing — SHIPPED (fawx pair, fawx devices, /v1/devices endpoints)</li>
-        <li><span class="check">✓</span> Cron / scheduled tasks — SHIPPED (fx-cron crate merged, 7 HTTP endpoints, 6 agent tools, CronSkill registered in startup)</li>
-        <li><span class="planned">○</span> Fleet worker mode — serve --fleet for distributed task execution</li>
+        <li><span class="check">✓</span> Cron / scheduled tasks — SHIPPED (fx-cron crate, 7 HTTP endpoints, 6 agent tools)</li>
+        <li><span class="check">✓</span> Fleet worker mode — serve --fleet SHIPPED (#1422)</li>
+        <li><span class="check">✓</span> Git UI endpoints — 6 real endpoints (status/log/diff/stage/commit/push)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -251,39 +252,44 @@
         <li><span class="check">✓</span> Phase 3: Skills browser, settings, error handling, iOS adaptations, keyboard shortcuts</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 4: Self-Contained Install — Spec Approved (#1406)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 4: Self-Contained Install</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Notarized DMG distribution (not App Store)</li>
-        <li><span class="planned">○</span> Setup wizard — skippable, non-destructive, re-enterable from Settings</li>
-        <li><span class="planned">○</span> Tailscale-first networking with auto HTTPS via tailscale cert</li>
-        <li><span class="planned">○</span> LaunchAgent daemon — GUI is just a client + manager</li>
-        <li><span class="planned">○</span> Menu bar status icon (start/stop/restart)</li>
-        <li><span class="planned">○</span> iPhone QR code pairing</li>
-        <li><span class="planned">○</span> 13 new backend endpoints (setup, auth management, config presets, pairing)</li>
-        <li><span class="planned">○</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
-        <li><span class="planned">○</span> <strong>RE tool deny list</strong> — block strings/objdump/otool targeting binary</li>
-        <li><span class="planned">○</span> <strong>Error sanitization</strong> — strip module paths and enum names from agent-facing errors</li>
-        <li><span class="planned">○</span> <strong>Panic sanitization</strong> — panic=abort, strip location detail in release builds</li>
+        <li><span class="check">✓</span> DMG build pipeline (notarized, ARM)</li>
+        <li><span class="check">✓</span> Setup wizard — skippable, non-destructive, re-enterable from Settings</li>
+        <li><span class="check">✓</span> Tailscale-first networking with auto HTTPS via tailscale cert</li>
+        <li><span class="check">✓</span> LaunchAgent daemon — GUI is just a client + manager</li>
+        <li><span class="check">✓</span> Menu bar status icon (start/stop/restart)</li>
+        <li><span class="check">✓</span> iPhone QR code pairing (backend)</li>
+        <li><span class="check">✓</span> 13+ backend endpoints (setup, auth, config presets, pairing, server lifecycle)</li>
+        <li><span class="check">✓</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
+        <li><span class="check">✓</span> <strong>Release profile hardening</strong> — panic=abort, strip=true, lto=true</li>
+        <li><span class="wip">◐</span> Swift GUI — in e2e testing (setup wizard works, chat streaming debugging)</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Spec Approved (#1407)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Backend Complete</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Proposal gate — inline permission prompts + modal diff viewer</li>
-        <li><span class="planned">○</span> <strong>Proposal gate hardening</strong> — risk-tiered UX, two-step for sensitive ops, anti-batch bypass, escalation detection</li>
-        <li><span class="planned">○</span> Permission system — per-tool settings in Skills menu + global overview</li>
-        <li><span class="planned">○</span> OpenAI PKCE OAuth (ChatGPT subscription login)</li>
-        <li><span class="planned">○</span> Remote VPS pairing via existing pairing code system</li>
-        <li><span class="planned">○</span> Skill marketplace install/remove (signed skills only)</li>
-        <li><span class="planned">○</span> Skill building by Fawx (auto-signed)</li>
-        <li><span class="planned">○</span> <strong>WASM security hardening</strong> — default-deny capabilities, network domain allowlist, resource limits, host boundary fuzzing</li>
-        <li><span class="planned">○</span> Cost tracking + synthesis/custom instructions</li>
+        <li><span class="check">✓</span> PermissionGateExecutor — action-level permission checks with SSE prompts, async pause/resume</li>
+        <li><span class="check">✓</span> Permission system API — GET/PATCH /v1/permissions with presets (power/cautious/experimental/custom)</li>
+        <li><span class="check">✓</span> Inline permission prompts — SSE event, respond endpoint, session overrides, idempotent resolve</li>
+        <li><span class="check">✓</span> OpenAI PKCE OAuth — start/callback/refresh endpoints, credential store integration</li>
+        <li><span class="check">✓</span> Synthesis / custom instructions — GET/PUT/DELETE with optimistic concurrency</li>
+        <li><span class="check">✓</span> Usage / cost tracking — real session token counts + estimated cost</li>
+        <li><span class="check">✓</span> Marketplace stub endpoints (search/install/remove)</li>
+        <li><span class="check">✓</span> Proposal endpoints wired to real filesystem proposals</li>
+        <li><span class="check">✓</span> <strong>WASM domain allowlist</strong> — NetworkRestricted capability with per-skill domain control</li>
+        <li><span class="check">✓</span> Subagent model/thinking overrides</li>
+        <li><span class="wip">◐</span> Swift GUI — Codex built screens, in e2e testing</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments + Telemetry (post-publish)</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments — Backend Complete</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Fleet dashboard — node health, task dispatch, workload visualization</li>
-        <li><span class="planned">○</span> Experiment monitor — run/chain/scores/tournament</li>
-        <li><span class="planned">○</span> <strong>Behavioral telemetry</strong> — opt-in anonymous signals, granular consent, differential privacy aggregation</li>
+        <li><span class="check">✓</span> Fleet dashboard — 5 endpoints (overview, nodes, detail, remove, dispatch)</li>
+        <li><span class="check">✓</span> Fleet task dispatch — wired to FleetHttpClient, sends tasks to worker nodes</li>
+        <li><span class="check">✓</span> ExperimentRegistry — CRUD lifecycle, JSON persistence, cancellation, restart recovery</li>
+        <li><span class="check">✓</span> Experiment execution — tokio::spawn runs run_improvement_cycle() on create</li>
+        <li><span class="check">✓</span> Kernel yield primitive — WakeCondition, YieldRequest, YieldHandle, loop integration</li>
+        <li><span class="planned">○</span> <strong>Behavioral telemetry</strong> — opt-in anonymous signals, granular consent, differential privacy</li>
+        <li><span class="planned">○</span> Swift fleet dashboard + experiment monitor screens</li>
       </ul>
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
@@ -295,6 +301,22 @@
         <li><span class="planned">○</span> <strong>Binary hardening</strong> — symbol stripping, panic location removal, release profile hardening</li>
         <li><span class="planned">○</span> <strong>Open source launch</strong> — skill SDK, marketplace protocol, channel traits, docs site (Apache 2.0)</li>
         <li><span class="planned">○</span> fawx.ai download page</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Git UI Pane</h2>
+      </div>
+      <p class="phase-desc">Built-in Git interface in the native app. Branch status, diff viewer, stage/commit/push — powered by the same git tools the agent uses.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Backend endpoints shipped (GET status/log/diff, POST stage/commit/push)</li>
+        <li><span class="planned">○</span> Swift Git pane — branch picker, file status list, inline diff viewer</li>
+        <li><span class="planned">○</span> Stage/unstage individual files</li>
+        <li><span class="planned">○</span> Commit with message + push in one flow</li>
+        <li><span class="planned">○</span> Pull/fetch with conflict indication</li>
       </ul>
     </div>
     <hr class="divider">
