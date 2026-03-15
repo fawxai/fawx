@@ -1883,7 +1883,7 @@ mod tests {
     #[test]
     fn tailscale_cert_paths_use_tls_directory() {
         let data_dir = Path::new("/tmp/fawx");
-        let (cert_path, key_path) = super::tailscale::cert_paths(data_dir);
+        let (cert_path, key_path) = crate::commands::tailscale::cert_paths(data_dir);
 
         assert_eq!(cert_path, data_dir.join("tls").join("cert.pem"));
         assert_eq!(key_path, data_dir.join("tls").join("key.pem"));

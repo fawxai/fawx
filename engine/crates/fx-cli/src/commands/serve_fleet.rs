@@ -395,13 +395,12 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::{sync::Arc, time::Duration};
     use tempfile::TempDir;
-    use tokio::{
-        sync::{mpsc, Mutex},
-        task::JoinHandle,
-        time::timeout,
-    };
+    use tokio::sync::Mutex as TokioMutex;
+    use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 
     #[derive(Debug)]
     enum ServerEvent {
@@ -438,7 +437,7 @@ mod tests {
     struct TestServerState {
         events: mpsc::UnboundedSender<ServerEvent>,
         node_id: String,
-        tasks: Arc<Mutex<VecDeque<Option<FleetTaskRequest>>>>,
+        tasks: Arc<TokioMutex<VecDeque<Option<FleetTaskRequest>>>>,
     }
 
     struct TestFleetServer {
@@ -453,7 +452,7 @@ mod tests {
             let state = TestServerState {
                 events: events_tx,
                 node_id: node_id.to_string(),
-                tasks: Arc::new(Mutex::new(tasks.into())),
+                tasks: Arc::new(TokioMutex::new(tasks.into())),
             };
             let app = Router::new()
                 .route("/fleet/register", post(handle_register))
