@@ -335,6 +335,9 @@ fn classify_and_gate(
     if let Some(decision) = classify_read_call(call) {
         return decision;
     }
+    if let Some(decision) = classify_shell_blind(call) {
+        return decision;
+    }
     classify_write_call(call, config, working_dir, proposals_dir, active)
 }
 
@@ -360,6 +363,56 @@ fn classify_read_call(call: &ToolCall) -> Option<GateDecision> {
     }
 
     Some(GateDecision::PassThrough)
+}
+
+#[cfg_attr(not(feature = "kernel-blind"), allow(dead_code))]
+fn classify_shell_blind(call: &ToolCall) -> Option<GateDecision> {
+    if !is_kernel_blind_enforced() {
+        return None;
+    }
+    if !matches!(call.name.as_str(), "shell" | "bash" | "execute_command") {
+        return None;
+    }
+    let command = call
+        .arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)?;
+
+    if shell_targets_kernel_path(command) {
+        return Some(GateDecision::Block(blind_read_result(call)));
+    }
+    None
+}
+
+#[cfg_attr(not(feature = "kernel-blind"), allow(dead_code))]
+fn shell_targets_kernel_path(command: &str) -> bool {
+    let read_commands = ["cat ", "head ", "tail ", "less ", "more ", "bat "];
+    let search_commands = ["grep ", "rg ", "ag ", "find "];
+    let git_commands = ["git show ", "git log -p", "git diff ", "git blame "];
+    let re_tools = [
+        "strings ", "objdump ", "otool ", "nm ", "readelf ", "hexdump ", "xxd ",
+    ];
+
+    for cmd_prefix in read_commands
+        .iter()
+        .chain(search_commands.iter())
+        .chain(git_commands.iter())
+        .chain(re_tools.iter())
+    {
+        if command.contains(cmd_prefix) {
+            for path in KERNEL_BLIND_PATHS {
+                if command.contains(path) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if command.contains("/proc/self/exe") || command.contains("/proc/self/maps") {
+        return true;
+    }
+
+    false
 }
 
 fn classify_write_call(
@@ -705,6 +758,15 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "kernel-blind"), allow(dead_code))]
+    fn shell_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": command}),
+        }
+    }
+
     fn edit_call(id: &str, path: &str, old_text: &str, new_text: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
@@ -1018,6 +1080,51 @@ mod tests {
         #[tokio::test]
         async fn kernel_blind_blocks_list_directory_on_kernel_path() {
             assert_blind_path_denied(list_directory_call("1", "engine/crates/fx-kernel/")).await;
+        }
+
+        #[tokio::test]
+        async fn shell_blocks_cat_kernel_path() {
+            assert_blind_path_denied(shell_call("1", "cat engine/crates/fx-kernel/src/lib.rs"))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn shell_blocks_grep_kernel_path() {
+            assert_blind_path_denied(shell_call("1", "grep -r pattern engine/crates/fx-kernel/"))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn shell_blocks_git_show_kernel_path() {
+            assert_blind_path_denied(shell_call(
+                "1",
+                "git show HEAD:engine/crates/fx-kernel/src/lib.rs",
+            ))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn shell_blocks_strings_on_proc_self_exe() {
+            assert_blind_path_denied(shell_call("1", "strings /proc/self/exe")).await;
+        }
+
+        #[tokio::test]
+        async fn shell_allows_cat_loadable_path() {
+            let (result, call_count) =
+                execute_single_tool(shell_call("1", "cat engine/crates/fx-loadable/src/lib.rs"))
+                    .await;
+
+            assert_tool_passed_through(&result, "1", "shell");
+            assert_eq!(call_count, 1);
+        }
+
+        #[tokio::test]
+        async fn shell_allows_grep_docs() {
+            let (result, call_count) =
+                execute_single_tool(shell_call("1", "grep -r pattern docs/")).await;
+
+            assert_tool_passed_through(&result, "1", "shell");
+            assert_eq!(call_count, 1);
         }
 
         #[tokio::test]
