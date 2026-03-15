@@ -1592,6 +1592,175 @@ mod routing_and_status {
         assert_eq!(json["message"], "Server restart requested.");
     }
 
+    #[tokio::test]
+    async fn config_patch_endpoint_merges_changes_and_returns_changed_keys() {
+        let (temp, config, manager) = temp_config_manager("[http]\nbearer_token = \"secret\"\n");
+        let app = build_router(
+            test_state_with_config(config, Some(manager), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PATCH",
+                "/v1/config",
+                r#"{"changes":{"http":{"port":8401},"ui":{"auto_start":true}}}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["updated"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(
+            json["changed_keys"],
+            serde_json::json!(["http.port", "ui.auto_start"])
+        );
+
+        let content =
+            std::fs::read_to_string(temp.path().join("config.toml")).expect("read config");
+        assert!(content.contains("port = 8401"));
+        assert!(content.contains("[ui]"));
+        assert!(content.contains("auto_start = true"));
+    }
+
+    #[tokio::test]
+    async fn config_presets_endpoint_lists_available_presets() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/config/presets"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["presets"][0]["name"], "safe");
+        assert_eq!(
+            json["presets"][0]["description"],
+            "Conservative defaults for cautious use."
+        );
+        assert_eq!(json["presets"][1]["name"], "power-user");
+        assert_eq!(
+            json["presets"][1]["description"],
+            "Fewer confirmations, higher autonomy."
+        );
+    }
+
+    #[tokio::test]
+    async fn config_patch_endpoint_rejects_invalid_json_body() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PATCH",
+                "/v1/config",
+                r#"{"changes":{"http":{"port":8401}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn apply_config_preset_endpoint_returns_not_found_for_unknown_preset() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/config/preset/unknown",
+                r#"{"confirm":true}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "unknown config preset: unknown");
+    }
+
+    #[tokio::test]
+    async fn apply_config_preset_endpoint_rejects_confirm_false() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/config/preset/safe",
+                r#"{"confirm":false}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "preset application requires confirm=true");
+    }
+
+    #[tokio::test]
+    async fn apply_config_preset_endpoint_updates_permissions_config() {
+        let (temp, config, manager) = temp_config_manager("");
+        let app = build_router(
+            test_state_with_config(config, Some(manager), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/config/preset/safe",
+                r#"{"confirm":true}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "safe");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["restart_required"], false);
+        assert!(json["changed_keys"]
+            .as_array()
+            .is_some_and(|keys| !keys.is_empty()));
+
+        let content =
+            std::fs::read_to_string(temp.path().join("config.toml")).expect("read config");
+        assert!(content.contains("preset = \"cautious\""));
+        assert!(content.contains("proposal_required"));
+    }
+
+    #[tokio::test]
+    async fn config_preset_diff_endpoint_previews_changes() {
+        let (temp, config, manager) = temp_config_manager("");
+        let app = build_router(
+            test_state_with_config(config, Some(manager), Vec::new()),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/config/preset/safe/diff"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "safe");
+        assert_eq!(json["changes"][0]["key"], "permissions.preset");
+        assert_eq!(json["changes"][0]["old"], "power");
+        assert_eq!(json["changes"][0]["new"], "cautious");
+
+        let content =
+            std::fs::read_to_string(temp.path().join("config.toml")).expect("read config");
+        assert!(content.is_empty());
+    }
+
     fn make_session_registry() -> SessionRegistry {
         let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
         SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
