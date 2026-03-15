@@ -33,6 +33,8 @@ impl Default for LaunchAgentConfig {
 #[derive(Debug)]
 pub enum LaunchAgentError {
     HomeDirNotFound,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    UidParseFailed,
     PlistWriteFailed(io::Error),
     LaunchctlSpawnFailed(io::Error),
     LaunchctlFailed {
@@ -48,6 +50,7 @@ impl fmt::Display for LaunchAgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HomeDirNotFound => write!(f, "HOME directory not found"),
+            Self::UidParseFailed => write!(f, "failed to parse current user ID"),
             Self::PlistWriteFailed(e) => write!(f, "failed to write plist: {e}"),
             Self::LaunchctlSpawnFailed(e) => write!(f, "failed to spawn launchctl: {e}"),
             Self::LaunchctlFailed {
@@ -191,15 +194,20 @@ fn is_loaded() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn parse_current_uid(stdout: &[u8]) -> Result<u32, LaunchAgentError> {
+    String::from_utf8_lossy(stdout)
+        .trim()
+        .parse()
+        .map_err(|_| LaunchAgentError::UidParseFailed)
+}
+
+#[cfg(target_os = "macos")]
 fn current_uid() -> Result<u32, LaunchAgentError> {
     let output = Command::new("id")
         .args(["-u"])
         .output()
         .map_err(LaunchAgentError::LaunchctlSpawnFailed)?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .map_err(|_| LaunchAgentError::HomeDirNotFound)
+    parse_current_uid(&output.stdout)
 }
 
 #[cfg(target_os = "macos")]
@@ -331,6 +339,12 @@ mod tests {
     }
 
     #[test]
+    fn error_display_uid_parse_failed() {
+        let err = LaunchAgentError::UidParseFailed;
+        assert_eq!(err.to_string(), "failed to parse current user ID");
+    }
+
+    #[test]
     fn error_display_launchctl_spawn_failed() {
         let err = LaunchAgentError::LaunchctlSpawnFailed(io::Error::from(io::ErrorKind::Other));
         assert_eq!(err.to_string(), "failed to spawn launchctl: other error");
@@ -347,6 +361,19 @@ mod tests {
             err.to_string(),
             "launchctl bootstrap failed (exit unknown): signal lost"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_current_uid_parses_valid_uid() {
+        assert_eq!(parse_current_uid(b"501\n").unwrap(), 501);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_current_uid_returns_uid_parse_failed_for_invalid_uid() {
+        let err = parse_current_uid(b"not-a-uid").unwrap_err();
+        assert!(matches!(err, LaunchAgentError::UidParseFailed));
     }
 
     fn xml_tags_are_balanced(xml: &str) -> bool {
