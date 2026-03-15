@@ -1,0 +1,1739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx — Phase 4 + Phase 5 Mockups</title>
+<style>
+/* ═══════════════════════════════════════════════════════════
+   DESIGN SYSTEM — exact values from cowork-mockup-prompt.md
+   ═══════════════════════════════════════════════════════════ */
+:root {
+  --bg: #1A1A1A;
+  --surface: #242424;
+  --surface-hover: #2E2E2E;
+  --surface-active: #383838;
+  --text: #E8E8E8;
+  --text-secondary: #999999;
+  --accent: #E8711A;
+  --accent-subtle: rgba(232, 113, 26, 0.125);
+  --success: #4ADE80;
+  --warning: #FBBF24;
+  --error: #F87171;
+  --border: #333333;
+  --code-bg: #2D2D2D;
+}
+.light {
+  --bg: #FFFFFF;
+  --surface: #F5F5F5;
+  --surface-hover: #EBEBEB;
+  --surface-active: #E0E0E0;
+  --text: #1A1A1A;
+  --text-secondary: #666666;
+  --accent: #D45E14;
+  --accent-subtle: rgba(212, 94, 20, 0.08);
+  --success: #22C55E;
+  --warning: #D97706;
+  --error: #DC2626;
+  --border: #E5E5E5;
+  --code-bg: #F0F0F0;
+}
+
+/* ── Reset ── */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  background: #111; color: #ccc; line-height: 1.5;
+}
+h1, h2, h3, h4 { color: var(--text); margin: 0; }
+
+/* ── Top control bar ── */
+.controls {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+  display: flex; align-items: center;
+  background: #0a0a0a; border-bottom: 1px solid #333;
+  height: 44px; padding: 0 16px;
+}
+.tab-bar { display: flex; gap: 2px; overflow-x: auto; flex: 1; }
+.tab-btn {
+  background: none; border: none; color: #888;
+  padding: 10px 14px; font-size: 12px; font-family: inherit;
+  cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.tab-btn:hover { color: #ccc; background: #1a1a1a; }
+.tab-btn.active { color: #E8711A; border-bottom-color: #E8711A; font-weight: 600; }
+.tab-sep {
+  color: #444; padding: 10px 8px 10px 14px; font-size: 10px; cursor: default;
+  font-weight: 600; user-select: none; letter-spacing: 0.5px; text-transform: uppercase;
+}
+.theme-toggle {
+  display: flex; gap: 2px; background: #1a1a1a; border: 1px solid #333;
+  border-radius: 6px; padding: 2px; margin-left: 12px; flex-shrink: 0;
+}
+.theme-toggle button {
+  background: none; border: none; color: #888; padding: 4px 12px;
+  border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit;
+}
+.theme-toggle button.active { background: #333; color: #fff; font-weight: 600; }
+
+/* ── Screen container ── */
+.screen { display: none; padding: 64px 24px 24px; min-height: 100vh; }
+.screen.active { display: flex; flex-direction: column; align-items: center; }
+.screen-label {
+  font-size: 11px; color: #555; letter-spacing: 0.5px; text-transform: uppercase;
+  margin-bottom: 24px; align-self: flex-start;
+}
+.screen-pair {
+  display: flex; gap: 40px; align-items: flex-start; flex-wrap: wrap; justify-content: center;
+}
+
+/* ── macOS window chrome ── */
+.mac-win {
+  width: 900px; min-height: 600px; background: var(--bg);
+  border-radius: 10px; overflow: hidden; position: relative;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 1px solid #444;
+  display: flex; flex-direction: column;
+}
+.mac-win.sm { width: 700px; min-height: 480px; }
+.mac-tb {
+  height: 38px; background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 16px; flex-shrink: 0;
+}
+.dots { display: flex; gap: 8px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; }
+.dot.r { background: #FF5F57; }
+.dot.y { background: #FFBD2E; }
+.dot.g { background: #28C840; }
+.mac-title {
+  flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: var(--text-secondary);
+}
+.mac-body { flex: 1; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
+
+/* ── iPhone frame ── */
+.iphone {
+  width: 390px; min-height: 844px; background: var(--bg);
+  border-radius: 44px; overflow: hidden; position: relative;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 3px solid #555;
+  display: flex; flex-direction: column;
+}
+.notch {
+  width: 126px; height: 34px; background: #000; border-radius: 0 0 20px 20px;
+  position: absolute; top: 0; left: 50%; transform: translateX(-50%); z-index: 10;
+}
+.status-bar {
+  height: 54px; flex-shrink: 0; display: flex; align-items: flex-end; justify-content: space-between;
+  padding: 0 24px 6px; font-size: 12px; font-weight: 600; color: var(--text);
+}
+.home-ind {
+  width: 134px; height: 5px; background: var(--text-secondary); opacity: 0.3;
+  border-radius: 3px; position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+}
+.ios-body { flex: 1; display: flex; flex-direction: column; background: var(--bg); overflow-y: auto; }
+.ios-nav {
+  display: flex; align-items: center; padding: 0 16px; height: 44px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--bg);
+}
+.ios-nav-back { font-size: 24px; color: var(--accent); cursor: pointer; width: 28px; }
+.ios-nav-title { flex: 1; text-align: center; font-size: 17px; font-weight: 600; color: var(--text); }
+.ios-large-title {
+  font-size: 28px; font-weight: 700; color: var(--text); padding: 4px 16px 12px;
+}
+.ios-section-hdr {
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.3px; padding: 20px 16px 6px;
+}
+.ios-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  font-size: 15px; color: var(--text); background: var(--surface);
+}
+.ios-row .lbl { flex: 1; font-size: 15px; color: var(--text); }
+.ios-row .val { font-size: 15px; color: var(--text-secondary); }
+.ios-tab-bar {
+  display: flex; justify-content: space-around; align-items: center;
+  height: 50px; border-top: 1px solid var(--border); background: var(--surface);
+  flex-shrink: 0;
+}
+.ios-tab { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; color: var(--text-secondary); }
+.ios-tab.active { color: var(--accent); }
+.ios-tab-icon { font-size: 20px; }
+
+/* ── Wizard card (centered setup flow) ── */
+.wiz-card {
+  width: 440px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 32px; text-align: center;
+}
+.wiz-emoji { font-size: 48px; margin-bottom: 12px; }
+.wiz-h1 { font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.wiz-sub { font-size: 14px; color: var(--text-secondary); margin-bottom: 24px; line-height: 1.5; }
+.wiz-footer { font-size: 12px; color: var(--text-secondary); margin-top: 20px; line-height: 1.4; }
+
+/* ── Provider cards ── */
+.prov-grid { display: flex; gap: 12px; margin-bottom: 20px; }
+.prov-card {
+  flex: 1; padding: 16px; border: 2px solid var(--border); border-radius: 8px;
+  background: var(--bg); cursor: pointer; text-align: center; transition: all 0.15s;
+}
+.prov-card:hover { border-color: var(--accent); }
+.prov-card.sel { border-color: var(--accent); background: var(--accent-subtle); }
+.prov-icon {
+  width: 48px; height: 48px; border-radius: 12px; margin: 0 auto 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; font-weight: 700;
+}
+.prov-name { font-size: 14px; font-weight: 600; color: var(--text); }
+.prov-co { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 10px 20px; border: none; border-radius: 8px;
+  font-size: 14px; font-weight: 500; font-family: inherit; cursor: pointer;
+  transition: all 0.15s; text-decoration: none;
+}
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.primary:hover { opacity: 0.9; }
+.btn.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+.btn.secondary:hover { background: var(--surface-hover); }
+.btn.danger { background: var(--error); color: #fff; }
+.btn.ghost { background: none; color: var(--text-secondary); border: none; }
+.btn.ghost:hover { color: var(--text); }
+.btn.link { background: none; border: none; color: var(--accent); padding: 0; font-weight: 400; }
+.btn.full { width: 100%; }
+
+/* ── Toggle switch ── */
+.tog {
+  width: 44px; height: 24px; border-radius: 12px; border: none;
+  background: var(--surface-hover); cursor: pointer; position: relative;
+  transition: background 0.2s; flex-shrink: 0;
+}
+.tog::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 20px; height: 20px; border-radius: 10px;
+  background: white; transition: transform 0.2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+.tog.on { background: var(--accent); }
+.tog.on::after { transform: translateX(20px); }
+
+/* ── Radio option rows ── */
+.radio-row {
+  display: flex; align-items: center; padding: 12px; gap: 12px;
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+  margin-bottom: 8px; transition: all 0.15s;
+}
+.radio-row.sel { border-color: var(--accent); background: var(--accent-subtle); }
+.radio-dot {
+  width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border); flex-shrink: 0;
+}
+.radio-row.sel .radio-dot { border-color: var(--accent); background: var(--accent); }
+.radio-label { font-size: 14px; color: var(--text); }
+.radio-row:not(.sel) .radio-label { color: var(--text-secondary); }
+
+/* ── Form fields ── */
+.field { margin-bottom: 16px; }
+.field-label { display: block; font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 6px; }
+.field-input {
+  width: 100%; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-size: 14px; font-family: inherit;
+}
+.field-input.mono { font-family: 'SF Mono', Menlo, monospace; font-size: 13px; }
+.field-help { font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4; }
+
+/* ── QR placeholder ── */
+.qr-box {
+  width: 200px; height: 200px; background: #fff; border-radius: 8px;
+  margin: 0 auto 12px; display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden;
+}
+.qr-box svg { width: 160px; height: 160px; }
+.qr-box.sm { width: 160px; height: 160px; }
+.qr-box.sm svg { width: 128px; height: 128px; }
+
+/* ── Menu bar mockup (macOS only) ── */
+.menubar {
+  background: linear-gradient(180deg, #3a3a3a 0%, #2a2a2a 100%);
+  height: 25px; display: flex; align-items: center; padding: 0 10px;
+  font-size: 13px; color: #ddd; gap: 16px; border-radius: 4px 4px 0 0;
+}
+.light .menubar { background: linear-gradient(180deg, #f0f0f0 0%, #d8d8d8 100%); color: #222; }
+.menubar-icon { font-size: 14px; position: relative; cursor: default; }
+.menubar-status { width: 7px; height: 7px; border-radius: 50%; position: absolute; bottom: -2px; right: -4px; }
+.menu-drop {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  min-width: 220px; box-shadow: 0 8px 30px rgba(0,0,0,0.4); overflow: hidden;
+}
+.light .menu-drop { box-shadow: 0 8px 30px rgba(0,0,0,0.15); }
+.menu-hdr {
+  padding: 10px 14px; font-size: 13px; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.menu-sep { height: 1px; background: var(--border); margin: 2px 0; }
+.menu-item {
+  padding: 6px 14px; font-size: 13px; color: var(--text); cursor: default;
+}
+.menu-item:hover { background: var(--accent); color: #fff; border-radius: 3px; margin: 0 4px; padding: 6px 10px; }
+.menu-item.bold { font-weight: 600; }
+.menu-item .shortcut { float: right; color: var(--text-secondary); font-size: 12px; }
+
+/* ── Settings layout (macOS) ── */
+.set-layout { display: flex; flex: 1; overflow: hidden; }
+.set-side {
+  width: 180px; background: var(--surface); border-right: 1px solid var(--border);
+  padding: 10px 6px; flex-shrink: 0;
+}
+.set-nav {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  font-size: 13px; color: var(--text-secondary); border-radius: 6px; cursor: pointer; margin-bottom: 1px;
+}
+.set-nav:hover { background: var(--surface-hover); color: var(--text); }
+.set-nav.active { background: var(--surface-active); color: var(--text); }
+.set-body { flex: 1; padding: 20px 28px; overflow-y: auto; }
+.set-title { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 20px; }
+
+/* ── Status indicators ── */
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0;
+}
+.status-dot.green { background: var(--success); }
+.status-dot.yellow { background: var(--warning); }
+.status-dot.red { background: var(--error); }
+
+/* ── Tier header strips ── */
+.tier-strip { height: 5px; width: 100%; flex-shrink: 0; }
+.tier-strip.green { background: var(--success); }
+.tier-strip.amber { background: var(--warning); }
+.tier-strip.red { background: var(--error); }
+
+/* ── Badges ── */
+.badge {
+  display: inline-flex; align-items: center; padding: 3px 8px;
+  border-radius: 4px; font-size: 11px; font-weight: 500; white-space: nowrap;
+}
+.badge.green { background: rgba(74,222,128,0.15); color: var(--success); }
+.badge.amber { background: rgba(251,191,36,0.15); color: var(--warning); }
+.badge.red { background: rgba(248,113,113,0.15); color: var(--error); }
+.badge.blue { background: rgba(59,130,246,0.15); color: #60A5FA; }
+.badge.gray { background: var(--surface-hover); color: var(--text-secondary); }
+
+/* ── Proposal card (inline) ── */
+.prop-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden; max-width: 600px;
+}
+.prop-body { padding: 20px; }
+.prop-action { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.prop-target { font-family: 'SF Mono', Menlo, monospace; font-size: 13px; color: var(--text-secondary); margin-bottom: 16px; word-break: break-all; }
+.prop-reason {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 16px;
+}
+.prop-reason-lbl { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 4px; }
+.prop-reason-txt { font-size: 13px; color: var(--text); line-height: 1.5; }
+.prop-btns { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ── Diff viewer ── */
+.diff {
+  background: var(--code-bg); border-radius: 6px; overflow: hidden;
+  font-family: 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.7;
+}
+.diff-hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--text-secondary);
+}
+.diff-line { display: flex; }
+.diff-ln {
+  width: 36px; padding: 1px 6px; text-align: right; color: var(--text-secondary);
+  background: var(--surface); border-right: 1px solid var(--border); user-select: none; flex-shrink: 0;
+}
+.diff-code { flex: 1; padding: 1px 10px; white-space: pre; color: var(--text); }
+.diff-line.add { background: rgba(74,222,128,0.08); }
+.diff-line.add .diff-code { color: var(--success); }
+.diff-line.del { background: rgba(248,113,113,0.08); }
+.diff-line.del .diff-code { color: var(--error); }
+
+/* ── Segmented control ── */
+.seg {
+  display: inline-flex; background: var(--surface); border-radius: 8px; padding: 3px;
+}
+.seg-btn {
+  padding: 6px 14px; font-size: 13px; color: var(--text-secondary);
+  background: none; border: none; border-radius: 5px; cursor: pointer; font-family: inherit;
+}
+.seg-btn.active { background: var(--bg); color: var(--text); font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
+
+/* ── Category pills ── */
+.pills { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+.pill {
+  padding: 6px 12px; background: var(--surface); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 16px; font-size: 12px;
+  cursor: pointer; white-space: nowrap; transition: all 0.15s;
+}
+.pill:hover { border-color: var(--accent); color: var(--text); }
+.pill.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* ── Skills grid ── */
+.skill-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.skill-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; transition: border-color 0.15s; cursor: pointer;
+}
+.skill-card:hover { border-color: var(--accent); }
+.skill-hdr { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.skill-icon {
+  width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center;
+  justify-content: center; font-size: 16px; font-weight: 700; color: #fff; flex-shrink: 0;
+}
+.skill-name { font-size: 14px; font-weight: 600; color: var(--text); }
+.skill-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.4; margin-bottom: 10px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.skill-foot { display: flex; align-items: center; gap: 6px; }
+
+/* ── Banners ── */
+.banner {
+  padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px;
+  display: flex; align-items: flex-start; gap: 8px; line-height: 1.4;
+}
+.banner.warn { background: rgba(251,191,36,0.1); border-left: 3px solid var(--warning); color: var(--text); }
+.banner.info { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+.banner-icon { flex-shrink: 0; }
+
+/* ── Bar chart ── */
+.bar-chart { display: flex; flex-direction: column; gap: 10px; }
+.bar-row { display: flex; align-items: center; gap: 10px; }
+.bar-label { width: 90px; font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+.bar-track { flex: 1; height: 20px; background: var(--surface); border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--accent); border-radius: 4px; }
+.bar-val { width: 60px; font-size: 11px; color: var(--text-secondary); font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+
+/* ── Code input (pairing) ── */
+.code-boxes { display: flex; gap: 8px; justify-content: center; }
+.code-box {
+  width: 44px; height: 52px; border: 2px solid var(--border); border-radius: 8px;
+  font-size: 20px; text-align: center; background: var(--surface); color: var(--text);
+  font-weight: 600; font-family: 'SF Mono', Menlo, monospace;
+}
+.code-box:focus { border-color: var(--accent); outline: none; }
+
+/* ── Countdown button ── */
+.btn-countdown {
+  padding: 10px 20px; background: var(--surface-hover); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+  font-family: inherit; cursor: not-allowed;
+}
+.btn-countdown.ready { background: var(--accent); color: #fff; border: none; cursor: pointer; }
+
+/* ── Preset cards (permissions) ── */
+.preset-row { display: flex; gap: 10px; margin-bottom: 20px; }
+.preset-card {
+  flex: 1; padding: 14px; background: var(--surface); border: 2px solid var(--border);
+  border-radius: 8px; cursor: pointer; transition: all 0.15s;
+}
+.preset-card:hover { border-color: var(--accent); }
+.preset-card.sel { border-color: var(--accent); background: var(--accent-subtle); }
+.preset-name { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.preset-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.3; }
+
+/* ── Tool permission rows ── */
+.perm-group { margin-bottom: 16px; }
+.perm-group-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.perm-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; margin-bottom: 4px;
+}
+.perm-label { font-size: 13px; color: var(--text); }
+
+/* ── Capability list (skill detail) ── */
+.cap-list { display: flex; flex-direction: column; gap: 6px; }
+.cap-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.cap-icon { width: 18px; text-align: center; flex-shrink: 0; }
+
+/* ── Chat message context (for proposal inline view) ── */
+.msg-user {
+  align-self: flex-end; max-width: 80%;
+  background: var(--accent-subtle); color: var(--text);
+  padding: 10px 14px; border-radius: 14px 14px 4px 14px; font-size: 14px;
+}
+.msg-agent { align-self: flex-start; max-width: 80%; font-size: 14px; color: var(--text); }
+
+/* ── Search bar ── */
+.search-input {
+  width: 100%; padding: 10px 14px 10px 36px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+  color: var(--text); font-family: inherit;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%23999' viewBox='0 0 24 24'%3E%3Cpath d='M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: 12px center;
+}
+.search-input::placeholder { color: var(--text-secondary); }
+
+/* ── Misc helpers ── */
+.mono { font-family: 'SF Mono', Menlo, monospace; }
+.center { text-align: center; }
+.flex { display: flex; }
+.flex-col { display: flex; flex-direction: column; }
+.gap-sm { gap: 8px; }
+.gap-md { gap: 12px; }
+.gap-lg { gap: 16px; }
+.gap-xl { gap: 24px; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.justify-center { justify-content: center; }
+.flex-1 { flex: 1; }
+.p-md { padding: 12px; }
+.p-lg { padding: 16px; }
+.p-xl { padding: 24px; }
+.mb-sm { margin-bottom: 8px; }
+.mb-md { margin-bottom: 12px; }
+.mb-lg { margin-bottom: 16px; }
+.mb-xl { margin-bottom: 24px; }
+.text-sm { font-size: 12px; }
+.text-base { font-size: 14px; }
+.text-secondary { color: var(--text-secondary); }
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
+.text-error { color: var(--error); }
+.text-accent { color: var(--accent); }
+.fw-600 { font-weight: 600; }
+.w-full { width: 100%; }
+.rounded { border-radius: 8px; }
+.bg-surface { background: var(--surface); }
+.bg-bg { background: var(--bg); }
+.border { border: 1px solid var(--border); }
+.overflow-auto { overflow-y: auto; }
+.shrink-0 { flex-shrink: 0; }
+
+/* QR code SVG (fake pattern) */
+.qr-svg { fill: #000; }
+</style>
+</head>
+<body>
+
+<!-- ── Controls ── -->
+<div class="controls">
+  <div class="tab-bar">
+    <span class="tab-sep">Setup</span>
+    <button class="tab-btn active" onclick="show(0)">Welcome</button>
+    <button class="tab-btn" onclick="show(1)">Tailscale</button>
+    <button class="tab-btn" onclick="show(2)">Provider</button>
+    <button class="tab-btn" onclick="show(3)">Ready</button>
+    <span class="tab-sep">System</span>
+    <button class="tab-btn" onclick="show(4)">Menu Bar</button>
+    <button class="tab-btn" onclick="show(5)">Server</button>
+    <button class="tab-btn" onclick="show(6)">Pairing</button>
+    <span class="tab-sep">Safety</span>
+    <button class="tab-btn" onclick="show(7)">Proposal</button>
+    <button class="tab-btn" onclick="show(8)">Diff</button>
+    <button class="tab-btn" onclick="show(9)">History</button>
+    <button class="tab-btn" onclick="show(10)">Permissions</button>
+    <span class="tab-sep">Skills</span>
+    <button class="tab-btn" onclick="show(11)">Marketplace</button>
+    <button class="tab-btn" onclick="show(12)">Detail</button>
+    <span class="tab-sep">Settings</span>
+    <button class="tab-btn" onclick="show(13)">Costs</button>
+    <button class="tab-btn" onclick="show(14)">Instructions</button>
+    <button class="tab-btn" onclick="show(15)">ChatGPT</button>
+    <button class="tab-btn" onclick="show(16)">Remote</button>
+  </div>
+  <div class="theme-toggle">
+    <button class="active" onclick="theme('dark')">Dark</button>
+    <button onclick="theme('light')">Light</button>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 0 — Welcome                                          -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen active" id="s0">
+  <div class="screen-label">Phase 4 · Setup Wizard — Welcome</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Fawx Setup</div><div style="width:52px"></div></div>
+      <div class="mac-body flex items-center justify-center">
+        <div class="wiz-card">
+          <div class="wiz-emoji">🦊</div>
+          <div class="wiz-h1">Welcome to Fawx</div>
+          <div style="font-size:14px;color:var(--text-secondary);margin-bottom:6px">Your self-hosted AI agent.</div>
+          <div class="wiz-sub">Fawx runs on your Mac and connects to Claude or ChatGPT.<br>Your conversations stay on your hardware. No cloud required.</div>
+          <button class="btn primary full">Get started</button>
+          <div class="wiz-footer">Fawx stores all data locally on this Mac. No telemetry is collected.</div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-body flex items-center justify-center p-xl">
+        <div class="wiz-card" style="width:100%;border-radius:16px">
+          <div style="font-size:64px;margin-bottom:16px">🦊</div>
+          <div class="wiz-h1">Welcome to Fawx</div>
+          <div style="font-size:14px;color:var(--text-secondary);margin-bottom:6px">Your self-hosted AI agent.</div>
+          <div class="wiz-sub">Fawx runs on your Mac and connects to Claude or ChatGPT. Your conversations stay private.</div>
+          <button class="btn primary full">Get started</button>
+          <div class="wiz-footer">All data stored locally. No telemetry.</div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 1 — Tailscale Setup                                  -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s1">
+  <div class="screen-label">Phase 4 · Setup Wizard — Tailscale</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Fawx Setup</div><div style="width:52px"></div></div>
+      <div class="mac-body flex items-center justify-center">
+        <div class="wiz-card">
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:8px">Secure Connectivity</div>
+          <div class="wiz-sub">Fawx uses Tailscale to securely connect your devices.</div>
+          <!-- Status checks -->
+          <div class="flex-col gap-md mb-xl" style="text-align:left;width:100%">
+            <div class="flex items-center gap-sm"><span style="font-size:18px">✅</span><span class="text-base" style="color:var(--text)">Tailscale is running</span></div>
+            <div class="flex items-center gap-sm"><span style="font-size:18px">✅</span><span class="text-base" style="color:var(--text)">HTTPS certificate configured</span></div>
+          </div>
+          <!-- Progress bar (complete) -->
+          <div class="mb-xl w-full" style="height:4px;background:var(--surface-hover);border-radius:2px;overflow:hidden">
+            <div style="height:100%;width:100%;background:var(--success);border-radius:2px"></div>
+          </div>
+          <button class="btn primary full mb-sm">Continue</button>
+          <button class="btn ghost full">Skip</button>
+          <div class="wiz-footer">Skipping means secure iPhone pairing won't be available during setup. You can set it up later in Settings.</div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-body flex items-center justify-center p-xl">
+        <div class="wiz-card" style="width:100%;border-radius:16px">
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:8px">Secure Connectivity</div>
+          <div class="wiz-sub">Fawx uses Tailscale to securely connect your devices.</div>
+          <div class="flex-col gap-md mb-xl" style="text-align:left;width:100%">
+            <div class="flex items-center gap-sm"><span style="font-size:18px">✅</span><span class="text-base" style="color:var(--text)">Tailscale is running</span></div>
+            <div class="flex items-center gap-sm"><span style="font-size:18px">✅</span><span class="text-base" style="color:var(--text)">HTTPS certificate configured</span></div>
+          </div>
+          <div class="mb-xl w-full" style="height:4px;background:var(--surface-hover);border-radius:2px;overflow:hidden">
+            <div style="height:100%;width:100%;background:var(--success);border-radius:2px"></div>
+          </div>
+          <button class="btn primary full mb-sm">Continue</button>
+          <button class="btn ghost full">Skip</button>
+          <div class="wiz-footer">Skipping means iPhone pairing won't be available. Set it up later in Settings.</div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 2 — Add AI Provider                                  -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s2">
+  <div class="screen-label">Phase 4 · Setup Wizard — Add Provider</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Fawx Setup</div><div style="width:52px"></div></div>
+      <div class="mac-body flex items-center justify-center">
+        <div class="wiz-card" style="width:480px">
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:20px">Add an AI Provider</div>
+          <!-- Provider cards side by side -->
+          <div class="prov-grid">
+            <div class="prov-card sel">
+              <div class="prov-icon" style="background:var(--accent-subtle);color:var(--accent)">A</div>
+              <div class="prov-name">Claude</div>
+              <div class="prov-co">Anthropic</div>
+            </div>
+            <div class="prov-card">
+              <div class="prov-icon" style="background:var(--surface-hover);color:var(--text-secondary)">O</div>
+              <div class="prov-name" style="opacity:0.6">ChatGPT</div>
+              <div class="prov-co" style="opacity:0.6">OpenAI</div>
+            </div>
+          </div>
+          <!-- Sub-view: connection method -->
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;text-align:left">
+            <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:12px">How do you want to connect?</div>
+            <div class="radio-row sel">
+              <div class="radio-dot"></div>
+              <div class="radio-label">I have a subscription</div>
+            </div>
+            <div class="radio-row">
+              <div class="radio-dot"></div>
+              <div class="radio-label">I have an API key</div>
+            </div>
+            <div class="field" style="margin-top:16px">
+              <label class="field-label">Paste your setup token</label>
+              <input type="password" class="field-input mono" placeholder="sk-ant-..." />
+            </div>
+            <div class="field-help" style="margin-bottom:12px">Open the Anthropic console, generate a setup token, and paste it here.</div>
+            <button class="btn primary full">Connect</button>
+          </div>
+          <button class="btn ghost full" style="margin-top:12px">Skip for now</button>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-body overflow-auto p-lg">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px">
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:16px">Add an AI Provider</div>
+          <!-- Stacked providers -->
+          <div class="flex-col gap-md mb-lg">
+            <div class="prov-card sel" style="border-radius:12px"><div class="prov-icon" style="background:var(--accent-subtle);color:var(--accent)">A</div><div class="prov-name">Claude</div><div class="prov-co">Anthropic</div></div>
+            <div class="prov-card" style="border-radius:12px"><div class="prov-icon" style="background:var(--surface-hover);color:var(--text-secondary)">O</div><div class="prov-name" style="opacity:0.6">ChatGPT</div><div class="prov-co" style="opacity:0.6">OpenAI</div></div>
+          </div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:left">
+            <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:10px">How do you want to connect?</div>
+            <div class="radio-row sel"><div class="radio-dot"></div><div class="radio-label">I have a subscription</div></div>
+            <div class="radio-row"><div class="radio-dot"></div><div class="radio-label">I have an API key</div></div>
+            <div class="field" style="margin-top:12px"><label class="field-label">Paste your setup token</label><input type="password" class="field-input mono" placeholder="sk-ant-..." /></div>
+            <div class="field-help" style="margin-bottom:10px">Generate a token in the Anthropic console.</div>
+            <button class="btn primary full">Connect</button>
+          </div>
+          <button class="btn ghost full" style="margin-top:12px">Skip</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 3 — You're Ready                                     -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s3">
+  <div class="screen-label">Phase 4 · Setup Wizard — You're Ready</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Fawx Setup</div><div style="width:52px"></div></div>
+      <div class="mac-body flex items-center justify-center">
+        <div class="wiz-card" style="width:440px">
+          <div style="font-size:48px;margin-bottom:12px">🎉</div>
+          <div class="wiz-h1" style="font-size:20px;margin-bottom:24px">Fawx is running on this Mac</div>
+          <!-- Auto-start toggle -->
+          <div class="flex items-center justify-between w-full mb-xl" style="background:var(--bg);border-radius:8px;padding:12px 14px">
+            <span class="text-base" style="color:var(--text)">Start Fawx when you log in</span>
+            <button class="tog on"></button>
+          </div>
+          <!-- QR code -->
+          <div class="center mb-lg">
+            <div class="qr-box">
+              <svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/><rect x="8" y="0" width="1" height="1"/><rect x="10" y="0" width="2" height="1"/><rect x="14" y="0" width="1" height="1"/><rect x="8" y="2" width="1" height="2"/><rect x="10" y="3" width="3" height="1"/><rect x="15" y="2" width="2" height="1"/><rect x="9" y="5" width="2" height="1"/><rect x="13" y="4" width="1" height="3"/><rect x="16" y="5" width="1" height="2"/><rect x="0" y="8" width="1" height="2"/><rect x="2" y="8" width="2" height="1"/><rect x="5" y="9" width="1" height="2"/><rect x="8" y="8" width="1" height="1"/><rect x="10" y="8" width="1" height="3"/><rect x="12" y="9" width="2" height="1"/><rect x="15" y="8" width="1" height="1"/><rect x="18" y="8" width="2" height="2"/><rect x="22" y="8" width="1" height="2"/><rect x="25" y="8" width="1" height="1"/><rect x="27" y="9" width="2" height="1"/><rect x="0" y="11" width="2" height="1"/><rect x="4" y="12" width="1" height="1"/><rect x="6" y="11" width="1" height="2"/><rect x="8" y="12" width="2" height="1"/><rect x="12" y="11" width="1" height="1"/><rect x="14" y="12" width="2" height="1"/><rect x="20" y="11" width="1" height="1"/><rect x="22" y="12" width="2" height="1"/><rect x="26" y="11" width="1" height="2"/><rect x="1" y="14" width="1" height="1"/><rect x="3" y="13" width="2" height="1"/><rect x="8" y="14" width="3" height="1"/><rect x="13" y="13" width="1" height="2"/><rect x="16" y="14" width="2" height="1"/><rect x="20" y="13" width="1" height="1"/><rect x="24" y="14" width="1" height="1"/><rect x="27" y="13" width="1" height="2"/><rect x="8" y="16" width="1" height="1"/><rect x="11" y="15" width="2" height="2"/><rect x="14" y="16" width="1" height="1"/><rect x="18" y="15" width="1" height="2"/><rect x="22" y="16" width="3" height="1"/><rect x="28" y="16" width="1" height="1"/><rect x="9" y="18" width="1" height="1"/><rect x="12" y="18" width="2" height="1"/><rect x="16" y="18" width="1" height="1"/><rect x="20" y="18" width="2" height="1"/><rect x="24" y="18" width="1" height="2"/><rect x="27" y="18" width="1" height="1"/><rect x="8" y="20" width="1" height="1"/><rect x="10" y="20" width="1" height="2"/><rect x="14" y="20" width="1" height="1"/><rect x="16" y="21" width="2" height="1"/><rect x="19" y="20" width="1" height="1"/><rect x="22" y="20" width="1" height="1"/><rect x="26" y="20" width="2" height="2"/><rect x="8" y="22" width="2" height="1"/><rect x="12" y="23" width="1" height="1"/><rect x="15" y="22" width="1" height="2"/><rect x="18" y="22" width="1" height="1"/><rect x="22" y="22" width="1" height="2"/><rect x="25" y="23" width="2" height="1"/><rect x="28" y="22" width="1" height="1"/><rect x="9" y="24" width="1" height="1"/><rect x="12" y="25" width="2" height="1"/><rect x="16" y="24" width="1" height="2"/><rect x="19" y="25" width="1" height="1"/><rect x="22" y="25" width="1" height="1"/><rect x="25" y="25" width="2" height="1"/><rect x="8" y="26" width="1" height="2"/><rect x="11" y="27" width="1" height="1"/><rect x="14" y="26" width="1" height="1"/><rect x="18" y="27" width="2" height="1"/><rect x="22" y="27" width="3" height="1"/><rect x="26" y="27" width="1" height="2"/><rect x="28" y="26" width="1" height="1"/></svg>
+            </div>
+            <div class="text-base mb-sm" style="color:var(--text)">Scan with your iPhone to connect</div>
+            <div class="mono text-sm text-secondary">joes-mac.tail1234.ts.net:8400</div>
+          </div>
+          <div class="flex justify-between items-center w-full" style="margin-top:8px">
+            <div></div>
+            <button class="btn primary">Start chatting →</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-body flex items-center justify-center p-xl">
+        <div class="wiz-card" style="width:100%;border-radius:16px">
+          <div style="font-size:48px;margin-bottom:12px">🎉</div>
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:20px">Fawx is running on this Mac</div>
+          <div class="flex items-center justify-between w-full mb-xl" style="background:var(--bg);border-radius:10px;padding:12px 14px">
+            <span class="text-base" style="color:var(--text)">Start Fawx at login</span>
+            <button class="tog on"></button>
+          </div>
+          <div class="center mb-lg">
+            <div class="qr-box sm"><svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/><rect x="10" y="0" width="2" height="1"/><rect x="14" y="0" width="1" height="1"/><rect x="10" y="3" width="3" height="1"/><rect x="9" y="5" width="2" height="1"/><rect x="13" y="4" width="1" height="3"/></svg></div>
+            <div class="text-base mb-sm" style="color:var(--text)">Scan with your iPhone</div>
+            <div class="mono text-sm text-secondary">joes-mac.tail1234.ts.net:8400</div>
+          </div>
+          <button class="btn primary full">Start chatting</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 4 — Menu Bar Dropdown (macOS only)                   -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s4">
+  <div class="screen-label">Phase 4 · System — Menu Bar (macOS only)</div>
+  <div class="screen-pair">
+    <!-- macOS menu bar mock -->
+    <div style="width:420px">
+      <!-- Simulated menu bar strip -->
+      <div class="menubar">
+        <span style="font-weight:700">  </span>
+        <span>Finder</span>
+        <span>File</span>
+        <span>Edit</span>
+        <span>View</span>
+        <span style="flex:1"></span>
+        <span style="position:relative;cursor:default">🦊<span class="menubar-status" style="background:var(--success)"></span></span>
+        <span style="opacity:0.7">📶</span>
+        <span style="opacity:0.7">🔋</span>
+        <span style="font-size:12px">Sat 9:41 AM</span>
+      </div>
+      <!-- Dropdown from Fawx icon -->
+      <div style="position:relative;margin-left:auto;width:220px;float:right">
+        <div class="menu-drop">
+          <div class="menu-hdr">
+            <span class="status-dot green"></span>
+            <span style="font-size:13px;color:var(--text)">Fawx is running</span>
+          </div>
+          <div class="menu-sep"></div>
+          <div class="menu-item bold">Open Fawx</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item">Restart Server</div>
+          <div class="menu-item">Stop Server</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item">Quit <span class="shortcut">⌘Q</span></div>
+          <div class="menu-item">Stop Server & Quit</div>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+      <!-- Status variants shown below -->
+      <div style="margin-top:32px;display:flex;gap:16px;flex-wrap:wrap">
+        <div style="text-align:center">
+          <div class="menubar" style="width:120px;justify-content:center;border-radius:6px">
+            <span style="position:relative">🦊<span class="menubar-status" style="background:var(--success)"></span></span>
+          </div>
+          <div class="text-sm text-secondary" style="margin-top:6px">Running</div>
+        </div>
+        <div style="text-align:center">
+          <div class="menubar" style="width:120px;justify-content:center;border-radius:6px">
+            <span style="position:relative">🦊<span class="menubar-status" style="background:var(--error)"></span></span>
+          </div>
+          <div class="text-sm text-secondary" style="margin-top:6px">Stopped</div>
+        </div>
+        <div style="text-align:center">
+          <div class="menubar" style="width:120px;justify-content:center;border-radius:6px">
+            <span style="position:relative">🦊<span class="menubar-status" style="background:var(--warning)"></span></span>
+          </div>
+          <div class="text-sm text-secondary" style="margin-top:6px">Starting</div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS placeholder -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-body flex items-center justify-center">
+        <div class="center" style="padding:24px">
+          <div style="font-size:40px;opacity:0.3;margin-bottom:12px">🖥️</div>
+          <div style="font-size:16px;font-weight:600;color:var(--text-secondary)">Menu bar is macOS only</div>
+          <div class="text-sm text-secondary" style="margin-top:8px">The menu bar provides quick server controls from the macOS status area.</div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 5 — Server & LaunchAgent Settings                    -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s5">
+  <div class="screen-label">Phase 4 · System — Server Settings</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav active">🖥️ Server</div>
+          <div class="set-nav">🎨 Appearance</div>
+          <div class="set-nav">🤖 Model</div>
+          <div class="set-nav">📱 iPhone</div>
+          <div class="set-nav">ℹ️ About</div>
+        </div>
+        <div class="set-body">
+          <div class="set-title">Server</div>
+          <!-- Status -->
+          <div class="field">
+            <div class="field-label">Status</div>
+            <div class="flex items-center gap-sm">
+              <span class="status-dot green"></span>
+              <span style="color:var(--success);font-size:14px;font-weight:500">Running</span>
+              <span class="text-sm text-secondary" style="margin-left:8px">Uptime: 14h 23m</span>
+            </div>
+          </div>
+          <!-- Auto-start -->
+          <div class="field">
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="field-label" style="margin-bottom:2px">Start Fawx when you log in</div>
+                <div class="text-sm text-secondary">Launches automatically via LaunchAgent</div>
+              </div>
+              <button class="tog on"></button>
+            </div>
+          </div>
+          <!-- Port -->
+          <div class="field">
+            <div class="field-label">Port</div>
+            <input type="text" class="field-input" value="8400" style="width:120px;background:var(--surface)" />
+          </div>
+          <!-- Actions -->
+          <div class="field">
+            <div class="field-label" style="margin-bottom:8px">Actions</div>
+            <div class="flex gap-sm">
+              <button class="btn secondary">Restart Server</button>
+              <button class="btn secondary">Stop Server</button>
+            </div>
+          </div>
+          <!-- Logs link -->
+          <div><a href="#" style="font-size:13px;color:var(--accent);text-decoration:none">View server logs →</a></div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Settings</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto">
+        <div class="ios-large-title">Server</div>
+        <div class="ios-section-hdr">STATUS</div>
+        <div class="ios-row"><span class="lbl">Status</span><span class="flex items-center gap-sm"><span class="status-dot green"></span><span class="text-success">Running</span></span></div>
+        <div class="ios-row"><span class="lbl">Uptime</span><span class="val">14h 23m</span></div>
+        <div class="ios-row"><span class="lbl">Port</span><span class="val mono">8400</span></div>
+        <div class="ios-section-hdr">PREFERENCES</div>
+        <div class="ios-row"><span class="lbl">Start at login</span><button class="tog on"></button></div>
+        <div class="ios-section-hdr">ACTIONS</div>
+        <div class="ios-row" style="justify-content:center"><span class="text-accent fw-600">Restart Server</span></div>
+        <div class="ios-row" style="justify-content:center"><span class="text-accent fw-600">Stop Server</span></div>
+        <div class="ios-row" style="justify-content:center"><span class="text-accent fw-600">View Logs</span></div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 6 — iPhone Pairing (Settings)                        -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s6">
+  <div class="screen-label">Phase 4 · System — iPhone Pairing</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav">🖥️ Server</div>
+          <div class="set-nav">🎨 Appearance</div>
+          <div class="set-nav">🤖 Model</div>
+          <div class="set-nav active">📱 iPhone</div>
+          <div class="set-nav">ℹ️ About</div>
+        </div>
+        <div class="set-body">
+          <div class="set-title">iPhone Pairing</div>
+          <div class="center mb-xl">
+            <div class="qr-box" style="margin-bottom:16px">
+              <svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/><rect x="10" y="0" width="2" height="1"/><rect x="14" y="0" width="1" height="1"/><rect x="10" y="3" width="3" height="1"/><rect x="9" y="5" width="2" height="1"/><rect x="13" y="4" width="1" height="3"/></svg>
+            </div>
+          </div>
+          <!-- Connection info -->
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
+            <div class="flex items-center justify-between mb-sm"><span class="text-sm text-secondary">Hostname</span><span class="mono text-sm" style="color:var(--text)">joes-mac.tail1234.ts.net</span></div>
+            <div class="flex items-center justify-between mb-sm"><span class="text-sm text-secondary">Port</span><span class="mono text-sm" style="color:var(--text)">8400</span></div>
+            <div class="flex items-center justify-between"><span class="text-sm text-secondary">Transport</span><span class="badge green">Tailscale HTTPS</span></div>
+          </div>
+          <button class="btn secondary">Regenerate QR Code</button>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">iPhone Pairing</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto p-lg">
+        <div class="center mb-xl">
+          <div class="qr-box" style="margin-bottom:16px">
+            <svg viewBox="0 0 29 29" class="qr-svg"><rect x="0" y="0" width="7" height="7"/><rect x="2" y="2" width="3" height="3" fill="#fff"/><rect x="3" y="3" width="1" height="1"/><rect x="22" y="0" width="7" height="7"/><rect x="24" y="2" width="3" height="3" fill="#fff"/><rect x="25" y="3" width="1" height="1"/><rect x="0" y="22" width="7" height="7"/><rect x="2" y="24" width="3" height="3" fill="#fff"/><rect x="3" y="25" width="1" height="1"/></svg>
+          </div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:16px">
+          <div class="ios-row"><span class="lbl text-secondary">Hostname</span><span class="val mono" style="font-size:12px;color:var(--text)">joes-mac.tail1234.ts.net</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">Port</span><span class="val mono" style="color:var(--text)">8400</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">Transport</span><span class="badge green">Tailscale HTTPS</span></div>
+        </div>
+        <button class="btn secondary full">Regenerate QR Code</button>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 7 — Proposal Prompt (Inline)                         -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s7">
+  <div class="screen-label">Phase 5 · Safety — Inline Proposal Prompt</div>
+  <div class="screen-pair">
+    <!-- macOS — inline proposal in chat -->
+    <div class="mac-win" style="width:900px;min-height:640px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Fawx</div><div style="width:52px"></div></div>
+      <div class="mac-body" style="padding:24px;overflow-y:auto">
+        <div style="max-width:660px;margin:0 auto;display:flex;flex-direction:column;gap:16px">
+          <!-- User message -->
+          <div class="msg-user">Update the server config to use the new auth middleware</div>
+          <!-- Agent partial response -->
+          <div class="msg-agent">I'll update the configuration. Let me modify the server setup file to use the new authentication middleware.</div>
+          <!-- Proposal card (elevated tier) -->
+          <div class="prop-card">
+            <div class="tier-strip amber"></div>
+            <div class="prop-body">
+              <div class="flex items-center gap-sm mb-sm">
+                <span class="badge amber">Elevated</span>
+              </div>
+              <div class="prop-action">Fawx wants to write to <code class="mono text-sm" style="background:var(--code-bg);padding:2px 6px;border-radius:3px">src/server/config.ts</code></div>
+              <div class="prop-target">/Users/joe/project/src/server/config.ts</div>
+              <div class="prop-reason">
+                <div class="prop-reason-lbl">Agent's reason</div>
+                <div class="prop-reason-txt">Replacing the old basicAuth middleware with the new JWT-based authMiddleware to enable token-based authentication for API endpoints.</div>
+              </div>
+              <!-- Diff preview (collapsed) -->
+              <div style="margin-bottom:16px">
+                <button class="btn link" style="font-size:12px">▶ Show diff preview</button>
+              </div>
+              <div class="prop-btns">
+                <button class="btn secondary">Deny</button>
+                <button class="btn primary">Approve</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS — bottom sheet -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Chat</div><div style="width:28px"></div></div>
+      <!-- Chat messages (dimmed behind sheet) -->
+      <div style="flex:1;background:var(--bg);padding:12px;opacity:0.4;overflow:hidden">
+        <div style="background:var(--accent-subtle);padding:10px 12px;border-radius:12px 12px 4px 12px;max-width:85%;margin-left:auto;font-size:14px;color:var(--text);margin-bottom:8px">Update the server config</div>
+        <div style="font-size:14px;color:var(--text)">I'll update the configuration...</div>
+      </div>
+      <!-- Bottom sheet -->
+      <div style="background:var(--surface);border-top:1px solid var(--border);border-radius:16px 16px 0 0;padding:16px;flex-shrink:0;position:relative">
+        <div style="width:36px;height:4px;background:var(--text-secondary);opacity:0.3;border-radius:2px;margin:0 auto 14px"></div>
+        <div class="tier-strip amber" style="border-radius:3px;margin-bottom:12px"></div>
+        <div class="flex items-center gap-sm mb-sm"><span class="badge amber">Elevated</span></div>
+        <div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:4px">Write to file</div>
+        <div class="mono text-sm text-secondary mb-md" style="word-break:break-all">src/server/config.ts</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:14px">
+          <div style="font-size:11px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;margin-bottom:3px">Agent's reason</div>
+          <div class="text-sm" style="color:var(--text);line-height:1.4">Replacing basicAuth with JWT-based authMiddleware.</div>
+        </div>
+        <div class="flex gap-sm">
+          <button class="btn secondary" style="flex:1">Deny</button>
+          <button class="btn primary" style="flex:1">Approve</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 8 — Diff Viewer (Sensitive tier)                     -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s8">
+  <div class="screen-label">Phase 5 · Safety — Proposal Diff Viewer</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win" style="width:800px;min-height:560px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Review Changes</div><div style="width:52px"></div></div>
+      <div class="tier-strip red"></div>
+      <div class="mac-body" style="padding:20px;overflow-y:auto">
+        <div class="flex items-center gap-sm mb-md">
+          <span class="badge red">Sensitive</span>
+          <span class="mono text-sm text-secondary">src/auth/credentials.ts</span>
+        </div>
+        <!-- Diff -->
+        <div class="diff mb-lg">
+          <div class="diff-hdr"><span>src/auth/credentials.ts</span><span>+3 −2</span></div>
+          <div class="diff-line"><div class="diff-ln">41</div><div class="diff-code">export function getAuthConfig() {</div></div>
+          <div class="diff-line"><div class="diff-ln">42</div><div class="diff-code">  const config = loadConfig();</div></div>
+          <div class="diff-line del"><div class="diff-ln">43</div><div class="diff-code">−  config.secret = process.env.OLD_SECRET;</div></div>
+          <div class="diff-line del"><div class="diff-ln">44</div><div class="diff-code">−  config.provider = 'basic';</div></div>
+          <div class="diff-line add"><div class="diff-ln">43</div><div class="diff-code">+  config.secret = process.env.JWT_SECRET;</div></div>
+          <div class="diff-line add"><div class="diff-ln">44</div><div class="diff-code">+  config.provider = 'jwt';</div></div>
+          <div class="diff-line add"><div class="diff-ln">45</div><div class="diff-code">+  config.tokenExpiry = '24h';</div></div>
+          <div class="diff-line"><div class="diff-ln">46</div><div class="diff-code">  return config;</div></div>
+          <div class="diff-line"><div class="diff-ln">47</div><div class="diff-code">}</div></div>
+        </div>
+        <!-- Buttons with countdown -->
+        <div class="flex items-center justify-between">
+          <div class="text-sm text-secondary">⌘D deny · ⌘A approve</div>
+          <div class="flex gap-sm">
+            <button class="btn secondary">Deny</button>
+            <button class="btn-countdown">Review for 3s…</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Review Changes</div><div style="width:28px"></div></div>
+      <div class="tier-strip red"></div>
+      <div class="ios-body overflow-auto p-lg">
+        <div class="flex items-center gap-sm mb-md"><span class="badge red">Sensitive</span></div>
+        <div class="mono text-sm text-secondary mb-md">src/auth/credentials.ts</div>
+        <div class="diff mb-lg" style="font-size:11px">
+          <div class="diff-hdr" style="font-size:11px"><span>credentials.ts</span><span>+3 −2</span></div>
+          <div class="diff-line"><div class="diff-ln" style="width:28px;font-size:10px">42</div><div class="diff-code">  const config = loadConfig();</div></div>
+          <div class="diff-line del"><div class="diff-ln" style="width:28px;font-size:10px">43</div><div class="diff-code">−  config.secret = OLD_SECRET;</div></div>
+          <div class="diff-line del"><div class="diff-ln" style="width:28px;font-size:10px">44</div><div class="diff-code">−  config.provider = 'basic';</div></div>
+          <div class="diff-line add"><div class="diff-ln" style="width:28px;font-size:10px">43</div><div class="diff-code">+  config.secret = JWT_SECRET;</div></div>
+          <div class="diff-line add"><div class="diff-ln" style="width:28px;font-size:10px">44</div><div class="diff-code">+  config.provider = 'jwt';</div></div>
+          <div class="diff-line add"><div class="diff-ln" style="width:28px;font-size:10px">45</div><div class="diff-code">+  config.tokenExpiry = '24h';</div></div>
+        </div>
+        <div class="flex gap-sm">
+          <button class="btn secondary" style="flex:1">Deny</button>
+          <button class="btn-countdown" style="flex:1">Review for 3s…</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 9 — Proposal History                                 -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s9">
+  <div class="screen-label">Phase 5 · Safety — Proposal History</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win" style="width:860px;min-height:560px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Proposal History</div><div style="width:52px"></div></div>
+      <div class="mac-body" style="padding:20px;overflow-y:auto">
+        <div class="flex items-center justify-between mb-lg">
+          <div class="set-title" style="margin-bottom:0">Proposal History</div>
+          <div class="flex gap-sm">
+            <span class="pill active">All</span>
+            <span class="pill">Approved</span>
+            <span class="pill">Denied</span>
+          </div>
+        </div>
+        <!-- History rows -->
+        <div class="flex-col gap-sm">
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer">
+            <span class="status-dot green"></span>
+            <div style="flex:1;min-width:0">
+              <div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Write to src/server/config.ts</span><span class="badge amber" style="font-size:10px">Elevated</span></div>
+              <div class="text-sm text-secondary" style="margin-top:2px">Replace auth middleware configuration</div>
+            </div>
+            <div class="flex-col items-center" style="align-items:flex-end;gap:2px">
+              <span class="badge green" style="font-size:10px">✓ Approved</span>
+              <span class="text-sm text-secondary">2m ago</span>
+            </div>
+          </div>
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer">
+            <span class="status-dot green"></span>
+            <div style="flex:1;min-width:0">
+              <div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Execute npm install jsonwebtoken</span><span class="badge green" style="font-size:10px">Standard</span></div>
+              <div class="text-sm text-secondary" style="margin-top:2px">Install JWT dependency</div>
+            </div>
+            <div class="flex-col" style="align-items:flex-end;gap:2px">
+              <span class="badge green" style="font-size:10px">✓ Approved</span>
+              <span class="text-sm text-secondary">5m ago</span>
+            </div>
+          </div>
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer">
+            <span class="status-dot red"></span>
+            <div style="flex:1;min-width:0">
+              <div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Write to .env.production</span><span class="badge red" style="font-size:10px">Sensitive</span></div>
+              <div class="text-sm text-secondary" style="margin-top:2px">Add JWT_SECRET to production env</div>
+            </div>
+            <div class="flex-col" style="align-items:flex-end;gap:2px">
+              <span class="badge red" style="font-size:10px">✗ Denied</span>
+              <span class="text-sm text-secondary">8m ago</span>
+            </div>
+          </div>
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer">
+            <span class="status-dot green"></span>
+            <div style="flex:1;min-width:0">
+              <div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Read package.json</span><span class="badge green" style="font-size:10px">Standard</span></div>
+              <div class="text-sm text-secondary" style="margin-top:2px">Check current dependencies</div>
+            </div>
+            <div class="flex-col" style="align-items:flex-end;gap:2px">
+              <span class="badge green" style="font-size:10px">✓ Approved</span>
+              <span class="text-sm text-secondary">12m ago</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Proposals</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto">
+        <div class="pills" style="padding:12px 16px 0">
+          <span class="pill active">All</span><span class="pill">Approved</span><span class="pill">Denied</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <span class="status-dot green"></span>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Write config.ts</span><span class="badge amber" style="font-size:9px;padding:2px 5px">Elevated</span></div><div class="text-sm text-secondary">2m ago</div></div>
+          <span class="badge green" style="font-size:10px">✓</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <span class="status-dot green"></span>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">npm install</span><span class="badge green" style="font-size:9px;padding:2px 5px">Standard</span></div><div class="text-sm text-secondary">5m ago</div></div>
+          <span class="badge green" style="font-size:10px">✓</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <span class="status-dot red"></span>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Write .env.prod</span><span class="badge red" style="font-size:9px;padding:2px 5px">Sensitive</span></div><div class="text-sm text-secondary">8m ago</div></div>
+          <span class="badge red" style="font-size:10px">✗</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <span class="status-dot green"></span>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:14px;font-weight:500;color:var(--text)">Read package.json</span><span class="badge green" style="font-size:9px;padding:2px 5px">Standard</span></div><div class="text-sm text-secondary">12m ago</div></div>
+          <span class="badge green" style="font-size:10px">✓</span>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 10 — Tool Permissions                                -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s10">
+  <div class="screen-label">Phase 5 · Safety — Tool Permissions</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav">🖥️ Server</div>
+          <div class="set-nav active">🔒 Permissions</div>
+          <div class="set-nav">🤖 Model</div>
+          <div class="set-nav">📱 iPhone</div>
+        </div>
+        <div class="set-body" style="overflow-y:auto">
+          <div class="set-title">Permissions</div>
+          <!-- Preset selector -->
+          <div class="preset-row">
+            <div class="preset-card"><div class="preset-name">🛡️ Safe</div><div class="preset-desc">Conservative defaults for cautious use.</div></div>
+            <div class="preset-card sel"><div class="preset-name">⚡ Power User</div><div class="preset-desc">Fewer confirmations, higher autonomy.</div></div>
+            <div class="preset-card"><div class="preset-name">🔧 Custom</div><div class="preset-desc">Fine-grained control.</div></div>
+          </div>
+          <!-- Tool categories -->
+          <div class="perm-group">
+            <div class="perm-group-title">File Access</div>
+            <div class="perm-row"><span class="perm-label">Read files</span><button class="tog on"></button></div>
+            <div class="perm-row"><span class="perm-label">Write files</span><button class="tog on"></button></div>
+            <div class="perm-row"><span class="perm-label">Delete files</span><button class="tog"></button></div>
+          </div>
+          <div class="perm-group">
+            <div class="perm-group-title">Shell</div>
+            <div class="perm-row"><span class="perm-label">Execute commands</span><button class="tog on"></button></div>
+          </div>
+          <div class="perm-group">
+            <div class="perm-group-title">Network</div>
+            <div class="perm-row"><span class="perm-label">Web requests</span><button class="tog on"></button></div>
+            <div class="perm-row"><span class="perm-label">API calls</span><button class="tog on"></button></div>
+          </div>
+          <div class="perm-group">
+            <div class="perm-group-title">Memory</div>
+            <div class="perm-row"><span class="perm-label">Read memory</span><button class="tog on"></button></div>
+            <div class="perm-row"><span class="perm-label">Write memory</span><button class="tog on"></button></div>
+          </div>
+          <button class="btn link" style="margin-top:8px;font-size:12px">Reset to preset defaults</button>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Permissions</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto">
+        <!-- Preset as segmented -->
+        <div style="padding:12px 16px">
+          <div class="seg" style="width:100%">
+            <button class="seg-btn" style="flex:1">Safe</button>
+            <button class="seg-btn active" style="flex:1">Power</button>
+            <button class="seg-btn" style="flex:1">Custom</button>
+          </div>
+        </div>
+        <div class="ios-section-hdr">FILE ACCESS</div>
+        <div class="ios-row"><span class="lbl">Read files</span><button class="tog on"></button></div>
+        <div class="ios-row"><span class="lbl">Write files</span><button class="tog on"></button></div>
+        <div class="ios-row"><span class="lbl">Delete files</span><button class="tog"></button></div>
+        <div class="ios-section-hdr">SHELL</div>
+        <div class="ios-row"><span class="lbl">Execute commands</span><button class="tog on"></button></div>
+        <div class="ios-section-hdr">NETWORK</div>
+        <div class="ios-row"><span class="lbl">Web requests</span><button class="tog on"></button></div>
+        <div class="ios-row"><span class="lbl">API calls</span><button class="tog on"></button></div>
+        <div class="ios-section-hdr">MEMORY</div>
+        <div class="ios-row"><span class="lbl">Read memory</span><button class="tog on"></button></div>
+        <div class="ios-row"><span class="lbl">Write memory</span><button class="tog on"></button></div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 11 — Skill Marketplace                               -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s11">
+  <div class="screen-label">Phase 5 · Skills — Marketplace Browse</div>
+  <div class="screen-pair">
+    <!-- macOS (3-column grid) -->
+    <div class="mac-win" style="width:960px;min-height:620px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Skill Marketplace</div><div style="width:52px"></div></div>
+      <div class="mac-body" style="padding:20px;overflow-y:auto">
+        <div class="mb-md"><input class="search-input" type="text" placeholder="Search skills..." /></div>
+        <div class="pills mb-lg">
+          <span class="pill active">All</span><span class="pill">Productivity</span><span class="pill">Development</span><span class="pill">Communication</span><span class="pill">Data</span>
+        </div>
+        <div class="skill-grid">
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#3B82F6">W</div><div class="skill-name">Weather</div></div>
+            <div class="skill-desc">Get current weather and forecasts for any location worldwide.</div>
+            <div class="skill-foot"><span class="badge green">Verified</span><span class="badge gray" style="margin-left:4px">Installed</span></div>
+          </div>
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#F59E0B">S</div><div class="skill-name">Brave Search</div></div>
+            <div class="skill-desc">Search the web using Brave's privacy-focused search engine.</div>
+            <div class="skill-foot"><span class="badge green">Verified</span></div>
+          </div>
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#8B5CF6">G</div><div class="skill-name">GitHub</div></div>
+            <div class="skill-desc">Manage repos, create issues, review PRs, and browse code.</div>
+            <div class="skill-foot"><span class="badge green">Verified</span><span class="badge gray" style="margin-left:4px">Installed</span></div>
+          </div>
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#10B981">N</div><div class="skill-name">Notion</div></div>
+            <div class="skill-desc">Read and write pages, databases, and blocks in Notion.</div>
+            <div class="skill-foot"><span class="badge green">Verified</span></div>
+          </div>
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#EC4899">M</div><div class="skill-name">Memory</div></div>
+            <div class="skill-desc">Persistent memory across sessions for user preferences.</div>
+            <div class="skill-foot"><span class="badge blue">Local</span><span class="badge gray" style="margin-left:4px">Installed</span></div>
+          </div>
+          <div class="skill-card">
+            <div class="skill-hdr"><div class="skill-icon" style="background:#6366F1">C</div><div class="skill-name">Calendar</div></div>
+            <div class="skill-desc">View and manage calendar events, create meetings.</div>
+            <div class="skill-foot"><span class="badge green">Verified</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS (list view) -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Marketplace</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto">
+        <div style="padding:8px 16px"><input class="search-input" type="text" placeholder="Search skills..." style="font-size:15px" /></div>
+        <div class="pills" style="padding:4px 16px 8px"><span class="pill active">All</span><span class="pill">Productivity</span><span class="pill">Dev</span><span class="pill">Data</span></div>
+        <div class="ios-row" style="padding:14px 16px;gap:12px">
+          <div class="skill-icon" style="background:#3B82F6;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;flex-shrink:0">W</div>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:15px;font-weight:600;color:var(--text)">Weather</span><span class="badge green" style="font-size:9px;padding:2px 5px">Verified</span></div><div class="text-sm text-secondary">Current weather and forecasts</div></div>
+          <span class="badge gray" style="font-size:10px">Installed</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:12px">
+          <div class="skill-icon" style="background:#F59E0B;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;flex-shrink:0">S</div>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:15px;font-weight:600;color:var(--text)">Brave Search</span><span class="badge green" style="font-size:9px;padding:2px 5px">Verified</span></div><div class="text-sm text-secondary">Privacy-focused web search</div></div>
+          <button class="btn primary" style="padding:6px 14px;font-size:12px">Install</button>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:12px">
+          <div class="skill-icon" style="background:#8B5CF6;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;flex-shrink:0">G</div>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:15px;font-weight:600;color:var(--text)">GitHub</span><span class="badge green" style="font-size:9px;padding:2px 5px">Verified</span></div><div class="text-sm text-secondary">Repos, issues, PRs</div></div>
+          <span class="badge gray" style="font-size:10px">Installed</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:12px">
+          <div class="skill-icon" style="background:#10B981;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;flex-shrink:0">N</div>
+          <div style="flex:1;min-width:0"><div class="flex items-center gap-sm"><span style="font-size:15px;font-weight:600;color:var(--text)">Notion</span><span class="badge green" style="font-size:9px;padding:2px 5px">Verified</span></div><div class="text-sm text-secondary">Pages, databases, blocks</div></div>
+          <button class="btn primary" style="padding:6px 14px;font-size:12px">Install</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 12 — Skill Detail                                    -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s12">
+  <div class="screen-label">Phase 5 · Skills — Skill Detail</div>
+  <div class="screen-pair">
+    <!-- macOS (sheet/panel) -->
+    <div class="mac-win sm" style="width:560px;min-height:520px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Skill Details</div><div style="width:52px"></div></div>
+      <div class="mac-body" style="padding:24px;overflow-y:auto">
+        <div class="flex items-center gap-md mb-lg">
+          <div class="skill-icon" style="background:#3B82F6;width:56px;height:56px;border-radius:14px;font-size:24px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff">W</div>
+          <div>
+            <div style="font-size:18px;font-weight:700;color:var(--text)">Weather</div>
+            <div class="text-sm text-secondary">by Fawx Team · v1.2.0 · Updated Feb 2026</div>
+          </div>
+        </div>
+        <div class="text-base mb-lg" style="color:var(--text);line-height:1.6">Get real-time weather data and multi-day forecasts for any location. Supports temperature, humidity, wind, precipitation, and severe weather alerts. Data sourced from the National Weather Service and wttr.in.</div>
+        <!-- Capabilities -->
+        <div class="mb-lg">
+          <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:10px">Capabilities</div>
+          <div class="cap-list">
+            <div class="cap-row"><span class="cap-icon text-success">✓</span><span style="color:var(--text)">Network access: <span class="mono text-sm">api.weather.gov, wttr.in</span></span></div>
+            <div class="cap-row"><span class="cap-icon text-secondary">—</span><span class="text-secondary">File access: none</span></div>
+            <div class="cap-row"><span class="cap-icon text-secondary">—</span><span class="text-secondary">Shell access: none</span></div>
+          </div>
+        </div>
+        <!-- Trust -->
+        <div class="mb-lg">
+          <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:6px">Trust</div>
+          <div class="flex items-center gap-sm"><span class="badge green">Verified</span><span class="text-sm text-secondary">Signed by Fawx marketplace and reviewed.</span></div>
+        </div>
+        <button class="btn danger full">Remove</button>
+      </div>
+    </div>
+    <!-- iOS (full screen) -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Weather</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto p-lg">
+        <div class="flex items-center gap-md mb-lg">
+          <div class="skill-icon" style="background:#3B82F6;width:56px;height:56px;border-radius:14px;font-size:24px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff">W</div>
+          <div><div style="font-size:18px;font-weight:700;color:var(--text)">Weather</div><div class="text-sm text-secondary">by Fawx Team · v1.2.0</div></div>
+        </div>
+        <div class="text-base mb-lg" style="color:var(--text);line-height:1.6">Get real-time weather data and multi-day forecasts for any location. Supports temperature, humidity, wind, precipitation, and severe weather alerts.</div>
+        <div class="ios-section-hdr" style="padding-left:0">CAPABILITIES</div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:16px">
+          <div class="ios-row"><span class="lbl text-success">✓ Network</span><span class="val mono text-sm">api.weather.gov, wttr.in</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">— File access</span><span class="val">none</span></div>
+          <div class="ios-row"><span class="lbl text-secondary">— Shell access</span><span class="val">none</span></div>
+        </div>
+        <div class="ios-section-hdr" style="padding-left:0">TRUST</div>
+        <div class="flex items-center gap-sm mb-xl"><span class="badge green">Verified</span><span class="text-sm text-secondary">Signed & reviewed.</span></div>
+        <button class="btn danger full">Remove</button>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 13 — Cost Dashboard                                  -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s13">
+  <div class="screen-label">Phase 5 · Settings — Cost Tracking</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav">🖥️ Server</div>
+          <div class="set-nav">🔒 Permissions</div>
+          <div class="set-nav active">💰 Costs</div>
+          <div class="set-nav">📝 Instructions</div>
+        </div>
+        <div class="set-body" style="overflow-y:auto">
+          <div class="flex items-center justify-between mb-lg">
+            <div class="set-title" style="margin-bottom:0">Cost Tracking</div>
+            <div class="seg"><button class="seg-btn">Today</button><button class="seg-btn active">Week</button><button class="seg-btn">Month</button></div>
+          </div>
+          <!-- Session summary -->
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:20px">
+            <div class="text-sm text-secondary mb-sm">Current session</div>
+            <div class="flex items-center gap-md">
+              <div><span style="font-size:24px;font-weight:700;color:var(--text)">$0.42</span></div>
+              <div class="text-sm text-secondary">12,480 tokens</div>
+            </div>
+          </div>
+          <!-- Per-provider -->
+          <div class="mb-lg">
+            <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:12px">By Provider</div>
+            <div class="bar-chart">
+              <div class="bar-row"><div class="bar-label">Claude 3.5<br><span class="text-sm text-secondary">Anthropic</span></div><div class="bar-track"><div class="bar-fill" style="width:72%"></div></div><div class="bar-val">$3.24</div></div>
+              <div class="bar-row"><div class="bar-label">GPT-4o<br><span class="text-sm text-secondary">OpenAI</span></div><div class="bar-track"><div class="bar-fill" style="width:28%;background:var(--success)"></div></div><div class="bar-val">$1.18</div></div>
+            </div>
+          </div>
+          <!-- Total -->
+          <div class="flex items-center justify-between" style="border-top:1px solid var(--border);padding-top:14px;margin-bottom:8px">
+            <span style="font-size:14px;font-weight:600;color:var(--text)">This week total</span>
+            <span style="font-size:18px;font-weight:700;color:var(--text)">$4.42</span>
+          </div>
+          <div class="text-sm text-secondary">Estimated based on published API pricing.</div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Costs</div><div style="width:28px"></div></div>
+      <div class="ios-body overflow-auto">
+        <div style="padding:12px 16px"><div class="seg" style="width:100%"><button class="seg-btn" style="flex:1">Today</button><button class="seg-btn active" style="flex:1">Week</button><button class="seg-btn" style="flex:1">Month</button></div></div>
+        <!-- Session card -->
+        <div style="margin:8px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div class="text-sm text-secondary mb-sm">Current session</div>
+          <div class="flex items-center gap-sm"><span style="font-size:22px;font-weight:700;color:var(--text)">$0.42</span><span class="text-sm text-secondary">· 12,480 tokens</span></div>
+        </div>
+        <div class="ios-section-hdr">BY PROVIDER</div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <div style="width:4px;height:32px;background:var(--accent);border-radius:2px;flex-shrink:0"></div>
+          <div style="flex:1"><div style="font-size:14px;font-weight:500;color:var(--text)">Claude 3.5 Sonnet</div><div class="text-sm text-secondary">Anthropic · 89.2k tokens</div></div>
+          <span style="font-size:15px;font-weight:600;color:var(--text)">$3.24</span>
+        </div>
+        <div class="ios-row" style="padding:14px 16px;gap:10px">
+          <div style="width:4px;height:32px;background:var(--success);border-radius:2px;flex-shrink:0"></div>
+          <div style="flex:1"><div style="font-size:14px;font-weight:500;color:var(--text)">GPT-4o</div><div class="text-sm text-secondary">OpenAI · 34.1k tokens</div></div>
+          <span style="font-size:15px;font-weight:600;color:var(--text)">$1.18</span>
+        </div>
+        <div style="margin:12px 16px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:12px;display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:14px;font-weight:600;color:var(--text)">This week total</span>
+          <span style="font-size:18px;font-weight:700;color:var(--text)">$4.42</span>
+        </div>
+        <div class="text-sm text-secondary" style="padding:4px 16px">Estimated based on published API pricing.</div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 14 — Custom Instructions (Synthesis Editor)          -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s14">
+  <div class="screen-label">Phase 5 · Settings — Custom Instructions</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav">🖥️ Server</div>
+          <div class="set-nav">🔒 Permissions</div>
+          <div class="set-nav">💰 Costs</div>
+          <div class="set-nav active">📝 Instructions</div>
+        </div>
+        <div class="set-body">
+          <div class="set-title">Custom Instructions</div>
+          <div class="text-sm text-secondary mb-lg">These instructions are included in every conversation.</div>
+          <!-- Editor -->
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:8px">
+            <textarea style="width:100%;height:180px;padding:14px;background:transparent;border:none;color:var(--text);font-size:14px;font-family:'SF Mono',Menlo,monospace;line-height:1.6;resize:vertical;outline:none">I prefer concise responses unless I ask for detail.
+When writing code, use TypeScript with strict types.
+Always explain trade-offs before making architectural decisions.
+Use conventional commits for any git operations.</textarea>
+          </div>
+          <div class="flex items-center justify-between mb-lg">
+            <span class="mono text-sm text-secondary">156 characters · ~39 tokens</span>
+          </div>
+          <div class="flex gap-sm">
+            <button class="btn primary">Save</button>
+            <button class="btn secondary">Reset to default</button>
+          </div>
+          <!-- Preview (collapsed) -->
+          <div style="margin-top:20px"><button class="btn link" style="font-size:12px">▶ Preview how this affects the system prompt</button></div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Instructions</div><div style="width:28px"></div></div>
+      <div class="ios-body p-lg">
+        <div class="text-sm text-secondary mb-md">Included in every conversation.</div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:8px">
+          <textarea style="width:100%;height:200px;padding:14px;background:transparent;border:none;color:var(--text);font-size:15px;font-family:'SF Mono',Menlo,monospace;line-height:1.6;resize:none;outline:none">I prefer concise responses.
+Use TypeScript with strict types.
+Explain trade-offs first.</textarea>
+        </div>
+        <div class="mono text-sm text-secondary mb-lg">86 characters · ~22 tokens</div>
+        <div class="flex-col gap-sm">
+          <button class="btn primary full">Save</button>
+          <button class="btn secondary full">Reset to default</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 15 — ChatGPT Login (PKCE OAuth)                      -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s15">
+  <div class="screen-label">Phase 5 · Settings — ChatGPT Login Flow</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win" style="width:640px;min-height:480px">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Add Provider — ChatGPT</div><div style="width:52px"></div></div>
+      <div class="mac-body flex items-center justify-center">
+        <div class="wiz-card" style="width:400px">
+          <!-- Connected state -->
+          <div style="width:56px;height:56px;border-radius:14px;background:var(--surface-hover);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:var(--text);margin:0 auto 16px">O</div>
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:4px">ChatGPT Connected</div>
+          <div class="text-sm text-secondary mb-xl">Signed in as joe@example.com</div>
+          <!-- Model access -->
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:left;margin-bottom:20px;width:100%">
+            <div class="text-sm fw-600 mb-sm" style="color:var(--text)">Available models</div>
+            <div class="flex gap-sm" style="flex-wrap:wrap">
+              <span class="badge gray">GPT-4o</span>
+              <span class="badge gray">GPT-4o mini</span>
+              <span class="badge gray">o1</span>
+              <span class="badge gray">o1-mini</span>
+            </div>
+          </div>
+          <button class="btn danger full">Disconnect</button>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">ChatGPT</div><div style="width:28px"></div></div>
+      <div class="ios-body flex items-center justify-center p-xl">
+        <div class="wiz-card" style="width:100%;border-radius:16px">
+          <div style="width:56px;height:56px;border-radius:14px;background:var(--surface-hover);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:var(--text);margin:0 auto 16px">O</div>
+          <div class="wiz-h1" style="font-size:18px;margin-bottom:4px">Connected</div>
+          <div class="text-sm text-secondary mb-xl">joe@example.com</div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:left;margin-bottom:16px;width:100%">
+            <div class="text-sm fw-600 mb-sm" style="color:var(--text)">Models</div>
+            <div class="flex gap-sm" style="flex-wrap:wrap"><span class="badge gray">GPT-4o</span><span class="badge gray">GPT-4o mini</span><span class="badge gray">o1</span></div>
+          </div>
+          <button class="btn danger full">Disconnect</button>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- SCREEN 16 — Remote Server Pairing                           -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<div class="screen" id="s16">
+  <div class="screen-label">Phase 5 · Settings — Remote Server Pairing</div>
+  <div class="screen-pair">
+    <!-- macOS -->
+    <div class="mac-win sm">
+      <div class="mac-tb"><div class="dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div><div class="mac-title">Settings</div><div style="width:52px"></div></div>
+      <div class="set-layout">
+        <div class="set-side">
+          <div class="set-nav">🔌 Connection</div>
+          <div class="set-nav">🖥️ Server</div>
+          <div class="set-nav active">🌐 Remote</div>
+          <div class="set-nav">🔒 Permissions</div>
+          <div class="set-nav">📝 Instructions</div>
+        </div>
+        <div class="set-body">
+          <div class="set-title">Remote Server</div>
+          <div class="banner info mb-lg"><span class="banner-icon">ℹ️</span><span>This connects to a Fawx server running on a different machine, not your local Mac.</span></div>
+          <!-- Tabs: Pairing Code / Manual -->
+          <div class="seg mb-lg"><button class="seg-btn active">Pairing Code</button><button class="seg-btn">Manual</button></div>
+          <!-- Pairing code view -->
+          <div class="field">
+            <div class="field-label">Enter the 6-character code shown on your server</div>
+            <div class="code-boxes" style="margin:16px 0">
+              <input class="code-box" maxlength="1" value="F" />
+              <input class="code-box" maxlength="1" value="A" />
+              <input class="code-box" maxlength="1" value="W" />
+              <input class="code-box" maxlength="1" value="X" />
+              <input class="code-box" maxlength="1" />
+              <input class="code-box" maxlength="1" />
+            </div>
+          </div>
+          <button class="btn primary" style="margin-bottom:16px">Test Connection</button>
+          <!-- Connection status -->
+          <div class="flex items-center gap-sm">
+            <span class="status-dot yellow"></span>
+            <span class="text-sm text-warning">Testing connection…</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- iOS -->
+    <div class="iphone">
+      <div class="notch"></div>
+      <div class="status-bar"><span>9:41</span><span style="font-size:11px">📶 🔋</span></div>
+      <div class="ios-nav"><div class="ios-nav-back">‹</div><div class="ios-nav-title">Remote Server</div><div style="width:28px"></div></div>
+      <div class="ios-body p-lg">
+        <div class="banner info mb-lg"><span class="banner-icon">ℹ️</span><span class="text-sm">Connects to a Fawx server on a different machine.</span></div>
+        <div style="padding:0 0 12px"><div class="seg" style="width:100%"><button class="seg-btn active" style="flex:1">Pairing Code</button><button class="seg-btn" style="flex:1">Manual</button></div></div>
+        <div class="text-sm text-secondary center mb-md">Enter the code shown on your server</div>
+        <div class="code-boxes mb-xl">
+          <input class="code-box" maxlength="1" value="F" />
+          <input class="code-box" maxlength="1" value="A" />
+          <input class="code-box" maxlength="1" value="W" />
+          <input class="code-box" maxlength="1" value="X" />
+          <input class="code-box" maxlength="1" />
+          <input class="code-box" maxlength="1" />
+        </div>
+        <button class="btn primary full mb-md">Test Connection</button>
+        <div class="flex items-center justify-center gap-sm"><span class="status-dot yellow"></span><span class="text-sm text-warning">Testing…</span></div>
+      </div>
+      <div class="home-ind"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════ -->
+<!-- JavaScript                                                   -->
+<!-- ═════════════════════════════════════════════════════════════ -->
+<script>
+function show(n) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('s' + n).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach((b, i) => {
+    b.classList.toggle('active', i === n);
+  });
+}
+function theme(t) {
+  document.body.classList.toggle('light', t === 'light');
+  document.querySelectorAll('.theme-toggle button').forEach(b => {
+    b.classList.toggle('active', b.textContent.toLowerCase() === t);
+  });
+}
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    const active = document.querySelector('.screen.active');
+    const idx = parseInt(active.id.replace('s', ''));
+    const next = e.key === 'ArrowRight' ? Math.min(idx + 1, 16) : Math.max(idx - 1, 0);
+    show(next);
+  }
+});
+</script>
+</body>
+</html>
