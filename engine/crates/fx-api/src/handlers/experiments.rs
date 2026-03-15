@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::HandlerResult;
 
@@ -127,11 +128,15 @@ pub async fn handle_create_experiment(
         registry.get(&experiment.id).cloned().unwrap_or(experiment)
     };
 
-    // TODO: tokio::spawn background execution with run_improvement_cycle().
-    // Requires exposing SignalStore + CompletionProvider from AppEngine
-    // or creating them independently. For now, the experiment stays in
-    // Running status until manually stopped or the server restarts
-    // (restart recovery transitions it to Failed).
+    // Spawn background execution if provider is available
+    if let Some(provider) = &state.improvement_provider {
+        spawn_experiment_execution(
+            experiment.id.clone(),
+            Arc::clone(&state.experiment_registry),
+            Arc::clone(provider),
+            state.data_dir.clone(),
+        );
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -247,6 +252,73 @@ fn empty_results_response(experiment: &Experiment) -> ExperimentResultsResponse 
         proposals_written: Vec::new(),
         branches_created: Vec::new(),
         skipped: Vec::new(),
+    }
+}
+
+fn spawn_experiment_execution(
+    experiment_id: String,
+    registry: Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
+    provider: Arc<dyn fx_llm::CompletionProvider + Send + Sync>,
+    data_dir: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        tracing::info!(experiment_id = %experiment_id, "Starting experiment execution");
+        let result = run_experiment(provider.as_ref(), &data_dir).await;
+
+        let mut reg = registry.lock().await;
+        match result {
+            Ok(run_result) => {
+                tracing::info!(
+                    experiment_id = %experiment_id,
+                    plans = run_result.plans_generated,
+                    "Experiment completed"
+                );
+                let experiment_result = convert_run_result(run_result);
+                let _ = reg.complete(&experiment_id, experiment_result);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    experiment_id = %experiment_id,
+                    error = %error,
+                    "Experiment failed"
+                );
+                let _ = reg.fail(&experiment_id, error.to_string());
+            }
+        }
+    });
+}
+
+async fn run_experiment(
+    provider: &dyn fx_llm::CompletionProvider,
+    data_dir: &std::path::Path,
+) -> Result<fx_improve::ImprovementRunResult, fx_improve::ImprovementError> {
+    let signal_store = fx_memory::SignalStore::new(data_dir, "experiment")
+        .map_err(|e| fx_improve::ImprovementError::Analysis(e.to_string()))?;
+    let config = fx_improve::ImprovementConfig::default();
+    let paths = fx_improve::CyclePaths {
+        data_dir,
+        repo_root: data_dir,
+        proposals_dir: &data_dir.join("proposals"),
+    };
+    fx_improve::run_improvement_cycle(&signal_store, provider, &config, &paths).await
+}
+
+fn convert_run_result(
+    result: fx_improve::ImprovementRunResult,
+) -> crate::experiment_registry::ExperimentResult {
+    crate::experiment_registry::ExperimentResult {
+        plans_generated: result.plans_generated,
+        proposals_written: result
+            .proposals_written
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        branches_created: result.branches_created,
+        skipped: result
+            .skipped
+            .into_iter()
+            .map(|(name, reason)| crate::experiment_registry::SkippedItem { name, reason })
+            .collect(),
     }
 }
 
@@ -511,6 +583,7 @@ mod tests {
             fleet_manager: None,
             cron_store: None,
             experiment_registry: test_registry(&data_dir),
+            improvement_provider: None,
         };
         (temp_dir, state)
     }

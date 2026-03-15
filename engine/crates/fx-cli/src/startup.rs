@@ -358,8 +358,9 @@ pub struct LoopEngineBundle {
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
     /// Shared callback slot for permission prompts SSE.
-    /// Set per-cycle by HeadlessApp before running the loop.
     pub permission_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    /// LLM provider for experiment/improvement pipelines.
+    pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 }
 
 #[derive(Clone, Default)]
@@ -465,6 +466,7 @@ fn build_loop_engine_with_options(
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let registry_options = build_skill_registry_options(&config, &options);
     let working_dir = registry_options.working_dir.clone();
+    let improvement_provider_for_bundle = improvement_provider.clone();
     let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
     let synthesis = config
         .model
@@ -537,6 +539,7 @@ fn build_loop_engine_with_options(
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
         permission_callback_slot,
+        improvement_provider: improvement_provider_for_bundle,
     })
 }
 

@@ -34,6 +34,7 @@ pub struct HttpState {
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub experiment_registry:
         Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
+    pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 }
 
 #[derive(Clone)]

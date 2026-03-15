@@ -14,6 +14,7 @@ pub async fn run(
     http_config: &HttpConfig,
     telegram: Option<Arc<TelegramChannel>>,
     webhook_channels: Vec<Arc<WebhookChannel>>,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> anyhow::Result<i32> {
     let data_dir = crate::startup::fawx_data_dir();
     let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
@@ -42,6 +43,7 @@ pub async fn run(
             telegram,
             webhook_channels,
             cron_store,
+            improvement_provider,
         },
     )
     .await;

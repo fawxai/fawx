@@ -451,6 +451,7 @@ struct HeadlessStartup {
     webhook_config: fx_config::WebhookConfig,
     #[cfg(feature = "http")]
     data_dir: std::path::PathBuf,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 }
 
 fn build_headless_startup(
@@ -472,6 +473,7 @@ fn build_headless_startup(
     let data_dir = startup::fawx_data_dir();
     let config_manager = Some(build_config_manager(&config));
     let improvement_provider = startup::build_improvement_provider(&auth_manager, &config);
+    let improvement_provider_for_http = improvement_provider.clone();
     let app = build_headless_app(
         router,
         config,
@@ -492,6 +494,7 @@ fn build_headless_startup(
         webhook_config,
         #[cfg(feature = "http")]
         data_dir,
+        improvement_provider: improvement_provider_for_http,
     })
 }
 
@@ -633,6 +636,7 @@ async fn run_http_server(
         telegram_config,
         webhook_config,
         data_dir,
+        improvement_provider,
     } = build_headless_startup(system_prompt, true)?;
     app.initialize();
     app.apply_http_defaults();
@@ -647,7 +651,15 @@ async fn run_http_server(
     let telegram = build_telegram_channel(&telegram_config, auth_store.as_ref());
     let webhooks = build_webhook_channels(&webhook_config);
 
-    http_serve::run(app, port, &http_config, telegram, webhooks).await
+    http_serve::run(
+        app,
+        port,
+        &http_config,
+        telegram,
+        webhooks,
+        improvement_provider,
+    )
+    .await
 }
 
 /// Install a SIGHUP handler that logs and triggers a graceful process restart.

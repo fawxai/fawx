@@ -1343,6 +1343,7 @@ mod routing_and_status {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
+            improvement_provider: None,
         }
     }
 
@@ -1381,6 +1382,7 @@ mod routing_and_status {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
+            improvement_provider: None,
         }
     }
 
@@ -3195,6 +3197,7 @@ thinking = "adaptive"
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
+            improvement_provider: None,
         };
         let app = build_router(state, None);
         let req = Request::builder()

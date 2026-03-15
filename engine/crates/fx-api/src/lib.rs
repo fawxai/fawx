@@ -63,6 +63,7 @@ pub struct RunConfig {
     pub telegram: Option<Arc<TelegramChannel>>,
     pub webhook_channels: Vec<Arc<WebhookChannel>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 }
 
 pub async fn run(
@@ -105,6 +106,7 @@ pub async fn run(
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
         experiment_registry: Arc::new(Mutex::new(experiment_registry)),
+        improvement_provider: config.improvement_provider.clone(),
     };
     let router = build_router(state, fleet_manager);
 
