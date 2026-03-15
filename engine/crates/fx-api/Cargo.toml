@@ -13,6 +13,7 @@ base64 = "0.22"
 futures.workspace = true
 fx-channel-telegram = { path = "../fx-channel-telegram" }
 fx-channel-webhook = { path = "../fx-channel-webhook" }
+fx-auth.workspace = true
 fx-bus.workspace = true
 fx-cron.workspace = true
 fx-config.workspace = true
@@ -24,6 +25,7 @@ fx-session.workspace = true
 fx-storage.workspace = true
 fx-tools.workspace = true
 rand = "0.8"
+reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

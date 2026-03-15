@@ -108,6 +108,56 @@ pub struct ServerRestartResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SetupTokenRequest {
+    pub setup_token: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SetupTokenResponse {
+    pub provider: String,
+    pub status: String,
+    pub auth_method: String,
+    pub model_count: usize,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiKeyRequest {
+    pub api_key: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiKeyResponse {
+    pub provider: String,
+    pub status: String,
+    pub auth_method: String,
+    pub model_count: usize,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DeleteProviderResponse {
+    pub provider: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VerifyRequest {
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VerifyResponse {
+    pub provider: String,
+    pub verified: bool,
+    pub status: String,
+    pub message: String,
+    pub checked_at: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: String,

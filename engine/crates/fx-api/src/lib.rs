@@ -1,3 +1,4 @@
+pub(crate) mod auth_store;
 pub(crate) mod config_redaction;
 pub mod time_util;
 
@@ -43,11 +44,13 @@ use tokio::sync::Mutex;
 
 pub use tailscale::is_tailscale_ip;
 pub use types::{
-    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, ErrorRecordDto,
-    HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto,
-    RecentErrorsResponse, SendToSessionRequest, SendToSessionResponse, ServerRestartResponse,
-    ServerStatusResponse, SetupAuthStatus, SetupStatusResponse, SetupTailscaleStatus,
-    SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
+    ApiKeyRequest, ApiKeyResponse, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike,
+    DeleteProviderResponse, ErrorBody, ErrorRecordDto, HealthResponse, MessageRequest,
+    MessageResponse, ModelInfoDto, ModelSwitchDto, RecentErrorsResponse, SendToSessionRequest,
+    SendToSessionResponse, ServerRestartResponse, ServerStatusResponse, SetupAuthStatus,
+    SetupStatusResponse, SetupTailscaleStatus, SetupTokenRequest, SetupTokenResponse,
+    SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto, VerifyRequest,
+    VerifyResponse,
 };
 
 pub struct RunConfig {

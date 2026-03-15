@@ -68,5 +68,9 @@ pub trait AppEngine: Send + Sync {
 
     fn session_bus(&self) -> Option<&SessionBus>;
 
+    fn reload_auth_state(&mut self) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
     fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto>;
 }

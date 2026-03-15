@@ -5,7 +5,10 @@ use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
 use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
-use crate::handlers::phase4::{handle_server_restart, handle_server_status, handle_setup_status};
+use crate::handlers::phase4::{
+    handle_delete_provider, handle_server_restart, handle_server_status, handle_setup_status,
+    handle_setup_token, handle_store_api_key, handle_verify_provider,
+};
 use crate::handlers::sessions::{
     handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
     handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
