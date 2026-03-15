@@ -337,3 +337,26 @@ pub struct ImagePayload {
     pub data: String,
     pub media_type: String,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QrPairingResponse {
+    pub scheme_url: String,
+    pub display_host: String,
+    pub port: u16,
+    pub transport: String,
+    pub same_network_only: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TailscaleCertRequest {
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TailscaleCertResponse {
+    pub success: bool,
+    pub hostname: String,
+    pub cert_path: String,
+    pub key_path: String,
+    pub https_enabled: bool,
+}
