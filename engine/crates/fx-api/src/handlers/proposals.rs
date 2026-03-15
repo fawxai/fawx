@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::HandlerResult;
 
-/// Risk tier for proposal classification
+/// Risk tier for proposal classification.
+/// Note: "Routine" operations (auto-approved) don't generate proposals,
+/// so there is no Routine variant — only operations requiring approval have tiers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalTier {
@@ -192,6 +194,22 @@ mod tests {
         assert_eq!(json["tier"], "elevated");
         assert_eq!(json["action"], "write_file");
         assert!(json["diff"].is_string());
+    }
+
+    #[test]
+    fn pending_proposal_serializes_without_diff() {
+        let p = PendingProposal {
+            id: "p2".into(),
+            tier: ProposalTier::Standard,
+            action: "execute_command".into(),
+            target: "ls -la".into(),
+            agent_reason: "List files".into(),
+            diff: None,
+            created_at: 1_700_000_000,
+        };
+        let json = serde_json::to_value(p).unwrap();
+        assert_eq!(json["tier"], "standard");
+        assert!(json["diff"].is_null());
     }
 
     #[test]
