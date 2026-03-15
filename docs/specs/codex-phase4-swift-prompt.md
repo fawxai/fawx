@@ -66,11 +66,13 @@
 
 ### Screen 3: Add AI Provider
 - **On appear:** `GET /v1/setup/status` → read `auth.providers_configured` to show existing ✅ badges
-- **Claude setup token flow:**
-  - User picks Claude → "I have a subscription" → show token paste field
-  - Open browser: `https://console.anthropic.com/settings/keys` 
-  - User pastes token → `POST /v1/auth/anthropic/setup-token` with `{ "setup_token": "<pasted>" }`
+- **Claude subscription flow ("Sign in with Anthropic"):**
+  - User picks Claude → "I have a subscription" → show "Sign in with Anthropic" button
+  - Button opens browser: `https://console.anthropic.com/settings/keys`
+  - UI shows: "Generate a setup token in the Anthropic console and paste it below"
+  - User pastes setup token → `POST /v1/auth/anthropic/setup-token` with `{ "setup_token": "<pasted>" }`
   - Show result: authenticated ✅ or error
+  - Note: This is token-based auth presented as a sign-in flow. Real OAuth deferred to Phase 5.
 - **API key flow (Claude or OpenAI):**
   - User picks provider → "I have an API key" → show key paste field
   - User pastes key → `POST /v1/auth/{provider}/api-key` with `{ "api_key": "<pasted>" }`
@@ -99,9 +101,9 @@
 - **Menu items:**
   - "Open Fawx" → `NSApp.activate(ignoringOtherApps: true)`, bring window front
   - "Restart Server" → `POST /v1/server/restart`
-  - "Stop Server" → `POST /v1/server/restart` (with stop semantics — check endpoint)
-  - "Quit" → `NSApp.terminate(nil)` (GUI only, server continues)
-  - "Stop Server & Quit" → stop server + quit
+  - "Stop Server" → `POST /v1/server/stop` (bootout LaunchAgent + SIGTERM — server stays dead until manually started)
+  - "Quit" → `NSApp.terminate(nil)` (GUI only, server continues if LaunchAgent active)
+  - "Stop Server & Quit" → `POST /v1/server/stop` then `NSApp.terminate(nil)`
 
 ### Screen 6: Server Settings (in Settings)
 - **Server status:** `GET /v1/server/status` → show status dot + uptime
@@ -111,7 +113,8 @@
 - **Port field:** read from `GET /v1/server/status` → `port`
   - On change → `PATCH /v1/config` with `{ "changes": { "http": { "port": <new> } } }`
   - If `restart_required` in response → prompt user to restart
-- **Restart/Stop buttons:** `POST /v1/server/restart`
+- **Restart button:** `POST /v1/server/restart`
+- **Stop button:** `POST /v1/server/stop`
 
 ### Screen 7: iPhone Pairing (in Settings)
 - **macOS:** `GET /v1/pair/qr` → display QR code + connection info
@@ -140,9 +143,11 @@ App Launch
 - Menu bar creates `NSStatusItem` in `FawxApp.swift` init
 
 ### iOS-specific:
-- No setup wizard for server — iPhone pairs to an existing Mac
-- Setup flow: "Connect to Fawx" → scan QR code or enter pairing code
-- Settings shows connection status, not server management
+- **Simplified pairing wizard, NOT a server setup wizard.** iPhone doesn't run a server — it pairs to an existing Mac.
+- iOS wizard flow: Welcome → "Connect to Fawx" → scan QR code or enter pairing code → Done
+- No Tailscale step (Mac handles that), no provider step (Mac handles that), no LaunchAgent step
+- Settings shows connection status (connected to X, running/stopped) — view-only, not management
+- Server Settings panel on iOS is read-only status, not restart/stop controls
 
 ---
 
