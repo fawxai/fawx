@@ -1,3 +1,4 @@
+use crate::handlers;
 use crate::handlers::config::{handle_config_get, handle_config_set};
 use crate::handlers::devices::{handle_delete_device, handle_list_devices};
 use crate::handlers::errors::handle_recent_errors;
@@ -54,6 +55,22 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/skills", get(handle_list_skills))
         .route("/auth", get(handle_list_auth))
+        .route(
+            "/auth/anthropic/setup-token",
+            post(handlers::auth::handle_setup_token),
+        )
+        .route(
+            "/auth/{provider}/api-key",
+            post(handlers::auth::handle_store_api_key),
+        )
+        .route(
+            "/auth/{provider}",
+            delete(handlers::auth::handle_delete_provider),
+        )
+        .route(
+            "/auth/{provider}/verify",
+            post(handlers::auth::handle_verify_provider),
+        )
         .route("/setup/status", get(handle_setup_status))
         .route("/server/status", get(handle_server_status))
         .route("/server/restart", post(handle_server_restart))

@@ -15,9 +15,9 @@ use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, ErrorRecordDto,
-    HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
-    StatusResponse, ThinkingLevelDto,
+    ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody,
+    ErrorRecordDto, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto,
+    SetupTokenRequest, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -534,6 +534,22 @@ fn message_request_rejects_missing_message() {
     let json = r#"{}"#;
     let result = serde_json::from_str::<MessageRequest>(json);
     assert!(result.is_err());
+}
+
+#[test]
+fn setup_token_request_deserializes_without_label() {
+    let json = r#"{"setup_token":"token"}"#;
+    let request: SetupTokenRequest = serde_json::from_str(json).expect("valid json");
+
+    assert_eq!(request.setup_token, "token");
+}
+
+#[test]
+fn api_key_request_deserializes_without_label() {
+    let json = r#"{"api_key":"sk-test"}"#;
+    let request: ApiKeyRequest = serde_json::from_str(json).expect("valid json");
+
+    assert_eq!(request.api_key, "sk-test");
 }
 
 #[test]

@@ -5,6 +5,7 @@ use crate::types::ErrorBody;
 
 pub(crate) type HandlerResult<T> = Result<T, (StatusCode, Json<ErrorBody>)>;
 
+pub mod auth;
 pub mod config;
 pub mod cron;
 pub mod devices;
