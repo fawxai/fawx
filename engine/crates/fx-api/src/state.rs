@@ -1,6 +1,7 @@
 use crate::devices::DeviceStore;
 use crate::engine::AppEngine;
 use crate::pairing::PairingState;
+use crate::server_runtime::ServerRuntime;
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
@@ -17,6 +18,7 @@ pub struct HttpState {
     pub app: Arc<Mutex<dyn AppEngine>>,
     pub session_registry: Option<SessionRegistry>,
     pub start_time: Instant,
+    pub server_runtime: ServerRuntime,
     pub tailscale_ip: Option<String>,
     pub bearer_token: String,
     pub pairing: Arc<Mutex<PairingState>>,

@@ -10,6 +10,7 @@ use crate::listener::{
 use crate::middleware::verify_token;
 use crate::pairing::PairingState;
 use crate::router::build_router;
+use crate::server_runtime::ServerRuntime;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
@@ -1265,6 +1266,10 @@ mod routing_and_status {
         test_state_with_config(fx_config::FawxConfig::default(), config_manager, webhooks)
     }
 
+    fn test_server_runtime() -> ServerRuntime {
+        ServerRuntime::local(8400)
+    }
+
     fn test_state_with_app(app: HeadlessApp, webhooks: Vec<Arc<WebhookChannel>>) -> HttpState {
         let data_dir = app
             .config()
@@ -1276,6 +1281,7 @@ mod routing_and_status {
             app: Arc::new(Mutex::new(app)),
             session_registry: None,
             start_time: Instant::now(),
+            server_runtime: test_server_runtime(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
             pairing: Arc::new(Mutex::new(PairingState::new())),
@@ -1304,6 +1310,7 @@ mod routing_and_status {
             ))),
             session_registry: None,
             start_time: Instant::now(),
+            server_runtime: test_server_runtime(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
             pairing: Arc::new(Mutex::new(PairingState::new())),
@@ -2854,6 +2861,7 @@ thinking = "adaptive"
             app: Arc::new(Mutex::new(make_test_app(None))),
             session_registry: None,
             start_time: Instant::now(),
+            server_runtime: test_server_runtime(),
             tailscale_ip: None,
             bearer_token: TEST_TOKEN.to_string(),
             pairing: Arc::new(Mutex::new(PairingState::new())),

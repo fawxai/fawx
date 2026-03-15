@@ -9,6 +9,7 @@ pub(crate) mod listener;
 pub(crate) mod middleware;
 pub(crate) mod pairing;
 pub(crate) mod router;
+pub mod server_runtime;
 pub(crate) mod sse;
 pub(crate) mod state;
 pub mod tailscale;
@@ -27,6 +28,7 @@ use crate::listener::{
 };
 use crate::pairing::PairingState;
 use crate::router::{build_router, load_fleet_manager_if_initialized};
+use crate::server_runtime::ServerRuntime;
 use crate::state::{build_channel_runtime, HttpState};
 use crate::telegram::polling::run_telegram_polling;
 use crate::token::{validate_bearer_token, BearerTokenStore};
@@ -43,8 +45,9 @@ pub use tailscale::is_tailscale_ip;
 pub use types::{
     AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody, ErrorRecordDto,
     HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto,
-    RecentErrorsResponse, SendToSessionRequest, SendToSessionResponse, SkillSummaryDto,
-    StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
+    RecentErrorsResponse, SendToSessionRequest, SendToSessionResponse, ServerRestartResponse,
+    ServerStatusResponse, SetupAuthStatus, SetupStatusResponse, SetupTailscaleStatus,
+    SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
 };
 
 pub struct RunConfig {
@@ -71,10 +74,12 @@ pub async fn run(
     let session_registry = init_session_registry(&config.data_dir);
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
+    let server_runtime = ServerRuntime::local(config.port);
     let state = HttpState {
         app: Arc::clone(&shared_app),
         session_registry,
         start_time: Instant::now(),
+        server_runtime,
         tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
         pairing: Arc::new(Mutex::new(PairingState::new())),
