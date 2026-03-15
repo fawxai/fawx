@@ -89,6 +89,23 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/usage", get(handlers::usage::handle_usage))
         .route(
+            "/experiments",
+            get(handlers::experiments::handle_list_experiments)
+                .post(handlers::experiments::handle_create_experiment),
+        )
+        .route(
+            "/experiments/{id}",
+            get(handlers::experiments::handle_get_experiment),
+        )
+        .route(
+            "/experiments/{id}/results",
+            get(handlers::experiments::handle_get_experiment_results),
+        )
+        .route(
+            "/experiments/{id}/stop",
+            post(handlers::experiments::handle_stop_experiment),
+        )
+        .route(
             "/permissions",
             get(handlers::permissions::handle_get_permissions)
                 .patch(handlers::permissions::handle_patch_permissions),

@@ -10,6 +10,7 @@ pub mod config;
 pub mod cron;
 pub mod devices;
 pub mod errors;
+pub mod experiments;
 pub mod fleet;
 pub mod fleet_dashboard;
 pub mod health;
