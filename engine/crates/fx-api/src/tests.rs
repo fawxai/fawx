@@ -1336,6 +1336,7 @@ mod routing_and_status {
             synthesis: synthesis_state(has_synthesis),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            fleet_manager: None,
             cron_store: None,
         }
     }
@@ -1369,6 +1370,7 @@ mod routing_and_status {
             synthesis: synthesis_state(has_synthesis),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            fleet_manager: None,
             cron_store: None,
         }
     }
@@ -3178,6 +3180,7 @@ thinking = "adaptive"
             synthesis: synthesis_state(false),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            fleet_manager: None,
             cron_store: None,
         };
         let app = build_router(state, None);

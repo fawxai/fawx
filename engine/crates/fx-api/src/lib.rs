@@ -77,6 +77,7 @@ pub async fn run(
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(config.telegram.clone(), config.webhook_channels);
     let session_registry = init_session_registry(&config.data_dir);
+    let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
     let server_runtime = ServerRuntime::local(config.port);
@@ -98,9 +99,9 @@ pub async fn run(
         )),
         oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
         permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+        fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
     };
-    let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let router = build_router(state, fleet_manager);
 
     print_startup_targets(&listeners);

@@ -125,7 +125,7 @@ pub fn current_time_ms() -> u64 {
 }
 
 /// Default stale threshold: 60 seconds in milliseconds.
-const DEFAULT_STALE_THRESHOLD_MS: u64 = 60_000;
+pub const DEFAULT_STALE_THRESHOLD_MS: u64 = 60_000;
 
 /// Registry of known Fawx nodes.
 pub struct NodeRegistry {

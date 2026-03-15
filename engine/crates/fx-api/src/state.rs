@@ -5,6 +5,7 @@ use crate::server_runtime::ServerRuntime;
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
+use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
 use fx_session::SessionRegistry;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ pub struct HttpState {
     pub synthesis: Arc<crate::handlers::synthesis::SynthesisState>,
     pub oauth_flows: Arc<crate::handlers::oauth::OAuthFlowStore>,
     pub permission_prompts: Arc<fx_kernel::PermissionPromptState>,
+    pub fleet_manager: Option<Arc<Mutex<FleetManager>>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
 }
 

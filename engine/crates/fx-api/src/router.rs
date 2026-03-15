@@ -152,6 +152,23 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/launchagent/reload",
             post(handlers::launchagent::handle_launchagent_reload),
         )
+        .route(
+            "/fleet/overview",
+            get(handlers::fleet_dashboard::handle_fleet_overview),
+        )
+        .route(
+            "/fleet/nodes",
+            get(handlers::fleet_dashboard::handle_fleet_nodes),
+        )
+        .route(
+            "/fleet/nodes/{id}",
+            get(handlers::fleet_dashboard::handle_fleet_node_detail)
+                .delete(handlers::fleet_dashboard::handle_remove_fleet_node),
+        )
+        .route(
+            "/fleet/nodes/{id}/tasks",
+            post(handlers::fleet_dashboard::handle_dispatch_task),
+        )
         .route("/devices", get(handle_list_devices))
         .route("/errors/recent", get(handle_recent_errors))
         .route("/devices/{id}", delete(handle_delete_device))

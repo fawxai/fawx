@@ -776,6 +776,7 @@ mod tests {
             synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            fleet_manager: None,
             cron_store: None,
         };
 
