@@ -52,6 +52,7 @@ pub mod rollback;
 pub mod signals;
 pub mod streaming;
 pub mod types;
+pub mod user_facing_error;
 pub mod verify;
 pub mod watchdog;
 
