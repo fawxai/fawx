@@ -70,3 +70,11 @@ tmp/
 # Local Gradle wrapper cache used by sandboxed test runs
 .gradle-local/
 .openclaw-worktrees/
+
+# Swift app local build artifacts
+app/.artifacts/
+app/.build/
+app/.derived/
+app/.derived-ios/
+app/.derived-macos/
+app/.swiftpm/
