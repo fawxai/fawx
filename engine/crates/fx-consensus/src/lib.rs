@@ -15,6 +15,7 @@ pub mod subagent_source;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_fixtures;
 pub mod tournament;
+pub mod training;
 pub mod types;
 
 pub use cargo_workspace::CargoWorkspace;
