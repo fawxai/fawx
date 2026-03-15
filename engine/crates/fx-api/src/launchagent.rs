@@ -1,8 +1,9 @@
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+#[cfg(target_os = "macos")]
+use std::{fs, process::Command};
 
 const LABEL: &str = "ai.fawx.server";
 
