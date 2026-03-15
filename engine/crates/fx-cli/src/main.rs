@@ -123,6 +123,12 @@ enum Commands {
         force: bool,
     },
 
+    /// Manage Tailscale integration
+    Tailscale {
+        #[command(subcommand)]
+        command: TailscaleCommands,
+    },
+
     /// Manage authentication credentials
     Auth {
         #[command(subcommand)]
@@ -310,6 +316,16 @@ enum SkillCommands {
         /// Directory to create the project in
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TailscaleCommands {
+    /// Generate a TLS certificate for HTTPS
+    Cert {
+        /// Tailscale DNS name to request a certificate for
+        #[arg(long)]
+        hostname: Option<String>,
     },
 }
 
@@ -847,6 +863,16 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     }
 }
 
+fn dispatch_tailscale(command: TailscaleCommands) -> anyhow::Result<i32> {
+    match command {
+        TailscaleCommands::Cert { hostname } => {
+            let layout = commands::runtime_layout::RuntimeLayout::detect()?;
+            commands::tailscale::run_cert(hostname, &layout.data_dir)?;
+            Ok(0)
+        }
+    }
+}
+
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
         Commands::Tui { args } => launch_fawx_tui(&args),
@@ -882,6 +908,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Backup(args) => commands::backup::run(&args),
         Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
+        Commands::Tailscale { command } => dispatch_tailscale(command),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
         Commands::Config { command } => {
             commands::config::run(command).await?;

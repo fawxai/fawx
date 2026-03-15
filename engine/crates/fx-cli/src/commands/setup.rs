@@ -741,33 +741,14 @@ fn run_tailscale_cert(wizard: &SetupWizard, hostname: &str) {
     }
 
     println!("  Running tailscale cert...");
-    let (cert_path, key_path) = tailscale_cert_paths(&wizard.data_dir);
-    if let Some(cert_dir) = cert_path.parent() {
-        fs::create_dir_all(cert_dir).ok();
-    }
-
-    let cert_result = std::process::Command::new("tailscale")
-        .arg("cert")
-        .arg("--cert-file")
-        .arg(&cert_path)
-        .arg("--key-file")
-        .arg(&key_path)
-        .arg("--")
-        .arg(hostname)
-        .output();
-    match cert_result {
-        Ok(output) if output.status.success() => {
+    match super::tailscale::generate_cert_files(hostname, &wizard.data_dir) {
+        Ok((cert_path, _)) => {
             println!("  ✅ HTTPS certificate ready at {}", cert_path.display());
         }
-        _ => {
+        Err(_) => {
             println!("  ⚠ Could not generate certificate. You can set this up later.");
         }
     }
-}
-
-fn tailscale_cert_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
-    let tls_dir = data_dir.join("tls");
-    (tls_dir.join("cert.pem"), tls_dir.join("key.pem"))
 }
 
 fn launchagent_answer_from_prompt<E>(result: Result<String, E>) -> String {
@@ -1902,7 +1883,7 @@ mod tests {
     #[test]
     fn tailscale_cert_paths_use_tls_directory() {
         let data_dir = Path::new("/tmp/fawx");
-        let (cert_path, key_path) = tailscale_cert_paths(data_dir);
+        let (cert_path, key_path) = super::tailscale::cert_paths(data_dir);
 
         assert_eq!(cert_path, data_dir.join("tls").join("cert.pem"));
         assert_eq!(key_path, data_dir.join("tls").join("key.pem"));

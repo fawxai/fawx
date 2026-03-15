@@ -61,6 +61,8 @@ pub(crate) mod start_stop;
 #[allow(dead_code)]
 pub mod status;
 #[allow(dead_code)]
+pub mod tailscale;
+#[allow(dead_code)]
 pub mod update;
 #[allow(dead_code)]
 pub mod version;
