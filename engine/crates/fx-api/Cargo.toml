@@ -23,6 +23,7 @@ fx-llm.workspace = true
 fx-session.workspace = true
 fx-storage.workspace = true
 fx-tools.workspace = true
+libc = "0.2"
 rand = "0.8"
 ring.workspace = true
 serde.workspace = true
