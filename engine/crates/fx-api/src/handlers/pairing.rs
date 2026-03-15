@@ -1,6 +1,6 @@
 use crate::pairing::{PairingCode, PairingError, PairingState};
 use crate::state::HttpState;
-use crate::types::ErrorBody;
+use crate::types::{ErrorBody, QrPairingResponse, TailscaleCertRequest, TailscaleCertResponse};
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,81 @@ pub async fn handle_exchange_pair(
     Ok(Json(ExchangePairResponse { token, device_id }))
 }
 
+pub async fn handle_qr_pairing(State(state): State<HttpState>) -> Json<QrPairingResponse> {
+    let runtime = &state.server_runtime;
+    let host = runtime.host.clone();
+    let port = runtime.port;
+    let transport = if runtime.https_enabled {
+        "tailscale_https"
+    } else {
+        "lan_http"
+    };
+    let scheme_url = format!("fawx://connect?host={host}&port={port}&token=REDACTED");
+    Json(QrPairingResponse {
+        scheme_url,
+        display_host: host,
+        port,
+        transport: transport.to_string(),
+        same_network_only: !runtime.https_enabled,
+    })
+}
+
+pub async fn handle_tailscale_cert(
+    Json(request): Json<TailscaleCertRequest>,
+) -> HandlerResult<Json<TailscaleCertResponse>> {
+    let hostname = request.hostname;
+    let result = tokio::task::spawn_blocking({
+        let hostname = hostname.clone();
+        move || run_tailscale_cert(&hostname)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody { error: e }),
+        )
+    })?;
+    Ok(Json(result))
+}
+
+fn run_tailscale_cert(hostname: &str) -> Result<TailscaleCertResponse, String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cert_dir = format!("{home}/.fawx/tls");
+    std::fs::create_dir_all(&cert_dir).map_err(|e| format!("failed to create TLS dir: {e}"))?;
+    let cert_path = format!("{cert_dir}/cert.pem");
+    let key_path = format!("{cert_dir}/key.pem");
+    let output = std::process::Command::new("tailscale")
+        .args([
+            "cert",
+            "--cert-file",
+            &cert_path,
+            "--key-file",
+            &key_path,
+            hostname,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run tailscale cert: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("tailscale cert failed: {stderr}"));
+    }
+    Ok(TailscaleCertResponse {
+        success: true,
+        hostname: hostname.to_string(),
+        cert_path,
+        key_path,
+        https_enabled: true,
+    })
+}
+
 async fn exchange_pairing_code(state: &HttpState, code: &str) -> HandlerResult<()> {
     let mut pairing = state.pairing.lock().await;
     pairing.exchange(code).map_err(pairing_error_response)
@@ -108,4 +183,36 @@ fn error_response(status: StatusCode, error: &str) -> (StatusCode, Json<ErrorBod
             error: error.to_string(),
         }),
     )
+}
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+
+    #[test]
+    fn qr_response_serializes() {
+        let r = QrPairingResponse {
+            scheme_url: "fawx://connect?host=test&port=8400&token=REDACTED".into(),
+            display_host: "test.ts.net".into(),
+            port: 8400,
+            transport: "tailscale_https".into(),
+            same_network_only: false,
+        };
+        let json = serde_json::to_value(r).unwrap();
+        assert_eq!(json["transport"], "tailscale_https");
+        assert_eq!(json["same_network_only"], false);
+    }
+
+    #[test]
+    fn cert_response_serializes() {
+        let r = TailscaleCertResponse {
+            success: true,
+            hostname: "test.ts.net".into(),
+            cert_path: "/tmp/cert.pem".into(),
+            key_path: "/tmp/key.pem".into(),
+            https_enabled: true,
+        };
+        let json = serde_json::to_value(r).unwrap();
+        assert_eq!(json["success"], true);
+    }
 }

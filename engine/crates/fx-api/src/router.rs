@@ -78,6 +78,11 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/errors/recent", get(handle_recent_errors))
         .route("/devices/{id}", delete(handle_delete_device))
         .route("/pair/generate", post(handle_generate_pair))
+        .route("/pair/qr", get(handlers::pairing::handle_qr_pairing))
+        .route(
+            "/tailscale/cert",
+            post(handlers::pairing::handle_tailscale_cert),
+        )
         .route(
             "/cron/jobs",
             get(crate::handlers::cron::handle_list_jobs)
