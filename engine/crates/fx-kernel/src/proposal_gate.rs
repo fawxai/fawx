@@ -1,10 +1,10 @@
-//! Kernel-level write enforcement via the proposal gate.
+//! Kernel-level tool enforcement via the proposal gate.
 //!
-//! `ProposalGateExecutor` wraps any `ToolExecutor` and intercepts write
-//! operations, classifying target paths against the self-modification policy
-//! and compiled Tier 3 invariants. Writes to immutable paths are blocked;
-//! writes to propose-tier paths create proposals instead of executing; writes
-//! to allow-tier paths pass through.
+//! `ProposalGateExecutor` wraps any `ToolExecutor` and intercepts read and
+//! write operations against compiled kernel invariants. Reads from blind paths
+//! are blocked; writes to immutable paths are blocked; writes to propose-tier
+//! paths create proposals instead of executing; writes to allow-tier paths pass
+//! through.
 
 use crate::act::{
     ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
@@ -32,6 +32,17 @@ const TIER3_PATHS: &[&str] = &[
     "tests/invariant/",
     "prompt-ledger/",
     "snapshots/",
+];
+
+/// Kernel-blind paths — blocked for agent read access.
+/// These are compiled invariants and cannot be overridden.
+const KERNEL_BLIND_PATHS: &[&str] = &[
+    "engine/crates/fx-kernel/",
+    "engine/crates/fx-auth/",
+    "engine/crates/fx-security/",
+    "engine/crates/fx-consensus/",
+    "fawx-ripcord/",
+    "tests/invariant/",
 ];
 
 /// An approved proposal that allows writes to specific paths.
@@ -121,6 +132,13 @@ pub fn is_tier3_path(relative_path: &str) -> bool {
         .any(|prefix| normalized.starts_with(prefix))
 }
 
+pub fn is_kernel_blind_path(relative_path: &str) -> bool {
+    let normalized = normalize_relative(relative_path);
+    KERNEL_BLIND_PATHS
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
 fn normalize_relative(path: &str) -> String {
     let unified = path.replace('\\', "/");
     // Strip leading ./ prefix
@@ -141,7 +159,7 @@ fn normalize_relative(path: &str) -> String {
     parts.join("/")
 }
 
-fn extract_write_path(call: &ToolCall) -> Option<String> {
+fn extract_path_argument(call: &ToolCall) -> Option<String> {
     call.arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
@@ -154,6 +172,15 @@ fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: format!("BLOCKED: write to '{path}' denied. {reason}"),
+    }
+}
+
+fn blind_read_result(call: &ToolCall) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success: false,
+        output: "This file is not available.".to_string(),
     }
 }
 
@@ -301,11 +328,40 @@ fn classify_and_gate(
     proposals_dir: &Path,
     active: &Option<ActiveProposal>,
 ) -> GateDecision {
+    if let Some(decision) = classify_read_call(call) {
+        return decision;
+    }
+    classify_write_call(call, config, working_dir, proposals_dir, active)
+}
+
+fn classify_read_call(call: &ToolCall) -> Option<GateDecision> {
+    if call.name != "read_file" {
+        return None;
+    }
+
+    let Some(path) = extract_path_argument(call) else {
+        return Some(GateDecision::PassThrough);
+    };
+
+    if is_kernel_blind_path(&path) {
+        return Some(GateDecision::Block(blind_read_result(call)));
+    }
+
+    Some(GateDecision::PassThrough)
+}
+
+fn classify_write_call(
+    call: &ToolCall,
+    config: &SelfModifyConfig,
+    working_dir: &Path,
+    proposals_dir: &Path,
+    active: &Option<ActiveProposal>,
+) -> GateDecision {
     if !is_write_tool(&call.name) {
         return GateDecision::PassThrough;
     }
 
-    let Some(path) = extract_write_path(call) else {
+    let Some(path) = extract_path_argument(call) else {
         return GateDecision::PassThrough;
     };
 
@@ -793,39 +849,212 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 5: Read-only tools always pass through
+    fn assert_blind_read_denied(result: &ToolResult, tool_call_id: &str) {
+        assert_eq!(result.tool_call_id, tool_call_id);
+        assert_eq!(result.tool_name, "read_file");
+        assert!(!result.success);
+        assert!(result.output.contains("This file is not available."));
+    }
+
     #[tokio::test]
-    async fn read_only_tools_always_pass_through() {
+    async fn kernel_blind_paths_block_read_file_on_proposal_gate_source() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call(
+                    "1",
+                    "engine/crates/fx-kernel/src/proposal_gate.rs",
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_on_auth_keys() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "engine/crates/fx-auth/src/crypto/keys.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_on_security_layer() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "engine/crates/fx-security/src/audit/mod.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_on_consensus_layer() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "engine/crates/fx-consensus/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_on_ripcord_shell() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[read_call("1", "fawx-ripcord/src/main.rs")], None)
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_on_invariant_tests() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[read_call("1", "tests/invariant/tier3_test.rs")], None)
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_with_dot_slash_prefix() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "./engine/crates/fx-kernel/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_with_backslash_separators() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "engine\\crates\\fx-kernel\\src\\lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_block_read_file_path_traversal() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "../../engine/crates/fx-kernel/foo.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_blind_read_denied(&results[0], "1");
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_allow_read_file_on_loadable_layer() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[read_call("1", "engine/crates/fx-loadable/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert_eq!(results[0].output, "executed:read_file");
+        assert_eq!(probe.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn kernel_blind_paths_allow_read_file_on_docs() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[read_call("1", "docs/specs/kernel-blindness.md")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert_eq!(results[0].output, "executed:read_file");
+        assert_eq!(probe.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_read_tools_still_pass_through() {
         let (executor, probe) = make_executor(enabled_config());
 
         let read_tools = vec![
             ToolCall {
                 id: "1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "engine/crates/fx-kernel/src/lib.rs"}),
-            },
-            ToolCall {
-                id: "2".to_string(),
                 name: "list_directory".to_string(),
                 arguments: serde_json::json!({"path": ".github/"}),
             },
             ToolCall {
-                id: "3".to_string(),
+                id: "2".to_string(),
                 name: "search_text".to_string(),
                 arguments: serde_json::json!({"query": "test", "path": "src/"}),
             },
             ToolCall {
-                id: "4".to_string(),
+                id: "3".to_string(),
                 name: "memory_read".to_string(),
                 arguments: serde_json::json!({"key": "notes"}),
             },
             ToolCall {
-                id: "5".to_string(),
+                id: "4".to_string(),
                 name: "memory_list".to_string(),
                 arguments: serde_json::json!({}),
             },
             ToolCall {
-                id: "6".to_string(),
+                id: "5".to_string(),
                 name: "current_time".to_string(),
                 arguments: serde_json::json!({}),
             },
@@ -833,11 +1062,11 @@ mod tests {
 
         let results = executor.execute_tools(&read_tools, None).await.unwrap();
 
-        assert_eq!(results.len(), 6);
+        assert_eq!(results.len(), 5);
         for result in &results {
             assert!(result.success);
         }
-        assert_eq!(probe.call_count(), 6);
+        assert_eq!(probe.call_count(), 5);
     }
 
     // Test 6: git_checkpoint gated by tier
