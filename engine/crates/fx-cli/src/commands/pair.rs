@@ -1,6 +1,4 @@
-use super::api_client::{
-    api_error_message, bearer_token, http_client, request_error,
-};
+use super::api_client::{api_error_message, bearer_token, http_client, request_error};
 use super::runtime_layout::RuntimeLayout;
 use anyhow::Context;
 use clap::Args;
@@ -252,6 +250,7 @@ fn format_countdown(total_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::api_client::server_not_running_message;
     use axum::{
         extract::State,
         http::{header, HeaderMap, StatusCode},
