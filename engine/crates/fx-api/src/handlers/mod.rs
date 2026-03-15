@@ -13,6 +13,7 @@ pub mod errors;
 pub mod experiments;
 pub mod fleet;
 pub mod fleet_dashboard;
+pub mod git;
 pub mod health;
 pub mod launchagent;
 pub mod marketplace;
