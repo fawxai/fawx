@@ -18,6 +18,7 @@ Fawx cannot read, inspect, or reverse-engineer its own kernel source code or bin
 
 ### In scope
 - Kernel source path deny list (compiled const, read enforcement)
+- Compile-time feature flag (`kernel-blind`) for toggling enforcement
 - Tool-level read filtering (`read_file`, `search_text`, `list_directory`, shell commands, git commands)
 - Reverse engineering tool deny list (best-effort shell filtering)
 - Error message sanitization (strip internal structure from agent-facing errors)
@@ -27,6 +28,31 @@ Fawx cannot read, inspect, or reverse-engineer its own kernel source code or bin
 - WASM capability restrictions (separate spec: `wasm-security-hardening.md`)
 - Proposal gate UX hardening (separate spec: `proposal-gate-hardening.md`)
 - Behavioral telemetry (separate spec: `behavioral-telemetry.md`)
+
+### 2.1 Feature Flag: `kernel-blind`
+
+Enforcement is gated behind a **compile-time feature flag**, not a runtime config or environment variable.
+
+```toml
+# engine/crates/fx-kernel/Cargo.toml
+[features]
+kernel-blind = []  # enabled in release/distribution builds only
+```
+
+```rust
+// proposal_gate.rs
+fn is_kernel_blind_enforced() -> bool {
+    cfg!(feature = "kernel-blind")
+}
+```
+
+**Dev builds** (`cargo build`): blindness off. Developers and the experiment pipeline can read kernel source normally.
+
+**Release/distribution builds** (`cargo build --release --features kernel-blind`): blindness on. Hardcoded, no runtime toggle, no config, no env var override.
+
+**CI enforcement**: the release build profile and distribution scripts always include `--features kernel-blind`. CI tests run both with and without the feature to ensure both paths work.
+
+The enforcement code is always compiled and tested regardless of the feature flag — the flag only gates whether `classify_read_call()` actively denies reads. This ensures no untested code ships.
 
 ---
 
