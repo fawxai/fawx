@@ -642,73 +642,42 @@ impl SetupWizard {
 
     fn run_tailscale_phase(&self) {
         println!("\n── Tailscale ──\n");
-        match std::process::Command::new("which")
-            .arg("tailscale")
+        match std::process::Command::new("tailscale")
+            .args(["status", "--json"])
             .output()
         {
-            Ok(output) if output.status.success() => {
-                match std::process::Command::new("tailscale")
-                    .args(["status", "--json"])
-                    .output()
-                {
-                    Ok(status_output) if status_output.status.success() => {
-                        let json: serde_json::Value =
-                            serde_json::from_slice(&status_output.stdout).unwrap_or_default();
-                        let backend = json
-                            .get("BackendState")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown");
-                        if backend == "Running" {
-                            println!("  ✅ Tailscale is running");
-                            println!("  Running tailscale cert...");
-                            let hostname = json
-                                .pointer("/Self/DNSName")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim_end_matches('.');
-                            if !hostname.is_empty() {
-                                let cert_result = std::process::Command::new("tailscale")
-                                    .args(["cert", "--", hostname])
-                                    .output();
-                                match cert_result {
-                                    Ok(out) if out.status.success() => {
-                                        println!("  ✅ HTTPS certificate ready for {hostname}");
-                                    }
-                                    _ => {
-                                        println!(
-                                            "  ⚠ Could not generate certificate. You can set this up later."
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            println!("  Tailscale is installed but not logged in.");
-                            println!("  Run 'tailscale login' to enable secure remote access.");
-                        }
-                    }
-                    _ => {
-                        println!("  Tailscale is installed but status unavailable.");
-                    }
-                }
-            }
-            _ => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 println!("  Tailscale not found.");
                 println!("  Install from https://tailscale.com/download for secure remote access.");
                 println!("  (Optional — Fawx works without it for local use.)");
             }
+            Err(_) => {
+                println!("  Tailscale is installed but status unavailable.");
+            }
+            Ok(output) if !output.status.success() => {
+                println!("  Tailscale is installed but not responding.");
+            }
+            Ok(output) => report_tailscale_status(self, &output.stdout),
         }
     }
 
     #[cfg(all(target_os = "macos", feature = "http"))]
     fn run_launchagent_phase(&self) {
         println!("\n── Auto-Start ──\n");
-        let answer =
-            prompt_line("  Start Fawx automatically when you log in? [Y/n] ").unwrap_or_default();
-        let should_install =
-            answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y');
-        if should_install {
+        let answer = launchagent_answer_from_prompt(prompt_line(
+            "  Start Fawx automatically when you log in? [Y/n] ",
+        ));
+        if should_install_launchagent(&answer) {
+            let binary_path = match std::env::current_exe() {
+                Ok(path) => path,
+                Err(e) => {
+                    println!("  ⚠ Could not determine binary path: {e}");
+                    println!("  Skipping LaunchAgent install.");
+                    return;
+                }
+            };
             let config = fx_api::launchagent::LaunchAgentConfig {
-                server_binary_path: std::env::current_exe().unwrap_or_default(),
+                server_binary_path: binary_path,
                 port: if self.http.enabled {
                     self.http.port
                 } else {
@@ -738,6 +707,75 @@ impl SetupWizard {
     fn run_launchagent_phase(&self) {
         // LaunchAgent is macOS-only; skip silently on other platforms
     }
+}
+
+fn report_tailscale_status(wizard: &SetupWizard, status_stdout: &[u8]) {
+    let json: serde_json::Value = match serde_json::from_slice(status_stdout) {
+        Ok(json) => json,
+        Err(_) => {
+            println!("  Tailscale is installed but status unreadable.");
+            return;
+        }
+    };
+    let backend = json
+        .get("BackendState")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Unknown");
+    if backend == "Running" {
+        println!("  ✅ Tailscale is running");
+        let hostname = json
+            .pointer("/Self/DNSName")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim_end_matches('.');
+        run_tailscale_cert(wizard, hostname);
+    } else {
+        println!("  Tailscale is installed but not logged in.");
+        println!("  Run 'tailscale login' to enable secure remote access.");
+    }
+}
+
+fn run_tailscale_cert(wizard: &SetupWizard, hostname: &str) {
+    if hostname.is_empty() {
+        return;
+    }
+
+    println!("  Running tailscale cert...");
+    let (cert_path, key_path) = tailscale_cert_paths(&wizard.data_dir);
+    if let Some(cert_dir) = cert_path.parent() {
+        fs::create_dir_all(cert_dir).ok();
+    }
+
+    let cert_result = std::process::Command::new("tailscale")
+        .arg("cert")
+        .arg("--cert-file")
+        .arg(&cert_path)
+        .arg("--key-file")
+        .arg(&key_path)
+        .arg("--")
+        .arg(hostname)
+        .output();
+    match cert_result {
+        Ok(output) if output.status.success() => {
+            println!("  ✅ HTTPS certificate ready at {}", cert_path.display());
+        }
+        _ => {
+            println!("  ⚠ Could not generate certificate. You can set this up later.");
+        }
+    }
+}
+
+fn tailscale_cert_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
+    let tls_dir = data_dir.join("tls");
+    (tls_dir.join("cert.pem"), tls_dir.join("key.pem"))
+}
+
+fn launchagent_answer_from_prompt<E>(result: Result<String, E>) -> String {
+    result.unwrap_or_else(|_| "n".to_string())
+}
+
+fn should_install_launchagent(answer: &str) -> bool {
+    answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y')
 }
 
 fn installed_skill_names(data_dir: &Path) -> anyhow::Result<BTreeSet<String>> {
@@ -1844,6 +1882,30 @@ mod tests {
         assert!(is_skip_input("SKIP"));
         assert!(!is_skip_input("1"));
         assert!(!is_skip_input("abc"));
+    }
+
+    #[test]
+    fn launchagent_answer_defaults_to_no_when_prompt_fails() {
+        let answer = launchagent_answer_from_prompt::<&str>(Err("stdin closed"));
+
+        assert_eq!(answer, "n");
+    }
+
+    #[test]
+    fn should_install_launchagent_accepts_empty_and_yes_answers() {
+        assert!(should_install_launchagent(""));
+        assert!(should_install_launchagent("y"));
+        assert!(should_install_launchagent("Yes"));
+        assert!(!should_install_launchagent("n"));
+    }
+
+    #[test]
+    fn tailscale_cert_paths_use_tls_directory() {
+        let data_dir = Path::new("/tmp/fawx");
+        let (cert_path, key_path) = tailscale_cert_paths(data_dir);
+
+        assert_eq!(cert_path, data_dir.join("tls").join("cert.pem"));
+        assert_eq!(key_path, data_dir.join("tls").join("key.pem"));
     }
 
     #[test]
