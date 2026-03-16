@@ -181,6 +181,99 @@ pub async fn handle_git_stage(
     }))
 }
 
+// ── Unstage ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GitUnstageRequest {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GitUnstageResponse {
+    pub unstaged: bool,
+    pub paths: Vec<String>,
+}
+
+pub async fn handle_git_unstage(
+    State(state): State<HttpState>,
+    Json(request): Json<GitUnstageRequest>,
+) -> HandlerResult<Json<GitUnstageResponse>> {
+    validate_paths(&request.paths).map_err(bad_request)?;
+    let cwd = workspace_dir(&state).await;
+    let paths = request.paths;
+    if paths.is_empty() {
+        run_git(["reset", "HEAD"], &cwd)
+            .await
+            .map_err(bad_request)?;
+    } else {
+        run_git(unstage_args(&paths), &cwd)
+            .await
+            .map_err(bad_request)?;
+    }
+    Ok(Json(GitUnstageResponse {
+        unstaged: true,
+        paths,
+    }))
+}
+
+fn unstage_args(paths: &[String]) -> Vec<String> {
+    let mut args = vec!["reset".to_string(), "HEAD".to_string(), "--".to_string()];
+    args.extend(paths.iter().cloned());
+    args
+}
+
+// ── Pull ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct GitPullResponse {
+    pub pulled: bool,
+    pub summary: String,
+    pub conflicts: bool,
+}
+
+pub async fn handle_git_pull(
+    State(state): State<HttpState>,
+) -> HandlerResult<Json<GitPullResponse>> {
+    let cwd = workspace_dir(&state).await;
+    let output = run_git_output(["pull"], &cwd).await.map_err(bad_request)?;
+    let conflicts = output.stdout.contains("CONFLICT") || output.stderr.contains("CONFLICT");
+    let summary = if output.stdout.trim().is_empty() {
+        output.stderr.trim().to_string()
+    } else {
+        output.stdout.trim().to_string()
+    };
+    Ok(Json(GitPullResponse {
+        pulled: true,
+        summary,
+        conflicts,
+    }))
+}
+
+// ── Fetch ────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct GitFetchResponse {
+    pub fetched: bool,
+    pub summary: String,
+}
+
+pub async fn handle_git_fetch(
+    State(state): State<HttpState>,
+) -> HandlerResult<Json<GitFetchResponse>> {
+    let cwd = workspace_dir(&state).await;
+    let output = run_git_output(["fetch"], &cwd).await.map_err(bad_request)?;
+    let summary = if output.stderr.trim().is_empty() {
+        "Already up to date.".to_string()
+    } else {
+        output.stderr.trim().to_string()
+    };
+    Ok(Json(GitFetchResponse {
+        fetched: true,
+        summary,
+    }))
+}
+
 pub async fn handle_git_commit(
     State(state): State<HttpState>,
     Json(request): Json<GitCommitRequest>,
