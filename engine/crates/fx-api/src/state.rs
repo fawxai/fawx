@@ -1,7 +1,8 @@
 use crate::devices::DeviceStore;
-use crate::engine::AppEngine;
+use crate::engine::{AppEngine, ConfigManagerHandle};
 use crate::pairing::PairingState;
 use crate::server_runtime::ServerRuntime;
+use crate::types::{ModelInfoDto, ThinkingLevelDto};
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
@@ -13,11 +14,89 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as TokioRwLock};
+
+/// Atomic snapshot of frequently-read state. All fields are updated together
+/// so concurrent readers never see inconsistent combinations (e.g., new model
+/// with old thinking level).
+#[derive(Debug, Clone)]
+pub struct ReadSnapshot {
+    pub active_model: String,
+    pub thinking_level: ThinkingLevelDto,
+    pub available_models: Vec<ModelInfoDto>,
+    pub token_usage: (u64, u64),
+}
+
+/// Read-only state cache, updated after mutations. Handlers that only need
+/// to read model/thinking/usage info use this instead of locking the app Mutex.
+/// A single RwLock around the snapshot ensures all fields are consistent.
+pub struct SharedReadState {
+    snapshot: TokioRwLock<ReadSnapshot>,
+}
+
+impl SharedReadState {
+    pub fn new(model: String, thinking: ThinkingLevelDto, models: Vec<ModelInfoDto>) -> Self {
+        Self {
+            snapshot: TokioRwLock::new(ReadSnapshot {
+                active_model: model,
+                thinking_level: thinking,
+                available_models: models,
+                token_usage: (0, 0),
+            }),
+        }
+    }
+
+    pub fn from_app(app: &dyn AppEngine) -> Self {
+        Self::new(
+            app.active_model().to_owned(),
+            app.thinking_level(),
+            app.available_models(),
+        )
+    }
+
+    /// Read the current snapshot. Returns a clone — readers never block writers.
+    pub async fn read(&self) -> ReadSnapshot {
+        self.snapshot.read().await.clone()
+    }
+
+    /// Update all fields atomically after a cycle completes.
+    pub async fn update_after_cycle(
+        &self,
+        model: &str,
+        thinking: &ThinkingLevelDto,
+        tokens: (u64, u64),
+    ) {
+        let mut snap = self.snapshot.write().await;
+        snap.active_model = model.to_owned();
+        snap.thinking_level = thinking.clone();
+        snap.token_usage = tokens;
+    }
+
+    /// Update model-related fields atomically after a model switch.
+    pub async fn update_model(
+        &self,
+        model: &str,
+        thinking: &ThinkingLevelDto,
+        models: Vec<ModelInfoDto>,
+    ) {
+        let mut snap = self.snapshot.write().await;
+        snap.active_model = model.to_owned();
+        snap.thinking_level = thinking.clone();
+        snap.available_models = models;
+    }
+
+    /// Update just thinking level.
+    pub async fn update_thinking(&self, thinking: &ThinkingLevelDto) {
+        let mut snap = self.snapshot.write().await;
+        snap.thinking_level = thinking.clone();
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpState {
     pub app: Arc<Mutex<dyn AppEngine>>,
+    pub shared: Arc<SharedReadState>,
+    pub config_manager: Option<ConfigManagerHandle>,
     pub session_registry: Option<SessionRegistry>,
     pub start_time: Instant,
     pub server_runtime: ServerRuntime,

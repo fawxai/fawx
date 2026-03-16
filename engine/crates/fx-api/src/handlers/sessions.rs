@@ -324,14 +324,25 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
     let callback = stream_callback(task.sender.clone(), Arc::clone(&task.disconnected));
     let result = {
         let mut app = task.state.app.lock().await;
-        app.process_message_with_context(
-            &task.message,
-            encoded_images_to_attachments(&task.images),
-            task.context,
-            InputSource::Http,
-            Some(callback),
-        )
-        .await
+        let r = app
+            .process_message_with_context(
+                &task.message,
+                encoded_images_to_attachments(&task.images),
+                task.context,
+                InputSource::Http,
+                Some(callback),
+            )
+            .await;
+        // Update shared read state while we still hold the lock
+        task.state
+            .shared
+            .update_after_cycle(
+                app.active_model(),
+                &app.thinking_level(),
+                app.session_token_usage(),
+            )
+            .await;
+        r
     };
 
     match result {
@@ -373,6 +384,15 @@ async fn process_and_route_session_message(
                 None,
             )
             .await?;
+        // Update shared read state while we still hold the lock
+        state
+            .shared
+            .update_after_cycle(
+                app.active_model(),
+                &app.thinking_level(),
+                app.session_token_usage(),
+            )
+            .await;
         result
     };
 

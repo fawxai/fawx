@@ -70,13 +70,11 @@ pub async fn handle_usage(State(state): State<HttpState>) -> Json<UsageResponse>
 }
 
 async fn session_token_usage(state: &HttpState) -> (u64, u64) {
-    let app = state.app.lock().await;
-    app.session_token_usage()
+    state.shared.read().await.token_usage
 }
 
 async fn active_model_name(state: &HttpState) -> String {
-    let app = state.app.lock().await;
-    app.active_model().to_string()
+    state.shared.read().await.active_model
 }
 
 fn provider_usage(
