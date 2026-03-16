@@ -173,7 +173,7 @@ pub fn spawn_background_experiment(
     let config = build_config(&parsed);
 
     let spawn_signal = signal.clone();
-    let _background_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let completion = match runner.run_loop(config, max_rounds).await {
             Ok(chain_result) => BackgroundExperimentResult {
                 signal: spawn_signal.clone(),
@@ -183,12 +183,19 @@ pub fn spawn_background_experiment(
                 }),
                 error: None,
             },
-            Err(error) => BackgroundExperimentResult {
-                signal: spawn_signal.clone(),
-                success: false,
-                summary: String::new(),
-                error: Some(error.to_string()),
-            },
+            Err(error) => {
+                tracing::error!(
+                    signal = %spawn_signal,
+                    %error,
+                    "background experiment failed"
+                );
+                BackgroundExperimentResult {
+                    signal: spawn_signal.clone(),
+                    success: false,
+                    summary: String::new(),
+                    error: Some(error.to_string()),
+                }
+            }
         };
         if let Some(callback) = on_complete {
             callback(completion);
