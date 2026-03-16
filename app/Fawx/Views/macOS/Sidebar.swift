@@ -9,6 +9,9 @@ struct Sidebar: View {
     let newSessionAction: () -> Void
     let selectSessionAction: (String) -> Void
     let showSkillsAction: () -> Void
+    let showFleetAction: () -> Void
+    let showExperimentsAction: () -> Void
+    let showGitAction: () -> Void
     let openSettingsAction: () -> Void
     let clearSessionAction: (String) -> Void
     let deleteSessionAction: (String) -> Void
@@ -92,6 +95,24 @@ struct Sidebar: View {
                     systemImage: "puzzlepiece.extension",
                     isSelected: selection == .skills,
                     action: showSkillsAction
+                )
+                sidebarButton(
+                    title: "Fleet",
+                    systemImage: "point.3.connected.trianglepath.dotted",
+                    isSelected: selection == .fleet,
+                    action: showFleetAction
+                )
+                sidebarButton(
+                    title: "Experiments",
+                    systemImage: "waveform.path.ecg.rectangle",
+                    isSelected: selection == .experiments,
+                    action: showExperimentsAction
+                )
+                sidebarButton(
+                    title: "Git",
+                    systemImage: "arrow.trianglehead.branch",
+                    isSelected: selection == .git,
+                    action: showGitAction
                 )
                 sidebarButton(
                     title: "Settings",

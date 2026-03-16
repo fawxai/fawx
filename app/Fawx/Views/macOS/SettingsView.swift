@@ -6,6 +6,7 @@ struct SettingsView: View {
     @Bindable var appState: AppState
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var telemetryViewModel: TelemetryViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
     @Bindable var usageViewModel: UsageViewModel
     @State private var isPresentingModelSelector = false
@@ -19,6 +20,7 @@ struct SettingsView: View {
                 modelThinkingSection
                 authStatusSection
                 permissionsSection
+                telemetrySection
                 synthesisSection
                 usageSection
                 appearanceSection
@@ -225,6 +227,12 @@ struct SettingsView: View {
     private var synthesisSection: some View {
         settingsSection("Custom Instructions") {
             SynthesisSettingsPanel(viewModel: synthesisViewModel)
+        }
+    }
+
+    private var telemetrySection: some View {
+        settingsSection("Privacy & Telemetry") {
+            TelemetrySettingsPanel(viewModel: telemetryViewModel)
         }
     }
 

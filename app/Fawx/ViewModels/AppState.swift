@@ -107,6 +107,10 @@ enum AppRootDestination: Sendable, Equatable {
     case remoteOnboarding
 }
 
+enum RefreshCadence {
+    static let dashboardPanels: Duration = .seconds(30)
+}
+
 @MainActor
 @Observable
 final class AppState {

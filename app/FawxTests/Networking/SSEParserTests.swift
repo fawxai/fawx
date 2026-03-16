@@ -54,4 +54,60 @@ final class SSEParserTests: XCTestCase {
 
         XCTAssertEqual(events, [.done(response: "All set")])
     }
+
+    func testParseLineParsesPermissionPromptEvent() throws {
+        var parser = SSEParser()
+
+        XCTAssertEqual(try parser.parseLine("event: permission_prompt"), [])
+        XCTAssertEqual(
+            try parser.parseLine(#"data: {"id":"prompt-1","action":"write","path":"/tmp/report.md","tier":2}"#),
+            []
+        )
+
+        let events = try parser.parseLine("")
+
+        XCTAssertEqual(
+            events,
+            [
+                .permissionPrompt(
+                    PermissionPrompt(
+                        id: "prompt-1",
+                        action: "write",
+                        path: "/tmp/report.md",
+                        tier: 2
+                    )
+                )
+            ]
+        )
+    }
+
+    func testParseLineParsesLegacyPermissionPromptEventShape() throws {
+        var parser = SSEParser()
+
+        XCTAssertEqual(try parser.parseLine("event: permission_prompt"), [])
+        XCTAssertEqual(
+            try parser.parseLine(
+                #"data: {"id":"prompt-1","tool":"shell","title":"Allow shell command","reason":"Needed to inspect the repo","request_summary":"git status --short --branch","session_scoped_allow_available":true,"expires_at":1742000000}"#
+            ),
+            []
+        )
+
+        let events = try parser.parseLine("")
+
+        XCTAssertEqual(
+            events,
+            [
+                .permissionPrompt(
+                    PermissionPrompt(
+                        id: "prompt-1",
+                        action: "shell command",
+                        path: "git status --short --branch",
+                        tier: nil,
+                        sessionScopedAllowAvailable: true,
+                        expiresAt: 1742000000
+                    )
+                )
+            ]
+        )
+    }
 }

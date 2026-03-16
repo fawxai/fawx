@@ -11,8 +11,12 @@ struct FawxApp: App {
     @State private var sessionViewModel: SessionViewModel
     @State private var chatViewModel: ChatViewModel
     @State private var skillsViewModel: SkillsViewModel
+    @State private var fleetViewModel: FleetViewModel
+    @State private var experimentsViewModel: ExperimentsViewModel
+    @State private var gitViewModel: GitViewModel
     @State private var settingsViewModel: SettingsViewModel
     @State private var permissionsViewModel: PermissionsViewModel
+    @State private var telemetryViewModel: TelemetryViewModel
     @State private var synthesisViewModel: SynthesisViewModel
     @State private var usageViewModel: UsageViewModel
     @State private var setupViewModel: SetupViewModel
@@ -26,8 +30,12 @@ struct FawxApp: App {
         let sessionViewModel = SessionViewModel(appState: appState)
         let chatViewModel = ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
         let skillsViewModel = SkillsViewModel(appState: appState)
+        let fleetViewModel = FleetViewModel(appState: appState)
+        let experimentsViewModel = ExperimentsViewModel(appState: appState)
+        let gitViewModel = GitViewModel(appState: appState)
         let settingsViewModel = SettingsViewModel(appState: appState)
         let permissionsViewModel = PermissionsViewModel(appState: appState)
+        let telemetryViewModel = TelemetryViewModel(appState: appState)
         let synthesisViewModel = SynthesisViewModel(appState: appState)
         let usageViewModel = UsageViewModel(appState: appState)
         let setupViewModel = SetupViewModel(appState: appState)
@@ -36,8 +44,12 @@ struct FawxApp: App {
         _sessionViewModel = State(initialValue: sessionViewModel)
         _chatViewModel = State(initialValue: chatViewModel)
         _skillsViewModel = State(initialValue: skillsViewModel)
+        _fleetViewModel = State(initialValue: fleetViewModel)
+        _experimentsViewModel = State(initialValue: experimentsViewModel)
+        _gitViewModel = State(initialValue: gitViewModel)
         _settingsViewModel = State(initialValue: settingsViewModel)
         _permissionsViewModel = State(initialValue: permissionsViewModel)
+        _telemetryViewModel = State(initialValue: telemetryViewModel)
         _synthesisViewModel = State(initialValue: synthesisViewModel)
         _usageViewModel = State(initialValue: usageViewModel)
         _setupViewModel = State(initialValue: setupViewModel)
@@ -123,8 +135,12 @@ struct FawxApp: App {
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
                 skillsViewModel: skillsViewModel,
+                fleetViewModel: fleetViewModel,
+                experimentsViewModel: experimentsViewModel,
+                gitViewModel: gitViewModel,
                 settingsViewModel: settingsViewModel,
                 permissionsViewModel: permissionsViewModel,
+                telemetryViewModel: telemetryViewModel,
                 synthesisViewModel: synthesisViewModel,
                 usageViewModel: usageViewModel
             )
@@ -134,8 +150,12 @@ struct FawxApp: App {
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
                 skillsViewModel: skillsViewModel,
+                fleetViewModel: fleetViewModel,
+                experimentsViewModel: experimentsViewModel,
+                gitViewModel: gitViewModel,
                 settingsViewModel: settingsViewModel,
                 permissionsViewModel: permissionsViewModel,
+                telemetryViewModel: telemetryViewModel,
                 synthesisViewModel: synthesisViewModel,
                 usageViewModel: usageViewModel
             )
@@ -150,11 +170,40 @@ struct FawxApp: App {
     @ViewBuilder
     private func themedRootView(selectedTheme: AppTheme) -> some View {
 #if os(macOS)
-        rootView
+        rootViewWithPermissionSheet
 #else
-        rootView
+        rootViewWithPermissionSheet
             .preferredColorScheme(selectedTheme.colorScheme)
 #endif
+    }
+
+    private var rootViewWithPermissionSheet: some View {
+        rootView.sheet(item: activePermissionPromptBinding) { prompt in
+            PermissionPromptSheetView(
+                prompt: prompt,
+                isSubmitting: chatViewModel.isRespondingToPermissionPrompt,
+                errorMessage: chatViewModel.permissionPromptErrorMessage,
+                allowAction: {
+                    chatViewModel.respondToPermissionPrompt(.allow)
+                },
+                denyAction: {
+                    chatViewModel.respondToPermissionPrompt(.deny)
+                },
+                allowSessionAction: {
+                    chatViewModel.respondToPermissionPrompt(.allowSession)
+                }
+            )
+            .interactiveDismissDisabled(true)
+        }
+    }
+
+    private var activePermissionPromptBinding: Binding<PermissionPrompt?> {
+        Binding(
+            get: {
+                chatViewModel.activePermissionPrompt
+            },
+            set: { _ in }
+        )
     }
 
     private var pollingInterval: Duration {

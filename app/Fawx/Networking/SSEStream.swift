@@ -6,6 +6,7 @@ enum SSEEvent: Sendable, Hashable {
     case toolCallDelta(id: String?, argumentsDelta: String)
     case toolCallComplete(id: String?, name: String?, arguments: String)
     case toolResult(id: String?, output: String, isError: Bool)
+    case permissionPrompt(PermissionPrompt)
     case phase(String)
     case engineError(category: String, message: String, recoverable: Bool)
     case done(response: String?)
@@ -97,6 +98,9 @@ struct SSEParser {
                 output: payload.outputString,
                 isError: payload.isError
             )
+        case "permission_prompt":
+            let payload = try decoder.decode(PermissionPrompt.self, from: Data(data.utf8))
+            return .permissionPrompt(payload)
         case "phase", "phase_change":
             let payload = try decoder.decode(PhasePayload.self, from: Data(data.utf8))
             return .phase(payload.phase)
