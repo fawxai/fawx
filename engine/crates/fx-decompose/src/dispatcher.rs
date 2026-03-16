@@ -254,10 +254,12 @@ impl SubGoalDispatcher for DagDispatcher {
 }
 
 /// Mock executor for testing.
+#[cfg(any(test, feature = "test-support"))]
 pub struct MockSubGoalExecutor {
     outcomes: Vec<SubGoalOutcome>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MockSubGoalExecutor {
     pub fn new(outcomes: Vec<SubGoalOutcome>) -> Self {
         Self { outcomes }
@@ -272,6 +274,7 @@ impl MockSubGoalExecutor {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl SubGoalExecutor for MockSubGoalExecutor {
     async fn execute(
