@@ -22,8 +22,11 @@ mod router;
 mod routing;
 mod sse;
 pub mod streaming;
+pub use thinking::ThinkingRegistry;
+
 #[cfg(test)]
 mod test_helpers;
+pub mod thinking;
 mod types;
 
 pub use anthropic::AnthropicAuthMode;
