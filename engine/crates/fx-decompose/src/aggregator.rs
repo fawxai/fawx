@@ -101,12 +101,29 @@ pub struct TempWorkspace {
 }
 
 impl TempWorkspace {
-    /// Create a new temp workspace with an initialized git repo.
-    pub fn new() -> Result<Self, DecomposeError> {
+    /// Create an empty temp workspace with an initialized git repo.
+    pub async fn empty() -> Result<Self, DecomposeError> {
         let temp_dir = TempDir::new()
             .map_err(|e| DecomposeError::AggregationFailed(format!("temp dir: {e}")))?;
         let path = temp_dir.path().to_path_buf();
-        init_git_repo(&path)?;
+        init_git_repo_async(path.clone()).await?;
+        Ok(Self {
+            path,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    /// Create a temp workspace by copying an existing directory, then initializing git.
+    pub async fn from_path(source: &Path) -> Result<Self, DecomposeError> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| DecomposeError::AggregationFailed(format!("temp dir: {e}")))?;
+        let path = temp_dir.path().to_path_buf();
+        let src = source.to_path_buf();
+        let dst = path.clone();
+        tokio::task::spawn_blocking(move || copy_dir_recursive(&src, &dst))
+            .await
+            .map_err(|e| DecomposeError::AggregationFailed(format!("spawn_blocking: {e}")))??;
+        init_git_repo_async(path.clone()).await?;
         Ok(Self {
             path,
             _temp_dir: temp_dir,
@@ -207,7 +224,15 @@ impl std::fmt::Display for PatchApplyError {
     }
 }
 
-fn init_git_repo(path: &Path) -> Result<(), DecomposeError> {
+impl std::error::Error for PatchApplyError {}
+
+async fn init_git_repo_async(path: PathBuf) -> Result<(), DecomposeError> {
+    tokio::task::spawn_blocking(move || init_git_repo_sync(&path))
+        .await
+        .map_err(|e| DecomposeError::AggregationFailed(format!("spawn_blocking: {e}")))?
+}
+
+fn init_git_repo_sync(path: &Path) -> Result<(), DecomposeError> {
     let run = |args: &[&str]| -> Result<(), DecomposeError> {
         let output = std::process::Command::new("git")
             .args(args)
@@ -235,6 +260,36 @@ fn init_git_repo(path: &Path) -> Result<(), DecomposeError> {
     Ok(())
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), DecomposeError> {
+    if !src.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| DecomposeError::AggregationFailed(format!("read dir: {e}")))?
+    {
+        let entry =
+            entry.map_err(|e| DecomposeError::AggregationFailed(format!("dir entry: {e}")))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)
+                .map_err(|e| DecomposeError::AggregationFailed(format!("mkdir: {e}")))?;
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)
+                .map_err(|e| DecomposeError::AggregationFailed(format!("copy: {e}")))?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn from_path(source: &Path) -> Result<TempWorkspace, DecomposeError> {
+    TempWorkspace::from_path(source).await
+}
+
 /// Aggregator that applies patches to a workspace, verifies build, and handles conflicts.
 pub struct BuildVerifyAggregator {
     workspace_provider: Box<dyn WorkspaceProvider>,
@@ -253,7 +308,7 @@ impl BuildVerifyAggregator {
         &self,
         workspace: &TempWorkspace,
         results: &[SubGoalResult],
-    ) -> MergeResult {
+    ) -> Result<MergeResult, DecomposeError> {
         let mut merged = Vec::new();
         let mut conflicts = Vec::new();
 
@@ -266,23 +321,20 @@ impl BuildVerifyAggregator {
             }
         }
 
-        let combined_patch = workspace.combined_diff().await.unwrap_or_default();
-        let build_ok = if merged.is_empty() {
-            true
+        let combined_patch = workspace.combined_diff().await?;
+        let build_ok = if !merged.is_empty() {
+            workspace.cargo_check(self.build_timeout).await?
         } else {
-            workspace
-                .cargo_check(self.build_timeout)
-                .await
-                .unwrap_or(false)
+            true
         };
 
-        MergeResult {
+        Ok(MergeResult {
             combined_patch,
             merged,
             conflicts,
             build_ok,
             test_result: None,
-        }
+        })
     }
 }
 
@@ -295,7 +347,7 @@ impl ResultAggregator for BuildVerifyAggregator {
         _experiment: &Experiment,
     ) -> Result<AggregatedResult, DecomposeError> {
         let workspace = self.workspace_provider.create().await?;
-        let merge = self.merge_patches(&workspace, results).await;
+        let merge = self.merge_patches(&workspace, results).await?;
         let total = results.len().max(1);
         let rate = merge.merged.len() as f64 / total as f64;
         let outcomes = results
@@ -338,7 +390,7 @@ pub struct DefaultWorkspaceProvider;
 #[async_trait::async_trait]
 impl WorkspaceProvider for DefaultWorkspaceProvider {
     async fn create(&self) -> Result<TempWorkspace, DecomposeError> {
-        TempWorkspace::new()
+        TempWorkspace::empty().await
     }
 }
 
@@ -452,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn temp_workspace_initializes_git_repo() {
-        let workspace = TempWorkspace::new().unwrap();
+        let workspace = TempWorkspace::empty().await.unwrap();
         let output = tokio::process::Command::new("git")
             .args(["status"])
             .current_dir(&workspace.path)
@@ -464,13 +516,42 @@ mod tests {
 
     #[tokio::test]
     async fn temp_workspace_applies_empty_patch() {
-        let workspace = TempWorkspace::new().unwrap();
+        let workspace = TempWorkspace::empty().await.unwrap();
         workspace.apply_patch("").await.unwrap();
     }
 
     #[tokio::test]
+    async fn temp_workspace_from_path_copies_source_files() {
+        let source = tempfile::TempDir::new().unwrap();
+        tokio::fs::create_dir(source.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            source.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        )
+        .await
+        .unwrap();
+
+        let workspace = TempWorkspace::from_path(source.path()).await.unwrap();
+        let copied = tokio::fs::read_to_string(workspace.path.join("src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(copied, "pub fn value() -> u32 { 1 }\n");
+
+        let output = tokio::process::Command::new("git")
+            .args(["status"])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[tokio::test]
     async fn temp_workspace_combined_diff_empty_on_clean() {
-        let workspace = TempWorkspace::new().unwrap();
+        let workspace = TempWorkspace::empty().await.unwrap();
         let diff = workspace.combined_diff().await.unwrap();
         assert!(diff.trim().is_empty());
     }
