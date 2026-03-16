@@ -41,3 +41,181 @@ struct PermissionsPatchResponse: Codable, Sendable, Hashable {
         case changedActions = "changed_actions"
     }
 }
+
+enum PermissionPromptDecision: String, Encodable, Sendable, Hashable {
+    case allow
+    case deny
+    case allowSession = "allow_session"
+
+    var buttonTitle: String {
+        switch self {
+        case .allow:
+            return "Allow"
+        case .deny:
+            return "Deny"
+        case .allowSession:
+            return "Allow for Session"
+        }
+    }
+}
+
+struct PermissionPrompt: Decodable, Sendable, Hashable, Identifiable {
+    let id: String
+    let action: String
+    let path: String
+    let tier: Int?
+    let sessionScopedAllowAvailable: Bool
+    let expiresAt: UInt64?
+
+    init(
+        id: String,
+        action: String,
+        path: String,
+        tier: Int? = nil,
+        sessionScopedAllowAvailable: Bool = true,
+        expiresAt: UInt64? = nil
+    ) {
+        self.id = id
+        self.action = action
+        self.path = path
+        self.tier = tier
+        self.sessionScopedAllowAvailable = sessionScopedAllowAvailable
+        self.expiresAt = expiresAt
+    }
+
+    var summaryText: String {
+        if displayPath.isEmpty {
+            return "Fawx wants to \(displayAction)."
+        }
+
+        return "Fawx wants to \(displayAction) \(displayPath)."
+    }
+
+    var indicatorText: String {
+        if displayPath.isEmpty {
+            return "Approval needed: \(displayAction)"
+        }
+
+        return "Approval needed: \(displayAction) \(displayPath)"
+    }
+
+    var tierLabel: String? {
+        guard let tier else {
+            return nil
+        }
+
+        return "Tier \(tier)"
+    }
+
+    var displayAction: String {
+        let trimmed = action.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "perform this action" : trimmed
+    }
+
+    var displayPath: String {
+        path.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case action
+        case path
+        case tier
+        case tool
+        case title
+        case reason
+        case requestSummary = "request_summary"
+        case sessionScopedAllowAvailable = "session_scoped_allow_available"
+        case expiresAt = "expires_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        id = try container.decode(String.self, forKey: .id)
+
+        let explicitAction = try container.decodeIfPresent(String.self, forKey: .action)
+        let explicitPath = try container.decodeIfPresent(String.self, forKey: .path)
+        let tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        let title = try container.decodeIfPresent(String.self, forKey: .title)
+        let reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        let requestSummary = try container.decodeIfPresent(String.self, forKey: .requestSummary)
+
+        action = Self.resolveAction(
+            explicitAction: explicitAction,
+            tool: tool,
+            title: title,
+            reason: reason
+        )
+        path = Self.resolvePath(
+            explicitPath: explicitPath,
+            requestSummary: requestSummary,
+            reason: reason
+        )
+        tier = try container.decodeIfPresent(Int.self, forKey: .tier)
+        sessionScopedAllowAvailable = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sessionScopedAllowAvailable
+        ) ?? true
+        expiresAt = try container.decodeIfPresent(UInt64.self, forKey: .expiresAt)
+    }
+
+    private static func resolveAction(
+        explicitAction: String?,
+        tool: String?,
+        title: String?,
+        reason: String?
+    ) -> String {
+        if let explicitAction = explicitAction?.nonEmptyTrimmed {
+            return explicitAction
+        }
+
+        if let title = title?.nonEmptyTrimmed {
+            let stripped = title.replacingOccurrences(
+                of: #"^Allow\s+"#,
+                with: "",
+                options: .regularExpression
+            )
+            if let stripped = stripped.nonEmptyTrimmed {
+                return stripped.prefix(1).lowercased() + stripped.dropFirst()
+            }
+        }
+
+        if let tool = tool?.nonEmptyTrimmed {
+            return tool == "shell" ? "run a shell command" : tool
+        }
+
+        if let reason = reason?.nonEmptyTrimmed {
+            return reason
+        }
+
+        return "perform this action"
+    }
+
+    private static func resolvePath(
+        explicitPath: String?,
+        requestSummary: String?,
+        reason: String?
+    ) -> String {
+        if let explicitPath = explicitPath?.nonEmptyTrimmed {
+            return explicitPath
+        }
+
+        if let requestSummary = requestSummary?.nonEmptyTrimmed {
+            return requestSummary
+        }
+
+        if let reason = reason?.nonEmptyTrimmed {
+            return reason
+        }
+
+        return ""
+    }
+}
+
+private extension String {
+    var nonEmptyTrimmed: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}

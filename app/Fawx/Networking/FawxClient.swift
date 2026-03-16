@@ -195,6 +195,33 @@ actor FawxClient {
         )
     }
 
+    func respondToPermissionPrompt(
+        id: String,
+        decision: PermissionPromptDecision
+    ) async throws {
+        do {
+            let body = try encoder.encode(PermissionPromptRespondBody(decision: decision))
+            let _: JSONValue = try await performRequest(
+                path: "/v1/permissions/prompts/\(id)/respond",
+                method: "POST",
+                bodyData: body,
+                decodeAs: JSONValue.self
+            )
+        } catch let error as APIError
+            where decision == .allowSession && error.statusCode == 422
+        {
+            let legacyBody = try encoder.encode(
+                LegacyPermissionPromptRespondBody(decision: "allow", scope: "session")
+            )
+            let _: JSONValue = try await performRequest(
+                path: "/v1/permissions/prompts/\(id)/respond",
+                method: "POST",
+                bodyData: legacyBody,
+                decodeAs: JSONValue.self
+            )
+        }
+    }
+
     func getSynthesis() async throws -> SynthesisResponse {
         try await performRequest(path: "/v1/synthesis", decodeAs: SynthesisResponse.self)
     }
@@ -824,6 +851,15 @@ private struct VerifyProviderBody: Encodable {
 
 private struct ConfigPatchBody: Encodable {
     let changes: JSONValue
+}
+
+private struct PermissionPromptRespondBody: Encodable {
+    let decision: PermissionPromptDecision
+}
+
+private struct LegacyPermissionPromptRespondBody: Encodable {
+    let decision: String
+    let scope: String
 }
 
 private struct InstallSkillRequest: Encodable {

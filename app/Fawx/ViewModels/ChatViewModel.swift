@@ -56,6 +56,7 @@ final class ChatViewModel {
     }
 
     private static let sessionLoadDebounceMs = 50
+    private static let permissionPromptTimeout: Duration = .seconds(60)
     static let maxCachedSessions = 10
 
     var transcriptItems: [ChatTranscriptItem] = []
@@ -66,6 +67,9 @@ final class ChatViewModel {
     var streamingText = ""
     var currentPhase: StreamingPhase?
     var errorMessage: String?
+    var activePermissionPrompt: PermissionPrompt?
+    var isRespondingToPermissionPrompt = false
+    var permissionPromptErrorMessage: String?
     var pendingTranscriptScrollBehavior: TranscriptScrollBehavior = .snap
 
     private let appState: AppState
@@ -75,9 +79,11 @@ final class ChatViewModel {
     private var streamTask: Task<Void, Never>?
     private var retryRequest: RetryRequest?
     private var anonymousToolCallCounter = 0
+    private var queuedPermissionPrompts: [PermissionPrompt] = []
     @ObservationIgnored private var historyLoadSequence = 0
     @ObservationIgnored private var transcriptCache: [String: [SessionMessage]] = [:]
     @ObservationIgnored private var transcriptCacheAccessOrder: [String] = []
+    @ObservationIgnored private var permissionPromptTimeoutTask: Task<Void, Never>?
     private var sessionLoadTask: Task<Void, Never>?
 
     init(appState: AppState, sessionViewModel: SessionViewModel) {
@@ -123,6 +129,30 @@ final class ChatViewModel {
 
     var canRetryLastMessage: Bool {
         retryRequest != nil && !isStreaming
+    }
+
+    var pendingPermissionPromptCount: Int {
+        queuedPermissionPrompts.count + (activePermissionPrompt == nil ? 0 : 1)
+    }
+
+    var hasPendingPermissionPrompt: Bool {
+        pendingPermissionPromptCount > 0
+    }
+
+    var permissionPromptIndicatorText: String? {
+        if let activePermissionPrompt {
+            return activePermissionPrompt.indicatorText
+        }
+
+        guard pendingPermissionPromptCount > 0 else {
+            return nil
+        }
+
+        if pendingPermissionPromptCount == 1 {
+            return "1 approval request pending"
+        }
+
+        return "\(pendingPermissionPromptCount) approval requests pending"
     }
 
     func invalidateSession(_ sessionID: String) {
@@ -389,6 +419,7 @@ final class ChatViewModel {
     }
 
     func stopStreaming() {
+        clearPermissionPromptState()
         streamTask?.cancel()
         streamTask = nil
     }
@@ -479,6 +510,8 @@ final class ChatViewModel {
                         if currentSessionID == sessionID {
                             finishToolCall(id: id, output: output, isError: isError)
                         }
+                    case .permissionPrompt(let prompt):
+                        enqueuePermissionPrompt(prompt)
                     case .phase(let phase):
                         currentPhase = StreamingPhase(rawValue: phase)
                     case .done(let response):
@@ -604,11 +637,142 @@ final class ChatViewModel {
     }
 
     private func resetStreamingState() {
+        clearPermissionPromptState()
         streamingText = ""
         isStreaming = false
         streamingSessionID = nil
         currentPhase = nil
         anonymousToolCallCounter = 0
+    }
+
+    func respondToPermissionPrompt(_ decision: PermissionPromptDecision) {
+        Task {
+            await submitPermissionPromptDecision(decision)
+        }
+    }
+
+    private func enqueuePermissionPrompt(_ prompt: PermissionPrompt) {
+        permissionPromptErrorMessage = nil
+
+        if activePermissionPrompt?.id == prompt.id {
+            activePermissionPrompt = prompt
+            isRespondingToPermissionPrompt = false
+            schedulePermissionPromptTimeout(for: prompt)
+            return
+        }
+
+        if let index = queuedPermissionPrompts.firstIndex(where: { $0.id == prompt.id }) {
+            queuedPermissionPrompts[index] = prompt
+        } else {
+            queuedPermissionPrompts.append(prompt)
+        }
+
+        activateNextPermissionPromptIfNeeded()
+    }
+
+    private func activateNextPermissionPromptIfNeeded() {
+        guard activePermissionPrompt == nil else {
+            return
+        }
+
+        guard !queuedPermissionPrompts.isEmpty else {
+            return
+        }
+
+        activePermissionPrompt = queuedPermissionPrompts.removeFirst()
+        isRespondingToPermissionPrompt = false
+        permissionPromptErrorMessage = nil
+
+        if let activePermissionPrompt {
+            schedulePermissionPromptTimeout(for: activePermissionPrompt)
+        }
+    }
+
+    private func schedulePermissionPromptTimeout(for prompt: PermissionPrompt) {
+        permissionPromptTimeoutTask?.cancel()
+        permissionPromptTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.permissionPromptTimeout)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+
+            await self?.autoDenyPermissionPromptIfNeeded(promptID: prompt.id)
+        }
+    }
+
+    private func autoDenyPermissionPromptIfNeeded(promptID: String) async {
+        guard activePermissionPrompt?.id == promptID else {
+            return
+        }
+
+        await submitPermissionPromptDecision(.deny, isAutomatic: true)
+    }
+
+    private func submitPermissionPromptDecision(
+        _ decision: PermissionPromptDecision,
+        isAutomatic: Bool = false
+    ) async {
+        guard let prompt = activePermissionPrompt, !isRespondingToPermissionPrompt else {
+            return
+        }
+
+        isRespondingToPermissionPrompt = true
+        permissionPromptErrorMessage = nil
+        permissionPromptTimeoutTask?.cancel()
+
+        do {
+            try await appState.client.respondToPermissionPrompt(id: prompt.id, decision: decision)
+            finishActivePermissionPrompt(id: prompt.id)
+
+            if isAutomatic {
+                appState.showToast(message: "Approval request timed out and was denied.", style: .warning)
+            }
+        } catch is CancellationError {
+            isRespondingToPermissionPrompt = false
+            if activePermissionPrompt?.id == prompt.id {
+                schedulePermissionPromptTimeout(for: prompt)
+            }
+        } catch let apiError as APIError where apiError.statusCode == 404 || apiError.statusCode == 409 {
+            finishActivePermissionPrompt(id: prompt.id)
+
+            if isAutomatic {
+                appState.showToast(message: "Approval request expired.", style: .warning)
+            }
+        } catch {
+            isRespondingToPermissionPrompt = false
+            permissionPromptErrorMessage = "Couldn't send approval response. \(error.localizedDescription)"
+
+            if activePermissionPrompt?.id == prompt.id {
+                schedulePermissionPromptTimeout(for: prompt)
+            }
+        }
+    }
+
+    private func finishActivePermissionPrompt(id: String) {
+        permissionPromptTimeoutTask?.cancel()
+        permissionPromptTimeoutTask = nil
+        permissionPromptErrorMessage = nil
+
+        guard activePermissionPrompt?.id == id else {
+            isRespondingToPermissionPrompt = false
+            return
+        }
+
+        activePermissionPrompt = nil
+        isRespondingToPermissionPrompt = false
+        activateNextPermissionPromptIfNeeded()
+    }
+
+    private func clearPermissionPromptState() {
+        permissionPromptTimeoutTask?.cancel()
+        permissionPromptTimeoutTask = nil
+        activePermissionPrompt = nil
+        queuedPermissionPrompts.removeAll(keepingCapacity: true)
+        isRespondingToPermissionPrompt = false
+        permissionPromptErrorMessage = nil
     }
 
     private func appendMessage(_ message: SessionMessage, for sessionID: String) {
@@ -839,6 +1003,14 @@ extension ChatViewModel {
         self.streamingSessionID = streamingSessionID
         self.streamingText = streamingText
         self.currentPhase = phase
+    }
+
+    func enqueuePermissionPromptForTesting(_ prompt: PermissionPrompt) {
+        enqueuePermissionPrompt(prompt)
+    }
+
+    func finishActivePermissionPromptForTesting(id: String) {
+        finishActivePermissionPrompt(id: id)
     }
 }
 #endif

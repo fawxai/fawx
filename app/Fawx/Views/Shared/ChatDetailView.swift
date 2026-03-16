@@ -144,6 +144,13 @@ struct ChatDetailView: View {
 
     private var composerArea: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
+            if let indicatorText = chatViewModel.permissionPromptIndicatorText {
+                PermissionPromptInlineNotice(
+                    text: indicatorText,
+                    tierLabel: chatViewModel.activePermissionPrompt?.tierLabel
+                )
+            }
+
             if let errorMessage = chatViewModel.errorMessage {
                 HStack(alignment: .center, spacing: FawxSpacing.paddingMD) {
                     Text(errorMessage)
@@ -335,4 +342,185 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+struct PermissionPromptSheetView: View {
+    let prompt: PermissionPrompt
+    let isSubmitting: Bool
+    let errorMessage: String?
+    let allowAction: () -> Void
+    let denyAction: () -> Void
+    let allowSessionAction: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+            HStack(spacing: FawxSpacing.paddingSM) {
+                Image(systemName: "hand.raised.fill")
+                    .foregroundStyle(promptAccentColor)
+
+                Text("Permission Required")
+                    .font(FawxTypography.heading2)
+                    .foregroundStyle(Color.fawxText)
+
+                Spacer()
+
+                if let tierLabel = prompt.tierLabel {
+                    Text(tierLabel)
+                        .font(FawxTypography.status)
+                        .foregroundStyle(promptAccentColor)
+                        .padding(.horizontal, FawxSpacing.paddingSM)
+                        .padding(.vertical, FawxSpacing.paddingXS)
+                        .background(promptAccentColor.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+
+            Text(prompt.summaryText)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxText)
+
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                permissionDetailRow(label: "Action", value: prompt.displayAction, monospaced: false)
+
+                if !prompt.displayPath.isEmpty {
+                    permissionDetailRow(label: "Path", value: prompt.displayPath, monospaced: true)
+                }
+            }
+            .padding(FawxSpacing.paddingMD)
+            .background(Color.fawxSurface)
+            .overlay(
+                RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                    .stroke(Color.fawxBorder, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+
+            if let errorMessage, !errorMessage.isEmpty {
+                Text(errorMessage)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxError)
+                    .padding(FawxSpacing.paddingMD)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.fawxError.opacity(0.08))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                            .stroke(Color.fawxError.opacity(0.25), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+            }
+
+            Text("This request auto-denies after 60 seconds.")
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            HStack(spacing: FawxSpacing.paddingMD) {
+                Button(prompt.allowSessionActionTitle, action: allowSessionAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.fawxAccent)
+                    .disabled(isSubmitting)
+
+                Button(prompt.allowActionTitle, action: allowAction)
+                    .buttonStyle(.bordered)
+                    .disabled(isSubmitting)
+
+                Button(prompt.denyActionTitle, role: .destructive, action: denyAction)
+                    .buttonStyle(.bordered)
+                    .disabled(isSubmitting)
+            }
+
+            if isSubmitting {
+                HStack(spacing: FawxSpacing.paddingSM) {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    Text("Sending response...")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+            }
+        }
+        .padding(FawxSpacing.paddingXL)
+        .frame(minWidth: 360, idealWidth: 440, maxWidth: 520, alignment: .leading)
+        .background(Color.fawxBackground)
+    }
+
+    @ViewBuilder
+    private func permissionDetailRow(label: String, value: String, monospaced: Bool) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+            Text(label)
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            if monospaced {
+                Text(verbatim: value)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(Color.fawxText)
+                    .textSelection(.enabled)
+            } else {
+                Text(value)
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxText)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var promptAccentColor: Color {
+        switch prompt.tier ?? 1 {
+        case 3...:
+            return .fawxError
+        case 2:
+            return .fawxWarning
+        default:
+            return .fawxAccent
+        }
+    }
+}
+
+private struct PermissionPromptInlineNotice: View {
+    let text: String
+    let tierLabel: String?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: FawxSpacing.paddingSM) {
+            Image(systemName: "hand.raised")
+                .foregroundStyle(Color.fawxWarning)
+
+            Text(text)
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let tierLabel {
+                Text(tierLabel)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxWarning)
+                    .padding(.horizontal, FawxSpacing.paddingSM)
+                    .padding(.vertical, FawxSpacing.paddingXS)
+                    .background(Color.fawxWarning.opacity(0.12))
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(FawxSpacing.paddingMD)
+        .background(Color.fawxWarning.opacity(0.08))
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxWarning.opacity(0.2), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+    }
+}
+
+private extension PermissionPrompt {
+    var allowActionTitle: String {
+        PermissionPromptDecision.allow.buttonTitle
+    }
+
+    var denyActionTitle: String {
+        PermissionPromptDecision.deny.buttonTitle
+    }
+
+    var allowSessionActionTitle: String {
+        PermissionPromptDecision.allowSession.buttonTitle
+    }
 }

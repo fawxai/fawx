@@ -165,11 +165,40 @@ struct FawxApp: App {
     @ViewBuilder
     private func themedRootView(selectedTheme: AppTheme) -> some View {
 #if os(macOS)
-        rootView
+        rootViewWithPermissionSheet
 #else
-        rootView
+        rootViewWithPermissionSheet
             .preferredColorScheme(selectedTheme.colorScheme)
 #endif
+    }
+
+    private var rootViewWithPermissionSheet: some View {
+        rootView.sheet(item: activePermissionPromptBinding) { prompt in
+            PermissionPromptSheetView(
+                prompt: prompt,
+                isSubmitting: chatViewModel.isRespondingToPermissionPrompt,
+                errorMessage: chatViewModel.permissionPromptErrorMessage,
+                allowAction: {
+                    chatViewModel.respondToPermissionPrompt(.allow)
+                },
+                denyAction: {
+                    chatViewModel.respondToPermissionPrompt(.deny)
+                },
+                allowSessionAction: {
+                    chatViewModel.respondToPermissionPrompt(.allowSession)
+                }
+            )
+            .interactiveDismissDisabled(true)
+        }
+    }
+
+    private var activePermissionPromptBinding: Binding<PermissionPrompt?> {
+        Binding(
+            get: {
+                chatViewModel.activePermissionPrompt
+            },
+            set: { _ in }
+        )
     }
 
     private var pollingInterval: Duration {

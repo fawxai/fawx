@@ -186,6 +186,35 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNotNil(sut.cachedMessages(for: "session-\(ChatViewModel.maxCachedSessions)"))
     }
 
+    func testEnqueuePermissionPromptExposesActivePromptAndIndicator() {
+        let sut = makeSUT()
+        let prompt = PermissionPrompt(id: "prompt-1", action: "write", path: "/tmp/report.md", tier: 2)
+
+        sut.enqueuePermissionPromptForTesting(prompt)
+
+        XCTAssertEqual(sut.activePermissionPrompt, prompt)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
+        XCTAssertTrue(sut.hasPendingPermissionPrompt)
+        XCTAssertEqual(sut.permissionPromptIndicatorText, "Approval needed: write /tmp/report.md")
+    }
+
+    func testPermissionPromptQueuePromotesNextPromptWhenFirstCompletes() {
+        let sut = makeSUT()
+        let first = PermissionPrompt(id: "prompt-1", action: "write", path: "/tmp/first.md", tier: 1)
+        let second = PermissionPrompt(id: "prompt-2", action: "run", path: "/usr/bin/git", tier: 3)
+
+        sut.enqueuePermissionPromptForTesting(first)
+        sut.enqueuePermissionPromptForTesting(second)
+
+        XCTAssertEqual(sut.activePermissionPrompt, first)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 2)
+
+        sut.finishActivePermissionPromptForTesting(id: first.id)
+
+        XCTAssertEqual(sut.activePermissionPrompt, second)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
+    }
+
     private func makeSUT() -> ChatViewModel {
         let appState = AppState()
         let sessionViewModel = SessionViewModel(appState: appState)
