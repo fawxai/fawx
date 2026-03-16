@@ -45,7 +45,7 @@ fn adjust_patch_quality(mut example: TrainingExample) -> TrainingExample {
 }
 
 fn has_diff_markers(text: &str) -> bool {
-    text.contains("diff ") || text.contains("---") || text.contains("+++")
+    text.contains("diff --git") || (text.contains("---") && text.contains("+++"))
 }
 
 pub struct DiversityFilter {
@@ -196,6 +196,17 @@ mod tests {
         let ex = completion("p", "diff --git a/src b/src\n---\n+++", 0.9, "latency");
         let result = PatchQualityFilter.filter(vec![ex]);
         assert!((result[0].quality_score - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn diff_markers_require_git_header_or_both_file_markers() {
+        assert!(has_diff_markers("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(has_diff_markers(
+            "--- a/src/lib.rs
++++ b/src/lib.rs"
+        ));
+        assert!(!has_diff_markers("--- a/src/lib.rs"));
+        assert!(!has_diff_markers("+++ b/src/lib.rs"));
     }
 
     #[test]

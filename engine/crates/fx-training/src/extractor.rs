@@ -52,18 +52,19 @@ impl ChainExtractor for DefaultChainExtractor {
         config: &ExtractionConfig,
     ) -> Vec<TrainingExample> {
         let mut examples = Vec::new();
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
+            let chain_history = &entries[..index];
             if !signal_matches(entry, config) {
                 continue;
             }
-            if let Some(ex) = try_completion(entry, chain_path, config) {
+            if let Some(ex) = try_completion(entry, chain_path, chain_history, config) {
                 examples.push(ex);
             }
-            if let Some(ex) = try_preference(entry, chain_path, config) {
+            if let Some(ex) = try_preference(entry, chain_path, chain_history, config) {
                 examples.push(ex);
             }
             if config.include_negative_examples {
-                if let Some(ex) = try_negative(entry, chain_path) {
+                if let Some(ex) = try_negative(entry, chain_path, chain_history) {
                     examples.push(ex);
                 }
             }
@@ -77,6 +78,10 @@ fn signal_matches(entry: &ChainEntry, config: &ExtractionConfig) -> bool {
         Some(filter) => entry.experiment.trigger.name.eq_ignore_ascii_case(filter),
         None => true,
     }
+}
+
+fn build_user_prompt(entry: &ChainEntry, chain_history: &[ChainEntry]) -> String {
+    build_experiment_prompt(&entry.experiment, &format_chain_history(chain_history))
 }
 
 fn best_aggregate_score(entry: &ChainEntry) -> f64 {
@@ -99,6 +104,7 @@ fn build_tags(entry: &ChainEntry) -> Vec<String> {
 fn try_completion(
     entry: &ChainEntry,
     chain_path: &Path,
+    chain_history: &[ChainEntry],
     config: &ExtractionConfig,
 ) -> Option<TrainingExample> {
     if entry.result.decision != Decision::Accept {
@@ -112,7 +118,7 @@ fn try_completion(
     if score < config.min_winner_score {
         return None;
     }
-    let user_prompt = build_experiment_prompt(&entry.experiment, &format_chain_history(&[]));
+    let user_prompt = build_user_prompt(entry, chain_history);
     let metrics = BTreeMap::from([("aggregate_score".to_owned(), score)]);
     let response = format_model_response(patch, "Accepted patch", &metrics);
     Some(TrainingExample {
@@ -133,6 +139,7 @@ fn try_completion(
 fn try_preference(
     entry: &ChainEntry,
     chain_path: &Path,
+    chain_history: &[ChainEntry],
     config: &ExtractionConfig,
 ) -> Option<TrainingExample> {
     let patches = &entry.result.candidate_patches;
@@ -151,7 +158,7 @@ fn try_preference(
     }
     let chosen = patches.get(best_id)?;
     let rejected = patches.get(worst_id)?;
-    let user_prompt = build_experiment_prompt(&entry.experiment, &format_chain_history(&[]));
+    let user_prompt = build_user_prompt(entry, chain_history);
     Some(TrainingExample {
         id: Uuid::new_v4(),
         source_chain_index: entry.index,
@@ -169,7 +176,11 @@ fn try_preference(
     })
 }
 
-fn try_negative(entry: &ChainEntry, chain_path: &Path) -> Option<TrainingExample> {
+fn try_negative(
+    entry: &ChainEntry,
+    chain_path: &Path,
+    chain_history: &[ChainEntry],
+) -> Option<TrainingExample> {
     if entry.result.decision != Decision::Reject {
         return None;
     }
@@ -177,7 +188,7 @@ fn try_negative(entry: &ChainEntry, chain_path: &Path) -> Option<TrainingExample
     if patch.trim().is_empty() {
         return None;
     }
-    let user_prompt = build_experiment_prompt(&entry.experiment, &format_chain_history(&[]));
+    let user_prompt = build_user_prompt(entry, chain_history);
     let metrics = BTreeMap::new();
     let response = format_model_response(patch, "Rejected patch", &metrics);
     Some(TrainingExample {
@@ -384,6 +395,56 @@ mod tests {
         assert!(examples
             .iter()
             .all(|e| !matches!(e.kind, ExampleKind::Completion(ref c) if c.assistant_response.contains(&big_patch))));
+    }
+
+    fn prompt_for(example: TrainingExample) -> String {
+        match example.kind {
+            ExampleKind::Completion(c) => c.user_prompt,
+            ExampleKind::Preference(p) => p.user_prompt,
+        }
+    }
+
+    #[test]
+    fn completion_uses_chain_history_in_prompt() {
+        let history = vec![accept_entry(0.8, "diff --git a/src/lib.rs b/src/lib.rs")];
+        let entry = accept_entry(0.9, "diff --git a/src/main.rs b/src/main.rs");
+
+        let example = try_completion(
+            &entry,
+            Path::new("chain.json"),
+            &history,
+            &ExtractionConfig::default(),
+        )
+        .expect("completion example");
+
+        assert!(prompt_for(example).contains("Entry #0"));
+    }
+
+    #[test]
+    fn preference_uses_chain_history_in_prompt() {
+        let history = vec![accept_entry(0.8, "diff --git a/src/lib.rs b/src/lib.rs")];
+        let entry = multi_candidate_entry(0.9, 0.3);
+
+        let example = try_preference(
+            &entry,
+            Path::new("chain.json"),
+            &history,
+            &ExtractionConfig::default(),
+        )
+        .expect("preference example");
+
+        assert!(prompt_for(example).contains("Entry #0"));
+    }
+
+    #[test]
+    fn negative_uses_chain_history_in_prompt() {
+        let history = vec![accept_entry(0.8, "diff --git a/src/lib.rs b/src/lib.rs")];
+        let entry = reject_entry("diff --git a/src/main.rs b/src/main.rs");
+
+        let example =
+            try_negative(&entry, Path::new("chain.json"), &history).expect("negative example");
+
+        assert!(prompt_for(example).contains("Entry #0"));
     }
 
     #[test]

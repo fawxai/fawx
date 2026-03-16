@@ -1,15 +1,28 @@
 use crate::{ExampleKind, TrainingError, TrainingExample};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
     OpenAiJsonl,
     AlpacaJsonl,
     DpoJsonl,
     RawJson,
+}
+
+impl fmt::Display for ExportFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::OpenAiJsonl => "openai-jsonl",
+            Self::AlpacaJsonl => "alpaca-jsonl",
+            Self::DpoJsonl => "dpo-jsonl",
+            Self::RawJson => "raw-json",
+        };
+        formatter.write_str(label)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +197,14 @@ mod tests {
     }
 
     #[test]
+    fn export_format_display_is_stable() {
+        assert_eq!(ExportFormat::OpenAiJsonl.to_string(), "openai-jsonl");
+        assert_eq!(ExportFormat::AlpacaJsonl.to_string(), "alpaca-jsonl");
+        assert_eq!(ExportFormat::DpoJsonl.to_string(), "dpo-jsonl");
+        assert_eq!(ExportFormat::RawJson.to_string(), "raw-json");
+    }
+
+    #[test]
     fn raw_exports_everything() {
         assert!(format_raw(&completion_example()).is_some());
         assert!(format_raw(&preference_example()).is_some());
@@ -198,6 +219,7 @@ mod tests {
         let report = export_examples(&examples, &ExportFormat::OpenAiJsonl, &path).unwrap();
 
         assert_eq!(report.examples_exported, 1);
+        assert_eq!(report.format, ExportFormat::OpenAiJsonl);
         assert!(report.file_size_bytes > 0);
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 1);

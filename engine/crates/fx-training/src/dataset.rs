@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     schema_version: u32,
-    next_id: u32,
+    next_id: u64,
     total_examples: usize,
     updated_at: DateTime<Utc>,
 }
@@ -48,7 +48,7 @@ pub struct DatasetStats {
     pub newest_example: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExampleFilter {
     pub kind: Option<ExampleKindFilter>,
     pub min_quality: Option<f64>,
@@ -80,8 +80,8 @@ impl DatasetManager {
         filter: Option<&dyn QualityFilter>,
     ) -> Result<IngestReport, TrainingError> {
         let mut manifest = self.load_manifest()?;
-        let existing_hashes = self.load_existing_hashes()?;
-        let filtered = apply_optional_filter(examples, filter);
+        let mut existing_hashes = self.load_existing_hashes()?;
+        let filtered = apply_optional_filter(examples.to_vec(), filter);
         let filtered_out = examples.len().saturating_sub(filtered.len());
         let mut added = 0;
         let mut duplicates_skipped = 0;
@@ -91,6 +91,7 @@ impl DatasetManager {
                 duplicates_skipped += 1;
                 continue;
             }
+            existing_hashes.insert(hash);
             let filename = format!("{:08}.json", manifest.next_id);
             let path = self.examples_dir().join(filename);
             write_example(&path, example)?;
@@ -118,7 +119,8 @@ impl DatasetManager {
 
     pub fn stats(&self) -> Result<DatasetStats, TrainingError> {
         let examples = self.load_all_examples()?;
-        Ok(compute_stats(&examples))
+        let total_size_bytes = self.total_example_size_bytes()?;
+        Ok(compute_stats(&examples, total_size_bytes))
     }
 
     pub fn prune(&self, min_quality: f64) -> Result<usize, TrainingError> {
@@ -168,6 +170,22 @@ impl DatasetManager {
 
     fn save_manifest(&self, manifest: &Manifest) -> Result<(), TrainingError> {
         write_manifest(&self.manifest_path(), manifest)
+    }
+
+    fn total_example_size_bytes(&self) -> Result<u64, TrainingError> {
+        let dir = self.examples_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut total_size_bytes = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if is_json_file(&path) {
+                total_size_bytes += entry.metadata()?.len();
+            }
+        }
+        Ok(total_size_bytes)
     }
 
     fn load_existing_hashes(&self) -> Result<HashSet<String>, TrainingError> {
@@ -230,12 +248,12 @@ fn is_json_file(path: &Path) -> bool {
 }
 
 fn apply_optional_filter(
-    examples: &[TrainingExample],
+    examples: Vec<TrainingExample>,
     filter: Option<&dyn QualityFilter>,
 ) -> Vec<TrainingExample> {
     match filter {
-        Some(f) => f.filter(examples.to_vec()),
-        None => examples.to_vec(),
+        Some(f) => f.filter(examples),
+        None => examples,
     }
 }
 
@@ -287,7 +305,7 @@ fn matches_filter(example: &TrainingExample, filter: &ExampleFilter) -> bool {
     true
 }
 
-fn compute_stats(examples: &[TrainingExample]) -> DatasetStats {
+fn compute_stats(examples: &[TrainingExample], total_size_bytes: u64) -> DatasetStats {
     let mut completions = 0;
     let mut preferences = 0;
     let mut signals = HashSet::new();
@@ -316,7 +334,7 @@ fn compute_stats(examples: &[TrainingExample]) -> DatasetStats {
         preference_examples: preferences,
         signals_represented: signals.into_iter().collect(),
         avg_quality_score: avg,
-        total_size_bytes: 0,
+        total_size_bytes,
         oldest_example: oldest,
         newest_example: newest,
     }
@@ -394,6 +412,22 @@ mod tests {
     }
 
     #[test]
+    fn ingest_skips_duplicates_within_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = DatasetManager::new(dir.path().join("ds")).unwrap();
+        let examples = vec![
+            sample_example("p1", "r1", 0.9),
+            sample_example("p1", "r1", 0.8),
+        ];
+
+        let report = manager.ingest(&examples, None).unwrap();
+
+        assert_eq!(report.added, 1);
+        assert_eq!(report.duplicates_skipped, 1);
+        assert_eq!(manager.list(None).unwrap().len(), 1);
+    }
+
+    #[test]
     fn prune_removes_low_quality() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = DatasetManager::new(dir.path().join("ds")).unwrap();
@@ -464,11 +498,35 @@ mod tests {
     }
 
     #[test]
+    fn stats_reports_total_example_file_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = DatasetManager::new(dir.path().join("ds")).unwrap();
+        let examples = vec![
+            sample_example("p1", "r1", 0.9),
+            sample_example("p2", "r2", 0.8),
+        ];
+        manager.ingest(&examples, None).unwrap();
+
+        let expected_size = std::fs::read_dir(manager.examples_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| is_json_file(&entry.path()))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+
+        let stats = manager.stats().unwrap();
+
+        assert!(stats.total_size_bytes > 0);
+        assert_eq!(stats.total_size_bytes, expected_size);
+    }
+
+    #[test]
     fn stats_empty_dataset() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = DatasetManager::new(dir.path().join("ds")).unwrap();
         let stats = manager.stats().unwrap();
         assert_eq!(stats.avg_quality_score, 0.0);
+        assert_eq!(stats.total_size_bytes, 0);
         assert!(stats.oldest_example.is_none());
     }
 }
