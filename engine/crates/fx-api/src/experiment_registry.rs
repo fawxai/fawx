@@ -224,6 +224,14 @@ impl ExperimentRegistry {
             .any(|experiment| experiment.status == ExperimentStatus::Running)
     }
 
+    pub fn cancel_token(&self, id: &str) -> Option<CancellationToken> {
+        with_running_experiments(&self.running_experiments, |running| {
+            running.get(id).cloned()
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn start(&mut self, id: &str) -> Result<(), String> {
         self.update_experiment(id, |experiment| {
             require_status(experiment.status, ExperimentStatus::Queued, "queued")?;
@@ -338,7 +346,7 @@ fn create_storage_dir(data_dir: &Path) -> Result<(), io::Error> {
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX_EPOCH")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -700,21 +708,13 @@ mod tests {
 
         registry.start(&created.id).expect("start");
         let token = registry
-            .running_experiments
-            .lock()
-            .expect("running experiments")
-            .get(&created.id)
-            .cloned()
+            .cancel_token(&created.id)
             .expect("cancellation token");
 
         registry.stop(&created.id).expect("stop");
 
         assert!(token.is_cancelled());
-        let running = registry
-            .running_experiments
-            .lock()
-            .expect("running experiments");
-        assert!(!running.contains_key(&created.id));
+        assert!(registry.cancel_token(&created.id).is_none());
     }
 
     #[test]

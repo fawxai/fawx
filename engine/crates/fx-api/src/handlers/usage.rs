@@ -35,7 +35,7 @@ pub struct ProviderUsage {
     pub estimated_cost_usd: f64,
 }
 
-/// Rough cost estimate in USD. Uses approximate per-token pricing.
+/// Rough cost estimate in USD using approximate Sonnet-tier per-token pricing.
 fn estimate_cost_usd(input_tokens: u64, output_tokens: u64) -> f64 {
     // Conservative estimate: ~$3/M input, ~$15/M output (Claude Sonnet-tier)
     let input_cost = (input_tokens as f64) * 3.0 / 1_000_000.0;

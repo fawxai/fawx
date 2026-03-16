@@ -114,16 +114,22 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
 
     /// Set the stream callback for emitting permission prompt SSE events.
     pub fn with_stream_callback(self, callback: StreamCallback) -> Self {
-        if let Ok(mut guard) = self.stream_callback.lock() {
-            *guard = Some(callback);
+        match self.stream_callback.lock() {
+            Ok(mut guard) => {
+                *guard = Some(callback);
+            }
+            Err(error) => tracing::warn!("permission gate callback mutex poisoned: {error}"),
         }
         self
     }
 
     /// Swap the stream callback (used per-cycle when executor is shared).
     pub fn set_stream_callback(&self, callback: Option<StreamCallback>) {
-        if let Ok(mut guard) = self.stream_callback.lock() {
-            *guard = callback;
+        match self.stream_callback.lock() {
+            Ok(mut guard) => {
+                *guard = callback;
+            }
+            Err(error) => tracing::warn!("permission gate callback mutex poisoned: {error}"),
         }
     }
 
@@ -263,10 +269,13 @@ fn emit_prompt(
     callback_slot: &Arc<std::sync::Mutex<Option<StreamCallback>>>,
     prompt: PermissionPrompt,
 ) {
-    if let Ok(guard) = callback_slot.lock() {
-        if let Some(cb) = guard.as_ref() {
-            cb(StreamEvent::PermissionPrompt(prompt));
+    match callback_slot.lock() {
+        Ok(guard) => {
+            if let Some(cb) = guard.as_ref() {
+                cb(StreamEvent::PermissionPrompt(prompt));
+            }
         }
+        Err(error) => tracing::warn!("permission gate callback mutex poisoned: {error}"),
     }
 }
 

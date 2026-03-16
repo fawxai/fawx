@@ -105,11 +105,11 @@ pub async fn handle_decide(
     if request.approved {
         // Move to approved directory
         let approved_dir = proposals_dir.join("approved");
-        move_proposal_files(&sidecar_path, &approved_dir);
+        move_proposal_files(&sidecar_path, &approved_dir).map_err(internal_proposal_error)?;
     } else {
         // Move to rejected directory
         let rejected_dir = proposals_dir.join("rejected");
-        move_proposal_files(&sidecar_path, &rejected_dir);
+        move_proposal_files(&sidecar_path, &rejected_dir).map_err(internal_proposal_error)?;
     }
 
     let action = if request.approved {
@@ -178,6 +178,10 @@ fn sidecar_to_proposal(sidecar: &ProposalSidecar) -> PendingProposal {
     }
 }
 
+/// Returns a display identifier derived from sidecar metadata.
+///
+/// This is not round-trippable back to the on-disk proposal path: lookups use
+/// the actual filename stem, not a reconstructed ID from sidecar contents.
 fn proposal_id_from_sidecar(sidecar: &ProposalSidecar) -> String {
     let sanitized = sidecar
         .title
@@ -215,28 +219,48 @@ fn read_sidecar(path: &std::path::Path) -> Option<ProposalSidecar> {
 }
 
 fn find_sidecar_by_id(proposals_dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
-    let timestamp_prefix = id.split('_').next().unwrap_or(id);
     let entries = fs::read_dir(proposals_dir).ok()?;
     entries
         .filter_map(|e| e.ok())
         .find(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".json") && name.starts_with(timestamp_prefix)
+            let path = entry.path();
+            path.extension().is_some_and(|ext| ext == "json")
+                && path
+                    .file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy() == id)
         })
         .map(|entry| entry.path())
 }
 
-fn move_proposal_files(sidecar_path: &std::path::Path, dest_dir: &std::path::Path) {
-    let _ = fs::create_dir_all(dest_dir);
-    if let Some(filename) = sidecar_path.file_name() {
-        let _ = fs::rename(sidecar_path, dest_dir.join(filename));
-    }
-    // Also move the .md file
+fn move_proposal_files(
+    sidecar_path: &std::path::Path,
+    dest_dir: &std::path::Path,
+) -> Result<(), String> {
+    fs::create_dir_all(dest_dir).map_err(|error| {
+        format!(
+            "failed to create proposal archive dir {}: {error}",
+            dest_dir.display()
+        )
+    })?;
+    move_proposal_file(sidecar_path, dest_dir, "sidecar")?;
+
     let md_path = sidecar_path.with_extension("md");
-    if let Some(filename) = md_path.file_name() {
-        let _ = fs::rename(&md_path, dest_dir.join(filename));
+    if md_path.exists() {
+        move_proposal_file(&md_path, dest_dir, "markdown")?;
     }
+    Ok(())
+}
+
+fn move_proposal_file(
+    path: &std::path::Path,
+    dest_dir: &std::path::Path,
+    kind: &str,
+) -> Result<(), String> {
+    let filename = path
+        .file_name()
+        .ok_or_else(|| format!("proposal {kind} path has no filename: {}", path.display()))?;
+    fs::rename(path, dest_dir.join(filename))
+        .map_err(|error| format!("failed to move proposal {kind} {}: {error}", path.display()))
 }
 
 fn proposal_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
@@ -246,6 +270,10 @@ fn proposal_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
             error: format!("Proposal {id} not found"),
         }),
     )
+}
+
+fn internal_proposal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error }))
 }
 
 #[cfg(test)]
@@ -337,17 +365,17 @@ mod tests {
     #[test]
     fn read_sidecars_from_dir_reads_json_files() {
         let temp = tempfile::TempDir::new().unwrap();
-        let sidecar = ProposalSidecar {
-            version: 1,
-            timestamp: 1700000000,
-            title: "Test".into(),
-            description: "desc".into(),
-            target_path: "file.rs".into(),
-            proposed_content: "content".into(),
-            risk: "low".into(),
-            file_hash_at_creation: None,
-        };
-        let json = serde_json::to_string(&sidecar).unwrap();
+        let json = serde_json::json!({
+            "version": 1,
+            "timestamp": 1700000000,
+            "title": "Test",
+            "description": "desc",
+            "target_path": "file.rs",
+            "proposed_content": "content",
+            "risk": "low",
+            "file_hash_at_creation": null,
+        })
+        .to_string();
         fs::write(temp.path().join("1700000000-test.json"), &json).unwrap();
         // Write a non-json file that should be ignored
         fs::write(temp.path().join("readme.md"), "# Readme").unwrap();
@@ -356,5 +384,29 @@ mod tests {
 
         assert_eq!(sidecars.len(), 1);
         assert_eq!(sidecars[0].title, "Test");
+    }
+
+    #[test]
+    fn find_sidecar_by_id_matches_full_stem() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("1700000000-first.json");
+        let second = temp.path().join("1700000000-second.json");
+        fs::write(&first, "{}").unwrap();
+        fs::write(&second, "{}").unwrap();
+
+        let found = find_sidecar_by_id(temp.path(), "1700000000-second");
+
+        assert_eq!(found, Some(second));
+    }
+
+    #[test]
+    fn move_proposal_files_returns_error_when_sidecar_move_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing = temp.path().join("missing.json");
+        let archive = temp.path().join("approved");
+
+        let error = move_proposal_files(&missing, &archive).expect_err("missing sidecar");
+
+        assert!(error.contains("failed to move proposal sidecar"));
     }
 }

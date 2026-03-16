@@ -9,10 +9,13 @@ use fx_fleet::{
     NodeCapability, NodeInfo, NodeStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use fx_fleet::DEFAULT_STALE_THRESHOLD_MS;
+
+static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetOverviewResponse {
@@ -167,14 +170,23 @@ fn generate_task_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("task_{nanos:x}")
+    let counter = TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format_task_id(nanos, counter)
+}
+
+fn format_task_id(nanos: u128, counter: u64) -> String {
+    format!("task_{nanos:x}_{counter:x}")
 }
 
 fn build_fleet_task_request(task_id: &str, request: &DispatchTaskRequest) -> FleetTaskRequest {
     FleetTaskRequest {
         task_id: task_id.to_string(),
         task_type: FleetTaskType::GenerateAndEvaluate,
+        // Dashboard dispatch runs against the worker's existing local checkout,
+        // so there is no remote repository URL to clone for this stub task.
         repo_url: String::new(),
+        // Likewise, the worker uses its current checkout instead of a requested
+        // branch until fleet dispatch grows repo-aware execution.
         branch: String::new(),
         git_token: None,
         signal: serde_json::json!({"description": request.task}),
@@ -473,7 +485,15 @@ mod tests {
         };
         let fleet_req = build_fleet_task_request("task_123", &request);
         assert_eq!(fleet_req.task_id, "task_123");
+        assert!(fleet_req.repo_url.is_empty());
+        assert!(fleet_req.branch.is_empty());
         assert_eq!(fleet_req.signal["description"], "Run experiment");
         assert_eq!(fleet_req.config["priority"], "high");
+    }
+
+    #[test]
+    fn format_task_id_uses_counter_suffix() {
+        assert_eq!(format_task_id(0xabc, 0x1), "task_abc_1");
+        assert_ne!(format_task_id(0xabc, 0x1), format_task_id(0xabc, 0x2));
     }
 }

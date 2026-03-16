@@ -114,27 +114,23 @@ pub async fn handle_create_experiment(
     let name = validate_name(request.name)?;
     let kind = parse_kind(request.kind)?;
     let config = request.config.unwrap_or_default();
-    let experiment = {
-        let mut registry = state.experiment_registry.lock().await;
-        if registry.has_running_experiment() {
-            return Err(concurrent_experiment_conflict());
-        }
-        let experiment = registry
-            .create(name, kind, config)
-            .map_err(internal_error)?;
-        // Transition to Running immediately
-        registry.start(&experiment.id).map_err(internal_error)?;
-        // Re-read after start to get updated status
-        registry.get(&experiment.id).cloned().unwrap_or(experiment)
-    };
+    let provider = state.improvement_provider.clone();
+    let (experiment, cancel_token) = start_experiment(
+        &state.experiment_registry,
+        name,
+        kind,
+        config,
+        provider.is_some(),
+    )
+    .await?;
 
-    // Spawn background execution if provider is available
-    if let Some(provider) = &state.improvement_provider {
+    if let (Some(provider), Some(cancel_token)) = (provider, cancel_token) {
         spawn_experiment_execution(
             experiment.id.clone(),
             Arc::clone(&state.experiment_registry),
-            Arc::clone(provider),
+            provider,
             state.data_dir.clone(),
+            cancel_token,
         );
     }
 
@@ -146,6 +142,41 @@ pub async fn handle_create_experiment(
             status: experiment.status,
         }),
     ))
+}
+
+async fn start_experiment(
+    registry: &Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
+    name: String,
+    kind: ExperimentKind,
+    config: ExperimentConfig,
+    include_cancel_token: bool,
+) -> HandlerResult<(Experiment, Option<tokio_util::sync::CancellationToken>)> {
+    let mut registry = registry.lock().await;
+    if registry.has_running_experiment() {
+        return Err(concurrent_experiment_conflict());
+    }
+    let experiment = registry
+        .create(name, kind, config)
+        .map_err(internal_error)?;
+    registry.start(&experiment.id).map_err(internal_error)?;
+    let cancel_token = if include_cancel_token {
+        Some(required_cancel_token(&registry, &experiment.id)?)
+    } else {
+        None
+    };
+    let experiment = registry.get(&experiment.id).cloned().unwrap_or(experiment);
+    Ok((experiment, cancel_token))
+}
+
+fn required_cancel_token(
+    registry: &crate::experiment_registry::ExperimentRegistry,
+    experiment_id: &str,
+) -> HandlerResult<tokio_util::sync::CancellationToken> {
+    registry.cancel_token(experiment_id).ok_or_else(|| {
+        internal_error(format!(
+            "failed to load cancellation token for experiment '{experiment_id}'"
+        ))
+    })
 }
 
 // GET /v1/experiments/{id}
@@ -260,32 +291,79 @@ fn spawn_experiment_execution(
     registry: Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
     provider: Arc<dyn fx_llm::CompletionProvider + Send + Sync>,
     data_dir: std::path::PathBuf,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         tracing::info!(experiment_id = %experiment_id, "Starting experiment execution");
-        let result = run_experiment(provider.as_ref(), &data_dir).await;
+        let result =
+            await_experiment_result(cancel_token, run_experiment(provider.as_ref(), &data_dir))
+                .await;
+        record_experiment_outcome(&experiment_id, registry, result).await;
+    });
+}
 
-        let mut reg = registry.lock().await;
-        match result {
-            Ok(run_result) => {
-                tracing::info!(
-                    experiment_id = %experiment_id,
-                    plans = run_result.plans_generated,
-                    "Experiment completed"
-                );
-                let experiment_result = convert_run_result(run_result);
-                let _ = reg.complete(&experiment_id, experiment_result);
-            }
-            Err(error) => {
+async fn await_experiment_result<E>(
+    cancel_token: tokio_util::sync::CancellationToken,
+    run: impl std::future::Future<Output = Result<fx_improve::ImprovementRunResult, E>>,
+) -> Result<fx_improve::ImprovementRunResult, String>
+where
+    E: std::fmt::Display,
+{
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => Err("Cancelled by user".to_string()),
+        result = run => result.map_err(|error| error.to_string()),
+    }
+}
+
+async fn record_experiment_outcome(
+    experiment_id: &str,
+    registry: Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
+    result: Result<fx_improve::ImprovementRunResult, String>,
+) {
+    let mut registry = registry.lock().await;
+    if let Err(error) = apply_experiment_outcome(&mut registry, experiment_id, result) {
+        tracing::warn!(
+            experiment_id = %experiment_id,
+            error = %error,
+            "Failed to record experiment outcome"
+        );
+    }
+}
+
+fn apply_experiment_outcome(
+    registry: &mut crate::experiment_registry::ExperimentRegistry,
+    experiment_id: &str,
+    result: Result<fx_improve::ImprovementRunResult, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(run_result) => {
+            tracing::info!(
+                experiment_id = %experiment_id,
+                plans = run_result.plans_generated,
+                "Experiment completed"
+            );
+            registry.complete(experiment_id, convert_run_result(run_result))
+        }
+        Err(error) => {
+            if error == "Cancelled by user" {
+                tracing::info!(experiment_id = %experiment_id, "Experiment cancelled");
+                if registry
+                    .get(experiment_id)
+                    .is_some_and(|experiment| experiment.status == ExperimentStatus::Stopped)
+                {
+                    return Ok(());
+                }
+            } else {
                 tracing::warn!(
                     experiment_id = %experiment_id,
                     error = %error,
                     "Experiment failed"
                 );
-                let _ = reg.fail(&experiment_id, error.to_string());
             }
+            registry.fail(experiment_id, error)
         }
-    });
+    }
 }
 
 async fn run_experiment(
@@ -686,13 +764,27 @@ mod tests {
             .expect("created experiment");
         assert_eq!(status, StatusCode::CREATED);
         assert!(created.created);
-        assert_eq!(created.status, ExperimentStatus::Queued);
+        assert_eq!(created.status, ExperimentStatus::Running);
 
         let Json(list) = handle_list_experiments(State(state), Query(ListParams::default()))
             .await
             .expect("list experiments");
         assert_eq!(list.total, 1);
-        assert_eq!(list.experiments[0].score_summary, "waiting to start");
+        assert_eq!(list.experiments[0].score_summary, "running");
+    }
+
+    #[tokio::test]
+    async fn await_experiment_result_returns_cancelled_when_token_is_cancelled() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let result = await_experiment_result(
+            token,
+            std::future::pending::<Result<fx_improve::ImprovementRunResult, anyhow::Error>>(),
+        )
+        .await;
+
+        assert_eq!(result, Err("Cancelled by user".to_string()));
     }
 
     #[tokio::test]

@@ -95,8 +95,7 @@ impl TrainingDataset {
         }
         let mut file = std::fs::File::create(path)?;
         for example in &self.examples {
-            let line = serde_json::to_string(example)
-                .map_err(std::io::Error::other)?;
+            let line = serde_json::to_string(example).map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
         }
         Ok(())

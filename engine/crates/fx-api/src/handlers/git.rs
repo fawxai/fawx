@@ -474,10 +474,15 @@ async fn push_target(cwd: &Path, output: &GitOutput) -> Result<(String, String),
         .map(|(remote, _)| remote.clone())
         .or_else(|| parse_push_remote(output))
         .ok_or_else(|| GitError::new("unable to determine push remote"))?;
-    let branch = parse_push_branch(output)
-        .or_else(|| upstream.map(|(_, branch)| branch))
-        .or_else(|| current_branch(cwd).ok())
-        .ok_or_else(|| GitError::new("unable to determine push branch"))?;
+    let branch = if let Some(branch) = parse_push_branch(output) {
+        branch
+    } else if let Some((_, branch)) = upstream.as_ref() {
+        branch.clone()
+    } else if let Ok(branch) = current_branch(cwd).await {
+        branch
+    } else {
+        return Err(GitError::new("unable to determine push branch"));
+    };
     Ok((remote, branch))
 }
 
@@ -518,11 +523,12 @@ fn split_upstream_ref(upstream: &str) -> Result<(String, String), GitError> {
         .ok_or_else(|| GitError::new(format!("invalid upstream ref: {upstream}")))
 }
 
-fn current_branch(cwd: &Path) -> Result<String, GitError> {
-    let output = std::process::Command::new("git")
+async fn current_branch(cwd: &Path) -> Result<String, GitError> {
+    let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(cwd)
         .output()
+        .await
         .map_err(|error| GitError::new(format!("failed to read current branch: {error}")))?;
     if !output.status.success() {
         return Err(GitError::new("failed to read current branch"));

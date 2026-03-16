@@ -1929,10 +1929,14 @@ impl HeadlessSubagentFactory {
         let mut app =
             HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
         if let Some(model) = &config.model {
-            let _ = app.set_active_model(model);
+            if let Err(error) = app.set_active_model(model) {
+                tracing::warn!(model = %model, error = %error, "subagent model override failed");
+            }
         }
         if let Some(thinking) = &config.thinking {
-            let _ = app.set_thinking_level(thinking);
+            if let Err(error) = app.set_thinking_level(thinking) {
+                tracing::warn!(thinking = %thinking, error = %error, "subagent thinking override failed");
+            }
         }
         Ok(app)
     }
