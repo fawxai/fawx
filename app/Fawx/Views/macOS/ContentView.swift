@@ -11,6 +11,7 @@ struct ContentView: View {
     @Bindable var gitViewModel: GitViewModel
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var telemetryViewModel: TelemetryViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
     @Bindable var usageViewModel: UsageViewModel
 
@@ -110,6 +111,7 @@ struct ContentView: View {
                 appState: appState,
                 chatViewModel: chatViewModel,
                 permissionsViewModel: permissionsViewModel,
+                telemetryViewModel: telemetryViewModel,
                 synthesisViewModel: synthesisViewModel,
                 usageViewModel: usageViewModel
             )

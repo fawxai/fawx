@@ -16,6 +16,7 @@ struct FawxApp: App {
     @State private var gitViewModel: GitViewModel
     @State private var settingsViewModel: SettingsViewModel
     @State private var permissionsViewModel: PermissionsViewModel
+    @State private var telemetryViewModel: TelemetryViewModel
     @State private var synthesisViewModel: SynthesisViewModel
     @State private var usageViewModel: UsageViewModel
     @State private var setupViewModel: SetupViewModel
@@ -34,6 +35,7 @@ struct FawxApp: App {
         let gitViewModel = GitViewModel(appState: appState)
         let settingsViewModel = SettingsViewModel(appState: appState)
         let permissionsViewModel = PermissionsViewModel(appState: appState)
+        let telemetryViewModel = TelemetryViewModel(appState: appState)
         let synthesisViewModel = SynthesisViewModel(appState: appState)
         let usageViewModel = UsageViewModel(appState: appState)
         let setupViewModel = SetupViewModel(appState: appState)
@@ -47,6 +49,7 @@ struct FawxApp: App {
         _gitViewModel = State(initialValue: gitViewModel)
         _settingsViewModel = State(initialValue: settingsViewModel)
         _permissionsViewModel = State(initialValue: permissionsViewModel)
+        _telemetryViewModel = State(initialValue: telemetryViewModel)
         _synthesisViewModel = State(initialValue: synthesisViewModel)
         _usageViewModel = State(initialValue: usageViewModel)
         _setupViewModel = State(initialValue: setupViewModel)
@@ -137,6 +140,7 @@ struct FawxApp: App {
                 gitViewModel: gitViewModel,
                 settingsViewModel: settingsViewModel,
                 permissionsViewModel: permissionsViewModel,
+                telemetryViewModel: telemetryViewModel,
                 synthesisViewModel: synthesisViewModel,
                 usageViewModel: usageViewModel
             )
@@ -151,6 +155,7 @@ struct FawxApp: App {
                 gitViewModel: gitViewModel,
                 settingsViewModel: settingsViewModel,
                 permissionsViewModel: permissionsViewModel,
+                telemetryViewModel: telemetryViewModel,
                 synthesisViewModel: synthesisViewModel,
                 usageViewModel: usageViewModel
             )

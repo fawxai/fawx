@@ -20,6 +20,7 @@ struct TabRootView: View {
     @Bindable var gitViewModel: GitViewModel
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var telemetryViewModel: TelemetryViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
     @Bindable var usageViewModel: UsageViewModel
     @State private var selectedTab: RootTab = .chat
@@ -191,6 +192,7 @@ struct TabRootView: View {
                         appState: appState,
                         chatViewModel: chatViewModel,
                         permissionsViewModel: permissionsViewModel,
+                        telemetryViewModel: telemetryViewModel,
                         synthesisViewModel: synthesisViewModel,
                         usageViewModel: usageViewModel,
                         openSessions: {

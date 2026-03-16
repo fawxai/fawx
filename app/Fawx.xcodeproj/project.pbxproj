@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		009504689DAF5953AC83F803 /* UsageSettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EBAC07324B5BA38831E8F87 /* UsageSettingsPanel.swift */; };
+		0A1B2C3D4E5F60718293A4B5 /* Telemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7B8C9D0E1F2345A6B7C8D9 /* Telemetry.swift */; };
 		014AA085FD64490EA9FFADC9 /* IOSViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EBEBAEBE84A36EC81E2FC6C /* IOSViewModifiers.swift */; };
 		0190B1F3E250D3220089AABB /* PermissionsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC1890444EF1EA2B509EA92 /* PermissionsViewModel.swift */; };
 		01C5301484465E3E7C541A9D /* InputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 087BAB7361F5CCDC27BA6864 /* InputBar.swift */; };
@@ -62,6 +63,8 @@
 		3C14A04D5C6119E544E8FDC0 /* ChatTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1220A4A2A4B7E97E698344D0 /* ChatTranscript.swift */; };
 		3F5C75AD2C13BEE5E66C3AEF /* FormattersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A3D04ACC1D05027C3551689 /* FormattersTests.swift */; };
 		3F7B8BA7AC464855EB212A79 /* ProviderStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73DE6C8CB3C4908445029312 /* ProviderStep.swift */; };
+		4A5B6C7D8E9F0123A4B5C6D7 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9B0C1D2E3F4567A8B9C0D1 /* TelemetrySettingsPanel.swift */; };
+		5A6B7C8D9E0F1234A5B6C7D8 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9B0C1D2E3F4567A8B9C0D1 /* TelemetrySettingsPanel.swift */; };
 		43EB4E7C25ED26B1E975B253 /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8D4FC172453166D85114D88 /* SettingsViewModel.swift */; };
 		4434B83AA0C0928B713EA744 /* ChatDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66BB4F24881B0920C360CCD2 /* ChatDetailView.swift */; };
 		47F1CA7B59F8F29E3ECBD0CF /* SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02E62E5C85D4819024AE1EFE /* SessionListView.swift */; };
@@ -92,6 +95,7 @@
 		64175F9AE08DCBE56689543B /* ExperimentsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5034042A2AA2627984B5A5C5 /* ExperimentsViewModel.swift */; };
 		64B48B88589DAAA1CF142E9B /* SidebarSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946A14621A9A282DEB705EEC /* SidebarSelection.swift */; };
 		673DC8E775BA957B6421E89F /* Usage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11BFF651D03E0E963581BB73 /* Usage.swift */; };
+		1A2B3C4D5E6F708192A3B4C5 /* Telemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7B8C9D0E1F2345A6B7C8D9 /* Telemetry.swift */; };
 		68B1AA744FF35DA153136D09 /* JSONValueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CB40DD2F1D7B9B76438587D /* JSONValueTests.swift */; };
 		69C55993DDC2099858EFD9C7 /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232351F0DF7FF0EBB90785CE /* KeychainHelper.swift */; };
 		6B111CB1715A4326A3021CA9 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1AB5E3BFD623318C9101192 /* MessageBubble.swift */; };
@@ -123,6 +127,7 @@
 		8ADDECD164F3B2AAD313967E /* FawxClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFFF4154D4D9B8169FD9D9F7 /* FawxClient.swift */; };
 		8B2DFC34BD8C1F3D7DA57EBF /* PairingFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 820A7E36F11D83635B504EE7 /* PairingFlowTests.swift */; };
 		8B8E28F0202E137B1CBA8119 /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232351F0DF7FF0EBB90785CE /* KeychainHelper.swift */; };
+		2A3B4C5D6E7F8091A2B3C4D5 /* TelemetryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A8B9C0D1E2F3456A7B8C9D0 /* TelemetryViewModel.swift */; };
 		8C0B21EE44AC466CAF01C36C /* Session.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7F19EE118E04C627C071358 /* Session.swift */; };
 		8C277DC34AA3A272380684F6 /* ModelBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A34A4F474A3C63738988C4F0 /* ModelBadge.swift */; };
 		8DA2FA12A443CB1679A5D406 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = 5D9877CF87AB8998A43DACE5 /* MarkdownUI */; };
@@ -173,6 +178,7 @@
 		C611442CECB052D61D6D94BA /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C2E500BF4B907FA02585BB44 /* Assets.xcassets */; };
 		C68E000944DEE04BCD700B8D /* ModelInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A283E2181E2E7E4F28576BB /* ModelInfo.swift */; };
 		C86B9C2CBFA9411F82271B9B /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1C102D83B027ED47E7EFCC /* Typography.swift */; };
+		3A4B5C6D7E8F9012A3B4C5D6 /* TelemetryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A8B9C0D1E2F3456A7B8C9D0 /* TelemetryViewModel.swift */; };
 		C91E3CBA9479CBB77C0F118B /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F387D59910781C5ED91C8C79 /* SetupWizardView.swift */; };
 		CA7BB428CDB1F75FE846A4A4 /* KeychainHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4D5070D2FD9D2FED69F7DC3 /* KeychainHelperTests.swift */; };
 		CEE7FD790046A1E5C81B64EA /* FawxClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFFF4154D4D9B8169FD9D9F7 /* FawxClient.swift */; };
@@ -355,6 +361,9 @@
 		F836BAF2755ADDBE8ED750D9 /* Experiments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Experiments.swift; sourceTree = "<group>"; };
 		FED5328018149000B95E5360 /* SectionMenuButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionMenuButton.swift; sourceTree = "<group>"; };
 		FFFB5D0979E7B04955A759A9 /* SkillsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillsViewModel.swift; sourceTree = "<group>"; };
+		6A7B8C9D0E1F2345A6B7C8D9 /* Telemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Telemetry.swift; sourceTree = "<group>"; };
+		7A8B9C0D1E2F3456A7B8C9D0 /* TelemetryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryViewModel.swift; sourceTree = "<group>"; };
+		8A9B0C1D2E3F4567A8B9C0D1 /* TelemetrySettingsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetrySettingsPanel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -536,6 +545,7 @@
 				266FDB9D5C4C4294B9824915 /* SkillsView.swift */,
 				6FE3EF30F2592174E359957C /* StatusBar.swift */,
 				F16E21E51BEE32606C108B28 /* SynthesisSettingsPanel.swift */,
+				8A9B0C1D2E3F4567A8B9C0D1 /* TelemetrySettingsPanel.swift */,
 				A2E8890F4C465F005286B345 /* ToastView.swift */,
 				9A6130E5920E7904DA6D6312 /* ToolCallCard.swift */,
 				4EBAC07324B5BA38831E8F87 /* UsageSettingsPanel.swift */,
@@ -583,6 +593,7 @@
 				5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */,
 				FFFB5D0979E7B04955A759A9 /* SkillsViewModel.swift */,
 				068E87A8E0FC1B301B9E706B /* SynthesisViewModel.swift */,
+				7A8B9C0D1E2F3456A7B8C9D0 /* TelemetryViewModel.swift */,
 				75FE8A78B6B891D04A97F2E9 /* UsageViewModel.swift */,
 			);
 			path = ViewModels;
@@ -606,6 +617,7 @@
 				946A14621A9A282DEB705EEC /* SidebarSelection.swift */,
 				D7F8C22A99D83FF3BD92A7BE /* Skill.swift */,
 				C379D0DE77BBC0F8135DDD2C /* Synthesis.swift */,
+				6A7B8C9D0E1F2345A6B7C8D9 /* Telemetry.swift */,
 				C0F3654454E2926DF38F0ED7 /* ThinkingLevel.swift */,
 				11BFF651D03E0E963581BB73 /* Usage.swift */,
 			);
@@ -912,6 +924,9 @@
 				EA296FD3AADB876AD80D7FBD /* SynthesisSettingsPanel.swift in Sources */,
 				02524E6761A54713555B986F /* SynthesisViewModel.swift in Sources */,
 				7A4F42D1EBB023C8167B46CB /* TabRootView.swift in Sources */,
+				0A1B2C3D4E5F60718293A4B5 /* Telemetry.swift in Sources */,
+				4A5B6C7D8E9F0123A4B5C6D7 /* TelemetrySettingsPanel.swift in Sources */,
+				2A3B4C5D6E7F8091A2B3C4D5 /* TelemetryViewModel.swift in Sources */,
 				573397B0E9E88B8B4C423AE1 /* TailscaleStep.swift in Sources */,
 				316BC2FB3F33B3824EA69F76 /* ThinkingLevel.swift in Sources */,
 				F6BEF29A7856BE584C69DFDB /* ToastView.swift in Sources */,
@@ -1009,6 +1024,9 @@
 				2971AAC37FEB47FB003F073D /* SynthesisSettingsPanel.swift in Sources */,
 				09C5AD3E52F229B2B9CEC431 /* SynthesisViewModel.swift in Sources */,
 				F62F9353122ADFDA2A587DB4 /* TabRootView.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4C5 /* Telemetry.swift in Sources */,
+				5A6B7C8D9E0F1234A5B6C7D8 /* TelemetrySettingsPanel.swift in Sources */,
+				3A4B5C6D7E8F9012A3B4C5D6 /* TelemetryViewModel.swift in Sources */,
 				D7CF82CB291F2893D0BD40E9 /* TailscaleStep.swift in Sources */,
 				8499D77C5D19A517453D0E87 /* ThinkingLevel.swift in Sources */,
 				940AF70F880B7CCF34B3E6F3 /* ToastView.swift in Sources */,

@@ -248,6 +248,20 @@ actor FawxClient {
         try await performRequest(path: "/v1/usage", decodeAs: UsageResponse.self)
     }
 
+    func getTelemetryConsent() async throws -> TelemetryConsentResponse {
+        try await performRequest(path: "/v1/telemetry/consent", decodeAs: TelemetryConsentResponse.self)
+    }
+
+    func patchTelemetryConsent(_ request: TelemetryConsentPatchRequest) async throws -> TelemetryConsentResponse {
+        let body = try encoder.encode(request)
+        return try await performRequest(
+            path: "/v1/telemetry/consent",
+            method: "PATCH",
+            bodyData: body,
+            decodeAs: TelemetryConsentResponse.self
+        )
+    }
+
     func serverStatus() async throws -> ServerStatusResponse {
         try await performRequest(
             candidatePaths: ["/status", "/v1/status"],

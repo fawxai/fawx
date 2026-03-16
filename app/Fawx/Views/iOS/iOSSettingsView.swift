@@ -7,6 +7,7 @@ private enum SettingsRoute: Hashable {
     case modelThinking
     case authentication
     case permissions
+    case telemetry
     case synthesis
     case usage
 }
@@ -16,6 +17,7 @@ struct iOSSettingsView: View {
     @Bindable var appState: AppState
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var telemetryViewModel: TelemetryViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
     @Bindable var usageViewModel: UsageViewModel
     let openSessions: () -> Void
@@ -80,6 +82,10 @@ struct iOSSettingsView: View {
                         Text("Permissions & Safety")
                     }
 
+                    NavigationLink(value: SettingsRoute.telemetry) {
+                        Text("Privacy & Telemetry")
+                    }
+
                     NavigationLink(value: SettingsRoute.synthesis) {
                         Text("Custom Instructions")
                     }
@@ -135,6 +141,8 @@ struct iOSSettingsView: View {
                     iOSAuthStatusSettingsView(appState: appState)
                 case .permissions:
                     iOSPermissionsSettingsView(permissionsViewModel: permissionsViewModel)
+                case .telemetry:
+                    iOSTelemetrySettingsView(telemetryViewModel: telemetryViewModel)
                 case .synthesis:
                     iOSSynthesisSettingsView(synthesisViewModel: synthesisViewModel)
                 case .usage:
@@ -374,6 +382,22 @@ private struct iOSSynthesisSettingsView: View {
         }
         .background(Color.fawxBackground.ignoresSafeArea())
         .navigationTitle("Instructions")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+    }
+}
+
+private struct iOSTelemetrySettingsView: View {
+    @Bindable var telemetryViewModel: TelemetryViewModel
+
+    var body: some View {
+        ScrollView {
+            TelemetrySettingsPanel(viewModel: telemetryViewModel)
+                .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Privacy & Telemetry")
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
