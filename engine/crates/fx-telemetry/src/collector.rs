@@ -30,6 +30,9 @@ impl SignalCollector {
     }
 
     /// Record a signal. Silently dropped if category not consented.
+    ///
+    /// Holds both consent and buffer locks atomically to prevent TOCTOU
+    /// races where consent is revoked between the check and the write.
     pub fn record(&self, category: SignalCategory, event: &str, value: serde_json::Value) {
         let consent = match self.consent.read() {
             Ok(guard) => guard,
@@ -38,23 +41,28 @@ impl SignalCollector {
         if !consent.is_category_enabled(&category) {
             return;
         }
-        drop(consent);
-
-        let signal = TelemetrySignal {
-            id: Uuid::new_v4(),
-            category,
-            event: event.to_owned(),
-            value,
-            timestamp: Utc::now(),
-            session_id: self.session_id.clone(),
-        };
-
+        // Hold consent lock while acquiring buffer lock to prevent
+        // a concurrent update_consent from revoking between check and write.
         let mut buffer = match self.buffer.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Re-check after acquiring buffer lock (consent may have been
+        // revoked if another thread upgraded to write between our read
+        // and the buffer write acquisition — belt and suspenders).
+        if !consent.is_category_enabled(&category) {
+            return;
+        }
+        drop(consent);
         if buffer.len() < self.max_buffer_size {
-            buffer.push(signal);
+            buffer.push(TelemetrySignal {
+                id: Uuid::new_v4(),
+                category,
+                event: event.to_owned(),
+                value,
+                timestamp: Utc::now(),
+                session_id: self.session_id.clone(),
+            });
         }
     }
 

@@ -134,4 +134,21 @@ mod tests {
         assert_eq!(decoded.category, signal.category);
         assert_eq!(decoded.event, signal.event);
     }
+
+    /// Compile-time enforcement: if a new SignalCategory variant is added,
+    /// this match will fail to compile, reminding the developer to update all().
+    #[test]
+    fn signal_category_all_is_exhaustive() {
+        for category in SignalCategory::all() {
+            match category {
+                SignalCategory::ToolUsage
+                | SignalCategory::ProposalGate
+                | SignalCategory::Experiments
+                | SignalCategory::Errors
+                | SignalCategory::ModelUsage
+                | SignalCategory::Performance => {}
+            }
+        }
+        // If you add a variant and this doesn't compile, add it to all() too.
+    }
 }

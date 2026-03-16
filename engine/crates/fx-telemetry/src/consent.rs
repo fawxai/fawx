@@ -36,9 +36,11 @@ impl TelemetryConsent {
         self.updated_at = Utc::now();
     }
 
-    /// Disable everything.
+    /// Disable everything. Clears per-category map so re-enabling
+    /// the master switch doesn't silently re-enable all categories.
     pub fn disable_all(&mut self) {
         self.enabled = false;
+        self.categories.clear();
         self.updated_at = Utc::now();
     }
 
@@ -93,6 +95,18 @@ mod tests {
         consent.disable_all();
         assert!(!consent.enabled);
         assert_eq!(consent.enabled_count(), 0);
+    }
+
+    #[test]
+    fn disable_all_clears_categories_so_reenable_is_clean() {
+        let mut consent = TelemetryConsent::default();
+        consent.enable_all();
+        consent.disable_all();
+        // Re-enabling master without explicitly enabling categories
+        // should NOT silently re-enable anything.
+        consent.enabled = true;
+        assert_eq!(consent.enabled_count(), 0);
+        assert!(!consent.is_category_enabled(&SignalCategory::ToolUsage));
     }
 
     #[test]
