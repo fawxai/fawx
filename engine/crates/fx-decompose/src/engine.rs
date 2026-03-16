@@ -258,11 +258,11 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 sub_goals: vec![crate::context::SubGoalAttempt {
                     description: "optimize hot path".to_owned(),
-                    outcome: "completed".to_owned(),
+                    outcome: crate::context::SubGoalAttemptOutcome::Completed,
                     score: Some(0.7),
                     failure_reason: None,
                 }],
-                decision: "reject".to_owned(),
+                decision: crate::context::AttemptDecision::Reject,
                 best_score: 0.5,
             }],
             stats: crate::context::FitnessStats {

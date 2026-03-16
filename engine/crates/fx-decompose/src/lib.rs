@@ -67,7 +67,8 @@ pub enum SubGoalOutcome {
 
 pub use aggregator::{AggregatedResult, ResultAggregator, SimpleAggregator};
 pub use context::{
-    DecompositionAttempt, DecompositionContext, FitnessContext, FitnessStats, SubGoalAttempt,
+    AttemptDecision, DecompositionAttempt, DecompositionContext, FitnessContext, FitnessStats,
+    SubGoalAttempt, SubGoalAttemptOutcome,
 };
 pub use dag::ExecutionDag;
 #[cfg(any(test, feature = "test-support"))]

@@ -80,18 +80,58 @@ pub struct FitnessContext {
     pub stats: FitnessStats,
 }
 
+/// Outcome of a decomposition attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptDecision {
+    Accept,
+    Reject,
+    Inconclusive,
+}
+
+impl std::fmt::Display for AttemptDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accept => write!(f, "accept"),
+            Self::Reject => write!(f, "reject"),
+            Self::Inconclusive => write!(f, "inconclusive"),
+        }
+    }
+}
+
+/// Outcome of an individual sub-goal attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubGoalAttemptOutcome {
+    Completed,
+    Failed,
+    Skipped,
+    BudgetExhausted,
+}
+
+impl std::fmt::Display for SubGoalAttemptOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Skipped => write!(f, "skipped"),
+            Self::BudgetExhausted => write!(f, "budget_exhausted"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecompositionAttempt {
     pub timestamp: DateTime<Utc>,
     pub sub_goals: Vec<SubGoalAttempt>,
-    pub decision: String,
+    pub decision: AttemptDecision,
     pub best_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubGoalAttempt {
     pub description: String,
-    pub outcome: String,
+    pub outcome: SubGoalAttemptOutcome,
     pub score: Option<f64>,
     pub failure_reason: Option<String>,
 }
@@ -154,11 +194,11 @@ mod tests {
                 timestamp: Utc::now(),
                 sub_goals: vec![SubGoalAttempt {
                     description: "fix bug".to_owned(),
-                    outcome: "completed".to_owned(),
+                    outcome: SubGoalAttemptOutcome::Completed,
                     score: Some(0.8),
                     failure_reason: None,
                 }],
-                decision: "accept".to_owned(),
+                decision: AttemptDecision::Accept,
                 best_score: 0.8,
             }],
             stats: FitnessStats {
