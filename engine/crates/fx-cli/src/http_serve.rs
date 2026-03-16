@@ -17,6 +17,7 @@ pub async fn run(
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> anyhow::Result<i32> {
     let data_dir = crate::startup::fawx_data_dir();
+    let experiment_registry = app.experiment_registry().cloned();
     let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
         Ok(store) => Some(store),
         Err(error) => {
@@ -44,6 +45,7 @@ pub async fn run(
             webhook_channels,
             cron_store,
             improvement_provider,
+            experiment_registry,
         },
     )
     .await;

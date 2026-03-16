@@ -457,6 +457,7 @@ struct HeadlessStartup {
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
     skip_session_db: bool,
+    #[cfg(feature = "http")] wire_experiment_registry: bool,
 ) -> anyhow::Result<HeadlessStartup> {
     let config = startup::load_config()?;
     let logging_guard = headless::init_serve_logging(&config)?;
@@ -474,6 +475,15 @@ fn build_headless_startup(
     let config_manager = Some(build_config_manager(&config));
     let improvement_provider = startup::build_improvement_provider(&auth_manager, &config);
     let improvement_provider_for_http = improvement_provider.clone();
+    #[cfg(feature = "http")]
+    let experiment_registry = if wire_experiment_registry {
+        let registry_data_dir = startup::configured_data_dir(&data_dir, &config);
+        Some(startup::build_shared_experiment_registry(
+            &registry_data_dir,
+        )?)
+    } else {
+        None
+    };
     let app = build_headless_app(
         router,
         config,
@@ -482,6 +492,8 @@ fn build_headless_startup(
         config_manager,
         data_dir.clone(),
         skip_session_db,
+        #[cfg(feature = "http")]
+        experiment_registry,
     )?;
     Ok(HeadlessStartup {
         app,
@@ -506,6 +518,7 @@ fn build_headless_app(
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
     data_dir: PathBuf,
     skip_session_db: bool,
+    #[cfg(feature = "http")] experiment_registry: Option<fx_api::SharedExperimentRegistry>,
 ) -> anyhow::Result<headless::HeadlessApp> {
     let session_bus = startup::build_session_bus_for_data_dir(&data_dir);
     let subagent_manager = build_subagent_manager(
@@ -519,6 +532,8 @@ fn build_headless_app(
         .flatten();
     let options = startup::HeadlessLoopBuildOptions {
         session_registry,
+        #[cfg(feature = "http")]
+        experiment_registry: experiment_registry.clone(),
         ..parent_loop_build_options(
             &subagent_manager,
             config_manager.clone(),
@@ -544,6 +559,8 @@ fn build_headless_app(
         cron_store: bundle.cron_store,
         startup_warnings: bundle.startup_warnings,
         permission_callback_slot: bundle.permission_callback_slot,
+        #[cfg(feature = "http")]
+        experiment_registry,
     })
 }
 
@@ -612,11 +629,15 @@ async fn run_headless(
     json: bool,
     system_prompt: Option<std::path::PathBuf>,
 ) -> anyhow::Result<i32> {
+    #[cfg(feature = "http")]
+    let startup = build_headless_startup(system_prompt, false, false)?;
+    #[cfg(not(feature = "http"))]
+    let startup = build_headless_startup(system_prompt, false)?;
     let HeadlessStartup {
         mut app,
         _logging_guard,
         ..
-    } = build_headless_startup(system_prompt, false)?;
+    } = startup;
     if single {
         app.run_single(json).await
     } else {
@@ -637,7 +658,7 @@ async fn run_http_server(
         webhook_config,
         data_dir,
         improvement_provider,
-    } = build_headless_startup(system_prompt, true)?;
+    } = build_headless_startup(system_prompt, true, true)?;
     app.initialize();
     app.apply_http_defaults();
 

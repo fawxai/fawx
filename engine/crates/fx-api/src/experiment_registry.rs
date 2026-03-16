@@ -157,6 +157,8 @@ pub struct ExperimentResult {
     pub plans_generated: usize,
     pub proposals_written: Vec<String>,
     pub branches_created: Vec<String>,
+    #[serde(default)]
+    pub score_summary: Option<String>,
     pub skipped: Vec<SkippedItem>,
 }
 
@@ -508,6 +510,7 @@ mod tests {
             plans_generated: 2,
             proposals_written: vec!["proposal.md".to_string()],
             branches_created: vec!["feature/branch".to_string()],
+            score_summary: None,
             skipped: vec![SkippedItem {
                 name: "candidate".to_string(),
                 reason: "not enough signal".to_string(),
@@ -530,6 +533,22 @@ mod tests {
             result: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn experiment_result_deserializes_without_score_summary_for_backwards_compatibility() {
+        let result: ExperimentResult = serde_json::from_str(
+            r#"{
+                "plans_generated": 1,
+                "proposals_written": ["proposal.md"],
+                "branches_created": [],
+                "skipped": []
+            }"#,
+        )
+        .expect("deserialize legacy result");
+
+        assert_eq!(result.plans_generated, 1);
+        assert_eq!(result.score_summary, None);
     }
 
     #[test]

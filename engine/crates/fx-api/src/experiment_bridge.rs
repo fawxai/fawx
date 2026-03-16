@@ -1,8 +1,10 @@
 use crate::experiment_registry::{
-    ExperimentConfig, ExperimentKind, ExperimentRegistry, ExperimentResult, SkippedItem,
+    ExperimentConfig, ExperimentKind, ExperimentRegistry, ExperimentResult,
 };
 use crate::SharedExperimentRegistry;
 use fx_tools::ExperimentRegistrar;
+
+const MAX_SCORE_SUMMARY_CHARS: usize = 2_000;
 
 pub struct RegistryBridge {
     registry: SharedExperimentRegistry,
@@ -72,19 +74,17 @@ fn completed_result(summary: &str) -> ExperimentResult {
         plans_generated: 0,
         proposals_written: Vec::new(),
         branches_created: Vec::new(),
-        skipped: summary_item(summary),
+        score_summary: normalize_score_summary(summary),
+        skipped: Vec::new(),
     }
 }
 
-fn summary_item(summary: &str) -> Vec<SkippedItem> {
+fn normalize_score_summary(summary: &str) -> Option<String> {
     let trimmed = summary.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return None;
     }
-    vec![SkippedItem {
-        name: "summary".to_string(),
-        reason: trimmed.chars().take(200).collect(),
-    }]
+    Some(trimmed.chars().take(MAX_SCORE_SUMMARY_CHARS).collect())
 }
 
 #[cfg(test)]
@@ -114,11 +114,33 @@ mod tests {
         let registry = registry.try_lock().expect("registry lock");
         let experiment = registry.get(&id).expect("experiment");
         assert_eq!(experiment.status, ExperimentStatus::Completed);
-        assert_eq!(experiment.result.as_ref().expect("result").skipped.len(), 1);
         assert_eq!(
-            experiment.result.as_ref().expect("result").skipped[0].name,
-            "summary"
+            experiment
+                .result
+                .as_ref()
+                .expect("result")
+                .score_summary
+                .as_deref(),
+            Some("done")
         );
+        assert!(experiment
+            .result
+            .as_ref()
+            .expect("result")
+            .skipped
+            .is_empty());
+    }
+
+    #[test]
+    fn completed_result_keeps_up_to_two_thousand_summary_chars() {
+        let summary = "x".repeat(MAX_SCORE_SUMMARY_CHARS + 50);
+        let result = completed_result(&summary);
+
+        assert_eq!(
+            result.score_summary.as_ref().map(String::len),
+            Some(MAX_SCORE_SUMMARY_CHARS)
+        );
+        assert!(result.skipped.is_empty());
     }
 
     fn experiment_status(

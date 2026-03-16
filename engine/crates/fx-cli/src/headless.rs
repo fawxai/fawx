@@ -162,6 +162,8 @@ pub struct HeadlessAppDeps {
     pub startup_warnings: Vec<StartupWarning>,
     pub permission_callback_slot:
         Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    #[cfg(feature = "http")]
+    pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -187,6 +189,8 @@ pub struct HeadlessApp {
     session_key: Option<SessionKey>,
     cron_store: Option<fx_cron::SharedCronStore>,
     startup_warnings: Vec<StartupWarning>,
+    #[cfg(feature = "http")]
+    experiment_registry: Option<fx_api::SharedExperimentRegistry>,
     error_history: VecDeque<ErrorRecord>,
     /// Cumulative token usage across all cycles in this session.
     cumulative_tokens: TokenUsage,
@@ -339,6 +343,8 @@ impl HeadlessApp {
             session_key: deps.session_key,
             cron_store: deps.cron_store,
             startup_warnings: deps.startup_warnings,
+            #[cfg(feature = "http")]
+            experiment_registry: deps.experiment_registry,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: deps.permission_callback_slot,
@@ -605,31 +611,32 @@ impl HeadlessApp {
         self.cron_store.as_ref()
     }
 
+    #[cfg(feature = "http")]
+    pub fn experiment_registry(&self) -> Option<&fx_api::SharedExperimentRegistry> {
+        self.experiment_registry.as_ref()
+    }
+
     pub fn thinking_available_levels(&self) -> Vec<String> {
         self.thinking_registry.available_levels(&self.active_model)
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
-        self.switch_active_model(selector)
-            .map(|result| result.active_model)
+        self.apply_active_model_selection(selector)
+            .map(|(active_model, _)| active_model)
     }
 
     #[cfg(feature = "http")]
     pub fn switch_active_model(&mut self, selector: &str) -> anyhow::Result<ModelSwitchDto> {
         let previous_model = self.active_model.clone();
-        let resolved = resolve_headless_model_selector(&self.router, selector)?;
-        apply_headless_active_model(self, &resolved);
-        persist_default_model(
-            &mut self.config,
-            self.config_manager.as_ref(),
-            &fawx_data_dir(),
-            &resolved,
-        )?;
-        let thinking_adjusted = self.adjust_thinking_for_active_model()?;
+        let (active_model, thinking_adjusted) = self.apply_active_model_selection(selector)?;
         Ok(ModelSwitchDto {
             previous_model,
-            active_model: resolved,
-            thinking_adjusted,
+            active_model,
+            thinking_adjusted: thinking_adjusted.map(|(from, to)| ThinkingAdjustedDto {
+                from: from.to_string(),
+                to: to.to_string(),
+                reason: thinking_adjustment_reason(from, to, self.active_provider_name()),
+            }),
         })
     }
 
@@ -647,6 +654,7 @@ impl HeadlessApp {
         ))
     }
 
+    #[cfg(feature = "http")]
     fn active_provider_name(&self) -> Option<&str> {
         self.router.provider_for_model(&self.active_model)
     }
@@ -655,10 +663,7 @@ impl HeadlessApp {
         self.config.general.thinking.unwrap_or_default()
     }
 
-    pub fn set_supported_thinking_level(
-        &mut self,
-        level: &str,
-    ) -> anyhow::Result<ThinkingLevelDto> {
+    fn apply_supported_thinking_level(&mut self, level: &str) -> anyhow::Result<()> {
         let budget: ThinkingBudget = level
             .parse()
             .map_err(|error: String| anyhow::anyhow!(error))?;
@@ -670,7 +675,21 @@ impl HeadlessApp {
             &fawx_data_dir(),
             Some(&budget.to_string()),
         )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "http")]
+    pub fn set_supported_thinking_level(
+        &mut self,
+        level: &str,
+    ) -> anyhow::Result<ThinkingLevelDto> {
+        self.apply_supported_thinking_level(level)?;
         Ok(self.thinking_level_dto())
+    }
+
+    #[cfg(not(feature = "http"))]
+    pub fn set_supported_thinking_level(&mut self, level: &str) -> anyhow::Result<()> {
+        self.apply_supported_thinking_level(level)
     }
 
     fn ensure_supported_thinking_budget(&self, budget: ThinkingBudget) -> anyhow::Result<()> {
@@ -695,8 +714,25 @@ impl HeadlessApp {
         }
     }
 
-    #[cfg(feature = "http")]
-    fn adjust_thinking_for_active_model(&mut self) -> anyhow::Result<Option<ThinkingAdjustedDto>> {
+    fn apply_active_model_selection(
+        &mut self,
+        selector: &str,
+    ) -> anyhow::Result<(String, Option<(ThinkingBudget, ThinkingBudget)>)> {
+        let active_model = resolve_headless_model_selector(&self.router, selector)?;
+        apply_headless_active_model(self, &active_model);
+        persist_default_model(
+            &mut self.config,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            &active_model,
+        )?;
+        let thinking_adjusted = self.align_thinking_for_active_model()?;
+        Ok((active_model, thinking_adjusted))
+    }
+
+    fn align_thinking_for_active_model(
+        &mut self,
+    ) -> anyhow::Result<Option<(ThinkingBudget, ThinkingBudget)>> {
         let current = self.current_thinking_budget();
         if self.is_supported_thinking_budget(current) {
             return Ok(None);
@@ -709,11 +745,7 @@ impl HeadlessApp {
             &fawx_data_dir(),
             Some(&adjusted.to_string()),
         )?;
-        Ok(Some(ThinkingAdjustedDto {
-            from: current.to_string(),
-            to: adjusted.to_string(),
-            reason: thinking_adjustment_reason(current, adjusted, self.active_provider_name()),
-        }))
+        Ok(Some((current, adjusted)))
     }
 
     fn is_supported_thinking_budget(&self, budget: ThinkingBudget) -> bool {
@@ -1927,6 +1959,8 @@ impl HeadlessSubagentFactory {
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
             permission_callback_slot: bundle.permission_callback_slot,
+            #[cfg(feature = "http")]
+            experiment_registry: None,
         };
         let mut app =
             HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
@@ -2330,8 +2364,11 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            #[cfg(feature = "http")]
+            experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         }
@@ -2579,6 +2616,8 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "http")]
+            experiment_registry: None,
         }
     }
 
@@ -2858,8 +2897,11 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            #[cfg(feature = "http")]
+            experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
@@ -3192,8 +3234,11 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            #[cfg(feature = "http")]
+            experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
@@ -3235,8 +3280,11 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            #[cfg(feature = "http")]
+            experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
