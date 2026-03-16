@@ -40,6 +40,7 @@ members = [
     "engine/crates/fx-bus",
     "engine/crates/fx-cron",
     "engine/crates/fx-consensus",
+    "engine/crates/fx-training",
 ]
 exclude = [
     "skills/calculator-skill",
