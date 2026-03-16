@@ -343,6 +343,9 @@ fn tool_to_action_category(tool_name: &str) -> &'static str {
         "shell" | "bash" | "execute_command" => "shell",
         "git" | "git_status" | "git_diff" | "git_commit" | "git_push" => "git",
         "delete_file" | "remove_file" => "file_delete",
+        "run_experiment" | "experiment" => "tool_call",
+        "subagent_spawn" | "subagent_status" | "subagent_cancel" => "tool_call",
+        "run_command" | "execute" => "code_execute",
         _ => "unknown",
     }
 }
