@@ -8,6 +8,36 @@ final class FormattersTests: XCTestCase {
         XCTAssertEqual(url, "http://localhost:8400")
     }
 
+    func testCanonicalizeServerURLDefaultsRemoteHostsToHTTPS() {
+        let url = canonicalizeServerURL("example.com:8400/v1/chat?foo=bar#frag")
+
+        XCTAssertEqual(url, "https://example.com:8400")
+    }
+
+    func testCanonicalizeServerURLDefaultsBonjourHostsToHTTPS() {
+        let url = canonicalizeServerURL("myserver.local:8400/v1/chat?foo=bar#frag")
+
+        XCTAssertEqual(url, "https://myserver.local:8400")
+    }
+
+    func testCanonicalizeServerURLDefaultsLoopbackHostsToHTTP() {
+        let url = canonicalizeServerURL("localhost:8400/v1/chat?foo=bar#frag")
+
+        XCTAssertEqual(url, "http://localhost:8400")
+    }
+
+    func testCanonicalizeServerURLAllowsExplicitLocalNetworkHTTP() {
+        let url = canonicalizeServerURL("http://192.168.1.10:8400")
+
+        XCTAssertEqual(url, "http://192.168.1.10:8400")
+    }
+
+    func testCanonicalizeServerURLRejectsExplicitRemoteHTTP() {
+        let url = canonicalizeServerURL("http://example.com:8400")
+
+        XCTAssertNil(url)
+    }
+
     func testCanonicalizeServerURLRejectsDoubleScheme() {
         let url = canonicalizeServerURL("http://https://example.com")
 

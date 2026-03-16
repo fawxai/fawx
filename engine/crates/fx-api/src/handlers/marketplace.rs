@@ -1,7 +1,8 @@
+use crate::skill_manifests::{update_skill_capabilities, SkillManifestError};
+use crate::state::HttpState;
 use crate::types::ErrorBody;
-use axum::extract::{Path, Query};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 const MARKETPLACE_NOT_CONNECTED_MESSAGE: &str = "Marketplace not yet connected";
@@ -40,6 +41,20 @@ pub struct InstallSkillRequest {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateSkillPermissionsRequest {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateSkillPermissionsResponse {
+    pub updated: bool,
+    pub name: String,
+    pub capabilities: Vec<String>,
+    pub restart_required: bool,
+}
+
 pub async fn handle_search_skills(Query(params): Query<SearchQuery>) -> Json<SkillSearchResponse> {
     Json(SkillSearchResponse {
         query: params.q,
@@ -60,6 +75,23 @@ pub async fn handle_remove_skill(Path(name): Path<String>) -> (StatusCode, Json<
     skill_not_found(name)
 }
 
+pub async fn handle_update_skill_permissions(
+    State(state): State<HttpState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateSkillPermissionsRequest>,
+) -> Result<Json<UpdateSkillPermissionsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let capabilities =
+        update_skill_capabilities(&state.data_dir.join("skills"), &name, &request.capabilities)
+            .map_err(skill_manifest_error)?;
+
+    Ok(Json(UpdateSkillPermissionsResponse {
+        updated: true,
+        name,
+        capabilities,
+        restart_required: true,
+    }))
+}
+
 fn marketplace_unavailable() -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -74,6 +106,21 @@ fn skill_not_found(name: String) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::NOT_FOUND,
         Json(ErrorBody {
             error: format!("Skill '{name}' not found"),
+        }),
+    )
+}
+
+fn skill_manifest_error(error: SkillManifestError) -> (StatusCode, Json<ErrorBody>) {
+    let status = match &error {
+        SkillManifestError::NotFound(_) => StatusCode::NOT_FOUND,
+        SkillManifestError::Invalid(_) => StatusCode::BAD_REQUEST,
+        SkillManifestError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (
+        status,
+        Json(ErrorBody {
+            error: error.message().to_string(),
         }),
     )
 }
@@ -152,5 +199,20 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.0.error, "Skill 'portfolio-tracker' not found");
+    }
+
+    #[test]
+    fn update_skill_permissions_response_serializes() {
+        let response = UpdateSkillPermissionsResponse {
+            updated: true,
+            name: "weather".into(),
+            capabilities: vec!["network".into(), "notifications".into()],
+            restart_required: true,
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["name"], "weather");
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["capabilities"][0], "network");
     }
 }

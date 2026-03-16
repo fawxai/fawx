@@ -745,7 +745,7 @@ impl HeadlessApp {
         ContextInfoDto::from_snapshot(&self.context_info_snapshot())
     }
 
-    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>)> {
+    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
         match self.runtime_info.read() {
             Ok(info) => runtime_skill_summaries(&info),
             Err(error) => {
@@ -1435,7 +1435,7 @@ fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
     statuses.into_values().collect()
 }
 
-fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>)> {
+fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>, Vec<String>)> {
     info.skills
         .iter()
         .map(|skill| {
@@ -1443,6 +1443,7 @@ fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<Strin
                 skill.name.clone(),
                 skill.description.clone().unwrap_or_default(),
                 skill.tool_names.clone(),
+                skill.capabilities.clone(),
             )
         })
         .collect()

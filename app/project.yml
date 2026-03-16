@@ -31,6 +31,7 @@ targets:
         PRODUCT_NAME: Fawx
         PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.mac
         INFOPLIST_FILE: Fawx/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Fawx/Fawx-macOS.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
   Fawx-iOS:

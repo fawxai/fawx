@@ -1268,6 +1268,7 @@ mod routing_and_status {
                     name: (*name).to_string(),
                     description: (*description).map(ToString::to_string),
                     tool_names: tools.iter().map(ToString::to_string).collect(),
+                    capabilities: Vec::new(),
                 },
             )
             .collect();
@@ -1557,7 +1558,13 @@ mod routing_and_status {
         let app = build_router(test_state_with_config(config, None, Vec::new()), None);
 
         let response = app
-            .oneshot(authed_request("GET", "/v1/setup/status"))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/setup/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
 

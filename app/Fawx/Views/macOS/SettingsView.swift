@@ -5,17 +5,25 @@ struct SettingsView: View {
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var appState: AppState
     @Bindable var chatViewModel: ChatViewModel
+    @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var synthesisViewModel: SynthesisViewModel
+    @Bindable var usageViewModel: UsageViewModel
     @State private var isPresentingModelSelector = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: FawxSpacing.paddingXL) {
                 connectionSection
+                serverSection
+                pairingSection
                 modelThinkingSection
                 authStatusSection
+                permissionsSection
+                synthesisSection
+                usageSection
                 appearanceSection
             }
-            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: 760, alignment: .leading)
             .padding(.horizontal, FawxSpacing.paddingXL)
             .padding(.vertical, FawxSpacing.paddingLG)
         }
@@ -23,6 +31,7 @@ struct SettingsView: View {
         .task {
             if appState.isConfigured {
                 await appState.revalidateConnection(allowReconnect: false)
+                await appState.refreshSettingsState()
             }
         }
     }
@@ -31,9 +40,17 @@ struct SettingsView: View {
         settingsSection("Connection") {
             settingsCard {
                 settingsValueRow(
+                    label: "Mode",
+                    value: appState.isRemoteClient ? "Remote Client" : "Local Server",
+                    isSecondary: false
+                )
+
+                settingsDivider
+
+                settingsValueRow(
                     label: "Server URL",
-                    value: settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL,
-                    isSecondary: settingsViewModel.serverURL.isEmpty,
+                    value: appState.displayedServerURLString.isEmpty ? "Not configured" : appState.displayedServerURLString,
+                    isSecondary: appState.displayedServerURLString.isEmpty,
                     allowsSelection: true
                 )
 
@@ -41,8 +58,10 @@ struct SettingsView: View {
 
                 settingsValueRow(
                     label: "Paired as",
-                    value: settingsViewModel.pairedDeviceName ?? "Not paired",
-                    isSecondary: settingsViewModel.pairedDeviceName == nil
+                    value: appState.isRemoteClient
+                        ? (settingsViewModel.pairedDeviceName ?? "Not paired")
+                        : "This Mac",
+                    isSecondary: settingsViewModel.pairedDeviceName == nil && appState.isRemoteClient
                 )
 
                 settingsDivider
@@ -53,8 +72,6 @@ struct SettingsView: View {
                     isSecondary: true
                 )
 
-                settingsDivider
-
                 HStack(spacing: FawxSpacing.paddingMD) {
                     Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
                         Task {
@@ -63,12 +80,14 @@ struct SettingsView: View {
                     }
                     .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
 
-                    Button("Unpair", role: .destructive) {
-                        Task {
-                            await settingsViewModel.unpair()
+                    if appState.isRemoteClient {
+                        Button("Unpair", role: .destructive) {
+                            Task {
+                                await settingsViewModel.unpair()
+                            }
                         }
+                        .disabled(!settingsViewModel.isPaired)
                     }
-                    .disabled(!settingsViewModel.isPaired)
 
                     Spacer(minLength: 0)
                 }
@@ -79,6 +98,26 @@ struct SettingsView: View {
                     .font(FawxTypography.chatBody)
                     .foregroundStyle(testStatusColor)
             }
+        }
+    }
+
+    private var serverSection: some View {
+        settingsSection("Server") {
+            ServerSettingsPanel(
+                appState: appState,
+                isReadOnly: false
+            )
+        }
+    }
+
+    private var pairingSection: some View {
+        settingsSection("iPhone Pairing") {
+            PairingSettingsPanel(
+                appState: appState,
+                settingsViewModel: settingsViewModel,
+                isReadOnly: false,
+                openScanner: nil
+            )
         }
     }
 
@@ -173,10 +212,25 @@ struct SettingsView: View {
 
     private var authStatusSection: some View {
         settingsSection("Auth Status") {
-            AuthStatusList(
-                providers: appState.authProviders,
-                errorMessage: appState.authProvidersError
-            )
+            AuthStatusList(appState: appState)
+        }
+    }
+
+    private var permissionsSection: some View {
+        settingsSection("Permissions & Safety") {
+            PermissionsSettingsPanel(viewModel: permissionsViewModel)
+        }
+    }
+
+    private var synthesisSection: some View {
+        settingsSection("Custom Instructions") {
+            SynthesisSettingsPanel(viewModel: synthesisViewModel)
+        }
+    }
+
+    private var usageSection: some View {
+        settingsSection("Usage") {
+            UsageSettingsPanel(viewModel: usageViewModel)
         }
     }
 
@@ -187,26 +241,26 @@ struct SettingsView: View {
     private var connectionStatusLabel: String {
         switch appState.connectionStatus {
         case .connected:
-            return "Connected"
+            "Connected"
         case .connecting:
-            return "Connecting"
+            "Connecting"
         case .reconnecting:
-            return "Reconnecting"
+            "Reconnecting"
         case .disconnected:
-            return "Disconnected"
+            "Disconnected"
         }
     }
 
     private var testStatusColor: Color {
         switch settingsViewModel.testStatusKind {
         case .idle:
-            return .fawxTextSecondary
+            .fawxTextSecondary
         case .success:
-            return .fawxSuccess
+            .fawxSuccess
         case .warning:
-            return .fawxWarning
+            .fawxWarning
         case .failure:
-            return .fawxError
+            .fawxError
         }
     }
 
@@ -280,7 +334,6 @@ struct SettingsView: View {
 private struct SelectableTextModifier: ViewModifier {
     let isSelectable: Bool
 
-    @ViewBuilder
     func body(content: Content) -> some View {
         if isSelectable {
             content.textSelection(.enabled)

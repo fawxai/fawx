@@ -6,12 +6,12 @@ struct SkillsView: View {
 
     @Bindable var skillsViewModel: SkillsViewModel
     let showsHeader: Bool
-    let searchText: String
+    @State private var selectedSection: SkillsSection = .installed
+    @State private var searchText = ""
 
-    init(skillsViewModel: SkillsViewModel, showsHeader: Bool = true, searchText: String = "") {
+    init(skillsViewModel: SkillsViewModel, showsHeader: Bool = true) {
         _skillsViewModel = Bindable(skillsViewModel)
         self.showsHeader = showsHeader
-        self.searchText = searchText
     }
 
     var body: some View {
@@ -21,6 +21,8 @@ struct SkillsView: View {
                     header
                 }
 
+                sectionPicker
+                searchField
                 content
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -30,8 +32,52 @@ struct SkillsView: View {
         .task {
             await skillsViewModel.refresh()
         }
+        .task(id: selectedSection == .marketplace ? searchText : "__installed__") {
+            guard selectedSection == .marketplace else {
+                return
+            }
+
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else {
+                return
+            }
+            await skillsViewModel.searchMarketplace(query: searchText)
+        }
         .refreshable {
             await skillsViewModel.refresh()
+            if selectedSection == .marketplace {
+                await skillsViewModel.searchMarketplace(query: searchText)
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { skillsViewModel.editingSkill != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        skillsViewModel.cancelEditingPermissions()
+                    }
+                }
+            )
+        ) {
+            if let skill = skillsViewModel.editingSkill {
+                SkillPermissionsEditor(
+                    skill: skill,
+                    selectedCapabilities: skillsViewModel.skillPermissionsDraft,
+                    errorMessage: skillsViewModel.skillPermissionsErrorMessage,
+                    isSaving: skillsViewModel.savingSkillPermissionsName == skill.name,
+                    toggleCapability: { capability, enabled in
+                        skillsViewModel.setCapability(capability, enabled: enabled)
+                    },
+                    saveAction: {
+                        Task {
+                            await skillsViewModel.saveEditingPermissions()
+                        }
+                    },
+                    cancelAction: {
+                        skillsViewModel.cancelEditingPermissions()
+                    }
+                )
+            }
         }
     }
 
@@ -41,14 +87,66 @@ struct SkillsView: View {
                 .font(FawxTypography.heading1)
                 .foregroundStyle(Color.fawxText)
 
-            Text("Loaded on server")
+            Text(selectedSection == .installed ? "Loaded on server" : "Signed marketplace skills")
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
         }
     }
 
+    private var sectionPicker: some View {
+        Picker("Skill source", selection: $selectedSection) {
+            ForEach(SkillsSection.allCases, id: \.self) { section in
+                Text(section.title).tag(section)
+            }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityLabel("Skill source")
+    }
+
+    private var searchField: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            TextField(searchPrompt, text: $searchText)
+                .textFieldStyle(.plain)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxText)
+                .accessibilityIdentifier("skillsSearchField")
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, FawxSpacing.paddingMD)
+        .padding(.vertical, FawxSpacing.paddingSM)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        }
+    }
+
     @ViewBuilder
     private var content: some View {
+        switch selectedSection {
+        case .installed:
+            installedContent
+        case .marketplace:
+            MarketplaceView(skillsViewModel: skillsViewModel, searchText: searchText)
+        }
+    }
+
+    @ViewBuilder
+    private var installedContent: some View {
         if skillsViewModel.isLoading && skillsViewModel.skills.isEmpty {
             ProgressView("Loading skills...")
                 .foregroundStyle(Color.fawxTextSecondary)
@@ -90,7 +188,18 @@ struct SkillsView: View {
 
                 LazyVGrid(columns: gridColumns, spacing: FawxSpacing.paddingMD) {
                     ForEach(filteredSkills) { skill in
-                        SkillCardView(skill: skill)
+                        SkillCardView(
+                            skill: skill,
+                            isRemoving: skillsViewModel.removingSkillNames.contains(skill.name),
+                            isSavingPermissions: skillsViewModel.savingSkillPermissionsName == skill.name,
+                            editPermissionsAction: {
+                                skillsViewModel.beginEditingPermissions(for: skill)
+                            }
+                        ) {
+                            Task {
+                                await skillsViewModel.removeInstalledSkill(named: skill.name)
+                            }
+                        }
                     }
                 }
                 .accessibilityIdentifier("skillsGrid")
@@ -111,11 +220,21 @@ struct SkillsView: View {
                 skill.name,
                 skill.displayDescription ?? "",
                 skill.tools.joined(separator: " "),
+                skill.capabilities.joined(separator: " "),
             ]
 
             return haystacks.contains { value in
                 value.localizedLowercase.contains(normalizedQuery)
             }
+        }
+    }
+
+    private var searchPrompt: String {
+        switch selectedSection {
+        case .installed:
+            "Search installed skills"
+        case .marketplace:
+            "Search marketplace skills"
         }
     }
 
@@ -147,6 +266,10 @@ struct SkillsView: View {
 
 private struct SkillCardView: View {
     let skill: SkillSummary
+    let isRemoving: Bool
+    let isSavingPermissions: Bool
+    let editPermissionsAction: () -> Void
+    let removeAction: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
@@ -195,6 +318,44 @@ private struct SkillCardView: View {
                     ToolChip(label: "+\(remainingToolCount) more")
                 }
             }
+
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                Text("Permissions")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+
+                if skill.capabilities.isEmpty {
+                    Text("No extra permissions requested.")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                } else {
+                    FlowLayout(spacing: FawxSpacing.paddingXS) {
+                        ForEach(skill.capabilities, id: \.self) { capability in
+                            PermissionChip(label: humanizedCapability(capability))
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Button(isSavingPermissions ? "Saving..." : "Edit Permissions") {
+                    editPermissionsAction()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isRemoving || isSavingPermissions)
+
+                Spacer(minLength: 0)
+
+                SkillStatusPill(label: "Installed", tone: .loaded)
+
+                Spacer(minLength: 0)
+
+                Button(isRemoving ? "Removing..." : "Remove", role: .destructive) {
+                    removeAction()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isRemoving || isSavingPermissions)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(FawxSpacing.paddingLG)
@@ -214,6 +375,21 @@ private struct SkillCardView: View {
 
     private var remainingToolCount: Int {
         max(skill.tools.count - previewTools.count, 0)
+    }
+
+}
+
+private enum SkillsSection: CaseIterable {
+    case installed
+    case marketplace
+
+    var title: String {
+        switch self {
+        case .installed:
+            "Installed"
+        case .marketplace:
+            "Marketplace"
+        }
     }
 }
 
@@ -249,6 +425,27 @@ private struct ToolChip: View {
             .background(Color.fawxSurface)
             .clipShape(Capsule())
     }
+}
+
+private struct PermissionChip: View {
+    let label: String
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.fawxWarning)
+            .padding(.horizontal, FawxSpacing.paddingSM)
+            .padding(.vertical, 6)
+            .background(Color.fawxWarning.opacity(0.12))
+            .clipShape(Capsule())
+    }
+}
+
+private func humanizedCapability(_ rawValue: String) -> String {
+    rawValue
+        .replacingOccurrences(of: "_", with: " ")
+        .replacingOccurrences(of: "-", with: " ")
+        .localizedCapitalized
 }
 
 private struct FlowLayout: Layout {
@@ -317,7 +514,7 @@ private struct FlowLayout: Layout {
     }
 }
 
-private struct SkillsPlaceholderView: View {
+struct SkillsPlaceholderView: View {
     let systemImage: String
     let title: String
     let message: String
@@ -346,5 +543,175 @@ private struct SkillsPlaceholderView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+private struct SkillPermissionsEditor: View {
+    let skill: SkillSummary
+    let selectedCapabilities: Set<String>
+    let errorMessage: String?
+    let isSaving: Bool
+    let toggleCapability: (String, Bool) -> Void
+    let saveAction: () -> Void
+    let cancelAction: () -> Void
+
+    private let editableCapabilities = SkillCapabilityOption.allCases
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        Text(skill.name)
+                            .font(FawxTypography.heading1)
+                            .foregroundStyle(Color.fawxText)
+
+                        Text("Choose what this skill is allowed to access. These changes update the installed manifest and require a server restart to affect the running skill.")
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                    LazyVGrid(columns: capabilityColumns, alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        ForEach(editableCapabilities) { capability in
+                            SkillCapabilityRow(
+                                option: capability,
+                                isEnabled: selectedCapabilities.contains(capability.rawValue)
+                            ) { enabled in
+                                toggleCapability(capability.rawValue, enabled)
+                            }
+                        }
+                    }
+
+                    if !skill.unsupportedCapabilities.isEmpty {
+                        VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                            Text("Unsupported in-app permissions")
+                                .font(FawxTypography.sidebarTitle)
+                                .foregroundStyle(Color.fawxWarning)
+
+                            Text("This skill also declares advanced permissions that still need CLI editing.")
+                                .font(FawxTypography.chatBody)
+                                .foregroundStyle(Color.fawxTextSecondary)
+
+                            FlowLayout(spacing: FawxSpacing.paddingXS) {
+                                ForEach(skill.unsupportedCapabilities, id: \.self) { capability in
+                                    PermissionChip(label: humanizedCapability(capability))
+                                }
+                            }
+                        }
+                        .padding(FawxSpacing.paddingMD)
+                        .background(Color.fawxWarning.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+                    }
+
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxError)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(FawxSpacing.paddingLG)
+            }
+            .background(Color.fawxBackground)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: cancelAction)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "Saving..." : "Save", action: saveAction)
+                        .disabled(isSaving)
+                }
+            }
+        }
+#if os(iOS)
+        .presentationDetents([.medium, .large])
+#endif
+    }
+
+    private var capabilityColumns: [GridItem] {
+#if os(macOS)
+        [
+            GridItem(.flexible(minimum: 180), spacing: FawxSpacing.paddingSM),
+            GridItem(.flexible(minimum: 180), spacing: FawxSpacing.paddingSM),
+        ]
+#else
+        [GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingSM)]
+#endif
+    }
+}
+
+private struct SkillCapabilityRow: View {
+    let option: SkillCapabilityOption
+    let isEnabled: Bool
+    let setEnabled: (Bool) -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(option.title)
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxText)
+
+                Text(option.description)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+
+            Toggle("", isOn: Binding(get: { isEnabled }, set: setEnabled))
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
+        .padding(FawxSpacing.paddingMD)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        }
+    }
+}
+
+private enum SkillCapabilityOption: String, CaseIterable, Identifiable {
+    case network
+    case storage
+    case notifications
+    case sensors
+    case phoneActions = "phone_actions"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .network:
+            "Network"
+        case .storage:
+            "Storage"
+        case .notifications:
+            "Notifications"
+        case .sensors:
+            "Sensors"
+        case .phoneActions:
+            "Phone Actions"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .network:
+            "Allow outbound web requests and API calls."
+        case .storage:
+            "Allow persistent local storage owned by the skill."
+        case .notifications:
+            "Allow posting local notifications."
+        case .sensors:
+            "Allow reading device sensor data."
+        case .phoneActions:
+            "Allow privileged phone actions such as calling or messaging."
+        }
     }
 }

@@ -12,6 +12,14 @@ struct FawxApp: App {
     @State private var chatViewModel: ChatViewModel
     @State private var skillsViewModel: SkillsViewModel
     @State private var settingsViewModel: SettingsViewModel
+    @State private var permissionsViewModel: PermissionsViewModel
+    @State private var synthesisViewModel: SynthesisViewModel
+    @State private var usageViewModel: UsageViewModel
+    @State private var setupViewModel: SetupViewModel
+    @State private var bootstrappedConfigurationKey: String?
+#if os(macOS)
+    @State private var menuBarManager: MenuBarManager
+#endif
 
     init() {
         let appState = AppState()
@@ -19,12 +27,23 @@ struct FawxApp: App {
         let chatViewModel = ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
         let skillsViewModel = SkillsViewModel(appState: appState)
         let settingsViewModel = SettingsViewModel(appState: appState)
+        let permissionsViewModel = PermissionsViewModel(appState: appState)
+        let synthesisViewModel = SynthesisViewModel(appState: appState)
+        let usageViewModel = UsageViewModel(appState: appState)
+        let setupViewModel = SetupViewModel(appState: appState)
 
         _appState = State(initialValue: appState)
         _sessionViewModel = State(initialValue: sessionViewModel)
         _chatViewModel = State(initialValue: chatViewModel)
         _skillsViewModel = State(initialValue: skillsViewModel)
         _settingsViewModel = State(initialValue: settingsViewModel)
+        _permissionsViewModel = State(initialValue: permissionsViewModel)
+        _synthesisViewModel = State(initialValue: synthesisViewModel)
+        _usageViewModel = State(initialValue: usageViewModel)
+        _setupViewModel = State(initialValue: setupViewModel)
+#if os(macOS)
+        _menuBarManager = State(initialValue: MenuBarManager(appState: appState))
+#endif
     }
 
     var body: some Scene {
@@ -42,19 +61,20 @@ struct FawxApp: App {
         WindowGroup {
             themedRootView(selectedTheme: selectedTheme)
                 .task(id: appState.configurationKey) {
-                    await appState.bootstrap()
                     settingsViewModel.reloadStoredValues()
-                    await sessionViewModel.refresh()
-                    await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+#if os(macOS)
+                    menuBarManager.updateAppState(appState)
+#endif
+                    await handleConfigurationChange()
                 }
                 .task(id: appState.configurationKey + "|polling") {
-                    guard appState.isConfigured else {
+                    guard appState.showsMainExperience, appState.isConfigured else {
                         return
                     }
 
                     while !Task.isCancelled {
-                        try? await Task.sleep(for: .seconds(30))
-                        guard appState.isConfigured, appState.connectionStatus == .connected else {
+                        try? await Task.sleep(for: pollingInterval)
+                        guard appState.showsMainExperience, appState.isConfigured, appState.connectionStatus == .connected else {
                             continue
                         }
 
@@ -69,14 +89,16 @@ struct FawxApp: App {
                     }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
-                    guard newPhase == .active, appState.isConfigured else {
+                    guard newPhase == .active else {
                         return
                     }
 
                     Task {
-                        await appState.bootstrap()
-                        await sessionViewModel.refresh()
-                        await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+                        if appState.showsMainExperience, appState.isConfigured {
+                            await refreshForForegroundActivation()
+                        } else if appState.rootDestination == .setupWizard {
+                            await setupViewModel.prepareCurrentStep()
+                        }
                     }
                 }
         }
@@ -93,14 +115,18 @@ struct FawxApp: App {
 
     @ViewBuilder
     private var rootView: some View {
-        if appState.isConfigured {
+        switch appState.rootDestination {
+        case .main:
 #if os(macOS)
             ContentView(
                 appState: appState,
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
                 skillsViewModel: skillsViewModel,
-                settingsViewModel: settingsViewModel
+                settingsViewModel: settingsViewModel,
+                permissionsViewModel: permissionsViewModel,
+                synthesisViewModel: synthesisViewModel,
+                usageViewModel: usageViewModel
             )
 #else
             TabRootView(
@@ -108,11 +134,16 @@ struct FawxApp: App {
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
                 skillsViewModel: skillsViewModel,
-                settingsViewModel: settingsViewModel
+                settingsViewModel: settingsViewModel,
+                permissionsViewModel: permissionsViewModel,
+                synthesisViewModel: synthesisViewModel,
+                usageViewModel: usageViewModel
             )
 #endif
-        } else {
-            OnboardingView(settingsViewModel: settingsViewModel)
+        case .setupWizard:
+            SetupWizardView(viewModel: setupViewModel, appState: appState)
+        case .remoteOnboarding:
+            OnboardingView(settingsViewModel: settingsViewModel, appState: appState)
         }
     }
 
@@ -124,6 +155,63 @@ struct FawxApp: App {
         rootView
             .preferredColorScheme(selectedTheme.colorScheme)
 #endif
+    }
+
+    private var pollingInterval: Duration {
+        let defaultSeconds: Double
+#if os(iOS)
+        defaultSeconds = 60
+#else
+        defaultSeconds = 30
+#endif
+        let override = ProcessInfo.processInfo.environment["FAWX_POLL_INTERVAL_SECONDS"]
+            .flatMap(Double.init)
+            .map { min(max($0, 10), 300) }
+        return .seconds(override ?? defaultSeconds)
+    }
+
+    @MainActor
+    private func handleConfigurationChange() async {
+        if appState.rootDestination == .setupWizard {
+            await setupViewModel.prepareCurrentStep()
+            return
+        }
+
+        guard appState.showsMainExperience else {
+            return
+        }
+
+        guard bootstrappedConfigurationKey != appState.configurationKey else {
+            return
+        }
+
+        bootstrappedConfigurationKey = appState.configurationKey
+        await refreshMainExperience()
+    }
+
+    @MainActor
+    private func refreshMainExperience() async {
+        await appState.bootstrap()
+        await sessionViewModel.refresh()
+        await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+    }
+
+    @MainActor
+    private func refreshForForegroundActivation() async {
+        if bootstrappedConfigurationKey != appState.configurationKey {
+            await handleConfigurationChange()
+            return
+        }
+
+        do {
+            _ = try await appState.client.health()
+            try await appState.refreshServerState()
+            await sessionViewModel.refresh()
+            await appState.refreshContext(for: sessionViewModel.selectedSessionID)
+            await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+        } catch {
+            await appState.noteRecoverableRequestFailure(error)
+        }
     }
 
 #if os(macOS)

@@ -30,4 +30,13 @@ enum APIError: LocalizedError, Sendable {
             return message
         }
     }
+
+    var statusCode: Int? {
+        switch self {
+        case .httpStatus(let code, _):
+            code
+        default:
+            nil
+        }
+    }
 }

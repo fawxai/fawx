@@ -24,6 +24,8 @@ struct ToastView: View {
             return Color.fawxSurface
         case .success:
             return Color.fawxSuccess.opacity(0.14)
+        case .warning:
+            return Color.fawxWarning.opacity(0.14)
         case .error:
             return Color.fawxError.opacity(0.14)
         }
@@ -35,6 +37,8 @@ struct ToastView: View {
             return Color.fawxBorder
         case .success:
             return Color.fawxSuccess.opacity(0.35)
+        case .warning:
+            return Color.fawxWarning.opacity(0.35)
         case .error:
             return Color.fawxError.opacity(0.35)
         }

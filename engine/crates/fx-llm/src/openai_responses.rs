@@ -124,6 +124,11 @@ impl OpenAiResponsesProvider {
         parse_model_response(response, &self.supported_models).await
     }
 
+    /// Validate the OAuth token by performing a live model-catalog fetch.
+    pub async fn verify_credentials(&self) -> Result<usize, LlmError> {
+        Ok(self.fetch_models().await?.len())
+    }
+
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
         if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
             return Ok(());

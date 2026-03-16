@@ -19,7 +19,7 @@ use super::HandlerResult;
 
 const FLOW_TTL_SECONDS: u64 = 600;
 const MAX_CONCURRENT_FLOWS: usize = 10;
-const APP_REDIRECT_URI: &str = "fawx-auth://openai/callback";
+const APP_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
 pub struct OAuthFlowStore {
     flows: Mutex<HashMap<String, StoredFlow>>,
@@ -570,7 +570,7 @@ mod tests {
         assert!(request.contains("grant_type=authorization_code"));
         assert!(request.contains("code=auth-code"));
         assert!(request.contains(&format!("code_verifier={}", flow.code_verifier())));
-        assert!(request.contains("redirect_uri=fawx-auth%3A%2F%2Fopenai%2Fcallback"));
+        assert!(request.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(request.contains(&format!("client_id={OPENAI_CLIENT_ID}")));
         assert_eq!(token_response.access_token, "access-token-value");
         assert_eq!(token_response.refresh_token, "refresh-token-value");

@@ -54,8 +54,12 @@ final class IOSViewSourceRegressionTests: XCTestCase {
         }
 
         XCTAssertTrue(source.contains("Section(\"Connection\")"))
-        XCTAssertTrue(source.contains("Section(\"Server\")"))
+        XCTAssertTrue(source.contains("Section(\"Manage\")"))
         XCTAssertTrue(source.contains("Section(\"Appearance\")"))
+        XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.server)"))
+        XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.permissions)"))
+        XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.synthesis)"))
+        XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.usage)"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {

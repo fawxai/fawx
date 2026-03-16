@@ -7,6 +7,9 @@ struct ContentView: View {
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var skillsViewModel: SkillsViewModel
     @Bindable var settingsViewModel: SettingsViewModel
+    @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var synthesisViewModel: SynthesisViewModel
+    @Bindable var usageViewModel: UsageViewModel
 
     @SceneStorage("sidebar_selection") private var sidebarSelectionRawValue: String?
 
@@ -90,7 +93,10 @@ struct ContentView: View {
             SettingsView(
                 settingsViewModel: settingsViewModel,
                 appState: appState,
-                chatViewModel: chatViewModel
+                chatViewModel: chatViewModel,
+                permissionsViewModel: permissionsViewModel,
+                synthesisViewModel: synthesisViewModel,
+                usageViewModel: usageViewModel
             )
             .navigationTitle("Settings")
         case .session, .none:

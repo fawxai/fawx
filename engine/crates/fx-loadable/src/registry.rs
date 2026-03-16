@@ -95,8 +95,8 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Return a summary of each registered skill, description, and tool names.
-    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>)> {
+    /// Return a summary of each registered skill, description, tool names, and declared capabilities.
+    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
         let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
         skills
             .iter()
@@ -110,6 +110,7 @@ impl SkillRegistry {
                     skill.name().to_string(),
                     skill.description().to_string(),
                     tools,
+                    skill.capabilities(),
                 )
             })
             .collect()

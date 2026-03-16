@@ -2486,6 +2486,7 @@ mod tests {
                 name: "fawx-builtin".to_string(),
                 description: Some("Built-in runtime tools".to_string()),
                 tool_names: vec!["read_file".to_string(), "self_info".to_string()],
+                capabilities: Vec::new(),
             }],
             config_summary: fx_core::runtime_info::ConfigSummary {
                 max_iterations: 6,

@@ -13,8 +13,10 @@ struct TabRootView: View {
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var skillsViewModel: SkillsViewModel
     @Bindable var settingsViewModel: SettingsViewModel
+    @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var synthesisViewModel: SynthesisViewModel
+    @Bindable var usageViewModel: UsageViewModel
     @State private var selectedTab: RootTab = .chat
-    @State private var skillsSearchText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,8 +47,7 @@ struct TabRootView: View {
                     NavigationStack {
                         SkillsView(
                             skillsViewModel: skillsViewModel,
-                            showsHeader: false,
-                            searchText: skillsSearchText
+                            showsHeader: false
                         )
                             .navigationTitle("Skills")
                             .iOSInlineNavigationTitle()
@@ -64,13 +65,6 @@ struct TabRootView: View {
                                     )
                                 }
                             }
-                            .safeAreaInset(edge: .bottom, spacing: 0) {
-                                BottomSearchBar(
-                                    text: $skillsSearchText,
-                                    prompt: "Search skills",
-                                    accessibilityIdentifier: "skillsSearchField"
-                                )
-                            }
                     }
                 }
 
@@ -79,6 +73,9 @@ struct TabRootView: View {
                         settingsViewModel: settingsViewModel,
                         appState: appState,
                         chatViewModel: chatViewModel,
+                        permissionsViewModel: permissionsViewModel,
+                        synthesisViewModel: synthesisViewModel,
+                        usageViewModel: usageViewModel,
                         openSessions: {
                             selectedTab = .chat
                         },

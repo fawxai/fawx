@@ -8,7 +8,7 @@ use crate::handlers::errors::handle_recent_errors;
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
-use crate::handlers::pairing::{handle_exchange_pair, handle_generate_pair};
+use crate::handlers::pairing::{handle_adopt_local_device, handle_exchange_pair, handle_generate_pair};
 use crate::handlers::phase4::{
     handle_server_restart, handle_server_status, handle_server_stop, handle_setup_status,
 };
@@ -85,7 +85,8 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route(
             "/skills/{name}",
-            delete(handlers::marketplace::handle_remove_skill),
+            delete(handlers::marketplace::handle_remove_skill)
+                .patch(handlers::marketplace::handle_update_skill_permissions),
         )
         .route("/usage", get(handlers::usage::handle_usage))
         .route(
@@ -126,49 +127,16 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/config/preset/{name}/diff", get(handle_config_preset_diff))
         .route("/auth", get(handle_list_auth))
         .route(
-            "/auth/anthropic/setup-token",
-            post(handlers::auth::handle_setup_token),
-        )
-        .route(
-            "/auth/{provider}/api-key",
-            post(handlers::auth::handle_store_api_key),
-        )
-        .route(
             "/auth/{provider}",
             delete(handlers::auth::handle_delete_provider),
-        )
-        .route(
-            "/auth/{provider}/verify",
-            post(handlers::auth::handle_verify_provider),
         )
         .route(
             "/auth/{provider}/refresh",
             post(handlers::oauth::handle_oauth_refresh),
         )
-        .route(
-            "/auth/{provider}/oauth-start",
-            get(handlers::oauth::handle_oauth_start),
-        )
-        .route(
-            "/auth/{provider}/oauth-callback",
-            post(handlers::oauth::handle_oauth_callback),
-        )
-        .route("/setup/status", get(handle_setup_status))
         .route("/server/status", get(handle_server_status))
         .route("/server/restart", post(handle_server_restart))
         .route("/server/stop", post(handle_server_stop))
-        .route(
-            "/launchagent/status",
-            get(handlers::launchagent::handle_launchagent_status),
-        )
-        .route(
-            "/launchagent/install",
-            post(handlers::launchagent::handle_launchagent_install),
-        )
-        .route(
-            "/launchagent/uninstall",
-            post(handlers::launchagent::handle_launchagent_uninstall),
-        )
         .route(
             "/launchagent/reload",
             post(handlers::launchagent::handle_launchagent_reload),
@@ -203,11 +171,6 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/git/fetch", post(handlers::git::handle_git_fetch))
         .route("/devices/{id}", delete(handle_delete_device))
         .route("/pair/generate", post(handle_generate_pair))
-        .route("/pair/qr", get(handlers::pairing::handle_qr_pairing))
-        .route(
-            "/tailscale/cert",
-            post(handlers::pairing::handle_tailscale_cert),
-        )
         .route(
             "/cron/jobs",
             get(crate::handlers::cron::handle_list_jobs)
@@ -228,6 +191,47 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             get(crate::handlers::cron::handle_list_runs),
         );
 
+    let setup_v1_router = Router::new()
+        .route("/setup/status", get(handle_setup_status))
+        .route("/setup/adopt-local", post(handle_adopt_local_device))
+        .route(
+            "/auth/anthropic/setup-token",
+            post(handlers::auth::handle_setup_token),
+        )
+        .route(
+            "/auth/{provider}/api-key",
+            post(handlers::auth::handle_store_api_key),
+        )
+        .route(
+            "/auth/{provider}/verify",
+            post(handlers::auth::handle_verify_provider),
+        )
+        .route(
+            "/auth/{provider}/oauth-start",
+            get(handlers::oauth::handle_oauth_start),
+        )
+        .route(
+            "/auth/{provider}/oauth-callback",
+            post(handlers::oauth::handle_oauth_callback),
+        )
+        .route(
+            "/launchagent/status",
+            get(handlers::launchagent::handle_launchagent_status),
+        )
+        .route(
+            "/launchagent/install",
+            post(handlers::launchagent::handle_launchagent_install),
+        )
+        .route(
+            "/launchagent/uninstall",
+            post(handlers::launchagent::handle_launchagent_uninstall),
+        )
+        .route("/pair/qr", get(handlers::pairing::handle_qr_pairing))
+        .route(
+            "/tailscale/cert",
+            post(handlers::pairing::handle_tailscale_cert),
+        );
+
     let authenticated = Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
@@ -242,7 +246,8 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
     let public = Router::new()
         .route("/health", get(handle_health))
         .route("/v1/pair", post(handle_exchange_pair))
-        .route("/telegram/webhook", post(handle_telegram_webhook));
+        .route("/telegram/webhook", post(handle_telegram_webhook))
+        .nest("/v1", setup_v1_router);
     let router = authenticated.merge(public).with_state(state);
 
     merge_fleet_router(router, fleet_manager)

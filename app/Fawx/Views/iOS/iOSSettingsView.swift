@@ -2,31 +2,50 @@ import Observation
 import SwiftUI
 
 private enum SettingsRoute: Hashable {
+    case server
+    case pairing
     case modelThinking
     case authentication
+    case permissions
+    case synthesis
+    case usage
 }
 
 struct iOSSettingsView: View {
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var appState: AppState
     @Bindable var chatViewModel: ChatViewModel
+    @Bindable var permissionsViewModel: PermissionsViewModel
+    @Bindable var synthesisViewModel: SynthesisViewModel
+    @Bindable var usageViewModel: UsageViewModel
     let openSessions: () -> Void
     let openSkills: () -> Void
 
     @State private var navigationPath: [SettingsRoute] = []
+    @State private var isShowingQRScanner = false
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
                 Section("Connection") {
-                    LabeledContent("Server URL") {
-                        Text(settingsViewModel.serverURL.isEmpty ? "Not configured" : settingsViewModel.serverURL)
-                            .foregroundStyle(settingsViewModel.serverURL.isEmpty ? Color.fawxTextSecondary : Color.fawxText)
+                    LabeledContent("Server") {
+                        Text(appState.displayedServerURLString.isEmpty ? "Not configured" : appState.displayedServerURLString)
+                            .foregroundStyle(appState.displayedServerURLString.isEmpty ? Color.fawxTextSecondary : Color.fawxText)
+                    }
+
+                    LabeledContent("Mode") {
+                        Text(appState.isRemoteClient ? "Remote Client" : "Local Server")
+                            .foregroundStyle(Color.fawxText)
                     }
 
                     LabeledContent("Paired as") {
                         Text(settingsViewModel.pairedDeviceName ?? "Not paired")
                             .foregroundStyle(settingsViewModel.pairedDeviceName == nil ? Color.fawxTextSecondary : Color.fawxText)
+                    }
+
+                    LabeledContent("Status") {
+                        Text(appState.serverStatusLabel)
+                            .foregroundStyle(appState.connectionStatus == .connected ? Color.fawxSuccess : Color.fawxTextSecondary)
                     }
 
                     Button(settingsViewModel.isTestingConnection ? "Checking..." : "Test Connection") {
@@ -35,22 +54,35 @@ struct iOSSettingsView: View {
                         }
                     }
                     .disabled(settingsViewModel.isTestingConnection || settingsViewModel.serverURL.isEmpty)
-
-                    Button("Unpair", role: .destructive) {
-                        Task {
-                            await settingsViewModel.unpair()
-                        }
-                    }
-                    .disabled(!settingsViewModel.isPaired)
                 }
 
-                Section("Server") {
+                Section("Manage") {
+                    NavigationLink(value: SettingsRoute.pairing) {
+                        Text("Server Connection")
+                    }
+
+                    NavigationLink(value: SettingsRoute.server) {
+                        Text("Server")
+                    }
+
                     NavigationLink(value: SettingsRoute.modelThinking) {
                         Text("Model & Thinking")
                     }
 
                     NavigationLink(value: SettingsRoute.authentication) {
                         Text("Authentication")
+                    }
+
+                    NavigationLink(value: SettingsRoute.permissions) {
+                        Text("Permissions & Safety")
+                    }
+
+                    NavigationLink(value: SettingsRoute.synthesis) {
+                        Text("Custom Instructions")
+                    }
+
+                    NavigationLink(value: SettingsRoute.usage) {
+                        Text("Usage")
                     }
                 }
 
@@ -81,31 +113,103 @@ struct iOSSettingsView: View {
             }
             .navigationDestination(for: SettingsRoute.self) { route in
                 switch route {
+                case .server:
+                    iOSServerSettingsDetail(appState: appState)
+                case .pairing:
+                    iOSPairingSettingsDetail(
+                        settingsViewModel: settingsViewModel,
+                        appState: appState,
+                        openScanner: {
+                            isShowingQRScanner = true
+                        }
+                    )
                 case .modelThinking:
                     iOSModelThinkingSettingsView(appState: appState, chatViewModel: chatViewModel)
                 case .authentication:
                     iOSAuthStatusSettingsView(appState: appState)
+                case .permissions:
+                    iOSPermissionsSettingsView(permissionsViewModel: permissionsViewModel)
+                case .synthesis:
+                    iOSSynthesisSettingsView(synthesisViewModel: synthesisViewModel)
+                case .usage:
+                    iOSUsageSettingsView(usageViewModel: usageViewModel)
                 }
             }
             .task {
                 if appState.isConfigured {
                     await appState.revalidateConnection(allowReconnect: false)
+                    await appState.refreshSettingsState()
                 }
             }
+        }
+        .sheet(isPresented: $isShowingQRScanner) {
+            QRCodeScannerSheet(
+                onCancel: {
+                    isShowingQRScanner = false
+                },
+                onCodeScanned: { rawValue in
+                    isShowingQRScanner = false
+                    Task {
+                        await settingsViewModel.applyScannedConnectionLink(rawValue)
+                    }
+                }
+            )
         }
     }
 
     private var testStatusColor: Color {
         switch settingsViewModel.testStatusKind {
         case .idle:
-            return .fawxTextSecondary
+            .fawxTextSecondary
         case .success:
-            return .fawxSuccess
+            .fawxSuccess
         case .warning:
-            return .fawxWarning
+            .fawxWarning
         case .failure:
-            return .fawxError
+            .fawxError
         }
+    }
+}
+
+private struct iOSServerSettingsDetail: View {
+    @Bindable var appState: AppState
+
+    var body: some View {
+        ScrollView {
+            ServerSettingsPanel(
+                appState: appState,
+                isReadOnly: true
+            )
+            .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Server")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+    }
+}
+
+private struct iOSPairingSettingsDetail: View {
+    @Bindable var settingsViewModel: SettingsViewModel
+    @Bindable var appState: AppState
+    let openScanner: () -> Void
+
+    var body: some View {
+        ScrollView {
+            PairingSettingsPanel(
+                appState: appState,
+                settingsViewModel: settingsViewModel,
+                isReadOnly: true,
+                openScanner: openScanner
+            )
+            .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Server Connection")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
     }
 }
 
@@ -221,10 +325,7 @@ private struct iOSAuthStatusSettingsView: View {
 
     var body: some View {
         ScrollView {
-            AuthStatusList(
-                providers: appState.authProviders,
-                errorMessage: appState.authProvidersError
-            )
+            AuthStatusList(appState: appState)
             .padding(FawxSpacing.paddingLG)
         }
         .background(Color.fawxBackground.ignoresSafeArea())
@@ -235,7 +336,56 @@ private struct iOSAuthStatusSettingsView: View {
         .task {
             if appState.isConfigured {
                 await appState.revalidateConnection(allowReconnect: false)
+                await appState.refreshSettingsState()
             }
         }
+    }
+}
+
+private struct iOSPermissionsSettingsView: View {
+    @Bindable var permissionsViewModel: PermissionsViewModel
+
+    var body: some View {
+        ScrollView {
+            PermissionsSettingsPanel(viewModel: permissionsViewModel)
+                .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Permissions")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+    }
+}
+
+private struct iOSSynthesisSettingsView: View {
+    @Bindable var synthesisViewModel: SynthesisViewModel
+
+    var body: some View {
+        ScrollView {
+            SynthesisSettingsPanel(viewModel: synthesisViewModel)
+                .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Instructions")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+    }
+}
+
+private struct iOSUsageSettingsView: View {
+    @Bindable var usageViewModel: UsageViewModel
+
+    var body: some View {
+        ScrollView {
+            UsageSettingsPanel(viewModel: usageViewModel)
+                .padding(FawxSpacing.paddingLG)
+        }
+        .background(Color.fawxBackground.ignoresSafeArea())
+        .navigationTitle("Usage")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
     }
 }

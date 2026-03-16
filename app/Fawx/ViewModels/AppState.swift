@@ -41,33 +41,33 @@ enum AppFontSize: String, CaseIterable, Sendable {
     var scale: CGFloat {
         switch self {
         case .small:
-            return 0.92
+            0.92
         case .medium:
-            return 1.0
+            1
         case .large:
-            return 1.12
+            1.12
         }
     }
 
     var sliderValue: Double {
         switch self {
         case .small:
-            return 0
+            0
         case .medium:
-            return 1
+            1
         case .large:
-            return 2
+            2
         }
     }
 
     static func fromSliderValue(_ value: Double) -> AppFontSize {
         switch Int(value.rounded()) {
         case ...0:
-            return .small
+            .small
         case 2...:
-            return .large
+            .large
         default:
-            return .medium
+            .medium
         }
     }
 }
@@ -75,6 +75,7 @@ enum AppFontSize: String, CaseIterable, Sendable {
 enum AppToastStyle: Sendable, Equatable {
     case info
     case success
+    case warning
     case error
 }
 
@@ -95,6 +96,17 @@ struct ConnectionBannerState: Sendable, Equatable {
     let showsRetry: Bool
 }
 
+enum AppConnectionMode: String, Sendable {
+    case local
+    case remote
+}
+
+enum AppRootDestination: Sendable, Equatable {
+    case main
+    case setupWizard
+    case remoteOnboarding
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -103,9 +115,15 @@ final class AppState {
         static let pairedDeviceName = "paired_device_name"
         static let theme = "theme"
         static let fontSize = "font_size"
+        static let setupComplete = "setup_complete"
+        static let connectionMode = "connection_mode"
     }
 
+    private static let defaultLocalSetupServerURLString = "http://127.0.0.1:8400"
+
     var connectionStatus: ConnectionStatus = .disconnected
+    var connectionMode: AppConnectionMode
+    var rootDestination: AppRootDestination
     var serverURLString: String
     var pairedDeviceName: String?
     var activeModel: ModelInfo?
@@ -122,11 +140,19 @@ final class AppState {
     var fontSize: AppFontSize
     var isUpdatingServerSettings = false
     var authProvidersError: String?
+    var serverStatusError: String?
     var sidebarSelection: SidebarSelection?
     var toast: AppToast?
+    var setupStatus: SetupStatusResponse?
+    var localServerStatus: LocalServerRuntimeStatus?
+    var launchAgentStatus: LaunchAgentStatusResponse?
+    var qrPairingResponse: QrPairingResponse?
+    var localInstallConfiguration: LocalInstallConfiguration?
+    var setupActionError: String?
 
     let client: FawxClient
     private var authToken: String?
+    private var isSetupComplete: Bool
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectAttempt = 0
@@ -136,27 +162,61 @@ final class AppState {
             Self.resetPersistedConfiguration()
         }
 
-        let storedServerURL = UserDefaults.standard.string(forKey: StorageKey.serverURL) ?? ""
-        let storedTheme = AppTheme(rawValue: UserDefaults.standard.string(forKey: StorageKey.theme) ?? AppTheme.system.rawValue) ?? .system
-        let storedFontSize = AppFontSize(rawValue: UserDefaults.standard.string(forKey: StorageKey.fontSize) ?? AppFontSize.medium.rawValue) ?? .medium
+        let defaults = UserDefaults.standard
+        let storedServerURL = defaults.string(forKey: StorageKey.serverURL) ?? ""
+        let storedTheme = AppTheme(rawValue: defaults.string(forKey: StorageKey.theme) ?? AppTheme.system.rawValue) ?? .system
+        let storedFontSize = AppFontSize(rawValue: defaults.string(forKey: StorageKey.fontSize) ?? AppFontSize.medium.rawValue) ?? .medium
+        let defaultConnectionMode = Self.defaultConnectionMode(forStoredServerURL: storedServerURL)
+        let storedConnectionMode = AppConnectionMode(
+            rawValue: defaults.string(forKey: StorageKey.connectionMode) ?? defaultConnectionMode.rawValue
+        ) ?? defaultConnectionMode
+        let storedSetupComplete = defaults.bool(forKey: StorageKey.setupComplete)
         let storedToken = try? KeychainHelper.token(forServer: storedServerURL)
-        let storedDeviceName = UserDefaults.standard.string(forKey: StorageKey.pairedDeviceName)
+        let storedDeviceName = defaults.string(forKey: StorageKey.pairedDeviceName)
+        let detectedLocalInstall = LocalInstallConfiguration.loadDefault()
 
-        let resolvedServerURL = UITestLaunchOptions.serverURLOverride ?? storedServerURL
-        let resolvedToken = UITestLaunchOptions.bearerTokenOverride ?? storedToken ?? nil
+        var resolvedServerURL = UITestLaunchOptions.serverURLOverride ?? storedServerURL
+        var resolvedToken = UITestLaunchOptions.bearerTokenOverride ?? storedToken
+        var resolvedConnectionMode = storedConnectionMode
+
+#if os(macOS)
+        if (resolvedServerURL.isEmpty || resolvedToken?.isEmpty != false), let detectedLocalInstall {
+            resolvedServerURL = detectedLocalInstall.baseURLString
+            resolvedToken = detectedLocalInstall.bearerToken
+            resolvedConnectionMode = .local
+        } else if resolvedServerURL.isEmpty && resolvedConnectionMode == .local {
+            resolvedServerURL = Self.defaultLocalSetupServerURLString
+        }
+#endif
+
         let resolvedDeviceName = UITestLaunchOptions.pairedDeviceNameOverride
             ?? storedDeviceName
             ?? (UITestLaunchOptions.isUITesting && resolvedToken != nil ? "UI Test Device" : nil)
 
+        let resolvedSetupComplete = storedSetupComplete || detectedLocalInstall != nil
+        let resolvedBaseURL = URL(string: resolvedServerURL)
+
+        self.connectionMode = resolvedConnectionMode
+        self.rootDestination = Self.resolveInitialDestination(
+            isConfigured: !resolvedServerURL.isEmpty && resolvedToken?.isEmpty == false,
+            setupComplete: resolvedSetupComplete,
+            connectionMode: resolvedConnectionMode,
+            hasStoredServerURL: !storedServerURL.isEmpty,
+            hasLocalInstall: detectedLocalInstall != nil
+        )
         self.serverURLString = resolvedServerURL
         self.pairedDeviceName = resolvedDeviceName
         self.theme = storedTheme
         self.fontSize = storedFontSize
         self.authToken = resolvedToken
-        self.client = FawxClient(
-            baseURL: URL(string: resolvedServerURL),
-            bearerToken: resolvedToken
-        )
+        self.localInstallConfiguration = detectedLocalInstall
+        self.isSetupComplete = resolvedSetupComplete
+        self.client = FawxClient(baseURL: resolvedBaseURL, bearerToken: resolvedToken)
+
+        if resolvedSetupComplete {
+            defaults.set(true, forKey: StorageKey.setupComplete)
+        }
+        defaults.set(resolvedConnectionMode.rawValue, forKey: StorageKey.connectionMode)
     }
 
     var isConfigured: Bool {
@@ -169,11 +229,127 @@ final class AppState {
         return true
     }
 
+    var showsMainExperience: Bool {
+        rootDestination == .main
+    }
+
+    var isRemoteClient: Bool {
+        connectionMode == .remote
+    }
+
+    var canOpenRemoteOnboarding: Bool {
+#if os(macOS)
+        true
+#else
+        false
+#endif
+    }
+
+    var localLogFileURL: URL? {
+        localInstallConfiguration?.logFileURL
+    }
+
+    var advertisedHost: String? {
+        if let displayHost = qrPairingResponse?.displayHost, !displayHost.isEmpty {
+            return displayHost
+        }
+        if let hostname = setupStatus?.tailscale.hostname, !hostname.isEmpty {
+            return hostname
+        }
+        return nil
+    }
+
+    var displayedHost: String {
+        if let advertisedHost {
+            return advertisedHost
+        }
+        if let host = URL(string: serverURLString)?.host, !host.isEmpty {
+            return host
+        }
+        return "Not connected"
+    }
+
+    var displayedPort: Int? {
+        if let port = URL(string: serverURLString)?.port {
+            return port
+        }
+        if let port = localServerStatus?.port {
+            return port
+        }
+        if let port = qrPairingResponse?.port {
+            return port
+        }
+        return nil
+    }
+
+    var displayedServerURLString: String {
+        if let advertisedHost, let port = displayedPort {
+            let scheme = prefersHTTPSDisplay ? "https" : "http"
+            return "\(scheme)://\(advertisedHost):\(port)"
+        }
+        return serverURLString
+    }
+
+    private var prefersHTTPSDisplay: Bool {
+        if qrPairingResponse?.transport == "tailscale_https" {
+            return true
+        }
+        if localServerStatus?.httpsEnabled == true || setupStatus?.localServer.httpsEnabled == true {
+            return true
+        }
+        if let advertisedHost, advertisedHost.contains(".ts.net") {
+            return true
+        }
+        return false
+    }
+
+    var serverStatusLabel: String {
+        switch connectionStatus {
+        case .connected:
+            return localServerStatus?.status.capitalized ?? "Connected"
+        case .connecting:
+            return "Connecting"
+        case .reconnecting:
+            return "Reconnecting"
+        case .disconnected:
+            if let localServerStatus, localServerStatus.status == "stopped" {
+                return "Stopped"
+            }
+            return "Disconnected"
+        }
+    }
+
+    var autoStartEnabled: Bool {
+        launchAgentStatus?.installed
+            ?? setupStatus?.launchagent.autoStartEnabled
+            ?? false
+    }
+
+    var canManageServerLocally: Bool {
+#if os(macOS)
+        connectionMode == .local
+#else
+        false
+#endif
+    }
+
     var configurationKey: String {
         [
             serverURLString,
             pairedDeviceName ?? "",
             isConfigured ? "paired" : "unpaired",
+            connectionMode.rawValue,
+            rootDestinationKey,
+        ].joined(separator: "|")
+    }
+
+    var setupWizardKey: String {
+        [
+            localInstallConfiguration?.baseURLString ?? "",
+            setupStatus?.mode ?? "",
+            setupStatus?.launchagent.loaded == true ? "launchagent" : "no-launchagent",
+            setupStatus?.tailscale.hostname ?? "",
+            authProviders.map(\.provider).joined(separator: ","),
         ].joined(separator: "|")
     }
 
@@ -182,8 +358,8 @@ final class AppState {
     }
 
     var connectionBanner: ConnectionBannerState? {
-        guard isConfigured, let connectionError, !connectionError.isEmpty else {
-            if connectionStatus == .reconnecting {
+        guard showsMainExperience, isConfigured, let connectionError, !connectionError.isEmpty else {
+            if showsMainExperience, connectionStatus == .reconnecting {
                 return ConnectionBannerState(
                     message: "Reconnecting to Fawx server at \(serverURLString)...",
                     tone: .warning,
@@ -204,18 +380,79 @@ final class AppState {
     }
 
     func bootstrap() async {
-        guard isConfigured else {
+        guard showsMainExperience, isConfigured else {
             reconnectTask?.cancel()
             reconnectTask = nil
-            connectionStatus = .disconnected
+            if showsMainExperience {
+                connectionStatus = .disconnected
+            }
             return
         }
 
         reconnectAttempt = 0
         await attemptConnection(initialStatus: .connecting, allowReconnect: true)
+        await refreshPhase4State()
     }
 
-    func savePairing(serverURLString rawURL: String, token: String, deviceName: String) async throws {
+    func beginRemoteOnboarding() {
+        connectionMode = .remote
+        rootDestination = .remoteOnboarding
+        setupActionError = nil
+        persistConnectionMode()
+    }
+
+    func returnToLocalSetup() {
+#if os(macOS)
+        connectionMode = .local
+        rootDestination = .setupWizard
+        setupActionError = nil
+        persistConnectionMode()
+#endif
+    }
+
+    func completeLocalSetup() async throws {
+        reloadLocalInstallConfiguration()
+
+        let resolvedServerURL: String
+
+        if let localInstallConfiguration {
+            resolvedServerURL = localInstallConfiguration.baseURLString
+        } else if !serverURLString.isEmpty {
+            resolvedServerURL = serverURLString
+        } else {
+            resolvedServerURL = Self.defaultLocalSetupServerURLString
+        }
+
+        guard
+            let canonicalURLString = canonicalizeServerURL(resolvedServerURL),
+            let url = URL(string: canonicalURLString)
+        else {
+            throw APIError.invalidURL(resolvedServerURL)
+        }
+
+        let setupClient = FawxClient(baseURL: url)
+        let requestedDeviceName = Self.defaultLocalDeviceName()
+        let response = try await setupClient.adoptLocalDevice(deviceName: requestedDeviceName)
+        let pairedDeviceName = response.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedDeviceName = pairedDeviceName?.nonEmpty ?? requestedDeviceName
+
+        try await savePairing(
+            serverURLString: canonicalURLString,
+            token: response.token,
+            deviceName: resolvedDeviceName,
+            connectionMode: .local
+        )
+        isSetupComplete = true
+        UserDefaults.standard.set(true, forKey: StorageKey.setupComplete)
+        await bootstrap()
+    }
+
+    func savePairing(
+        serverURLString rawURL: String,
+        token: String,
+        deviceName: String,
+        connectionMode: AppConnectionMode = .remote
+    ) async throws {
         guard let canonicalURLString = canonicalizeServerURL(rawURL) else {
             throw APIError.invalidURL(rawURL)
         }
@@ -226,19 +463,30 @@ final class AppState {
         serverURLString = canonicalURLString
         pairedDeviceName = deviceName
         authToken = token
+        self.connectionMode = connectionMode
+        rootDestination = .main
 
-        UserDefaults.standard.set(canonicalURLString, forKey: StorageKey.serverURL)
-        UserDefaults.standard.set(deviceName, forKey: StorageKey.pairedDeviceName)
+        let defaults = UserDefaults.standard
+        defaults.set(canonicalURLString, forKey: StorageKey.serverURL)
+        defaults.set(deviceName, forKey: StorageKey.pairedDeviceName)
+        defaults.set(connectionMode.rawValue, forKey: StorageKey.connectionMode)
         try KeychainHelper.saveToken(token, forServer: canonicalURLString)
+
         await client.updateConfiguration(baseURL: url, bearerToken: token)
         connectionError = nil
+        serverStatusError = nil
         connectionStatus = .connected
+        setupActionError = nil
     }
 
     func unpair() async throws {
         if !serverURLString.isEmpty {
-            try KeychainHelper.deleteToken(forServer: serverURLString)
+            try? KeychainHelper.deleteToken(forServer: serverURLString)
         }
+
+        let hasLocalInstall = localInstallConfiguration != nil
+        let setupComplete = isSetupComplete
+        let previousConnectionMode = connectionMode
 
         authToken = nil
         pairedDeviceName = nil
@@ -253,17 +501,39 @@ final class AppState {
         permissionPresetName = "Power User"
         connectionError = nil
         connectionStatus = .disconnected
+        serverStatusError = nil
+        setupStatus = nil
+        localServerStatus = nil
+        launchAgentStatus = nil
+        qrPairingResponse = nil
 
+        UserDefaults.standard.removeObject(forKey: StorageKey.serverURL)
         UserDefaults.standard.removeObject(forKey: StorageKey.pairedDeviceName)
-        await client.updateConfiguration(baseURL: URL(string: serverURLString), bearerToken: nil)
+        await client.updateConfiguration(baseURL: nil, bearerToken: nil)
+
+        rootDestination = Self.resolveInitialDestination(
+            isConfigured: false,
+            setupComplete: setupComplete,
+            connectionMode: previousConnectionMode,
+            hasStoredServerURL: false,
+            hasLocalInstall: hasLocalInstall && previousConnectionMode == .local
+        )
     }
 
     func refreshServerState() async throws {
         async let modelsTask = client.listModels()
-        async let statusTask = client.serverStatus()
-        let models = try await modelsTask
+        async let legacyStatusTask = client.serverStatus()
 
-        let status = try? await statusTask
+        let models = try await modelsTask
+        let legacyStatus: ServerStatusResponse?
+        do {
+            legacyStatus = try await legacyStatusTask
+            serverStatusError = nil
+        } catch {
+            legacyStatus = nil
+            serverStatusError = error.localizedDescription
+        }
+
         do {
             let thinking = try await client.thinking()
             thinkingLevel = thinking.level
@@ -271,6 +541,17 @@ final class AppState {
         } catch {
             thinkingLevel = nil
         }
+
+        await refreshAuthProviders()
+
+        availableModels = models.models
+        let activeModelID = legacyStatus?.model ?? models.activeModel
+        activeModel = models.models.first(where: { $0.modelID == activeModelID }) ?? models.models.first
+        permissionPresetName = resolvePermissionPreset(from: legacyStatus?.config)
+        await refreshPhase4State()
+    }
+
+    func refreshAuthProviders() async {
         do {
             let auth = try await client.authProviders()
             authProviders = auth.providers.sorted { lhs, rhs in
@@ -284,12 +565,197 @@ final class AppState {
             authProviders = []
             authProvidersError = error.localizedDescription
         }
+    }
 
-        availableModels = models.models
-        let activeModelID = status?.model ?? models.activeModel
-        activeModel = models.models.first(where: { $0.modelID == activeModelID })
-            ?? models.models.first
-        permissionPresetName = resolvePermissionPreset(from: status?.config)
+    func refreshSettingsState() async {
+        if isConfigured {
+            do {
+                try await refreshServerState()
+                return
+            } catch {
+                await noteRecoverableRequestFailure(error)
+            }
+        }
+        await refreshAuthProviders()
+        await refreshPhase4State()
+    }
+
+    func refreshPhase4State() async {
+        let canQueryLocalSetupServer: Bool
+#if os(macOS)
+        canQueryLocalSetupServer = rootDestination == .setupWizard
+            && connectionMode == .local
+            && !serverURLString.isEmpty
+#else
+        canQueryLocalSetupServer = false
+#endif
+
+        guard isConfigured || canQueryLocalSetupServer else {
+            setupStatus = nil
+            localServerStatus = nil
+            launchAgentStatus = nil
+            qrPairingResponse = nil
+            return
+        }
+
+        do {
+            setupStatus = try await client.setupStatus()
+            setupActionError = nil
+        } catch {
+            setupStatus = nil
+        }
+
+        do {
+            localServerStatus = try await client.runtimeStatus()
+        } catch {
+            if localServerStatus?.status != "stopped" {
+                localServerStatus = nil
+            }
+        }
+
+        do {
+            launchAgentStatus = try await client.launchAgentStatus()
+        } catch {
+            launchAgentStatus = nil
+        }
+
+        do {
+            qrPairingResponse = try await client.qrPairing()
+        } catch {
+            qrPairingResponse = nil
+        }
+    }
+
+    func setLaunchAgentEnabled(_ enabled: Bool) async throws -> String {
+        isUpdatingServerSettings = true
+        defer { isUpdatingServerSettings = false }
+
+        if enabled {
+            let response = try await client.installLaunchAgent(autoStart: true)
+            showToast(message: response.message, style: .success)
+            await refreshPhase4State()
+            return response.message
+        } else {
+            let response = try await client.uninstallLaunchAgent()
+            showToast(message: response.message, style: .info)
+            await refreshPhase4State()
+            return response.message
+        }
+    }
+
+    func restartLocalServer() async throws -> String {
+        isUpdatingServerSettings = true
+        defer { isUpdatingServerSettings = false }
+
+        let response = try await client.restartServer()
+        connectionStatus = .reconnecting
+        if let localServerStatus {
+            self.localServerStatus = LocalServerRuntimeStatus(
+                status: "starting",
+                version: localServerStatus.version,
+                uptimeSeconds: 0,
+                pid: localServerStatus.pid,
+                host: localServerStatus.host,
+                port: localServerStatus.port,
+                httpsEnabled: localServerStatus.httpsEnabled
+            )
+        }
+        showToast(message: response.message, style: .info)
+        await waitForLocalServerReconnect()
+        await revalidateConnection(allowReconnect: true)
+        await refreshPhase4State()
+        return response.message
+    }
+
+    func stopLocalServer() async throws -> String {
+        isUpdatingServerSettings = true
+        defer { isUpdatingServerSettings = false }
+
+        let response = try await client.stopServer()
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+        connectionStatus = .disconnected
+        connectionError = connectionMode == .local ? nil : connectionMessage(for: APIError.invalidResponse)
+        localServerStatus = LocalServerRuntimeStatus(
+            status: "stopped",
+            version: localServerStatus?.version ?? "",
+            uptimeSeconds: 0,
+            pid: 0,
+            host: localServerStatus?.host ?? setupStatus?.localServer.host ?? displayedHost,
+            port: localServerStatus?.port ?? setupStatus?.localServer.port ?? displayedPort ?? 8400,
+            httpsEnabled: localServerStatus?.httpsEnabled ?? setupStatus?.localServer.httpsEnabled ?? false
+        )
+        showToast(message: response.message, style: .info)
+        await refreshPhase4State()
+        return response.message
+    }
+
+    func updateServerPort(_ port: Int) async throws -> ConfigPatchResponse {
+        isUpdatingServerSettings = true
+        defer { isUpdatingServerSettings = false }
+
+        let response = try await client.patchConfig(
+            changes: .object([
+                "http": .object([
+                    "port": .number(Double(port)),
+                ]),
+            ])
+        )
+        if response.restartRequired {
+            showToast(message: "Port updated. Restart the server to apply it.", style: .info)
+        } else {
+            showToast(message: "Server port updated.", style: .success)
+        }
+        await refreshPhase4State()
+        return response
+    }
+
+    func fetchPairingQRCode() async throws -> QrPairingResponse {
+        let response = try await client.qrPairing()
+        qrPairingResponse = response
+        return response
+    }
+
+    func requestTailscaleCertificate(hostname: String) async throws -> TailscaleCertResponse {
+        let response = try await client.tailscaleCert(hostname: hostname)
+        await refreshPhase4State()
+        return response
+    }
+
+    func storeAnthropicSetupToken(_ token: String) async throws -> ProviderAuthActionResponse {
+        let response = try await client.exchangeAnthropicSetupToken(token)
+        if isConfigured {
+            try await refreshServerState()
+        } else {
+            await refreshPhase4State()
+        }
+        return response
+    }
+
+    func storeProviderAPIKey(provider: String, apiKey: String) async throws -> ProviderAuthActionResponse {
+        let response = try await client.storeAPIKey(provider: provider, apiKey: apiKey)
+        if isConfigured {
+            try await refreshServerState()
+        } else {
+            await refreshPhase4State()
+        }
+        return response
+    }
+
+    func verifyProvider(_ provider: String) async throws -> ProviderVerificationResponse {
+        let response = try await client.verifyProvider(provider)
+        if isConfigured {
+            try await refreshServerState()
+        } else {
+            await refreshPhase4State()
+        }
+        return response
+    }
+
+    func deleteProvider(_ provider: String) async throws {
+        _ = try await client.deleteProvider(provider)
+        try await refreshServerState()
     }
 
     func retryConnection() async {
@@ -316,6 +782,7 @@ final class AppState {
 
         let initialStatus: ConnectionStatus = allowReconnect ? .reconnecting : .connecting
         await attemptConnection(initialStatus: initialStatus, allowReconnect: allowReconnect)
+        await refreshPhase4State()
     }
 
     func markDisconnected(from error: Error) {
@@ -365,10 +832,7 @@ final class AppState {
 
         if let thinkingAdjusted = response.thinkingAdjusted {
             thinkingLevel = thinkingAdjusted.to
-            showToast(
-                message: "Thinking adjusted to \(thinkingAdjusted.to.displayName).",
-                style: .info
-            )
+            showToast(message: "Thinking adjusted to \(thinkingAdjusted.to.displayName).", style: .info)
         }
 
         try await refreshServerState()
@@ -395,12 +859,38 @@ final class AppState {
         FawxTypography.setScale(fontSize.scale)
     }
 
+    private var rootDestinationKey: String {
+        switch rootDestination {
+        case .main:
+            "main"
+        case .setupWizard:
+            "setup"
+        case .remoteOnboarding:
+            "remote"
+        }
+    }
+
     private func resolvePermissionPreset(from config: JSONValue?) -> String {
         let rawPreset = config?
             .value(at: ["permissions", "preset"])?
             .stringValue
 
         return permissionPresetLabel(rawPreset)
+    }
+
+    private func waitForLocalServerReconnect() async {
+        for _ in 0 ..< 12 {
+            if Task.isCancelled {
+                return
+            }
+
+            do {
+                _ = try await client.health()
+                return
+            } catch {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
     }
 
     private func attemptConnection(initialStatus: ConnectionStatus, allowReconnect: Bool) async {
@@ -452,7 +942,7 @@ final class AppState {
             }
 
             while !Task.isCancelled && self.isConfigured {
-                let delaySeconds = min(pow(2.0, Double(self.reconnectAttempt)), 30)
+                let delaySeconds = min(pow(2, Double(self.reconnectAttempt)), 30)
                 do {
                     try await Task.sleep(for: .seconds(delaySeconds))
                 } catch is CancellationError {
@@ -482,7 +972,7 @@ final class AppState {
                     guard !Task.isCancelled else {
                         return
                     }
-                    self.reconnectAttempt += 1
+                    self.reconnectAttempt = min(self.reconnectAttempt + 1, 5)
                     self.connectionError = self.connectionMessage(for: error)
                     let nextStatus = ConnectionStateMachine.retryFailureStatus(
                         for: error,
@@ -508,18 +998,20 @@ final class AppState {
     }
 
     private func connectionMessage(for error: Error) -> String {
+        let destination = serverURLString.isEmpty ? "your Fawx server" : serverURLString
+
         if isAuthenticationFailure(error) {
             return "Authentication failed. Check your pairing in Settings."
         }
 
         if isConnectivityFailure(error) {
-            return "Fawx server at \(serverURLString) is offline or unreachable."
+            return "Fawx server at \(destination) is offline or unreachable."
         }
 
-        return "Fawx server at \(serverURLString) returned an unexpected response."
+        return "Fawx server at \(destination) returned an unexpected response."
     }
 
-    private func showToast(message: String, style: AppToastStyle) {
+    func showToast(message: String, style: AppToastStyle) {
         toastDismissTask?.cancel()
         toast = AppToast(message: message, style: style)
 
@@ -527,6 +1019,58 @@ final class AppState {
             try? await Task.sleep(for: .seconds(3))
             self?.toast = nil
         }
+    }
+
+    private func reloadLocalInstallConfiguration() {
+#if os(macOS)
+        if let configuration = LocalInstallConfiguration.loadDefault() {
+            localInstallConfiguration = configuration
+        }
+#endif
+    }
+
+    private func persistConnectionMode() {
+        UserDefaults.standard.set(connectionMode.rawValue, forKey: StorageKey.connectionMode)
+    }
+
+    private static func resolveInitialDestination(
+        isConfigured: Bool,
+        setupComplete: Bool,
+        connectionMode: AppConnectionMode,
+        hasStoredServerURL: Bool,
+        hasLocalInstall: Bool
+    ) -> AppRootDestination {
+#if os(iOS)
+        return isConfigured ? .main : .remoteOnboarding
+#else
+        if isConfigured && (setupComplete || hasLocalInstall || connectionMode == .remote) {
+            return .main
+        }
+        if hasLocalInstall {
+            return .main
+        }
+        if connectionMode == .remote || hasStoredServerURL {
+            return .remoteOnboarding
+        }
+        return .setupWizard
+#endif
+    }
+
+    private static func defaultConnectionMode(forStoredServerURL storedServerURL: String) -> AppConnectionMode {
+#if os(iOS)
+        .remote
+#else
+        storedServerURL.isEmpty ? .local : .remote
+#endif
+    }
+
+    private static func defaultLocalDeviceName() -> String {
+#if os(macOS)
+        if let localizedName = Host.current().localizedName, !localizedName.isEmpty {
+            return localizedName
+        }
+#endif
+        return "This Mac"
     }
 
     private static func resetPersistedConfiguration() {
@@ -541,5 +1085,7 @@ final class AppState {
         defaults.removeObject(forKey: StorageKey.pairedDeviceName)
         defaults.removeObject(forKey: StorageKey.theme)
         defaults.removeObject(forKey: StorageKey.fontSize)
+        defaults.removeObject(forKey: StorageKey.setupComplete)
+        defaults.removeObject(forKey: StorageKey.connectionMode)
     }
 }

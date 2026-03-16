@@ -7,6 +7,10 @@ use crate::types::{
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use fx_auth::auth::AuthMethod;
+use fx_llm::{ModelCatalog, OpenAiResponsesProvider};
+use std::time::Duration;
+use tokio::time;
 
 use super::HandlerResult;
 
@@ -76,20 +80,164 @@ pub async fn handle_verify_provider(
     Path(provider): Path<String>,
     Json(request): Json<VerifyRequest>,
 ) -> HandlerResult<Json<VerifyResponse>> {
-    let _ = (state, request);
+    let checked_at = current_unix_timestamp_secs();
+    let store = AuthStore::open(&state.data_dir).map_err(internal_error)?;
+    let auth_manager = store.load_auth_manager().map_err(internal_error)?;
 
-    // TODO: make lightweight API call to verify credentials
-    let checked_at = std::time::SystemTime::now()
+    let Some(auth_method) = auth_manager.get(&provider).cloned() else {
+        return Ok(Json(VerifyResponse {
+            provider,
+            verified: false,
+            status: "not_configured".to_string(),
+            message: "No saved credentials found for this provider.".to_string(),
+            checked_at,
+        }));
+    };
+
+    let timeout_seconds = request.timeout_seconds.clamp(1, 30);
+    let timeout = Duration::from_secs(timeout_seconds);
+
+    match verify_auth_method(&provider, &auth_method, timeout).await {
+        Ok(_) => Ok(Json(VerifyResponse {
+            provider,
+            verified: true,
+            status: "authenticated".to_string(),
+            message: "Credentials verified successfully.".to_string(),
+            checked_at,
+        })),
+        Err(message) => Ok(Json(VerifyResponse {
+            provider,
+            verified: false,
+            status: "invalid".to_string(),
+            message,
+            checked_at,
+        })),
+    }
+}
+
+async fn verify_auth_method(
+    provider: &str,
+    auth_method: &AuthMethod,
+    timeout: Duration,
+) -> Result<(), String> {
+    match auth_method {
+        AuthMethod::OAuth {
+            provider: stored_provider,
+            access_token,
+            account_id,
+            ..
+        } => {
+            if stored_provider != provider {
+                return Err(format!(
+                    "Stored OAuth credentials belong to '{stored_provider}', not '{provider}'."
+                ));
+            }
+
+            if let Some(account_id) = account_id {
+                if provider != "openai" {
+                    return Err(format!(
+                        "Stored OAuth credentials don't support verification for provider '{provider}'."
+                    ));
+                }
+
+                let provider_client =
+                    OpenAiResponsesProvider::new(access_token.clone(), account_id.clone())
+                        .map_err(|error| error.to_string())?;
+                let verification = time::timeout(timeout, provider_client.verify_credentials())
+                    .await
+                    .map_err(|_| format!("Timed out while contacting {}.", provider_display_name(provider)))?;
+
+                verification
+                    .map(|_| ())
+                    .map_err(|error| verification_error_message(provider, error.to_string()))
+            } else {
+                verify_with_catalog(provider, access_token, "oauth", timeout).await
+            }
+        }
+        _ => {
+            let (provider_name, token, auth_mode) = verification_request(provider, auth_method)?;
+            verify_with_catalog(provider_name, &token, auth_mode, timeout).await
+        }
+    }
+}
+
+async fn verify_with_catalog(
+    provider: &str,
+    token: &str,
+    auth_mode: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let catalog = ModelCatalog::with_timeout(timeout);
+    catalog
+        .verify_credentials(provider, token, auth_mode)
+        .await
+        .map(|_| ())
+        .map_err(|error| verification_error_message(provider, error))
+}
+
+fn verification_request<'a>(
+    provider: &'a str,
+    auth_method: &'a AuthMethod,
+) -> Result<(&'a str, String, &'static str), String> {
+    match auth_method {
+        AuthMethod::ApiKey { key, .. } => {
+            let auth_mode = if provider == "anthropic" {
+                "api_key"
+            } else {
+                "bearer"
+            };
+            Ok((provider, key.clone(), auth_mode))
+        }
+        AuthMethod::SetupToken { token } => {
+            if provider != "anthropic" {
+                return Err(format!(
+                    "Stored credentials don't support verification for provider '{provider}'."
+                ));
+            }
+            Ok((provider, token.clone(), "setup_token"))
+        }
+        AuthMethod::OAuth { .. } => Err(format!(
+            "Stored OAuth credentials require provider-specific verification for '{provider}'."
+        )),
+    }
+}
+
+fn verification_error_message(provider: &str, error: String) -> String {
+    let provider_label = provider_display_name(provider);
+
+    if error.contains("401") || error.contains("403") {
+        return format!("{provider_label} rejected these credentials.");
+    }
+
+    if error.contains("timed out") || error.contains("deadline has elapsed") {
+        return format!("Timed out while contacting {provider_label}.");
+    }
+
+    if error.contains("unsupported provider") || error.contains("unsupported auth mode") {
+        return error;
+    }
+
+    if error.contains("request failed") {
+        return format!("Couldn't reach {provider_label} to verify credentials.");
+    }
+
+    format!("{provider_label} verification failed: {error}")
+}
+
+fn provider_display_name(provider: &str) -> &str {
+    match provider {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "openrouter" => "OpenRouter",
+        _ => provider,
+    }
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    Ok(Json(VerifyResponse {
-        provider,
-        verified: false,
-        status: "unverified".to_string(),
-        message: "Verification not yet implemented.".to_string(),
-        checked_at,
-    }))
+        .as_secs()
 }
 
 pub(super) fn save_auth_method(
@@ -180,18 +328,32 @@ mod tests {
     fn verify_response_serializes_expected_shape() {
         let response = VerifyResponse {
             provider: "anthropic".to_string(),
-            verified: false,
-            status: "unverified".to_string(),
-            message: "Verification not yet implemented.".to_string(),
+            verified: true,
+            status: "authenticated".to_string(),
+            message: "Credentials verified successfully.".to_string(),
             checked_at: 1_742_000_000,
         };
 
         let json = serde_json::to_value(response).expect("serialize");
 
         assert_eq!(json["provider"], "anthropic");
-        assert_eq!(json["verified"], false);
-        assert_eq!(json["status"], "unverified");
-        assert_eq!(json["message"], "Verification not yet implemented.");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["status"], "authenticated");
+        assert_eq!(json["message"], "Credentials verified successfully.");
         assert_eq!(json["checked_at"], 1_742_000_000);
     }
+
+    #[test]
+    fn verification_request_maps_anthropic_setup_tokens() {
+        let auth_method = AuthMethod::SetupToken {
+            token: "setup-token-123".to_string(),
+        };
+
+        let request = verification_request("anthropic", &auth_method).expect("verify request");
+
+        assert_eq!(request.0, "anthropic");
+        assert_eq!(request.1, "setup-token-123");
+        assert_eq!(request.2, "setup_token");
+    }
+
 }

@@ -1,6 +1,9 @@
 import Foundation
 
 actor FawxClient {
+    private static let streamIdleTimeout: TimeInterval = 120
+    private static let streamResourceTimeout: TimeInterval = 600
+
     private var baseURL: URL?
     private var bearerToken: String?
 
@@ -19,8 +22,8 @@ actor FawxClient {
         self.restSession = URLSession(configuration: restConfiguration)
 
         let streamConfiguration = URLSessionConfiguration.default
-        streamConfiguration.timeoutIntervalForRequest = 0
-        streamConfiguration.timeoutIntervalForResource = 0
+        streamConfiguration.timeoutIntervalForRequest = Self.streamIdleTimeout
+        streamConfiguration.timeoutIntervalForResource = Self.streamResourceTimeout
         self.streamSession = URLSession(configuration: streamConfiguration)
     }
 
@@ -42,6 +45,180 @@ actor FawxClient {
             bodyData: body,
             decodeAs: PairingExchangeResponse.self
         )
+    }
+
+    func adoptLocalDevice(deviceName: String) async throws -> PairingExchangeResponse {
+        let body = try encoder.encode(LocalAdoptBody(deviceName: deviceName))
+        return try await performSetupRequest(
+            path: "/v1/setup/adopt-local",
+            method: "POST",
+            bodyData: body,
+            decodeAs: PairingExchangeResponse.self
+        )
+    }
+
+    func setupStatus() async throws -> SetupStatusResponse {
+        try await performSetupRequest(path: "/v1/setup/status", decodeAs: SetupStatusResponse.self)
+    }
+
+    func runtimeStatus() async throws -> LocalServerRuntimeStatus {
+        try await performRequest(path: "/v1/server/status", decodeAs: LocalServerRuntimeStatus.self)
+    }
+
+    func restartServer() async throws -> ServerRestartControlResponse {
+        try await performRequest(
+            path: "/v1/server/restart",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: ServerRestartControlResponse.self
+        )
+    }
+
+    func stopServer() async throws -> ServerStopControlResponse {
+        try await performRequest(
+            path: "/v1/server/stop",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: ServerStopControlResponse.self
+        )
+    }
+
+    func launchAgentStatus() async throws -> LaunchAgentStatusResponse {
+        try await performSetupRequest(
+            path: "/v1/launchagent/status",
+            decodeAs: LaunchAgentStatusResponse.self
+        )
+    }
+
+    func installLaunchAgent(autoStart: Bool = true) async throws -> LaunchAgentInstallResponse {
+        let body = try encoder.encode(LaunchAgentInstallBody(autoStart: autoStart))
+        return try await performSetupRequest(
+            path: "/v1/launchagent/install",
+            method: "POST",
+            bodyData: body,
+            decodeAs: LaunchAgentInstallResponse.self
+        )
+    }
+
+    func uninstallLaunchAgent() async throws -> LaunchAgentUninstallResponse {
+        try await performSetupRequest(
+            path: "/v1/launchagent/uninstall",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: LaunchAgentUninstallResponse.self
+        )
+    }
+
+    func qrPairing() async throws -> QrPairingResponse {
+        try await performSetupRequest(path: "/v1/pair/qr", decodeAs: QrPairingResponse.self)
+    }
+
+    func tailscaleCert(hostname: String) async throws -> TailscaleCertResponse {
+        let body = try encoder.encode(TailscaleCertRequest(hostname: hostname))
+        return try await performSetupRequest(
+            path: "/v1/tailscale/cert",
+            method: "POST",
+            bodyData: body,
+            decodeAs: TailscaleCertResponse.self
+        )
+    }
+
+    func exchangeAnthropicSetupToken(
+        _ setupToken: String,
+        label: String = "Personal Claude subscription"
+    ) async throws -> ProviderAuthActionResponse {
+        let body = try encoder.encode(AnthropicSetupTokenBody(setupToken: setupToken, label: label))
+        return try await performSetupRequest(
+            path: "/v1/auth/anthropic/setup-token",
+            method: "POST",
+            bodyData: body,
+            decodeAs: ProviderAuthActionResponse.self
+        )
+    }
+
+    func storeAPIKey(
+        provider: String,
+        apiKey: String,
+        label: String = "Manual key"
+    ) async throws -> ProviderAuthActionResponse {
+        let body = try encoder.encode(APIKeyStoreBody(apiKey: apiKey, label: label))
+        return try await performSetupRequest(
+            path: "/v1/auth/\(provider)/api-key",
+            method: "POST",
+            bodyData: body,
+            decodeAs: ProviderAuthActionResponse.self
+        )
+    }
+
+    func verifyProvider(
+        _ provider: String,
+        timeoutSeconds: Int = 10
+    ) async throws -> ProviderVerificationResponse {
+        let body = try encoder.encode(VerifyProviderBody(timeoutSeconds: timeoutSeconds))
+        return try await performSetupRequest(
+            path: "/v1/auth/\(provider)/verify",
+            method: "POST",
+            bodyData: body,
+            decodeAs: ProviderVerificationResponse.self
+        )
+    }
+
+    func deleteProvider(_ provider: String) async throws -> DeleteProviderResponse {
+        try await performRequest(
+            path: "/v1/auth/\(provider)",
+            method: "DELETE",
+            decodeAs: DeleteProviderResponse.self
+        )
+    }
+
+    func patchConfig(changes: JSONValue) async throws -> ConfigPatchResponse {
+        let body = try encoder.encode(ConfigPatchBody(changes: changes))
+        return try await performRequest(
+            path: "/v1/config",
+            method: "PATCH",
+            bodyData: body,
+            decodeAs: ConfigPatchResponse.self
+        )
+    }
+
+    func getPermissions() async throws -> PermissionsResponse {
+        try await performRequest(path: "/v1/permissions", decodeAs: PermissionsResponse.self)
+    }
+
+    func patchPermissions(_ request: PermissionsPatchRequest) async throws -> PermissionsPatchResponse {
+        let body = try encoder.encode(request)
+        return try await performRequest(
+            path: "/v1/permissions",
+            method: "PATCH",
+            bodyData: body,
+            decodeAs: PermissionsPatchResponse.self
+        )
+    }
+
+    func getSynthesis() async throws -> SynthesisResponse {
+        try await performRequest(path: "/v1/synthesis", decodeAs: SynthesisResponse.self)
+    }
+
+    func setSynthesis(_ text: String, version: Int? = nil) async throws -> SetSynthesisResponse {
+        let body = try encoder.encode(SetSynthesisRequest(synthesis: text, version: version))
+        return try await performRequest(
+            path: "/v1/synthesis",
+            method: "PUT",
+            bodyData: body,
+            decodeAs: SetSynthesisResponse.self
+        )
+    }
+
+    func clearSynthesis() async throws -> ClearSynthesisResponse {
+        try await performRequest(
+            path: "/v1/synthesis",
+            method: "DELETE",
+            decodeAs: ClearSynthesisResponse.self
+        )
+    }
+
+    func getUsage() async throws -> UsageResponse {
+        try await performRequest(path: "/v1/usage", decodeAs: UsageResponse.self)
     }
 
     func serverStatus() async throws -> ServerStatusResponse {
@@ -232,10 +409,70 @@ actor FawxClient {
         try await performRequest(path: "/v1/skills", decodeAs: SkillsResponse.self)
     }
 
+    func searchSkills(query: String) async throws -> SkillSearchResponse {
+        try await performRequest(
+            path: "/v1/skills/search",
+            queryItems: [.init(name: "q", value: query)],
+            decodeAs: SkillSearchResponse.self
+        )
+    }
+
+    func installSkill(name: String) async throws {
+        let body = try encoder.encode(InstallSkillRequest(name: name))
+        let _: JSONValue = try await performRequest(
+            path: "/v1/skills/install",
+            method: "POST",
+            bodyData: body,
+            decodeAs: JSONValue.self
+        )
+    }
+
+    func removeSkill(name: String) async throws {
+        let _: JSONValue = try await performRequest(
+            path: "/v1/skills/\(name)",
+            method: "DELETE",
+            decodeAs: JSONValue.self
+        )
+    }
+
+    func updateSkillPermissions(
+        name: String,
+        capabilities: [String]
+    ) async throws -> UpdateSkillPermissionsResponse {
+        let body = try encoder.encode(UpdateSkillPermissionsRequest(capabilities: capabilities))
+        return try await performRequest(
+            path: "/v1/skills/\(name)",
+            method: "PATCH",
+            bodyData: body,
+            decodeAs: UpdateSkillPermissionsResponse.self
+        )
+    }
+
     func authProviders() async throws -> AuthProvidersResponse {
         try await performRequest(
             candidatePaths: ["/v1/auth/status", "/v1/auth"],
             decodeAs: AuthProvidersResponse.self
+        )
+    }
+
+    func oauthStart(provider: String) async throws -> OAuthStartResponse {
+        try await performSetupRequest(
+            path: "/v1/auth/\(provider)/oauth-start",
+            decodeAs: OAuthStartResponse.self
+        )
+    }
+
+    func oauthCallback(
+        provider: String,
+        code: String,
+        flowToken: String
+    ) async throws -> OAuthCallbackResponse {
+        let body = try encoder.encode(OAuthCallbackRequest(code: code, flowToken: flowToken))
+        return try await performSetupRequest(
+            path: "/v1/auth/\(provider)/oauth-callback",
+            method: "POST",
+            bodyData: body,
+            decodeAs: OAuthCallbackResponse.self
         )
     }
 
@@ -273,7 +510,7 @@ actor FawxClient {
                     bodyData: bodyData,
                     decodeAs: Response.self
                 )
-            } catch APIError.httpStatus(let code, _) where code == 404 {
+            } catch APIError.httpStatus(let code, _) where code == 404 || code == 405 {
                 lastError = APIError.httpStatus(code, nil)
                 continue
             } catch {
@@ -307,6 +544,40 @@ actor FawxClient {
         } catch {
             throw APIError.decoding(error.localizedDescription)
         }
+    }
+
+    private func performSetupRequest<Response: Decodable>(
+        path: String,
+        method: String = "GET",
+        queryItems: [URLQueryItem] = [],
+        bodyData: Data? = nil,
+        decodeAs: Response.Type
+    ) async throws -> Response {
+        if let bearerToken, !bearerToken.isEmpty {
+            do {
+                return try await performRequest(
+                    path: path,
+                    method: method,
+                    queryItems: queryItems,
+                    authRequired: true,
+                    bodyData: bodyData,
+                    decodeAs: Response.self
+                )
+            } catch APIError.httpStatus(let code, _) where code == 401 || code == 403 || code == 404 {
+                // Fall back to the setup-mode public endpoint shape below.
+            } catch APIError.authenticationRequired {
+                // Fall through to the public setup endpoint shape below.
+            }
+        }
+
+        return try await performRequest(
+            path: path,
+            method: method,
+            queryItems: queryItems,
+            authRequired: false,
+            bodyData: bodyData,
+            decodeAs: Response.self
+        )
     }
 
     private func makeRequest(
@@ -388,6 +659,58 @@ private struct CreateSessionBody: Encodable {
     let model: String?
 }
 
+private struct LaunchAgentInstallBody: Encodable {
+    let autoStart: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case autoStart = "auto_start"
+    }
+}
+
+private struct TailscaleCertRequest: Encodable {
+    let hostname: String
+}
+
+private struct AnthropicSetupTokenBody: Encodable {
+    let setupToken: String
+    let label: String
+
+    enum CodingKeys: String, CodingKey {
+        case setupToken = "setup_token"
+        case label
+    }
+}
+
+private struct APIKeyStoreBody: Encodable {
+    let apiKey: String
+    let label: String
+
+    enum CodingKeys: String, CodingKey {
+        case apiKey = "api_key"
+        case label
+    }
+}
+
+private struct VerifyProviderBody: Encodable {
+    let timeoutSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case timeoutSeconds = "timeout_seconds"
+    }
+}
+
+private struct ConfigPatchBody: Encodable {
+    let changes: JSONValue
+}
+
+private struct InstallSkillRequest: Encodable {
+    let name: String
+}
+
+private struct UpdateSkillPermissionsRequest: Encodable {
+    let capabilities: [String]
+}
+
 private struct SendMessageBody: Encodable {
     let message: String
     let images: [ImagePayload]
@@ -414,6 +737,14 @@ private struct PairingExchangeBody: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case code
+        case deviceName = "device_name"
+    }
+}
+
+private struct LocalAdoptBody: Encodable {
+    let deviceName: String
+
+    enum CodingKeys: String, CodingKey {
         case deviceName = "device_name"
     }
 }

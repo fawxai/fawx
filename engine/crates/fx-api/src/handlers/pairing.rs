@@ -2,9 +2,13 @@ use crate::pairing::{PairingCode, PairingError, PairingState};
 use crate::server_runtime::ServerRuntime;
 use crate::state::HttpState;
 use crate::types::{ErrorBody, QrPairingResponse, TailscaleCertRequest, TailscaleCertResponse};
-use axum::extract::{Json, State};
+use axum::extract::{ConnectInfo, Json, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::process::Command;
 
 const DEFAULT_DEVICE_NAME: &str = "Unnamed device";
 
@@ -19,6 +23,12 @@ pub struct GeneratePairRequest {
 #[derive(Debug, Deserialize)]
 pub struct ExchangePairRequest {
     pub code: String,
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdoptLocalRequest {
     #[serde(default)]
     pub device_name: Option<String>,
 }
@@ -59,29 +69,109 @@ pub async fn handle_exchange_pair(
     Ok(Json(ExchangePairResponse { token, device_id }))
 }
 
-pub async fn handle_qr_pairing(State(state): State<HttpState>) -> Json<QrPairingResponse> {
-    Json(qr_pairing_response(&state.server_runtime))
+pub async fn handle_adopt_local_device(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<HttpState>,
+    Json(request): Json<AdoptLocalRequest>,
+) -> HandlerResult<Json<ExchangePairResponse>> {
+    if !remote_addr.ip().is_loopback() {
+        return Err(error_response(StatusCode::FORBIDDEN, "loopback_only"));
+    }
+
+    let device_name = requested_device_name(request.device_name.as_deref());
+    let (token, device_id) = create_and_persist_device(&state, &device_name)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ExchangePairResponse { token, device_id }))
 }
 
-fn qr_pairing_response(runtime: &ServerRuntime) -> QrPairingResponse {
-    let (transport, same_network_only) = qr_transport(runtime.https_enabled);
-    let host = runtime.host.clone();
+pub async fn handle_qr_pairing(State(state): State<HttpState>) -> Json<QrPairingResponse> {
+    let tailscale = tokio::task::spawn_blocking(detect_qr_tailscale_status)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "tailscale QR detection task failed");
+            QrTailscaleStatus::default()
+        });
+    Json(qr_pairing_response(&state.server_runtime, &tailscale))
+}
+
+fn qr_pairing_response(runtime: &ServerRuntime, tailscale: &QrTailscaleStatus) -> QrPairingResponse {
+    let target = qr_target(runtime, tailscale);
+    let host = target.host;
     let port = runtime.port;
     let scheme_url = format!("fawx://connect?host={host}&port={port}&token=REDACTED");
     QrPairingResponse {
         scheme_url,
         display_host: host,
         port,
-        transport: transport.to_string(),
-        same_network_only,
+        transport: target.transport.to_string(),
+        same_network_only: target.same_network_only,
     }
 }
 
-fn qr_transport(https_enabled: bool) -> (&'static str, bool) {
-    if https_enabled {
-        ("tailscale_https", false)
-    } else {
-        ("lan_http", true)
+fn qr_target(runtime: &ServerRuntime, tailscale: &QrTailscaleStatus) -> QrTransportTarget {
+    if tailscale.cert_ready {
+        if let Some(hostname) = tailscale.hostname.as_deref() {
+            return QrTransportTarget {
+                host: hostname.to_string(),
+                transport: "tailscale_https",
+                same_network_only: false,
+            };
+        }
+    }
+
+    if runtime.https_enabled {
+        return QrTransportTarget {
+            host: runtime.host.clone(),
+            transport: "tailscale_https",
+            same_network_only: false,
+        };
+    }
+
+    QrTransportTarget {
+        host: runtime.host.clone(),
+        transport: "lan_http",
+        same_network_only: true,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QrTailscaleStatus {
+    hostname: Option<String>,
+    cert_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QrTransportTarget {
+    host: String,
+    transport: &'static str,
+    same_network_only: bool,
+}
+
+fn detect_qr_tailscale_status() -> QrTailscaleStatus {
+    match Command::new("tailscale").args(["status", "--json"]).output() {
+        Err(error) if error.kind() == ErrorKind::NotFound => QrTailscaleStatus::default(),
+        Err(_) => QrTailscaleStatus::default(),
+        Ok(output) if !output.status.success() => QrTailscaleStatus::default(),
+        Ok(output) => match serde_json::from_slice::<Value>(&output.stdout) {
+            Ok(json) => build_qr_tailscale_status(&json),
+            Err(_) => QrTailscaleStatus::default(),
+        },
+    }
+}
+
+fn build_qr_tailscale_status(json: &Value) -> QrTailscaleStatus {
+    QrTailscaleStatus {
+        hostname: json
+            .pointer("/Self/DNSName")
+            .and_then(Value::as_str)
+            .map(|hostname| hostname.trim_end_matches('.'))
+            .filter(|hostname| !hostname.is_empty())
+            .map(str::to_string),
+        cert_ready: json
+            .get("CertDomains")
+            .and_then(Value::as_array)
+            .is_some_and(|domains| !domains.is_empty()),
     }
 }
 
@@ -278,16 +368,31 @@ mod phase4_tests {
 
     #[test]
     fn qr_pairing_uses_https_transport_when_https_enabled() {
-        let response = qr_pairing_response(&test_runtime(true));
+        let response = qr_pairing_response(&test_runtime(true), &QrTailscaleStatus::default());
         assert_eq!(response.transport, "tailscale_https");
         assert!(!response.same_network_only);
     }
 
     #[test]
     fn qr_pairing_uses_lan_transport_when_https_disabled() {
-        let response = qr_pairing_response(&test_runtime(false));
+        let response = qr_pairing_response(&test_runtime(false), &QrTailscaleStatus::default());
         assert_eq!(response.transport, "lan_http");
         assert!(response.same_network_only);
+    }
+
+    #[test]
+    fn qr_pairing_prefers_tailscale_hostname_when_cert_ready() {
+        let response = qr_pairing_response(
+            &test_runtime(false),
+            &QrTailscaleStatus {
+                hostname: Some("joes-mac.tail1234.ts.net".to_string()),
+                cert_ready: true,
+            },
+        );
+        assert_eq!(response.display_host, "joes-mac.tail1234.ts.net");
+        assert_eq!(response.transport, "tailscale_https");
+        assert!(!response.same_network_only);
+        assert!(response.scheme_url.contains("host=joes-mac.tail1234.ts.net"));
     }
 
     #[test]

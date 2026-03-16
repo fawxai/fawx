@@ -5,7 +5,7 @@ enum KeychainHelper {
     static let defaultService = "ai.fawx.app"
 
     static func token(forServer account: String, service: String = defaultService) throws -> String? {
-        let query = tokenQuery(forServer: account, service: service, includeData: true)
+        let query = tokenLookupQuery(forServer: account, service: service)
 
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
@@ -34,13 +34,10 @@ enum KeychainHelper {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
         ]
 
-        let existingStatus = SecItemCopyMatching(query as CFDictionary, nil)
-        switch existingStatus {
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        switch updateStatus {
         case errSecSuccess:
-            let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-            guard status == errSecSuccess else {
-                throw KeychainError.operationFailed(status)
-            }
+            return
         case errSecItemNotFound:
             var newItem = query
             attributes.forEach { newItem[$0.key] = $0.value }
@@ -49,7 +46,7 @@ enum KeychainHelper {
                 throw KeychainError.operationFailed(status)
             }
         default:
-            throw KeychainError.operationFailed(existingStatus)
+            throw KeychainError.operationFailed(updateStatus)
         }
     }
 
@@ -64,19 +61,22 @@ enum KeychainHelper {
 
     private static func tokenQuery(
         forServer account: String,
-        service: String,
-        includeData: Bool = false
+        service: String
     ) -> [String: Any] {
-        var query: [String: Any] = [
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+    }
 
-        if includeData {
-            query[kSecReturnData as String] = true
-        }
+    private static func tokenLookupQuery(
+        forServer account: String,
+        service: String
+    ) -> [String: Any] {
+        var query = tokenQuery(forServer: account, service: service)
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecReturnData as String] = true
         return query
     }
 }

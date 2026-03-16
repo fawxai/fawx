@@ -3,25 +3,53 @@ import SwiftUI
 
 struct OnboardingView: View {
     @Bindable var settingsViewModel: SettingsViewModel
+    @Bindable var appState: AppState
+
+#if os(iOS)
+    @State private var isShowingQRScanner = false
+#endif
 
     var body: some View {
         ZStack {
             Color.fawxBackground.ignoresSafeArea()
 
             VStack(spacing: FawxSpacing.paddingLG) {
-                Text("Welcome to Fawx")
-                    .font(FawxTypography.heading1)
-                    .foregroundStyle(Color.fawxText)
+                titleSection
 
-                Text("Pair this device with your Fawx server to get started.")
-                    .font(FawxTypography.chatBody)
-                    .foregroundStyle(Color.fawxTextSecondary)
+#if os(iOS)
+                scanCard
+#endif
 
                 onboardingCard
+
+#if os(macOS)
+                if appState.canOpenRemoteOnboarding {
+                    Button("Set up this Mac instead") {
+                        appState.returnToLocalSetup()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.fawxAccent)
+                }
+#endif
             }
             .padding(FawxSpacing.paddingXL)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+#if os(iOS)
+        .sheet(isPresented: $isShowingQRScanner) {
+            QRCodeScannerSheet(
+                onCancel: {
+                    isShowingQRScanner = false
+                },
+                onCodeScanned: { rawValue in
+                    isShowingQRScanner = false
+                    Task {
+                        await settingsViewModel.applyScannedConnectionLink(rawValue)
+                    }
+                }
+            )
+        }
+#endif
     }
 
     private var onboardingCard: some View {
@@ -41,6 +69,58 @@ struct OnboardingView: View {
                 .stroke(Color.fawxBorder, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+    }
+
+    private var titleSection: some View {
+        VStack(spacing: FawxSpacing.paddingSM) {
+            Group {
+#if os(macOS)
+                Text("Connect to another Fawx server")
+#else
+                Text("Connect to Fawx")
+#endif
+            }
+            .font(FawxTypography.heading1)
+            .foregroundStyle(Color.fawxText)
+
+            Text(titleDetail)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+#if os(iOS)
+    private var scanCard: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+            Text("Scan a pairing QR code from your Mac to fill in the connection automatically.")
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            Button(settingsViewModel.isProcessingQRCode ? "Scanning..." : "Scan QR Code") {
+                isShowingQRScanner = true
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.fawxAccent)
+            .disabled(settingsViewModel.isProcessingQRCode)
+        }
+        .padding(FawxSpacing.paddingLG)
+        .frame(maxWidth: 460)
+        .background(Color.fawxSurface)
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+    }
+#endif
+
+    private var titleDetail: String {
+#if os(macOS)
+        "Enter the server URL and pairing code to use a Fawx server running on another machine."
+#else
+        "Scan the QR code from your Mac or enter the server URL and pairing code manually."
+#endif
     }
 
     private var serverStep: some View {

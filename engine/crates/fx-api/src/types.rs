@@ -312,14 +312,16 @@ pub struct SkillSummaryDto {
     pub name: String,
     pub description: String,
     pub tools: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
-impl From<(String, String, Vec<String>)> for SkillSummaryDto {
-    fn from((name, description, tools): (String, String, Vec<String>)) -> Self {
+impl From<(String, String, Vec<String>, Vec<String>)> for SkillSummaryDto {
+    fn from((name, description, tools, capabilities): (String, String, Vec<String>, Vec<String>)) -> Self {
         Self {
             name,
             description,
             tools,
+            capabilities,
         }
     }
 }

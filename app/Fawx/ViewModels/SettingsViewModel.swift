@@ -13,6 +13,11 @@ enum OnboardingStep: Int, Sendable {
     case pairingCode
 }
 
+private struct ScannedConnectionInfo {
+    let serverURL: String
+    let token: String?
+}
+
 @MainActor
 @Observable
 final class SettingsViewModel {
@@ -21,6 +26,7 @@ final class SettingsViewModel {
     var onboardingStep: OnboardingStep = .serverURL
     var isTestingConnection = false
     var isPairingDevice = false
+    var isProcessingQRCode = false
     var testStatusKind: ConnectionTestKind = .idle
     var testStatusMessage: String?
     var pairingStatusKind: ConnectionTestKind = .idle
@@ -39,8 +45,7 @@ final class SettingsViewModel {
             return false
         }
 
-        return testStatusKind == .success
-            && lastSuccessfulURL == canonicalURLString
+        return testStatusKind == .success && lastSuccessfulURL == canonicalURLString
     }
 
     var canPair: Bool {
@@ -93,18 +98,18 @@ final class SettingsViewModel {
         testStatusMessage = nil
         pairingStatusKind = .idle
         pairingStatusMessage = nil
-        lastSuccessfulURL = nil
+        lastSuccessfulURL = appState.isConfigured ? canonicalizeServerURL(appState.serverURLString) : nil
     }
 
     func testConnection() async {
         guard let canonicalURLString = canonicalizeServerURL(serverURL) else {
             testStatusKind = .failure
-            testStatusMessage = "Enter a valid server URL."
+            testStatusMessage = serverURLValidationMessage(serverURL)
             return
         }
         guard let url = URL(string: canonicalURLString) else {
             testStatusKind = .failure
-            testStatusMessage = "Enter a valid server URL."
+            testStatusMessage = serverURLValidationMessage(serverURL)
             return
         }
 
@@ -193,14 +198,14 @@ final class SettingsViewModel {
 
         do {
             let response = try await client.pair(code: strippedPairingCode, deviceName: requestedDeviceName)
-            let pairedDeviceName = response.deviceName?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedDeviceName = pairedDeviceName?.isEmpty == false ? pairedDeviceName! : requestedDeviceName
+            let pairedDeviceName = response.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedDeviceName = pairedDeviceName?.nonEmpty ?? requestedDeviceName
 
             try await appState.savePairing(
                 serverURLString: canonicalURLString,
                 token: response.token,
-                deviceName: resolvedDeviceName
+                deviceName: resolvedDeviceName,
+                connectionMode: .remote
             )
             pairingStatusKind = .success
             pairingStatusMessage = "Paired as \(resolvedDeviceName)."
@@ -211,6 +216,46 @@ final class SettingsViewModel {
         } catch {
             pairingStatusKind = .failure
             pairingStatusMessage = error.localizedDescription
+        }
+    }
+
+    func applyScannedConnectionLink(_ rawValue: String) async {
+        guard let connection = Self.parseScannedConnection(rawValue) else {
+            pairingStatusKind = .failure
+            pairingStatusMessage = "That QR code does not contain a valid Fawx connection."
+            return
+        }
+
+        isProcessingQRCode = true
+        defer { isProcessingQRCode = false }
+
+        serverURL = connection.serverURL
+
+        if let directToken = connection.token, !directToken.isEmpty {
+            do {
+                try await appState.savePairing(
+                    serverURLString: connection.serverURL,
+                    token: directToken,
+                    deviceName: currentDeviceName,
+                    connectionMode: .remote
+                )
+                pairingStatusKind = .success
+                pairingStatusMessage = "Connected to \(connection.serverURL)."
+                lastSuccessfulURL = connection.serverURL
+                await appState.bootstrap()
+                return
+            } catch {
+                pairingStatusKind = .failure
+                pairingStatusMessage = error.localizedDescription
+                return
+            }
+        }
+
+        await testConnection()
+        if canContinue {
+            continueToPairing()
+            pairingStatusKind = .warning
+            pairingStatusMessage = "Server detected. Enter the pairing code to finish connecting."
         }
     }
 
@@ -239,5 +284,51 @@ final class SettingsViewModel {
 
         let splitIndex = stripped.index(stripped.startIndex, offsetBy: 3)
         return "\(stripped[..<splitIndex])-\(stripped[splitIndex...])"
+    }
+
+    private static func parseScannedConnection(_ rawValue: String) -> ScannedConnectionInfo? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        if let canonicalURL = canonicalizeServerURL(trimmed) {
+            return ScannedConnectionInfo(serverURL: canonicalURL, token: nil)
+        }
+
+        guard let components = URLComponents(string: trimmed) else {
+            return nil
+        }
+
+        let items = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { item in
+            (item.name.lowercased(), item.value ?? "")
+        })
+
+        let host = items["host"] ?? components.host
+        let port = items["port"].flatMap(Int.init) ?? components.port ?? 8400
+        guard let host, !host.isEmpty else {
+            return nil
+        }
+
+        let preferredScheme: String
+        if host.contains(".ts.net") {
+            preferredScheme = "https"
+        } else {
+            preferredScheme = "http"
+        }
+
+        guard let canonicalURL = canonicalizeServerURL("\(preferredScheme)://\(host):\(port)") else {
+            return nil
+        }
+
+        let token = items["token"]
+        let resolvedToken: String?
+        if let token, !token.isEmpty, token.uppercased() != "REDACTED" {
+            resolvedToken = token
+        } else {
+            resolvedToken = nil
+        }
+
+        return ScannedConnectionInfo(serverURL: canonicalURL, token: resolvedToken)
     }
 }

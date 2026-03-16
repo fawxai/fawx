@@ -41,8 +41,13 @@ struct CacheEntry {
 impl ModelCatalog {
     /// Create a new catalog with empty cache.
     pub fn new() -> Self {
+        Self::with_timeout(Duration::from_secs(20))
+    }
+
+    /// Create a new catalog with a custom request timeout.
+    pub fn with_timeout(timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
+            .timeout(timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -50,6 +55,18 @@ impl ModelCatalog {
             cache: HashMap::new(),
             client,
         }
+    }
+
+    /// Validate provider credentials by making a live models request.
+    pub async fn verify_credentials(
+        &self,
+        provider: &str,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Result<usize, String> {
+        let provider_key = normalize_provider(provider);
+        let models = self.fetch_models(&provider_key, api_key, auth_mode).await?;
+        Ok(models.len())
     }
 
     /// Fetch models for a provider. Uses cache if fresh, falls back on error.

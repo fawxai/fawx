@@ -124,6 +124,14 @@ impl Skill for WasmSkill {
         vec![self.build_tool_definition()]
     }
 
+    fn capabilities(&self) -> Vec<String> {
+        self.manifest
+            .capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
         // WASM skills may have arbitrary side effects we can't predict.
         ToolCacheability::NeverCache

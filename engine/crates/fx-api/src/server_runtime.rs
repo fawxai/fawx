@@ -129,18 +129,7 @@ struct RestartPlan {
 
 impl RestartPlan {
     fn detect() -> Self {
-        let launchagent = detect_launchagent_state();
-        if launchagent.installed && launchagent.loaded && launchagent.auto_start_enabled {
-            return Self {
-                signal: RestartSignal::Terminate,
-                restart_via: "launchagent_keepalive",
-            };
-        }
-
-        Self {
-            signal: RestartSignal::Hangup,
-            restart_via: "sighup_reexec",
-        }
+        restart_plan_for_state(detect_launchagent_state(), current_process_managed_by_launchagent())
     }
 
     fn action(self) -> RestartAction {
@@ -149,6 +138,59 @@ impl RestartPlan {
             message: "Server restart requested.",
         }
     }
+}
+
+fn restart_plan_for_state(
+    launchagent: LaunchAgentState,
+    managed_by_launchagent: bool,
+) -> RestartPlan {
+    if launchagent.installed
+        && launchagent.loaded
+        && launchagent.auto_start_enabled
+        && managed_by_launchagent
+    {
+        return RestartPlan {
+            signal: RestartSignal::Terminate,
+            restart_via: "launchagent_keepalive",
+        };
+    }
+
+    RestartPlan {
+        signal: RestartSignal::Hangup,
+        restart_via: "sighup_reexec",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_managed_by_launchagent() -> bool {
+    if std::env::var("LAUNCH_JOB_LABEL")
+        .ok()
+        .as_deref()
+        .is_some_and(|label| label == LAUNCHAGENT_LABEL)
+    {
+        return true;
+    }
+
+    current_parent_pid().is_some_and(|ppid| ppid == 1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_process_managed_by_launchagent() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn current_parent_pid() -> Option<u32> {
+    let pid = std::process::id().to_string();
+    let output = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn schedule_restart_signal(signal: RestartSignal) -> Result<(), String> {
@@ -216,4 +258,39 @@ fn command_output_contains(command: &str, args: &[&str], needle: &str) -> bool {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).contains(needle))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_server_restart_uses_sighup_even_if_launchagent_is_installed() {
+        let plan = restart_plan_for_state(
+            LaunchAgentState {
+                installed: true,
+                loaded: true,
+                auto_start_enabled: true,
+            },
+            false,
+        );
+
+        assert_eq!(plan.signal, RestartSignal::Hangup);
+        assert_eq!(plan.restart_via, "sighup_reexec");
+    }
+
+    #[test]
+    fn launchagent_managed_server_uses_keepalive_restart() {
+        let plan = restart_plan_for_state(
+            LaunchAgentState {
+                installed: true,
+                loaded: true,
+                auto_start_enabled: true,
+            },
+            true,
+        );
+
+        assert_eq!(plan.signal, RestartSignal::Terminate);
+        assert_eq!(plan.restart_via, "launchagent_keepalive");
+    }
 }

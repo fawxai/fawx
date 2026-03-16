@@ -86,10 +86,11 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(pairButton.waitForExistence(timeout: 3), "Expected the pair button to appear.")
         pairButton.tap()
 
+        let messageInput = app.descendants(matching: .any)["messageInput"]
         let sessionList = app.descendants(matching: .any)["sessionList"]
         XCTAssertTrue(
-            sessionList.waitForExistence(timeout: 15),
-            "Expected the app to transition to the main session list after pairing."
+            messageInput.waitForExistence(timeout: 15) || sessionList.waitForExistence(timeout: 5),
+            "Expected the app to transition into the main chat experience after pairing."
         )
 
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())

@@ -14,6 +14,7 @@ pub(crate) mod middleware;
 pub(crate) mod pairing;
 pub(crate) mod router;
 pub mod server_runtime;
+pub(crate) mod skill_manifests;
 pub(crate) mod sse;
 pub(crate) mod state;
 pub mod tailscale;

@@ -169,7 +169,7 @@ pub async fn serve_listener(
     router: Router,
     label: &'static str,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
 }
@@ -180,7 +180,10 @@ pub async fn serve_listener_with_shutdown(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let label = listener.target.label;
-    axum::serve(listener.listener, router)
+    axum::serve(
+        listener.listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             if !*shutdown.borrow() {
                 let _ = shutdown.changed().await;

@@ -1,5 +1,6 @@
 use crate::state::HttpState;
 use crate::types::{ErrorBody, SetModelRequest, SetThinkingRequest};
+use crate::skill_manifests::installed_skill_capabilities;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -48,7 +49,17 @@ pub async fn handle_set_thinking(
 
 pub async fn handle_list_skills(State(state): State<HttpState>) -> Json<Value> {
     let app = state.app.lock().await;
-    let skills = app.skill_summaries();
+    let mut skills = app.skill_summaries();
+    drop(app);
+
+    if let Ok(manifest_capabilities) = installed_skill_capabilities(&state.data_dir.join("skills")) {
+        for skill in &mut skills {
+            if let Some(capabilities) = manifest_capabilities.get(&skill.name) {
+                skill.capabilities = capabilities.clone();
+            }
+        }
+    }
+
     let total = skills.len();
     Json(json!({
         "skills": skills,
