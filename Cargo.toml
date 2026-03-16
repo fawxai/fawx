@@ -41,6 +41,7 @@ members = [
     "engine/crates/fx-cron",
     "engine/crates/fx-consensus",
     "engine/crates/fx-training",
+  "engine/crates/fx-telemetry",
 ]
 exclude = [
     "skills/calculator-skill",
