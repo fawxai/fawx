@@ -9,7 +9,7 @@ mod skill_bridge;
 mod tools;
 
 pub use cron_skill::CronSkill;
-pub use experiment_tool::ExperimentToolState;
+pub use experiment_tool::{ExperimentRegistrar, ExperimentToolState};
 pub use git_skill::GitSkill;
 #[cfg(feature = "improvement")]
 pub use improvement_tools::ImprovementToolsState;

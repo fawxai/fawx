@@ -6,6 +6,7 @@ pub mod time_util;
 pub(crate) mod devices;
 pub mod engine;
 pub(crate) mod error;
+pub mod experiment_bridge;
 pub mod experiment_registry;
 pub(crate) mod handlers;
 pub mod launchagent;
@@ -57,6 +58,8 @@ pub use types::{
     VerifyRequest, VerifyResponse,
 };
 
+pub type SharedExperimentRegistry = Arc<Mutex<crate::experiment_registry::ExperimentRegistry>>;
+
 pub struct RunConfig {
     pub port: u16,
     pub http_config: HttpConfig,
@@ -65,6 +68,7 @@ pub struct RunConfig {
     pub webhook_channels: Vec<Arc<WebhookChannel>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    pub experiment_registry: Option<SharedExperimentRegistry>,
 }
 
 pub async fn run(
@@ -80,8 +84,14 @@ pub async fn run(
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(config.telegram.clone(), config.webhook_channels);
     let session_registry = init_session_registry(&config.data_dir);
-    let experiment_registry = crate::experiment_registry::ExperimentRegistry::new(&config.data_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to load experiment registry: {e}"))?;
+    let experiment_registry = match config.experiment_registry {
+        Some(registry) => registry,
+        None => {
+            let registry = crate::experiment_registry::ExperimentRegistry::new(&config.data_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to load experiment registry: {e}"))?;
+            Arc::new(Mutex::new(registry))
+        }
+    };
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
@@ -121,7 +131,7 @@ pub async fn run(
         permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
-        experiment_registry: Arc::new(Mutex::new(experiment_registry)),
+        experiment_registry,
         improvement_provider: config.improvement_provider.clone(),
         telemetry: default_telemetry(),
     };

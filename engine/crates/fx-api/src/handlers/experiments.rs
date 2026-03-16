@@ -49,6 +49,7 @@ pub type ExperimentDetailResponse = Experiment;
 pub struct ExperimentResultsResponse {
     pub id: String,
     pub status: ExperimentStatus,
+    pub score_summary: String,
     pub leaders: Vec<ExperimentLeader>,
     pub tournament: Option<ExperimentTournament>,
     pub plans_generated: usize,
@@ -232,6 +233,9 @@ fn completed_summary(result: Option<&ExperimentResult>) -> String {
     let Some(result) = result else {
         return "completed".to_string();
     };
+    if let Some(summary) = stored_score_summary(result) {
+        return summary;
+    }
 
     let plans = pluralize(result.plans_generated, "plan", "plans");
     let proposals = pluralize(result.proposals_written.len(), "proposal", "proposals");
@@ -250,6 +254,7 @@ fn build_results_response(experiment: &Experiment) -> ExperimentResultsResponse 
     ExperimentResultsResponse {
         id: experiment.id.clone(),
         status: experiment.status,
+        score_summary: score_summary(experiment),
         leaders: build_result_leaders(result),
         tournament: None,
         plans_generated: result.plans_generated,
@@ -277,6 +282,7 @@ fn empty_results_response(experiment: &Experiment) -> ExperimentResultsResponse 
     ExperimentResultsResponse {
         id: experiment.id.clone(),
         status: experiment.status,
+        score_summary: score_summary(experiment),
         leaders: Vec::new(),
         tournament: None,
         plans_generated: 0,
@@ -392,6 +398,7 @@ fn convert_run_result(
             .map(|p| p.display().to_string())
             .collect(),
         branches_created: result.branches_created,
+        score_summary: None,
         skipped: result
             .skipped
             .into_iter()
@@ -477,6 +484,15 @@ fn running_summary(experiment: &Experiment) -> String {
         "match {} of {}",
         progress.completed_matches, progress.total_matches
     )
+}
+
+fn stored_score_summary(result: &ExperimentResult) -> Option<String> {
+    result
+        .score_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map(ToString::to_string)
 }
 
 fn concurrent_experiment_conflict() -> (StatusCode, Json<ErrorBody>) {
@@ -723,6 +739,7 @@ mod tests {
         let response = ExperimentResultsResponse {
             id: "exp1".to_string(),
             status: ExperimentStatus::Queued,
+            score_summary: "waiting to start".to_string(),
             leaders: Vec::new(),
             tournament: None,
             plans_generated: 0,
@@ -734,6 +751,7 @@ mod tests {
         let json = serde_json::to_value(response).expect("json");
         assert!(json["leaders"].as_array().expect("leaders").is_empty());
         assert!(json["tournament"].is_null());
+        assert_eq!(json["score_summary"], "waiting to start");
     }
 
     #[test]
@@ -815,6 +833,39 @@ mod tests {
             .await
             .expect("list experiments");
         assert_eq!(list.experiments[0].score_summary, "match 2 of 4");
+    }
+
+    #[tokio::test]
+    async fn list_uses_recorded_score_summary_for_completed_experiment() {
+        let (_temp_dir, state) = test_state();
+        {
+            let mut registry = state.experiment_registry.lock().await;
+            let experiment = registry
+                .create(
+                    "Tournament".to_string(),
+                    ExperimentKind::Tournament,
+                    ExperimentConfig::default(),
+                )
+                .expect("create experiment");
+            registry.start(&experiment.id).expect("start experiment");
+            registry
+                .complete(
+                    &experiment.id,
+                    ExperimentResult {
+                        plans_generated: 0,
+                        proposals_written: Vec::new(),
+                        branches_created: Vec::new(),
+                        score_summary: Some("winner: control node".to_string()),
+                        skipped: Vec::new(),
+                    },
+                )
+                .expect("complete experiment");
+        }
+
+        let Json(list) = handle_list_experiments(State(state), Query(ListParams::default()))
+            .await
+            .expect("list experiments");
+        assert_eq!(list.experiments[0].score_summary, "winner: control node");
     }
 
     #[tokio::test]
@@ -928,6 +979,7 @@ mod tests {
             .expect("results response");
         assert_eq!(results.id, id);
         assert_eq!(results.status, ExperimentStatus::Queued);
+        assert_eq!(results.score_summary, "waiting to start");
         assert_eq!(results.plans_generated, 0);
         assert!(results.leaders.is_empty());
         assert!(results.tournament.is_none());
@@ -953,6 +1005,7 @@ mod tests {
                         plans_generated: 2,
                         proposals_written: vec!["proposal-a.md".to_string()],
                         branches_created: vec!["feature/proposal-a".to_string()],
+                        score_summary: Some("winner: proposal-a".to_string()),
                         skipped: vec![SkippedItem {
                             name: "candidate-a".to_string(),
                             reason: "not enough signal".to_string(),
@@ -967,6 +1020,7 @@ mod tests {
             .await
             .expect("results response");
         assert_eq!(results.status, ExperimentStatus::Completed);
+        assert_eq!(results.score_summary, "winner: proposal-a");
         assert_eq!(results.plans_generated, 2);
         assert_eq!(results.proposals_written, vec!["proposal-a.md".to_string()]);
         assert_eq!(
@@ -1002,6 +1056,7 @@ mod tests {
                         plans_generated: 1,
                         proposals_written: vec!["proposal.md".to_string()],
                         branches_created: Vec::new(),
+                        score_summary: None,
                         skipped: Vec::new(),
                     },
                 )

@@ -4,6 +4,10 @@ use crate::helpers::{format_memory_for_prompt, thinking_config_from_budget};
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use fx_analysis::AnalysisError;
+#[cfg(feature = "http")]
+use fx_api::experiment_bridge::RegistryBridge;
+#[cfg(feature = "http")]
+use fx_api::SharedExperimentRegistry;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_bus::{BusStore, SessionBus};
@@ -374,6 +378,8 @@ pub struct HeadlessLoopBuildOptions {
     pub session_registry: Option<fx_session::SessionRegistry>,
     pub session_bus: Option<SessionBus>,
     pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
+    #[cfg(feature = "http")]
+    pub experiment_registry: Option<SharedExperimentRegistry>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -388,6 +394,8 @@ impl HeadlessLoopBuildOptions {
             session_registry: None,
             session_bus: None,
             permission_prompt_state: None,
+            #[cfg(feature = "http")]
+            experiment_registry: None,
         }
     }
 
@@ -402,6 +410,8 @@ impl HeadlessLoopBuildOptions {
             session_registry: None,
             session_bus: None,
             permission_prompt_state: None,
+            #[cfg(feature = "http")]
+            experiment_registry: None,
         }
     }
 }
@@ -415,6 +425,8 @@ struct SkillRegistryBuildOptions {
     experiment_progress: Option<ProgressCallback>,
     session_registry: Option<fx_session::SessionRegistry>,
     session_bus: Option<SessionBus>,
+    #[cfg(feature = "http")]
+    experiment_registry: Option<SharedExperimentRegistry>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -450,6 +462,17 @@ pub fn build_headless_loop_engine_bundle(
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
     build_loop_engine_with_options(data_dir, config.clone(), improvement_provider, options)
+}
+
+#[cfg(feature = "http")]
+pub(crate) fn build_shared_experiment_registry(
+    data_dir: &Path,
+) -> Result<SharedExperimentRegistry, StartupError> {
+    let registry =
+        fx_api::experiment_registry::ExperimentRegistry::new(data_dir).map_err(|error| {
+            StartupError::Store(format!("failed to load experiment registry: {error}"))
+        })?;
+    Ok(Arc::new(tokio::sync::Mutex::new(registry)))
 }
 
 /// Capacity of the streaming event bus broadcast channel.
@@ -558,6 +581,8 @@ fn build_skill_registry_options(
         experiment_progress: options.experiment_progress.clone(),
         session_registry: options.session_registry.clone(),
         session_bus: options.session_bus.clone(),
+        #[cfg(feature = "http")]
+        experiment_registry: options.experiment_registry.clone(),
     }
 }
 
@@ -936,11 +961,24 @@ fn build_tool_executor(
     let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
         .with_process_registry(process_registry);
     #[cfg(feature = "http")]
+    let executor = attach_experiment_registrar(executor, options.experiment_registry.as_ref());
+    #[cfg(feature = "http")]
     let executor = executor.with_background_experiments(true);
     match options.experiment_progress.clone() {
         Some(progress) => executor.with_experiment_progress(progress),
         None => executor,
     }
+}
+
+#[cfg(feature = "http")]
+fn attach_experiment_registrar(
+    executor: FawxToolExecutor,
+    registry: Option<&SharedExperimentRegistry>,
+) -> FawxToolExecutor {
+    let Some(registry) = registry else {
+        return executor;
+    };
+    executor.with_experiment_registrar(Arc::new(RegistryBridge::new(Arc::clone(registry))))
 }
 
 fn attach_node_run_if_configured(
@@ -2063,6 +2101,35 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn build_tool_executor_attaches_experiment_registrar_when_registry_supplied() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let working_dir = temp_dir.path().to_path_buf();
+        let options = SkillRegistryBuildOptions {
+            working_dir: working_dir.clone(),
+            memory_enabled: false,
+            subagent_control: None,
+            config_manager: None,
+            experiment_progress: None,
+            session_registry: None,
+            session_bus: None,
+            experiment_registry: Some(
+                build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
+            ),
+        };
+        let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {
+            allowed_dirs: vec![working_dir],
+            ..ProcessConfig::default()
+        }));
+
+        let executor = build_tool_executor(&options, ToolConfig::default(), process_registry);
+        let debug = format!("{executor:?}");
+
+        assert!(debug.contains("experiment_registrar: true"), "{debug}");
+        assert!(debug.contains("background_experiments: true"), "{debug}");
     }
 
     #[test]
