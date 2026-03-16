@@ -55,6 +55,7 @@
 		5ED4DFC69EC10A9700CB7832 /* SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02E62E5C85D4819024AE1EFE /* SessionListView.swift */; };
 		628187E4687D83596CCF2D60 /* SSEParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADFE086ECAE74F74DEC95BBF /* SSEParserTests.swift */; };
 		62D6A86D5E31EA975E546065 /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2822C7AA61307F89BAE00E0 /* Formatters.swift */; };
+		6350342BF81D33DDC2688337 /* ChatViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */; };
 		63A72093F2863A9042DD9BC4 /* ModelSelectionList.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27DEFB04586D7E73237C5B1C /* ModelSelectionList.swift */; };
 		64B48B88589DAAA1CF142E9B /* SidebarSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946A14621A9A282DEB705EEC /* SidebarSelection.swift */; };
 		68B1AA744FF35DA153136D09 /* JSONValueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CB40DD2F1D7B9B76438587D /* JSONValueTests.swift */; };
@@ -71,6 +72,7 @@
 		7BDE8D38EE1ED8C89158ECA9 /* SSEStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B681FEBC9D221AE3782A46 /* SSEStream.swift */; };
 		7EE2EBCADD290969C00F85FB /* SSEStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B681FEBC9D221AE3782A46 /* SSEStream.swift */; };
 		7F5349C88546D6B818E937D1 /* ConnectionBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD3B2154B09BF7D99E20294A /* ConnectionBannerView.swift */; };
+		824571D15BD23EED555159CE /* ChatViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */; };
 		836801577BEEB985E2E17EF3 /* SessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BB6FBE502B0B717CF55A760 /* SessionViewModel.swift */; };
 		8499D77C5D19A517453D0E87 /* ThinkingLevel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0F3654454E2926DF38F0ED7 /* ThinkingLevel.swift */; };
 		881ACE4E2F11DB8173217A3C /* SessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0472FB42E7C8822B57CF98DC /* SessionTests.swift */; };
@@ -231,6 +233,7 @@
 		C2E500BF4B907FA02585BB44 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticatedChatFlowTests.swift; sourceTree = "<group>"; };
 		C7F19EE118E04C627C071358 /* Session.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Session.swift; sourceTree = "<group>"; };
+		CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModelTests.swift; sourceTree = "<group>"; };
 		D077EA1389A1D84FDB7D0DF4 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		D08FE445D7033AAED2208E6D /* AuthProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthProvider.swift; sourceTree = "<group>"; };
 		D4567A3E8C8FEA6832E659D6 /* Sidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sidebar.swift; sourceTree = "<group>"; };
@@ -295,6 +298,7 @@
 		2C74131A919381BAFCCFC914 /* ViewModels */ = {
 			isa = PBXGroup;
 			children = (
+				CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */,
 				8EEB1F0A4C398B611C3A76C4 /* ConnectionStateMachineTests.swift */,
 			);
 			path = ViewModels;
@@ -803,6 +807,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				6350342BF81D33DDC2688337 /* ChatViewModelTests.swift in Sources */,
 				2E2FC6DD4D72BA4F560E9615 /* ConnectionStateMachineTests.swift in Sources */,
 				3F5C75AD2C13BEE5E66C3AEF /* FormattersTests.swift in Sources */,
 				1EDD1D9AD144B5652F786711 /* JSONValueTests.swift in Sources */,
@@ -818,6 +823,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				824571D15BD23EED555159CE /* ChatViewModelTests.swift in Sources */,
 				1FE328F23A3906A844187753 /* ConnectionStateMachineTests.swift in Sources */,
 				D124E354061B4491FCED1045 /* FormattersTests.swift in Sources */,
 				68B1AA744FF35DA153136D09 /* JSONValueTests.swift in Sources */,

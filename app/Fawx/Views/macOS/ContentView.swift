@@ -65,15 +65,14 @@ struct ContentView: View {
             await restoreSelectionAfterRefresh()
         }
         .onChange(of: sessionViewModel.selectedSessionID) { _, newValue in
-            Task {
-                if let newValue {
-                    if sidebarSelection != .session(newValue) {
-                        sidebarSelection = .session(newValue)
-                    }
-                    await chatViewModel.loadMessages(for: newValue)
-                } else if case .session = sidebarSelection {
-                    beginNewSession()
+            if let newValue {
+                if sidebarSelection != .session(newValue) {
+                    sidebarSelection = .session(newValue)
                 }
+                chatViewModel.prepareToDisplaySession(newValue)
+                chatViewModel.scheduleLoadMessages(for: newValue, force: true)
+            } else if case .session = sidebarSelection {
+                beginNewSession()
             }
         }
         .onChange(of: appState.sidebarSelection) { _, newValue in
@@ -129,6 +128,7 @@ struct ContentView: View {
     }
 
     private func beginNewSession() {
+        chatViewModel.cancelScheduledLoad()
         sidebarSelection = nil
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
@@ -136,16 +136,19 @@ struct ContentView: View {
 
     private func selectSession(_ sessionID: String) {
         sidebarSelection = .session(sessionID)
+        chatViewModel.prepareToDisplaySession(sessionID)
         sessionViewModel.select(sessionID)
     }
 
     private func showSkills() {
+        chatViewModel.cancelScheduledLoad()
         sidebarSelection = .skills
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
     }
 
     private func showSettings() {
+        chatViewModel.cancelScheduledLoad()
         sidebarSelection = .settings
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
@@ -154,7 +157,7 @@ struct ContentView: View {
     private func restoreSelectionAfterRefresh() async {
         if let selectedSessionID, sessionViewModel.sessions.contains(where: { $0.id == selectedSessionID }) {
             sessionViewModel.select(selectedSessionID)
-            await chatViewModel.loadMessages(for: selectedSessionID, force: true)
+            chatViewModel.scheduleLoadMessages(for: selectedSessionID, force: true)
         } else {
             if case .session = sidebarSelection {
                 sidebarSelection = nil
@@ -171,7 +174,8 @@ struct ContentView: View {
 
             let didClear = await sessionViewModel.clearSession(id: sessionID)
             if didClear, sessionViewModel.selectedSessionID == sessionID {
-                await chatViewModel.loadMessages(for: sessionID, force: true)
+                chatViewModel.invalidateSession(sessionID)
+                chatViewModel.scheduleLoadMessages(for: sessionID, force: true)
             }
         }
     }
@@ -184,14 +188,16 @@ struct ContentView: View {
 
             let didDelete = await sessionViewModel.deleteSession(id: sessionID)
             if didDelete {
+                chatViewModel.invalidateSession(sessionID)
                 if selectedSessionID == sessionID {
                     beginNewSession()
                 } else if sessionViewModel.selectedSessionID == nil {
                     chatViewModel.showEmptyState()
                 } else {
-                    await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID)
+                    chatViewModel.scheduleLoadMessages(for: sessionViewModel.selectedSessionID)
                 }
             }
         }
     }
+
 }

@@ -17,10 +17,7 @@ struct ChatDetailView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: FawxSpacing.paddingLG) {
-                    if chatViewModel.isLoadingHistory {
-                        ProgressView("Loading conversation...")
-                            .foregroundStyle(Color.fawxTextSecondary)
-                    } else if sessionViewModel.selectedSessionID == nil && chatViewModel.transcriptItems.isEmpty {
+                    if sessionViewModel.selectedSessionID == nil && chatViewModel.transcriptItems.isEmpty {
                         emptyState
                     } else {
                         ForEach(chatViewModel.transcriptItems) { item in
@@ -28,10 +25,10 @@ struct ChatDetailView: View {
                                 .id(item.id)
                         }
 
-                        if chatViewModel.isStreaming || !chatViewModel.streamingText.isEmpty {
+                        if chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty {
                             MessageBubble(
                                 role: .assistant,
-                                content: chatViewModel.streamingText.isEmpty ? "..." : chatViewModel.streamingText,
+                                content: streamingBubbleContent,
                                 isStreaming: true
                             )
                             .id("streaming")
@@ -42,6 +39,17 @@ struct ChatDetailView: View {
             }
             .background(Color.fawxBackground)
             .accessibilityIdentifier("messageList")
+            .overlay {
+                if chatViewModel.isLoadingHistory && chatViewModel.transcriptItems.isEmpty {
+                    loadingOverlay
+                }
+            }
+            .overlay(alignment: .top) {
+                if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
+                    cachedRefreshIndicator
+                        .padding(.top, FawxSpacing.paddingLG)
+                }
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 composerArea
             }
@@ -49,14 +57,16 @@ struct ChatDetailView: View {
                 scheduleScrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
-                scheduleScrollToBottom(using: proxy)
+                let animated = chatViewModel.pendingTranscriptScrollBehavior == .animated && !chatViewModel.isLoadingHistory
+                scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
+                chatViewModel.pendingTranscriptScrollBehavior = .animated
             }
-            .onChange(of: chatViewModel.streamingText) { _, _ in
-                scheduleScrollToBottom(using: proxy)
+            .onChange(of: chatViewModel.visibleStreamingText) { _, _ in
+                scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
             }
             .onChange(of: chatViewModel.isLoadingHistory) { oldValue, newValue in
                 if oldValue && !newValue {
-                    scheduleScrollToBottom(using: proxy, animated: false)
+                    scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
                 }
             }
 #if os(iOS)
@@ -69,11 +79,50 @@ struct ChatDetailView: View {
         .background(Color.fawxBackground)
     }
 
+    private var loadingOverlay: some View {
+        VStack(spacing: FawxSpacing.paddingMD) {
+            ProgressView()
+                .controlSize(.regular)
+
+            Text("Loading conversation...")
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+        .padding(FawxSpacing.paddingXL)
+        .background(Color.fawxSurface.opacity(0.96))
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder.opacity(0.8), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+    }
+
+    private var cachedRefreshIndicator: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            ProgressView()
+                .controlSize(.small)
+
+            Text("Refreshing conversation...")
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+        .padding(.horizontal, FawxSpacing.paddingMD)
+        .padding(.vertical, FawxSpacing.paddingSM)
+        .background(Color.fawxSurface.opacity(0.94))
+        .overlay(
+            Capsule()
+                .stroke(Color.fawxBorder.opacity(0.7), lineWidth: 1)
+        )
+        .clipShape(Capsule())
+        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+
     @ViewBuilder
     private func transcriptItemView(_ item: ChatTranscriptItem) -> some View {
         switch item {
         case .message(let message):
-            MessageBubble(message: message)
+            MessageBubble(message: message.message)
         case .toolCall(let toolCall):
             ToolCallCard(toolCall: toolCall)
         }
@@ -121,9 +170,9 @@ struct ChatDetailView: View {
             InputBar(
                 text: $chatViewModel.draftMessage,
                 queuedMessage: chatViewModel.queuedMessage,
-                isStreaming: chatViewModel.isStreaming,
+                isStreaming: chatViewModel.isCurrentSessionStreaming,
                 connectionStatus: appState.connectionStatus,
-                currentPhase: chatViewModel.currentPhase,
+                currentPhase: chatViewModel.composerPhaseLabel,
                 activeModel: appState.activeModel,
                 availableModels: appState.availableModels,
                 thinkingLevel: appState.thinkingLevel,
@@ -163,8 +212,16 @@ struct ChatDetailView: View {
         }
     }
 
-    private func scheduleScrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
+    private func scheduleScrollToBottom(
+        using proxy: ScrollViewProxy,
+        animated: Bool = true,
+        includeFollowUp: Bool = true
+    ) {
         scrollToBottom(using: proxy, animated: animated)
+
+        guard includeFollowUp else {
+            return
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             scrollToBottom(using: proxy, animated: animated)
@@ -172,7 +229,7 @@ struct ChatDetailView: View {
     }
 
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool) {
-        let target = chatViewModel.isStreaming || !chatViewModel.streamingText.isEmpty
+        let target = chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty
             ? "streaming"
             : chatViewModel.transcriptItems.last?.id
 
@@ -195,6 +252,15 @@ struct ChatDetailView: View {
 #else
         return FawxSpacing.paddingXL
 #endif
+    }
+
+    private var streamingBubbleContent: String {
+        let streamed = chatViewModel.visibleStreamingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !streamed.isEmpty {
+            return chatViewModel.visibleStreamingText
+        }
+
+        return chatViewModel.visibleCurrentPhase?.streamingPlaceholder ?? "..."
     }
 
 #if os(iOS)

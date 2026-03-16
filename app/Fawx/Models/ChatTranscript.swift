@@ -13,8 +13,13 @@ struct ToolCallRecord: Identifiable, Hashable, Sendable {
     }
 }
 
+struct TranscriptMessage: Identifiable, Hashable, Sendable {
+    let id: String
+    let message: SessionMessage
+}
+
 enum ChatTranscriptItem: Identifiable, Hashable, Sendable {
-    case message(SessionMessage)
+    case message(TranscriptMessage)
     case toolCall(ToolCallRecord)
 
     var id: String {
@@ -24,5 +29,13 @@ enum ChatTranscriptItem: Identifiable, Hashable, Sendable {
         case .toolCall(let toolCall):
             return "tool:\(toolCall.id)"
         }
+    }
+
+    var sessionMessage: SessionMessage? {
+        guard case .message(let transcriptMessage) = self else {
+            return nil
+        }
+
+        return transcriptMessage.message
     }
 }

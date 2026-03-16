@@ -31,6 +31,19 @@ struct SessionListView: View {
                 stackLayout
             }
         }
+        .onChange(of: sessionViewModel.selectedSessionID) { _, newValue in
+            guard usesSplitLayout else {
+                return
+            }
+
+            if let sessionID = newValue {
+                chatViewModel.prepareToDisplaySession(sessionID)
+                chatViewModel.scheduleLoadMessages(for: sessionID, force: true)
+            } else {
+                chatViewModel.cancelScheduledLoad()
+                chatViewModel.showEmptyState()
+            }
+        }
         .alert("Clear this session?", isPresented: pendingClearAlertBinding) {
             Button("Cancel", role: .cancel) {
                 pendingClearSession = nil
@@ -59,9 +72,15 @@ struct SessionListView: View {
                     chatDetailView(for: route)
                 }
                 .onChange(of: navigationPath.last) { _, newValue in
-                    if newValue == nil {
+                    switch newValue {
+                    case nil, .newSession:
+                        chatViewModel.cancelScheduledLoad()
                         sessionViewModel.select(nil)
                         chatViewModel.showEmptyState()
+                    case .session(let sessionID):
+                        sessionViewModel.select(sessionID)
+                        chatViewModel.prepareToDisplaySession(sessionID)
+                        chatViewModel.scheduleLoadMessages(for: sessionID, force: true)
                     }
                 }
                 .onAppear {
@@ -174,10 +193,6 @@ struct SessionListView: View {
 #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
 #endif
-            .task(id: sessionID) {
-                sessionViewModel.select(sessionID)
-                await chatViewModel.loadMessages(for: sessionID)
-            }
         }
     }
 
@@ -203,13 +218,17 @@ struct SessionListView: View {
 
     private func selectSession(_ sessionID: String) {
         FawxHaptics.lightImpact()
-        sessionViewModel.select(sessionID)
+        chatViewModel.prepareToDisplaySession(sessionID)
+        if usesSplitLayout {
+            sessionViewModel.select(sessionID)
+        }
         if usesSplitLayout == false {
             navigationPath = [.session(sessionID)]
         }
     }
 
     private func createNewSession() {
+        chatViewModel.cancelScheduledLoad()
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
         if usesSplitLayout == false {
@@ -218,6 +237,7 @@ struct SessionListView: View {
     }
 
     private func resetToEmptyConversation() {
+        chatViewModel.cancelScheduledLoad()
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
         if usesSplitLayout {
@@ -231,6 +251,7 @@ struct SessionListView: View {
             return
         }
 
+        chatViewModel.cancelScheduledLoad()
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
 
@@ -242,6 +263,7 @@ struct SessionListView: View {
     }
 
     private func showSessionsList() {
+        chatViewModel.cancelScheduledLoad()
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
         if usesSplitLayout == false {
@@ -282,7 +304,9 @@ struct SessionListView: View {
 
             let didClear = await sessionViewModel.clearSession(id: sessionID)
             if didClear, sessionViewModel.selectedSessionID == sessionID {
-                await chatViewModel.loadMessages(for: sessionID, force: true)
+                chatViewModel.invalidateSession(sessionID)
+                chatViewModel.prepareToDisplaySession(sessionID)
+                chatViewModel.scheduleLoadMessages(for: sessionID, force: true)
             }
         }
     }
@@ -295,6 +319,7 @@ struct SessionListView: View {
 
             let didDelete = await sessionViewModel.deleteSession(id: sessionID)
             if didDelete {
+                chatViewModel.invalidateSession(sessionID)
                 if sessionViewModel.selectedSessionID == nil {
                     resetToEmptyConversation()
                 } else if usesSplitLayout == false, navigationPath.last == .session(sessionID) {
@@ -456,4 +481,5 @@ struct SessionListView: View {
         false
 #endif
     }
+
 }
