@@ -84,7 +84,7 @@ struct TelemetrySettingsPanel: View {
             .disabled(
                 viewModel.isLoading
                     || viewModel.isUpdatingMaster
-                    || !viewModel.pendingCategories.isEmpty
+                    || viewModel.hasPendingCategoryUpdate
                     || !viewModel.canManageTelemetry
             )
         }
@@ -152,7 +152,7 @@ struct TelemetrySettingsPanel: View {
                 !viewModel.isEnabled
                     || viewModel.isLoading
                     || viewModel.isUpdatingMaster
-                    || isPending
+                    || viewModel.hasPendingCategoryUpdate
                     || !viewModel.canManageTelemetry
             )
         }

@@ -29,7 +29,7 @@ struct ExperimentsView: View {
         }
         .task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: RefreshCadence.dashboardPanels)
                 guard !Task.isCancelled else {
                     break
                 }
@@ -171,6 +171,13 @@ private struct ExperimentDetailSheet: View {
                         if let results = viewModel.selectedResults,
                            detail.status == .completed || detail.result != nil {
                             resultsCard(results)
+                        } else if let resultsErrorMessage = viewModel.resultsErrorMessage,
+                                  !resultsErrorMessage.isEmpty {
+                            statusMessageCard(
+                                title: "Results unavailable",
+                                message: resultsErrorMessage,
+                                color: .fawxWarning
+                            )
                         }
 
                         if let error = detail.error, !error.isEmpty {

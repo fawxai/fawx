@@ -408,15 +408,17 @@ struct PermissionPromptSheetView: View {
                     .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
             }
 
-            Text("This request auto-denies after 60 seconds.")
+            Text("This request auto-denies after \(ChatViewModel.permissionPromptTimeoutSeconds) seconds.")
                 .font(FawxTypography.status)
                 .foregroundStyle(Color.fawxTextSecondary)
 
             HStack(spacing: FawxSpacing.paddingMD) {
-                Button(prompt.allowSessionActionTitle, action: allowSessionAction)
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color.fawxAccent)
-                    .disabled(isSubmitting)
+                if prompt.sessionScopedAllowAvailable {
+                    Button(prompt.allowSessionActionTitle, action: allowSessionAction)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.fawxAccent)
+                        .disabled(isSubmitting)
+                }
 
                 Button(prompt.allowActionTitle, action: allowAction)
                     .buttonStyle(.bordered)

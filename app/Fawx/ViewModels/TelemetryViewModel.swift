@@ -12,13 +12,29 @@ final class TelemetryViewModel {
     var errorMessage: String?
 
     private let appState: AppState
+    private let fetchConsent: @Sendable () async throws -> TelemetryConsentResponse
+    private let patchConsent: @Sendable (TelemetryConsentPatchRequest) async throws -> TelemetryConsentResponse
 
-    init(appState: AppState) {
+    init(
+        appState: AppState,
+        fetchConsent: (@Sendable () async throws -> TelemetryConsentResponse)? = nil,
+        patchConsent: (@Sendable (TelemetryConsentPatchRequest) async throws -> TelemetryConsentResponse)? = nil
+    ) {
         self.appState = appState
+        self.fetchConsent = fetchConsent ?? { [client = appState.client] in
+            try await client.getTelemetryConsent()
+        }
+        self.patchConsent = patchConsent ?? { [client = appState.client] request in
+            try await client.patchTelemetryConsent(request)
+        }
     }
 
     var canManageTelemetry: Bool {
         appState.isConfigured
+    }
+
+    var hasPendingCategoryUpdate: Bool {
+        !pendingCategories.isEmpty
     }
 
     func refresh() async {
@@ -39,7 +55,7 @@ final class TelemetryViewModel {
         defer { isLoading = false }
 
         do {
-            apply(response: try await appState.client.getTelemetryConsent())
+            apply(response: try await fetchConsent())
             errorMessage = nil
         } catch {
             if categories.isEmpty {
@@ -56,6 +72,9 @@ final class TelemetryViewModel {
             return
         }
         guard isEnabled != enabled else {
+            return
+        }
+        guard !isUpdatingMaster, pendingCategories.isEmpty else {
             return
         }
 
@@ -76,7 +95,7 @@ final class TelemetryViewModel {
         defer { isUpdatingMaster = false }
 
         do {
-            let response = try await appState.client.patchTelemetryConsent(
+            let response = try await patchConsent(
                 TelemetryConsentPatchRequest(enabled: enabled, categories: nil)
             )
             apply(response: response)
@@ -99,6 +118,9 @@ final class TelemetryViewModel {
         guard categories[index].enabled != enabled else {
             return
         }
+        guard !isUpdatingMaster, pendingCategories.isEmpty else {
+            return
+        }
 
         let previousCategories = categories
 
@@ -109,7 +131,7 @@ final class TelemetryViewModel {
         defer { pendingCategories.remove(name) }
 
         do {
-            let response = try await appState.client.patchTelemetryConsent(
+            let response = try await patchConsent(
                 TelemetryConsentPatchRequest(enabled: nil, categories: [name: enabled])
             )
             apply(response: response)

@@ -13,12 +13,30 @@ final class ExperimentsViewModel {
     var selectedResults: ExperimentResultsResponse?
     var isLoadingDetail = false
     var detailErrorMessage: String?
+    var resultsErrorMessage: String?
     var isStoppingExperiment = false
 
     private let appState: AppState
+    private let fetchExperimentDetail: @Sendable (String) async throws -> ExperimentDetail
+    private let fetchExperimentResults: @Sendable (String) async throws -> ExperimentResultsResponse
+    private let stopExperimentRequest: @Sendable (String) async throws -> StopExperimentResponse
 
-    init(appState: AppState) {
+    init(
+        appState: AppState,
+        fetchExperimentDetail: (@Sendable (String) async throws -> ExperimentDetail)? = nil,
+        fetchExperimentResults: (@Sendable (String) async throws -> ExperimentResultsResponse)? = nil,
+        stopExperimentRequest: (@Sendable (String) async throws -> StopExperimentResponse)? = nil
+    ) {
         self.appState = appState
+        self.fetchExperimentDetail = fetchExperimentDetail ?? { [client = appState.client] id in
+            try await client.experiment(id: id)
+        }
+        self.fetchExperimentResults = fetchExperimentResults ?? { [client = appState.client] id in
+            try await client.experimentResults(id: id)
+        }
+        self.stopExperimentRequest = stopExperimentRequest ?? { [client = appState.client] id in
+            try await client.stopExperiment(id: id)
+        }
     }
 
     func refresh() async {
@@ -63,6 +81,7 @@ final class ExperimentsViewModel {
         selectedExperiment = nil
         selectedResults = nil
         detailErrorMessage = nil
+        resultsErrorMessage = nil
         await refreshSelectedExperiment()
     }
 
@@ -78,19 +97,50 @@ final class ExperimentsViewModel {
         isLoadingDetail = true
         defer { isLoadingDetail = false }
 
-        do {
-            async let detailTask = appState.client.experiment(id: selectedExperimentID)
-            async let resultsTask = appState.client.experimentResults(id: selectedExperimentID)
+        let requestedExperimentID = selectedExperimentID
 
-            selectedExperiment = try await detailTask
-            selectedResults = try await resultsTask
+        do {
+            let detail = try await fetchExperimentDetail(requestedExperimentID)
+            guard self.selectedExperimentID == requestedExperimentID else {
+                return
+            }
+            selectedExperiment = detail
             detailErrorMessage = nil
         } catch {
+            guard self.selectedExperimentID == requestedExperimentID else {
+                return
+            }
             if selectedExperiment == nil {
                 selectedExperiment = nil
                 selectedResults = nil
+                resultsErrorMessage = nil
             }
             detailErrorMessage = error.localizedDescription
+            await appState.noteRecoverableRequestFailure(error)
+            return
+        }
+
+        do {
+            let results = try await fetchExperimentResults(requestedExperimentID)
+            guard self.selectedExperimentID == requestedExperimentID else {
+                return
+            }
+            selectedResults = results
+            resultsErrorMessage = nil
+        } catch {
+            guard self.selectedExperimentID == requestedExperimentID else {
+                return
+            }
+            selectedResults = nil
+
+            if let apiError = error as? APIError,
+               apiError.statusCode == 404,
+               let detail = selectedExperiment,
+               detail.status == .queued || detail.status == .running {
+                resultsErrorMessage = nil
+            } else {
+                resultsErrorMessage = error.localizedDescription
+            }
             await appState.noteRecoverableRequestFailure(error)
         }
     }
@@ -108,7 +158,7 @@ final class ExperimentsViewModel {
         defer { isStoppingExperiment = false }
 
         do {
-            let response = try await appState.client.stopExperiment(id: selectedExperimentID)
+            let response = try await stopExperimentRequest(selectedExperimentID)
             appState.showToast(
                 message: response.stopping ? "Stopping experiment \(selectedExperiment?.name ?? response.id)." : "Experiment stop request was ignored.",
                 style: response.stopping ? .warning : .info
@@ -127,6 +177,7 @@ final class ExperimentsViewModel {
         selectedResults = nil
         isLoadingDetail = false
         detailErrorMessage = nil
+        resultsErrorMessage = nil
         isStoppingExperiment = false
     }
 }

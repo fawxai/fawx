@@ -16,6 +16,29 @@ struct GitView: View {
         .task { @MainActor in
             await viewModel.refresh()
         }
+        .alert(
+            item: Binding(
+                get: { viewModel.pendingConfirmation },
+                set: { newValue in
+                    if newValue == nil {
+                        viewModel.cancelPendingConfirmation()
+                    }
+                }
+            )
+        ) { request in
+            Alert(
+                title: Text(request.title),
+                message: Text(request.message),
+                primaryButton: .default(Text(request.confirmButtonTitle)) {
+                    Task {
+                        await viewModel.confirmPendingConfirmation()
+                    }
+                },
+                secondaryButton: .cancel {
+                    viewModel.cancelPendingConfirmation()
+                }
+            )
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Fetch") {
@@ -26,16 +49,12 @@ struct GitView: View {
                 .disabled(viewModel.isPerformingAction)
 
                 Button("Pull") {
-                    Task {
-                        await viewModel.pull()
-                    }
+                    viewModel.requestPullConfirmation()
                 }
                 .disabled(viewModel.isPerformingAction)
 
                 Button("Push") {
-                    Task {
-                        await viewModel.push()
-                    }
+                    viewModel.requestPushConfirmation()
                 }
                 .disabled(viewModel.isPerformingAction)
             }
@@ -239,9 +258,7 @@ private struct GitSidebarContent: View {
                 Spacer(minLength: 0)
 
                 Button(viewModel.isPerformingAction ? "Committing..." : "Commit") {
-                    Task {
-                        await viewModel.commit()
-                    }
+                    viewModel.requestCommitConfirmation()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.fawxAccent)

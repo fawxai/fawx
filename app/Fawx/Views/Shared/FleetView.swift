@@ -24,7 +24,7 @@ struct FleetView: View {
         }
         .task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: RefreshCadence.dashboardPanels)
                 guard !Task.isCancelled else {
                     break
                 }
@@ -238,10 +238,11 @@ private struct FleetNodeDetailSheet: View {
                         .font(FawxTypography.heading1)
                         .foregroundStyle(Color.fawxText)
 
-                    Text(detail.endpoint)
+                    Text(verbatim: detail.endpoint)
                         .font(FawxTypography.code)
                         .foregroundStyle(Color.fawxTextSecondary)
                         .textSelection(.enabled)
+                        .privacySensitive()
                 }
 
                 Spacer(minLength: 0)

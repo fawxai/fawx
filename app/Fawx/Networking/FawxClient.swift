@@ -565,8 +565,28 @@ actor FawxClient {
         )
     }
 
+    func gitStageAll() async throws -> GitStageResponse {
+        let body = try encoder.encode(EmptyJSONRequest())
+        return try await performRequest(
+            path: "/v1/git/stage",
+            method: "POST",
+            bodyData: body,
+            decodeAs: GitStageResponse.self
+        )
+    }
+
     func gitUnstage(paths: [String]) async throws -> GitUnstageResponse {
         let body = try encoder.encode(GitPathsRequest(paths: paths))
+        return try await performRequest(
+            path: "/v1/git/unstage",
+            method: "POST",
+            bodyData: body,
+            decodeAs: GitUnstageResponse.self
+        )
+    }
+
+    func gitUnstageAll() async throws -> GitUnstageResponse {
+        let body = try encoder.encode(EmptyJSONRequest())
         return try await performRequest(
             path: "/v1/git/unstage",
             method: "POST",
@@ -892,6 +912,8 @@ private struct FleetDispatchTaskBody: Encodable {
 private struct GitPathsRequest: Encodable {
     let paths: [String]
 }
+
+private struct EmptyJSONRequest: Encodable {}
 
 private struct GitCommitRequestBody: Encodable {
     let message: String

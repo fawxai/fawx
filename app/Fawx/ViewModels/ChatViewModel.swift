@@ -56,7 +56,8 @@ final class ChatViewModel {
     }
 
     private static let sessionLoadDebounceMs = 50
-    private static let permissionPromptTimeout: Duration = .seconds(60)
+    static let permissionPromptTimeoutSeconds = 60
+    private static let permissionPromptTimeout: Duration = .seconds(permissionPromptTimeoutSeconds)
     static let maxCachedSessions = 10
 
     var transcriptItems: [ChatTranscriptItem] = []

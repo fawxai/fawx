@@ -1,6 +1,60 @@
 import Foundation
 import Observation
 
+struct GitConfirmationRequest: Identifiable, Equatable {
+    enum Action: Equatable {
+        case commit(message: String)
+        case push
+        case pull
+    }
+
+    let action: Action
+
+    var id: String {
+        switch action {
+        case .commit(let message):
+            return "commit:\(message)"
+        case .push:
+            return "push"
+        case .pull:
+            return "pull"
+        }
+    }
+
+    var title: String {
+        switch action {
+        case .commit:
+            return "Commit Changes?"
+        case .push:
+            return "Push Changes?"
+        case .pull:
+            return "Pull Latest Changes?"
+        }
+    }
+
+    var message: String {
+        switch action {
+        case .commit(let message):
+            return "Create a commit with this message?\n\n\(message)"
+        case .push:
+            return "Push the current branch to its remote?"
+        case .pull:
+            return "Pull the latest changes into the current branch?"
+        }
+    }
+
+    var confirmButtonTitle: String {
+        switch action {
+        case .commit:
+            return "Commit"
+        case .push:
+            return "Push"
+        case .pull:
+            return "Pull"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class GitViewModel {
@@ -13,6 +67,7 @@ final class GitViewModel {
     var commitMessage = ""
     var isPerformingAction = false
     var lastActionSummary: String?
+    var pendingConfirmation: GitConfirmationRequest?
 
     private let appState: AppState
 
@@ -118,33 +173,74 @@ final class GitViewModel {
     func stageAll() async {
         await runMutation(
             successMessage: "Staged all changes.",
-            action: { try await appState.client.gitStage(paths: []) }
+            action: { try await appState.client.gitStageAll() }
         )
     }
 
     func unstageAll() async {
         await runMutation(
             successMessage: "Unstaged all changes.",
-            action: { try await appState.client.gitUnstage(paths: []) }
+            action: { try await appState.client.gitUnstageAll() }
         )
     }
 
-    func commit() async {
+    func requestCommitConfirmation() {
         let trimmedMessage = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedMessage.isEmpty else {
             return
         }
+        guard !stagedFiles.isEmpty, !isPerformingAction else {
+            return
+        }
+        pendingConfirmation = GitConfirmationRequest(action: .commit(message: trimmedMessage))
+    }
 
+    func requestPushConfirmation() {
+        guard !isPerformingAction else {
+            return
+        }
+        pendingConfirmation = GitConfirmationRequest(action: .push)
+    }
+
+    func requestPullConfirmation() {
+        guard !isPerformingAction else {
+            return
+        }
+        pendingConfirmation = GitConfirmationRequest(action: .pull)
+    }
+
+    func cancelPendingConfirmation() {
+        pendingConfirmation = nil
+    }
+
+    func confirmPendingConfirmation() async {
+        guard let pendingConfirmation else {
+            return
+        }
+
+        self.pendingConfirmation = nil
+
+        switch pendingConfirmation.action {
+        case .commit(let message):
+            await performCommit(message: message)
+        case .push:
+            await performPush()
+        case .pull:
+            await performPull()
+        }
+    }
+
+    private func performCommit(message: String) async {
         await runMutation(
             successMessage: "Committed changes.",
-            action: { try await appState.client.gitCommit(message: trimmedMessage) },
+            action: { try await appState.client.gitCommit(message: message) },
             onSuccess: { _ in
                 self.commitMessage = ""
             }
         )
     }
 
-    func push() async {
+    private func performPush() async {
         await runMutation(
             successMessage: nil,
             action: { try await appState.client.gitPush() },
@@ -155,7 +251,7 @@ final class GitViewModel {
         )
     }
 
-    func pull() async {
+    private func performPull() async {
         await runMutation(
             successMessage: nil,
             action: { try await appState.client.gitPull() },
@@ -223,7 +319,16 @@ final class GitViewModel {
         }
 
         return blocks.first { block in
-            block.contains(" a/\(path)") || block.contains(" b/\(path)")
+            guard let header = block.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first else {
+                return false
+            }
+
+            let headerLine = String(header)
+            if headerLine == "diff --git a/\(path) b/\(path)" {
+                return true
+            }
+
+            return block.contains("\n--- a/\(path)\n") || block.contains("\n+++ b/\(path)\n")
         }
     }
 }
