@@ -66,7 +66,9 @@ pub enum SubGoalOutcome {
 }
 
 pub use aggregator::{AggregatedResult, ResultAggregator, SimpleAggregator};
-pub use context::DecompositionContext;
+pub use context::{
+    DecompositionAttempt, DecompositionContext, FitnessContext, FitnessStats, SubGoalAttempt,
+};
 pub use dag::ExecutionDag;
 #[cfg(any(test, feature = "test-support"))]
 pub use dispatcher::MockSubGoalExecutor;
@@ -74,7 +76,7 @@ pub use dispatcher::{
     DagDispatcher, DecompositionEvent, DecompositionProgressCallback, ParallelDispatcher,
     SequentialDispatcher, SubGoalDispatcher, SubGoalExecutor,
 };
-pub use engine::{Decomposer, LlmDecomposer};
+pub use engine::{format_fitness_context, Decomposer, LlmDecomposer};
 pub use error::DecomposeError;
 
 #[cfg(test)]

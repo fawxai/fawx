@@ -84,6 +84,66 @@ pub fn parse_plan_json(text: &str) -> Result<DecompositionPlan, DecomposeError> 
     })
 }
 
+/// Format fitness context for inclusion in LLM decomposition prompts.
+pub fn format_fitness_context(fitness: &crate::context::FitnessContext) -> String {
+    if fitness.prior_attempts.is_empty() {
+        return "No prior decomposition attempts for this signal.".to_owned();
+    }
+    let mut lines = Vec::new();
+    lines.push("Previous decomposition attempts for this signal:".to_owned());
+    for (index, attempt) in fitness.prior_attempts.iter().enumerate() {
+        lines.push(format!(
+            "- Attempt {} ({}): {}, score {:.2}",
+            index + 1,
+            attempt.timestamp.format("%Y-%m-%d"),
+            attempt.decision,
+            attempt.best_score
+        ));
+        for sub_goal in &attempt.sub_goals {
+            let score_str = sub_goal
+                .score
+                .map(|score| format!(" (score {score:.2})"))
+                .unwrap_or_default();
+            let fail_str = sub_goal
+                .failure_reason
+                .as_deref()
+                .map(|reason| format!(" — {reason}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  - \"{}\": {}{}{}",
+                sub_goal.description, sub_goal.outcome, score_str, fail_str
+            ));
+        }
+    }
+    push_fitness_stats(&mut lines, &fitness.stats);
+    lines.join("\n")
+}
+
+fn push_fitness_stats(lines: &mut Vec<String>, stats: &crate::context::FitnessStats) {
+    lines.push(format!(
+        "\nStatistics: {} attempts, {} accepts, {} rejects, avg score {:.2}",
+        stats.total_attempts, stats.accepts, stats.rejects, stats.avg_best_score
+    ));
+    if !stats.common_failures.is_empty() {
+        let failures = stats
+            .common_failures
+            .iter()
+            .take(5)
+            .map(|(reason, count)| format!("\"{reason}\" ({count}x)"))
+            .collect::<Vec<_>>();
+        lines.push(format!("Common failures: {}", failures.join(", ")));
+    }
+    if !stats.successful_approaches.is_empty() {
+        let approaches = stats
+            .successful_approaches
+            .iter()
+            .take(10)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        lines.push(format!("Successful approaches: {}", approaches.join(", ")));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +242,43 @@ mod tests {
     fn parse_plan_json_invalid() {
         let error = parse_plan_json("not json").unwrap_err();
         assert!(error.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn format_empty_fitness_context() {
+        let fitness = crate::context::FitnessContext::default();
+        let text = format_fitness_context(&fitness);
+        assert!(text.contains("No prior"));
+    }
+
+    #[test]
+    fn format_fitness_context_with_attempts() {
+        let fitness = crate::context::FitnessContext {
+            prior_attempts: vec![crate::context::DecompositionAttempt {
+                timestamp: chrono::Utc::now(),
+                sub_goals: vec![crate::context::SubGoalAttempt {
+                    description: "optimize hot path".to_owned(),
+                    outcome: "completed".to_owned(),
+                    score: Some(0.7),
+                    failure_reason: None,
+                }],
+                decision: "reject".to_owned(),
+                best_score: 0.5,
+            }],
+            stats: crate::context::FitnessStats {
+                total_attempts: 1,
+                accepts: 0,
+                rejects: 1,
+                avg_best_score: 0.5,
+                common_failures: vec![("build error".to_owned(), 1)],
+                successful_approaches: vec!["optimize hot path".to_owned()],
+            },
+        };
+        let text = format_fitness_context(&fitness);
+        assert!(text.contains("Attempt 1"));
+        assert!(text.contains("optimize hot path"));
+        assert!(text.contains("Common failures"));
+        assert!(text.contains("Successful approaches"));
     }
 
     #[tokio::test]
