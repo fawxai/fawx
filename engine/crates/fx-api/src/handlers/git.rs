@@ -321,13 +321,36 @@ pub async fn handle_git_push(
     State(state): State<HttpState>,
 ) -> HandlerResult<Json<GitPushResponse>> {
     let cwd = workspace_dir(&state).await;
-    let output = run_git_output(["push"], &cwd).await.map_err(bad_request)?;
-    let (remote, branch) = push_target(&cwd, &output).await.map_err(internal_error)?;
-    Ok(Json(GitPushResponse {
-        pushed: true,
-        remote,
-        branch,
-    }))
+    match run_git_output(["push"], &cwd).await {
+        Ok(output) => {
+            let (remote, branch) = push_target(&cwd, &output).await.map_err(internal_error)?;
+            Ok(Json(GitPushResponse {
+                pushed: true,
+                remote,
+                branch,
+            }))
+        }
+        Err(error) => {
+            let suggestion = classify_push_error(&error.to_string());
+            Err(bad_request(GitError::new(format!(
+                "{suggestion}\n\nDetails: {error}"
+            ))))
+        }
+    }
+}
+
+fn classify_push_error(message: &str) -> &'static str {
+    if message.contains("upstream branch") || message.contains("no upstream") {
+        "Push failed: no upstream branch configured. Run `git push -u origin HEAD` from the terminal first."
+    } else if message.contains("non-fast-forward") || message.contains("rejected") {
+        "Push failed: remote has changes you don't have. Pull first, then push."
+    } else if message.contains("permission denied") || message.contains("403") {
+        "Push failed: permission denied. Check your Git credentials."
+    } else if message.contains("Could not resolve host") {
+        "Push failed: cannot reach the remote. Check your network connection."
+    } else {
+        "Push failed. See details below."
+    }
 }
 
 async fn workspace_dir(state: &HttpState) -> PathBuf {
