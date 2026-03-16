@@ -49,12 +49,17 @@ impl ModelMapping {
 }
 
 /// Find the best matching profile name for a model ID.
-/// Returns None if no mapping matches.
+/// Priority: exact > prefix > wildcard. Within the same priority,
+/// the longest pattern wins (most specific match).
 pub fn find_best_match<'a>(mappings: &'a [ModelMapping], model_id: &str) -> Option<&'a str> {
     mappings
         .iter()
         .filter(|m| m.matches(model_id))
-        .min_by_key(|m| m.priority)
+        .min_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| b.pattern.len().cmp(&a.pattern.len()))
+        })
         .map(|m| m.profile_name.as_str())
 }
 
@@ -109,6 +114,18 @@ mod tests {
         let mapping = ModelMapping::exact("claude-opus-4-6", "profile");
         assert!(mapping.matches("claude-opus-4-6"));
         assert!(!mapping.matches("claude-opus-4-6-extended"));
+    }
+
+    #[test]
+    fn longer_prefix_wins_at_same_priority() {
+        let mappings = vec![
+            ModelMapping::prefix("claude-", "short-profile"),
+            ModelMapping::prefix("claude-opus-", "long-profile"),
+        ];
+        assert_eq!(
+            find_best_match(&mappings, "claude-opus-4-6"),
+            Some("long-profile")
+        );
     }
 
     #[test]

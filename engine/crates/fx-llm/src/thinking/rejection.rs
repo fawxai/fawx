@@ -1,28 +1,34 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Session-scoped cache of runtime-rejected (model, level) pairs.
 /// Resets on process restart — no disk persistence.
 pub struct RejectionCache {
-    rejected: Mutex<HashSet<(String, String)>>,
+    rejected: RwLock<HashSet<(String, String)>>,
 }
 
 impl RejectionCache {
     pub fn new() -> Self {
         Self {
-            rejected: Mutex::new(HashSet::new()),
+            rejected: RwLock::new(HashSet::new()),
         }
     }
 
     /// Record that a level was rejected for a model.
     pub fn record(&self, model_id: &str, level: &str) {
-        let mut set = self.rejected.lock().expect("rejection cache lock");
+        let mut set = match self.rejected.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         set.insert((model_id.to_owned(), level.to_owned()));
     }
 
     /// Check if a level has been rejected for a model.
     pub fn is_rejected(&self, model_id: &str, level: &str) -> bool {
-        let set = self.rejected.lock().expect("rejection cache lock");
+        let set = match self.rejected.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         set.contains(&(model_id.to_owned(), level.to_owned()))
     }
 }
