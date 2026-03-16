@@ -448,6 +448,129 @@ actor FawxClient {
         )
     }
 
+    func fleetOverview() async throws -> FleetOverviewResponse {
+        try await performRequest(path: "/v1/fleet/overview", decodeAs: FleetOverviewResponse.self)
+    }
+
+    func fleetNodes() async throws -> FleetNodesResponse {
+        try await performRequest(path: "/v1/fleet/nodes", decodeAs: FleetNodesResponse.self)
+    }
+
+    func fleetNode(id: String) async throws -> FleetNodeDetailResponse {
+        try await performRequest(path: "/v1/fleet/nodes/\(id)", decodeAs: FleetNodeDetailResponse.self)
+    }
+
+    func dispatchFleetTask(
+        nodeID: String,
+        task: String,
+        priority: String = "normal"
+    ) async throws -> FleetDispatchTaskResponse {
+        let body = try encoder.encode(FleetDispatchTaskBody(task: task, priority: priority))
+        return try await performRequest(
+            path: "/v1/fleet/nodes/\(nodeID)/tasks",
+            method: "POST",
+            bodyData: body,
+            decodeAs: FleetDispatchTaskResponse.self
+        )
+    }
+
+    func experiments() async throws -> ExperimentsListResponse {
+        try await performRequest(path: "/v1/experiments", decodeAs: ExperimentsListResponse.self)
+    }
+
+    func experiment(id: String) async throws -> ExperimentDetail {
+        try await performRequest(path: "/v1/experiments/\(id)", decodeAs: ExperimentDetail.self)
+    }
+
+    func experimentResults(id: String) async throws -> ExperimentResultsResponse {
+        try await performRequest(
+            path: "/v1/experiments/\(id)/results",
+            decodeAs: ExperimentResultsResponse.self
+        )
+    }
+
+    func stopExperiment(id: String) async throws -> StopExperimentResponse {
+        try await performRequest(
+            path: "/v1/experiments/\(id)/stop",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: StopExperimentResponse.self
+        )
+    }
+
+    func gitStatus() async throws -> GitStatusResponse {
+        try await performRequest(path: "/v1/git/status", decodeAs: GitStatusResponse.self)
+    }
+
+    func gitLog(limit: Int = 10) async throws -> GitLogResponse {
+        try await performRequest(
+            path: "/v1/git/log",
+            queryItems: [.init(name: "limit", value: String(limit))],
+            decodeAs: GitLogResponse.self
+        )
+    }
+
+    func gitDiff() async throws -> GitDiffResponse {
+        try await performRequest(path: "/v1/git/diff", decodeAs: GitDiffResponse.self)
+    }
+
+    func gitStage(paths: [String]) async throws -> GitStageResponse {
+        let body = try encoder.encode(GitPathsRequest(paths: paths))
+        return try await performRequest(
+            path: "/v1/git/stage",
+            method: "POST",
+            bodyData: body,
+            decodeAs: GitStageResponse.self
+        )
+    }
+
+    func gitUnstage(paths: [String]) async throws -> GitUnstageResponse {
+        let body = try encoder.encode(GitPathsRequest(paths: paths))
+        return try await performRequest(
+            path: "/v1/git/unstage",
+            method: "POST",
+            bodyData: body,
+            decodeAs: GitUnstageResponse.self
+        )
+    }
+
+    func gitCommit(message: String) async throws -> GitCommitResponse {
+        let body = try encoder.encode(GitCommitRequestBody(message: message))
+        return try await performRequest(
+            path: "/v1/git/commit",
+            method: "POST",
+            bodyData: body,
+            decodeAs: GitCommitResponse.self
+        )
+    }
+
+    func gitPush() async throws -> GitPushResponse {
+        try await performRequest(
+            path: "/v1/git/push",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: GitPushResponse.self
+        )
+    }
+
+    func gitPull() async throws -> GitPullResponse {
+        try await performRequest(
+            path: "/v1/git/pull",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: GitPullResponse.self
+        )
+    }
+
+    func gitFetch() async throws -> GitFetchResponse {
+        try await performRequest(
+            path: "/v1/git/fetch",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: GitFetchResponse.self
+        )
+    }
+
     func authProviders() async throws -> AuthProvidersResponse {
         try await performRequest(
             candidatePaths: ["/v1/auth/status", "/v1/auth"],
@@ -709,6 +832,19 @@ private struct InstallSkillRequest: Encodable {
 
 private struct UpdateSkillPermissionsRequest: Encodable {
     let capabilities: [String]
+}
+
+private struct FleetDispatchTaskBody: Encodable {
+    let task: String
+    let priority: String
+}
+
+private struct GitPathsRequest: Encodable {
+    let paths: [String]
+}
+
+private struct GitCommitRequestBody: Encodable {
+    let message: String
 }
 
 private struct SendMessageBody: Encodable {

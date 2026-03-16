@@ -4,6 +4,9 @@ import SwiftUI
 private enum RootTab: Hashable {
     case chat
     case skills
+    case fleet
+    case experiments
+    case git
     case settings
 }
 
@@ -12,6 +15,9 @@ struct TabRootView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var skillsViewModel: SkillsViewModel
+    @Bindable var fleetViewModel: FleetViewModel
+    @Bindable var experimentsViewModel: ExperimentsViewModel
+    @Bindable var gitViewModel: GitViewModel
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
@@ -37,6 +43,15 @@ struct TabRootView: View {
                         openSkills: {
                             selectedTab = .skills
                         },
+                        openFleet: {
+                            selectedTab = .fleet
+                        },
+                        openExperiments: {
+                            selectedTab = .experiments
+                        },
+                        openGit: {
+                            selectedTab = .git
+                        },
                         openSettings: {
                             selectedTab = .settings
                         }
@@ -59,6 +74,108 @@ struct TabRootView: View {
                                             selectedTab = .chat
                                         },
                                         showSkills: {},
+                                        showFleet: {
+                                            selectedTab = .fleet
+                                        },
+                                        showExperiments: {
+                                            selectedTab = .experiments
+                                        },
+                                        showGit: {
+                                            selectedTab = .git
+                                        },
+                                        showSettings: {
+                                            selectedTab = .settings
+                                        }
+                                    )
+                                }
+                            }
+                    }
+                }
+
+                rootSectionContainer(isActive: selectedTab == .fleet) {
+                    NavigationStack {
+                        FleetView(viewModel: fleetViewModel)
+                            .navigationTitle("Fleet")
+                            .iOSInlineNavigationTitle()
+                            .toolbar {
+                                ToolbarItem(placement: .fawxTopLeading) {
+                                    SectionMenuButton(
+                                        disabledSection: .fleet,
+                                        showSessions: {
+                                            selectedTab = .chat
+                                        },
+                                        showSkills: {
+                                            selectedTab = .skills
+                                        },
+                                        showFleet: {},
+                                        showExperiments: {
+                                            selectedTab = .experiments
+                                        },
+                                        showGit: {
+                                            selectedTab = .git
+                                        },
+                                        showSettings: {
+                                            selectedTab = .settings
+                                        }
+                                    )
+                                }
+                            }
+                    }
+                }
+
+                rootSectionContainer(isActive: selectedTab == .experiments) {
+                    NavigationStack {
+                        ExperimentsView(viewModel: experimentsViewModel)
+                            .navigationTitle("Experiments")
+                            .iOSInlineNavigationTitle()
+                            .toolbar {
+                                ToolbarItem(placement: .fawxTopLeading) {
+                                    SectionMenuButton(
+                                        disabledSection: .experiments,
+                                        showSessions: {
+                                            selectedTab = .chat
+                                        },
+                                        showSkills: {
+                                            selectedTab = .skills
+                                        },
+                                        showFleet: {
+                                            selectedTab = .fleet
+                                        },
+                                        showExperiments: {},
+                                        showGit: {
+                                            selectedTab = .git
+                                        },
+                                        showSettings: {
+                                            selectedTab = .settings
+                                        }
+                                    )
+                                }
+                            }
+                    }
+                }
+
+                rootSectionContainer(isActive: selectedTab == .git) {
+                    NavigationStack {
+                        GitView(viewModel: gitViewModel)
+                            .navigationTitle("Git")
+                            .iOSInlineNavigationTitle()
+                            .toolbar {
+                                ToolbarItem(placement: .fawxTopLeading) {
+                                    SectionMenuButton(
+                                        disabledSection: .git,
+                                        showSessions: {
+                                            selectedTab = .chat
+                                        },
+                                        showSkills: {
+                                            selectedTab = .skills
+                                        },
+                                        showFleet: {
+                                            selectedTab = .fleet
+                                        },
+                                        showExperiments: {
+                                            selectedTab = .experiments
+                                        },
+                                        showGit: {},
                                         showSettings: {
                                             selectedTab = .settings
                                         }
@@ -81,6 +198,15 @@ struct TabRootView: View {
                         },
                         openSkills: {
                             selectedTab = .skills
+                        },
+                        openFleet: {
+                            selectedTab = .fleet
+                        },
+                        openExperiments: {
+                            selectedTab = .experiments
+                        },
+                        openGit: {
+                            selectedTab = .git
                         }
                     )
                 }

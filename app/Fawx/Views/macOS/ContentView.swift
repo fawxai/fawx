@@ -6,6 +6,9 @@ struct ContentView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var skillsViewModel: SkillsViewModel
+    @Bindable var fleetViewModel: FleetViewModel
+    @Bindable var experimentsViewModel: ExperimentsViewModel
+    @Bindable var gitViewModel: GitViewModel
     @Bindable var settingsViewModel: SettingsViewModel
     @Bindable var permissionsViewModel: PermissionsViewModel
     @Bindable var synthesisViewModel: SynthesisViewModel
@@ -31,6 +34,9 @@ struct ContentView: View {
                     newSessionAction: beginNewSession,
                     selectSessionAction: selectSession,
                     showSkillsAction: showSkills,
+                    showFleetAction: showFleet,
+                    showExperimentsAction: showExperiments,
+                    showGitAction: showGit,
                     openSettingsAction: showSettings,
                     clearSessionAction: clearSession,
                     deleteSessionAction: deleteSession
@@ -89,6 +95,15 @@ struct ContentView: View {
         case .skills:
             SkillsView(skillsViewModel: skillsViewModel)
                 .navigationTitle("Skills")
+        case .fleet:
+            FleetView(viewModel: fleetViewModel)
+                .navigationTitle("Fleet")
+        case .experiments:
+            ExperimentsView(viewModel: experimentsViewModel)
+                .navigationTitle("Experiments")
+        case .git:
+            GitView(viewModel: gitViewModel)
+                .navigationTitle("Git")
         case .settings:
             SettingsView(
                 settingsViewModel: settingsViewModel,
@@ -147,17 +162,23 @@ struct ContentView: View {
     }
 
     private func showSkills() {
-        chatViewModel.cancelScheduledLoad()
-        sidebarSelection = .skills
-        sessionViewModel.select(nil)
-        chatViewModel.showEmptyState()
+        switchToNonChatSection(.skills)
+    }
+
+    private func showFleet() {
+        switchToNonChatSection(.fleet)
+    }
+
+    private func showExperiments() {
+        switchToNonChatSection(.experiments)
+    }
+
+    private func showGit() {
+        switchToNonChatSection(.git)
     }
 
     private func showSettings() {
-        chatViewModel.cancelScheduledLoad()
-        sidebarSelection = .settings
-        sessionViewModel.select(nil)
-        chatViewModel.showEmptyState()
+        switchToNonChatSection(.settings)
     }
 
     private func restoreSelectionAfterRefresh() async {
@@ -204,6 +225,13 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func switchToNonChatSection(_ selection: SidebarSelection) {
+        chatViewModel.cancelScheduledLoad()
+        sidebarSelection = selection
+        sessionViewModel.select(nil)
+        chatViewModel.showEmptyState()
     }
 
 }

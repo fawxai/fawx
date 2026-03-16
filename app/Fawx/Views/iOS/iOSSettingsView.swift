@@ -20,6 +20,9 @@ struct iOSSettingsView: View {
     @Bindable var usageViewModel: UsageViewModel
     let openSessions: () -> Void
     let openSkills: () -> Void
+    let openFleet: () -> Void
+    let openExperiments: () -> Void
+    let openGit: () -> Void
 
     @State private var navigationPath: [SettingsRoute] = []
     @State private var isShowingQRScanner = false
@@ -106,6 +109,9 @@ struct iOSSettingsView: View {
                             disabledSection: .settings,
                             showSessions: openSessions,
                             showSkills: openSkills,
+                            showFleet: openFleet,
+                            showExperiments: openExperiments,
+                            showGit: openGit,
                             showSettings: {}
                         )
                     }

@@ -16,6 +16,9 @@ struct SessionListView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     let openSkills: () -> Void
+    let openFleet: () -> Void
+    let openExperiments: () -> Void
+    let openGit: () -> Void
     let openSettings: () -> Void
 
     @State private var navigationPath: [SessionRoute] = []
@@ -286,6 +289,9 @@ struct SessionListView: View {
                             disabledSection: nil,
                             showSessions: showSessionsList,
                             showSkills: openSkills,
+                            showFleet: openFleet,
+                            showExperiments: openExperiments,
+                            showGit: openGit,
                             showSettings: openSettings
                         )
                     }
@@ -364,6 +370,9 @@ struct SessionListView: View {
                     disabledSection: .sessions,
                     showSessions: showSessionsList,
                     showSkills: openSkills,
+                    showFleet: openFleet,
+                    showExperiments: openExperiments,
+                    showGit: openGit,
                     showSettings: openSettings
                 )
             }
