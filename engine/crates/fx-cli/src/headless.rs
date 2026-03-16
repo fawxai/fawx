@@ -1936,7 +1936,7 @@ impl HeadlessSubagentFactory {
             }
         }
         if let Some(thinking) = &config.thinking {
-            if let Err(error) = app.set_thinking_level(thinking) {
+            if let Err(error) = app.set_supported_thinking_level(thinking) {
                 tracing::warn!(thinking = %thinking, error = %error, "subagent thinking override failed");
             }
         }
