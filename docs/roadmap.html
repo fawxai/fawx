@@ -348,15 +348,18 @@
 
     <div class="phase">
       <div class="phase-header">
-        <span class="phase-badge badge-planned">Planned</span>
+        <span class="phase-badge badge-shipped">Shipped</span>
         <h2 class="phase-title">Self-Improving Fleet Coordination</h2>
       </div>
-      <p class="phase-desc">Hybrid DAG decomposition + linear refinement chains. Git IS the version control — branches are decomposition, commits are chains, PRs are proposals, merges are composition.</p>
+      <p class="phase-desc">Hybrid DAG decomposition + linear refinement chains. Cross-branch tournaments, auto-decomposition engine, per-model thinking profiles.</p>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Cross-branch tournament scoring</li>
-        <li><span class="planned">○</span> Auto-decomposition (break complex problems into subtasks)</li>
+        <li><span class="check">✓</span> Cross-branch tournament types (TournamentConfig, BranchScore, TournamentResult)</li>
+        <li><span class="check">✓</span> Auto-decomposition engine — DAG parser, sequential/parallel/DAG dispatchers, aggregator (fx-decompose)</li>
+        <li><span class="check">✓</span> Thinking registry — per-model profiles, runtime rejection cache, priority matching (fx-llm)</li>
+        <li><span class="check">✓</span> Training data curation — chain extraction, quality filters, dataset manager, 4 export formats (fx-training)</li>
         <li><span class="planned">○</span> Semantic merge validation</li>
         <li><span class="planned">○</span> Fitness backpropagation (scores flow back to inform decomposition)</li>
+        <li><span class="planned">○</span> Wire ThinkingRegistry into HeadlessApp (replace hardcoded levels)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -378,15 +381,19 @@
 
     <div class="phase">
       <div class="phase-header">
-        <span class="phase-badge badge-planned">Planned</span>
-        <h2 class="phase-title">Self-Training Pipeline</h2>
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">fx-forge — Model Forge</h2>
       </div>
-      <p class="phase-desc">Recursive improvement: experiments generate training data, fine-tune the local model, better model runs better experiments.</p>
+      <p class="phase-desc">Fawx doesn't just use models — it builds them. Unified pipeline from LoRA on your Mac to from-scratch on Prime Intellect. Same orchestrator, pluggable backends.</p>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Training data curation from chain winners</li>
-        <li><span class="planned">○</span> LoRA fine-tuning orchestration</li>
-        <li><span class="planned">○</span> Model evaluation as fitness criterion</li>
-        <li><span class="planned">○</span> Signed adapter deployment via chain</li>
+        <li><span class="check">✓</span> Training data curation (fx-training) — extraction, filters, dataset manager, OpenAI/Alpaca/DPO/raw export</li>
+        <li><span class="check">✓</span> fx-forge spec — reviewed and approved</li>
+        <li><span class="wip">◐</span> Phase 1: Core types + MockBackend + ArtifactManager + orchestrator</li>
+        <li><span class="planned">○</span> Phase 2: LocalBackend (Unsloth) + LlamaCppConverter (safetensors → GGUF)</li>
+        <li><span class="planned">○</span> Phase 3: CloudBackend (RunPod/Lambda) — remote GPU training</li>
+        <li><span class="planned">○</span> Phase 4: ClusterBackend (Prime Intellect) — distributed pre-training</li>
+        <li><span class="planned">○</span> Phase 5: ServingBackend (vLLM multi-user, llama.cpp single-user)</li>
+        <li><span class="planned">○</span> Phase 6: Self-improvement loop — experiments → curate → train → eval → activate → repeat</li>
       </ul>
     </div>
 
