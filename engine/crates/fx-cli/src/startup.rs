@@ -935,6 +935,8 @@ fn build_tool_executor(
 ) -> FawxToolExecutor {
     let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
         .with_process_registry(process_registry);
+    #[cfg(feature = "http")]
+    let executor = executor.with_background_experiments(true);
     match options.experiment_progress.clone() {
         Some(progress) => executor.with_experiment_progress(progress),
         None => executor,

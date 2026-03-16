@@ -1,5 +1,6 @@
 use crate::experiment_tool::{
-    handle_run_experiment, run_experiment_tool_definition, ExperimentToolState,
+    handle_run_experiment, run_experiment_tool_definition, spawn_background_experiment,
+    ExperimentToolState,
 };
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
@@ -72,6 +73,7 @@ pub struct FawxToolExecutor {
     subagent_control: Option<Arc<dyn SubagentControl>>,
     experiment: Option<ExperimentToolState>,
     experiment_progress: Option<ProgressCallback>,
+    background_experiments: bool,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
@@ -120,6 +122,7 @@ impl FawxToolExecutor {
             subagent_control: None,
             experiment: None,
             experiment_progress: None,
+            background_experiments: false,
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
@@ -178,6 +181,13 @@ impl FawxToolExecutor {
     /// Attach an experiment progress callback for run_experiment.
     pub fn with_experiment_progress(mut self, progress: ProgressCallback) -> Self {
         self.experiment_progress = Some(progress);
+        self
+    }
+
+    /// Toggle spawn-and-return behavior for run_experiment.
+    #[must_use]
+    pub fn with_background_experiments(mut self, background: bool) -> Self {
+        self.background_experiments = background;
         self
     }
 
@@ -920,14 +930,25 @@ impl FawxToolExecutor {
             .experiment
             .as_ref()
             .ok_or_else(|| "experiment tool not configured".to_string())?;
-        handle_run_experiment(
-            state,
-            self.subagent_control.as_ref(),
-            &self.working_dir,
-            args,
-            self.experiment_progress.clone(),
-        )
-        .await
+        if self.background_experiments {
+            spawn_background_experiment(
+                state,
+                self.subagent_control.clone(),
+                &self.working_dir,
+                args,
+                self.experiment_progress.clone(),
+                None,
+            )
+        } else {
+            handle_run_experiment(
+                state,
+                self.subagent_control.as_ref(),
+                &self.working_dir,
+                args,
+                self.experiment_progress.clone(),
+            )
+            .await
+        }
     }
 
     async fn handle_subagent_status(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -1306,7 +1327,8 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("config_manager", &self.config_manager.is_some())
             .field("subagent_control", &self.subagent_control.is_some())
             .field("experiment", &self.experiment.is_some())
-            .field("experiment_progress", &self.experiment_progress.is_some());
+            .field("experiment_progress", &self.experiment_progress.is_some())
+            .field("background_experiments", &self.background_experiments);
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
         debug.finish()
@@ -3691,6 +3713,47 @@ three
             events.first(),
             Some(ProgressEvent::RoundStarted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn run_experiment_background_mode_returns_immediately() {
+        let temp = TempDir::new().expect("tempdir");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let executor = test_executor(temp.path())
+            .with_experiment(experiment_state(temp.path()))
+            .with_background_experiments(true)
+            .with_experiment_progress(Arc::new(move |_event: &ProgressEvent| {
+                let _ = started_tx.send(());
+                if let Some(receiver) = release_rx.lock().expect("release lock").take() {
+                    receiver.recv().expect("release signal");
+                }
+            }));
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_experiment".to_string(),
+            arguments: serde_json::json!({
+                "signal": "signal",
+                "hypothesis": "test hypothesis",
+                "mode": "placeholder",
+                "nodes": 1,
+                "project": temp.path().display().to_string(),
+            }),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            executor.execute_call(&call, None),
+        )
+        .await
+        .expect("background mode should return without waiting for progress");
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Experiment started in background."));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background experiment should start");
+        release_tx.send(()).expect("release background experiment");
     }
 
     #[test]
