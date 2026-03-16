@@ -126,13 +126,28 @@ pub fn parse_run_experiment_args(
     if parsed.max_rounds == 0 {
         return Err("max_rounds must be at least 1".to_string());
     }
-    parsed.project = Some(
-        parsed
+    parsed.project = Some(expand_tilde(
+        &parsed
             .project
             .clone()
             .unwrap_or_else(|| working_dir.to_path_buf()),
-    );
+    ));
     Ok(parsed)
+}
+
+/// Expand `~` or `~/...` to the user's home directory.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        dirs::home_dir().unwrap_or_else(|| path.to_path_buf())
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(home) => home.join(rest),
+            None => path.to_path_buf(),
+        }
+    } else {
+        path.to_path_buf()
+    }
 }
 
 pub async fn handle_run_experiment(
