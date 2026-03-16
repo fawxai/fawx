@@ -17,13 +17,9 @@ pub fn sanitized_status_config(app: &dyn AppEngine) -> Option<serde_json::Value>
 }
 
 pub async fn handle_health(State(state): State<HttpState>) -> Json<HealthResponse> {
+    let app = state.app.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
-    // Try to read model, but don't block if app is busy (e.g., during experiments).
-    // The health endpoint must always respond quickly so the GUI stays connected.
-    let model = match state.app.try_lock() {
-        Ok(app) => app.active_model().to_string(),
-        Err(_) => "(busy)".to_string(),
-    };
+    let model = app.active_model().to_string();
     Json(HealthResponse {
         status: "ok",
         model,
@@ -33,15 +29,9 @@ pub async fn handle_health(State(state): State<HttpState>) -> Json<HealthRespons
 }
 
 pub async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
-    // Try non-blocking lock so status endpoint stays responsive during long operations.
-    let (model, config) = match state.app.try_lock() {
-        Ok(app) => {
-            let model = app.active_model().to_string();
-            let config = sanitized_status_config(&*app);
-            (model, config)
-        }
-        Err(_) => ("(busy)".to_string(), None),
-    };
+    let app = state.app.lock().await;
+    let model = app.active_model().to_string();
+    let config = sanitized_status_config(&*app);
 
     Json(StatusResponse {
         status: "ok",
