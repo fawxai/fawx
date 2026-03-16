@@ -219,8 +219,7 @@ impl ForgeOrchestrator {
     fn save_job(&self, job: &ForgeJob) -> Result<(), ForgeError> {
         let path = self.jobs_dir.join(format!("{}.json", job.id));
         let json = serde_json::to_string_pretty(job)?;
-        std::fs::write(path, json)?;
-        Ok(())
+        crate::storage::atomic_write(&path, &json)
     }
 
     fn load_job(&self, job_id: Uuid) -> Result<Option<ForgeJob>, ForgeError> {
