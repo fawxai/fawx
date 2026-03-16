@@ -1,3 +1,4 @@
+use crate::error::DecomposeError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -13,6 +14,13 @@ impl From<&str> for PathPattern {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainEntry {
     pub summary: String,
+}
+
+/// Minimal experiment representation for decomposition.
+/// Uses local types to avoid circular dependency with fx-consensus.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Experiment {
+    pub hypothesis: String,
 }
 
 /// Context provided to a decomposer for informed planning.
@@ -42,6 +50,23 @@ impl Default for DecompositionContext {
     }
 }
 
+impl DecompositionContext {
+    /// Validates that the context has sensible values.
+    pub fn validate(&self) -> Result<(), DecomposeError> {
+        if self.max_sub_goals == 0 {
+            return Err(DecomposeError::BudgetExceeded(
+                "max_sub_goals must be at least 1".to_owned(),
+            ));
+        }
+        if self.max_complexity_weight == 0 {
+            return Err(DecomposeError::BudgetExceeded(
+                "max_complexity_weight must be at least 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +79,25 @@ mod tests {
         assert!(context.source_files.is_empty());
         assert!(context.scope.is_empty());
         assert!(context.chain_history.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_sub_goals() {
+        let context = DecompositionContext {
+            max_sub_goals: 0,
+            ..DecompositionContext::default()
+        };
+        let error = context.validate().unwrap_err();
+        assert!(error.to_string().contains("max_sub_goals"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_complexity_weight() {
+        let context = DecompositionContext {
+            max_complexity_weight: 0,
+            ..DecompositionContext::default()
+        };
+        let error = context.validate().unwrap_err();
+        assert!(error.to_string().contains("max_complexity_weight"));
     }
 }

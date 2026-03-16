@@ -1,6 +1,6 @@
 use crate::context::DecompositionContext;
 use crate::error::DecomposeError;
-use crate::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
+use crate::{ComplexityHint, DecompositionPlan, SubGoal};
 use fx_core::signals::Signal;
 
 #[async_trait::async_trait]
@@ -32,20 +32,28 @@ impl Decomposer for LlmDecomposer {
     async fn decompose(
         &self,
         signal: &Signal,
-        _context: &DecompositionContext,
+        context: &DecompositionContext,
     ) -> Result<DecompositionPlan, DecomposeError> {
         Err(DecomposeError::DecompositionFailed(format!(
-            "LlmDecomposer requires a ModelRouter (not yet wired): signal={}, model={}",
-            signal.message, self.model
+            "LlmDecomposer requires a ModelRouter (not yet wired): signal={}, model={}, max_sub_goals={}, max_complexity_weight={}",
+            signal.message, self.model, context.max_sub_goals, context.max_complexity_weight
         )))
     }
 }
 
 /// Validate and potentially truncate a decomposition plan against budget constraints.
+/// Truncation happens BEFORE weight check so plans with many goals but acceptable
+/// post-truncation weight are not incorrectly rejected.
 pub fn validate_plan(
     mut plan: DecompositionPlan,
     context: &DecompositionContext,
 ) -> Result<DecompositionPlan, DecomposeError> {
+    context.validate()?;
+    if plan.sub_goals.len() > context.max_sub_goals {
+        let original = plan.sub_goals.len();
+        plan.sub_goals.truncate(context.max_sub_goals);
+        plan.truncated_from = Some(original);
+    }
     let total_weight = total_complexity_weight(&plan.sub_goals);
     if total_weight > context.max_complexity_weight {
         return Err(DecomposeError::BudgetExceeded(format!(
@@ -53,14 +61,11 @@ pub fn validate_plan(
             context.max_complexity_weight
         )));
     }
-    if plan.sub_goals.len() > context.max_sub_goals {
-        let original = plan.sub_goals.len();
-        plan.sub_goals.truncate(context.max_sub_goals);
-        plan.truncated_from = Some(original);
-    }
     Ok(plan)
 }
 
+/// Computes total complexity weight for a set of sub-goals.
+/// Goals without a complexity hint default to `Moderate` (weight 2).
 fn total_complexity_weight(goals: &[SubGoal]) -> u32 {
     goals
         .iter()
@@ -82,6 +87,7 @@ pub fn parse_plan_json(text: &str) -> Result<DecompositionPlan, DecomposeError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AggregationStrategy;
     use fx_core::signals::{LoopStep, SignalKind};
 
     fn simple_plan(count: usize) -> DecompositionPlan {
@@ -124,6 +130,20 @@ mod tests {
         let context = DecompositionContext {
             max_sub_goals: 5,
             max_complexity_weight: 100,
+            ..DecompositionContext::default()
+        };
+        let result = validate_plan(plan, &context).unwrap();
+        assert_eq!(result.sub_goals.len(), 5);
+        assert_eq!(result.truncated_from, Some(12));
+    }
+
+    #[test]
+    fn validate_plan_truncates_before_weight_check() {
+        // 12 Moderate goals = weight 24, but after truncation to 5 = weight 10
+        let plan = simple_plan(12);
+        let context = DecompositionContext {
+            max_sub_goals: 5,
+            max_complexity_weight: 12,
             ..DecompositionContext::default()
         };
         let result = validate_plan(plan, &context).unwrap();

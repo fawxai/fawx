@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Task decomposition types and sub-goal execution for the Fawx engine."
 
+[features]
+test-support = []
+
 [dependencies]
 fx-core = { workspace = true }
 async-trait = "0.1"

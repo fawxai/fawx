@@ -1,3 +1,17 @@
+//! DAG parser for Custom aggregation strategy.
+//!
+//! The DAG spec is a string describing execution order:
+//! - Comma-separated indices run in **parallel** within a level
+//! - `->` separates **sequential** levels
+//!
+//! # Examples
+//! - `"0->1->2"` — fully sequential (goal 0, then 1, then 2)
+//! - `"0,1,2"` — fully parallel (all three at once)
+//! - `"0,1->2->3"` — goals 0 and 1 in parallel, then 2, then 3
+//! - `"0,1->2,3->4"` — {0,1} parallel, then {2,3} parallel, then {4}
+//!
+//! All indices must be 0-based, unique, and cover every sub-goal exactly once.
+
 use crate::error::DecomposeError;
 use std::collections::HashSet;
 

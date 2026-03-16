@@ -1,13 +1,8 @@
+use crate::context::Experiment;
 use crate::dag::ExecutionDag;
 use crate::error::DecomposeError;
 use crate::{AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Experiment {
-    pub hypothesis: String,
-}
 
 pub type DecompositionProgressCallback = Arc<dyn Fn(&DecompositionEvent) + Send + Sync>;
 
@@ -23,6 +18,11 @@ pub enum DecompositionEvent {
 
 #[async_trait::async_trait]
 pub trait SubGoalExecutor: Send + Sync {
+    /// Execute a single sub-goal.
+    ///
+    /// For sequential dispatch, `prior_results` contains results from previously
+    /// completed sub-goals. For parallel and DAG dispatch, `prior_results` will
+    /// be empty since goals execute independently.
     async fn execute(
         &self,
         goal: &SubGoal,

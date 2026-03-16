@@ -1,4 +1,4 @@
-use crate::dispatcher::Experiment;
+use crate::context::Experiment;
 use crate::error::DecomposeError;
 use crate::{DecompositionPlan, SubGoalOutcome, SubGoalResult};
 
