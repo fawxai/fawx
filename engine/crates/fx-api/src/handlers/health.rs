@@ -17,22 +17,22 @@ pub fn sanitized_status_config(manager: Option<&ConfigManagerHandle>) -> Option<
 
 pub async fn handle_health(State(state): State<HttpState>) -> Json<HealthResponse> {
     let uptime = state.start_time.elapsed().as_secs();
-    let model = state.shared.active_model.read().await.clone();
+    let snap = state.shared.read().await;
     Json(HealthResponse {
         status: "ok",
-        model,
+        model: snap.active_model,
         uptime_seconds: uptime,
         skills_loaded: 0,
     })
 }
 
 pub async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
-    let model = state.shared.active_model.read().await.clone();
+    let snap = state.shared.read().await;
     let config = sanitized_status_config(state.config_manager.as_ref());
 
     Json(StatusResponse {
         status: "ok",
-        model,
+        model: snap.active_model,
         skills: Vec::new(),
         memory_entries: 0,
         tailscale_ip: state.tailscale_ip.clone(),

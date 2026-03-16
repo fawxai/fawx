@@ -7,11 +7,10 @@ use axum::Json;
 use serde_json::{json, Value};
 
 pub async fn handle_list_models(State(state): State<HttpState>) -> Json<Value> {
-    let models = state.shared.available_models.read().await.clone();
-    let active_model = state.shared.active_model.read().await.clone();
+    let snap = state.shared.read().await;
     Json(json!({
-        "active_model": active_model,
-        "models": models,
+        "active_model": snap.active_model,
+        "models": snap.available_models,
     }))
 }
 
@@ -35,8 +34,8 @@ pub async fn handle_set_model(
 }
 
 pub async fn handle_get_thinking(State(state): State<HttpState>) -> Json<Value> {
-    let thinking = state.shared.thinking_level.read().await.clone();
-    Json(json!(thinking))
+    let snap = state.shared.read().await;
+    Json(json!(snap.thinking_level))
 }
 
 pub async fn handle_set_thinking(
@@ -49,7 +48,7 @@ pub async fn handle_set_thinking(
         .set_thinking_level(&request.level)
         .map_err(bad_request)?;
     // Update shared read state
-    *state.shared.thinking_level.write().await = updated.clone();
+    state.shared.update_thinking(&updated).await;
     Ok(Json(json!({
         "previous_level": previous.level,
         "level": updated.level,

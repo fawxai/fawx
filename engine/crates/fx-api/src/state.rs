@@ -16,22 +16,33 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock as TokioRwLock};
 
+/// Atomic snapshot of frequently-read state. All fields are updated together
+/// so concurrent readers never see inconsistent combinations (e.g., new model
+/// with old thinking level).
+#[derive(Debug, Clone)]
+pub struct ReadSnapshot {
+    pub active_model: String,
+    pub thinking_level: ThinkingLevelDto,
+    pub available_models: Vec<ModelInfoDto>,
+    pub token_usage: (u64, u64),
+}
+
 /// Read-only state cache, updated after mutations. Handlers that only need
 /// to read model/thinking/usage info use this instead of locking the app Mutex.
+/// A single RwLock around the snapshot ensures all fields are consistent.
 pub struct SharedReadState {
-    pub active_model: TokioRwLock<String>,
-    pub thinking_level: TokioRwLock<ThinkingLevelDto>,
-    pub available_models: TokioRwLock<Vec<ModelInfoDto>>,
-    pub token_usage: TokioRwLock<(u64, u64)>,
+    snapshot: TokioRwLock<ReadSnapshot>,
 }
 
 impl SharedReadState {
     pub fn new(model: String, thinking: ThinkingLevelDto, models: Vec<ModelInfoDto>) -> Self {
         Self {
-            active_model: TokioRwLock::new(model),
-            thinking_level: TokioRwLock::new(thinking),
-            available_models: TokioRwLock::new(models),
-            token_usage: TokioRwLock::new((0, 0)),
+            snapshot: TokioRwLock::new(ReadSnapshot {
+                active_model: model,
+                thinking_level: thinking,
+                available_models: models,
+                token_usage: (0, 0),
+            }),
         }
     }
 
@@ -43,26 +54,41 @@ impl SharedReadState {
         )
     }
 
+    /// Read the current snapshot. Returns a clone — readers never block writers.
+    pub async fn read(&self) -> ReadSnapshot {
+        self.snapshot.read().await.clone()
+    }
+
+    /// Update all fields atomically after a cycle completes.
     pub async fn update_after_cycle(
         &self,
         model: &str,
         thinking: &ThinkingLevelDto,
         tokens: (u64, u64),
     ) {
-        *self.active_model.write().await = model.to_owned();
-        *self.thinking_level.write().await = thinking.clone();
-        *self.token_usage.write().await = tokens;
+        let mut snap = self.snapshot.write().await;
+        snap.active_model = model.to_owned();
+        snap.thinking_level = thinking.clone();
+        snap.token_usage = tokens;
     }
 
+    /// Update model-related fields atomically after a model switch.
     pub async fn update_model(
         &self,
         model: &str,
         thinking: &ThinkingLevelDto,
         models: Vec<ModelInfoDto>,
     ) {
-        *self.active_model.write().await = model.to_owned();
-        *self.thinking_level.write().await = thinking.clone();
-        *self.available_models.write().await = models;
+        let mut snap = self.snapshot.write().await;
+        snap.active_model = model.to_owned();
+        snap.thinking_level = thinking.clone();
+        snap.available_models = models;
+    }
+
+    /// Update just thinking level.
+    pub async fn update_thinking(&self, thinking: &ThinkingLevelDto) {
+        let mut snap = self.snapshot.write().await;
+        snap.thinking_level = thinking.clone();
     }
 }
 
