@@ -84,6 +84,7 @@ impl ForgeOrchestrator {
         name: String,
         objective: TrainObjective,
     ) -> Result<ForgeJob, ForgeError> {
+        objective.validate()?;
         let backend = self.select_backend(&objective)?;
         let job = ForgeJob {
             id: Uuid::new_v4(),
@@ -97,6 +98,7 @@ impl ForgeOrchestrator {
             error: None,
             backend: backend.capabilities().name.clone(),
             cost: None,
+            handle: None,
         };
         self.save_job(&job)?;
         Ok(job)
@@ -119,13 +121,22 @@ impl ForgeOrchestrator {
         );
 
         self.start_job(&mut job)?;
-        let handle = backend.submit(&job.objective).await?;
+        let handle = match backend.submit(&job.objective).await {
+            Ok(h) => h,
+            Err(e) => return self.fail_job(&mut job, &progress, e),
+        };
+        job.handle = Some(handle.clone());
+        self.save_job(&job)?;
         emit_backend_selected(&progress, backend);
 
-        let train_progress = backend.progress(&handle).await?;
-        emit(&progress, ForgeEvent::TrainProgress(train_progress));
+        if let Ok(train_progress) = backend.progress(&handle).await {
+            emit(&progress, ForgeEvent::TrainProgress(train_progress));
+        }
 
-        let artifact = backend.wait(&handle).await?;
+        let artifact = match backend.wait(&handle).await {
+            Ok(a) => a,
+            Err(e) => return self.fail_job(&mut job, &progress, e),
+        };
         emit_train_complete(&progress, &artifact);
 
         self.complete_job(&mut job, artifact)?;
@@ -155,9 +166,36 @@ impl ForgeOrchestrator {
 
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<(), ForgeError> {
         let mut job = self.load_existing_job(job_id)?;
+        // Attempt backend cancel if we have a handle.
+        // Best-effort: if backend cancel fails, we still mark the job cancelled locally.
+        if let Some(ref handle) = job.handle {
+            if let Ok(backend) = self.select_backend(&job.objective) {
+                let _ = backend.cancel(handle).await;
+            }
+        }
         job.status = JobStatus::Cancelled;
         job.completed_at = Some(Utc::now());
         self.save_job(&job)
+    }
+
+    fn fail_job(
+        &self,
+        job: &mut ForgeJob,
+        progress: &Option<ForgeProgressCallback>,
+        error: ForgeError,
+    ) -> Result<ForgeJob, ForgeError> {
+        job.status = JobStatus::Failed;
+        job.error = Some(error.to_string());
+        job.completed_at = Some(Utc::now());
+        let _ = self.save_job(job);
+        emit(
+            progress,
+            ForgeEvent::JobFailed {
+                job_id: job.id,
+                error: error.to_string(),
+            },
+        );
+        Err(error)
     }
 
     fn start_job(&self, job: &mut ForgeJob) -> Result<(), ForgeError> {
@@ -254,6 +292,13 @@ mod tests {
     use super::*;
     use crate::backend::mock::MockBackend;
 
+    fn valid_lora() -> TrainObjective {
+        TrainObjective::Lora(crate::LoraConfig {
+            base_model: "llama-8b".to_owned(),
+            ..crate::LoraConfig::default()
+        })
+    }
+
     #[tokio::test]
     async fn create_and_run_job() {
         let directory = tempfile::TempDir::new().unwrap();
@@ -264,10 +309,7 @@ mod tests {
         .unwrap();
 
         let job = orchestrator
-            .create_job(
-                "test".to_owned(),
-                TrainObjective::Lora(crate::LoraConfig::default()),
-            )
+            .create_job("test".to_owned(), valid_lora())
             .await
             .unwrap();
         assert_eq!(job.status, JobStatus::Pending);
@@ -286,10 +328,7 @@ mod tests {
         )
         .unwrap();
         let job = orchestrator
-            .create_job(
-                "test".to_owned(),
-                TrainObjective::Lora(crate::LoraConfig::default()),
-            )
+            .create_job("test".to_owned(), valid_lora())
             .await
             .unwrap();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -322,10 +361,7 @@ mod tests {
         .unwrap();
 
         let job = orchestrator
-            .create_job(
-                "test".to_owned(),
-                TrainObjective::Lora(crate::LoraConfig::default()),
-            )
+            .create_job("test".to_owned(), valid_lora())
             .await
             .unwrap();
         orchestrator.cancel_job(job.id).await.unwrap();
@@ -344,17 +380,11 @@ mod tests {
         .unwrap();
 
         orchestrator
-            .create_job(
-                "a".to_owned(),
-                TrainObjective::Lora(crate::LoraConfig::default()),
-            )
+            .create_job("a".to_owned(), valid_lora())
             .await
             .unwrap();
         orchestrator
-            .create_job(
-                "b".to_owned(),
-                TrainObjective::Lora(crate::LoraConfig::default()),
-            )
+            .create_job("b".to_owned(), valid_lora())
             .await
             .unwrap();
 
@@ -367,10 +397,7 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let orchestrator =
             ForgeOrchestrator::new(Vec::new(), directory.path().join("jobs")).unwrap();
-        let error = orchestrator
-            .select_backend(&TrainObjective::Lora(crate::LoraConfig::default()))
-            .err()
-            .unwrap();
+        let error = orchestrator.select_backend(&valid_lora()).err().unwrap();
         assert!(error.to_string().contains("no backend"));
     }
 
@@ -382,9 +409,7 @@ mod tests {
             directory.path().join("jobs"),
         )
         .unwrap();
-        let validation = orchestrator
-            .validate_job(&TrainObjective::Lora(crate::LoraConfig::default()))
-            .unwrap();
+        let validation = orchestrator.validate_job(&valid_lora()).unwrap();
         assert_eq!(validation.backend, "mock");
     }
 }

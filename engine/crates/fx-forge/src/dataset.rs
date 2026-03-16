@@ -16,7 +16,7 @@ pub enum DatasetRef {
 impl Default for DatasetRef {
     fn default() -> Self {
         Self::Local {
-            path: PathBuf::new(),
+            path: PathBuf::from("<unset>"),
             format: DatasetFormat::OpenAiJsonl,
         }
     }
@@ -49,7 +49,11 @@ mod tests {
     #[test]
     fn dataset_ref_default() {
         let dataset = DatasetRef::default();
-        assert!(matches!(dataset, DatasetRef::Local { .. }));
+        assert_eq!(dataset.format(), &DatasetFormat::OpenAiJsonl);
+        match dataset {
+            DatasetRef::Local { path, .. } => assert_eq!(path, PathBuf::from("<unset>")),
+            DatasetRef::Remote { .. } => panic!("default dataset should be local"),
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod objective;
 pub mod orchestrator;
 pub mod progress;
 pub mod serving;
+mod storage;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,8 @@ pub struct ForgeJob {
     pub result: Option<TrainArtifact>,
     pub error: Option<String>,
     pub backend: String,
+    #[serde(default)]
+    pub handle: Option<JobHandle>,
     pub cost: Option<CostRecord>,
 }
 
@@ -107,13 +110,17 @@ mod tests {
             id: Uuid::new_v4(),
             name: "test".to_owned(),
             status: JobStatus::Pending,
-            objective: TrainObjective::Lora(LoraConfig::default()),
+            objective: TrainObjective::Lora(LoraConfig {
+                base_model: "test-model".to_owned(),
+                ..LoraConfig::default()
+            }),
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
             result: None,
             error: None,
             backend: "mock".to_owned(),
+            handle: None,
             cost: None,
         };
         let json = serde_json::to_string(&job).unwrap();

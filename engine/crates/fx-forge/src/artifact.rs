@@ -1,6 +1,7 @@
 use crate::eval::EvalResults;
 use crate::format::ModelFormat;
 use crate::progress::ArtifactType;
+use crate::storage::atomic_write;
 use crate::{CostRecord, ForgeError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -162,7 +163,7 @@ impl ArtifactManager {
         for entry in std::fs::read_dir(&metadata_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            if !is_json_file(&path) {
                 continue;
             }
             let content = std::fs::read_to_string(&path)?;
@@ -173,43 +174,91 @@ impl ArtifactManager {
     }
 
     fn save_all(&self, artifacts: &[ArtifactInfo]) -> Result<(), ForgeError> {
-        clear_metadata_files(&self.metadata_dir())?;
-        write_metadata_files(&self.metadata_dir(), artifacts)
+        let metadata_dir = self.metadata_dir();
+        write_metadata_temp_files(&metadata_dir, artifacts)?;
+        replace_metadata_files(&metadata_dir, artifacts.len())
     }
 }
 
+fn replace_metadata_files(metadata_dir: &Path, artifact_count: usize) -> Result<(), ForgeError> {
+    clear_metadata_files(metadata_dir)?;
+    rename_metadata_temp_files(metadata_dir, artifact_count)
+}
+
 fn clear_metadata_files(metadata_dir: &Path) -> Result<(), ForgeError> {
+    remove_matching_files(metadata_dir, is_json_file)
+}
+
+fn clear_temp_metadata_files(metadata_dir: &Path) -> Result<(), ForgeError> {
+    remove_matching_files(metadata_dir, is_temp_metadata_file)
+}
+
+fn remove_matching_files(
+    metadata_dir: &Path,
+    matcher: fn(&Path) -> bool,
+) -> Result<(), ForgeError> {
     if !metadata_dir.exists() {
         return Ok(());
     }
     for entry in std::fs::read_dir(metadata_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+        if matcher(&path) {
             std::fs::remove_file(path)?;
         }
     }
     Ok(())
 }
 
-fn write_metadata_files(metadata_dir: &Path, artifacts: &[ArtifactInfo]) -> Result<(), ForgeError> {
+fn write_metadata_temp_files(
+    metadata_dir: &Path,
+    artifacts: &[ArtifactInfo],
+) -> Result<(), ForgeError> {
+    clear_temp_metadata_files(metadata_dir)?;
     for (index, artifact) in artifacts.iter().enumerate() {
-        let filename = format!("{:08}.json", index + 1);
-        write_artifact_info(&metadata_dir.join(filename), artifact)?;
+        let filename = format!("{:08}.json.tmp", index + 1);
+        write_temp_artifact_info(&metadata_dir.join(filename), artifact)?;
+    }
+    Ok(())
+}
+
+fn rename_metadata_temp_files(
+    metadata_dir: &Path,
+    artifact_count: usize,
+) -> Result<(), ForgeError> {
+    for index in 0..artifact_count {
+        let temp_path = metadata_dir.join(format!("{:08}.json.tmp", index + 1));
+        let final_path = metadata_dir.join(format!("{:08}.json", index + 1));
+        std::fs::rename(temp_path, final_path)?;
     }
     Ok(())
 }
 
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), ForgeError> {
     let json = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(path, json)?;
-    Ok(())
+    atomic_write(path, &json)
 }
 
 fn write_artifact_info(path: &Path, info: &ArtifactInfo) -> Result<(), ForgeError> {
     let json = serde_json::to_string_pretty(info)?;
+    atomic_write(path, &json)
+}
+
+fn write_temp_artifact_info(path: &Path, info: &ArtifactInfo) -> Result<(), ForgeError> {
+    let json = serde_json::to_string_pretty(info)?;
     std::fs::write(path, json)?;
     Ok(())
+}
+
+fn is_json_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("json")
+}
+
+fn is_temp_metadata_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".json.tmp"))
+        .unwrap_or(false)
 }
 
 fn apply_filter(artifacts: Vec<ArtifactInfo>, filter: &ArtifactFilter) -> Vec<ArtifactInfo> {
@@ -336,5 +385,33 @@ mod tests {
         };
         let filtered = manager.list(Some(&filter)).unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn save_all_preserves_artifacts() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let manager = ArtifactManager::new(directory.path().join("artifacts")).unwrap();
+        manager.register(sample_artifact("a1", "llama-8b")).unwrap();
+        manager.register(sample_artifact("a2", "llama-8b")).unwrap();
+
+        let artifacts = manager.list(None).unwrap();
+        let expected_ids: Vec<_> = artifacts.iter().map(|artifact| artifact.id).collect();
+
+        manager.save_all(&artifacts).unwrap();
+
+        let loaded = manager.list(None).unwrap();
+        let loaded_ids: Vec<_> = loaded.iter().map(|artifact| artifact.id).collect();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded_ids.len(), expected_ids.len());
+        for expected_id in expected_ids {
+            assert!(loaded_ids.contains(&expected_id));
+        }
+        let temp_files = std::fs::read_dir(manager.metadata_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_temp_metadata_file(path))
+            .count();
+        assert_eq!(temp_files, 0);
     }
 }
