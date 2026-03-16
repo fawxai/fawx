@@ -145,6 +145,65 @@ pub async fn handle_run_experiment(
     }))
 }
 
+/// Result delivered to the completion callback when a background experiment finishes.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read by callback consumers (experiment registry integration)
+pub struct BackgroundExperimentResult {
+    pub signal: String,
+    pub success: bool,
+    pub summary: String,
+    pub error: Option<String>,
+}
+
+/// Run an experiment in the background. Returns immediately with a status message.
+/// The experiment runs in a `tokio::spawn` task and calls `on_complete` when done.
+pub fn spawn_background_experiment(
+    state: &ExperimentToolState,
+    subagent_control: Option<Arc<dyn SubagentControl>>,
+    working_dir: &Path,
+    args: &serde_json::Value,
+    progress: Option<ProgressCallback>,
+    on_complete: Option<Arc<dyn Fn(BackgroundExperimentResult) + Send + Sync>>,
+) -> Result<String, String> {
+    let parsed = parse_run_experiment_args(args, working_dir)?;
+    let signal = parsed.signal.clone();
+    let hypothesis = parsed.hypothesis.clone();
+    let max_rounds = parsed.max_rounds;
+    let runner = build_runner(&parsed, state, subagent_control.as_ref())?.with_progress(progress);
+    let config = build_config(&parsed);
+
+    let spawn_signal = signal.clone();
+    let _background_task = tokio::spawn(async move {
+        let completion = match runner.run_loop(config, max_rounds).await {
+            Ok(chain_result) => BackgroundExperimentResult {
+                signal: spawn_signal.clone(),
+                success: true,
+                summary: format_auto_chain_result(&chain_result, |report| {
+                    format_experiment_report(&parsed, report)
+                }),
+                error: None,
+            },
+            Err(error) => BackgroundExperimentResult {
+                signal: spawn_signal.clone(),
+                success: false,
+                summary: String::new(),
+                error: Some(error.to_string()),
+            },
+        };
+        if let Some(callback) = on_complete {
+            callback(completion);
+        }
+    });
+
+    Ok(format!(
+        "Experiment started in background.\n\
+         Signal: {signal}\n\
+         Hypothesis: {hypothesis}\n\
+         Max rounds: {max_rounds}\n\n\
+         The experiment is running asynchronously. Use the Experiment Monitor to track progress."
+    ))
+}
+
 fn build_runner(
     args: &RunExperimentArgs,
     state: &ExperimentToolState,
