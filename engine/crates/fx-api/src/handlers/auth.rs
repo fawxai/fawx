@@ -145,7 +145,12 @@ async fn verify_auth_method(
                         .map_err(|error| error.to_string())?;
                 let verification = time::timeout(timeout, provider_client.verify_credentials())
                     .await
-                    .map_err(|_| format!("Timed out while contacting {}.", provider_display_name(provider)))?;
+                    .map_err(|_| {
+                        format!(
+                            "Timed out while contacting {}.",
+                            provider_display_name(provider)
+                        )
+                    })?;
 
                 verification
                     .map(|_| ())
@@ -355,5 +360,4 @@ mod tests {
         assert_eq!(request.1, "setup-token-123");
         assert_eq!(request.2, "setup_token");
     }
-
 }

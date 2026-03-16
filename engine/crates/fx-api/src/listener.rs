@@ -169,9 +169,12 @@ pub async fn serve_listener(
     router: Router,
     label: &'static str,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
 }
 
 pub async fn serve_listener_with_shutdown(
@@ -184,13 +187,13 @@ pub async fn serve_listener_with_shutdown(
         listener.listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .with_graceful_shutdown(async move {
-            if !*shutdown.borrow() {
-                let _ = shutdown.changed().await;
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+    .with_graceful_shutdown(async move {
+        if !*shutdown.borrow() {
+            let _ = shutdown.changed().await;
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
 }
 
 pub async fn wait_for_server_pair(

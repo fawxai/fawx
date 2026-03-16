@@ -65,10 +65,14 @@ pub enum SubGoalOutcome {
     Skipped,
 }
 
-pub use aggregator::{AggregatedResult, ResultAggregator, SimpleAggregator};
+pub use aggregator::{
+    AggregatedResult, BuildVerifyAggregator, DefaultWorkspaceProvider, MergeResult,
+    MergeTestResult, PatchApplyError, ResultAggregator, SimpleAggregator, TempWorkspace,
+    WorkspaceProvider,
+};
 pub use context::{
-    AttemptDecision, DecompositionAttempt, DecompositionContext, FitnessContext, FitnessStats,
-    SubGoalAttempt, SubGoalAttemptOutcome,
+    AttemptDecision, ChainEntry, DecompositionAttempt, DecompositionContext, Experiment,
+    FitnessContext, FitnessStats, PathPattern, SubGoalAttempt, SubGoalAttemptOutcome,
 };
 pub use dag::ExecutionDag;
 #[cfg(any(test, feature = "test-support"))]
@@ -77,7 +81,9 @@ pub use dispatcher::{
     DagDispatcher, DecompositionEvent, DecompositionProgressCallback, ParallelDispatcher,
     SequentialDispatcher, SubGoalDispatcher, SubGoalExecutor,
 };
-pub use engine::{format_fitness_context, Decomposer, LlmDecomposer};
+pub use engine::{
+    format_fitness_context, parse_plan_json, validate_plan, Decomposer, LlmDecomposer,
+};
 pub use error::DecomposeError;
 
 #[cfg(test)]

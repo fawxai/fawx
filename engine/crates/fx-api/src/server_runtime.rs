@@ -129,7 +129,10 @@ struct RestartPlan {
 
 impl RestartPlan {
     fn detect() -> Self {
-        restart_plan_for_state(detect_launchagent_state(), current_process_managed_by_launchagent())
+        restart_plan_for_state(
+            detect_launchagent_state(),
+            current_process_managed_by_launchagent(),
+        )
     }
 
     fn action(self) -> RestartAction {

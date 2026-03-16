@@ -95,7 +95,10 @@ pub async fn handle_qr_pairing(State(state): State<HttpState>) -> Json<QrPairing
     Json(qr_pairing_response(&state.server_runtime, &tailscale))
 }
 
-fn qr_pairing_response(runtime: &ServerRuntime, tailscale: &QrTailscaleStatus) -> QrPairingResponse {
+fn qr_pairing_response(
+    runtime: &ServerRuntime,
+    tailscale: &QrTailscaleStatus,
+) -> QrPairingResponse {
     let target = qr_target(runtime, tailscale);
     let host = target.host;
     let port = runtime.port;
@@ -149,7 +152,10 @@ struct QrTransportTarget {
 }
 
 fn detect_qr_tailscale_status() -> QrTailscaleStatus {
-    match Command::new("tailscale").args(["status", "--json"]).output() {
+    match Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    {
         Err(error) if error.kind() == ErrorKind::NotFound => QrTailscaleStatus::default(),
         Err(_) => QrTailscaleStatus::default(),
         Ok(output) if !output.status.success() => QrTailscaleStatus::default(),
@@ -392,7 +398,9 @@ mod phase4_tests {
         assert_eq!(response.display_host, "joes-mac.tail1234.ts.net");
         assert_eq!(response.transport, "tailscale_https");
         assert!(!response.same_network_only);
-        assert!(response.scheme_url.contains("host=joes-mac.tail1234.ts.net"));
+        assert!(response
+            .scheme_url
+            .contains("host=joes-mac.tail1234.ts.net"));
     }
 
     #[test]

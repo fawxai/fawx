@@ -27,7 +27,9 @@ impl SkillManifestError {
     }
 }
 
-pub fn installed_skill_capabilities(skills_dir: &Path) -> Result<HashMap<String, Vec<String>>, String> {
+pub fn installed_skill_capabilities(
+    skills_dir: &Path,
+) -> Result<HashMap<String, Vec<String>>, String> {
     if !skills_dir.exists() {
         return Ok(HashMap::new());
     }
@@ -37,7 +39,8 @@ pub fn installed_skill_capabilities(skills_dir: &Path) -> Result<HashMap<String,
         .map_err(|error| format!("failed to read skills directory: {error}"))?;
 
     for entry in entries {
-        let entry = entry.map_err(|error| format!("failed to read skill directory entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("failed to read skill directory entry: {error}"))?;
         if !entry.path().is_dir() {
             continue;
         }
@@ -79,8 +82,9 @@ pub fn update_skill_capabilities(
     }
     document["capabilities"] = Item::Value(Value::Array(array));
 
-    fs::write(&manifest_path, document.to_string())
-        .map_err(|error| SkillManifestError::Internal(format!("failed to write manifest: {error}")))?;
+    fs::write(&manifest_path, document.to_string()).map_err(|error| {
+        SkillManifestError::Internal(format!("failed to write manifest: {error}"))
+    })?;
 
     Ok(normalized)
 }
@@ -101,8 +105,9 @@ fn read_manifest_summary(manifest_path: &Path) -> Result<(String, Vec<String>), 
 }
 
 fn read_document(path: &Path) -> Result<DocumentMut, SkillManifestError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| SkillManifestError::Internal(format!("failed to read manifest: {error}")))?;
+    let contents = fs::read_to_string(path).map_err(|error| {
+        SkillManifestError::Internal(format!("failed to read manifest: {error}"))
+    })?;
     contents
         .parse::<DocumentMut>()
         .map_err(|error| SkillManifestError::Invalid(format!("invalid manifest TOML: {error}")))
@@ -120,7 +125,10 @@ fn read_capabilities(document: &DocumentMut) -> Result<Vec<String>, String> {
     let mut capabilities = Vec::new();
     for value in array.iter() {
         let Some(raw) = value.as_str() else {
-            return Err("manifest contains advanced capability entries that are not editable in-app yet".to_string());
+            return Err(
+                "manifest contains advanced capability entries that are not editable in-app yet"
+                    .to_string(),
+            );
         };
         capabilities.push(raw.to_string());
     }
@@ -128,7 +136,9 @@ fn read_capabilities(document: &DocumentMut) -> Result<Vec<String>, String> {
     Ok(capabilities)
 }
 
-fn normalize_capabilities(requested_capabilities: &[String]) -> Result<Vec<String>, SkillManifestError> {
+fn normalize_capabilities(
+    requested_capabilities: &[String],
+) -> Result<Vec<String>, SkillManifestError> {
     let normalized: Vec<String> = requested_capabilities
         .iter()
         .map(|capability| capability.trim().to_string())
@@ -154,7 +164,11 @@ fn normalize_capabilities(requested_capabilities: &[String]) -> Result<Vec<Strin
 }
 
 fn validate_skill_name(skill_name: &str) -> Result<(), SkillManifestError> {
-    if skill_name.trim().is_empty() || skill_name.contains('/') || skill_name.contains('\\') || skill_name.contains("..") {
+    if skill_name.trim().is_empty()
+        || skill_name.contains('/')
+        || skill_name.contains('\\')
+        || skill_name.contains("..")
+    {
         return Err(SkillManifestError::Invalid(
             "invalid skill name".to_string(),
         ));
@@ -172,8 +186,9 @@ fn manifest_path_for_skill_name(
         )));
     }
 
-    let entries = fs::read_dir(skills_dir)
-        .map_err(|error| SkillManifestError::Internal(format!("failed to read skills directory: {error}")))?;
+    let entries = fs::read_dir(skills_dir).map_err(|error| {
+        SkillManifestError::Internal(format!("failed to read skills directory: {error}"))
+    })?;
 
     for entry in entries {
         let entry = entry.map_err(|error| {
@@ -268,8 +283,9 @@ capabilities = ["notifications"]
             vec!["network".to_string(), "notifications".to_string()]
         );
 
-        let manifest = fs::read_to_string(temp_dir.path().join("weather-skill").join("manifest.toml"))
-            .expect("manifest");
+        let manifest =
+            fs::read_to_string(temp_dir.path().join("weather-skill").join("manifest.toml"))
+                .expect("manifest");
         assert!(manifest.contains(r#"capabilities = ["network", "notifications"]"#));
     }
 
@@ -289,16 +305,10 @@ capabilities = []
 "#,
         );
 
-        let error = update_skill_capabilities(
-            temp_dir.path(),
-            "weather",
-            &["telepathy".to_string()],
-        )
-        .expect_err("should reject unknown capability");
+        let error =
+            update_skill_capabilities(temp_dir.path(), "weather", &["telepathy".to_string()])
+                .expect_err("should reject unknown capability");
 
-        assert_eq!(
-            error.message(),
-            "unknown skill capability 'telepathy'"
-        );
+        assert_eq!(error.message(), "unknown skill capability 'telepathy'");
     }
 }

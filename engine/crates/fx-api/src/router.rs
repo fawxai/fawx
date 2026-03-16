@@ -8,7 +8,9 @@ use crate::handlers::errors::handle_recent_errors;
 use crate::handlers::fleet::fleet_router;
 use crate::handlers::health::{handle_health, handle_status};
 use crate::handlers::message::handle_message;
-use crate::handlers::pairing::{handle_adopt_local_device, handle_exchange_pair, handle_generate_pair};
+use crate::handlers::pairing::{
+    handle_adopt_local_device, handle_exchange_pair, handle_generate_pair,
+};
 use crate::handlers::phase4::{
     handle_server_restart, handle_server_status, handle_server_stop, handle_setup_status,
 };
