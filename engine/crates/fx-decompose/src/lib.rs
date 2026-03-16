@@ -1,3 +1,10 @@
+pub mod aggregator;
+pub mod context;
+pub mod dag;
+pub mod dispatcher;
+pub mod engine;
+pub mod error;
+
 use fx_core::signals::Signal;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +64,18 @@ pub enum SubGoalOutcome {
     BudgetExhausted,
     Skipped,
 }
+
+pub use aggregator::{AggregatedResult, ResultAggregator, SimpleAggregator};
+pub use context::DecompositionContext;
+pub use dag::ExecutionDag;
+#[cfg(any(test, feature = "test-support"))]
+pub use dispatcher::MockSubGoalExecutor;
+pub use dispatcher::{
+    DagDispatcher, DecompositionEvent, DecompositionProgressCallback, ParallelDispatcher,
+    SequentialDispatcher, SubGoalDispatcher, SubGoalExecutor,
+};
+pub use engine::{Decomposer, LlmDecomposer};
+pub use error::DecomposeError;
 
 #[cfg(test)]
 mod tests {
