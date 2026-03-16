@@ -35,8 +35,8 @@ pub async fn handle_set_model(
 }
 
 pub async fn handle_get_thinking(State(state): State<HttpState>) -> Json<Value> {
-    let app = state.app.lock().await;
-    Json(json!(app.thinking_level()))
+    let thinking = state.shared.thinking_level.read().await.clone();
+    Json(json!(thinking))
 }
 
 pub async fn handle_set_thinking(
@@ -48,6 +48,8 @@ pub async fn handle_set_thinking(
     let updated = app
         .set_thinking_level(&request.level)
         .map_err(bad_request)?;
+    // Update shared read state
+    *state.shared.thinking_level.write().await = updated.clone();
     Ok(Json(json!({
         "previous_level": previous.level,
         "level": updated.level,

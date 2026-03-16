@@ -384,6 +384,15 @@ async fn process_and_route_session_message(
                 None,
             )
             .await?;
+        // Update shared read state while we still hold the lock
+        state
+            .shared
+            .update_after_cycle(
+                app.active_model(),
+                &app.thinking_level(),
+                app.session_token_usage(),
+            )
+            .await;
         result
     };
 
