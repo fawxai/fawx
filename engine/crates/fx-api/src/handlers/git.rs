@@ -236,18 +236,35 @@ pub async fn handle_git_pull(
     State(state): State<HttpState>,
 ) -> HandlerResult<Json<GitPullResponse>> {
     let cwd = workspace_dir(&state).await;
-    let output = run_git_output(["pull"], &cwd).await.map_err(bad_request)?;
+    match run_git_output(["pull"], &cwd).await {
+        Ok(output) => Ok(Json(pull_response_from_output(&output))),
+        Err(error) => {
+            let msg = error.to_string();
+            if msg.contains("CONFLICT") || msg.contains("Merge conflict") {
+                Ok(Json(GitPullResponse {
+                    pulled: false,
+                    summary: msg,
+                    conflicts: true,
+                }))
+            } else {
+                Err(bad_request(error))
+            }
+        }
+    }
+}
+
+fn pull_response_from_output(output: &GitOutput) -> GitPullResponse {
     let conflicts = output.stdout.contains("CONFLICT") || output.stderr.contains("CONFLICT");
     let summary = if output.stdout.trim().is_empty() {
         output.stderr.trim().to_string()
     } else {
         output.stdout.trim().to_string()
     };
-    Ok(Json(GitPullResponse {
-        pulled: true,
+    GitPullResponse {
+        pulled: !conflicts,
         summary,
         conflicts,
-    }))
+    }
 }
 
 // ── Fetch ────────────────────────────────────────────────────────
@@ -376,8 +393,16 @@ where
 }
 
 fn validate_paths(paths: &[String]) -> Result<(), GitError> {
-    if paths.iter().any(|path| path.trim().is_empty()) {
-        return Err(GitError::new("paths must not contain empty values"));
+    for path in paths {
+        if path.trim().is_empty() {
+            return Err(GitError::new("paths must not contain empty values"));
+        }
+        if path.contains("..") {
+            return Err(GitError::new("paths must not contain path traversal (..)"));
+        }
+        if path.starts_with('/') {
+            return Err(GitError::new("paths must be relative, not absolute"));
+        }
     }
     Ok(())
 }
@@ -739,5 +764,83 @@ mod tests {
         assert_eq!(commit.short_hash, "abcdef1");
         assert_eq!(commit.message, "feat: support pipes | in messages");
         assert_eq!(commit.author, "Joe");
+    }
+
+    #[test]
+    fn unstage_response_serializes() {
+        let response = GitUnstageResponse {
+            unstaged: true,
+            paths: vec!["src/lib.rs".to_string()],
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["unstaged"], true);
+        assert_eq!(json["paths"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn pull_response_serializes() {
+        let response = GitPullResponse {
+            pulled: true,
+            summary: "Already up to date.".to_string(),
+            conflicts: false,
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["pulled"], true);
+        assert_eq!(json["conflicts"], false);
+    }
+
+    #[test]
+    fn fetch_response_serializes() {
+        let response = GitFetchResponse {
+            fetched: true,
+            summary: "Already up to date.".to_string(),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["fetched"], true);
+    }
+
+    #[test]
+    fn pull_response_detects_conflicts_in_output() {
+        let output = GitOutput {
+            stdout: "CONFLICT (content): Merge conflict in src/lib.rs".to_string(),
+            stderr: String::new(),
+        };
+        let response = pull_response_from_output(&output);
+        assert!(response.conflicts);
+        assert!(!response.pulled);
+    }
+
+    #[test]
+    fn pull_response_clean_merge() {
+        let output = GitOutput {
+            stdout: "Updating abc123..def456\nFast-forward".to_string(),
+            stderr: String::new(),
+        };
+        let response = pull_response_from_output(&output);
+        assert!(!response.conflicts);
+        assert!(response.pulled);
+    }
+
+    #[test]
+    fn validate_paths_rejects_traversal() {
+        assert!(validate_paths(&["../../etc/passwd".to_string()]).is_err());
+        assert!(validate_paths(&["src/../../../etc".to_string()]).is_err());
+    }
+
+    #[test]
+    fn validate_paths_rejects_absolute() {
+        assert!(validate_paths(&["/etc/passwd".to_string()]).is_err());
+    }
+
+    #[test]
+    fn validate_paths_accepts_normal() {
+        assert!(validate_paths(&["src/lib.rs".to_string()]).is_ok());
+        assert!(validate_paths(&["engine/crates/fx-api/src/lib.rs".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn unstage_args_builds_correct_command() {
+        let args = unstage_args(&["src/lib.rs".to_string()]);
+        assert_eq!(args, vec!["reset", "HEAD", "--", "src/lib.rs"]);
     }
 }
