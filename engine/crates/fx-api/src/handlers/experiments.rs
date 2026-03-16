@@ -521,7 +521,7 @@ mod tests {
     use crate::experiment_registry::ExperimentRegistry;
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
-    use crate::state::build_channel_runtime;
+    use crate::state::{build_channel_runtime, default_telemetry};
     use crate::types::{
         AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto,
         SkillSummaryDto, ThinkingLevelDto,

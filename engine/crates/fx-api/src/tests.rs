@@ -13,7 +13,7 @@ use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::server_runtime::ServerRuntime;
 use crate::sse::{send_sse_frame, serialize_stream_event};
-use crate::state::{build_channel_runtime, ChannelRuntime, HttpState};
+use crate::state::{build_channel_runtime, default_telemetry, ChannelRuntime, HttpState};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
     ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody,
@@ -44,6 +44,7 @@ use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, St
 use fx_llm::{
     CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, Message, StreamChunk,
 };
+use fx_telemetry::{SignalCategory, SignalCollector, TelemetryConsent};
 use http_body_util::BodyExt;
 use hyper::Request;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1295,6 +1296,17 @@ mod routing_and_status {
         ))
     }
 
+    fn telemetry_with_enabled_categories(categories: &[SignalCategory]) -> Arc<SignalCollector> {
+        let mut consent = TelemetryConsent {
+            enabled: true,
+            ..TelemetryConsent::default()
+        };
+        for category in categories {
+            consent.enable_category(category.clone());
+        }
+        Arc::new(SignalCollector::new(consent))
+    }
+
     fn test_state(
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
         webhooks: Vec<Arc<WebhookChannel>>,
@@ -1345,6 +1357,7 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
+            telemetry: default_telemetry(),
         }
     }
 
@@ -1384,12 +1397,19 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
+            telemetry: default_telemetry(),
         }
     }
 
     fn test_state_with_devices(devices: DeviceStore) -> HttpState {
         let mut state = test_state(None, Vec::new());
         state.devices = Arc::new(Mutex::new(devices));
+        state
+    }
+
+    fn test_state_with_telemetry(telemetry: Arc<SignalCollector>) -> HttpState {
+        let mut state = test_state(None, Vec::new());
+        state.telemetry = telemetry;
         state
     }
 
@@ -1426,6 +1446,121 @@ mod routing_and_status {
             .expect("body")
             .to_bytes();
         serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn telemetry_consent_endpoint_returns_defaults() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/telemetry/consent"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["categories"].as_object().expect("categories").len(), 6);
+        assert_eq!(json["categories"]["tool_usage"]["enabled"], false);
+        assert_eq!(
+            json["categories"]["proposal_gate"]["description"],
+            "How often the safety gate activates"
+        );
+        assert!(json["updated_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn telemetry_consent_patch_updates_master_and_categories() {
+        let app = build_router(test_state(None, Vec::new()), None);
+
+        let update = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PATCH",
+                "/v1/telemetry/consent",
+                r#"{"enabled":true,"categories":{"tool_usage":true,"errors":true}}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let update_json = response_json(update).await;
+        assert_eq!(update_json["enabled"], true);
+        assert_eq!(update_json["categories"]["tool_usage"]["enabled"], true);
+        assert_eq!(update_json["categories"]["errors"]["enabled"], true);
+        assert_eq!(update_json["categories"]["model_usage"]["enabled"], false);
+
+        let current = app
+            .oneshot(authed_request("GET", "/v1/telemetry/consent"))
+            .await
+            .expect("response");
+        let current_json = response_json(current).await;
+        assert_eq!(current_json["enabled"], true);
+        assert_eq!(current_json["categories"]["tool_usage"]["enabled"], true);
+        assert_eq!(current_json["categories"]["errors"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn telemetry_signals_endpoint_drains_buffer() {
+        let telemetry =
+            telemetry_with_enabled_categories(&[SignalCategory::ToolUsage, SignalCategory::Errors]);
+        telemetry.record(
+            SignalCategory::ToolUsage,
+            "tool_call",
+            serde_json::json!({"tool": "read"}),
+        );
+        telemetry.record(
+            SignalCategory::Errors,
+            "error",
+            serde_json::json!({"code": 500}),
+        );
+        let app = build_router(test_state_with_telemetry(telemetry), None);
+
+        let response = app
+            .clone()
+            .oneshot(authed_request("GET", "/v1/telemetry/signals"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["signals"][0]["category"], "tool_usage");
+        assert_eq!(json["signals"][1]["category"], "errors");
+
+        let empty = app
+            .oneshot(authed_request("GET", "/v1/telemetry/signals"))
+            .await
+            .expect("response");
+        let empty_json = response_json(empty).await;
+        assert_eq!(empty_json["count"], 0);
+        assert_eq!(empty_json["signals"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn telemetry_delete_signals_endpoint_clears_buffer() {
+        let telemetry = telemetry_with_enabled_categories(&[SignalCategory::Errors]);
+        telemetry.record(
+            SignalCategory::Errors,
+            "error",
+            serde_json::json!({"code": 500}),
+        );
+        let app = build_router(test_state_with_telemetry(telemetry), None);
+
+        let delete = app
+            .clone()
+            .oneshot(authed_request("DELETE", "/v1/telemetry/signals"))
+            .await
+            .expect("response");
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/telemetry/signals"))
+            .await
+            .expect("response");
+        let json = response_json(response).await;
+        assert_eq!(json["count"], 0);
+        assert_eq!(json["signals"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -3205,6 +3340,7 @@ thinking = "adaptive"
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
+            telemetry: default_telemetry(),
         };
         let app = build_router(state, None);
         let req = Request::builder()

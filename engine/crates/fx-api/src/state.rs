@@ -8,6 +8,7 @@ use fx_core::channel::Channel;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
 use fx_session::SessionRegistry;
+use fx_telemetry::{SignalCollector, TelemetryConsent};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct HttpState {
     pub experiment_registry:
         Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    pub telemetry: Arc<SignalCollector>,
 }
 
 #[derive(Clone)]
@@ -43,6 +45,10 @@ pub struct ChannelRuntime {
     pub http: Arc<HttpChannel>,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub webhooks: Arc<HashMap<String, Arc<WebhookChannel>>>,
+}
+
+pub fn default_telemetry() -> Arc<SignalCollector> {
+    Arc::new(SignalCollector::new(TelemetryConsent::default()))
 }
 
 pub fn build_channel_runtime(

@@ -34,7 +34,7 @@ use crate::listener::{
 use crate::pairing::PairingState;
 use crate::router::{build_router, load_fleet_manager_if_initialized};
 use crate::server_runtime::ServerRuntime;
-use crate::state::{build_channel_runtime, HttpState};
+use crate::state::{build_channel_runtime, default_telemetry, HttpState};
 use crate::telegram::polling::run_telegram_polling;
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use fx_channel_telegram::TelegramChannel;
@@ -108,6 +108,7 @@ pub async fn run(
         cron_store: config.cron_store.clone(),
         experiment_registry: Arc::new(Mutex::new(experiment_registry)),
         improvement_provider: config.improvement_provider.clone(),
+        telemetry: default_telemetry(),
     };
     let router = build_router(state, fleet_manager);
 

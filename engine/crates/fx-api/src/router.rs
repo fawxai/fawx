@@ -171,6 +171,16 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/git/push", post(handlers::git::handle_git_push))
         .route("/git/pull", post(handlers::git::handle_git_pull))
         .route("/git/fetch", post(handlers::git::handle_git_fetch))
+        .route(
+            "/telemetry/consent",
+            get(handlers::telemetry::handle_get_consent)
+                .patch(handlers::telemetry::handle_patch_consent),
+        )
+        .route(
+            "/telemetry/signals",
+            get(handlers::telemetry::handle_get_signals)
+                .delete(handlers::telemetry::handle_delete_signals),
+        )
         .route("/devices/{id}", delete(handle_delete_device))
         .route("/pair/generate", post(handle_generate_pair))
         .route(

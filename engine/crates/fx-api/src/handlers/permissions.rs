@@ -414,9 +414,10 @@ mod tests {
     use super::*;
     use crate::devices::DeviceStore;
     use crate::engine::{AppEngine, CycleResult};
+    use crate::experiment_registry::ExperimentRegistry;
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
-    use crate::state::{build_channel_runtime, HttpState};
+    use crate::state::{build_channel_runtime, default_telemetry, HttpState};
     use crate::types::{
         AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto,
         SkillSummaryDto, ThinkingLevelDto,
@@ -752,6 +753,11 @@ mod tests {
             .map(|entry| entry.level.as_str())
     }
 
+    fn test_registry(data_dir: &Path) -> Arc<Mutex<ExperimentRegistry>> {
+        let registry = ExperimentRegistry::new(data_dir).expect("registry");
+        Arc::new(Mutex::new(registry))
+    }
+
     fn test_state(permissions: PermissionsConfig) -> (TempDir, HttpState) {
         let temp = TempDir::new().expect("tempdir");
         write_test_config(temp.path(), permissions);
@@ -778,6 +784,9 @@ mod tests {
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             fleet_manager: None,
             cron_store: None,
+            experiment_registry: test_registry(temp.path()),
+            improvement_provider: None,
+            telemetry: default_telemetry(),
         };
 
         (temp, state)

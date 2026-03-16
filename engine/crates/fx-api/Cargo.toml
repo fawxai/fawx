@@ -10,6 +10,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum = "0.8"
 base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
 futures.workspace = true
 fx-channel-telegram = { path = "../fx-channel-telegram" }
 fx-channel-webhook = { path = "../fx-channel-webhook" }
@@ -25,6 +26,7 @@ fx-llm.workspace = true
 fx-memory.workspace = true
 fx-session.workspace = true
 fx-storage.workspace = true
+fx-telemetry = { path = "../fx-telemetry" }
 fx-tools.workspace = true
 rand = "0.8"
 reqwest.workspace = true
