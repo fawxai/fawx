@@ -28,7 +28,7 @@ use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{supported_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
+use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter, ThinkingRegistry};
 use fx_memory::SignalStore;
 use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
@@ -197,6 +197,8 @@ pub struct HeadlessApp {
     /// process incoming cross-session messages during conversation.
     #[allow(dead_code)]
     bus_receiver: Option<mpsc::Receiver<Envelope>>,
+    /// Per-model thinking capability registry.
+    thinking_registry: ThinkingRegistry,
 }
 
 #[derive(Clone)]
@@ -341,6 +343,7 @@ impl HeadlessApp {
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: deps.permission_callback_slot,
             bus_receiver,
+            thinking_registry: ThinkingRegistry::with_defaults(),
         };
         app.record_startup_warning_history();
         Ok(app)
@@ -603,9 +606,7 @@ impl HeadlessApp {
     }
 
     pub fn thinking_available_levels(&self) -> Vec<String> {
-        self.active_provider_name()
-            .map(supported_thinking_levels)
-            .unwrap_or_else(|| supported_thinking_levels(""))
+        self.thinking_registry.available_levels(&self.active_model)
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -2331,6 +2332,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
+            thinking_registry: ThinkingRegistry::with_defaults(),
         }
     }
 
@@ -2858,6 +2860,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
+            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         std::fs::write(
@@ -3191,6 +3194,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
+            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         let result = app.process_message("hello").await.expect("process message");
@@ -3233,6 +3237,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             bus_receiver: None,
+            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         app.process_message("hello")
