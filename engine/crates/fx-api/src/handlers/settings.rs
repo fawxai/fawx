@@ -7,9 +7,8 @@ use axum::Json;
 use serde_json::{json, Value};
 
 pub async fn handle_list_models(State(state): State<HttpState>) -> Json<Value> {
-    let app = state.app.lock().await;
-    let models = app.available_models();
-    let active_model = app.active_model().to_string();
+    let models = state.shared.available_models.read().await.clone();
+    let active_model = state.shared.active_model.read().await.clone();
     Json(json!({
         "active_model": active_model,
         "models": models,
@@ -20,8 +19,18 @@ pub async fn handle_set_model(
     State(state): State<HttpState>,
     Json(request): Json<SetModelRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorBody>)> {
-    let mut app = state.app.lock().await;
-    let switched = app.set_active_model(&request.model).map_err(bad_request)?;
+    let (switched, active_model, thinking, models) = {
+        let mut app = state.app.lock().await;
+        let switched = app.set_active_model(&request.model).map_err(bad_request)?;
+        let active_model = app.active_model().to_owned();
+        let thinking = app.thinking_level();
+        let models = app.available_models();
+        (switched, active_model, thinking, models)
+    };
+    state
+        .shared
+        .update_model(&active_model, &thinking, models)
+        .await;
     Ok(Json(json!(switched)))
 }
 

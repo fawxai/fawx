@@ -1,7 +1,8 @@
 use crate::devices::DeviceStore;
-use crate::engine::AppEngine;
+use crate::engine::{AppEngine, ConfigManagerHandle};
 use crate::pairing::PairingState;
 use crate::server_runtime::ServerRuntime;
+use crate::types::{ModelInfoDto, ThinkingLevelDto};
 use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
@@ -13,11 +14,63 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as TokioRwLock};
+
+/// Read-only state cache, updated after mutations. Handlers that only need
+/// to read model/thinking/usage info use this instead of locking the app Mutex.
+pub struct SharedReadState {
+    pub active_model: TokioRwLock<String>,
+    pub thinking_level: TokioRwLock<ThinkingLevelDto>,
+    pub available_models: TokioRwLock<Vec<ModelInfoDto>>,
+    pub token_usage: TokioRwLock<(u64, u64)>,
+}
+
+impl SharedReadState {
+    pub fn new(model: String, thinking: ThinkingLevelDto, models: Vec<ModelInfoDto>) -> Self {
+        Self {
+            active_model: TokioRwLock::new(model),
+            thinking_level: TokioRwLock::new(thinking),
+            available_models: TokioRwLock::new(models),
+            token_usage: TokioRwLock::new((0, 0)),
+        }
+    }
+
+    pub fn from_app(app: &dyn AppEngine) -> Self {
+        Self::new(
+            app.active_model().to_owned(),
+            app.thinking_level(),
+            app.available_models(),
+        )
+    }
+
+    pub async fn update_after_cycle(
+        &self,
+        model: &str,
+        thinking: &ThinkingLevelDto,
+        tokens: (u64, u64),
+    ) {
+        *self.active_model.write().await = model.to_owned();
+        *self.thinking_level.write().await = thinking.clone();
+        *self.token_usage.write().await = tokens;
+    }
+
+    pub async fn update_model(
+        &self,
+        model: &str,
+        thinking: &ThinkingLevelDto,
+        models: Vec<ModelInfoDto>,
+    ) {
+        *self.active_model.write().await = model.to_owned();
+        *self.thinking_level.write().await = thinking.clone();
+        *self.available_models.write().await = models;
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpState {
     pub app: Arc<Mutex<dyn AppEngine>>,
+    pub shared: Arc<SharedReadState>,
+    pub config_manager: Option<ConfigManagerHandle>,
     pub session_registry: Option<SessionRegistry>,
     pub start_time: Instant,
     pub server_runtime: ServerRuntime,

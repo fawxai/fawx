@@ -34,7 +34,7 @@ use crate::listener::{
 use crate::pairing::PairingState;
 use crate::router::{build_router, load_fleet_manager_if_initialized};
 use crate::server_runtime::ServerRuntime;
-use crate::state::{build_channel_runtime, default_telemetry, HttpState};
+use crate::state::{build_channel_runtime, default_telemetry, HttpState, SharedReadState};
 use crate::telegram::polling::run_telegram_polling;
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use fx_channel_telegram::TelegramChannel;
@@ -86,9 +86,24 @@ pub async fn run(
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
     let server_runtime = ServerRuntime::local(config.port);
-    let has_synthesis = has_synthesis_config(&shared_app).await;
+    let (shared, config_manager, has_synthesis) = {
+        let app = shared_app.lock().await;
+        let config_manager = app.config_manager();
+        let has_synthesis = config_manager
+            .as_ref()
+            .and_then(|manager| manager.lock().ok())
+            .map(|guard| guard.config().model.synthesis_instruction.is_some())
+            .unwrap_or(false);
+        (
+            Arc::new(SharedReadState::from_app(&*app)),
+            config_manager,
+            has_synthesis,
+        )
+    };
     let state = HttpState {
         app: Arc::clone(&shared_app),
+        shared: Arc::clone(&shared),
+        config_manager,
         session_registry,
         start_time: Instant::now(),
         server_runtime,
@@ -119,18 +134,6 @@ pub async fn run(
 
     run_listeners(router, listeners).await?;
     Ok(0)
-}
-
-async fn has_synthesis_config(app: &Arc<Mutex<dyn AppEngine>>) -> bool {
-    let app_guard = app.lock().await;
-    let Some(manager) = app_guard.config_manager() else {
-        return false;
-    };
-    let has_value = manager
-        .lock()
-        .map(|guard| guard.config().model.synthesis_instruction.is_some())
-        .unwrap_or(false);
-    has_value
 }
 
 fn init_session_registry(data_dir: &Path) -> Option<SessionRegistry> {
