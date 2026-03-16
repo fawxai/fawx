@@ -23,7 +23,7 @@ The key insight: **separate the pipeline from the compute**. Fawx orchestrates; 
 | 3. Continued pre-train | Domain absorption | GPU cluster, days | $1K-10K | What data matters |
 | 4. From scratch | Custom architecture | Distributed cluster, weeks | $10K-1M+ | Everything |
 
-fx-forge supports all four. Phase 1 implements LoRA + mocks for the rest.
+fx-forge supports stages 1-3 in the type system. Stage 4 (from-scratch) is deferred — `TrainObjective` is `#[non_exhaustive]` so it can be added later without breaking changes.
 
 ---
 
@@ -46,14 +46,17 @@ pub struct ForgeJob {
     pub error: Option<String>,
     /// Which backend is handling this job.
     pub backend: String,
+    /// Cost tracking for this job.
+    pub cost: Option<CostRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JobStatus {
     Pending,
-    Preparing,      // downloading model, formatting dataset
+    Preparing,      // downloading model, formatting dataset, validating
     Uploading,      // uploading data to cloud/cluster
     Training,       // compute running
+    Converting,     // format conversion (safetensors → GGUF, etc.)
     Evaluating,     // benchmarking the result
     Completed,
     Failed,
@@ -62,15 +65,30 @@ pub enum JobStatus {
 
 /// What kind of training to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TrainObjective {
     Lora(LoraConfig),
     FullFinetune(FinetuneConfig),
     ContinuedPretrain(PretrainConfig),
-    FromScratch(ScratchConfig),
+}
+
+/// Cost tracking for a training job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostRecord {
+    /// Estimated cost before starting.
+    pub estimated_usd: Option<f64>,
+    /// Actual cost after completion (from backend).
+    pub actual_usd: Option<f64>,
+    /// GPU-hours consumed.
+    pub gpu_hours: Option<f64>,
+    /// Backend-specific billing details.
+    pub details: serde_json::Value,
 }
 ```
 
-### Training Configs (per objective)
+### Training Configs
+
+All configs include `extra_params` for backend-specific knobs that aren't modeled in the struct.
 
 ```rust
 /// LoRA adapter training on a frozen base model.
@@ -85,7 +103,15 @@ pub struct LoraConfig {
     pub epochs: u32,            // default: 3
     pub batch_size: u32,        // default: 4
     pub warmup_steps: u32,      // default: 10
+    pub dropout: f64,           // default: 0.05
+    pub max_grad_norm: Option<f64>,  // gradient clipping
+    pub fp16: bool,             // default: true
+    pub bf16: bool,             // default: false
     pub output_dir: PathBuf,
+    pub output_format: ModelFormat,  // what format to produce
+    /// Backend-specific parameters not modeled above.
+    #[serde(default)]
+    pub extra_params: HashMap<String, serde_json::Value>,
 }
 
 /// Full fine-tuning — all weights updated.
@@ -98,55 +124,46 @@ pub struct FinetuneConfig {
     pub batch_size: u32,        // default: 2
     pub gradient_accumulation: u32, // default: 4
     pub warmup_ratio: f64,      // default: 0.03
+    pub dropout: f64,           // default: 0.0
+    pub max_grad_norm: Option<f64>,
+    pub fp16: bool,
+    pub bf16: bool,
     pub output_dir: PathBuf,
+    pub output_format: ModelFormat,
+    #[serde(default)]
+    pub extra_params: HashMap<String, serde_json::Value>,
 }
 
 /// Continued pre-training on domain corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PretrainConfig {
     pub base_model: String,
-    pub corpus: CorpusRef,
+    pub corpus: DatasetRef,     // uses PlainText or Jsonl format
     pub learning_rate: f64,     // default: 1e-5
     pub max_steps: u64,
     pub batch_size: u32,
     pub context_length: u32,    // default: 4096
-    pub output_dir: PathBuf,
-}
-
-/// Train from scratch with custom architecture.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScratchConfig {
-    pub architecture: ArchitectureSpec,
-    pub corpus: CorpusRef,
-    pub tokenizer: TokenizerSpec,
-    pub total_tokens: u64,      // how many tokens to train on
-    pub batch_size: u32,
-    pub learning_rate: f64,
     pub warmup_steps: u64,
+    pub max_grad_norm: Option<f64>,
+    pub fp16: bool,
+    pub bf16: bool,
     pub output_dir: PathBuf,
+    pub output_format: ModelFormat,
+    #[serde(default)]
+    pub extra_params: HashMap<String, serde_json::Value>,
 }
+```
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArchitectureSpec {
-    pub family: String,         // "llama", "mamba", "rwkv", custom
-    pub params: ModelParams,
-}
+### Dataset and Format References
 
+```rust
+/// Reference to a training dataset — supports both local and remote.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelParams {
-    pub hidden_size: u32,
-    pub num_layers: u32,
-    pub num_heads: u32,
-    pub intermediate_size: u32,
-    pub vocab_size: u32,
-    pub max_position_embeddings: u32,
-}
-
-/// Reference to a training dataset (from fx-training).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetRef {
-    pub path: PathBuf,
-    pub format: DatasetFormat,
+pub enum DatasetRef {
+    /// Local filesystem path.
+    Local { path: PathBuf, format: DatasetFormat },
+    /// Remote URL (S3, HTTP, etc.) — backend downloads it.
+    Remote { url: String, format: DatasetFormat },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,37 +172,68 @@ pub enum DatasetFormat {
     AlpacaJsonl,
     DpoJsonl,
     RawJson,
-    PlainText,  // for pre-training corpus
-}
-
-/// Reference to a pre-training corpus.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CorpusRef {
-    pub paths: Vec<PathBuf>,    // directories or files
-    pub format: CorpusFormat,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CorpusFormat {
-    PlainText,
-    Jsonl,      // one document per line
+    PlainText,      // for pre-training corpus
+    Jsonl,          // one document per line
     Parquet,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenizerSpec {
-    pub source: TokenizerSource,
-    pub vocab_size: u32,
+/// Model weight format — critical for serving compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModelFormat {
+    /// PyTorch safetensors (default training output).
+    Safetensors,
+    /// llama.cpp GGUF (quantized, for local inference).
+    Gguf,
+    /// HuggingFace format (config.json + model files).
+    HuggingFace,
+    /// Raw PyTorch .bin files.
+    PyTorchBin,
+}
+```
+
+### Model Format Conversion
+
+Training backends typically output safetensors. Serving backends (especially llama.cpp) need GGUF. The pipeline needs an explicit conversion step.
+
+```rust
+/// Converts model artifacts between formats.
+#[async_trait]
+pub trait FormatConverter: Send + Sync {
+    /// Check if this converter supports the given conversion.
+    fn supports(&self, from: &ModelFormat, to: &ModelFormat) -> bool;
+
+    /// Convert a model artifact from one format to another.
+    async fn convert(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        from: &ModelFormat,
+        to: &ModelFormat,
+        quantization: Option<&QuantizationConfig>,
+    ) -> Result<ConversionResult, ForgeError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TokenizerSource {
-    /// Use an existing tokenizer from a model.
-    FromModel(String),
-    /// Train a new tokenizer on the corpus.
-    TrainBpe { vocab_size: u32 },
+pub struct QuantizationConfig {
+    /// Quantization method (e.g., "Q4_K_M", "Q5_K_S", "Q8_0").
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversionResult {
+    pub output_path: PathBuf,
+    pub output_format: ModelFormat,
+    pub size_bytes: u64,
+    pub quantization: Option<String>,
+    pub duration_secs: u64,
 }
 ```
+
+**Implementations:**
+- **`LlamaCppConverter`** — shells out to `llama-quantize` / `convert_hf_to_gguf.py` for safetensors → GGUF.
+- **`MockConverter`** — for testing.
+
+Conversion is an explicit pipeline step (the `Converting` job status) between training and evaluation/serving.
 
 ### Training Backend Trait
 
@@ -197,12 +245,11 @@ pub struct BackendCapabilities {
     pub supports_lora: bool,
     pub supports_full_finetune: bool,
     pub supports_pretraining: bool,
-    pub supports_from_scratch: bool,
     pub max_model_params: Option<u64>,
     pub max_dataset_gb: Option<u64>,
     pub has_gpu: bool,
     pub gpu_vram_gb: Option<u32>,
-    pub estimated_cost_per_hour: Option<f64>,
+    pub estimated_cost_per_gpu_hour: Option<f64>,
 }
 
 /// Handle to a submitted training job on a backend.
@@ -212,7 +259,7 @@ pub struct JobHandle(pub String);
 /// Progress of a training job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainProgress {
-    pub phase: String,          // "preparing", "training", "evaluating"
+    pub phase: String,
     pub epoch: Option<u32>,
     pub total_epochs: Option<u32>,
     pub step: u64,
@@ -222,17 +269,21 @@ pub struct TrainProgress {
     pub elapsed_secs: u64,
     pub estimated_remaining_secs: Option<u64>,
     pub tokens_processed: Option<u64>,
+    pub gpu_utilization_pct: Option<f32>,
+    pub cost_so_far_usd: Option<f64>,
 }
 
 /// Result of a completed training job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainArtifact {
     pub artifact_type: ArtifactType,
+    pub format: ModelFormat,
     pub path: PathBuf,
     pub size_bytes: u64,
     pub final_loss: Option<f64>,
     pub training_duration_secs: u64,
     pub examples_or_tokens_processed: u64,
+    pub cost: Option<CostRecord>,
     pub metadata: serde_json::Value,
 }
 
@@ -248,6 +299,12 @@ pub trait TrainBackend: Send + Sync {
     /// What this backend supports.
     fn capabilities(&self) -> &BackendCapabilities;
 
+    /// Validate that a training objective can run on this backend.
+    fn validate(&self, objective: &TrainObjective) -> Result<(), ForgeError>;
+
+    /// Estimate cost before starting.
+    async fn estimate_cost(&self, objective: &TrainObjective) -> Result<Option<f64>, ForgeError>;
+
     /// Submit a training job.
     async fn submit(&self, objective: &TrainObjective) -> Result<JobHandle, ForgeError>;
 
@@ -257,36 +314,49 @@ pub trait TrainBackend: Send + Sync {
     /// Wait for completion and retrieve the artifact.
     async fn wait(&self, handle: &JobHandle) -> Result<TrainArtifact, ForgeError>;
 
+    /// Retrieve logs from the training run.
+    async fn logs(&self, handle: &JobHandle, tail: usize) -> Result<Vec<String>, ForgeError>;
+
     /// Cancel a running job.
     async fn cancel(&self, handle: &JobHandle) -> Result<(), ForgeError>;
+
+    /// Resume a previously interrupted job (if supported).
+    /// Returns None if the backend doesn't support resume.
+    async fn resume(&self, handle: &JobHandle) -> Result<Option<JobHandle>, ForgeError>;
 }
 ```
 
+**Note on push vs poll:** Phase 1 uses poll-based progress. A future `ProgressStream` return type can be added to `submit()` without breaking the trait (add a default method). The poll approach is simpler, works for all backends, and is sufficient for Phase 1.
+
 ### Backend Implementations
 
-#### LocalBackend (Phase 1)
+#### LocalBackend (Phase 2)
 - Shells out to **Unsloth** (Python) for LoRA and full fine-tune
 - Falls back to **torchtune** if Unsloth unavailable
 - Parses stdout/stderr for progress
 - Single machine, needs local GPU
 - Auto-detects available VRAM and adjusts batch size
+- `validate()` checks Python env, GPU availability, VRAM sufficiency
 
-#### CloudBackend (Phase 2)
+#### CloudBackend (Phase 3)
 - Provisions GPU instances on **RunPod**, **Lambda**, or **vast.ai**
-- Uploads dataset, runs training script, downloads artifact
+- Uploads dataset (DatasetRef::Remote supported natively), runs training script, downloads artifact
 - SSH + rsync for file transfer
 - Auto-terminates instance on completion
 - Supports spot instances for cost savings
+- `estimate_cost()` queries provider pricing API
+- `resume()` supported via checkpoints on persistent storage
 
-#### ClusterBackend (Phase 3)
+#### ClusterBackend (Phase 4)
 - **Prime Intellect** integration for distributed training
 - OpenDiLoCo for multi-node pre-training
 - Handles data sharding, checkpoint sync, fault tolerance
-- For continued pre-training and from-scratch only
+- For continued pre-training only (initially)
 
-#### MockBackend (testing)
+#### MockBackend (Phase 1 — testing)
 - Returns configurable results after configurable delay
 - For testing the pipeline without real compute
+- Configurable capabilities to test backend selection
 
 ### Serving Backend Trait (separate from training)
 
@@ -295,7 +365,7 @@ pub trait TrainBackend: Send + Sync {
 #[async_trait]
 pub trait ServingBackend: Send + Sync {
     /// Load a base model.
-    async fn load_model(&self, model_path: &Path) -> Result<(), ForgeError>;
+    async fn load_model(&self, model_path: &Path, format: &ModelFormat) -> Result<(), ForgeError>;
 
     /// Attach a LoRA adapter to the loaded model.
     async fn attach_adapter(&self, adapter_path: &Path) -> Result<(), ForgeError>;
@@ -311,9 +381,9 @@ pub trait ServingBackend: Send + Sync {
 }
 ```
 
-**Implementations:**
-- **LlamaCppServing** — for single-user Mac inference. Manages llama-server process.
-- **VllmServing** — for multi-user serving. Hot-swaps LoRA adapters per request. Manages vLLM server process.
+**Implementations (Phase 5):**
+- **LlamaCppServing** — for single-user Mac inference. Manages llama-server process. Requires GGUF format.
+- **VllmServing** — for multi-user serving. Hot-swaps LoRA adapters per request. Requires safetensors format. Manages vLLM server process.
 
 ### Artifact Manager
 
@@ -328,12 +398,14 @@ pub struct ArtifactInfo {
     pub id: Uuid,
     pub name: String,
     pub artifact_type: ArtifactType,
+    pub format: ModelFormat,
     pub base_model: Option<String>,
     pub path: PathBuf,
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
     pub job_id: Uuid,
     pub eval_results: Option<EvalResults>,
+    pub cost: Option<CostRecord>,
     pub active: bool,
 }
 
@@ -351,10 +423,36 @@ impl ArtifactManager {
 #[derive(Debug, Clone)]
 pub struct ArtifactFilter {
     pub artifact_type: Option<ArtifactType>,
+    pub format: Option<ModelFormat>,
     pub base_model: Option<String>,
     pub active_only: bool,
 }
 ```
+
+**Note on multi-GB artifacts:** ArtifactManager stores **metadata** as JSON files (same pattern as fx-training DatasetManager). The actual model weights live at `path` — typically in the `output_dir` specified in the training config. ArtifactManager doesn't copy or move weight files; it just tracks them. This means deletion is a two-step: remove metadata + optionally remove weight files (with user confirmation for large files).
+
+### Dataset Validation
+
+Before submitting a job, the orchestrator validates the dataset:
+
+```rust
+pub struct DatasetValidation {
+    pub is_valid: bool,
+    pub example_count: usize,
+    pub format_errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub estimated_tokens: Option<u64>,
+}
+
+pub fn validate_dataset(dataset: &DatasetRef) -> Result<DatasetValidation, ForgeError>;
+```
+
+Checks:
+- File/URL exists and is readable
+- Format matches declared format (parseable as JSONL, etc.)
+- Non-empty (at least 1 example)
+- Samples first N lines for format validation (doesn't load entire dataset)
+- Estimates total tokens for cost estimation
 
 ### Evaluation
 
@@ -364,16 +462,26 @@ pub struct EvalConfig {
     pub prompts: Vec<EvalPrompt>,
     /// Run base model for comparison.
     pub compare_to_base: bool,
+    /// Optional: use an LLM judge for quality scoring.
+    pub llm_judge: Option<LlmJudgeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalPrompt {
     pub system: String,
     pub user: String,
-    /// Substrings the response should contain.
+    /// Expected behavior (for LLM judge evaluation).
+    pub expected_behavior: String,
+    /// Optional: exact substrings the response should contain.
     pub expected_contains: Vec<String>,
-    /// Keywords for quality scoring.
-    pub quality_keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmJudgeConfig {
+    /// Model to use as judge (should be stronger than the trained model).
+    pub judge_model: String,
+    /// Scoring rubric for the judge.
+    pub rubric: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,14 +491,19 @@ pub struct EvalResults {
     pub neutral: usize,
     pub avg_quality_delta: f64,
     pub prompts_evaluated: usize,
+    /// Per-prompt scores if LLM judge was used.
+    pub judge_scores: Option<Vec<f64>>,
 }
 ```
+
+LLM-as-judge is the realistic evaluation approach for model quality. Substring matching is a fast sanity check; the judge provides meaningful quality assessment.
 
 ### Job Orchestrator
 
 ```rust
 pub struct ForgeOrchestrator {
     backends: Vec<Box<dyn TrainBackend>>,
+    converters: Vec<Box<dyn FormatConverter>>,
     artifact_manager: ArtifactManager,
     jobs_dir: PathBuf,
 }
@@ -400,23 +513,25 @@ pub type ForgeProgressCallback = Arc<dyn Fn(&ForgeEvent) + Send + Sync>;
 #[derive(Debug, Clone)]
 pub enum ForgeEvent {
     JobCreated { job_id: Uuid, objective: String },
-    BackendSelected { backend: String },
-    DatasetPreparing { path: String },
-    UploadStarted { size_bytes: u64 },
-    UploadComplete,
+    BackendSelected { backend: String, estimated_cost_usd: Option<f64> },
+    DatasetValidated { examples: usize, estimated_tokens: Option<u64> },
+    DatasetUploading { size_bytes: u64 },
+    DatasetUploaded,
     TrainProgress(TrainProgress),
-    TrainComplete { loss: Option<f64>, duration_secs: u64 },
+    TrainComplete { loss: Option<f64>, duration_secs: u64, cost: Option<CostRecord> },
+    ConvertingFormat { from: ModelFormat, to: ModelFormat },
+    ConversionComplete(ConversionResult),
     EvalStarted { prompts: usize },
     EvalComplete(EvalResults),
     ArtifactRegistered { artifact_id: Uuid },
-    JobComplete { job_id: Uuid },
+    JobComplete { job_id: Uuid, total_cost: Option<CostRecord> },
     JobFailed { job_id: Uuid, error: String },
 }
 
 impl ForgeOrchestrator {
-    /// Create with available backends.
     pub fn new(
         backends: Vec<Box<dyn TrainBackend>>,
+        converters: Vec<Box<dyn FormatConverter>>,
         artifact_manager: ArtifactManager,
         jobs_dir: PathBuf,
     ) -> Result<Self, ForgeError>;
@@ -424,32 +539,39 @@ impl ForgeOrchestrator {
     /// Select the best backend for a training objective.
     pub fn select_backend(&self, objective: &TrainObjective) -> Result<&dyn TrainBackend, ForgeError>;
 
+    /// Validate a training objective before creating a job.
+    pub fn validate_job(&self, objective: &TrainObjective) -> Result<JobValidation, ForgeError>;
+
     /// Create and enqueue a job.
     pub async fn create_job(&self, name: String, objective: TrainObjective) -> Result<ForgeJob, ForgeError>;
 
-    /// Run a job through the full pipeline.
+    /// Run a job through the full pipeline:
+    /// validate → prepare → upload → train → convert → evaluate → register artifact.
     pub async fn run_job(
         &self,
         job_id: Uuid,
         progress: Option<ForgeProgressCallback>,
     ) -> Result<ForgeJob, ForgeError>;
 
-    /// Get job status.
     pub fn job_status(&self, job_id: Uuid) -> Result<Option<ForgeJob>, ForgeError>;
-
-    /// List all jobs.
     pub fn list_jobs(&self) -> Result<Vec<ForgeJob>, ForgeError>;
-
-    /// Cancel a running job.
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<(), ForgeError>;
+}
+
+pub struct JobValidation {
+    pub backend: String,
+    pub estimated_cost_usd: Option<f64>,
+    pub dataset_validation: DatasetValidation,
+    pub warnings: Vec<String>,
 }
 ```
 
 Backend selection logic:
 1. Filter backends by capability (does it support this TrainObjective?)
-2. Filter by resource requirements (model size vs backend limits)
-3. Prefer local over cloud if capable (cost optimization)
-4. Return error if no backend can handle the objective
+2. Filter by resource requirements (model size vs backend VRAM/limits)
+3. `validate()` each candidate backend
+4. Prefer local over cloud if capable (cost optimization)
+5. Return error if no backend can handle the objective
 
 ---
 
@@ -464,8 +586,10 @@ pub enum ForgeError {
     NoBackendAvailable(String),
     #[error("backend error: {0}")]
     BackendError(String),
-    #[error("dataset error: {0}")]
-    DatasetError(String),
+    #[error("dataset validation failed: {0}")]
+    DatasetInvalid(String),
+    #[error("format conversion failed: {0}")]
+    ConversionFailed(String),
     #[error("evaluation failed: {0}")]
     EvaluationFailed(String),
     #[error("artifact error: {0}")]
@@ -474,6 +598,8 @@ pub enum ForgeError {
     JobNotFound(Uuid),
     #[error("job already running: {0}")]
     JobAlreadyRunning(Uuid),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -489,62 +615,64 @@ pub enum ForgeError {
 fx-forge/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs              ← core types, re-exports
+│   ├── lib.rs              ← core types (ForgeJob, JobStatus, CostRecord), re-exports
 │   ├── error.rs            ← ForgeError
-│   ├── objective.rs        ← TrainObjective, LoraConfig, FinetuneConfig, etc.
+│   ├── objective.rs        ← TrainObjective, LoraConfig, FinetuneConfig, PretrainConfig
+│   ├── dataset.rs          ← DatasetRef, DatasetFormat, DatasetValidation, validate_dataset
+│   ├── format.rs           ← ModelFormat, FormatConverter trait, QuantizationConfig, ConversionResult
 │   ├── backend/
-│   │   ├── mod.rs          ← TrainBackend trait, BackendCapabilities
-│   │   ├── mock.rs         ← MockBackend for testing
-│   │   ├── local.rs        ← LocalBackend (Unsloth/torchtune) [Phase 2]
-│   │   ├── cloud.rs        ← CloudBackend (RunPod/Lambda) [Phase 2]
-│   │   └── cluster.rs      ← ClusterBackend (Prime Intellect) [Phase 3]
+│   │   ├── mod.rs          ← TrainBackend trait, BackendCapabilities, TrainProgress, TrainArtifact
+│   │   └── mock.rs         ← MockBackend for testing
 │   ├── serving/
-│   │   ├── mod.rs          ← ServingBackend trait
-│   │   ├── llamacpp.rs     ← LlamaCppServing [Phase 2]
-│   │   └── vllm.rs         ← VllmServing [Phase 2]
-│   ├── artifact.rs         ← ArtifactManager
-│   ├── eval.rs             ← EvalConfig, EvalResults
-│   ├── orchestrator.rs     ← ForgeOrchestrator, ForgeEvent
-│   └── progress.rs         ← TrainProgress, ForgeProgressCallback
+│   │   └── mod.rs          ← ServingBackend trait (types only, no implementations yet)
+│   ├── artifact.rs         ← ArtifactManager, ArtifactInfo, ArtifactFilter
+│   ├── eval.rs             ← EvalConfig, EvalPrompt, EvalResults, LlmJudgeConfig
+│   └── orchestrator.rs     ← ForgeOrchestrator, ForgeEvent, ForgeProgressCallback
 ```
 
 ---
 
 ## Implementation Phases
 
-**Phase 1 (this PR):** Core types + MockBackend + ArtifactManager + orchestrator skeleton. Everything compiles, tests pass, no real compute. ~1000-1500 lines.
+**Phase 1 (this PR):** Core types + MockBackend + MockConverter + ArtifactManager + dataset validation + orchestrator skeleton. Everything compiles, tests pass, no real compute. ~1500-2000 lines.
 
-**Phase 2:** LocalBackend (Unsloth for LoRA/fine-tune) + LlamaCppServing. Requires Python + Unsloth installed. First real training runs.
+**Phase 2:** LocalBackend (Unsloth for LoRA/fine-tune) + LlamaCppConverter (safetensors → GGUF). First real training runs on local GPU.
 
-**Phase 3:** CloudBackend (RunPod/Lambda). SSH provisioning, dataset upload, remote training, artifact download.
+**Phase 3:** CloudBackend (RunPod/Lambda). SSH provisioning, remote training, artifact download. Cost tracking wired to provider APIs.
 
-**Phase 4:** ClusterBackend (Prime Intellect). Distributed training, OpenDiLoCo integration.
+**Phase 4:** ClusterBackend (Prime Intellect). Distributed continued pre-training.
 
-**Phase 5:** VllmServing + hot LoRA swap. Multi-user serving with per-request adapter selection.
+**Phase 5:** LlamaCppServing + VllmServing. Model serving with hot LoRA swap.
 
-**Phase 6:** Self-improvement loop. Wire fx-training + fx-forge + fx-consensus into: run experiments → curate data → train model → evaluate → activate if improved → repeat.
+**Phase 6:** Self-improvement loop. Wire fx-training + fx-forge + fx-consensus: experiments → curate data → train → evaluate → activate if improved → repeat.
 
 ---
 
 ## Test Plan (Phase 1)
 
-1. **TrainObjective** — each variant serializes/deserializes correctly
-2. **LoraConfig/FinetuneConfig/etc** — defaults are sensible, validation works
-3. **MockBackend** — submit → progress → wait cycle, cancel behavior, capabilities reporting
-4. **ArtifactManager** — register, list, get, activate, deactivate, delete, active_for_model, filter
-5. **ForgeOrchestrator** — create job, run with mock, backend selection (picks capable backend), job status transitions, progress events emitted in order
-6. **Backend selection** — LoRA objective selects backend with `supports_lora`, from-scratch selects backend with `supports_from_scratch`, no capable backend → error
-7. **EvalResults** — correct delta calculation
-8. **Error handling** — backend failure → job Failed, missing dataset → DatasetError
+1. **TrainObjective** — each variant serializes/deserializes, `#[non_exhaustive]` verified
+2. **LoraConfig/FinetuneConfig/PretrainConfig** — defaults sensible, extra_params roundtrip, validation catches bad values (0 epochs, negative lr)
+3. **DatasetRef** — Local and Remote variants, format validation
+4. **DatasetValidation** — valid JSONL passes, empty file fails, format mismatch caught
+5. **ModelFormat** — all variants serialize correctly
+6. **MockBackend** — submit → progress → wait cycle, cancel, capabilities, estimate_cost, validate, logs, resume returns None
+7. **MockConverter** — convert succeeds, unsupported conversion returns error
+8. **ArtifactManager** — register, list, get, activate, deactivate, delete, active_for_model, filter by type/format/model
+9. **ForgeOrchestrator** — create job, run with mock backend + mock converter, backend selection, validation, progress events in order, cost tracking
+10. **Backend selection** — LoRA picks supports_lora backend, no capable backend → error, prefers local over cloud
+11. **Error handling** — backend failure → job Failed, invalid dataset → DatasetInvalid, no converter → ConversionFailed
 
 ---
 
 ## Design Decisions
 
-1. **TrainBackend is async** — even local training is long-running; async lets us poll without blocking.
-2. **Serving is separate from training** — different backends, different lifecycles. You might train on cloud but serve locally.
-3. **ArtifactManager mirrors DatasetManager pattern** — JSON files in a directory, manifest for metadata. Proven pattern from fx-training.
-4. **Backend selection is automatic** — orchestrator picks the best backend based on capabilities and objective. User can override with `backend: "local"` in the job config.
-5. **Phase 1 ships the full API surface** — MockBackend means the Swift app can wire up a "Forge" UI section before real training works. Types are stable; backends are pluggable.
-6. **No opinion on Python environment** — LocalBackend shells out to `unsloth` or `torchtune` via subprocess. User manages their Python env. We don't bundle Python.
-7. **Job persistence** — jobs saved as JSON in `jobs_dir`. If the process restarts, jobs can be listed but not resumed (resume = Phase 2 feature for cloud backends).
+1. **`#[non_exhaustive]` on TrainObjective** — FromScratch deferred, but the enum can grow without breaking callers.
+2. **Serving separate from training** — different backends, different lifecycles, different formats needed.
+3. **Format conversion as explicit pipeline step** — training outputs safetensors, serving may need GGUF. The conversion step is explicit (not hidden) so users know what's happening and can configure quantization.
+4. **DatasetRef supports Local + Remote** — local for development, remote for cloud backends that can download directly.
+5. **extra_params on every config** — escape hatch for backend-specific knobs. Backends interpret these as they see fit.
+6. **Cost tracking is first-class** — CostRecord on jobs, estimate_cost on backends, cost_so_far in progress. Training is expensive; users need visibility.
+7. **LLM-as-judge for evaluation** — substring matching is a sanity check, not a quality assessment. Real evaluation needs a stronger model judging the trained model.
+8. **ArtifactManager stores metadata, not weights** — weights stay where the training backend put them. No unnecessary copies of multi-GB files.
+9. **Poll-based progress for Phase 1** — simpler, works for all backends. Push-based (Stream) can be added as a default trait method later.
+10. **resume() designed in now** — even if MockBackend returns None, the trait surface is ready for cloud backends that support checkpoint resume.
