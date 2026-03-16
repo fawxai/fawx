@@ -15,6 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Callback for registering experiments in an external registry.
+/// Implemented by the HTTP layer to bridge fx-tools → fx-api.
+pub trait ExperimentRegistrar: Send + Sync {
+    fn register_started(&self, signal: &str, hypothesis: &str) -> String;
+    fn register_completed(&self, id: &str, success: bool, summary: &str);
+    fn register_failed(&self, id: &str, error: &str);
+}
+
 #[derive(Clone)]
 pub struct ExperimentToolState {
     pub chain_path: PathBuf,
@@ -164,6 +172,7 @@ pub fn spawn_background_experiment(
     args: &serde_json::Value,
     progress: Option<ProgressCallback>,
     on_complete: Option<Arc<dyn Fn(BackgroundExperimentResult) + Send + Sync>>,
+    registrar: Option<Arc<dyn ExperimentRegistrar>>,
 ) -> Result<String, String> {
     let parsed = parse_run_experiment_args(args, working_dir)?;
     let signal = parsed.signal.clone();
@@ -171,6 +180,8 @@ pub fn spawn_background_experiment(
     let max_rounds = parsed.max_rounds;
     let runner = build_runner(&parsed, state, subagent_control.as_ref())?.with_progress(progress);
     let config = build_config(&parsed);
+    let experiment_id = register_experiment_start(registrar.as_ref(), &signal, &hypothesis);
+    let spawn_experiment_id = experiment_id.clone();
 
     let spawn_signal = signal.clone();
     tokio::spawn(async move {
@@ -197,18 +208,51 @@ pub fn spawn_background_experiment(
                 }
             }
         };
+        notify_registrar(
+            registrar.as_ref(),
+            spawn_experiment_id.as_deref(),
+            &completion,
+        );
         if let Some(callback) = on_complete {
             callback(completion);
         }
     });
 
+    let id_msg = experiment_id.as_deref().unwrap_or("(unregistered)");
     Ok(format!(
-        "Experiment started in background.\n\
+        "Experiment started in background (ID: {id_msg}).\n\
          Signal: {signal}\n\
          Hypothesis: {hypothesis}\n\
          Max rounds: {max_rounds}\n\n\
-         The experiment is running asynchronously. Use the Experiment Monitor to track progress."
+         The experiment is running asynchronously. Check the Experiment Monitor for progress."
     ))
+}
+
+fn register_experiment_start(
+    registrar: Option<&Arc<dyn ExperimentRegistrar>>,
+    signal: &str,
+    hypothesis: &str,
+) -> Option<String> {
+    registrar.and_then(|callback| {
+        let id = callback.register_started(signal, hypothesis);
+        (!id.is_empty()).then_some(id)
+    })
+}
+
+fn notify_registrar(
+    registrar: Option<&Arc<dyn ExperimentRegistrar>>,
+    experiment_id: Option<&str>,
+    completion: &BackgroundExperimentResult,
+) {
+    let (Some(callback), Some(id)) = (registrar, experiment_id) else {
+        return;
+    };
+    if completion.success {
+        callback.register_completed(id, true, &completion.summary);
+        return;
+    }
+    let error = completion.error.as_deref().unwrap_or("unknown");
+    callback.register_failed(id, error);
 }
 
 fn build_runner(
@@ -658,7 +702,60 @@ fn default_max_rounds() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_config::FawxConfig;
+    use fx_llm::ModelRouter;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    struct RecordingRegistrar {
+        started: Mutex<Vec<(String, String)>>,
+        completed: Mutex<Vec<(String, bool, String)>>,
+        failed: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingRegistrar {
+        fn new() -> Self {
+            Self {
+                started: Mutex::new(Vec::new()),
+                completed: Mutex::new(Vec::new()),
+                failed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ExperimentRegistrar for RecordingRegistrar {
+        fn register_started(&self, signal: &str, hypothesis: &str) -> String {
+            self.started
+                .lock()
+                .expect("started lock")
+                .push((signal.to_string(), hypothesis.to_string()));
+            "exp-123".to_string()
+        }
+
+        fn register_completed(&self, id: &str, success: bool, summary: &str) {
+            self.completed.lock().expect("completed lock").push((
+                id.to_string(),
+                success,
+                summary.to_string(),
+            ));
+        }
+
+        fn register_failed(&self, id: &str, error: &str) {
+            self.failed
+                .lock()
+                .expect("failed lock")
+                .push((id.to_string(), error.to_string()));
+        }
+    }
+
+    fn experiment_state(root: &std::path::Path) -> ExperimentToolState {
+        ExperimentToolState {
+            chain_path: root.join("consensus").join("chain.json"),
+            router: Arc::new(ModelRouter::new()),
+            config: FawxConfig::default(),
+        }
+    }
 
     #[test]
     fn tool_definition_is_present() {
@@ -742,5 +839,51 @@ mod tests {
         )
         .expect_err("zero max_rounds should fail");
         assert!(error.contains("max_rounds must be at least 1"));
+    }
+
+    #[tokio::test]
+    async fn background_experiment_reports_registration_lifecycle() {
+        let temp = TempDir::new().expect("tempdir");
+        let registrar = Arc::new(RecordingRegistrar::new());
+        let (done_tx, done_rx) = mpsc::channel();
+        let callback: Arc<dyn Fn(BackgroundExperimentResult) + Send + Sync> = Arc::new(move |_| {
+            let _ = done_tx.send(());
+        });
+
+        let message = spawn_background_experiment(
+            &experiment_state(temp.path()),
+            None,
+            temp.path(),
+            &serde_json::json!({
+                "signal": "latency",
+                "hypothesis": "parallelism helps",
+                "mode": "placeholder",
+                "nodes": 1,
+                "project": temp.path().display().to_string(),
+            }),
+            None,
+            Some(callback),
+            Some(registrar.clone()),
+        )
+        .expect("background experiment should start");
+
+        assert!(message.contains("ID: exp-123"), "{message}");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background experiment should finish");
+
+        let started = registrar.started.lock().expect("started lock").clone();
+        let completed = registrar.completed.lock().expect("completed lock").clone();
+        let failed = registrar.failed.lock().expect("failed lock").clone();
+
+        assert_eq!(
+            started,
+            vec![("latency".to_string(), "parallelism helps".to_string())]
+        );
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, "exp-123");
+        assert!(completed[0].1);
+        assert!(completed[0].2.contains("Signal: latency"));
+        assert!(failed.is_empty());
     }
 }

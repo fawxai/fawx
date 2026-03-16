@@ -1,6 +1,6 @@
 use crate::experiment_tool::{
     handle_run_experiment, run_experiment_tool_definition, spawn_background_experiment,
-    ExperimentToolState,
+    ExperimentRegistrar, ExperimentToolState,
 };
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
@@ -73,6 +73,7 @@ pub struct FawxToolExecutor {
     subagent_control: Option<Arc<dyn SubagentControl>>,
     experiment: Option<ExperimentToolState>,
     experiment_progress: Option<ProgressCallback>,
+    experiment_registrar: Option<Arc<dyn ExperimentRegistrar>>,
     background_experiments: bool,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
@@ -122,6 +123,7 @@ impl FawxToolExecutor {
             subagent_control: None,
             experiment: None,
             experiment_progress: None,
+            experiment_registrar: None,
             background_experiments: false,
             node_run: None,
             #[cfg(feature = "improvement")]
@@ -181,6 +183,12 @@ impl FawxToolExecutor {
     /// Attach an experiment progress callback for run_experiment.
     pub fn with_experiment_progress(mut self, progress: ProgressCallback) -> Self {
         self.experiment_progress = Some(progress);
+        self
+    }
+
+    /// Attach an experiment registry bridge for background run_experiment calls.
+    pub fn with_experiment_registrar(mut self, registrar: Arc<dyn ExperimentRegistrar>) -> Self {
+        self.experiment_registrar = Some(registrar);
         self
     }
 
@@ -938,6 +946,7 @@ impl FawxToolExecutor {
                 args,
                 self.experiment_progress.clone(),
                 None,
+                self.experiment_registrar.clone(),
             )
         } else {
             handle_run_experiment(
@@ -1328,6 +1337,7 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("subagent_control", &self.subagent_control.is_some())
             .field("experiment", &self.experiment.is_some())
             .field("experiment_progress", &self.experiment_progress.is_some())
+            .field("experiment_registrar", &self.experiment_registrar.is_some())
             .field("background_experiments", &self.background_experiments);
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
