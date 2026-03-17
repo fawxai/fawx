@@ -719,7 +719,7 @@ impl CredentialStoreBridge {
             return self.github_token();
         };
         match broker.borrow_github_default() {
-            Ok(borrow) => Some(zeroize::Zeroizing::new(borrow.token().to_string())),
+            Ok(borrow) => Some(borrow.into_token()),
             Err(fx_auth::token_broker::BorrowError::NotConfigured) => None,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to borrow GitHub token");

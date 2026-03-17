@@ -7,10 +7,18 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// A borrowed GitHub credential with an explicit scope.
-#[derive(Debug)]
 pub struct TokenBorrow {
     token: Zeroizing<String>,
     scope: BorrowScope,
+}
+
+impl fmt::Debug for TokenBorrow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenBorrow")
+            .field("scope", &self.scope)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl TokenBorrow {
@@ -20,6 +28,11 @@ impl TokenBorrow {
 
     pub fn token(&self) -> &str {
         self.token.as_str()
+    }
+
+    /// Consume the borrow and return the token, preserving zeroize guarantees.
+    pub fn into_token(self) -> Zeroizing<String> {
+        self.token
     }
 
     pub fn scope(&self) -> BorrowScope {
@@ -241,6 +254,53 @@ mod tests {
 
         assert_eq!(borrow.token(), "ghp-contribution-token");
         assert_eq!(borrow.scope(), BorrowScope::Contribution);
+    }
+
+    #[test]
+    fn broker_borrow_default_uses_max_scope() {
+        let store = Arc::new(EncryptedFileCredentialStore::open_in_memory().expect("open store"));
+        store_github_pat(&store, "ghp-default-token");
+        let broker = CredentialStoreBroker::new(store, BorrowScope::Contribution);
+        let borrow = broker
+            .borrow_github_default()
+            .expect("default borrow should succeed");
+
+        assert_eq!(borrow.scope(), BorrowScope::Contribution);
+        assert_eq!(borrow.token(), "ghp-default-token");
+    }
+
+    #[test]
+    fn broker_borrow_default_readonly() {
+        let store = Arc::new(EncryptedFileCredentialStore::open_in_memory().expect("open store"));
+        store_github_pat(&store, "ghp-ro-token");
+        let broker = CredentialStoreBroker::new(store, BorrowScope::ReadOnly);
+        let borrow = broker
+            .borrow_github_default()
+            .expect("default borrow should succeed");
+
+        assert_eq!(borrow.scope(), BorrowScope::ReadOnly);
+    }
+
+    #[test]
+    fn token_borrow_into_token_consumes_borrow() {
+        let borrow = TokenBorrow::new(
+            Zeroizing::new("ghp-consume".to_string()),
+            BorrowScope::ReadOnly,
+        );
+        let token = borrow.into_token();
+        assert_eq!(token.as_str(), "ghp-consume");
+    }
+
+    #[test]
+    fn token_borrow_debug_redacts_token() {
+        let borrow = TokenBorrow::new(
+            Zeroizing::new("ghp-secret-value".to_string()),
+            BorrowScope::Contribution,
+        );
+        let debug = format!("{borrow:?}");
+        assert!(!debug.contains("ghp-secret-value"), "Debug should redact token");
+        assert!(debug.contains("REDACTED"), "Debug should show REDACTED");
+        assert!(debug.contains("Contribution"), "Debug should show scope");
     }
 
     #[test]
