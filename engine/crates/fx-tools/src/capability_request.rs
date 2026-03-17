@@ -98,6 +98,16 @@ impl CapabilityRequestSkill {
         }
     }
 
+    fn validate_request_fields(&self, capability: &str, reason: &str) -> Result<(), SkillError> {
+        if capability.trim().is_empty() {
+            return Err("'capability' must not be empty".to_string());
+        }
+        if reason.trim().is_empty() {
+            return Err("'reason' must not be empty".to_string());
+        }
+        Ok(())
+    }
+
     async fn await_response(
         &self,
         capability: String,
@@ -158,6 +168,7 @@ impl CapabilityRequestSkill {
         cancel: Option<&CancellationToken>,
     ) -> Result<String, SkillError> {
         let args = self.parse_args(arguments)?;
+        self.validate_request_fields(&args.capability, &args.reason)?;
         let request_number = self.reserve_request_slot()?;
         let handler = self
             .handler
@@ -165,6 +176,11 @@ impl CapabilityRequestSkill {
             .ok_or_else(|| "Capability requests are not available in this session.".to_string())?;
         let request = self.build_request(args, request_number);
         let capability = request.capability.clone();
+
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Capability request cancelled.".to_string());
+        }
+
         let receiver = handler(request);
         self.await_response(capability, receiver, cancel).await
     }
@@ -335,6 +351,96 @@ mod tests {
         assert_eq!(
             response.note,
             "Request denied by user. Use an alternative approach."
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_timeout_returns_denied() {
+        tokio::time::pause();
+        let handler: CapabilityRequestHandler = Arc::new(|_request| {
+            let (_tx, rx) = oneshot::channel();
+            rx
+        });
+        let skill = CapabilityRequestSkill::new(Some(handler));
+
+        let execution = tokio::spawn(async move {
+            skill
+                .execute(
+                    REQUEST_CAPABILITY_TOOL,
+                    r#"{"capability":"shell","reason":"need it"}"#,
+                    None,
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        let result = execution
+            .await
+            .expect("task should complete")
+            .expect("handled")
+            .expect("successful result");
+        let response = parse_output(&result);
+
+        assert!(!response.granted);
+        assert_eq!(response.capability, "shell");
+        assert!(response.note.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn execute_cancelled_returns_error() {
+        let skill = CapabilityRequestSkill::new(Some(mock_handler(true)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = skill
+            .execute(
+                REQUEST_CAPABILITY_TOOL,
+                r#"{"capability":"shell","reason":"need it"}"#,
+                Some(&cancel),
+            )
+            .await
+            .expect("handled");
+
+        assert!(result
+            .expect_err("expected cancellation error")
+            .contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn empty_capability_returns_error() {
+        let skill = CapabilityRequestSkill::new(Some(mock_handler(true)));
+        let result = skill
+            .execute(
+                REQUEST_CAPABILITY_TOOL,
+                r#"{"capability":"   ","reason":"need it"}"#,
+                None,
+            )
+            .await
+            .expect("handled");
+
+        assert_eq!(
+            result.expect_err("expected empty capability error"),
+            "'capability' must not be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_reason_returns_error() {
+        let skill = CapabilityRequestSkill::new(Some(mock_handler(true)));
+        let result = skill
+            .execute(
+                REQUEST_CAPABILITY_TOOL,
+                r#"{"capability":"shell","reason":"   "}"#,
+                None,
+            )
+            .await
+            .expect("handled");
+
+        assert_eq!(
+            result.expect_err("expected empty reason error"),
+            "'reason' must not be empty"
         );
     }
 

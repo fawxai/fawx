@@ -37,6 +37,7 @@ fx-analysis = { workspace = true, optional = true }
 fx-improve = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 tempfile = "3.14"
 fx-consensus = { workspace = true, features = ["test-support"] }
 fx-embeddings = { workspace = true, features = ["test-support"] }
