@@ -1,6 +1,9 @@
 //! Landlock LSM filesystem sandboxing.
 
-use crate::config::{PathMode, SandboxPath};
+use crate::{
+    config::{PathMode, SandboxPath},
+    SandboxError,
+};
 use landlock::{
     Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
 };
@@ -9,10 +12,6 @@ use landlock::{
 /// Restricts filesystem access to the specified paths.
 /// This is irreversible for the current process.
 pub fn apply_filesystem_sandbox(allowed_paths: &[SandboxPath]) -> Result<(), SandboxError> {
-    if allowed_paths.is_empty() {
-        return Ok(());
-    }
-
     let abi = ABI::V3;
     let mut ruleset = create_ruleset(abi)?;
 
@@ -71,18 +70,14 @@ fn path_rule(
     }
 }
 
-/// Sandbox application errors.
-#[derive(Debug)]
-pub enum SandboxError {
-    Landlock(String),
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl std::fmt::Display for SandboxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Landlock(msg) => write!(f, "Landlock error: {msg}"),
-        }
+    #[test]
+    fn create_ruleset_succeeds_without_any_allowed_paths() {
+        let result = create_ruleset(ABI::V3);
+
+        assert!(result.is_ok());
     }
 }
-
-impl std::error::Error for SandboxError {}

@@ -18,6 +18,25 @@ pub use config::{
     SandboxStatus,
 };
 
+#[derive(Debug)]
+pub enum SandboxError {
+    Landlock(String),
+    Seccomp(String),
+    Network(String),
+}
+
+impl std::fmt::Display for SandboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Landlock(message) => write!(f, "Landlock error: {message}"),
+            Self::Seccomp(message) => write!(f, "seccomp error: {message}"),
+            Self::Network(message) => write!(f, "network error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SandboxError {}
+
 /// Apply all available sandbox layers based on config.
 /// Returns status indicating which layers were successfully applied.
 pub fn apply_sandbox(config: &SandboxConfig) -> SandboxStatus {

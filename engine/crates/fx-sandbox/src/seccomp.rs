@@ -3,6 +3,7 @@
 //! Blocks privilege escalation by enabling `no_new_privs`.
 //! This is a hardened baseline applied regardless of capability config.
 
+use crate::SandboxError;
 #[cfg(target_os = "linux")]
 use nix::sys::prctl;
 
@@ -16,19 +17,3 @@ pub fn apply_syscall_sandbox() -> Result<(), SandboxError> {
     tracing::info!("seccomp: no_new_privs enabled");
     Ok(())
 }
-
-/// Seccomp sandbox errors.
-#[derive(Debug)]
-pub enum SandboxError {
-    Seccomp(String),
-}
-
-impl std::fmt::Display for SandboxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Seccomp(msg) => write!(f, "seccomp error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for SandboxError {}

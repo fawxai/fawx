@@ -3,12 +3,12 @@
 //! Uses nftables on Linux, no-op on other platforms.
 //! Phase 3 MVP: log-only for nftables (requires root/CAP_NET_ADMIN).
 
-use crate::config::NetworkCapability;
+use crate::{config::NetworkCapability, SandboxError};
 
 /// Apply network policy.
 /// Phase 3 MVP: logs the intended policy. Actual nftables enforcement
 /// requires root or CAP_NET_ADMIN and is deferred to FawxShell.
-pub fn apply_network_policy(capability: &NetworkCapability) -> Result<(), NetworkError> {
+pub fn apply_network_policy(capability: &NetworkCapability) -> Result<(), SandboxError> {
     match capability {
         NetworkCapability::Full => {
             tracing::debug!("Network policy: full access (no restrictions)");
@@ -33,22 +33,6 @@ fn log_allow_list_policy(host_count: usize) {
         host_count
     );
 }
-
-/// Network policy errors.
-#[derive(Debug)]
-pub enum NetworkError {
-    NfTables(String),
-}
-
-impl std::fmt::Display for NetworkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NfTables(msg) => write!(f, "nftables error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for NetworkError {}
 
 #[cfg(test)]
 mod tests {

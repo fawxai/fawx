@@ -118,6 +118,7 @@ fn restricted_paths(working_dir: &Path, data_dir: &Path) -> Vec<SandboxPath> {
         sandbox_path(Path::new("/tmp"), PathMode::ReadWrite),
         sandbox_path(Path::new("/usr"), PathMode::ReadOnly),
         sandbox_path(Path::new("/lib"), PathMode::ReadOnly),
+        sandbox_path(Path::new("/etc"), PathMode::ReadOnly),
     ]
 }
 
@@ -185,6 +186,9 @@ mod tests {
             config.filesystem_allow[1],
             sandbox_path(Path::new("/data"), PathMode::ReadWrite)
         );
+        assert!(config
+            .filesystem_allow
+            .contains(&sandbox_path(Path::new("/etc"), PathMode::ReadOnly,)));
     }
 
     #[test]
