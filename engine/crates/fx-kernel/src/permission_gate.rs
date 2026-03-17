@@ -361,25 +361,23 @@ fn tool_to_action_category(tool_name: &str) -> &'static str {
 }
 
 fn capability_denied_result(call: &ToolCall, category: &str) -> ToolResult {
-    let suggestion = match category {
+    let message = match category {
         "network_listen" | "outbound_message" => {
-            "This capability is not available in this session. Request a capability grant or use an alternative approach."
+            "DENIED: This action is not available in this session. Request a capability grant or use an alternative approach."
         }
         "credential_change" | "system_install" | "kernel_modify" => {
-            "This action requires elevated privileges not available in this session."
+            "DENIED: This action requires elevated privileges not available in this session."
         }
         "file_delete" | "outside_workspace" => {
-            "This action is outside the current session's capability space."
+            "DENIED: This action is outside the current session's permitted scope."
         }
-        _ => "This action is not permitted in the current session configuration.",
+        _ => "DENIED: This action is not permitted in the current session configuration.",
     };
     ToolResult {
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
         success: false,
-        output: format!(
-            "CAPABILITY_DENIED: Action category '{category}' is not in this session's capability space. {suggestion}"
-        ),
+        output: message.to_string(),
     }
 }
 
@@ -552,7 +550,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
-        assert!(results[0].output.contains("CAPABILITY_DENIED"));
+        assert!(results[0].output.contains("DENIED"));
         assert!(captured_id.lock().expect("captured").is_none());
     }
 
@@ -723,8 +721,11 @@ mod tests {
         let result = capability_denied_result(&call, "file_delete");
 
         assert!(!result.success);
-        assert!(result.output.contains("CAPABILITY_DENIED"));
-        assert!(result.output.contains("file_delete"));
+        assert!(result.output.contains("DENIED"));
+        assert!(
+            !result.output.contains("file_delete"),
+            "should not leak category name"
+        );
     }
 
     #[test]

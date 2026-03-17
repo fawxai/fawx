@@ -246,6 +246,7 @@ pub struct PermissionsConfig {
     /// Selected preset that produced these permission lists.
     pub preset: PermissionPreset,
     /// Whether restricted actions are denied or trigger prompts.
+    #[serde(default)]
     pub mode: CapabilityMode,
     /// Actions Fawx can perform without asking.
     pub unrestricted: Vec<PermissionAction>,
@@ -2159,9 +2160,21 @@ working_dir = "/tmp/work"
         let config: FawxConfig =
             toml::from_str("[general]\nmax_iterations = 12\n").expect("deserialize old config");
         assert_eq!(config.workspace, WorkspaceConfig::default());
-        assert_eq!(config.permissions, PermissionsConfig::power());
         assert_eq!(config.budget, BudgetConfig::default());
         assert_eq!(config.sandbox, SandboxConfig::default());
         assert_eq!(config.proposals, ProposalConfig::default());
+    }
+
+    #[test]
+    fn permissions_without_mode_defaults_to_capability() {
+        let config: PermissionsConfig = toml::from_str(
+            r#"
+preset = "power"
+unrestricted = ["read_any"]
+proposal_required = ["shell"]
+"#,
+        )
+        .expect("deserialize permissions without mode");
+        assert_eq!(config.mode, CapabilityMode::Capability);
     }
 }
