@@ -39,6 +39,7 @@ use fx_llm::{
 use fx_loadable::{SignaturePolicy, SkillRegistry, TransactionSkill};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_ripcord::{resolve_tripwires, RipcordJournal, TripwireEvaluator};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
@@ -363,6 +364,7 @@ pub struct LoopEngineBundle {
     pub startup_warnings: Vec<StartupWarning>,
     /// Shared callback slot for permission prompts SSE.
     pub permission_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    pub ripcord_journal: Arc<RipcordJournal>,
     /// LLM provider for experiment/improvement pipelines.
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 }
@@ -378,6 +380,7 @@ pub struct HeadlessLoopBuildOptions {
     pub session_registry: Option<fx_session::SessionRegistry>,
     pub session_bus: Option<SessionBus>,
     pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
+    pub ripcord_journal: Option<Arc<RipcordJournal>>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -394,6 +397,7 @@ impl HeadlessLoopBuildOptions {
             session_registry: None,
             session_bus: None,
             permission_prompt_state: None,
+            ripcord_journal: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -410,6 +414,7 @@ impl HeadlessLoopBuildOptions {
             session_registry: None,
             session_bus: None,
             permission_prompt_state: None,
+            ripcord_journal: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -505,7 +510,7 @@ fn build_loop_engine_with_options(
         CachingExecutor::new(SharedSkillRegistry::new(Arc::clone(&skills.registry)));
 
     // Build executor chain:
-    // PermissionGateExecutor → ProposalGateExecutor → CachingExecutor → SkillRegistry
+    // PermissionGateExecutor → TripwireEvaluator → ProposalGateExecutor → CachingExecutor → SkillRegistry
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
@@ -517,7 +522,16 @@ fn build_loop_engine_with_options(
     let permission_gate =
         PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state);
     let permission_callback_slot = permission_gate.stream_callback_slot();
-    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(permission_gate);
+    let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
+        let snapshot_dir = data_dir.join("ripcord").join("snapshots");
+        Arc::new(RipcordJournal::new(&snapshot_dir))
+    });
+    let mut tripwires = fx_ripcord::config::default_tripwires();
+    let working_dir_str = working_dir.to_string_lossy().to_string();
+    resolve_tripwires(&mut tripwires, &working_dir_str);
+    let tripwire_evaluator =
+        TripwireEvaluator::new(permission_gate, tripwires, Arc::clone(&ripcord_journal));
+    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(tripwire_evaluator);
 
     let mut builder = LoopEngine::builder()
         .budget(budget)
@@ -563,6 +577,7 @@ fn build_loop_engine_with_options(
         startup_warnings: skills.startup_warnings,
         permission_callback_slot,
         improvement_provider: improvement_provider_for_bundle,
+        ripcord_journal,
     })
 }
 

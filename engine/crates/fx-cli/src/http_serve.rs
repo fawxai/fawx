@@ -31,6 +31,7 @@ pub async fn run(
 
     let cron_store = app.cron_store().cloned();
     let scheduler_handle = start_scheduler_if_possible(&app, cron_store.as_ref());
+    let ripcord = Arc::clone(app.ripcord_journal());
 
     let result = fx_api::run(
         app,
@@ -46,6 +47,7 @@ pub async fn run(
             cron_store,
             improvement_provider,
             experiment_registry,
+            ripcord: Some(ripcord),
         },
     )
     .await;

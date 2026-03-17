@@ -69,6 +69,7 @@ pub struct RunConfig {
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     pub experiment_registry: Option<SharedExperimentRegistry>,
+    pub ripcord: Option<Arc<fx_ripcord::RipcordJournal>>,
 }
 
 pub async fn run(
@@ -129,6 +130,7 @@ pub async fn run(
         )),
         oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
         permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+        ripcord: config.ripcord.clone(),
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
         experiment_registry,

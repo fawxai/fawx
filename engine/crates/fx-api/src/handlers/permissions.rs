@@ -884,6 +884,7 @@ mod tests {
             synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
             fleet_manager: None,
             cron_store: None,
             experiment_registry: test_registry(temp.path()),
