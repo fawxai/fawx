@@ -8,6 +8,6 @@ pub mod config;
 pub mod journal;
 pub mod snapshot;
 
-pub use config::{TripwireConfig, TripwireKind};
+pub use config::{resolve_tripwires, TripwireConfig, TripwireKind};
 pub use journal::{JournalAction, JournalEntry, RipcordJournal, RipcordStatus};
 pub use snapshot::SnapshotStore;

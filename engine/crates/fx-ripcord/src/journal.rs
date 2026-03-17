@@ -139,10 +139,17 @@ impl RipcordJournal {
 
     /// Record an action in the journal.
     pub async fn record(&self, tool_name: &str, tool_call_id: &str, action: JournalAction) {
-        let entry = build_entry(tool_name, tool_call_id, action);
+        let reversible = action.is_reversible();
+        let entry = JournalEntry {
+            id: ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed),
+            timestamp: SystemTime::now(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            action,
+            reversible,
+        };
         let mut entries = self.entries.write().await;
         entries.push(entry);
-
         let mut status = self.status.write().await;
         status.entry_count = entries.len() as u64;
     }
@@ -181,6 +188,7 @@ fn activated_status(tripwire_id: &str, description: &str) -> RipcordStatus {
     }
 }
 
+#[cfg(test)]
 fn build_entry(tool_name: &str, tool_call_id: &str, action: JournalAction) -> JournalEntry {
     JournalEntry {
         id: ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -194,7 +202,7 @@ fn build_entry(tool_name: &str, tool_call_id: &str, action: JournalAction) -> Jo
 
 #[cfg(test)]
 mod tests {
-    use super::{JournalAction, RipcordJournal};
+    use super::{build_entry, JournalAction, RipcordJournal};
     use tempfile::TempDir;
 
     fn sample_file_write() -> JournalAction {
@@ -272,6 +280,15 @@ mod tests {
     fn journal_action_reversibility() {
         assert!(sample_file_write().is_reversible());
         assert!(!sample_git_push().is_reversible());
+    }
+
+    #[test]
+    fn build_entry_sets_reversible_flag_from_action() {
+        let reversible = build_entry("write_file", "call-1", sample_file_write());
+        let irreversible = build_entry("git", "call-2", sample_git_push());
+
+        assert!(reversible.reversible);
+        assert!(!irreversible.reversible);
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@ pub fn default_tripwires() -> Vec<TripwireConfig> {
         TripwireConfig {
             id: "outside_project".into(),
             kind: TripwireKind::Path {
-                pattern: "!**".into(),
+                pattern: "!{project_dir}/**".into(),
             },
             description: "Writes outside project directory".into(),
             enabled: true,
@@ -73,6 +73,15 @@ pub fn default_tripwires() -> Vec<TripwireConfig> {
             enabled: true,
         },
     ]
+}
+
+/// Replace `{project_dir}` placeholder in tripwire patterns with the actual project path.
+pub fn resolve_tripwires(tripwires: &mut [TripwireConfig], project_dir: &str) {
+    for tripwire in tripwires.iter_mut() {
+        if let TripwireKind::Path { pattern } = &mut tripwire.kind {
+            *pattern = pattern.replace("{project_dir}", project_dir);
+        }
+    }
 }
 
 impl TripwireConfig {
@@ -178,7 +187,7 @@ fn home_dir() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_tripwires, TripwireConfig, TripwireKind};
+    use super::{default_tripwires, resolve_tripwires, TripwireConfig, TripwireKind};
     use std::collections::HashMap;
 
     #[test]
@@ -301,6 +310,29 @@ mod tests {
     #[test]
     fn default_tripwires_returns_four_entries() {
         assert_eq!(default_tripwires().len(), 4);
+    }
+
+    #[test]
+    fn resolve_tripwires_replaces_placeholder() {
+        let mut tripwires = default_tripwires();
+
+        resolve_tripwires(&mut tripwires, "/repo/project");
+
+        let outside_project = tripwires
+            .into_iter()
+            .find(|tripwire| tripwire.id == "outside_project")
+            .expect("outside_project tripwire");
+        assert_eq!(
+            outside_project,
+            TripwireConfig {
+                id: "outside_project".into(),
+                kind: TripwireKind::Path {
+                    pattern: "!/repo/project/**".into(),
+                },
+                description: "Writes outside project directory".into(),
+                enabled: true,
+            }
+        );
     }
 
     #[test]

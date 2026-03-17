@@ -26,16 +26,12 @@ impl SnapshotStore {
             Err(error) => return Err(SnapshotError::Io(error)),
         };
 
-        let content = tokio::fs::read(path).await.map_err(SnapshotError::Io)?;
-        let hash = hex_hash(&content);
         if metadata.len() > MAX_SNAPSHOT_SIZE {
-            return Ok(Some(SnapshotResult {
-                hash,
-                stored: false,
-                size_bytes: metadata.len(),
-            }));
+            return Ok(Some(oversized_snapshot_result(&metadata)));
         }
 
+        let content = tokio::fs::read(path).await.map_err(SnapshotError::Io)?;
+        let hash = hex_hash(&content);
         self.store_snapshot(&hash, &content).await?;
         Ok(Some(SnapshotResult {
             hash,
@@ -50,6 +46,14 @@ impl SnapshotStore {
         let content = tokio::fs::read(&snapshot_path)
             .await
             .map_err(SnapshotError::Io)?;
+        let actual_hash = hex_hash(&content);
+        if actual_hash != hash {
+            return Err(SnapshotError::IntegrityError {
+                expected: hash.to_string(),
+                actual: actual_hash,
+            });
+        }
+
         self.ensure_parent_dir(target).await?;
         tokio::fs::write(target, content)
             .await
@@ -83,9 +87,7 @@ impl SnapshotStore {
         }
 
         self.ensure_parent_dir(&snapshot_path).await?;
-        tokio::fs::write(snapshot_path, content)
-            .await
-            .map_err(SnapshotError::Io)
+        write_restricted(&snapshot_path, content).await
     }
 
     async fn ensure_parent_dir(&self, path: &Path) -> Result<(), SnapshotError> {
@@ -113,17 +115,63 @@ pub struct SnapshotResult {
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(std::io::Error),
+    IntegrityError { expected: String, actual: String },
 }
 
 impl std::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "snapshot I/O error: {error}"),
+            Self::IntegrityError { expected, actual } => {
+                write!(
+                    f,
+                    "snapshot integrity error: expected {expected}, got {actual}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for SnapshotError {}
+
+fn oversized_snapshot_result(metadata: &std::fs::Metadata) -> SnapshotResult {
+    SnapshotResult {
+        hash: format!("size_{}_{}", metadata.len(), file_mtime_nanos(metadata)),
+        stored: false,
+        size_bytes: metadata.len(),
+    }
+}
+
+fn file_mtime_nanos(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+async fn write_restricted(path: &Path, content: &[u8]) -> Result<(), SnapshotError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::write(path, content)
+        .await
+        .map_err(SnapshotError::Io)?;
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    tokio::fs::set_permissions(path, permissions)
+        .await
+        .map_err(SnapshotError::Io)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn write_restricted(path: &Path, content: &[u8]) -> Result<(), SnapshotError> {
+    tokio::fs::write(path, content)
+        .await
+        .map_err(SnapshotError::Io)?;
+    Ok(())
+}
 
 fn hex_hash(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -133,7 +181,7 @@ fn hex_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::SnapshotStore;
+    use super::{hex_hash, SnapshotError, SnapshotStore, MAX_SNAPSHOT_SIZE};
     use tempfile::TempDir;
 
     async fn create_file(path: &std::path::Path, content: &[u8]) {
@@ -178,6 +226,35 @@ mod tests {
         assert!(result.stored);
         assert_eq!(result.size_bytes, 13);
         assert!(store.exists(&result.hash).await);
+    }
+
+    #[tokio::test]
+    async fn snapshot_large_file_returns_hash_only_without_reading() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let snapshot_dir = temp_dir.path().join("snapshots");
+        let store = SnapshotStore::new(&snapshot_dir);
+        let source = temp_dir.path().join("large.bin");
+        let oversized = vec![b'x'; (MAX_SNAPSHOT_SIZE + 1) as usize];
+        create_file(&source, &oversized).await;
+
+        let metadata = tokio::fs::metadata(&source).await.expect("source metadata");
+        let result = store
+            .snapshot(&source)
+            .await
+            .expect("snapshot large file")
+            .expect("snapshot result");
+
+        assert!(!result.stored);
+        assert_eq!(result.size_bytes, metadata.len());
+        assert_eq!(
+            result.hash,
+            format!(
+                "size_{}_{}",
+                metadata.len(),
+                super::file_mtime_nanos(&metadata)
+            )
+        );
+        assert!(!store.exists(&result.hash).await);
     }
 
     #[tokio::test]
@@ -229,6 +306,38 @@ mod tests {
         let restored = tokio::fs::read(&target).await.expect("read restored file");
 
         assert_eq!(restored, b"restore me");
+    }
+
+    #[tokio::test]
+    async fn restore_detects_corrupted_snapshot() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let snapshot_dir = temp_dir.path().join("snapshots");
+        let store = SnapshotStore::new(&snapshot_dir);
+        let source = temp_dir.path().join("source.txt");
+        let target = temp_dir.path().join("restored.txt");
+        create_file(&source, b"restore me").await;
+        let snapshot = store
+            .snapshot(&source)
+            .await
+            .expect("snapshot source")
+            .expect("snapshot result");
+        let snapshot_path = snapshot_dir.join(format!("{}.snapshot", snapshot.hash));
+        tokio::fs::write(&snapshot_path, b"corrupted")
+            .await
+            .expect("corrupt snapshot");
+
+        let error = store
+            .restore(&snapshot.hash, &target)
+            .await
+            .expect_err("restore should fail on corrupted snapshot");
+
+        match error {
+            SnapshotError::IntegrityError { expected, actual } => {
+                assert_eq!(expected, snapshot.hash);
+                assert_eq!(actual, hex_hash(b"corrupted"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
