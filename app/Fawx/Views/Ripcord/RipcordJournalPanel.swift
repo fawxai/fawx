@@ -132,7 +132,7 @@ struct RipcordJournalPanel: View {
     }
 
     private var activeSinceLabel: String {
-        if let date = status?.activatedDate ?? entries.first?.timestampDate {
+        if let date = status?.activatedAt ?? entries.first?.timestamp {
             return makeRipcordJournalDateFormatter().string(from: date)
         }
         return "Unavailable"

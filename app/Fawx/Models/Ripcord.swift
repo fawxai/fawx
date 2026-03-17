@@ -1,10 +1,53 @@
 import Foundation
 
+struct SystemTimestamp: Codable, Sendable, Hashable {
+    let secsSinceEpoch: Int64
+    let nanosSinceEpoch: Int
+
+    enum CodingKeys: String, CodingKey {
+        case secsSinceEpoch = "secs_since_epoch"
+        case nanosSinceEpoch = "nanos_since_epoch"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        secsSinceEpoch = try container.decode(Int64.self, forKey: .secsSinceEpoch)
+        nanosSinceEpoch = try container.decode(Int.self, forKey: .nanosSinceEpoch)
+    }
+
+    init(date: Date) {
+        let epochSeconds = date.timeIntervalSince1970
+        var wholeSeconds = Int64(epochSeconds.rounded(.down))
+        var nanoseconds = Int(((epochSeconds - Double(wholeSeconds)) * 1_000_000_000).rounded())
+
+        if nanoseconds == 1_000_000_000 {
+            wholeSeconds += 1
+            nanoseconds = 0
+        } else if nanoseconds < 0 {
+            wholeSeconds -= 1
+            nanoseconds += 1_000_000_000
+        }
+
+        secsSinceEpoch = wholeSeconds
+        nanosSinceEpoch = nanoseconds
+    }
+
+    var date: Date {
+        Date(timeIntervalSince1970: Double(secsSinceEpoch) + (Double(nanosSinceEpoch) / 1_000_000_000))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(secsSinceEpoch, forKey: .secsSinceEpoch)
+        try container.encode(nanosSinceEpoch, forKey: .nanosSinceEpoch)
+    }
+}
+
 struct RipcordStatusResponse: Codable, Sendable, Hashable {
     let active: Bool
     let tripwireId: String?
     let tripwireDescription: String?
-    let activatedAt: String?
+    let activatedAt: Date?
     let entryCount: Int
 
     enum CodingKeys: String, CodingKey {
@@ -23,6 +66,38 @@ struct RipcordStatusResponse: Codable, Sendable, Hashable {
         entryCount: 0
     )
 
+    init(
+        active: Bool,
+        tripwireId: String?,
+        tripwireDescription: String?,
+        activatedAt: Date?,
+        entryCount: Int
+    ) {
+        self.active = active
+        self.tripwireId = tripwireId
+        self.tripwireDescription = tripwireDescription
+        self.activatedAt = activatedAt
+        self.entryCount = entryCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        active = try container.decode(Bool.self, forKey: .active)
+        tripwireId = try container.decodeIfPresent(String.self, forKey: .tripwireId)
+        tripwireDescription = try container.decodeIfPresent(String.self, forKey: .tripwireDescription)
+        activatedAt = try container.decodeIfPresent(SystemTimestamp.self, forKey: .activatedAt)?.date
+        entryCount = try container.decode(Int.self, forKey: .entryCount)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(active, forKey: .active)
+        try container.encodeIfPresent(tripwireId, forKey: .tripwireId)
+        try container.encodeIfPresent(tripwireDescription, forKey: .tripwireDescription)
+        try container.encodeIfPresent(activatedAt.map(SystemTimestamp.init(date:)), forKey: .activatedAt)
+        try container.encode(entryCount, forKey: .entryCount)
+    }
+
     var displayDescription: String {
         let trimmed = tripwireDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "Tripwire crossed" : trimmed
@@ -30,10 +105,6 @@ struct RipcordStatusResponse: Codable, Sendable, Hashable {
 
     var entryCountLabel: String {
         "\(entryCount) action\(entryCount == 1 ? "" : "s") journaled"
-    }
-
-    var activatedDate: Date? {
-        activatedAt.flatMap(parseRipcordTimestamp)
     }
 }
 
@@ -43,7 +114,7 @@ struct RipcordJournalResponse: Codable, Sendable, Hashable {
 
 struct JournalEntry: Codable, Sendable, Hashable, Identifiable {
     let id: Int
-    let timestamp: String
+    let timestamp: Date
     let toolName: String
     let toolCallId: String
     let action: JournalAction
@@ -55,15 +126,44 @@ struct JournalEntry: Codable, Sendable, Hashable, Identifiable {
         case toolCallId = "tool_call_id"
     }
 
-    var timestampDate: Date? {
-        parseRipcordTimestamp(timestamp)
+    init(
+        id: Int,
+        timestamp: Date,
+        toolName: String,
+        toolCallId: String,
+        action: JournalAction,
+        reversible: Bool
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.toolName = toolName
+        self.toolCallId = toolCallId
+        self.action = action
+        self.reversible = reversible
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int.self, forKey: .id)
+        timestamp = try container.decode(SystemTimestamp.self, forKey: .timestamp).date
+        toolName = try container.decode(String.self, forKey: .toolName)
+        toolCallId = try container.decode(String.self, forKey: .toolCallId)
+        action = try container.decode(JournalAction.self, forKey: .action)
+        reversible = try container.decode(Bool.self, forKey: .reversible)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(SystemTimestamp(date: timestamp), forKey: .timestamp)
+        try container.encode(toolName, forKey: .toolName)
+        try container.encode(toolCallId, forKey: .toolCallId)
+        try container.encode(action, forKey: .action)
+        try container.encode(reversible, forKey: .reversible)
     }
 
     var displayTime: String {
-        guard let timestampDate else {
-            return timestamp
-        }
-        return makeRipcordTimeFormatter().string(from: timestampDate)
+        makeRipcordTimeFormatter().string(from: timestamp)
     }
 
     var actionSummary: String? {
@@ -270,19 +370,6 @@ private func makeRipcordTimeFormatter() -> DateFormatter {
     formatter.timeStyle = .short
     formatter.dateStyle = .none
     return formatter
-}
-
-private func makeRipcordTimestampFormatter(fractionalSeconds: Bool) -> ISO8601DateFormatter {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = fractionalSeconds
-        ? [.withInternetDateTime, .withFractionalSeconds]
-        : [.withInternetDateTime]
-    return formatter
-}
-
-private func parseRipcordTimestamp(_ timestamp: String) -> Date? {
-    makeRipcordTimestampFormatter(fractionalSeconds: true).date(from: timestamp)
-        ?? makeRipcordTimestampFormatter(fractionalSeconds: false).date(from: timestamp)
 }
 
 private func compactPath(_ path: String?) -> String? {
