@@ -1504,9 +1504,10 @@ fn register_auth_provider_with_models(
     let models = ensure_supported_models(auth_method, supported_models);
 
     match auth_method {
-        AuthMethod::SetupToken { token } => {
-            register_setup_token_provider(router, token, models)?;
-        }
+        AuthMethod::SetupToken { .. } => tracing::warn!(
+            supported_models = models.len(),
+            "skipping Anthropic setup token provider: raw setup tokens are not usable with the Messages API until exchanged for runtime credentials"
+        ),
         AuthMethod::ApiKey { provider, key } => {
             register_api_key_provider(router, provider, key, models)?;
         }
@@ -1526,29 +1527,6 @@ fn register_auth_provider_with_models(
         }
     }
 
-    Ok(())
-}
-
-fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
-    if supported_models.is_empty() {
-        default_supported_models(auth_method)
-    } else {
-        supported_models
-    }
-}
-
-fn register_setup_token_provider(
-    router: &mut ModelRouter,
-    token: &str,
-    supported_models: Vec<String>,
-) -> Result<(), StartupError> {
-    let provider = AnthropicProvider::new(base_url_for_provider("anthropic"), token.to_string())
-        .map_err(|error| {
-            StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
-        })?
-        .with_supported_models(supported_models);
-
-    router.register_provider_with_auth(Box::new(provider), "subscription");
     Ok(())
 }
 
@@ -1627,6 +1605,14 @@ fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
                 models_for_provider(provider)
             }
         }
+    }
+}
+
+fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
+    if supported_models.is_empty() {
+        default_supported_models(auth_method)
+    } else {
+        supported_models
     }
 }
 
@@ -1749,6 +1735,26 @@ mod tests {
         assert!(bus.is_some(), "expected session bus to initialize");
         assert!(temp_dir.path().join("bus.redb").exists());
         assert!(!temp_dir.path().join("sessions.redb").exists());
+    }
+
+    #[test]
+    fn permissions_to_policy_does_not_default_ask_in_capability_mode() {
+        let policy = permissions_to_policy(&fx_config::PermissionsConfig::power());
+
+        assert!(!policy.default_ask);
+        assert_eq!(policy.mode, fx_config::CapabilityMode::Capability);
+        assert!(policy.ask_required.contains("file_delete"));
+    }
+
+    #[test]
+    fn permissions_to_policy_keeps_default_ask_in_prompt_mode() {
+        let mut config = fx_config::PermissionsConfig::power();
+        config.mode = fx_config::CapabilityMode::Prompt;
+
+        let policy = permissions_to_policy(&config);
+
+        assert!(policy.default_ask);
+        assert_eq!(policy.mode, fx_config::CapabilityMode::Prompt);
     }
 
     fn create_embedding_model_dir(base: &Path, dimensions: usize) {
@@ -2298,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn build_router_with_mixed_credentials_sets_expected_models_and_auth_labels() {
+    fn build_router_with_mixed_credentials_skips_raw_anthropic_setup_tokens() {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
             "anthropic",
@@ -2317,9 +2323,12 @@ mod tests {
         let router = build_router(&auth_manager).expect("router should build");
         let models = router.available_models();
 
-        assert!(models.iter().any(|model| {
-            model.provider_name == "anthropic" && model.auth_method == "subscription"
-        }));
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider_name == "anthropic"),
+            "raw setup tokens should not register Anthropic runtime models"
+        );
         assert!(models.iter().any(|model| {
             model.model_id == "openai/gpt-4o-mini"
                 && model.provider_name == "openrouter"
@@ -2358,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn build_router_does_not_preselect_active_model() {
+    fn build_router_with_setup_token_only_has_no_runtime_models() {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
             "anthropic",
@@ -2369,10 +2378,7 @@ mod tests {
 
         let router = build_router(&auth_manager).expect("router should build");
 
-        assert!(
-            !router.available_models().is_empty(),
-            "router should expose available models"
-        );
+        assert!(router.available_models().is_empty());
         assert_eq!(router.active_model(), None);
     }
 

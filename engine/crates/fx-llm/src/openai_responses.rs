@@ -159,12 +159,6 @@ impl OpenAiResponsesProvider {
             })
             .collect();
 
-        let tool_choice = if tools.is_empty() {
-            None
-        } else {
-            Some(json!("required"))
-        };
-
         Ok(ResponsesRequestBody {
             model: request.model.clone(),
             instructions: request.system_prompt.clone(),
@@ -173,7 +167,7 @@ impl OpenAiResponsesProvider {
             stream,
             store: false,
             temperature: request.temperature,
-            tool_choice,
+            tool_choice: None,
         })
     }
 
@@ -1553,6 +1547,26 @@ mod tests {
     }
 
     #[test]
+    fn build_tool_continuation_request_omits_tool_choice_with_tools_available() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let mut request = continuation_request();
+        request.tools = vec![crate::types::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "look something up".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(serialized["tools"][0]["name"], "lookup");
+        assert!(serialized.get("tool_choice").is_none());
+    }
+
+    #[test]
     fn test_build_request_body_maps_tool_result_string_content() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
@@ -1654,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_sets_tool_choice_when_tools_present() {
+    fn build_request_body_omits_tool_choice_when_tools_present() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
             model: "gpt-4.1".to_string(),
@@ -1672,7 +1686,7 @@ mod tests {
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
-        assert_eq!(serialized["tool_choice"], "required");
+        assert!(serialized.get("tool_choice").is_none());
     }
 
     #[test]
