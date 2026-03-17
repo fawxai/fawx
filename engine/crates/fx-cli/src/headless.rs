@@ -162,6 +162,7 @@ pub struct HeadlessAppDeps {
     pub startup_warnings: Vec<StartupWarning>,
     pub permission_callback_slot:
         Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
 }
@@ -196,6 +197,7 @@ pub struct HeadlessApp {
     cumulative_tokens: TokenUsage,
     /// Shared callback slot for permission prompt SSE events.
     permission_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -348,6 +350,7 @@ impl HeadlessApp {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: deps.permission_callback_slot,
+            ripcord_journal: deps.ripcord_journal,
             bus_receiver,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
@@ -601,6 +604,10 @@ impl HeadlessApp {
     /// Return the shared config manager (if configured).
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
+    }
+
+    pub fn ripcord_journal(&self) -> &Arc<fx_ripcord::RipcordJournal> {
+        &self.ripcord_journal
     }
 
     pub fn session_bus(&self) -> Option<&SessionBus> {
@@ -1959,6 +1966,7 @@ impl HeadlessSubagentFactory {
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
             permission_callback_slot: bundle.permission_callback_slot,
+            ripcord_journal: bundle.ripcord_journal,
             #[cfg(feature = "http")]
             experiment_registry: None,
         };
@@ -2369,6 +2377,9 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         }
@@ -2616,6 +2627,9 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -2902,6 +2916,9 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
@@ -3239,6 +3256,9 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
@@ -3285,6 +3305,9 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             bus_receiver: None,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };

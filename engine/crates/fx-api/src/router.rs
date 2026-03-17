@@ -117,6 +117,10 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/permissions/prompts/{id}/respond",
             post(handlers::permission_prompts::handle_respond),
         )
+        .route("/ripcord/status", get(handlers::ripcord::handle_status))
+        .route("/ripcord/journal", get(handlers::ripcord::handle_journal))
+        .route("/ripcord/pull", post(handlers::ripcord::handle_pull))
+        .route("/ripcord/approve", post(handlers::ripcord::handle_approve))
         .route(
             "/synthesis",
             get(handlers::synthesis::handle_get_synthesis)

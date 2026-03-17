@@ -157,6 +157,7 @@ fn build_app_with_dependencies(
         cron_store: bundle.cron_store,
         startup_warnings: bundle.startup_warnings,
         permission_callback_slot: bundle.permission_callback_slot,
+        ripcord_journal: bundle.ripcord_journal,
         #[cfg(feature = "http")]
         experiment_registry: None,
     })

@@ -24,6 +24,7 @@ fx-kernel.workspace = true
 fx-improve.workspace = true
 fx-llm.workspace = true
 fx-memory.workspace = true
+fx-ripcord = { path = "../fx-ripcord" }
 fx-session.workspace = true
 fx-storage.workspace = true
 fx-telemetry = { path = "../fx-telemetry" }

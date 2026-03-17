@@ -110,6 +110,7 @@ pub struct HttpState {
     pub synthesis: Arc<crate::handlers::synthesis::SynthesisState>,
     pub oauth_flows: Arc<crate::handlers::oauth::OAuthFlowStore>,
     pub permission_prompts: Arc<fx_kernel::PermissionPromptState>,
+    pub ripcord: Option<Arc<fx_ripcord::RipcordJournal>>,
     pub fleet_manager: Option<Arc<Mutex<FleetManager>>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub experiment_registry:

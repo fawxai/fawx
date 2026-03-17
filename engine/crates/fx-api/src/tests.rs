@@ -1256,6 +1256,9 @@ mod routing_and_status {
             cron_store: None,
             startup_warnings: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             experiment_registry: None,
         })
         .expect("test app")
@@ -1357,6 +1360,7 @@ mod routing_and_status {
             synthesis: synthesis_state(has_synthesis),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
             fleet_manager: None,
             cron_store: None,
             experiment_registry: {
@@ -1398,6 +1402,7 @@ mod routing_and_status {
             synthesis: synthesis_state(has_synthesis),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
             fleet_manager: None,
             cron_store: None,
             experiment_registry: {
@@ -2615,6 +2620,9 @@ allowed_chat_ids = [123]
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
                 permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                    std::env::temp_dir().as_path(),
+                )),
                 experiment_registry: None,
             })
             .expect("test app"),
@@ -3347,6 +3355,7 @@ thinking = "adaptive"
             synthesis: synthesis_state(false),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
             fleet_manager: None,
             cron_store: None,
             experiment_registry: {
@@ -4043,6 +4052,9 @@ mod telegram_update {
             cron_store: None,
             startup_warnings: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
             experiment_registry: None,
         })
         .expect("test app")

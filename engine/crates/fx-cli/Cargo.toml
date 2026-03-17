@@ -26,6 +26,7 @@ fx-api = { path = "../fx-api", optional = true }
 fx-fleet.workspace = true
 fx-kernel.workspace = true
 fx-propose.workspace = true
+fx-ripcord = { path = "../fx-ripcord" }
 fx-canary = { path = "../fx-canary" }
 fx-consensus = { path = "../fx-consensus" }
 fx-subagent.workspace = true

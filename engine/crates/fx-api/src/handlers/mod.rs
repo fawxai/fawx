@@ -24,6 +24,7 @@ pub mod permission_prompts;
 pub mod permissions;
 pub mod phase4;
 pub mod proposals;
+pub mod ripcord;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub mod synthesis;
