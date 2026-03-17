@@ -1690,10 +1690,17 @@ fn permissions_to_policy(config: &fx_config::PermissionsConfig) -> PermissionPol
         .map(|action| action.as_str().to_string())
         .collect();
     let has_ask_entries = !config.proposal_required.is_empty();
+    let default_ask = match config.mode {
+        // Capability mode: only explicitly listed categories are denied.
+        // Unknown tools are allowed — don't block builtins like current_time, calculator, etc.
+        fx_config::CapabilityMode::Capability => false,
+        // Prompt mode: default to asking for unknown categories (legacy behavior).
+        fx_config::CapabilityMode::Prompt => has_ask_entries,
+    };
     PermissionPolicy {
         unrestricted,
         ask_required,
-        default_ask: has_ask_entries,
+        default_ask,
         mode: config.mode,
     }
 }
