@@ -1,3 +1,4 @@
+pub mod capability_request;
 mod cron_skill;
 mod experiment_tool;
 mod git_skill;
@@ -8,6 +9,7 @@ mod session_tools;
 mod skill_bridge;
 mod tools;
 
+pub use capability_request::{CapabilityRequest, CapabilityRequestHandler, CapabilityRequestSkill};
 pub use cron_skill::CronSkill;
 pub use experiment_tool::{ExperimentRegistrar, ExperimentToolState};
 pub use git_skill::GitSkill;
