@@ -572,6 +572,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_mode_with_default_ask_disabled_allows_unknown_tool() {
+        let mut policy = cautious_policy(CapabilityMode::Capability);
+        policy.default_ask = false;
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            policy,
+            Arc::new(PermissionPromptState::new()),
+        );
+
+        let results = executor
+            .execute_tools(&[test_call("current_time")], None)
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].tool_name, "current_time");
+    }
+
+    #[tokio::test]
     async fn capability_mode_session_override_still_works() {
         let prompt_state = Arc::new(PermissionPromptState::new());
         let receiver = prompt_state
