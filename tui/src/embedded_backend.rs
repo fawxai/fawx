@@ -153,10 +153,12 @@ fn handle_stream_event(
             complete_experiment_tool(active_experiments, experiment_panel, &id);
             send_tool_result(tx, output, is_error);
         }
+        StreamEvent::Error { message, .. } => {
+            tracing::warn!("stream error in embedded mode: {message}");
+        }
         StreamEvent::Done { .. }
         | StreamEvent::PhaseChange { .. }
-        | StreamEvent::PermissionPrompt(_)
-        | StreamEvent::Error { .. } => {}
+        | StreamEvent::PermissionPrompt(_) => {}
     }
 }
 

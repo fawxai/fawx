@@ -62,13 +62,6 @@ pub(crate) const APPROACH_END: &str = "</APPROACH>";
 pub(crate) const METRICS_START: &str = "<METRICS>";
 pub(crate) const METRICS_END: &str = "</METRICS>";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Used by extract_response_parts; will be needed for chain-forward parsing.
-pub(crate) struct ResponseParts {
-    pub patch: String,
-    pub approach: String,
-}
-
 pub(crate) fn example_content_hash(example: &TrainingExample) -> String {
     let key = example_content_key(example);
     format!("{:x}", Sha256::digest(key.as_bytes()))
@@ -85,22 +78,6 @@ fn example_content_key(example: &TrainingExample) -> String {
             preference.user_prompt, preference.chosen, preference.rejected
         ),
     }
-}
-
-#[allow(dead_code)] // Inverse of format_model_response; needed for chain-forward parsing.
-pub(crate) fn extract_response_parts(text: &str) -> ResponseParts {
-    ResponseParts {
-        patch: extract_tagged_block(text, PATCH_START, PATCH_END)
-            .unwrap_or_else(|| text.trim().to_owned()),
-        approach: extract_tagged_block(text, APPROACH_START, APPROACH_END).unwrap_or_default(),
-    }
-}
-
-#[allow(dead_code)] // Used by extract_response_parts.
-pub(crate) fn extract_tagged_block(text: &str, start_tag: &str, end_tag: &str) -> Option<String> {
-    let start = text.find(start_tag)? + start_tag.len();
-    let end = text[start..].find(end_tag)? + start;
-    Some(text[start..end].trim().to_owned())
 }
 
 pub(crate) fn format_model_response(
