@@ -150,11 +150,24 @@ The tool call is non-blocking for the kernel — it emits a request to the user 
 
 **This replaces "prompt mode" entirely.** The old `CapabilityMode::Prompt` (legacy per-action consent) is retained for backward compatibility but deprecated. The `request_capability` tool is the forward-looking escalation mechanism.
 
+**Security model for `request_capability`:**
+
+The agent writes its own justification — an inherent conflict of interest. But the tool doesn't change what's *possible*, only how the conversation about capabilities happens. The security posture is identical whether the user grants a capability because the agent asked or because they proactively configured it. The real security comes from the layers around the tool:
+
+1. **OS enforcement caps the ceiling.** No matter what the agent requests or the user grants, seccomp blocks privilege escalation, Landlock caps filesystem scope, network namespace caps egress. The agent cannot social-engineer past the kernel.
+2. **Telemetry catches patterns.** The signal flywheel tracks escalation sequences. Agent requests filesystem → shell → network in one session? That's a labeled signal. Over time, earned autonomy either normalizes the pattern or flags it.
+3. **Ripcord provides undo.** Even if the agent gets every capability it asked for, suspicious actions post-grant are on the ripcord journal. User pulls the cord.
+
+The tool itself is simple:
+- Show the user what the capability actually allows (UX, not security)
+- Rate limit: max 3 requests per session to prevent spam (not a security boundary — just prevents annoyance)
+- The tool uses structured capability identifiers, not natural language
+
 **Pressure test:**
-- *What if the preset is wrong?* Agent hits a denial, calls `request_capability` with context. User sees a meaningful request and grants for the session. Granting may require session restart (OS sandbox is irreversible).
-- *What if the user always overrides to "allow everything"?* That's their choice. OS enforcement still provides a floor (seccomp blocks privilege escalation regardless). The other layers still protect them.
-- *What if the agent abuses request_capability?* Rate-limit the tool (max 3 requests per session). After that, denials are final. The agent adapts or reports the limitation to the user.
-- *Parsing natural language into capability sets — is that reliable?* No. **Deferred.** Start with presets and explicit flags only. The tool uses structured capability identifiers, not natural language.
+- *What if the preset is wrong?* Agent hits a denial, calls `request_capability` with context. User sees what the capability allows and grants for the session. Granting may require session restart (OS sandbox is irreversible).
+- *What if the user always grants everything?* OS enforcement still provides the physical floor. Telemetry labels the pattern for earned autonomy to learn from.
+- *What if the agent games the reason field?* The user approves the *capability*, not the *reason*. The UI shows what the capability allows, not just why the agent says it wants it. But ultimately: the reason field is informational, not trusted. The defense is OS + telemetry + ripcord, not trusting the agent's explanation.
+- *Incremental escalation across sessions?* Telemetry tracks cross-session patterns. Earned autonomy (Phase 4) addresses this with signal data, not speculation now.
 
 **Honest limitation:** This is not novel. NemoClaw does this. Docker does this. It's table stakes. The value is in the layers above.
 
