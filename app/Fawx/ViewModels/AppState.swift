@@ -139,6 +139,7 @@ final class AppState {
     var lastHealth: HealthResponse?
     var currentContext: ContextInfo?
     var permissionPresetName = "Power User"
+    var permissionMode: PermissionMode = .prompt
     var connectionError: String?
     var theme: AppTheme
     var fontSize: AppFontSize
@@ -503,6 +504,7 @@ final class AppState {
         skills = []
         authProviders = []
         permissionPresetName = "Power User"
+        permissionMode = .prompt
         connectionError = nil
         connectionStatus = .disconnected
         serverStatusError = nil
@@ -527,6 +529,7 @@ final class AppState {
     func refreshServerState() async throws {
         async let modelsTask = client.listModels()
         async let legacyStatusTask = client.serverStatus()
+        async let permissionsTask = client.getPermissions()
 
         let models = try await modelsTask
         let legacyStatus: ServerStatusResponse?
@@ -536,6 +539,13 @@ final class AppState {
         } catch {
             legacyStatus = nil
             serverStatusError = error.localizedDescription
+        }
+
+        let permissionsResponse: PermissionsResponse?
+        do {
+            permissionsResponse = try await permissionsTask
+        } catch {
+            permissionsResponse = nil
         }
 
         do {
@@ -551,7 +561,12 @@ final class AppState {
         availableModels = models.models
         let activeModelID = legacyStatus?.model ?? models.activeModel
         activeModel = models.models.first(where: { $0.modelID == activeModelID }) ?? models.models.first
-        permissionPresetName = resolvePermissionPreset(from: legacyStatus?.config)
+        if let permissionsResponse {
+            permissionPresetName = permissionPresetLabel(permissionsResponse.preset)
+            permissionMode = permissionsResponse.mode
+        } else {
+            permissionPresetName = resolvePermissionPreset(from: legacyStatus?.config)
+        }
         await refreshPhase4State()
     }
 

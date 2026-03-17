@@ -1,5 +1,14 @@
 import Foundation
 
+enum PermissionMode: String, Codable, Sendable, Hashable, CaseIterable {
+    case capability
+    case prompt
+
+    var showsPermissionPrompts: Bool {
+        self == .prompt
+    }
+}
+
 struct PermissionEntry: Codable, Sendable, Hashable, Identifiable {
     let action: String
     let level: String
@@ -10,24 +19,88 @@ struct PermissionEntry: Codable, Sendable, Hashable, Identifiable {
 
 struct PermissionsResponse: Codable, Sendable, Hashable {
     let preset: String
+    let mode: PermissionMode
     let permissions: [PermissionEntry]
     let availablePresets: [String]
 
     enum CodingKeys: String, CodingKey {
         case preset
+        case mode
         case permissions
         case availablePresets = "available_presets"
+    }
+
+    init(
+        preset: String,
+        mode: PermissionMode,
+        permissions: [PermissionEntry],
+        availablePresets: [String]
+    ) {
+        self.preset = preset
+        self.mode = mode
+        self.permissions = permissions
+        self.availablePresets = availablePresets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        preset = try container.decode(String.self, forKey: .preset)
+
+        let rawMode = try container.decodeIfPresent(String.self, forKey: .mode)?.lowercased()
+        mode = rawMode.flatMap(PermissionMode.init(rawValue:)) ?? .prompt
+
+        permissions = try container.decode([PermissionEntry].self, forKey: .permissions)
+        availablePresets = try container.decode([String].self, forKey: .availablePresets)
     }
 }
 
 struct PermissionsPatchRequest: Encodable, Sendable {
     let preset: String?
+    let mode: PermissionMode?
     let changes: [PermissionChange]?
+
+    var legacyCompatibleRequest: PermissionsPatchRequest? {
+        guard mode != .capability else {
+            return nil
+        }
+
+        let translatedChanges = changes?.map { change in
+            PermissionChange(
+                action: change.action,
+                level: change.level.lowercased() == "ask" ? "propose" : change.level
+            )
+        }
+        let translatedAskLevel = changes?.contains(where: { $0.level.lowercased() == "ask" }) == true
+
+        let droppedPromptMode = mode == .prompt && (preset != nil || translatedChanges?.isEmpty == false)
+        guard translatedAskLevel || droppedPromptMode else {
+            return nil
+        }
+
+        return PermissionsPatchRequest(
+            preset: preset,
+            mode: droppedPromptMode ? nil : mode,
+            changes: translatedChanges
+        )
+    }
 }
 
 struct PermissionChange: Codable, Sendable, Hashable {
     let action: String
     let level: String
+}
+
+func editablePermissionLevel(_ level: String) -> String {
+    switch level.lowercased() {
+    case "allow":
+        "allow"
+    case "deny":
+        "deny"
+    case "ask", "propose", "denied":
+        "ask"
+    default:
+        "ask"
+    }
 }
 
 struct PermissionsPatchResponse: Codable, Sendable, Hashable {

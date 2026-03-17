@@ -7,6 +7,7 @@ struct PermissionsSettingsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+            securityModeSection
             presetSection
 
             if viewModel.isLoading && viewModel.permissions.isEmpty {
@@ -34,6 +35,35 @@ struct PermissionsSettingsPanel: View {
         }
     }
 
+    private var securityModeSection: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+            HStack(spacing: FawxSpacing.paddingSM) {
+                Text("Security Mode")
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+
+                if viewModel.isApplyingMode {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text("Choose whether restricted actions are silently denied or pause to ask for approval.")
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            if usesCompactLayout {
+                VStack(spacing: FawxSpacing.paddingSM) {
+                    modeButtons
+                }
+            } else {
+                HStack(alignment: .top, spacing: FawxSpacing.paddingSM) {
+                    modeButtons
+                }
+            }
+        }
+    }
+
     private var presetSection: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
             Text("Permission Preset")
@@ -44,7 +74,7 @@ struct PermissionsSettingsPanel: View {
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
 
-            if usesCompactPresetGrid {
+            if usesCompactLayout {
                 LazyVGrid(
                     columns: [
                         GridItem(.flexible(), spacing: FawxSpacing.paddingSM),
@@ -63,6 +93,7 @@ struct PermissionsSettingsPanel: View {
             if let selectedPresetOption {
                 PermissionPresetSummaryCard(
                     option: selectedPresetOption,
+                    mode: viewModel.permissionMode,
                     counts: permissionLevelCounts
                 )
             }
@@ -87,7 +118,8 @@ struct PermissionsSettingsPanel: View {
                             ForEach(group.entries) { permission in
                                 PermissionRow(
                                     permission: permission,
-                                    isPending: viewModel.pendingActions.contains(permission.action)
+                                    isPending: viewModel.pendingActions.contains(permission.action),
+                                    isDisabled: viewModel.isApplyingMode || viewModel.isApplyingPreset
                                 ) { newLevel in
                                     Task {
                                         await viewModel.setActionLevel(
@@ -129,8 +161,22 @@ struct PermissionsSettingsPanel: View {
         PermissionLevelCounts(permissions: viewModel.permissions)
     }
 
-    private var usesCompactPresetGrid: Bool {
+    private var usesCompactLayout: Bool {
         horizontalSizeClass == .compact
+    }
+
+    private var modeButtons: some View {
+        ForEach(PermissionMode.allCases, id: \.self) { mode in
+            PermissionModeButton(
+                mode: mode,
+                isSelected: viewModel.permissionMode == mode,
+                isDisabled: viewModel.isApplyingMode || viewModel.isApplyingPreset
+            ) {
+                Task {
+                    await viewModel.setMode(mode)
+                }
+            }
+        }
     }
 
     private var presetButtons: some View {
@@ -138,7 +184,7 @@ struct PermissionsSettingsPanel: View {
             PermissionPresetButton(
                 option: option,
                 isSelected: viewModel.selectedPreset == option.rawValue,
-                isDisabled: viewModel.isApplyingPreset
+                isDisabled: viewModel.isApplyingPreset || viewModel.isApplyingMode
             ) {
                 if option.rawValue == "custom" {
                     viewModel.showCustomEditor()
@@ -215,6 +261,53 @@ private enum PermissionGroupTitle: CaseIterable {
     }
 }
 
+private extension PermissionMode {
+    var title: String {
+        switch self {
+        case .capability:
+            "Capability"
+        case .prompt:
+            "Interactive"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .capability:
+            "Actions are allowed or silently denied based on your preset. No interruptions."
+        case .prompt:
+            "Restricted actions pause and ask for your approval before proceeding."
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .capability:
+            "shield.fill"
+        case .prompt:
+            "bell.badge.fill"
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .capability:
+            .fawxSuccess
+        case .prompt:
+            .fawxWarning
+        }
+    }
+
+    var recommendationLabel: String? {
+        switch self {
+        case .capability:
+            "Recommended"
+        case .prompt:
+            nil
+        }
+    }
+}
+
 private enum PermissionPresetOption: String, CaseIterable {
     case power
     case cautious
@@ -225,11 +318,11 @@ private enum PermissionPresetOption: String, CaseIterable {
     var title: String {
         switch self {
         case .power:
-            "Power User"
+            "Standard"
         case .cautious:
-            "Cautious"
+            "Restricted"
         case .experimental:
-            "Experimental"
+            "Open"
         case .custom:
             "Custom"
         case .safe:
@@ -240,11 +333,11 @@ private enum PermissionPresetOption: String, CaseIterable {
     var subtitle: String {
         switch self {
         case .power:
-            "Allows most workspace actions and asks before external or destructive changes."
+            "Balanced workspace autonomy with extra protection for external or destructive changes."
         case .cautious:
-            "Allows read-heavy work and asks before execution, writes, shell, and external changes."
+            "Read-heavy by default with tighter controls around execution, shell, writes, and external changes."
         case .experimental:
-            "Allows broad autonomy, including kernel changes, and only asks on the riskiest actions."
+            "Broad autonomy, including kernel changes, with only the riskiest actions still restricted."
         case .custom:
             "Tune every action yourself."
         case .safe:
@@ -267,18 +360,38 @@ private enum PermissionPresetOption: String, CaseIterable {
         }
     }
 
-    var asksOrBlocksSummary: String {
+    func restrictionSummary(for mode: PermissionMode) -> String {
         switch self {
         case .power:
-            "Credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification still require approval."
+            switch mode {
+            case .capability:
+                "Credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification are silently denied."
+            case .prompt:
+                "Credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification still require approval."
+            }
         case .cautious:
-            "Execution, writes, git, shell, self-modify, credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification require approval."
+            switch mode {
+            case .capability:
+                "Execution, writes, git, shell, self-modify, credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification are silently denied."
+            case .prompt:
+                "Execution, writes, git, shell, self-modify, credential changes, installs, network listeners, outbound messaging, deletes, outside-workspace access, and kernel modification require approval."
+            }
         case .experimental:
-            "Credential changes, installs, network listeners, outbound messaging, deletes, and outside-workspace access still require approval."
+            switch mode {
+            case .capability:
+                "Credential changes, installs, network listeners, outbound messaging, deletes, and outside-workspace access are silently denied."
+            case .prompt:
+                "Credential changes, installs, network listeners, outbound messaging, deletes, and outside-workspace access still require approval."
+            }
         case .custom:
             "Changing any action below keeps this preset in Custom."
         case .safe:
-            "High-impact actions are heavily constrained."
+            switch mode {
+            case .capability:
+                "High-impact actions are denied by default."
+            case .prompt:
+                "High-impact actions are heavily constrained."
+            }
         }
     }
 
@@ -295,6 +408,60 @@ private enum PermissionPresetOption: String, CaseIterable {
         case .safe:
             "shield"
         }
+    }
+}
+
+private struct PermissionModeButton: View {
+    let mode: PermissionMode
+    let isSelected: Bool
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                HStack(alignment: .center, spacing: FawxSpacing.paddingSM) {
+                    Image(systemName: mode.symbolName)
+                        .foregroundStyle(isSelected ? mode.accentColor : Color.fawxTextSecondary)
+
+                    Text(mode.title)
+                        .font(FawxTypography.sidebarTitle)
+                        .foregroundStyle(Color.fawxText)
+
+                    if let recommendationLabel = mode.recommendationLabel {
+                        Text(recommendationLabel)
+                            .font(FawxTypography.status)
+                            .foregroundStyle(mode.accentColor)
+                            .padding(.horizontal, FawxSpacing.paddingSM)
+                            .padding(.vertical, FawxSpacing.paddingXS)
+                            .background(mode.accentColor.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(isSelected ? mode.accentColor : Color.fawxTextSecondary)
+                }
+
+                Text(mode.subtitle)
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+            .padding(FawxSpacing.paddingMD)
+            .background(isSelected ? mode.accentColor.opacity(0.12) : Color.fawxBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isSelected ? mode.accentColor.opacity(0.35) : Color.fawxBorder, lineWidth: 1)
+            }
+            .opacity(isDisabled && !isSelected ? 0.55 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .accessibilityLabel(mode.title)
     }
 }
 
@@ -337,6 +504,7 @@ private struct PermissionPresetButton: View {
 private struct PermissionRow: View {
     let permission: PermissionEntry
     let isPending: Bool
+    let isDisabled: Bool
     let setLevel: (String) -> Void
 
     var body: some View {
@@ -363,15 +531,22 @@ private struct PermissionRow: View {
                     .controlSize(.small)
             } else {
                 Menu {
-                    ForEach(["allow", "propose", "deny"], id: \.self) { level in
-                        Button(permissionLevelTitle(level)) {
-                            setLevel(level)
+                    ForEach(EditablePermissionLevel.allCases, id: \.self) { level in
+                        Button {
+                            setLevel(level.rawValue)
+                        } label: {
+                            if editablePermissionLevel(permission.level) == level.rawValue {
+                                Label(level.title, systemImage: "checkmark")
+                            } else {
+                                Text(level.title)
+                            }
                         }
                     }
                 } label: {
                     PermissionLevelBadge(level: permission.level)
                 }
                 .accessibilityLabel("\(permission.title) permission level")
+                .disabled(isDisabled)
             }
         }
         .padding(FawxSpacing.paddingMD)
@@ -382,6 +557,7 @@ private struct PermissionRow: View {
 
 private struct PermissionPresetSummaryCard: View {
     let option: PermissionPresetOption
+    let mode: PermissionMode
     let counts: PermissionLevelCounts
 
     var body: some View {
@@ -398,14 +574,18 @@ private struct PermissionPresetSummaryCard: View {
                 .font(FawxTypography.status)
                 .foregroundStyle(Color.fawxSuccess)
 
-            Text("Asks or blocks: \(option.asksOrBlocksSummary)")
+            Text(option.restrictionSummary(for: mode))
                 .font(FawxTypography.status)
-                .foregroundStyle(Color.fawxWarning)
+                .foregroundStyle(mode == .capability ? Color.fawxError : Color.fawxWarning)
 
             HStack(spacing: FawxSpacing.paddingSM) {
-                PermissionCountPill(title: "Allow", count: counts.allow, color: .fawxSuccess)
-                PermissionCountPill(title: "Ask", count: counts.propose, color: .fawxWarning)
-                PermissionCountPill(title: "Deny", count: counts.deny, color: .fawxError)
+                PermissionCountPill(title: "Allowed", count: counts.allow, color: .fawxSuccess)
+                PermissionCountPill(
+                    title: mode == .capability ? "Denied" : "Requires Approval",
+                    count: counts.restricted,
+                    color: mode == .capability ? .fawxError : .fawxWarning
+                )
+                PermissionCountPill(title: "Blocked", count: counts.blocked, color: .fawxTextSecondary)
             }
         }
         .padding(FawxSpacing.paddingMD)
@@ -442,13 +622,16 @@ private struct PermissionCountPill: View {
 
 private struct PermissionLevelCounts {
     let allow: Int
-    let propose: Int
-    let deny: Int
+    let restricted: Int
+    let blocked: Int
 
     init(permissions: [PermissionEntry]) {
-        allow = permissions.filter { $0.level.lowercased() == "allow" }.count
-        propose = permissions.filter { $0.level.lowercased() == "propose" }.count
-        deny = permissions.filter { $0.level.lowercased() == "deny" }.count
+        allow = permissions.filter { permissionVisualState($0.level) == .allowed }.count
+        restricted = permissions.filter {
+            let state = permissionVisualState($0.level)
+            return state == .approvalRequired || state == .denied
+        }.count
+        blocked = permissions.filter { permissionVisualState($0.level) == .blocked }.count
     }
 }
 
@@ -472,25 +655,68 @@ private struct PermissionLevelBadge: View {
     }
 }
 
-private func permissionLevelTitle(_ level: String) -> String {
+private enum EditablePermissionLevel: String, CaseIterable {
+    case allow
+    case ask
+    case deny
+
+    var title: String {
+        switch self {
+        case .allow:
+            "Allowed"
+        case .ask:
+            "Requires Approval"
+        case .deny:
+            "Blocked"
+        }
+    }
+}
+
+private enum PermissionVisualState {
+    case allowed
+    case approvalRequired
+    case denied
+    case blocked
+}
+
+private func permissionVisualState(_ level: String) -> PermissionVisualState {
     switch level.lowercased() {
     case "allow":
-        "Allow"
+        .allowed
     case "deny":
-        "Deny"
+        .blocked
+    case "denied":
+        .denied
+    case "ask", "propose":
+        .approvalRequired
     default:
-        "Ask"
+        .approvalRequired
+    }
+}
+
+private func permissionLevelTitle(_ level: String) -> String {
+    switch permissionVisualState(level) {
+    case .allowed:
+        "Allowed"
+    case .approvalRequired:
+        "Requires Approval"
+    case .denied:
+        "Denied"
+    case .blocked:
+        "Blocked"
     }
 }
 
 private func permissionLevelColor(_ level: String) -> Color {
-    switch level.lowercased() {
-    case "allow":
+    switch permissionVisualState(level) {
+    case .allowed:
         .fawxSuccess
-    case "deny":
-        .fawxError
-    default:
+    case .approvalRequired:
         .fawxWarning
+    case .denied:
+        .fawxError
+    case .blocked:
+        .fawxTextSecondary
     }
 }
 

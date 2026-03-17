@@ -144,7 +144,9 @@ struct ChatDetailView: View {
 
     private var composerArea: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
-            if let indicatorText = chatViewModel.permissionPromptIndicatorText {
+            if appState.permissionMode.showsPermissionPrompts,
+               let indicatorText = chatViewModel.permissionPromptIndicatorText
+            {
                 PermissionPromptInlineNotice(
                     text: indicatorText,
                     tierLabel: chatViewModel.activePermissionPrompt?.tierLabel

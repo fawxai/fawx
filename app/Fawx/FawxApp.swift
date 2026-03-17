@@ -200,7 +200,9 @@ struct FawxApp: App {
     private var activePermissionPromptBinding: Binding<PermissionPrompt?> {
         Binding(
             get: {
-                chatViewModel.activePermissionPrompt
+                appState.permissionMode.showsPermissionPrompts
+                    ? chatViewModel.activePermissionPrompt
+                    : nil
             },
             set: { _ in }
         )
