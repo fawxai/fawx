@@ -124,14 +124,15 @@
         <h2 class="phase-title">Kernel Safety Architecture</h2>
       </div>
       </summary>
-      <p class="phase-desc">Hard kernel/loadable separation. Compiled safety invariants that the agent cannot modify.</p>
+      <p class="phase-desc">Hard kernel/loadable separation. Compiled safety invariants that the agent cannot modify, now shifted to an AX-first model: capability space up front, tripwire/ripcord inside the boundary, hard stops outside it.</p>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Proposal gates (human approval for writes)</li>
+        <li><span class="check">✓</span> Capability space defaults (Open / Standard / Restricted) replace prompt-first approvals</li>
+        <li><span class="check">✓</span> Tripwire → Ripcord pipeline with journaling, approve/pull APIs, and revert engine</li>
+        <li><span class="check">✓</span> request_capability tool for agent-initiated escalation</li>
         <li><span class="check">✓</span> Tier-3 immutable paths (compiled into binary)</li>
-        <li><span class="check">✓</span> Tool execution sandbox</li>
+        <li><span class="check">✓</span> OS-level sandbox framework (Landlock / seccomp / network policy, graceful degradation off Linux)</li>
         <li><span class="check">✓</span> Retry budget and loop guards</li>
         <li><span class="check">✓</span> Memory decay and boundary enforcement</li>
-        <li><span class="check">✓</span> Permission presets (Power / Cautious / Experimental)</li>
       </ul>
     </details>
     <hr class="divider">
@@ -254,7 +255,7 @@
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 4: Self-Contained Install</h3>
       <ul class="feature-list">
-        <li><span class="check">✓</span> DMG build pipeline (notarized, ARM)</li>
+        <li><span class="wip">◐</span> DMG / distribution pipeline polish (notarization, packaging, launch readiness)</li>
         <li><span class="check">✓</span> Setup wizard — skippable, non-destructive, re-enterable from Settings</li>
         <li><span class="check">✓</span> Tailscale-first networking with auto HTTPS via tailscale cert</li>
         <li><span class="check">✓</span> LaunchAgent daemon — GUI is just a client + manager</li>
@@ -263,14 +264,14 @@
         <li><span class="check">✓</span> 13+ backend endpoints (setup, auth, config presets, pairing, server lifecycle)</li>
         <li><span class="check">✓</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
         <li><span class="check">✓</span> <strong>Release profile hardening</strong> — panic=abort, strip=true, lto=true</li>
-        <li><span class="wip">◐</span> Swift GUI — in e2e testing (setup wizard works, chat streaming debugging)</li>
+        <li><span class="wip">◐</span> Swift GUI — e2e baseline restored; setup, chat, fleet, experiments, telemetry, and git flows are working, with final polish underway</li>
       </ul>
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Backend Complete</h3>
       <ul class="feature-list">
-        <li><span class="check">✓</span> PermissionGateExecutor — action-level permission checks with SSE prompts, async pause/resume</li>
-        <li><span class="check">✓</span> Permission system API — GET/PATCH /v1/permissions with presets (power/cautious/experimental/custom)</li>
-        <li><span class="check">✓</span> Inline permission prompts — SSE event, respond endpoint, session overrides, idempotent resolve</li>
+        <li><span class="check">✓</span> Capability gate executor — action-level permission checks with capability mode as the default</li>
+        <li><span class="check">✓</span> Permission system API — GET/PATCH /v1/permissions with presets, aliases, and mode field</li>
+        <li><span class="check">✓</span> Legacy prompt mode retained as opt-in; default path is capability-space planning, not modal interruption</li>
         <li><span class="check">✓</span> OpenAI PKCE OAuth — start/callback/refresh endpoints, credential store integration</li>
         <li><span class="check">✓</span> Synthesis / custom instructions — GET/PUT/DELETE with optimistic concurrency</li>
         <li><span class="check">✓</span> Usage / cost tracking — real session token counts + estimated cost</li>
@@ -278,28 +279,30 @@
         <li><span class="check">✓</span> Proposal endpoints wired to real filesystem proposals</li>
         <li><span class="check">✓</span> <strong>WASM domain allowlist</strong> — NetworkRestricted capability with per-skill domain control</li>
         <li><span class="check">✓</span> Subagent model/thinking overrides</li>
-        <li><span class="wip">◐</span> Swift GUI — Codex built screens, in e2e testing</li>
+        <li><span class="check">✓</span> request_capability flow wired end-to-end</li>
+        <li><span class="wip">◐</span> Swift GUI — Codex built screens, in e2e polish</li>
       </ul>
 
-      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments — Backend Complete</h3>
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments + Ripcord</h3>
       <ul class="feature-list">
         <li><span class="check">✓</span> Fleet dashboard — 5 endpoints (overview, nodes, detail, remove, dispatch)</li>
         <li><span class="check">✓</span> Fleet task dispatch — wired to FleetHttpClient, sends tasks to worker nodes</li>
         <li><span class="check">✓</span> ExperimentRegistry — CRUD lifecycle, JSON persistence, cancellation, restart recovery</li>
         <li><span class="check">✓</span> Experiment execution — tokio::spawn runs run_improvement_cycle() on create</li>
         <li><span class="check">✓</span> Kernel yield primitive — WakeCondition, YieldRequest, YieldHandle, loop integration</li>
-        <li><span class="planned">○</span> <strong>Behavioral telemetry</strong> — opt-in anonymous signals, granular consent, differential privacy</li>
-        <li><span class="planned">○</span> Swift fleet dashboard + experiment monitor screens</li>
+        <li><span class="check">✓</span> Ripcord API + journal review flow</li>
+        <li><span class="check">✓</span> Telemetry consent backend + Swift settings UI</li>
+        <li><span class="wip">◐</span> Swift fleet dashboard + experiment monitor screens — functional, polishing toward ship</li>
       </ul>
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> EULA, Terms of Service, Privacy Policy</li>
-        <li><span class="planned">○</span> TestFlight distribution</li>
+        <li><span class="wip">◐</span> Final chat / UX polish pass across TUI + native app</li>
+        <li><span class="wip">◐</span> EULA, Terms of Service, Privacy Policy (drafted, needs embedding in app/package)</li>
         <li><span class="planned">○</span> App icon + branding</li>
         <li><span class="planned">○</span> Sparkle auto-updater (with signature verification — security-critical)</li>
-        <li><span class="planned">○</span> <strong>Binary hardening</strong> — symbol stripping, panic location removal, release profile hardening</li>
-        <li><span class="planned">○</span> <strong>Open source launch</strong> — skill SDK, marketplace protocol, channel traits, docs site (Apache 2.0)</li>
+        <li><span class="planned">○</span> Notarized DMG / distribution packaging</li>
+        <li><span class="planned">○</span> Delaware incorporation</li>
         <li><span class="planned">○</span> fawx.ai download page</li>
       </ul>
     </div>
@@ -307,13 +310,13 @@
 
     <div class="phase">
       <div class="phase-header">
-        <span class="phase-badge badge-planned">Planned</span>
+        <span class="phase-badge badge-building">Building</span>
         <h2 class="phase-title">Git UI Pane</h2>
       </div>
       <p class="phase-desc">Built-in Git interface in the native app. Branch status, diff viewer, stage/commit/push — powered by the same git tools the agent uses.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> Backend endpoints shipped (GET status/log/diff, POST stage/commit/push)</li>
-        <li><span class="planned">○</span> Swift Git pane — branch picker, file status list, inline diff viewer</li>
+        <li><span class="wip">◐</span> Swift Git pane — baseline working, polish pass underway</li>
         <li><span class="planned">○</span> Stage/unstage individual files</li>
         <li><span class="planned">○</span> Commit with message + push in one flow</li>
         <li><span class="planned">○</span> Pull/fetch with conflict indication</li>
@@ -323,14 +326,14 @@
 
     <div class="phase">
       <div class="phase-header">
-        <span class="phase-badge badge-planned">Planned</span>
+        <span class="phase-badge badge-building">Building</span>
         <h2 class="phase-title">Fleet Task Execution</h2>
       </div>
       <p class="phase-desc">Distributed task dispatch. Workers receive and execute tasks from the primary, report results. Fleet-aware experiment scheduling.</p>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Worker mode (fawx serve --fleet)</li>
-        <li><span class="planned">○</span> Task dispatch over Tailscale HTTP</li>
-        <li><span class="planned">○</span> Heartbeat monitoring + health checks</li>
+        <li><span class="check">✓</span> Worker mode (fawx serve --fleet)</li>
+        <li><span class="check">✓</span> Task dispatch over Tailscale HTTP</li>
+        <li><span class="check">✓</span> Heartbeat monitoring + health checks</li>
         <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)
           <ul>
             <li><strong>Security note:</strong> GitHub PATs with <code>contents:write</code> can merge PRs, not just push branches. When implementing PAT sharing to subagents/workers:
@@ -357,9 +360,9 @@
         <li><span class="check">✓</span> Auto-decomposition engine — DAG parser, sequential/parallel/DAG dispatchers, aggregator (fx-decompose)</li>
         <li><span class="check">✓</span> Thinking registry — per-model profiles, runtime rejection cache, priority matching (fx-llm)</li>
         <li><span class="check">✓</span> Training data curation — chain extraction, quality filters, dataset manager, 4 export formats (fx-training)</li>
+        <li><span class="check">✓</span> ThinkingRegistry wired into HeadlessApp with recent adaptive-profile cleanup</li>
         <li><span class="planned">○</span> Semantic merge validation</li>
         <li><span class="planned">○</span> Fitness backpropagation (scores flow back to inform decomposition)</li>
-        <li><span class="planned">○</span> Wire ThinkingRegistry into HeadlessApp (replace hardcoded levels)</li>
       </ul>
     </div>
     <hr class="divider">
