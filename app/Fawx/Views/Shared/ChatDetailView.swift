@@ -9,6 +9,13 @@ struct ChatDetailView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
+    @State private var isShowingRipcordSheet = false
+    @State private var isLoadingRipcordJournal = false
+    @State private var ripcordJournalEntries: [JournalEntry] = []
+    @State private var ripcordJournalErrorMessage: String?
+    @State private var ripcordReport: RipcordReport?
+    @State private var pendingRipcordConfirmation: RipcordConfirmationAction?
+    @State private var ripcordActionInFlight: RipcordAction?
 
     let emptyStateTitle: String
     let emptyStateMessage: String
@@ -50,6 +57,23 @@ struct ChatDetailView: View {
                         .padding(.top, FawxSpacing.paddingLG)
                 }
             }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let ripcordStatus = appState.activeRipcordStatus {
+                    RipcordBanner(
+                        status: ripcordStatus,
+                        isPerformingAction: ripcordActionInFlight != nil,
+                        reviewAction: presentRipcordJournal,
+                        pullAction: {
+                            pendingRipcordConfirmation = .pull
+                        },
+                        approveAction: {
+                            pendingRipcordConfirmation = .approve
+                        }
+                    )
+                    .padding(.horizontal, FawxSpacing.paddingXL)
+                    .padding(.top, FawxSpacing.paddingSM)
+                }
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 composerArea
             }
@@ -75,8 +99,127 @@ struct ChatDetailView: View {
                 scheduleScrollToBottom(using: proxy)
             }
 #endif
+            .sheet(
+                isPresented: $isShowingRipcordSheet,
+                onDismiss: {
+                    ripcordReport = nil
+                }
+            ) {
+                if let ripcordReport {
+                    RipcordReportView(report: ripcordReport, dismissAction: {
+                        self.ripcordReport = nil
+                        isShowingRipcordSheet = false
+                    })
+                } else {
+                    RipcordJournalPanel(
+                        status: appState.activeRipcordStatus,
+                        entries: ripcordJournalEntries,
+                        isLoading: isLoadingRipcordJournal,
+                        errorMessage: ripcordJournalErrorMessage,
+                        isPerformingAction: ripcordActionInFlight != nil,
+                        refreshAction: {
+                            Task {
+                                await loadRipcordJournal()
+                            }
+                        },
+                        pullAction: {
+                            pendingRipcordConfirmation = .pull
+                        },
+                        approveAction: {
+                            pendingRipcordConfirmation = .approve
+                        },
+                        dismissAction: {
+                            isShowingRipcordSheet = false
+                        }
+                    )
+                }
+            }
+            .confirmationDialog(
+                pendingRipcordConfirmation?.title ?? "",
+                isPresented: Binding(
+                    get: { pendingRipcordConfirmation != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            pendingRipcordConfirmation = nil
+                        }
+                    }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(
+                    pendingRipcordConfirmation?.buttonTitle ?? "",
+                    role: pendingRipcordConfirmation?.buttonRole
+                ) {
+                    guard let pendingRipcordConfirmation else {
+                        return
+                    }
+
+                    Task {
+                        await performRipcordAction(pendingRipcordConfirmation)
+                    }
+                }
+
+                Button("Cancel", role: .cancel) {
+                    pendingRipcordConfirmation = nil
+                }
+            } message: {
+                Text(pendingRipcordConfirmation?.message ?? "")
+            }
         }
         .background(Color.fawxBackground)
+    }
+
+    private func presentRipcordJournal() {
+        ripcordReport = nil
+        isShowingRipcordSheet = true
+
+        Task {
+            await loadRipcordJournal()
+        }
+    }
+
+    @MainActor
+    private func loadRipcordJournal() async {
+        guard !isLoadingRipcordJournal else {
+            return
+        }
+
+        isLoadingRipcordJournal = true
+        ripcordJournalErrorMessage = nil
+        defer { isLoadingRipcordJournal = false }
+
+        do {
+            ripcordJournalEntries = try await appState.loadRipcordJournal()
+        } catch {
+            ripcordJournalErrorMessage = error.localizedDescription
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    @MainActor
+    private func performRipcordAction(_ action: RipcordConfirmationAction) async {
+        pendingRipcordConfirmation = nil
+        ripcordActionInFlight = action.ripcordAction
+        ripcordJournalErrorMessage = nil
+        defer { ripcordActionInFlight = nil }
+
+        do {
+            switch action {
+            case .pull:
+                ripcordReport = try await appState.pullRipcord()
+                ripcordJournalEntries = []
+                isShowingRipcordSheet = true
+            case .approve:
+                try await appState.approveRipcord()
+                ripcordReport = nil
+                ripcordJournalEntries = []
+                isShowingRipcordSheet = false
+            }
+        } catch {
+            ripcordJournalErrorMessage = error.localizedDescription
+            isShowingRipcordSheet = true
+            await appState.noteRecoverableRequestFailure(error)
+        }
     }
 
     private var loadingOverlay: some View {
@@ -344,6 +487,63 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private enum RipcordAction {
+    case pull
+    case approve
+}
+
+private enum RipcordConfirmationAction: String, Identifiable {
+    case pull
+    case approve
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .pull:
+            return "Pull ripcord?"
+        case .approve:
+            return "Approve changes?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .pull:
+            return "Fawx will try to undo every reversible journaled action and keep an audit record of anything it cannot revert."
+        case .approve:
+            return "This clears the ripcord journal and keeps the changes that have already been made."
+        }
+    }
+
+    var buttonTitle: String {
+        switch self {
+        case .pull:
+            return "Pull Ripcord"
+        case .approve:
+            return "Approve Changes"
+        }
+    }
+
+    var buttonRole: ButtonRole? {
+        switch self {
+        case .pull:
+            return .destructive
+        case .approve:
+            return nil
+        }
+    }
+
+    var ripcordAction: RipcordAction {
+        switch self {
+        case .pull:
+            return .pull
+        case .approve:
+            return .approve
+        }
+    }
 }
 
 struct PermissionPromptSheetView: View {
