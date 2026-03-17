@@ -510,6 +510,7 @@ fn build_headless_startup(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Pre-existing constructor shape; follow-up will bundle args into a config struct.
 fn build_headless_app(
     router: Arc<fx_llm::ModelRouter>,
     config: fx_config::FawxConfig,

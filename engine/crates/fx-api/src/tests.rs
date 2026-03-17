@@ -13,7 +13,9 @@ use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::server_runtime::ServerRuntime;
 use crate::sse::{send_sse_frame, serialize_stream_event};
-use crate::state::{build_channel_runtime, default_telemetry, ChannelRuntime, HttpState};
+use crate::state::{
+    build_channel_runtime, default_telemetry, ChannelRuntime, HttpState, SharedReadState,
+};
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
     ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody,
@@ -1253,6 +1255,8 @@ mod routing_and_status {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            experiment_registry: None,
         })
         .expect("test app")
     }
@@ -1335,8 +1339,11 @@ mod routing_and_status {
             .clone()
             .unwrap_or_else(std::env::temp_dir);
         let has_synthesis = app.config().model.synthesis_instruction.is_some();
+        let shared = Arc::new(SharedReadState::from_app(&app));
         HttpState {
             app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
@@ -1372,11 +1379,12 @@ mod routing_and_status {
             .clone()
             .unwrap_or_else(std::env::temp_dir);
         let has_synthesis = config.model.synthesis_instruction.is_some();
+        let app = make_test_app_with_config(config, config_manager);
+        let shared = Arc::new(SharedReadState::from_app(&app));
         HttpState {
-            app: Arc::new(Mutex::new(make_test_app_with_config(
-                config,
-                config_manager,
-            ))),
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
@@ -2606,6 +2614,8 @@ allowed_chat_ids = [123]
                 session_key: None,
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
+                permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                experiment_registry: None,
             })
             .expect("test app"),
             Vec::new(),
@@ -3313,8 +3323,12 @@ thinking = "adaptive"
         let mut webhooks = std::collections::HashMap::new();
         webhooks.insert("alpha".to_string(), webhook);
         let data_dir = std::env::temp_dir();
+        let app = make_test_app(None);
+        let shared = Arc::new(SharedReadState::from_app(&app));
         let state = HttpState {
-            app: Arc::new(Mutex::new(make_test_app(None))),
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
@@ -4028,6 +4042,8 @@ mod telegram_update {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
+            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            experiment_registry: None,
         })
         .expect("test app")
     }

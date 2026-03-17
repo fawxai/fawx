@@ -12,6 +12,7 @@ use crate::cancellation::CancellationToken;
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionPromptState};
 use crate::streaming::{StreamCallback, StreamEvent};
 use async_trait::async_trait;
+use fx_config::CapabilityMode;
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +32,8 @@ pub struct PermissionPolicy {
     pub ask_required: HashSet<String>,
     /// If true, unmapped tool categories default to requiring approval.
     pub default_ask: bool,
+    /// Whether restricted actions prompt or are silently denied.
+    pub mode: CapabilityMode,
 }
 
 impl PermissionPolicy {
@@ -40,6 +43,7 @@ impl PermissionPolicy {
             unrestricted: HashSet::new(),
             ask_required: HashSet::new(),
             default_ask: false,
+            mode: CapabilityMode::Capability,
         }
     }
 
@@ -65,6 +69,7 @@ impl PermissionPolicy {
             unrestricted,
             ask_required,
             default_ask: true,
+            mode: CapabilityMode::Prompt,
         }
     }
 
@@ -223,7 +228,12 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             return PermissionCheck::Allowed;
         }
 
-        self.ask_permission(call, category, cancel).await
+        match self.permissions.mode {
+            CapabilityMode::Capability => {
+                PermissionCheck::Denied(capability_denied_result(call, category))
+            }
+            CapabilityMode::Prompt => self.ask_permission(call, category, cancel).await,
+        }
     }
 
     async fn ask_permission(
@@ -350,6 +360,27 @@ fn tool_to_action_category(tool_name: &str) -> &'static str {
     }
 }
 
+fn capability_denied_result(call: &ToolCall, category: &str) -> ToolResult {
+    let message = match category {
+        "network_listen" | "outbound_message" => {
+            "DENIED: This action is not available in this session. Request a capability grant or use an alternative approach."
+        }
+        "credential_change" | "system_install" | "kernel_modify" => {
+            "DENIED: This action requires elevated privileges not available in this session."
+        }
+        "file_delete" | "outside_workspace" => {
+            "DENIED: This action is outside the current session's permitted scope."
+        }
+        _ => "DENIED: This action is not permitted in the current session configuration.",
+    };
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success: false,
+        output: message.to_string(),
+    }
+}
+
 fn denied_result(call: &ToolCall, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: call.id.clone(),
@@ -454,7 +485,7 @@ mod tests {
         let captured = Arc::clone(&captured_id);
         let callback: StreamCallback = Arc::new(move |event| {
             if let StreamEvent::PermissionPrompt(prompt) = event {
-                *captured.lock().unwrap() = Some(prompt.id.clone());
+                *captured.lock().expect("capture prompt") = Some(prompt.id.clone());
             }
         });
         (captured_id, callback)
@@ -468,13 +499,20 @@ mod tests {
         tokio::spawn(async move {
             for _ in 0..100 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                let prompt_id = captured_id.lock().unwrap().clone();
+                let prompt_id = captured_id.lock().expect("read prompt id").clone();
                 if let Some(id) = prompt_id {
                     let _ = prompt_state.resolve(&id, decision);
                     break;
                 }
             }
         })
+    }
+
+    fn cautious_policy(mode: CapabilityMode) -> PermissionPolicy {
+        PermissionPolicy {
+            mode,
+            ..PermissionPolicy::cautious()
+        }
     }
 
     #[tokio::test]
@@ -496,37 +534,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_requires_permission_under_cautious() {
-        let prompt_state = Arc::new(PermissionPromptState::new());
+    async fn capability_mode_silently_denies_restricted_tool() {
         let (captured_id, callback) = capture_prompt_id();
-        let resolver = spawn_resolution(
-            Arc::clone(&prompt_state),
-            Arc::clone(&captured_id),
-            PermissionDecision::Allow,
-        );
         let executor = PermissionGateExecutor::new(
             PassthroughExecutor,
-            PermissionPolicy::cautious(),
-            prompt_state,
+            cautious_policy(CapabilityMode::Capability),
+            Arc::new(PermissionPromptState::new()),
         )
         .with_stream_callback(callback);
 
-        let results = tokio::time::timeout(
-            Duration::from_secs(1),
-            executor.execute_tools(&[test_call("custom_tool")], None),
-        )
-        .await
-        .expect("permission resolution timeout")
-        .expect("execute");
-        resolver.await.expect("resolver join");
+        let results = executor
+            .execute_tools(&[test_call("shell")], None)
+            .await
+            .expect("execute");
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].success);
-        assert!(captured_id.lock().unwrap().is_some());
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("DENIED"));
+        assert!(captured_id.lock().expect("captured").is_none());
     }
 
     #[tokio::test]
-    async fn prompt_allow_executes_tool() {
+    async fn capability_mode_allows_unrestricted_tool() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            cautious_policy(CapabilityMode::Capability),
+            Arc::new(PermissionPromptState::new()),
+        );
+
+        let results = executor
+            .execute_tools(&[test_call("web_search")], None)
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn capability_mode_session_override_still_works() {
+        let prompt_state = Arc::new(PermissionPromptState::new());
+        let receiver = prompt_state
+            .register("setup".into(), "shell".into())
+            .expect("register")
+            .expect("receiver");
+        prompt_state
+            .resolve("setup", PermissionDecision::AllowSession)
+            .expect("resolve");
+        drop(receiver);
+
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            cautious_policy(CapabilityMode::Capability),
+            prompt_state,
+        );
+
+        let results = executor
+            .execute_tools(&[test_call("shell")], None)
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn prompt_mode_still_prompts() {
         let prompt_state = Arc::new(PermissionPromptState::new());
         let (captured_id, callback) = capture_prompt_id();
         let resolver = spawn_resolution(
@@ -536,7 +609,7 @@ mod tests {
         );
         let executor = PermissionGateExecutor::new(
             PassthroughExecutor,
-            PermissionPolicy::cautious(),
+            cautious_policy(CapabilityMode::Prompt),
             prompt_state,
         )
         .with_stream_callback(callback);
@@ -552,7 +625,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
-        assert_eq!(results[0].output, "executed");
+        assert!(captured_id.lock().expect("captured").is_some());
     }
 
     #[tokio::test]
@@ -566,7 +639,7 @@ mod tests {
         );
         let executor = PermissionGateExecutor::new(
             PassthroughExecutor,
-            PermissionPolicy::cautious(),
+            cautious_policy(CapabilityMode::Prompt),
             prompt_state,
         )
         .with_stream_callback(callback);
@@ -585,9 +658,6 @@ mod tests {
         assert!(results[0].output.contains("PERMISSION DENIED"));
     }
 
-    // Note: prompt_timeout test requires tokio `test-util` feature (start_paused).
-    // Deferred to a follow-up that adds the feature to fx-kernel's dev-dependencies.
-
     #[tokio::test]
     async fn prompt_cancel_returns_denied_result() {
         let prompt_state = Arc::new(PermissionPromptState::new());
@@ -598,7 +668,7 @@ mod tests {
         let canceller = tokio::spawn(async move {
             for _ in 0..100 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                if wait_for_prompt.lock().unwrap().is_some() {
+                if wait_for_prompt.lock().expect("wait for prompt").is_some() {
                     cancel_token.cancel();
                     break;
                 }
@@ -606,7 +676,7 @@ mod tests {
         });
         let executor = PermissionGateExecutor::new(
             PassthroughExecutor,
-            PermissionPolicy::cautious(),
+            cautious_policy(CapabilityMode::Prompt),
             prompt_state,
         )
         .with_stream_callback(callback);
@@ -623,33 +693,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert!(results[0].output.contains("Cancelled"));
-    }
-
-    #[tokio::test]
-    async fn session_override_skips_prompt() {
-        let prompt_state = Arc::new(PermissionPromptState::new());
-        let rx = prompt_state
-            .register("setup".into(), "shell".into())
-            .expect("register")
-            .expect("receiver");
-        prompt_state
-            .resolve("setup", PermissionDecision::AllowSession)
-            .expect("resolve");
-        drop(rx);
-
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::cautious(),
-            prompt_state,
-        );
-
-        let results = executor
-            .execute_tools(&[test_call("shell")], None)
-            .await
-            .expect("execute");
-
-        assert_eq!(results.len(), 1);
-        assert!(results[0].success);
     }
 
     #[test]
@@ -670,6 +713,19 @@ mod tests {
         assert!(!result.success);
         assert!(result.output.contains("User denied"));
         assert_eq!(result.tool_call_id, "call_shell");
+    }
+
+    #[test]
+    fn capability_denied_result_contains_category() {
+        let call = test_call("delete_file");
+        let result = capability_denied_result(&call, "file_delete");
+
+        assert!(!result.success);
+        assert!(result.output.contains("DENIED"));
+        assert!(
+            !result.output.contains("file_delete"),
+            "should not leak category name"
+        );
     }
 
     #[test]

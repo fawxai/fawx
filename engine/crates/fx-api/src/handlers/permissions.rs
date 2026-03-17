@@ -3,7 +3,9 @@ use crate::state::HttpState;
 use crate::types::ErrorBody;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
-use fx_config::{FawxConfig, PermissionAction, PermissionPreset, PermissionsConfig};
+use fx_config::{
+    CapabilityMode, FawxConfig, PermissionAction, PermissionPreset, PermissionsConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -21,6 +23,7 @@ pub struct PermissionEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PermissionsResponse {
     pub preset: String,
+    pub mode: String,
     pub permissions: Vec<PermissionEntry>,
     pub available_presets: Vec<String>,
 }
@@ -28,6 +31,7 @@ pub struct PermissionsResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PermissionsPatchRequest {
     pub preset: Option<String>,
+    pub mode: Option<String>,
     #[serde(default)]
     pub changes: Option<Vec<PermissionChange>>,
 }
@@ -97,6 +101,7 @@ pub async fn handle_patch_permissions(
 fn build_permissions_response(config: &PermissionsConfig) -> PermissionsResponse {
     PermissionsResponse {
         preset: config.preset.as_str().to_string(),
+        mode: capability_mode_name(config.mode).to_string(),
         permissions: permission_entries(config),
         available_presets: available_presets(),
     }
@@ -129,6 +134,7 @@ fn apply_patch_request(
     validate_patch_request(&request).map_err(validation_error)?;
 
     let mut permissions = resolve_base_permissions(current, request.preset.as_deref())?;
+    apply_capability_mode(&mut permissions, request.mode.as_deref())?;
     let changed_actions = apply_permission_changes(&mut permissions, request.changes)?;
     if !changed_actions.is_empty() {
         permissions.preset = PermissionPreset::Custom;
@@ -138,10 +144,10 @@ fn apply_patch_request(
 }
 
 fn validate_patch_request(request: &PermissionsPatchRequest) -> Result<(), String> {
-    if has_preset(request) || has_changes(request) {
+    if has_preset(request) || has_mode(request) || has_changes(request) {
         return Ok(());
     }
-    Err("permissions patch requires a preset or at least one change".to_string())
+    Err("permissions patch requires a preset, mode, or at least one change".to_string())
 }
 
 fn has_preset(request: &PermissionsPatchRequest) -> bool {
@@ -149,6 +155,13 @@ fn has_preset(request: &PermissionsPatchRequest) -> bool {
         .preset
         .as_deref()
         .is_some_and(|preset| !preset.trim().is_empty())
+}
+
+fn has_mode(request: &PermissionsPatchRequest) -> bool {
+    request
+        .mode
+        .as_deref()
+        .is_some_and(|mode| !mode.trim().is_empty())
 }
 
 fn has_changes(request: &PermissionsPatchRequest) -> bool {
@@ -212,6 +225,7 @@ async fn config_manager_handle(state: &HttpState) -> Option<ConfigManagerHandle>
 fn normalized_permissions(config: &PermissionsConfig) -> PermissionsConfig {
     let mut normalized = PermissionsConfig {
         preset: config.preset,
+        mode: config.mode,
         unrestricted: Vec::new(),
         proposal_required: Vec::new(),
     };
@@ -219,7 +233,7 @@ fn normalized_permissions(config: &PermissionsConfig) -> PermissionsConfig {
     for &action in all_actions() {
         match action_level(action, config) {
             "allow" => normalized.unrestricted.push(action),
-            "propose" => normalized.proposal_required.push(action),
+            "ask" | "propose" | "denied" => normalized.proposal_required.push(action),
             _ => {}
         }
     }
@@ -229,12 +243,12 @@ fn normalized_permissions(config: &PermissionsConfig) -> PermissionsConfig {
 
 fn action_level(action: PermissionAction, config: &PermissionsConfig) -> &'static str {
     if config.unrestricted.contains(&action) {
-        "allow"
-    } else if config.proposal_required.contains(&action) {
-        "propose"
-    } else {
-        "deny"
+        return "allow";
     }
+    if config.proposal_required.contains(&action) {
+        return proposal_level(config.mode);
+    }
+    "deny"
 }
 
 fn set_action_level(
@@ -260,11 +274,45 @@ fn remove_action(config: &mut PermissionsConfig, action: PermissionAction) {
 fn parse_level(level: &str) -> Result<PermissionLevel, String> {
     match level.trim().to_ascii_lowercase().as_str() {
         "allow" => Ok(PermissionLevel::Allow),
-        "propose" => Ok(PermissionLevel::Propose),
+        "ask" | "propose" | "denied" => Ok(PermissionLevel::Propose),
         "deny" => Ok(PermissionLevel::Deny),
         other => Err(format!(
             "unknown permission level '{other}'; expected allow, propose, or deny"
         )),
+    }
+}
+
+fn apply_capability_mode(
+    config: &mut PermissionsConfig,
+    mode: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if let Some(mode_name) = mode {
+        config.mode = parse_capability_mode(mode_name).map_err(validation_error)?;
+    }
+    Ok(())
+}
+
+fn parse_capability_mode(mode: &str) -> Result<CapabilityMode, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "capability" => Ok(CapabilityMode::Capability),
+        "prompt" => Ok(CapabilityMode::Prompt),
+        other => Err(format!(
+            "unknown capability mode '{other}'; expected capability or prompt"
+        )),
+    }
+}
+
+fn capability_mode_name(mode: CapabilityMode) -> &'static str {
+    match mode {
+        CapabilityMode::Capability => "capability",
+        CapabilityMode::Prompt => "prompt",
+    }
+}
+
+fn proposal_level(mode: CapabilityMode) -> &'static str {
+    match mode {
+        CapabilityMode::Capability => "denied",
+        CapabilityMode::Prompt => "ask",
     }
 }
 
@@ -339,6 +387,11 @@ fn write_permissions_table(
 ) -> Result<(), String> {
     let table = permissions_table(document)?;
     replace_item(table, "preset", edit_value(permissions.preset.as_str()))?;
+    replace_item(
+        table,
+        "mode",
+        edit_value(capability_mode_name(permissions.mode)),
+    )?;
     replace_item(
         table,
         "unrestricted",
@@ -532,6 +585,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_reflects_capability_mode_defaults() {
+        let (_temp, state) = test_state(PermissionsConfig::power());
+        let Json(response) = handle_get_permissions(State(state))
+            .await
+            .expect("get permissions");
+
+        assert_eq!(response.mode, "capability");
+        assert_eq!(
+            permission_level(&response, "credential_change"),
+            Some("denied")
+        );
+    }
+
+    #[tokio::test]
     async fn get_reflects_power_preset_defaults() {
         let (_temp, state) = test_state(PermissionsConfig::power());
         let Json(response) = handle_get_permissions(State(state))
@@ -571,6 +638,7 @@ mod tests {
         let (_temp, state) = test_state(PermissionsConfig::power());
         let request = PermissionsPatchRequest {
             preset: None,
+            mode: None,
             changes: Some(vec![PermissionChange {
                 action: "nonexistent".to_string(),
                 level: "allow".to_string(),
@@ -590,6 +658,7 @@ mod tests {
         let (_temp, state) = test_state(PermissionsConfig::power());
         let request = PermissionsPatchRequest {
             preset: None,
+            mode: None,
             changes: Some(vec![PermissionChange {
                 action: "shell".to_string(),
                 level: "yolo".to_string(),
@@ -609,6 +678,7 @@ mod tests {
         let (temp, state) = test_state(PermissionsConfig::power());
         let request = PermissionsPatchRequest {
             preset: Some("cautious".to_string()),
+            mode: None,
             changes: Some(vec![PermissionChange {
                 action: "shell".to_string(),
                 level: "allow".to_string(),
@@ -643,6 +713,7 @@ mod tests {
         let (_temp, state) = test_state(PermissionsConfig::power());
         let request = PermissionsPatchRequest {
             preset: Some("cautious".to_string()),
+            mode: None,
             changes: None,
         };
 
@@ -665,10 +736,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_mode_only_updates_response_and_display_levels() {
+        let (_temp, state) = test_state(PermissionsConfig::power());
+        let request = PermissionsPatchRequest {
+            preset: None,
+            mode: Some("prompt".to_string()),
+            changes: None,
+        };
+
+        let Json(response) = handle_patch_permissions(State(state.clone()), Json(request))
+            .await
+            .expect("patch permissions");
+        assert!(response.updated);
+
+        let Json(get_response) = handle_get_permissions(State(state))
+            .await
+            .expect("get updated");
+        assert_eq!(get_response.mode, "prompt");
+        assert_eq!(
+            permission_level(&get_response, "credential_change"),
+            Some("ask")
+        );
+    }
+
+    #[tokio::test]
     async fn patch_changes_only_sets_custom() {
         let (_temp, state) = test_state(PermissionsConfig::power());
         let request = PermissionsPatchRequest {
             preset: None,
+            mode: None,
             changes: Some(vec![PermissionChange {
                 action: "shell".to_string(),
                 level: "deny".to_string(),
@@ -733,6 +829,7 @@ mod tests {
     fn action_level_maps_correctly() {
         let config = PermissionsConfig {
             preset: PermissionPreset::Custom,
+            mode: CapabilityMode::Prompt,
             unrestricted: vec![PermissionAction::ReadAny],
             proposal_required: vec![PermissionAction::FileDelete],
         };
@@ -765,10 +862,15 @@ mod tests {
         let manager = Arc::new(StdMutex::new(
             ConfigManager::new(temp.path()).expect("config manager"),
         ));
+        let app = TestApp {
+            config_manager: Some(Arc::clone(&manager)),
+        };
         let state = HttpState {
-            app: Arc::new(Mutex::new(TestApp {
+            app: Arc::new(Mutex::new(app)),
+            shared: Arc::new(crate::state::SharedReadState::from_app(&TestApp {
                 config_manager: Some(manager),
             })),
+            config_manager: None,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: ServerRuntime::local(8400),
@@ -797,7 +899,7 @@ mod tests {
         config.general.data_dir = Some(data_dir.to_path_buf());
         config.permissions = permissions;
 
-        let content = toml::to_string_pretty(&config).expect("serialize config");
+        let content = toml_edit::ser::to_string_pretty(&config).expect("serialize config");
         fs::write(data_dir.join("config.toml"), content).expect("write config");
     }
 }

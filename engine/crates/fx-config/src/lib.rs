@@ -148,6 +148,16 @@ pub struct WorkspaceConfig {
 }
 
 /// Permission presets that define default agent autonomy levels.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMode {
+    /// Default: denied actions are silently blocked with structured error.
+    #[default]
+    Capability,
+    /// Opt-in: denied actions trigger interactive prompts (legacy behavior).
+    Prompt,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionPreset {
@@ -173,12 +183,12 @@ impl FromStr for PermissionPreset {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "power" => Ok(Self::Power),
-            "cautious" => Ok(Self::Cautious),
-            "experimental" => Ok(Self::Experimental),
+            "power" | "standard" => Ok(Self::Power),
+            "cautious" | "restricted" => Ok(Self::Cautious),
+            "experimental" | "open" => Ok(Self::Experimental),
             "custom" => Ok(Self::Custom),
             other => Err(format!(
-                "unknown permission preset '{other}'; expected power, cautious, experimental, custom"
+                "unknown permission preset '{other}'; expected power, cautious, experimental, custom, standard, restricted, open"
             )),
         }
     }
@@ -235,6 +245,9 @@ impl PermissionAction {
 pub struct PermissionsConfig {
     /// Selected preset that produced these permission lists.
     pub preset: PermissionPreset,
+    /// Whether restricted actions are denied or trigger prompts.
+    #[serde(default)]
+    pub mode: CapabilityMode,
     /// Actions Fawx can perform without asking.
     pub unrestricted: Vec<PermissionAction>,
     /// Actions that require human approval via proposal.
@@ -246,6 +259,7 @@ impl PermissionsConfig {
     pub fn power() -> Self {
         Self {
             preset: PermissionPreset::Power,
+            mode: CapabilityMode::Capability,
             unrestricted: actions(&[
                 PermissionAction::ReadAny,
                 PermissionAction::WebSearch,
@@ -273,6 +287,7 @@ impl PermissionsConfig {
     pub fn cautious() -> Self {
         Self {
             preset: PermissionPreset::Cautious,
+            mode: CapabilityMode::Capability,
             unrestricted: actions(&[
                 PermissionAction::ReadAny,
                 PermissionAction::WebSearch,
@@ -300,6 +315,7 @@ impl PermissionsConfig {
     pub fn experimental() -> Self {
         Self {
             preset: PermissionPreset::Experimental,
+            mode: CapabilityMode::Capability,
             unrestricted: actions(&[
                 PermissionAction::ReadAny,
                 PermissionAction::WebSearch,
@@ -323,6 +339,33 @@ impl PermissionsConfig {
         }
     }
 
+    /// Open — everything allowed except privilege escalation.
+    pub fn open() -> Self {
+        Self {
+            preset: PermissionPreset::Experimental,
+            mode: CapabilityMode::Capability,
+            ..Self::experimental()
+        }
+    }
+
+    /// Standard — developer workflow, credential/system changes blocked.
+    pub fn standard() -> Self {
+        Self {
+            preset: PermissionPreset::Power,
+            mode: CapabilityMode::Capability,
+            ..Self::power()
+        }
+    }
+
+    /// Restricted — read-heavy, most writes blocked.
+    pub fn restricted() -> Self {
+        Self {
+            preset: PermissionPreset::Cautious,
+            mode: CapabilityMode::Capability,
+            ..Self::cautious()
+        }
+    }
+
     pub fn from_preset_name(name: &str) -> Result<Self, String> {
         match PermissionPreset::from_str(name)? {
             PermissionPreset::Power => Ok(Self::power()),
@@ -338,7 +381,7 @@ impl PermissionsConfig {
 
 impl Default for PermissionsConfig {
     fn default() -> Self {
-        Self::power()
+        Self::standard()
     }
 }
 
@@ -1346,6 +1389,7 @@ log_dir = "~/.fawx/custom-logs"
             },
             permissions: PermissionsConfig {
                 preset: PermissionPreset::Custom,
+                mode: CapabilityMode::Prompt,
                 unrestricted: vec![PermissionAction::ReadAny, PermissionAction::ToolCall],
                 proposal_required: vec![PermissionAction::FileDelete],
             },
@@ -1918,6 +1962,7 @@ working_dir = "/tmp/work"
     fn permissions_config_serde_round_trip() {
         let config = PermissionsConfig {
             preset: PermissionPreset::Custom,
+            mode: CapabilityMode::Prompt,
             unrestricted: vec![PermissionAction::ReadAny, PermissionAction::ToolCall],
             proposal_required: vec![PermissionAction::FileDelete, PermissionAction::KernelModify],
         };
@@ -2071,8 +2116,33 @@ working_dir = "/tmp/work"
             PermissionsConfig::from_preset_name("custom").expect("custom preset"),
             PermissionsConfig {
                 preset: PermissionPreset::Custom,
+                mode: CapabilityMode::Capability,
                 ..PermissionsConfig::default()
             }
+        );
+    }
+
+    #[test]
+    fn permissions_default_is_standard_capability() {
+        let config = PermissionsConfig::default();
+
+        assert_eq!(config, PermissionsConfig::standard());
+        assert_eq!(config.mode, CapabilityMode::Capability);
+    }
+
+    #[test]
+    fn preset_from_name_accepts_aliases() {
+        assert_eq!(
+            PermissionsConfig::from_preset_name("standard").expect("standard preset"),
+            PermissionsConfig::power()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("restricted").expect("restricted preset"),
+            PermissionsConfig::cautious()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("open").expect("open preset"),
+            PermissionsConfig::experimental()
         );
     }
 
@@ -2081,7 +2151,7 @@ working_dir = "/tmp/work"
         let error = PermissionsConfig::from_preset_name("nope").expect_err("should fail fast");
         assert_eq!(
             error,
-            "unknown permission preset 'nope'; expected power, cautious, experimental, custom"
+            "unknown permission preset 'nope'; expected power, cautious, experimental, custom, standard, restricted, open"
         );
     }
 
@@ -2090,9 +2160,21 @@ working_dir = "/tmp/work"
         let config: FawxConfig =
             toml::from_str("[general]\nmax_iterations = 12\n").expect("deserialize old config");
         assert_eq!(config.workspace, WorkspaceConfig::default());
-        assert_eq!(config.permissions, PermissionsConfig::power());
         assert_eq!(config.budget, BudgetConfig::default());
         assert_eq!(config.sandbox, SandboxConfig::default());
         assert_eq!(config.proposals, ProposalConfig::default());
+    }
+
+    #[test]
+    fn permissions_without_mode_defaults_to_capability() {
+        let config: PermissionsConfig = toml::from_str(
+            r#"
+preset = "power"
+unrestricted = ["read_any"]
+proposal_required = ["shell"]
+"#,
+        )
+        .expect("deserialize permissions without mode");
+        assert_eq!(config.mode, CapabilityMode::Capability);
     }
 }
