@@ -153,7 +153,10 @@ fn handle_stream_event(
             complete_experiment_tool(active_experiments, experiment_panel, &id);
             send_tool_result(tx, output, is_error);
         }
-        StreamEvent::Done { .. } | StreamEvent::PhaseChange { .. } => {}
+        StreamEvent::Done { .. }
+        | StreamEvent::PhaseChange { .. }
+        | StreamEvent::PermissionPrompt(_)
+        | StreamEvent::Error { .. } => {}
     }
 }
 
