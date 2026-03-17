@@ -186,13 +186,14 @@ actor FawxClient {
     }
 
     func patchPermissions(_ request: PermissionsPatchRequest) async throws -> PermissionsPatchResponse {
-        let body = try encoder.encode(request)
-        return try await performRequest(
-            path: "/v1/permissions",
-            method: "PATCH",
-            bodyData: body,
-            decodeAs: PermissionsPatchResponse.self
-        )
+        do {
+            return try await performPermissionsPatch(request)
+        } catch let error as APIError where error.statusCode == 422 {
+            guard let legacyRequest = request.legacyCompatibleRequest else {
+                throw error
+            }
+            return try await performPermissionsPatch(legacyRequest)
+        }
     }
 
     func respondToPermissionPrompt(
@@ -761,6 +762,18 @@ actor FawxClient {
             authRequired: false,
             bodyData: bodyData,
             decodeAs: Response.self
+        )
+    }
+
+    private func performPermissionsPatch(
+        _ request: PermissionsPatchRequest
+    ) async throws -> PermissionsPatchResponse {
+        let body = try encoder.encode(request)
+        return try await performRequest(
+            path: "/v1/permissions",
+            method: "PATCH",
+            bodyData: body,
+            decodeAs: PermissionsPatchResponse.self
         )
     }
 
