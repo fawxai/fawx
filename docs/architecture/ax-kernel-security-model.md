@@ -121,10 +121,40 @@ capabilities = ["filesystem", "shell", "network"]
 deny = ["shell.sudo"]
 ```
 
+**Capability escalation via `request_capability` tool:**
+
+When an agent hits a capability boundary, the old model pauses the agent and shows a modal. The AX-first model replaces this with agent-initiated escalation via a tool call.
+
+The `request_capability` tool is a standard tool in the agent's toolkit (when enabled by preset). When the agent receives a `DENIED` result, it can choose to:
+1. **Adapt** — find an alternative approach that stays within its capability space
+2. **Escalate** — call `request_capability` with a reason explaining why it needs the capability
+
+```
+Tool call: request_capability
+Arguments: {
+    "capability": "network.external",
+    "reason": "I need to fetch the dependency from crates.io to complete the build"
+}
+```
+
+The tool call is non-blocking for the kernel — it emits a request to the user through whatever channel is active (TUI prompt, Swift notification, Telegram message) and returns a result:
+- `{ "granted": true, "scope": "session", "note": "Session will restart to apply new capability" }`
+- `{ "granted": false, "reason": "User denied the request" }`
+
+**Why this is better than prompt mode:**
+- The agent is never paused. It made a decision to escalate, not a system that interrupted it.
+- The user gets context — WHY the agent needs the capability, not just WHICH tool was blocked.
+- The agent can decide whether escalation is worth it, or just take an alternative path.
+- No timeouts, no SSE gymnastics, no modal dismissal bugs.
+- It's just another tool. Availability is controlled by the capability space like everything else.
+
+**This replaces "prompt mode" entirely.** The old `CapabilityMode::Prompt` (legacy per-action consent) is retained for backward compatibility but deprecated. The `request_capability` tool is the forward-looking escalation mechanism.
+
 **Pressure test:**
-- *What if the preset is wrong?* Agent surfaces "I need X capability but this session doesn't have it" as a clear message. This is the one human-in-the-loop moment — a **capability negotiation**, not a per-action prompt. "I need network access to fetch that dependency. Want to grant it for this session?" Once, not per-action. Granting requires re-sandboxing (Landlock rules update), which may require session restart.
+- *What if the preset is wrong?* Agent hits a denial, calls `request_capability` with context. User sees a meaningful request and grants for the session. Granting may require session restart (OS sandbox is irreversible).
 - *What if the user always overrides to "allow everything"?* That's their choice. OS enforcement still provides a floor (seccomp blocks privilege escalation regardless). The other layers still protect them.
-- *Parsing natural language into capability sets — is that reliable?* No. **Deferred.** Start with presets and explicit flags only.
+- *What if the agent abuses request_capability?* Rate-limit the tool (max 3 requests per session). After that, denials are final. The agent adapts or reports the limitation to the user.
+- *Parsing natural language into capability sets — is that reliable?* No. **Deferred.** Start with presets and explicit flags only. The tool uses structured capability identifiers, not natural language.
 
 **Honest limitation:** This is not novel. NemoClaw does this. Docker does this. It's table stakes. The value is in the layers above.
 
@@ -306,7 +336,8 @@ The earned autonomy system (Phase 4) consumes this data to:
 
 ### Phase 1: Foundation + OS Enforcement (ships first)
 - **OS-level sandbox:** Self-sandboxing via Landlock (filesystem) + seccomp-bpf (syscalls) + network namespace (egress). Capability config maps to kernel rules at session start.
-- **CapabilityGateExecutor:** Refactor from PermissionGateExecutor. Evaluate capabilities at session start, not per-action. Silent block with structured errors for out-of-bounds actions. Per-action consent prompts become opt-in, not default.
+- **CapabilityGateExecutor:** Refactor from PermissionGateExecutor. Evaluate capabilities at session start, not per-action. Silent block with structured errors for out-of-bounds actions. Legacy per-action consent prompts deprecated.
+- **`request_capability` tool:** Agent-initiated capability escalation. Agent decides to ask for a capability, provides reason. User approves/denies asynchronously. Replaces system-initiated prompt mode.
 - **Session-scoped overrides:** CLI flag + API parameter for per-session capability grants.
 - **3 presets:** Open, Standard, Restricted.
   - Open: all local capabilities, seccomp still blocks privilege escalation
@@ -341,6 +372,9 @@ The earned autonomy system (Phase 4) consumes this data to:
 - **FawxShell** — dedicated sandbox runtime, evaluate after Phase 1 validates the approach
 - **Shared mutable state tracking** — v2, when fleet scenarios use databases/services beyond git
 
+### Deprecated
+- **`CapabilityMode::Prompt` (legacy prompt mode)** — system-initiated per-action consent prompts. Retained for backward compatibility but replaced by `request_capability` tool for forward-looking deployments. Will be removed in a future version.
+
 ---
 
 ## Terminology
@@ -349,6 +383,7 @@ The earned autonomy system (Phase 4) consumes this data to:
 - **Capability Space:** The set of actions available to an agent in a given session. Maps to both app-level checks and OS-level enforcement.
 - **Tripwire:** A boundary within the capability space that, when crossed, silently activates journaled monitoring. Invisible to agent.
 - **Ripcord:** The mechanism for atomically reversing all journaled file/git actions since a tripwire was crossed.
+- **`request_capability` tool:** Agent-initiated capability escalation. The agent calls this tool with a reason when it needs a capability it doesn't have. Replaces system-initiated prompt mode.
 - **Phantom Execution:** (Deferred) Intercepting an irreversible action and returning a fake success.
 - **Signal Flywheel:** The feedback loop where human review decisions improve future boundary placement.
 - **Earned Autonomy:** (Future) Automatic boundary adjustment based on accumulated trust signals.
