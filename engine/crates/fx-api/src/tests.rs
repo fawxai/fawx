@@ -1383,12 +1383,12 @@ mod routing_and_status {
             .clone()
             .unwrap_or_else(std::env::temp_dir);
         let has_synthesis = config.model.synthesis_instruction.is_some();
-        let app = make_test_app_with_config(config, config_manager);
+        let app = make_test_app_with_config(config, config_manager.clone());
         let shared = Arc::new(SharedReadState::from_app(&app));
         HttpState {
             app: Arc::new(Mutex::new(app)),
             shared,
-            config_manager: None,
+            config_manager,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
@@ -2812,7 +2812,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["budget_tokens"], 5000);
         assert_eq!(
             json["available"],
-            serde_json::json!(["off", "low", "adaptive", "high"])
+            serde_json::json!(["adaptive", "low", "medium", "high"])
         );
     }
 
@@ -2909,7 +2909,7 @@ thinking = "low"
         let json = response_json(response).await;
         assert_eq!(
             json["error"],
-            "Thinking level 'adaptive' is not supported by the current model. Available: off, low, high"
+            "Thinking level 'adaptive' is not supported by the current model. Available: off, low, medium, high, xhigh"
         );
     }
 
@@ -2962,7 +2962,7 @@ thinking = "adaptive"
         assert_eq!(thinking_json["level"], "high");
         assert_eq!(
             thinking_json["available"],
-            serde_json::json!(["off", "low", "high"])
+            serde_json::json!(["off", "low", "medium", "high", "xhigh"])
         );
     }
 

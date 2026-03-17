@@ -37,11 +37,10 @@ pub fn default_model_mappings() -> Vec<ModelMapping> {
 fn anthropic_adaptive() -> ThinkingProfile {
     ThinkingProfile {
         levels: vec![
-            "off".to_owned(),
+            "adaptive".to_owned(),
             "low".to_owned(),
             "medium".to_owned(),
             "high".to_owned(),
-            "max".to_owned(),
         ],
         default: "high".to_owned(),
         api_style: ApiStyle::AdaptiveEffort,
@@ -52,7 +51,7 @@ fn anthropic_adaptive() -> ThinkingProfile {
 fn anthropic_adaptive_no_max() -> ThinkingProfile {
     ThinkingProfile {
         levels: vec![
-            "off".to_owned(),
+            "adaptive".to_owned(),
             "low".to_owned(),
             "medium".to_owned(),
             "high".to_owned(),
@@ -116,11 +115,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_default_profiles_have_off_level() {
+    fn all_default_profiles_have_baseline_level() {
         for (name, profile) in default_profiles() {
             assert!(
-                profile.levels.contains(&"off".to_owned()),
-                "profile {name} missing 'off' level"
+                profile.levels.contains(&"off".to_owned())
+                    || profile.levels.contains(&"adaptive".to_owned()),
+                "profile {name} missing 'off' or 'adaptive' level"
             );
         }
     }
@@ -145,16 +145,18 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_adaptive_has_max() {
+    fn anthropic_adaptive_includes_adaptive_level() {
         let profiles = default_profiles();
         let adaptive = profiles.get("anthropic-adaptive").unwrap();
-        assert!(adaptive.levels.contains(&"max".to_owned()));
+        assert!(adaptive.levels.contains(&"adaptive".to_owned()));
+        assert!(!adaptive.levels.contains(&"max".to_owned()));
     }
 
     #[test]
     fn anthropic_adaptive_no_max_excludes_max() {
         let profiles = default_profiles();
         let no_max = profiles.get("anthropic-adaptive-no-max").unwrap();
+        assert!(no_max.levels.contains(&"adaptive".to_owned()));
         assert!(!no_max.levels.contains(&"max".to_owned()));
     }
 
