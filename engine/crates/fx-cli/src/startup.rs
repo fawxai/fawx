@@ -1679,6 +1679,7 @@ fn permissions_to_policy(config: &fx_config::PermissionsConfig) -> PermissionPol
         unrestricted,
         ask_required,
         default_ask: has_ask_entries,
+        mode: config.mode,
     }
 }
 

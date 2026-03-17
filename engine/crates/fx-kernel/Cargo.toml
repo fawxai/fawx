@@ -11,6 +11,7 @@ kernel-blind = []
 
 [dependencies]
 fx-core = { workspace = true }
+fx-config.workspace = true
 fx-decompose = { workspace = true }
 fx-propose = { workspace = true }
 fx-storage = { workspace = true }

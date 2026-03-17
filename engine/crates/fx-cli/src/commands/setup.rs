@@ -1338,6 +1338,15 @@ fn write_permissions_config(
         "preset",
         permissions.preset.as_str(),
     )?;
+    set_string(
+        document,
+        &["permissions"],
+        "mode",
+        match permissions.mode {
+            fx_config::CapabilityMode::Capability => "capability",
+            fx_config::CapabilityMode::Prompt => "prompt",
+        },
+    )?;
     set_string_array(document, &["permissions"], "unrestricted", &unrestricted)?;
     set_string_array(
         document,

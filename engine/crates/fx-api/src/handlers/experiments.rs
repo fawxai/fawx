@@ -537,7 +537,7 @@ mod tests {
     use crate::experiment_registry::ExperimentRegistry;
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
-    use crate::state::{build_channel_runtime, default_telemetry};
+    use crate::state::{build_channel_runtime, default_telemetry, SharedReadState};
     use crate::types::{
         AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto,
         SkillSummaryDto, ThinkingLevelDto,
@@ -659,8 +659,11 @@ mod tests {
     fn test_state() -> (TempDir, HttpState) {
         let temp_dir = TempDir::new().expect("tempdir");
         let data_dir = temp_dir.path().to_path_buf();
+        let app = TestApp;
         let state = HttpState {
-            app: Arc::new(Mutex::new(TestApp)),
+            app: Arc::new(Mutex::new(app)),
+            shared: Arc::new(SharedReadState::from_app(&TestApp)),
+            config_manager: None,
             session_registry: None,
             start_time: Instant::now(),
             server_runtime: ServerRuntime::local(8400),
@@ -678,6 +681,7 @@ mod tests {
             cron_store: None,
             experiment_registry: test_registry(&data_dir),
             improvement_provider: None,
+            telemetry: default_telemetry(),
         };
         (temp_dir, state)
     }
@@ -802,7 +806,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err("Cancelled by user".to_string()));
+        assert!(matches!(result, Err(message) if message == "Cancelled by user"));
     }
 
     #[tokio::test]
