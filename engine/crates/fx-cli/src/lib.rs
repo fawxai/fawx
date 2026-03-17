@@ -123,11 +123,13 @@ fn build_app_with_dependencies(
     build_config: HeadlessAppBuildConfig,
 ) -> anyhow::Result<headless::HeadlessApp> {
     let session_bus = startup::build_session_bus_for_data_dir(&build_config.data_dir);
+    let credential_store = startup::open_credential_store(&build_config.data_dir).ok();
     let subagent_manager = build_subagent_manager(
         Arc::clone(&build_config.router),
         &build_config.config,
         build_config.improvement_provider.clone(),
         session_bus.clone(),
+        credential_store,
     );
     let bundle = startup::build_headless_loop_engine_bundle(
         &build_config.config,
@@ -181,12 +183,15 @@ fn build_subagent_manager(
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     session_bus: Option<fx_bus::SessionBus>,
+    credential_store: Option<startup::SharedCredentialStore>,
 ) -> Arc<fx_subagent::SubagentManager> {
+    let token_broker = startup::build_token_broker(config, credential_store.as_ref());
     let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
         router,
         config: config.clone(),
         improvement_provider,
         session_bus,
+        token_broker,
     });
 
     Arc::new(fx_subagent::SubagentManager::new(

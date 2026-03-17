@@ -116,6 +116,29 @@ pub(crate) fn signal_tag(tags: &[String]) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResponseParts {
+    pub patch: String,
+    pub approach: String,
+}
+
+#[cfg(test)]
+pub(crate) fn extract_response_parts(text: &str) -> ResponseParts {
+    ResponseParts {
+        patch: extract_tagged_block(text, PATCH_START, PATCH_END),
+        approach: extract_tagged_block(text, APPROACH_START, APPROACH_END),
+    }
+}
+
+#[cfg(test)]
+fn extract_tagged_block(text: &str, start: &str, end: &str) -> String {
+    text.split_once(start)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(value, _)| value.trim().to_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;

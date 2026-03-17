@@ -94,6 +94,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 
 # [security]
 # require_signatures = false
+# github_borrow_scope = "read_only"  # "read_only" | "contribution"
 
 # [self_modify]
 # enabled = false
@@ -650,6 +651,24 @@ pub struct HttpConfig {
     pub bearer_token: Option<String>,
 }
 
+/// Scope for borrowed GitHub credentials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowScope {
+    #[default]
+    ReadOnly,
+    Contribution,
+}
+
+impl std::fmt::Display for BorrowScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadOnly => write!(f, "read_only"),
+            Self::Contribution => write!(f, "contribution"),
+        }
+    }
+}
+
 /// Security settings for WASM skill signature verification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -658,6 +677,11 @@ pub struct SecurityConfig {
     /// When false (default), unsigned skills load with a warning.
     /// Invalid signatures are ALWAYS rejected regardless of this setting.
     pub require_signatures: bool,
+    /// Maximum GitHub PAT borrow scope for subagents/workers.
+    /// Defaults to read-only for safety. Set to "contribution" to allow
+    /// subagents to push branches and create PRs.
+    #[serde(default)]
+    pub github_borrow_scope: BorrowScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1335,6 +1359,7 @@ log_dir = "~/.fawx/custom-logs"
             },
             security: SecurityConfig {
                 require_signatures: true,
+                github_borrow_scope: BorrowScope::Contribution,
             },
             http: HttpConfig {
                 bearer_token: Some("test-token".to_string()),
@@ -1705,13 +1730,28 @@ deny = ["[invalid"]
     fn security_config_defaults_and_roundtrip() {
         let defaults = SecurityConfig::default();
         assert!(!defaults.require_signatures);
+        assert_eq!(defaults.github_borrow_scope, BorrowScope::ReadOnly);
 
         let config = SecurityConfig {
             require_signatures: true,
+            github_borrow_scope: BorrowScope::Contribution,
         };
         let encoded = toml::to_string(&config).expect("serialize");
         let decoded: SecurityConfig = toml::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn security_config_default_borrow_scope_is_read_only() {
+        let config = SecurityConfig::default();
+        assert_eq!(config.github_borrow_scope, BorrowScope::ReadOnly);
+    }
+
+    #[test]
+    fn security_config_deserializes_contribution_scope() {
+        let config: SecurityConfig = toml::from_str("github_borrow_scope = \"contribution\"")
+            .expect("deserialize security config");
+        assert_eq!(config.github_borrow_scope, BorrowScope::Contribution);
     }
 
     #[test]
@@ -1723,6 +1763,10 @@ deny = ["[invalid"]
         assert!(
             DEFAULT_CONFIG_TEMPLATE.contains("require_signatures"),
             "template should mention require_signatures"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("github_borrow_scope"),
+            "template should mention github_borrow_scope"
         );
     }
 
