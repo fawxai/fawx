@@ -50,8 +50,18 @@ final class PermissionTests: XCTestCase {
 
         let legacyRequest = request.legacyCompatibleRequest
 
-        XCTAssertEqual(legacyRequest?.mode, .prompt)
+        XCTAssertNil(legacyRequest?.mode)
         XCTAssertEqual(legacyRequest?.changes?.first?.action, "shell")
         XCTAssertEqual(legacyRequest?.changes?.first?.level, "propose")
+    }
+
+    func testLegacyCompatibleRequestDoesNotTranslateCapabilityMode() {
+        let request = PermissionsPatchRequest(
+            preset: nil,
+            mode: .capability,
+            changes: [PermissionChange(action: "shell", level: "ask")]
+        )
+
+        XCTAssertNil(request.legacyCompatibleRequest)
     }
 }

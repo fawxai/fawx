@@ -60,21 +60,27 @@ struct PermissionsPatchRequest: Encodable, Sendable {
     let changes: [PermissionChange]?
 
     var legacyCompatibleRequest: PermissionsPatchRequest? {
-        guard let changes, changes.contains(where: { $0.level.lowercased() == "ask" }) else {
+        guard mode != .capability else {
             return nil
         }
 
-        let legacyChanges = changes.map { change in
+        let translatedChanges = changes?.map { change in
             PermissionChange(
                 action: change.action,
                 level: change.level.lowercased() == "ask" ? "propose" : change.level
             )
         }
+        let translatedAskLevel = changes?.contains(where: { $0.level.lowercased() == "ask" }) == true
+
+        let droppedPromptMode = mode == .prompt && (preset != nil || translatedChanges?.isEmpty == false)
+        guard translatedAskLevel || droppedPromptMode else {
+            return nil
+        }
 
         return PermissionsPatchRequest(
             preset: preset,
-            mode: mode,
-            changes: legacyChanges
+            mode: droppedPromptMode ? nil : mode,
+            changes: translatedChanges
         )
     }
 }
@@ -82,6 +88,19 @@ struct PermissionsPatchRequest: Encodable, Sendable {
 struct PermissionChange: Codable, Sendable, Hashable {
     let action: String
     let level: String
+}
+
+func editablePermissionLevel(_ level: String) -> String {
+    switch level.lowercased() {
+    case "allow":
+        "allow"
+    case "deny":
+        "deny"
+    case "ask", "propose", "denied":
+        "ask"
+    default:
+        "ask"
+    }
 }
 
 struct PermissionsPatchResponse: Codable, Sendable, Hashable {

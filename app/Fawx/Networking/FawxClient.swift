@@ -188,7 +188,7 @@ actor FawxClient {
     func patchPermissions(_ request: PermissionsPatchRequest) async throws -> PermissionsPatchResponse {
         do {
             return try await performPermissionsPatch(request)
-        } catch let error as APIError where error.statusCode == 422 {
+        } catch let error as APIError where shouldRetryLegacyPermissionsPatch(for: request, after: error) {
             guard let legacyRequest = request.legacyCompatibleRequest else {
                 throw error
             }
@@ -775,6 +775,25 @@ actor FawxClient {
             bodyData: body,
             decodeAs: PermissionsPatchResponse.self
         )
+    }
+
+    private func shouldRetryLegacyPermissionsPatch(
+        for request: PermissionsPatchRequest,
+        after error: APIError
+    ) -> Bool {
+        guard request.legacyCompatibleRequest != nil else {
+            return false
+        }
+
+        guard let statusCode = error.statusCode else {
+            return false
+        }
+
+        guard (400 ..< 500).contains(statusCode) else {
+            return false
+        }
+
+        return statusCode != 401 && statusCode != 403
     }
 
     private func makeRequest(

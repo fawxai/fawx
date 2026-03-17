@@ -120,6 +120,10 @@
 		800A8B285C96FCBFFA367BDE /* PermissionsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC1890444EF1EA2B509EA92 /* PermissionsViewModel.swift */; };
 		824571D15BD23EED555159CE /* ChatViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */; };
 		82615B4AEFB902509D685C25 /* TelemetryViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */; };
+		A1B2C3D4E5F60718293A4B5E /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */; };
+		A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */; };
+		A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
+		A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
 		82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */; };
 		831393D1D284C205D00620B8 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 338FB5CB6D406E401F27B7B2 /* TelemetrySettingsPanel.swift */; };
 		833CF32214E7354D7C2FC3CB /* OAuthSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFDA886EBEC15236873ABBFE /* OAuthSessionCoordinator.swift */; };
@@ -298,6 +302,8 @@
 		5C13099200335A9EA37CBC02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		5CB40DD2F1D7B9B76438587D /* JSONValueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValueTests.swift; sourceTree = "<group>"; };
 		5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupViewModel.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTests.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModelTests.swift; sourceTree = "<group>"; };
 		6333ABC39A5F77ED86604EA0 /* TestConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestConfig.swift; sourceTree = "<group>"; };
 		63B30D0D5C6FC23F9116A401 /* GitViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitViewModel.swift; sourceTree = "<group>"; };
 		658865F5DEF00EE2E5B20502 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -424,6 +430,7 @@
 				CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */,
 				8EEB1F0A4C398B611C3A76C4 /* ConnectionStateMachineTests.swift */,
 				94EBE1811C9FC5658072CEA1 /* ExperimentsViewModelTests.swift */,
+				A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */,
 				146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */,
 			);
 			path = ViewModels;
@@ -453,6 +460,7 @@
 		3FC684A19A8993BF3C582F36 /* Models */ = {
 			isa = PBXGroup;
 			children = (
+				A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */,
 				D6BBC676908E289F8BF2330C /* ServerStatusTests.swift */,
 				7F1BED295F170968B50CE715 /* SessionMessageTests.swift */,
 				0472FB42E7C8822B57CF98DC /* SessionTests.swift */,
@@ -1059,6 +1067,8 @@
 				3F5C75AD2C13BEE5E66C3AEF /* FormattersTests.swift in Sources */,
 				1EDD1D9AD144B5652F786711 /* JSONValueTests.swift in Sources */,
 				CA7BB428CDB1F75FE846A4A4 /* KeychainHelperTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5E /* PermissionTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */,
 				628187E4687D83596CCF2D60 /* SSEParserTests.swift in Sources */,
 				36094D1F79A94CD4D30567B7 /* ServerStatusTests.swift in Sources */,
 				E219FC3B879329F84DEBFC1A /* SessionMessageTests.swift in Sources */,
@@ -1077,6 +1087,8 @@
 				D124E354061B4491FCED1045 /* FormattersTests.swift in Sources */,
 				68B1AA744FF35DA153136D09 /* JSONValueTests.swift in Sources */,
 				928985F53FFA38F2155ED817 /* KeychainHelperTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */,
 				585DA307C69ED769501B0404 /* SSEParserTests.swift in Sources */,
 				B0EA7CDED8A5AA50C31D1BF8 /* ServerStatusTests.swift in Sources */,
 				1C2C64297CB3D722F038BDBE /* SessionMessageTests.swift in Sources */,

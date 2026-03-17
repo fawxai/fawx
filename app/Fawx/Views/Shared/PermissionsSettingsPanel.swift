@@ -52,7 +52,7 @@ struct PermissionsSettingsPanel: View {
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
 
-            if usesCompactModeStack {
+            if usesCompactLayout {
                 VStack(spacing: FawxSpacing.paddingSM) {
                     modeButtons
                 }
@@ -74,7 +74,7 @@ struct PermissionsSettingsPanel: View {
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
 
-            if usesCompactPresetGrid {
+            if usesCompactLayout {
                 LazyVGrid(
                     columns: [
                         GridItem(.flexible(), spacing: FawxSpacing.paddingSM),
@@ -161,11 +161,7 @@ struct PermissionsSettingsPanel: View {
         PermissionLevelCounts(permissions: viewModel.permissions)
     }
 
-    private var usesCompactPresetGrid: Bool {
-        horizontalSizeClass == .compact
-    }
-
-    private var usesCompactModeStack: Bool {
+    private var usesCompactLayout: Bool {
         horizontalSizeClass == .compact
     }
 
@@ -681,19 +677,6 @@ private enum PermissionVisualState {
     case approvalRequired
     case denied
     case blocked
-}
-
-private func editablePermissionLevel(_ level: String) -> String {
-    switch level.lowercased() {
-    case "allow":
-        "allow"
-    case "deny":
-        "deny"
-    case "ask", "propose", "denied":
-        "ask"
-    default:
-        "ask"
-    }
 }
 
 private func permissionVisualState(_ level: String) -> PermissionVisualState {

@@ -132,7 +132,7 @@ final class PermissionsViewModel {
             return
         }
         let normalizedLevel = level.lowercased()
-        guard editablePermissionLevel(for: permissions[index].level) != normalizedLevel else {
+        guard editablePermissionLevel(permissions[index].level) != normalizedLevel else {
             return
         }
 
@@ -175,19 +175,6 @@ final class PermissionsViewModel {
     func showCustomEditor() {
         isShowingCustomEditor = true
         errorMessage = nil
-    }
-
-    private func editablePermissionLevel(for level: String) -> String {
-        switch level.lowercased() {
-        case "allow":
-            "allow"
-        case "deny":
-            "deny"
-        case "denied", "ask", "propose":
-            "ask"
-        default:
-            "ask"
-        }
     }
 
     private func displayLevel(forRequestedLevel level: String) -> String {
