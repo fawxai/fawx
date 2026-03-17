@@ -100,6 +100,25 @@ struct FawxApp: App {
                         }
                     }
                 }
+                .task(id: appState.configurationKey + "|ripcord") {
+                    await appState.refreshRipcordState()
+
+                    guard appState.showsMainExperience, appState.isConfigured else {
+                        return
+                    }
+
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: ripcordPollingInterval)
+                        guard !Task.isCancelled else {
+                            break
+                        }
+                        guard appState.showsMainExperience, appState.isConfigured, appState.connectionStatus == .connected else {
+                            continue
+                        }
+
+                        await appState.refreshRipcordState()
+                    }
+                }
                 .onChange(of: scenePhase) { _, newPhase in
                     guard newPhase == .active else {
                         return
@@ -221,6 +240,10 @@ struct FawxApp: App {
         return .seconds(override ?? defaultSeconds)
     }
 
+    private var ripcordPollingInterval: Duration {
+        .seconds(5)
+    }
+
     @MainActor
     private func handleConfigurationChange() async {
         if appState.rootDestination == .setupWizard {
@@ -257,6 +280,7 @@ struct FawxApp: App {
         do {
             _ = try await appState.client.health()
             try await appState.refreshServerState()
+            await appState.refreshRipcordState()
             await sessionViewModel.refresh()
             await appState.refreshContext(for: sessionViewModel.selectedSessionID)
             await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)

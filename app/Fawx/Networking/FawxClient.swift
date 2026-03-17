@@ -223,6 +223,32 @@ actor FawxClient {
         }
     }
 
+    func ripcordStatus() async throws -> RipcordStatusResponse {
+        try await performRequest(path: "/v1/ripcord/status", decodeAs: RipcordStatusResponse.self)
+    }
+
+    func ripcordJournal() async throws -> RipcordJournalResponse {
+        try await performRequest(path: "/v1/ripcord/journal", decodeAs: RipcordJournalResponse.self)
+    }
+
+    func pullRipcord() async throws -> RipcordReport {
+        try await performRequest(
+            path: "/v1/ripcord/pull",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: RipcordReport.self
+        )
+    }
+
+    func approveRipcord() async throws {
+        let _: RipcordApproveResponse = try await performRequest(
+            path: "/v1/ripcord/approve",
+            method: "POST",
+            bodyData: Data(),
+            decodeAs: RipcordApproveResponse.self
+        )
+    }
+
     func getSynthesis() async throws -> SynthesisResponse {
         try await performRequest(path: "/v1/synthesis", decodeAs: SynthesisResponse.self)
     }

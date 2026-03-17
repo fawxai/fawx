@@ -8,6 +8,7 @@ struct PermissionsSettingsPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
             securityModeSection
+            SandboxStatusCard()
             presetSection
 
             if viewModel.isLoading && viewModel.permissions.isEmpty {

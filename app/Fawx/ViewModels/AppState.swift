@@ -1,5 +1,6 @@
 import Observation
 import SwiftUI
+import UserNotifications
 
 enum ConnectionStatus: String, Sendable {
     case disconnected
@@ -140,6 +141,7 @@ final class AppState {
     var currentContext: ContextInfo?
     var permissionPresetName = "Power User"
     var permissionMode: PermissionMode = .prompt
+    var ripcordStatus: RipcordStatusResponse?
     var connectionError: String?
     var theme: AppTheme
     var fontSize: AppFontSize
@@ -159,6 +161,7 @@ final class AppState {
     private var authToken: String?
     private var isSetupComplete: Bool
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var hasRequestedNotificationAuthorization = false
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectAttempt = 0
 
@@ -384,6 +387,13 @@ final class AppState {
         }
     }
 
+    var activeRipcordStatus: RipcordStatusResponse? {
+        guard let ripcordStatus, ripcordStatus.active else {
+            return nil
+        }
+        return ripcordStatus
+    }
+
     func bootstrap() async {
         guard showsMainExperience, isConfigured else {
             reconnectTask?.cancel()
@@ -391,12 +401,14 @@ final class AppState {
             if showsMainExperience {
                 connectionStatus = .disconnected
             }
+            clearRipcordState()
             return
         }
 
         reconnectAttempt = 0
         await attemptConnection(initialStatus: .connecting, allowReconnect: true)
         await refreshPhase4State()
+        await refreshRipcordState()
     }
 
     func beginRemoteOnboarding() {
@@ -505,6 +517,7 @@ final class AppState {
         authProviders = []
         permissionPresetName = "Power User"
         permissionMode = .prompt
+        ripcordStatus = nil
         connectionError = nil
         connectionStatus = .disconnected
         serverStatusError = nil
@@ -512,6 +525,7 @@ final class AppState {
         localServerStatus = nil
         launchAgentStatus = nil
         qrPairingResponse = nil
+        clearRipcordState()
 
         UserDefaults.standard.removeObject(forKey: StorageKey.serverURL)
         UserDefaults.standard.removeObject(forKey: StorageKey.pairedDeviceName)
@@ -597,6 +611,47 @@ final class AppState {
         }
         await refreshAuthProviders()
         await refreshPhase4State()
+    }
+
+    func refreshRipcordState() async {
+        guard isConfigured else {
+            clearRipcordState()
+            return
+        }
+
+        do {
+            let status = try await client.ripcordStatus()
+            let previousStatus = ripcordStatus
+            ripcordStatus = status
+
+            if shouldNotifyForRipcordActivation(from: previousStatus, to: status) {
+                postRipcordNotification(for: status)
+            }
+        } catch let error as APIError where error.statusCode == 503 {
+            clearRipcordState()
+        } catch {
+            if ConnectionStateMachine.shouldHandleAsConnectionIssue(error) {
+                await noteRecoverableRequestFailure(error)
+            }
+        }
+    }
+
+    func loadRipcordJournal() async throws -> [JournalEntry] {
+        let response = try await client.ripcordJournal()
+        return response.entries.sorted { lhs, rhs in
+            lhs.id < rhs.id
+        }
+    }
+
+    func pullRipcord() async throws -> RipcordReport {
+        let report = try await client.pullRipcord()
+        ripcordStatus = .inactive
+        return report
+    }
+
+    func approveRipcord() async throws {
+        try await client.approveRipcord()
+        ripcordStatus = .inactive
     }
 
     func refreshPhase4State() async {
@@ -792,6 +847,7 @@ final class AppState {
             lastHealth = nil
             connectionError = nil
             connectionStatus = .disconnected
+            clearRipcordState()
             return
         }
 
@@ -811,6 +867,7 @@ final class AppState {
         lastHealth = nil
         connectionError = connectionMessage(for: error)
         connectionStatus = .disconnected
+        clearRipcordState()
     }
 
     func userFacingConnectionMessage(for error: Error) -> String {
@@ -878,6 +935,45 @@ final class AppState {
         FawxTypography.setScale(fontSize.scale)
     }
 
+    private func shouldNotifyForRipcordActivation(
+        from previousStatus: RipcordStatusResponse?,
+        to currentStatus: RipcordStatusResponse
+    ) -> Bool {
+        currentStatus.active && previousStatus?.active != true
+    }
+
+    private func postRipcordNotification(for status: RipcordStatusResponse) {
+        let title = "Fawx - Tripwire Crossed"
+        let subtitle = "\"\(status.displayDescription)\""
+        let body = "Actions are being journaled. Review when ready."
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            let center = UNUserNotificationCenter.current()
+            if !hasRequestedNotificationAuthorization {
+                hasRequestedNotificationAuthorization = true
+                _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            }
+
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.subtitle = subtitle
+            content.body = body
+            content.sound = .default
+
+            let identifier = "ripcord-\(status.tripwireId ?? UUID().uuidString)"
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+            try? await center.add(request)
+        }
+    }
+
+    private func clearRipcordState() {
+        ripcordStatus = nil
+    }
+
     private var rootDestinationKey: String {
         switch rootDestination {
         case .main:
@@ -938,6 +1034,7 @@ final class AppState {
 
     private func handleConnectionFailure(_ error: Error, allowReconnect: Bool) async {
         connectionError = connectionMessage(for: error)
+        clearRipcordState()
 
         switch ConnectionStateMachine.failureStatus(for: error, allowReconnect: allowReconnect) {
         case .reconnecting:

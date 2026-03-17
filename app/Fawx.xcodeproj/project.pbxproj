@@ -124,6 +124,18 @@
 		A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */; };
 		A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
 		A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
+		A1B2C3D4E5F60718293A4B69 /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */; };
+		A1B2C3D4E5F60718293A4B6A /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */; };
+		A1B2C3D4E5F60718293A4B6B /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */; };
+		A1B2C3D4E5F60718293A4B6C /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */; };
+		A1B2C3D4E5F60718293A4B6D /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */; };
+		A1B2C3D4E5F60718293A4B6E /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */; };
+		A1B2C3D4E5F60718293A4B6F /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */; };
+		A1B2C3D4E5F60718293A4B70 /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */; };
+		A1B2C3D4E5F60718293A4B71 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */; };
+		A1B2C3D4E5F60718293A4B72 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */; };
+		A1B2C3D4E5F60718293A4B73 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */; };
+		A1B2C3D4E5F60718293A4B74 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */; };
 		82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */; };
 		831393D1D284C205D00620B8 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 338FB5CB6D406E401F27B7B2 /* TelemetrySettingsPanel.swift */; };
 		833CF32214E7354D7C2FC3CB /* OAuthSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFDA886EBEC15236873ABBFE /* OAuthSessionCoordinator.swift */; };
@@ -304,6 +316,12 @@
 		5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupViewModel.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTests.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModelTests.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ripcord.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordBanner.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordJournalPanel.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordReportView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxStatusCard.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordTests.swift; sourceTree = "<group>"; };
 		6333ABC39A5F77ED86604EA0 /* TestConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestConfig.swift; sourceTree = "<group>"; };
 		63B30D0D5C6FC23F9116A401 /* GitViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitViewModel.swift; sourceTree = "<group>"; };
 		658865F5DEF00EE2E5B20502 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -461,6 +479,7 @@
 			isa = PBXGroup;
 			children = (
 				A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */,
+				A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */,
 				D6BBC676908E289F8BF2330C /* ServerStatusTests.swift */,
 				7F1BED295F170968B50CE715 /* SessionMessageTests.swift */,
 				0472FB42E7C8822B57CF98DC /* SessionTests.swift */,
@@ -506,6 +525,7 @@
 			children = (
 				8AD5952B591EF81CF6D4461A /* iOS */,
 				2F709E76FBE3BF26987D15C2 /* macOS */,
+				A1B2C3D4E5F60718293A4B68 /* Ripcord */,
 				99DA719B17358090192EDCE7 /* Shared */,
 			);
 			path = Views;
@@ -556,6 +576,7 @@
 				3250B13645E296DC323C0BBE /* PermissionsSettingsPanel.swift */,
 				C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */,
 				B43FE3356B111C8A9C1185ED /* QueuedMessageChip.swift */,
+				A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */,
 				B1A5C2E77F42EF3DD71F4EDF /* ServerSettingsPanel.swift */,
 				43A75068C7EB266AD29AF348 /* SessionRowView.swift */,
 				266FDB9D5C4C4294B9824915 /* SkillsView.swift */,
@@ -568,6 +589,16 @@
 				5CE85AFC1F0D6FCEFDE64141 /* SetupWizard */,
 			);
 			path = Shared;
+			sourceTree = "<group>";
+		};
+		A1B2C3D4E5F60718293A4B68 /* Ripcord */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */,
+				A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */,
+				A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */,
+			);
+			path = Ripcord;
 			sourceTree = "<group>";
 		};
 		9F21CFB0CAF17DFCEFF99251 /* FawxTests */ = {
@@ -628,6 +659,7 @@
 				4A283E2181E2E7E4F28576BB /* ModelInfo.swift */,
 				3F07B3D54545DE045D7EC042 /* OAuthFlow.swift */,
 				590BBABC228DCE73046BAEC0 /* Permission.swift */,
+				A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */,
 				F5C5B0EE3FBA10BED5CC69D7 /* ServerStatus.swift */,
 				C7F19EE118E04C627C071358 /* Session.swift */,
 				946A14621A9A282DEB705EEC /* SidebarSelection.swift */,
@@ -911,12 +943,17 @@
 				B6645E106D3B8B60D5A7927E /* Permission.swift in Sources */,
 				7BA020D7753EE877E81D979B /* PermissionsSettingsPanel.swift in Sources */,
 				0190B1F3E250D3220089AABB /* PermissionsViewModel.swift in Sources */,
+				A1B2C3D4E5F60718293A4B69 /* Ripcord.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6B /* RipcordBanner.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6D /* RipcordJournalPanel.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6F /* RipcordReportView.swift in Sources */,
 				3F7B8BA7AC464855EB212A79 /* ProviderStep.swift in Sources */,
 				6CE5644EEE9CD995BB0D8788 /* QRCodeScannerSheet.swift in Sources */,
 				82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */,
 				DFB31606918FE6868D41DEE8 /* QueuedMessageChip.swift in Sources */,
 				E615FB7472BF1E52DCAF5295 /* ReadyStep.swift in Sources */,
 				7EE2EBCADD290969C00F85FB /* SSEStream.swift in Sources */,
+				A1B2C3D4E5F60718293A4B71 /* SandboxStatusCard.swift in Sources */,
 				A2E158115FEBBEDB17A1B64D /* SectionMenuButton.swift in Sources */,
 				D43BAA2E7061092AB00802E2 /* ServerSettingsPanel.swift in Sources */,
 				D6CEFF568F334A5762C8AB24 /* ServerStatus.swift in Sources */,
@@ -1011,12 +1048,17 @@
 				AE525794B13CB7C413138BCE /* Permission.swift in Sources */,
 				F1680DCC5CE83B52D2D3A852 /* PermissionsSettingsPanel.swift in Sources */,
 				800A8B285C96FCBFFA367BDE /* PermissionsViewModel.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6A /* Ripcord.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6C /* RipcordBanner.swift in Sources */,
+				A1B2C3D4E5F60718293A4B6E /* RipcordJournalPanel.swift in Sources */,
+				A1B2C3D4E5F60718293A4B70 /* RipcordReportView.swift in Sources */,
 				2AF4D9AA513268FF12E565F6 /* ProviderStep.swift in Sources */,
 				24F7E781CDE097CE71703485 /* QRCodeScannerSheet.swift in Sources */,
 				B701CFFCB5584D5BDAC5B45D /* QRCodeView.swift in Sources */,
 				5BFD9FEE5D8675E1DC4C8080 /* QueuedMessageChip.swift in Sources */,
 				BDFDB4129E1B917E09B1F2F3 /* ReadyStep.swift in Sources */,
 				7BDE8D38EE1ED8C89158ECA9 /* SSEStream.swift in Sources */,
+				A1B2C3D4E5F60718293A4B72 /* SandboxStatusCard.swift in Sources */,
 				E74AD10CBBBB40389252474A /* SectionMenuButton.swift in Sources */,
 				A147900E8DAFE3576A0E694A /* ServerSettingsPanel.swift in Sources */,
 				F369BDF371346F985AD3A6BB /* ServerStatus.swift in Sources */,
@@ -1069,6 +1111,7 @@
 				CA7BB428CDB1F75FE846A4A4 /* KeychainHelperTests.swift in Sources */,
 				A1B2C3D4E5F60718293A4B5E /* PermissionTests.swift in Sources */,
 				A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B73 /* RipcordTests.swift in Sources */,
 				628187E4687D83596CCF2D60 /* SSEParserTests.swift in Sources */,
 				36094D1F79A94CD4D30567B7 /* ServerStatusTests.swift in Sources */,
 				E219FC3B879329F84DEBFC1A /* SessionMessageTests.swift in Sources */,
@@ -1089,6 +1132,7 @@
 				928985F53FFA38F2155ED817 /* KeychainHelperTests.swift in Sources */,
 				A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */,
 				A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */,
+				A1B2C3D4E5F60718293A4B74 /* RipcordTests.swift in Sources */,
 				585DA307C69ED769501B0404 /* SSEParserTests.swift in Sources */,
 				B0EA7CDED8A5AA50C31D1BF8 /* ServerStatusTests.swift in Sources */,
 				1C2C64297CB3D722F038BDBE /* SessionMessageTests.swift in Sources */,
