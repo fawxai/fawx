@@ -41,7 +41,7 @@ toml_edit = "0.22"
 uuid = { version = "1.13", features = ["v4"] }
 
 [dev-dependencies]
-fx-cli = { path = "../fx-cli", default-features = false }
+fx-cli = { path = "../fx-cli", default-features = false, features = ["http"] }
 toml = { workspace = true }
 fx-subagent = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"
