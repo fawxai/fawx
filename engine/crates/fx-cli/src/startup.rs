@@ -1504,9 +1504,10 @@ fn register_auth_provider_with_models(
     let models = ensure_supported_models(auth_method, supported_models);
 
     match auth_method {
-        AuthMethod::SetupToken { token } => {
-            register_setup_token_provider(router, token, models)?;
-        }
+        AuthMethod::SetupToken { .. } => tracing::warn!(
+            supported_models = models.len(),
+            "skipping Anthropic setup token provider: raw setup tokens are not usable with the Messages API until exchanged for runtime credentials"
+        ),
         AuthMethod::ApiKey { provider, key } => {
             register_api_key_provider(router, provider, key, models)?;
         }
@@ -1526,26 +1527,6 @@ fn register_auth_provider_with_models(
         }
     }
 
-    Ok(())
-}
-
-fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
-    if supported_models.is_empty() {
-        default_supported_models(auth_method)
-    } else {
-        supported_models
-    }
-}
-
-fn register_setup_token_provider(
-    _router: &mut ModelRouter,
-    _token: &str,
-    supported_models: Vec<String>,
-) -> Result<(), StartupError> {
-    tracing::warn!(
-        supported_models = supported_models.len(),
-        "skipping Anthropic setup token provider: raw setup tokens are not usable with the Messages API until exchanged for runtime credentials"
-    );
     Ok(())
 }
 
@@ -1624,6 +1605,14 @@ fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
                 models_for_provider(provider)
             }
         }
+    }
+}
+
+fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
+    if supported_models.is_empty() {
+        default_supported_models(auth_method)
+    } else {
+        supported_models
     }
 }
 
