@@ -63,6 +63,7 @@ pub(crate) const METRICS_START: &str = "<METRICS>";
 pub(crate) const METRICS_END: &str = "</METRICS>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used by extract_response_parts; will be needed for chain-forward parsing.
 pub(crate) struct ResponseParts {
     pub patch: String,
     pub approach: String,
@@ -86,6 +87,7 @@ fn example_content_key(example: &TrainingExample) -> String {
     }
 }
 
+#[allow(dead_code)] // Inverse of format_model_response; needed for chain-forward parsing.
 pub(crate) fn extract_response_parts(text: &str) -> ResponseParts {
     ResponseParts {
         patch: extract_tagged_block(text, PATCH_START, PATCH_END)
@@ -94,6 +96,7 @@ pub(crate) fn extract_response_parts(text: &str) -> ResponseParts {
     }
 }
 
+#[allow(dead_code)] // Used by extract_response_parts.
 pub(crate) fn extract_tagged_block(text: &str, start_tag: &str, end_tag: &str) -> Option<String> {
     let start = text.find(start_tag)? + start_tag.len();
     let end = text[start..].find(end_tag)? + start;
