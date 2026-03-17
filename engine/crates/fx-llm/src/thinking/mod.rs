@@ -113,10 +113,12 @@ mod tests {
         let registry = ThinkingRegistry::with_defaults();
 
         let opus = registry.profile_for_model("claude-opus-4-6");
-        assert!(opus.levels.contains(&"max".to_owned()));
+        assert!(opus.levels.contains(&"adaptive".to_owned()));
+        assert!(!opus.levels.contains(&"max".to_owned()));
         assert_eq!(opus.default, "high");
 
         let sonnet = registry.profile_for_model("claude-sonnet-4-6");
+        assert!(sonnet.levels.contains(&"adaptive".to_owned()));
         assert!(!sonnet.levels.contains(&"max".to_owned()));
         assert!(sonnet.levels.contains(&"high".to_owned()));
 
@@ -134,10 +136,10 @@ mod tests {
     #[test]
     fn available_levels_excludes_rejected() {
         let registry = ThinkingRegistry::with_defaults();
-        registry.record_rejection("claude-opus-4-6", "max");
+        registry.record_rejection("claude-opus-4-6", "adaptive");
 
         let available = registry.available_levels("claude-opus-4-6");
-        assert!(!available.contains(&"max".to_owned()));
+        assert!(!available.contains(&"adaptive".to_owned()));
         assert!(available.contains(&"high".to_owned()));
     }
 

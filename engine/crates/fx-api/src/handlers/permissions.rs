@@ -312,7 +312,7 @@ fn capability_mode_name(mode: CapabilityMode) -> &'static str {
 fn proposal_level(mode: CapabilityMode) -> &'static str {
     match mode {
         CapabilityMode::Capability => "denied",
-        CapabilityMode::Prompt => "ask",
+        CapabilityMode::Prompt => "propose",
     }
 }
 
@@ -609,12 +609,9 @@ mod tests {
         assert_eq!(permission_level(&response, "shell"), Some("allow"));
         assert_eq!(
             permission_level(&response, "credential_change"),
-            Some("propose")
+            Some("denied")
         );
-        assert_eq!(
-            permission_level(&response, "kernel_modify"),
-            Some("propose")
-        );
+        assert_eq!(permission_level(&response, "kernel_modify"), Some("denied"));
     }
 
     #[tokio::test]
@@ -626,11 +623,8 @@ mod tests {
 
         assert_eq!(response.preset, "cautious");
         assert_eq!(permission_level(&response, "read_any"), Some("allow"));
-        assert_eq!(permission_level(&response, "file_write"), Some("propose"));
-        assert_eq!(
-            permission_level(&response, "kernel_modify"),
-            Some("propose")
-        );
+        assert_eq!(permission_level(&response, "file_write"), Some("denied"));
+        assert_eq!(permission_level(&response, "kernel_modify"), Some("denied"));
     }
 
     #[tokio::test]
@@ -699,7 +693,7 @@ mod tests {
         assert_eq!(permission_level(&get_response, "shell"), Some("allow"));
         assert_eq!(
             permission_level(&get_response, "file_write"),
-            Some("propose")
+            Some("denied")
         );
         assert_eq!(saved.permissions.preset, PermissionPreset::Custom);
         assert!(saved
@@ -731,7 +725,7 @@ mod tests {
         assert_eq!(get_response.preset, "cautious");
         assert_eq!(
             permission_level(&get_response, "file_write"),
-            Some("propose")
+            Some("denied")
         );
     }
 
@@ -755,7 +749,7 @@ mod tests {
         assert_eq!(get_response.mode, "prompt");
         assert_eq!(
             permission_level(&get_response, "credential_change"),
-            Some("ask")
+            Some("propose")
         );
     }
 

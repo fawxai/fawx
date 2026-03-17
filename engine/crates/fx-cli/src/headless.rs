@@ -354,8 +354,21 @@ impl HeadlessApp {
             bus_receiver,
             thinking_registry: ThinkingRegistry::with_defaults(),
         };
+        app.seed_runtime_info();
         app.record_startup_warning_history();
         Ok(app)
+    }
+
+    fn seed_runtime_info(&self) {
+        let provider = self
+            .router
+            .provider_for_model(&self.active_model)
+            .unwrap_or("")
+            .to_string();
+        if let Ok(mut info) = self.runtime_info.write() {
+            info.active_model = self.active_model.clone();
+            info.provider = provider;
+        }
     }
 
     fn record_startup_warning_history(&mut self) {
@@ -845,7 +858,9 @@ impl HeadlessApp {
             .unwrap_or(DEFAULT_HTTP_MODEL);
 
         let Some(router) = Arc::get_mut(&mut self.router) else {
-            tracing::warn!("cannot set HTTP default model: router is shared");
+            // Router is already shared (e.g. by SubagentManager). The active
+            // model was seeded before Arc wrapping, so this is harmless.
+            tracing::debug!("skipping apply_http_defaults: router already shared");
             return;
         };
 

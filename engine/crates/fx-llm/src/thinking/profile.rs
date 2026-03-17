@@ -106,6 +106,7 @@ fn translate_default(style: &ApiStyle, level: &str) -> ThinkingParams {
 fn default_budget_for_level(level: &str) -> Option<u32> {
     match level {
         "low" => Some(1_024),
+        "adaptive" => Some(5_000),
         "medium" => Some(4_096),
         "high" => Some(10_000),
         "max" => Some(32_000),
@@ -121,11 +122,10 @@ mod tests {
     fn adaptive_profile() -> ThinkingProfile {
         ThinkingProfile {
             levels: vec![
-                "off".to_owned(),
+                "adaptive".to_owned(),
                 "low".to_owned(),
                 "medium".to_owned(),
                 "high".to_owned(),
-                "max".to_owned(),
             ],
             default: "high".to_owned(),
             api_style: ApiStyle::AdaptiveEffort,
@@ -195,13 +195,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_max_returns_high_budget() {
-        let params = adaptive_profile().translate("max");
+    fn adaptive_level_uses_adaptive_budget() {
+        let params = adaptive_profile().translate("adaptive");
         assert_eq!(
             params,
             ThinkingParams::Anthropic {
-                budget_tokens: Some(32_000),
-                effort: Some("max".to_owned()),
+                budget_tokens: Some(5_000),
+                effort: Some("adaptive".to_owned()),
             }
         );
     }
