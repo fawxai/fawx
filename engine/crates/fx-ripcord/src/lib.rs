@@ -7,9 +7,11 @@
 pub mod config;
 pub mod evaluator;
 pub mod journal;
+pub mod revert;
 pub mod snapshot;
 
 pub use config::{resolve_tripwires, TripwireConfig, TripwireKind};
 pub use evaluator::{TripwireEvaluator, TripwireNotifyFn};
 pub use journal::{JournalAction, JournalEntry, RipcordJournal, RipcordStatus};
+pub use revert::{approve_ripcord, pull_ripcord, RevertedEntry, RipcordReport, SkippedEntry};
 pub use snapshot::SnapshotStore;
