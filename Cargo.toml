@@ -27,6 +27,7 @@ members = [
     "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
     "engine/crates/fawx-ripcord",
+    "engine/crates/fx-ripcord",
     "engine/crates/fx-author",
     "engine/crates/fx-marketplace",
     "engine/crates/fawx-test",
