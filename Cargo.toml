@@ -12,6 +12,7 @@ members = [
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
     "engine/crates/fx-security",
+    "engine/crates/fx-sandbox",
     "engine/crates/fx-skills",
     "engine/crates/fx-storage",
     "engine/crates/fx-tools",
