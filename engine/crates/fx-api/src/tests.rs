@@ -2842,7 +2842,7 @@ allowed_chat_ids = [123]
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["level"], "off");
+        assert_eq!(json["level"], "adaptive");
         assert_eq!(
             json["available"],
             serde_json::json!(["off", "adaptive", "low", "medium", "high"])

@@ -593,6 +593,7 @@ impl Default for PreprocessDedup {
 /// `None` is treated as `Adaptive` (the default).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum ThinkingBudget {
+    #[default]
     #[serde(rename = "adaptive")]
     Adaptive,
     #[serde(rename = "high")]
@@ -601,7 +602,6 @@ pub enum ThinkingBudget {
     Medium,
     #[serde(rename = "low")]
     Low,
-    #[default]
     #[serde(rename = "off")]
     Off,
     /// OpenAI "none" — reasoning disabled.

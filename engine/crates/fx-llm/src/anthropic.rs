@@ -76,13 +76,22 @@ fn build_anthropic_thinking(
                     "adaptive thinking requested for non-Claude 4.6 model"
                 );
             }
+            // output_config.effort must be a valid Anthropic value.
+            // If the effort is "adaptive" or not a recognized value, omit
+            // output_config entirely and let the API use its default.
+            let valid_efforts = ["low", "medium", "high", "max"];
+            let output_config = if valid_efforts.contains(&effort.as_str()) {
+                Some(AnthropicOutputConfig {
+                    effort: effort.clone(),
+                })
+            } else {
+                None
+            };
             (
                 Some(AnthropicThinking::Adaptive {
                     thinking_type: "adaptive".to_string(),
                 }),
-                Some(AnthropicOutputConfig {
-                    effort: effort.clone(),
-                }),
+                output_config,
             )
         }
         Some(ThinkingConfig::Enabled { budget_tokens }) => {
