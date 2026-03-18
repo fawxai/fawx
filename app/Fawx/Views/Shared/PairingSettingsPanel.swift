@@ -2,6 +2,14 @@ import Observation
 import SwiftUI
 
 struct PairingSettingsPanel: View {
+    private static let pairingCodeExpirationFormatter: DateComponentsFormatter = {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.minute, .second]
+        formatter.unitsStyle = .abbreviated
+        formatter.zeroFormattingBehavior = [.dropLeading]
+        return formatter
+    }()
+
     @Bindable var appState: AppState
     @Bindable var settingsViewModel: SettingsViewModel
     let isReadOnly: Bool
@@ -224,12 +232,10 @@ struct PairingSettingsPanel: View {
         if remaining == 0 {
             return "Expired. Generate a new code to pair another device."
         }
-        if remaining < 60 {
-            return "Expires in \(remaining)s"
-        }
-        let minutes = remaining / 60
-        let seconds = remaining % 60
-        return "Expires in \(minutes)m \(seconds)s"
+
+        let formattedDuration = Self.pairingCodeExpirationFormatter.string(from: TimeInterval(remaining))
+            ?? "\(remaining)s"
+        return "Expires in \(formattedDuration)"
     }
 
     private func generatePairingCode() async {
