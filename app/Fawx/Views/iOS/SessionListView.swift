@@ -112,7 +112,25 @@ struct SessionListView: View {
         .navigationSplitViewStyle(.balanced)
     }
 
+    @ViewBuilder
     private var sessionList: some View {
+#if os(iOS)
+        if usesSplitLayout {
+            sessionListBody
+                .searchable(
+                    text: $searchText,
+                    placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "Search sessions"
+                )
+        } else {
+            sessionListBody
+        }
+#else
+        sessionListBody
+#endif
+    }
+
+    private var sessionListBody: some View {
         List {
             if sessionViewModel.isLoading {
                 ProgressView("Loading sessions...")
@@ -136,7 +154,7 @@ struct SessionListView: View {
                 )
             } else if filteredGroupedSections.isEmpty {
                 sessionListPlaceholder(
-                    title: "No matching sessions",
+                    title: "No sessions matching \"\(trimmedSearchText)\"",
                     message: "Try a different search term.",
                     actionTitle: "Clear Search"
                 ) {
@@ -430,29 +448,11 @@ struct SessionListView: View {
     }
 
     private var filteredGroupedSections: [SessionSection] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard query.isEmpty == false else {
-            return sessionViewModel.groupedSections
-        }
+        SessionViewModel.filterSessionSections(sessionViewModel.groupedSections, query: searchText)
+    }
 
-        let normalizedQuery = query.localizedLowercase
-        return sessionViewModel.groupedSections.compactMap { section in
-            let matchingSessions = section.sessions.filter { session in
-                [
-                    session.displayTitle,
-                    session.subtitlePreview ?? "",
-                    session.model,
-                ].contains { value in
-                    value.localizedLowercase.contains(normalizedQuery)
-                }
-            }
-
-            guard matchingSessions.isEmpty == false else {
-                return nil
-            }
-
-            return SessionSection(title: section.title, sessions: matchingSessions)
-        }
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @ViewBuilder
@@ -471,6 +471,16 @@ struct SessionListView: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier("sessionRow_\(session.id)")
         .accessibilityElement(children: .contain)
+        .listRowInsets(
+            EdgeInsets(
+                top: 0,
+                leading: FawxSpacing.paddingSM,
+                bottom: 0,
+                trailing: FawxSpacing.paddingSM
+            )
+        )
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button("Delete", role: .destructive) {
                 deleteSession(session.id)

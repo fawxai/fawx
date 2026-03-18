@@ -49,10 +49,10 @@ struct RipcordBanner: View {
             }
         }
         .padding(FawxSpacing.paddingLG)
-        .background(Color.fawxWarning.opacity(0.1))
+        .background(Color.fawxSurface)
         .overlay {
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                .stroke(Color.fawxWarning.opacity(0.3), lineWidth: 1)
+                .stroke(Color.fawxWarning.opacity(0.35), lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
         .accessibilityElement(children: .contain)
@@ -70,7 +70,8 @@ struct RipcordBanner: View {
                 .disabled(isPerformingAction)
 
             Button("Approve", action: approveAction)
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
+                .tint(.fawxAccent)
                 .disabled(isPerformingAction)
         }
     }
