@@ -23,6 +23,29 @@ final class SessionViewModel {
         self.appState = appState
     }
 
+    nonisolated static func filterSessionSections(_ sections: [SessionSection], query: String) -> [SessionSection] {
+        let normalizedQuery = query
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .localizedLowercase
+        guard normalizedQuery.isEmpty == false else {
+            return sections
+        }
+
+        return sections.compactMap { section in
+            let matchingSessions = section.sessions.filter { session in
+                searchFields(for: session).contains { value in
+                    value.localizedLowercase.contains(normalizedQuery)
+                }
+            }
+
+            guard matchingSessions.isEmpty == false else {
+                return nil
+            }
+
+            return SessionSection(title: section.title, sessions: matchingSessions)
+        }
+    }
+
     var selectedSession: Session? {
         sessions.first(where: { $0.id == selectedSessionID })
     }
@@ -163,5 +186,16 @@ final class SessionViewModel {
             sessions[index].messageCount += 1
         }
         sessions.sort(by: Session.sidebarSort)
+    }
+
+    private nonisolated static func searchFields(for session: Session) -> [String] {
+        [
+            session.key,
+            session.label ?? "",
+            session.title ?? "",
+            session.displayTitle,
+            session.preview ?? "",
+            session.model,
+        ]
     }
 }

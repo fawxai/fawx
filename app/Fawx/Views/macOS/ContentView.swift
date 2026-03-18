@@ -40,7 +40,8 @@ struct ContentView: View {
                     showGitAction: showGit,
                     openSettingsAction: showSettings,
                     clearSessionAction: clearSession,
-                    deleteSessionAction: deleteSession
+                    deleteSessionAction: deleteSession,
+                    deleteSessionsAction: deleteSessions
                 )
                 .frame(minWidth: 260)
             } detail: {
@@ -225,6 +226,38 @@ struct ContentView: View {
                 } else {
                     chatViewModel.scheduleLoadMessages(for: sessionViewModel.selectedSessionID)
                 }
+            }
+        }
+    }
+
+    private func deleteSessions(_ sessionIDs: [String]) {
+        let orderedSessionIDs = sessionViewModel.sessions
+            .map(\.id)
+            .filter { sessionIDs.contains($0) }
+        guard orderedSessionIDs.isEmpty == false else {
+            return
+        }
+
+        Task {
+            let deletedCurrentSelection = orderedSessionIDs.contains { $0 == selectedSessionID }
+
+            for sessionID in orderedSessionIDs {
+                if chatViewModel.activeStreamSessionID == sessionID {
+                    chatViewModel.stopStreaming()
+                }
+
+                let didDelete = await sessionViewModel.deleteSession(id: sessionID)
+                if didDelete {
+                    chatViewModel.invalidateSession(sessionID)
+                }
+            }
+
+            if deletedCurrentSelection {
+                beginNewSession()
+            } else if sessionViewModel.selectedSessionID == nil {
+                chatViewModel.showEmptyState()
+            } else {
+                chatViewModel.scheduleLoadMessages(for: sessionViewModel.selectedSessionID)
             }
         }
     }
