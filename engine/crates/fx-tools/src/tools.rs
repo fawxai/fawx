@@ -3,8 +3,9 @@ use crate::experiment_tool::{
     ExperimentRegistrar, ExperimentToolState,
 };
 use async_trait::async_trait;
-use fx_config::manager::ConfigManager;
+use fx_config::{manager::ConfigManager, FawxConfig};
 use fx_consensus::ProgressCallback;
+use fx_core::kernel_manifest::{build_kernel_manifest, BudgetSummary, ManifestSources};
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
@@ -12,6 +13,7 @@ use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
     ToolExecutor, ToolExecutorError, ToolResult,
 };
+use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
 use fx_llm::{ToolCall, ToolDefinition};
@@ -58,6 +60,17 @@ fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
     }))
 }
 
+fn build_budget_summary(config: &KernelBudgetConfig) -> BudgetSummary {
+    BudgetSummary {
+        max_llm_calls: config.max_llm_calls,
+        max_tool_invocations: config.max_tool_invocations,
+        max_tokens: config.max_tokens,
+        max_wall_time_seconds: config.max_wall_time_ms / 1_000,
+        max_retries_per_tool: u32::from(config.max_tool_retries),
+        max_fan_out: config.max_fan_out,
+    }
+}
+
 #[derive(Clone)]
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
@@ -69,6 +82,7 @@ pub struct FawxToolExecutor {
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    kernel_budget: KernelBudgetConfig,
     start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     experiment: Option<ExperimentToolState>,
@@ -119,6 +133,7 @@ impl FawxToolExecutor {
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
             config_manager: None,
+            kernel_budget: KernelBudgetConfig::default(),
             start_time: std::time::Instant::now(),
             subagent_control: None,
             experiment: None,
@@ -165,6 +180,12 @@ impl FawxToolExecutor {
     /// Attach a config manager for runtime config read/write tools.
     pub fn with_config_manager(mut self, mgr: Arc<Mutex<ConfigManager>>) -> Self {
         self.config_manager = Some(mgr);
+        self
+    }
+
+    /// Attach the active kernel budget configuration.
+    pub fn with_kernel_budget(mut self, budget: KernelBudgetConfig) -> Self {
+        self.kernel_budget = budget;
         self
     }
 
@@ -242,6 +263,7 @@ impl FawxToolExecutor {
             | "self_info"
             | "config_get"
             | "fawx_status"
+            | "kernel_manifest"
             | "exec_status"
             | "subagent_status"
             | "analyze_signals"
@@ -273,6 +295,7 @@ impl FawxToolExecutor {
             "config_get" => self.handle_config_get(&call.arguments),
             "config_set" => self.handle_config_set(&call.arguments),
             "fawx_status" => self.handle_fawx_status(),
+            "kernel_manifest" => self.handle_kernel_manifest(),
             "fawx_restart" => self.handle_fawx_restart(&call.arguments),
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
@@ -626,6 +649,44 @@ impl FawxToolExecutor {
         serde_json::to_string_pretty(&status).map_err(|e| format!("failed to format status: {e}"))
     }
 
+    fn handle_kernel_manifest(&self) -> Result<String, String> {
+        let runtime = self.locked_runtime_info()?;
+        let config = self.locked_config()?;
+        let sm_enabled = self.self_modify.as_ref().is_some_and(|sm| sm.enabled);
+        let sm_allow = self
+            .self_modify
+            .as_ref()
+            .map_or_else(Vec::new, |sm| sm.allow_paths.clone());
+        let sm_deny = self
+            .self_modify
+            .as_ref()
+            .map_or_else(Vec::new, |sm| sm.deny_paths.clone());
+        let working_dir = self.working_dir.to_string_lossy().into_owned();
+        let budget = build_budget_summary(&self.kernel_budget);
+        let can_request_capabilities = runtime
+            .skills
+            .iter()
+            .any(|skill| skill.tool_names.iter().any(|tool| tool == "request_capability"));
+        let sources = ManifestSources {
+            version: &runtime.version,
+            active_model: &runtime.active_model,
+            provider: &runtime.provider,
+            preset: Some(config.permissions.preset.as_str()),
+            permissions: &config.permissions,
+            budget: &budget,
+            sandbox: &config.sandbox,
+            self_modify_enabled: sm_enabled,
+            self_modify_allow: &sm_allow,
+            self_modify_deny: &sm_deny,
+            skills: &runtime.skills,
+            working_dir: &working_dir,
+            can_request_capabilities,
+        };
+        let manifest = build_kernel_manifest(&sources);
+        serde_json::to_string_pretty(&manifest)
+            .map_err(|e| format!("failed to serialize manifest: {e}"))
+    }
+
     fn handle_fawx_restart(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: FawxRestartArgs = parse_args(args)?;
         let delay = parsed.delay_seconds.unwrap_or(2);
@@ -636,6 +697,27 @@ impl FawxToolExecutor {
         Ok(format!(
             "restart scheduled in {clamped}s (reason: {reason})"
         ))
+    }
+
+    fn locked_runtime_info(&self) -> Result<RuntimeInfo, String> {
+        let info = self
+            .runtime_info
+            .as_ref()
+            .ok_or_else(|| "runtime info not configured".to_string())?;
+        info.read()
+            .map_err(|error| format!("failed to read runtime info: {error}"))
+            .map(|guard| guard.clone())
+    }
+
+    fn locked_config(&self) -> Result<FawxConfig, String> {
+        let manager = self
+            .config_manager
+            .as_ref()
+            .ok_or_else(|| "config manager not available".to_string())?;
+        let guard = manager
+            .lock()
+            .map_err(|error| format!("config lock failed: {error}"))?;
+        Ok(guard.config().clone())
     }
 
     fn locked_config_manager(&self) -> Result<std::sync::MutexGuard<'_, ConfigManager>, String> {
@@ -1334,6 +1416,7 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("self_modify", &self.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
             .field("config_manager", &self.config_manager.is_some())
+            .field("kernel_budget", &self.kernel_budget)
             .field("subagent_control", &self.subagent_control.is_some())
             .field("experiment", &self.experiment.is_some())
             .field("experiment_progress", &self.experiment_progress.is_some())
@@ -2415,6 +2498,19 @@ pub fn config_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "fawx_status".to_string(),
             description: "Get server status: uptime, model, memory entries".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "kernel_manifest".to_string(),
+            description: "Get a structured description of the kernel's current configuration, \
+                permissions, budget limits, sandbox rules, and available tools. Use this at the \
+                start of complex tasks to understand your capabilities and constraints before \
+                planning."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {},

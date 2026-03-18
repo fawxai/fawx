@@ -430,6 +430,7 @@ struct SkillRegistryBuildOptions {
     experiment_progress: Option<ProgressCallback>,
     session_registry: Option<fx_session::SessionRegistry>,
     session_bus: Option<SessionBus>,
+    kernel_budget: BudgetConfig,
     #[cfg(feature = "http")]
     experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -490,9 +491,10 @@ fn build_loop_engine_with_options(
     options: HeadlessLoopBuildOptions,
 ) -> Result<LoopEngineBundle, StartupError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
-    let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
+    let kernel_budget = BudgetConfig::default();
+    let budget = BudgetTracker::new(kernel_budget.clone(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    let registry_options = build_skill_registry_options(&config, &options);
+    let registry_options = build_skill_registry_options(&config, &options, &kernel_budget);
     let working_dir = registry_options.working_dir.clone();
     let improvement_provider_for_bundle = improvement_provider.clone();
     let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
@@ -584,6 +586,7 @@ fn build_loop_engine_with_options(
 fn build_skill_registry_options(
     config: &FawxConfig,
     options: &HeadlessLoopBuildOptions,
+    kernel_budget: &BudgetConfig,
 ) -> SkillRegistryBuildOptions {
     SkillRegistryBuildOptions {
         working_dir: options
@@ -596,6 +599,7 @@ fn build_skill_registry_options(
         experiment_progress: options.experiment_progress.clone(),
         session_registry: options.session_registry.clone(),
         session_bus: options.session_bus.clone(),
+        kernel_budget: kernel_budget.clone(),
         #[cfg(feature = "http")]
         experiment_registry: options.experiment_registry.clone(),
     }
@@ -974,7 +978,8 @@ fn build_tool_executor(
     process_registry: Arc<ProcessRegistry>,
 ) -> FawxToolExecutor {
     let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
-        .with_process_registry(process_registry);
+        .with_process_registry(process_registry)
+        .with_kernel_budget(options.kernel_budget.clone());
     #[cfg(feature = "http")]
     let executor = attach_experiment_registrar(executor, options.experiment_registry.as_ref());
     #[cfg(feature = "http")]
@@ -2145,6 +2150,7 @@ mod tests {
             experiment_progress: None,
             session_registry: None,
             session_bus: None,
+            kernel_budget: BudgetConfig::default(),
             experiment_registry: Some(
                 build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
             ),
