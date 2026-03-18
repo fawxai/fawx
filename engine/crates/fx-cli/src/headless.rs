@@ -43,6 +43,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 
+use crate::auth_store::AuthStore;
 use crate::commands::slash::{
     apply_thinking_budget, client_only_command_message, config_reload_success_message,
     execute_command, init_default_config, is_command_input, parse_command, persist_default_model,
@@ -234,6 +235,7 @@ pub struct AuthProviderStatus {
     pub provider: String,
     pub auth_methods: BTreeSet<String>,
     pub model_count: usize,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -606,7 +608,11 @@ impl HeadlessApp {
     }
 
     pub fn auth_provider_statuses(&self) -> Vec<AuthProviderStatus> {
-        auth_provider_statuses(self.available_models())
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        auth_provider_statuses(
+            self.available_models(),
+            stored_auth_provider_entries(&data_dir),
+        )
     }
 
     /// Return the loaded configuration.
@@ -1448,7 +1454,7 @@ fn auth_usage_message() -> String {
 }
 
 fn render_auth_overview(router: &ModelRouter) -> String {
-    let statuses = auth_provider_statuses(router.available_models());
+    let statuses = auth_provider_statuses(router.available_models(), Vec::new());
     if statuses.is_empty() {
         return "No credentials configured.".to_string();
     }
@@ -1458,9 +1464,14 @@ fn render_auth_overview(router: &ModelRouter) -> String {
 }
 
 fn render_auth_status_line(status: &AuthProviderStatus) -> String {
+    let state_label = match status.status.as_str() {
+        "saved" => "saved",
+        _ => "configured",
+    };
     format!(
-        "  ✓ {}: configured ({}) — {}",
+        "  ✓ {}: {} ({}) — {}",
         status.provider,
+        state_label,
         format_auth_methods(&status.auth_methods),
         model_count_label(status.model_count)
     )
@@ -1468,13 +1479,14 @@ fn render_auth_status_line(status: &AuthProviderStatus) -> String {
 
 fn render_auth_provider_status(router: &ModelRouter, provider: &str) -> String {
     let provider = normalize_provider_name(provider);
-    match auth_provider_statuses(router.available_models())
+    match auth_provider_statuses(router.available_models(), Vec::new())
         .into_iter()
         .find(|status| status.provider == provider)
     {
         Some(status) => format!(
-            "{} auth status:\n  Status: configured ({})\n  Models available: {}",
+            "{} auth status:\n  Status: {} ({})\n  Models available: {}",
             status.provider,
+            status.status,
             format_auth_methods(&status.auth_methods),
             status.model_count
         ),
@@ -1482,8 +1494,14 @@ fn render_auth_provider_status(router: &ModelRouter, provider: &str) -> String {
     }
 }
 
-fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
+fn auth_provider_statuses(
+    models: Vec<ModelInfo>,
+    stored_auth_entries: Vec<StoredAuthProviderEntry>,
+) -> Vec<AuthProviderStatus> {
     let mut statuses = BTreeMap::new();
+    for entry in stored_auth_entries {
+        update_saved_auth_provider_status(&mut statuses, entry);
+    }
     for model in models {
         update_auth_provider_status(&mut statuses, model);
     }
@@ -1518,7 +1536,71 @@ fn auth_provider_dto(status: AuthProviderStatus) -> AuthProviderDto {
         provider: status.provider,
         auth_methods: status.auth_methods.into_iter().collect(),
         model_count: status.model_count,
-        status: "registered".to_string(),
+        status: status.status,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredAuthProviderEntry {
+    provider: String,
+    auth_method: String,
+}
+
+fn stored_auth_provider_entries(data_dir: &Path) -> Vec<StoredAuthProviderEntry> {
+    let store = match AuthStore::open(data_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to open auth store while building auth statuses");
+            return Vec::new();
+        }
+    };
+    let auth_manager = match store.load_auth_manager() {
+        Ok(auth_manager) => auth_manager,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load auth manager while building auth statuses");
+            return Vec::new();
+        }
+    };
+
+    auth_manager
+        .providers()
+        .into_iter()
+        .filter_map(|provider| {
+            let auth_method = auth_manager
+                .get(&provider)
+                .map(stored_auth_method_label)?
+                .to_string();
+            Some(StoredAuthProviderEntry {
+                provider: normalize_provider_name(&provider),
+                auth_method,
+            })
+        })
+        .collect()
+}
+
+fn stored_auth_method_label(auth_method: &fx_auth::auth::AuthMethod) -> &'static str {
+    match auth_method {
+        fx_auth::auth::AuthMethod::ApiKey { .. } => "api_key",
+        fx_auth::auth::AuthMethod::SetupToken { .. } => "setup_token",
+        fx_auth::auth::AuthMethod::OAuth { .. } => "oauth",
+    }
+}
+
+fn update_saved_auth_provider_status(
+    statuses: &mut BTreeMap<String, AuthProviderStatus>,
+    entry: StoredAuthProviderEntry,
+) {
+    let status = statuses
+        .entry(entry.provider.clone())
+        .or_insert_with(|| AuthProviderStatus {
+            provider: entry.provider,
+            auth_methods: BTreeSet::new(),
+            model_count: 0,
+            status: "saved".to_string(),
+        });
+    status.auth_methods.insert(entry.auth_method);
+    if status.model_count == 0 {
+        status.status = "saved".to_string();
     }
 }
 
@@ -1533,9 +1615,17 @@ fn update_auth_provider_status(
             provider,
             auth_methods: BTreeSet::new(),
             model_count: 0,
+            status: "registered".to_string(),
         });
     status.auth_methods.insert(model.auth_method);
     status.model_count += 1;
+    // GitHub models use the same PAT-backed auth path as the dedicated
+    // settings card, so keep a persisted token visible as "saved" instead of
+    // collapsing it back to the generic "registered" model-provider state.
+    if status.provider == "github" && status.status == "saved" {
+        return;
+    }
+    status.status = "registered".to_string();
 }
 
 fn format_auth_methods(auth_methods: &BTreeSet<String>) -> String {
@@ -2370,11 +2460,20 @@ mod tests {
     }
 
     fn test_app() -> HeadlessApp {
+        let mut config = FawxConfig::default();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("fawx-headless-tests-{unique}"));
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        config.general.data_dir = Some(data_dir);
+
         HeadlessApp {
             loop_engine: test_engine(),
             router: Arc::new(ModelRouter::new()),
             runtime_info: test_runtime_info(),
-            config: FawxConfig::default(),
+            config,
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
@@ -2625,7 +2724,17 @@ mod tests {
         router
     }
 
-    fn headless_deps(mut router: ModelRouter, config: FawxConfig) -> HeadlessAppDeps {
+    fn headless_deps(mut router: ModelRouter, mut config: FawxConfig) -> HeadlessAppDeps {
+        if config.general.data_dir.is_none() {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let data_dir = std::env::temp_dir().join(format!("fawx-headless-tests-{unique}"));
+            std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+            config.general.data_dir = Some(data_dir);
+        }
+
         seed_headless_router_active_model(&mut router, &config);
         HeadlessAppDeps {
             loop_engine: test_engine(),
@@ -3007,6 +3116,80 @@ mod tests {
         let status = app.show_status();
         assert!(status.contains("providers: usage-reporting"));
         assert!(!status.contains("providers: usage-reporting, usage-reporting"));
+    }
+
+    #[test]
+    fn auth_provider_statuses_include_saved_non_model_credentials() {
+        let statuses = auth_provider_statuses(
+            Vec::new(),
+            vec![StoredAuthProviderEntry {
+                provider: "github".to_string(),
+                auth_method: "api_key".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            statuses,
+            vec![AuthProviderStatus {
+                provider: "github".to_string(),
+                auth_methods: BTreeSet::from(["api_key".to_string()]),
+                model_count: 0,
+                status: "saved".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_provider_statuses_prefer_registered_status_when_models_exist() {
+        let statuses = auth_provider_statuses(
+            vec![ModelInfo {
+                model_id: "gpt-4o".to_string(),
+                provider_name: "openai".to_string(),
+                auth_method: "oauth".to_string(),
+            }],
+            vec![
+                StoredAuthProviderEntry {
+                    provider: "github".to_string(),
+                    auth_method: "api_key".to_string(),
+                },
+                StoredAuthProviderEntry {
+                    provider: "openai".to_string(),
+                    auth_method: "oauth".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].provider, "github");
+        assert_eq!(statuses[0].status, "saved");
+        assert_eq!(statuses[1].provider, "openai");
+        assert_eq!(statuses[1].status, "registered");
+        assert_eq!(statuses[1].model_count, 1);
+    }
+
+    #[test]
+    fn auth_provider_statuses_keep_github_saved_status_when_models_exist() {
+        let statuses = auth_provider_statuses(
+            vec![ModelInfo {
+                model_id: "gpt-4o-mini".to_string(),
+                provider_name: "github".to_string(),
+                auth_method: "api_key".to_string(),
+            }],
+            vec![StoredAuthProviderEntry {
+                provider: "github".to_string(),
+                auth_method: "api_key".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            statuses,
+            vec![AuthProviderStatus {
+                provider: "github".to_string(),
+                auth_methods: BTreeSet::from(["api_key".to_string()]),
+                model_count: 1,
+                status: "saved".to_string(),
+            }]
+        );
     }
 
     #[test]

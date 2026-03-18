@@ -1220,10 +1220,19 @@ mod routing_and_status {
 
     fn build_test_app(
         router: ModelRouter,
-        config: fx_config::FawxConfig,
+        mut config: fx_config::FawxConfig,
         config_manager: Option<Arc<StdMutex<ConfigManager>>>,
         runtime_info: Arc<std::sync::RwLock<RuntimeInfo>>,
     ) -> HeadlessApp {
+        if config.general.data_dir.is_none() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let data_dir = std::env::temp_dir().join(format!("fawx-api-tests-{unique}"));
+            std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+            config.general.data_dir = Some(data_dir);
+        }
         build_test_app_with_bus(router, config, config_manager, runtime_info, None)
     }
 

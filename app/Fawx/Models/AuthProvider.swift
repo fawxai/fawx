@@ -9,6 +9,8 @@ struct AuthProvider: Codable, Identifiable, Sendable, Hashable {
     var id: String { provider }
     var displayName: String {
         switch provider.lowercased() {
+        case "github":
+            return "GitHub"
         case "openai":
             return "OpenAI"
         case "anthropic":
@@ -26,8 +28,12 @@ struct AuthProvider: Codable, Identifiable, Sendable, Hashable {
         }
     }
 
+    private var normalizedStatus: String {
+        status.lowercased()
+    }
+
     var isConfigured: Bool {
-        switch status.lowercased() {
+        switch normalizedStatus {
         case "not_configured", "unconfigured", "missing", "disabled", "unauthenticated":
             return false
         default:
@@ -36,7 +42,20 @@ struct AuthProvider: Codable, Identifiable, Sendable, Hashable {
     }
 
     var displayStatus: String {
-        isConfigured ? "Configured" : "Not configured"
+        switch normalizedStatus {
+        case "saved":
+            "Saved"
+        case "authenticated", "verified":
+            "Verified"
+        case "invalid":
+            "Invalid"
+        case "registered":
+            "Configured"
+        case "not_configured", "unconfigured", "missing", "disabled", "unauthenticated":
+            "Not configured"
+        default:
+            isConfigured ? "Configured" : "Not configured"
+        }
     }
 
     var authMethodsSummary: String {
