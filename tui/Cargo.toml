@@ -36,7 +36,7 @@ reqwest = { workspace = true, features = ["json"] }
 ring = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sparx = { git = "https://github.com/abbudjoe/sparx.git" }
+sparx = { git = "https://github.com/abbudjoe/sparx.git", rev = "6e942de454cf854c289da9c0d1f089441c2c5d69" }
 textwrap = "0.16"
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -34,6 +34,7 @@ reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle = "2"
 tokio.workspace = true
 tokio-util = "0.7"
 tracing.workspace = true

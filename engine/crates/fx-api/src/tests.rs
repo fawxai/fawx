@@ -863,8 +863,15 @@ fn verify_token_empty_provided_rejected() {
 }
 
 #[test]
-fn verify_token_empty_both_accepted() {
-    assert!(verify_token("", ""));
+fn verify_token_empty_expected_rejected() {
+    assert!(!verify_token("", "some-token"));
+}
+
+#[test]
+fn verify_token_empty_both_rejected() {
+    // Empty tokens must never authenticate — defense-in-depth against
+    // misconfigured HttpState with an empty bearer_token.
+    assert!(!verify_token("", ""));
 }
 
 #[test]
