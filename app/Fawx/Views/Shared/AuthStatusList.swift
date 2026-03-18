@@ -89,6 +89,7 @@ struct AuthStatusList: View {
                     initialProvider: selectedProviderForEditor
                 )
             }
+            .fawxOpaqueModalPresentation()
         }
     }
 

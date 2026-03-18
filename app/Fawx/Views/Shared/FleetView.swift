@@ -42,6 +42,7 @@ struct FleetView: View {
             )
         ) {
             FleetNodeDetailSheet(viewModel: viewModel)
+                .fawxOpaqueModalPresentation()
         }
     }
 

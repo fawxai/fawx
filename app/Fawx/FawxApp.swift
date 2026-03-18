@@ -213,6 +213,7 @@ struct FawxApp: App {
                 }
             )
             .interactiveDismissDisabled(true)
+            .fawxOpaqueModalPresentation()
         }
     }
 

@@ -168,6 +168,7 @@ struct iOSSettingsView: View {
                     }
                 }
             )
+            .fawxOpaqueModalPresentation()
         }
     }
 

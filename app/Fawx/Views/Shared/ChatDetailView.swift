@@ -119,34 +119,37 @@ struct ChatDetailView: View {
                     ripcordReport = nil
                 }
             ) {
-                if let ripcordReport {
-                    RipcordReportView(report: ripcordReport, dismissAction: {
-                        self.ripcordReport = nil
-                        isShowingRipcordSheet = false
-                    })
-                } else {
-                    RipcordJournalPanel(
-                        status: appState.activeRipcordStatus,
-                        entries: ripcordJournalEntries,
-                        isLoading: isLoadingRipcordJournal,
-                        errorMessage: ripcordJournalErrorMessage,
-                        isPerformingAction: ripcordActionInFlight != nil,
-                        refreshAction: {
-                            Task {
-                                await loadRipcordJournal()
-                            }
-                        },
-                        pullAction: {
-                            pendingRipcordConfirmation = .pull
-                        },
-                        approveAction: {
-                            pendingRipcordConfirmation = .approve
-                        },
-                        dismissAction: {
+                Group {
+                    if let ripcordReport {
+                        RipcordReportView(report: ripcordReport, dismissAction: {
+                            self.ripcordReport = nil
                             isShowingRipcordSheet = false
-                        }
-                    )
+                        })
+                    } else {
+                        RipcordJournalPanel(
+                            status: appState.activeRipcordStatus,
+                            entries: ripcordJournalEntries,
+                            isLoading: isLoadingRipcordJournal,
+                            errorMessage: ripcordJournalErrorMessage,
+                            isPerformingAction: ripcordActionInFlight != nil,
+                            refreshAction: {
+                                Task {
+                                    await loadRipcordJournal()
+                                }
+                            },
+                            pullAction: {
+                                pendingRipcordConfirmation = .pull
+                            },
+                            approveAction: {
+                                pendingRipcordConfirmation = .approve
+                            },
+                            dismissAction: {
+                                isShowingRipcordSheet = false
+                            }
+                        )
+                    }
                 }
+                .fawxOpaqueModalPresentation()
             }
             .confirmationDialog(
                 pendingRipcordConfirmation?.title ?? "",

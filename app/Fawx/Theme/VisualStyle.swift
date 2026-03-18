@@ -66,4 +66,10 @@ extension View {
     func fawxShadow(_ style: FawxShadowStyle) -> some View {
         modifier(FawxShadowModifier(style: style))
     }
+
+    @ViewBuilder
+    func fawxOpaqueModalPresentation() -> some View {
+        self
+            .presentationBackground(Color.fawxBackground)
+    }
 }
