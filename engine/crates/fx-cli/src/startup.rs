@@ -904,7 +904,8 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone());
+    // TODO: Wire GitHubTokenProvider from credential_provider once PAT borrowing lands (#1485)
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone(), None);
     registry.register(Arc::new(git_skill));
     let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm);
     registry.register(Arc::new(tx_skill));
