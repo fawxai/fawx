@@ -586,12 +586,17 @@ impl SetupWizard {
             system_prompt: Some("Reply with OK.".to_string()),
             thinking: None,
         };
-        router
-            .complete(request)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-        println!("  ✓ Model connection: {model}");
-        Ok(())
+        match router.complete(request).await {
+            Ok(_) => {
+                println!("  ✓ Model connection: {model}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("  ✗ Validation failed for {model}: {error}");
+                eprintln!("    Auth method: {:?}", self.auth_manager.get(model.split('/').next().unwrap_or("unknown")));
+                Err(anyhow!(error.to_string()))
+            }
+        }
     }
 
     fn validate_saved_telegram(&self) {
