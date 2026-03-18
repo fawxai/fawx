@@ -366,6 +366,9 @@ impl OpenAiResponsesProvider {
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
+        if status.as_u16() == 400 && Self::mentions_reasoning_rejection(&body) {
+            tracing::warn!("provider rejected reasoning config — check effort level: {body}");
+        }
         match status.as_u16() {
             401 | 403 => LlmError::Authentication(body),
             429 => LlmError::RateLimited(body),
@@ -373,6 +376,13 @@ impl OpenAiResponsesProvider {
             500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
+    }
+
+    fn mentions_reasoning_rejection(body: &str) -> bool {
+        let lowered = body.to_ascii_lowercase();
+        ["reasoning", "effort", "supported values", "must be one of"]
+            .iter()
+            .any(|term| lowered.contains(term))
     }
 
     async fn complete_via_stream(
@@ -1435,7 +1445,10 @@ mod tests {
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
 
-        assert_eq!(serialized["reasoning"], serde_json::json!({"effort": "xhigh"}));
+        assert_eq!(
+            serialized["reasoning"],
+            serde_json::json!({"effort": "xhigh"})
+        );
     }
 
     #[test]

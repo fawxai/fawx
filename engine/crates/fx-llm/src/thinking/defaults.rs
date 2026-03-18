@@ -1,99 +1,145 @@
 use crate::ThinkingConfig;
 
-/// Return valid thinking levels for a model.
-pub fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
-    let model = model_id.split('/').next_back().unwrap_or(model_id);
+const OFF_LEVELS: &[&str] = &["off"];
+const CLAUDE_OPUS_46_LEVELS: &[&str] = &["off", "adaptive", "low", "medium", "high", "max"];
+const CLAUDE_SONNET_46_LEVELS: &[&str] = &["off", "adaptive", "low", "medium", "high"];
+const CLAUDE_LEGACY_LEVELS: &[&str] = &["off", "low", "high"];
+const GPT_54_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+const GPT_52_LEVELS: &[&str] = &["none", "low", "medium", "high"];
+const GPT_5_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
+const O1_O3_LEVELS: &[&str] = &["off", "low", "medium", "high"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelFamily {
+    ClaudeOpus46,
+    ClaudeSonnet46,
+    /// Claude 4.5, Haiku, and all older Claude models (same behavior).
+    ClaudeLegacy,
+    Gpt54,
+    Gpt5,
+    Gpt52,
+    O1O3,
+    Unknown,
+}
+
+fn model_name(model_id: &str) -> &str {
+    model_id.split('/').next_back().unwrap_or(model_id)
+}
+
+fn classify_model(model_id: &str) -> ModelFamily {
+    let model = model_name(model_id);
     if model.contains("opus-4-6") {
-        return &["off", "adaptive", "low", "medium", "high", "max"];
+        return ModelFamily::ClaudeOpus46;
     }
     if model.contains("sonnet-4-6") {
-        return &["off", "adaptive", "low", "medium", "high"];
+        return ModelFamily::ClaudeSonnet46;
     }
     if model.starts_with("claude-opus-4-5")
         || model.starts_with("claude-sonnet-4-5")
         || model.starts_with("claude-haiku-4-5")
     {
-        return &["off", "low", "high"];
+        return ModelFamily::ClaudeLegacy;
     }
     if model.starts_with("claude-") {
-        return &["off", "low", "high"];
+        return ModelFamily::ClaudeLegacy;
     }
     if model.starts_with("gpt-5.4") {
-        return &["none", "low", "medium", "high", "xhigh"];
+        return ModelFamily::Gpt54;
     }
     if model.starts_with("gpt-5.2") {
-        return &["none", "low", "medium", "high"];
+        return ModelFamily::Gpt52;
     }
-    if model.starts_with("gpt-5") {
-        return &["minimal", "low", "medium", "high"];
+    if model.starts_with("gpt-5") || model.starts_with("codex-") {
+        return ModelFamily::Gpt5;
     }
     if model.starts_with("o1") || model.starts_with("o3") {
-        return &["low", "medium", "high"];
+        return ModelFamily::O1O3;
     }
-    &["off"]
+    ModelFamily::Unknown
+}
+
+fn anthropic_46_effort(level: &str) -> String {
+    if level == "adaptive" {
+        "high".to_string()
+    } else {
+        level.to_string()
+    }
+}
+
+fn openai_reasoning_effort(level: &str) -> String {
+    if level == "adaptive" {
+        "medium".to_string()
+    } else {
+        level.to_string()
+    }
+}
+
+fn legacy_claude_budget(model_id: &str, level: &str) -> u32 {
+    match level {
+        "low" => 1_024,
+        "high" => 10_000,
+        _ => {
+            tracing::warn!(
+                level,
+                model = model_name(model_id),
+                "unexpected thinking level for model, using default budget"
+            );
+            4_096
+        }
+    }
+}
+
+/// Return valid thinking levels for a model.
+pub fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
+    match classify_model(model_id) {
+        ModelFamily::ClaudeOpus46 => CLAUDE_OPUS_46_LEVELS,
+        ModelFamily::ClaudeSonnet46 => CLAUDE_SONNET_46_LEVELS,
+        ModelFamily::ClaudeLegacy => CLAUDE_LEGACY_LEVELS,
+        ModelFamily::Gpt54 => GPT_54_LEVELS,
+        ModelFamily::Gpt52 => GPT_52_LEVELS,
+        ModelFamily::Gpt5 => GPT_5_LEVELS,
+        ModelFamily::O1O3 => O1_O3_LEVELS,
+        ModelFamily::Unknown => OFF_LEVELS,
+    }
 }
 
 /// Return the default thinking level for a model.
 pub fn default_thinking_level(model_id: &str) -> &'static str {
-    let model = model_id.split('/').next_back().unwrap_or(model_id);
-    if model.contains("opus-4-6") || model.contains("sonnet-4-6") {
-        return "high";
+    match classify_model(model_id) {
+        ModelFamily::ClaudeOpus46 | ModelFamily::ClaudeSonnet46 | ModelFamily::ClaudeLegacy => {
+            "high"
+        }
+        ModelFamily::Gpt54 | ModelFamily::Gpt52 => "none",
+        ModelFamily::Gpt5 => "medium",
+        ModelFamily::O1O3 | ModelFamily::Unknown => "off",
     }
-    if model.starts_with("claude-") {
-        return "high";
-    }
-    if model.starts_with("gpt-5.4") || model.starts_with("gpt-5.2") {
-        return "none";
-    }
-    if model.starts_with("gpt-5") {
-        return "medium";
-    }
-    "off"
 }
 
 /// Build ThinkingConfig from a model ID and user-selected level.
 pub fn thinking_config_for_model(model_id: &str, level: &str) -> Option<ThinkingConfig> {
-    let model = model_id.split('/').next_back().unwrap_or(model_id);
     if level == "off" || level == "none" {
         return Some(ThinkingConfig::Off);
     }
-    if model.contains("opus-4-6") || model.contains("sonnet-4-6") {
-        let effort = if level == "adaptive" {
-            "high".to_string()
-        } else {
-            level.to_string()
-        };
-        return Some(ThinkingConfig::Adaptive { effort });
+
+    match classify_model(model_id) {
+        ModelFamily::ClaudeOpus46 | ModelFamily::ClaudeSonnet46 => Some(ThinkingConfig::Adaptive {
+            effort: anthropic_46_effort(level),
+        }),
+        ModelFamily::ClaudeLegacy => Some(ThinkingConfig::Enabled {
+            budget_tokens: legacy_claude_budget(model_id, level),
+        }),
+        ModelFamily::Gpt54 | ModelFamily::Gpt52 | ModelFamily::Gpt5 | ModelFamily::O1O3 => {
+            Some(ThinkingConfig::Reasoning {
+                effort: openai_reasoning_effort(level),
+            })
+        }
+        ModelFamily::Unknown => None,
     }
-    if model.starts_with("claude-") {
-        let budget = match level {
-            "low" => 1_024,
-            "high" => 10_000,
-            _ => 4_096,
-        };
-        return Some(ThinkingConfig::Enabled {
-            budget_tokens: budget,
-        });
-    }
-    if model.starts_with("gpt-")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("codex-")
-    {
-        let effort = if level == "adaptive" {
-            default_thinking_level(model).to_string()
-        } else {
-            level.to_string()
-        };
-        return Some(ThinkingConfig::Reasoning { effort });
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn opus_4_6_includes_max() {
         let levels = valid_thinking_levels("claude-opus-4-6");
@@ -128,6 +174,13 @@ mod tests {
     }
 
     #[test]
+    fn o3_includes_off() {
+        let levels = valid_thinking_levels("o3");
+        assert!(levels.contains(&"off"));
+        assert!(levels.contains(&"high"));
+    }
+
+    #[test]
     fn unknown_model_returns_off() {
         let levels = valid_thinking_levels("unknown-model");
         assert_eq!(levels, &["off"]);
@@ -138,6 +191,12 @@ mod tests {
         let a = valid_thinking_levels("claude-opus-4-6");
         let b = valid_thinking_levels("anthropic/claude-opus-4-6");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn codex_model_classified_as_gpt5() {
+        let levels = valid_thinking_levels("codex-mini-latest");
+        assert_eq!(levels, GPT_5_LEVELS);
     }
 
     #[test]
@@ -184,12 +243,31 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_alias_maps_to_model_default_effort() {
+    fn o1_off_returns_off() {
+        let config = thinking_config_for_model("o1", "off");
+        assert!(matches!(config, Some(crate::ThinkingConfig::Off)));
+    }
+
+    #[test]
+    fn adaptive_alias_maps_to_medium_effort_for_openai() {
         let config = thinking_config_for_model("gpt-5.4", "adaptive");
         assert_eq!(
             config,
             Some(crate::ThinkingConfig::Reasoning {
-                effort: "none".to_string(),
+                effort: "medium".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_claude_unknown_level_falls_back_to_default_budget() {
+        // Unexpected level like "adaptive" on a 4.5 model gets default budget (4096)
+        // and a tracing::warn is emitted (not asserted here — side effect).
+        let config = thinking_config_for_model("claude-sonnet-4-5-20250929", "adaptive");
+        assert_eq!(
+            config,
+            Some(crate::ThinkingConfig::Enabled {
+                budget_tokens: 4_096,
             })
         );
     }

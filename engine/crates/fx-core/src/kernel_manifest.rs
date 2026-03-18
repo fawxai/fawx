@@ -136,10 +136,7 @@ pub fn build_kernel_manifest(sources: &ManifestSources<'_>) -> KernelManifest {
     }
 }
 
-fn build_permission_manifest(
-    config: &PermissionsConfig,
-    can_request: bool,
-) -> PermissionManifest {
+fn build_permission_manifest(config: &PermissionsConfig, can_request: bool) -> PermissionManifest {
     let mode = match config.mode {
         CapabilityMode::Capability => "capability",
         CapabilityMode::Prompt => "prompt",
@@ -326,7 +323,10 @@ mod tests {
         let manifest = build_kernel_manifest(&fixture.sources());
         assert_eq!(manifest.tools.len(), 2);
         assert_eq!(manifest.tools[0].name, "builtin");
-        assert_eq!(manifest.tools[0].tools, vec!["read_file", "kernel_manifest"]);
+        assert_eq!(
+            manifest.tools[0].tools,
+            vec!["read_file", "kernel_manifest"]
+        );
     }
 
     #[test]
@@ -373,10 +373,7 @@ mod tests {
             manifest.self_modify.allow_paths,
             vec!["/workspace/fawx/docs", "/workspace/fawx/scripts"]
         );
-        assert_eq!(
-            manifest.self_modify.deny_paths,
-            vec![".git/**", "*.pem"]
-        );
+        assert_eq!(manifest.self_modify.deny_paths, vec![".git/**", "*.pem"]);
     }
 
     #[test]
@@ -394,7 +391,9 @@ mod tests {
         let manifest = build_kernel_manifest(&fixture.sources());
         assert!(manifest.permissions.can_request_capabilities);
 
-        fixture.skills[0].tool_names.retain(|name| name != "kernel_manifest");
+        fixture.skills[0]
+            .tool_names
+            .retain(|name| name != "kernel_manifest");
         let sources = ManifestSources {
             can_request_capabilities: false,
             ..fixture.sources()

@@ -183,8 +183,7 @@ mod tests {
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        let (module, was_cached) =
-            compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
+        let (module, was_cached) = compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
         assert!(!was_cached);
         assert_eq!(module.exports().count(), 0);
     }
@@ -195,12 +194,10 @@ mod tests {
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        let (_m1, cached1) =
-            compile_module_in(&engine, &wasm, tmp.path()).expect("first compile");
+        let (_m1, cached1) = compile_module_in(&engine, &wasm, tmp.path()).expect("first compile");
         assert!(!cached1);
 
-        let (_m2, cached2) =
-            compile_module_in(&engine, &wasm, tmp.path()).expect("second compile");
+        let (_m2, cached2) = compile_module_in(&engine, &wasm, tmp.path()).expect("second compile");
         assert!(cached2);
     }
 

@@ -2477,8 +2477,6 @@ mod tests {
         assert!(bundle.embedding_index_persistence.is_none());
     }
 
-
-
     #[test]
     fn build_loop_engine_from_builder_returns_startup_error_on_failure() {
         let error = build_loop_engine_from_builder(LoopEngine::builder())

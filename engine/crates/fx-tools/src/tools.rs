@@ -658,10 +658,12 @@ impl FawxToolExecutor {
         };
         let working_dir = self.working_dir.to_string_lossy().into_owned();
         let budget = build_budget_summary(&self.kernel_budget);
-        let can_request_capabilities = runtime
-            .skills
-            .iter()
-            .any(|skill| skill.tool_names.iter().any(|tool| tool == "request_capability"));
+        let can_request_capabilities = runtime.skills.iter().any(|skill| {
+            skill
+                .tool_names
+                .iter()
+                .any(|tool| tool == "request_capability")
+        });
         let sources = ManifestSources {
             version: &runtime.version,
             active_model: &runtime.active_model,
@@ -5316,8 +5318,7 @@ three
     #[test]
     fn kernel_manifest_fails_without_config_manager() {
         let temp = TempDir::new().expect("tempdir");
-        let exec = test_executor(temp.path())
-            .with_runtime_info(sample_runtime_info("m"));
+        let exec = test_executor(temp.path()).with_runtime_info(sample_runtime_info("m"));
         let error = exec.handle_kernel_manifest().expect_err("should fail");
         assert!(error.contains("config manager"));
     }

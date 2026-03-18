@@ -298,7 +298,10 @@ mod tests {
             BorrowScope::Contribution,
         );
         let debug = format!("{borrow:?}");
-        assert!(!debug.contains("ghp-secret-value"), "Debug should redact token");
+        assert!(
+            !debug.contains("ghp-secret-value"),
+            "Debug should redact token"
+        );
         assert!(debug.contains("REDACTED"), "Debug should show REDACTED");
         assert!(debug.contains("Contribution"), "Debug should show scope");
     }

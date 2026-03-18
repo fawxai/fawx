@@ -130,11 +130,7 @@ pub fn validate_skill_name(name: &str) -> Result<(), MarketplaceError> {
             "skill name must not be empty".to_string(),
         ));
     }
-    if name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.contains('\0')
-    {
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
         return Err(MarketplaceError::InstallError(format!(
             "skill name contains forbidden characters: '{name}'"
         )));
@@ -266,11 +262,15 @@ pub fn install(
     let install_dir = config.data_dir.join("skills").join(&entry.name);
     // Verify the resolved install path is actually under the skills directory.
     let skills_dir = config.data_dir.join("skills");
-    let canonical_skills = skills_dir.canonicalize().unwrap_or_else(|_| skills_dir.clone());
+    let canonical_skills = skills_dir
+        .canonicalize()
+        .unwrap_or_else(|_| skills_dir.clone());
     let canonical_install = install_dir.canonicalize().unwrap_or_else(|_| {
         // If install_dir doesn't exist yet, canonicalize the parent and append.
         let parent = install_dir.parent().unwrap_or(&skills_dir);
-        let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
         canonical_parent.join(install_dir.file_name().unwrap_or_default())
     });
     if !canonical_install.starts_with(&canonical_skills) {

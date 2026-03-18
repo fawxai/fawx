@@ -248,8 +248,7 @@ impl AnthropicProvider {
             })
             .collect::<Vec<_>>();
 
-        let (thinking, output_config) =
-            build_anthropic_thinking(&request.model, &request.thinking);
+        let (thinking, output_config) = build_anthropic_thinking(&request.model, &request.thinking);
 
         let body = AnthropicRequestBody {
             model: request.model.clone(),
@@ -599,6 +598,11 @@ impl AnthropicProvider {
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
+        if status.as_u16() == 400 && Self::mentions_thinking_rejection(&body) {
+            tracing::warn!(
+                "provider rejected thinking config — check effort/budget_tokens: {body}"
+            );
+        }
         match status.as_u16() {
             401 | 403 => LlmError::Authentication(body),
             429 => LlmError::RateLimited(body),
@@ -606,6 +610,13 @@ impl AnthropicProvider {
             500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
+    }
+
+    fn mentions_thinking_rejection(body: &str) -> bool {
+        let lowered = body.to_ascii_lowercase();
+        ["thinking", "effort", "budget_tokens", "output_config"]
+            .iter()
+            .any(|term| lowered.contains(term))
     }
 }
 
@@ -982,7 +993,9 @@ fn validate_request(body: &AnthropicRequestBody) {
         match thinking {
             AnthropicThinking::Adaptive { .. } => {
                 assert!(
-                    body.output_config.as_ref().is_some_and(|c| !c.effort.is_empty()),
+                    body.output_config
+                        .as_ref()
+                        .is_some_and(|c| !c.effort.is_empty()),
                     "adaptive thinking requires a non-empty effort"
                 );
             }
@@ -1010,7 +1023,10 @@ fn validate_request(body: &AnthropicRequestBody) {
             }
         }
     } else {
-        assert!(body.output_config.is_none(), "effort must be None when thinking is disabled");
+        assert!(
+            body.output_config.is_none(),
+            "effort must be None when thinking is disabled"
+        );
     }
 }
 

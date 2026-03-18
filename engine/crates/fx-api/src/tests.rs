@@ -1230,9 +1230,7 @@ mod routing_and_status {
             }),
             "api_key",
         );
-        router
-            .set_active("claude-sonnet-4-6")
-            .expect("set active");
+        router.set_active("claude-sonnet-4-6").expect("set active");
         router
     }
 
@@ -3018,9 +3016,7 @@ thinking = "high"
             }),
             "api_key",
         );
-        router
-            .set_active("claude-sonnet-4-6")
-            .expect("set active");
+        router.set_active("claude-sonnet-4-6").expect("set active");
         let state = test_state_with_app(
             build_test_app(router, config, Some(manager), test_runtime_info()),
             Vec::new(),
