@@ -225,18 +225,6 @@ impl AnthropicProvider {
 
         let mut system_prompt = request.system_prompt.clone();
 
-        // Setup tokens require Claude Code identity in the system prompt.
-        // Anthropic validates that OAuth/setup-token requests identify as Claude Code.
-        if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
-            let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
-            system_prompt = Some(match system_prompt {
-                Some(existing) if !existing.is_empty() => {
-                    format!("{identity}\n{existing}")
-                }
-                _ => identity.to_string(),
-            });
-        }
-
         let mut messages = Vec::new();
 
         for message in &request.messages {
@@ -287,7 +275,7 @@ impl AnthropicProvider {
                 Some(AnthropicThinking::Adaptive { .. }) => request.max_tokens.unwrap_or(16_000),
                 None => request.max_tokens.unwrap_or(4096),
             },
-            system: system_prompt,
+            system: self.build_system_value(system_prompt),
             stream,
             thinking,
             output_config,
@@ -297,6 +285,25 @@ impl AnthropicProvider {
         validate_request(&body);
 
         Ok(body)
+    }
+
+    /// Build the `system` field value.
+    ///
+    /// For setup tokens, Anthropic requires the Claude Code identity as the
+    /// first content block in an array format. For API keys, a plain string.
+    fn build_system_value(&self, prompt: Option<String>) -> Option<serde_json::Value> {
+        if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
+            let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+            let mut blocks = vec![serde_json::json!({"type": "text", "text": identity})];
+            if let Some(text) = prompt {
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+            }
+            Some(serde_json::Value::Array(blocks))
+        } else {
+            prompt.map(serde_json::Value::String)
+        }
     }
 
     fn map_message_to_anthropic(&self, message: &Message) -> Result<AnthropicMessage, LlmError> {
@@ -850,7 +857,7 @@ struct AnthropicRequestBody {
     temperature: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
