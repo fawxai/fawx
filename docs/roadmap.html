@@ -297,7 +297,10 @@
 
       <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
       <ul class="feature-list">
-        <li><span class="wip">◐</span> Final chat / UX polish pass across TUI + native app</li>
+        <li><span class="wip">◐</span> Final chat / UX polish pass across TUI + native app (4 Swift PRs in review)</li>
+        <li><span class="check">✓</span> GitHub PAT settings UI (spec ready, SecureField + Save in AuthStatusList)</li>
+        <li><span class="check">✓</span> Setup wizard skip (LLM provider step now skippable)</li>
+        <li><span class="check">✓</span> Auth fallback chain (broker → credential store → AuthManager)</li>
         <li><span class="wip">◐</span> EULA, Terms of Service, Privacy Policy (drafted, needs embedding in app/package)</li>
         <li><span class="planned">○</span> App icon + branding</li>
         <li><span class="planned">○</span> Sparkle auto-updater (with signature verification — security-critical)</li>
@@ -334,16 +337,9 @@
         <li><span class="check">✓</span> Worker mode (fawx serve --fleet)</li>
         <li><span class="check">✓</span> Task dispatch over Tailscale HTTP</li>
         <li><span class="check">✓</span> Heartbeat monitoring + health checks</li>
-        <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)
-          <ul>
-            <li><strong>Security note:</strong> GitHub PATs with <code>contents:write</code> can merge PRs, not just push branches. When implementing PAT sharing to subagents/workers:
-              <br>① Branch protection on <code>staging</code> + <code>main</code> — require review from repo owner before merge (GitHub-level enforcement, not policy)
-              <br>② Fine-grained PAT scoped to fawx repo only (limits blast radius)
-              <br>③ No <code>administration</code> permission on the PAT (prevents subagents from weakening branch protection)
-              <br>④ Result: subagents can push branches + create PRs + comment, but cannot merge to protected branches without owner review approval. <code>dev</code> stays open for automated pipeline.
-            </li>
-          </ul>
-        </li>
+        <li><span class="check">✓</span> PAT borrowing — scoped GitHub credential lending to subagents (ReadOnly / Contribution modes, configurable max)</li>
+        <li><span class="check">✓</span> git_push + github_pr_create tools — agents can push branches and open PRs with token auth</li>
+        <li><span class="check">✓</span> Kernel manifest — structured self-introspection tool (Layer 1/3 visible, Layer 2 excluded per AX)</li>
         <li><span class="planned">○</span> Fleet-aware experiment scheduling (--fleet flag)</li>
       </ul>
     </div>
@@ -361,8 +357,8 @@
         <li><span class="check">✓</span> Thinking registry — per-model profiles, runtime rejection cache, priority matching (fx-llm)</li>
         <li><span class="check">✓</span> Training data curation — chain extraction, quality filters, dataset manager, 4 export formats (fx-training)</li>
         <li><span class="check">✓</span> ThinkingRegistry wired into HeadlessApp with recent adaptive-profile cleanup</li>
-        <li><span class="planned">○</span> Semantic merge validation</li>
-        <li><span class="planned">○</span> Fitness backpropagation (scores flow back to inform decomposition)</li>
+        <li><span class="check">✓</span> Semantic merge validation — BuildVerifyAggregator with git apply + cargo check</li>
+        <li><span class="check">✓</span> Fitness backpropagation — FitnessContext types + prompt formatter wired into decomposer</li>
       </ul>
     </div>
     <hr class="divider">
