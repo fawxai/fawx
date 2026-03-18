@@ -41,9 +41,14 @@ struct ChatDetailView: View {
                             .id("streaming")
                         }
                     }
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id(scrollBottomAnchorID)
                 }
                 .padding(FawxSpacing.paddingXL)
             }
+            .id(sessionScrollIdentity)
             .background(Color.fawxBackground)
             .accessibilityIdentifier("messageList")
             .overlay {
@@ -87,6 +92,14 @@ struct ChatDetailView: View {
             }
             .onChange(of: chatViewModel.visibleStreamingText) { _, _ in
                 scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
+            }
+            .onChange(of: chatViewModel.isCurrentSessionStreaming) { _, isStreaming in
+                if isStreaming {
+                    scheduleScrollToBottom(using: proxy, animated: false)
+                }
+            }
+            .onChange(of: sessionViewModel.selectedSessionID) { _, _ in
+                scheduleScrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.isLoadingHistory) { oldValue, newValue in
                 if oldValue && !newValue {
@@ -273,6 +286,12 @@ struct ChatDetailView: View {
 
     private var emptyState: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
+            Text("🦊")
+                .font(.system(size: 30))
+                .padding(FawxSpacing.paddingMD)
+                .background(Color.fawxAccentSubtle)
+                .clipShape(Circle())
+
             Text(emptyStateTitle)
                 .font(FawxTypography.heading1)
                 .foregroundStyle(Color.fawxText)
@@ -282,6 +301,15 @@ struct ChatDetailView: View {
                 .foregroundStyle(Color.fawxTextSecondary)
                 .multilineTextAlignment(.center)
         }
+        .frame(maxWidth: 440)
+        .padding(FawxSpacing.paddingXL)
+        .background(Color.fawxSurface.opacity(0.98))
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius + 4)
+                .stroke(Color.fawxBorder.opacity(0.85), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius + 4))
+        .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
         .frame(maxWidth: .infinity, minHeight: 320)
     }
 
@@ -354,8 +382,15 @@ struct ChatDetailView: View {
         .padding(.top, FawxSpacing.paddingSM)
         .padding(.bottom, composerBottomPadding)
         .background(alignment: .top) {
-            Rectangle()
-                .fill(Color.fawxBackground.opacity(0.96))
+            LinearGradient(
+                colors: [
+                    Color.fawxBackground.opacity(0),
+                    Color.fawxBackground.opacity(0.86),
+                    Color.fawxBackground
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
                 .overlay(alignment: .top) {
                     Divider()
                         .opacity(0.35)
@@ -381,20 +416,21 @@ struct ChatDetailView: View {
     }
 
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool) {
-        let target = chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty
-            ? "streaming"
-            : chatViewModel.transcriptItems.last?.id
+        let hasVisibleTranscriptContent =
+            !chatViewModel.transcriptItems.isEmpty
+            || chatViewModel.isCurrentSessionStreaming
+            || !chatViewModel.visibleStreamingText.isEmpty
 
-        guard let target else {
+        guard hasVisibleTranscriptContent else {
             return
         }
 
         if animated {
             withAnimation(.easeOut(duration: 0.2)) {
-                proxy.scrollTo(target, anchor: .bottom)
+                proxy.scrollTo(scrollBottomAnchorID, anchor: .bottom)
             }
         } else {
-            proxy.scrollTo(target, anchor: .bottom)
+            proxy.scrollTo(scrollBottomAnchorID, anchor: .bottom)
         }
     }
 
@@ -413,6 +449,14 @@ struct ChatDetailView: View {
         }
 
         return chatViewModel.visibleCurrentPhase?.streamingPlaceholder ?? "..."
+    }
+
+    private var sessionScrollIdentity: String {
+        sessionViewModel.selectedSessionID ?? "new-session"
+    }
+
+    private var scrollBottomAnchorID: String {
+        "chat-scroll-bottom"
     }
 
 #if os(iOS)
