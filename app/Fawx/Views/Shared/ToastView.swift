@@ -9,7 +9,7 @@ struct ToastView: View {
             .foregroundStyle(Color.fawxText)
             .padding(.horizontal, FawxSpacing.paddingLG)
             .padding(.vertical, FawxSpacing.paddingSM)
-            .background(backgroundColor)
+            .fawxOpaqueTintedSurface(Capsule(), tint: tintColor, tintOpacity: tintOpacity)
             .clipShape(Capsule())
             .overlay(
                 Capsule()
@@ -18,16 +18,25 @@ struct ToastView: View {
             .shadow(color: Color.black.opacity(0.12), radius: 12, x: 0, y: 8)
     }
 
-    private var backgroundColor: Color {
+    private var tintColor: Color {
         switch toast.style {
         case .info:
             return Color.fawxSurface
         case .success:
-            return Color.fawxSuccess.opacity(0.14)
+            return Color.fawxSuccess
         case .warning:
-            return Color.fawxWarning.opacity(0.14)
+            return Color.fawxWarning
         case .error:
-            return Color.fawxError.opacity(0.14)
+            return Color.fawxError
+        }
+    }
+
+    private var tintOpacity: Double {
+        switch toast.style {
+        case .info:
+            return 1
+        case .success, .warning, .error:
+            return 0.14
         }
     }
 

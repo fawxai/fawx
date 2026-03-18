@@ -23,7 +23,7 @@ struct ConnectionBannerView: View {
         }
         .padding(.horizontal, FawxSpacing.paddingLG)
         .padding(.vertical, FawxSpacing.paddingSM)
-        .background(backgroundColor)
+        .fawxOpaqueTintedSurface(Rectangle(), tint: tintColor, tintOpacity: 0.12)
         .overlay(
             Rectangle()
                 .fill(borderColor)
@@ -35,12 +35,12 @@ struct ConnectionBannerView: View {
         .accessibilityValue(banner.message)
     }
 
-    private var backgroundColor: Color {
+    private var tintColor: Color {
         switch banner.tone {
         case .warning:
-            return Color.fawxWarning.opacity(0.12)
+            return Color.fawxWarning
         case .error:
-            return Color.fawxError.opacity(0.12)
+            return Color.fawxError
         }
     }
 

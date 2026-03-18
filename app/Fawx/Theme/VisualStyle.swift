@@ -67,6 +67,20 @@ extension View {
         modifier(FawxShadowModifier(style: style))
     }
 
+    func fawxOpaqueTintedSurface<S: Shape>(
+        _ shape: S,
+        tint: Color,
+        tintOpacity: Double = FawxOpacity.fillSubtle
+    ) -> some View {
+        background {
+            shape
+                .fill(Color.fawxBackground)
+                .overlay {
+                    shape.fill(tint.opacity(tintOpacity))
+                }
+        }
+    }
+
     @ViewBuilder
     func fawxOpaqueModalPresentation() -> some View {
         self
