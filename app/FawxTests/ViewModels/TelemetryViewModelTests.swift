@@ -5,8 +5,7 @@ import XCTest
 final class TelemetryViewModelTests: XCTestCase {
     func testSetCategoryEnabledIgnoresSecondMutationWhileFirstIsPending() async {
         let started = expectation(description: "First telemetry mutation started")
-        var continuation: CheckedContinuation<TelemetryConsentResponse, Error>?
-        var patchRequests: [TelemetryConsentPatchRequest] = []
+        let patchState = TelemetryPatchState()
 
         let response = makeTelemetryResponse(
             enabled: true,
@@ -20,12 +19,12 @@ final class TelemetryViewModelTests: XCTestCase {
             appState: AppState(),
             fetchConsent: { response },
             patchConsent: { request in
-                patchRequests.append(request)
+                let requestCount = patchState.append(request)
 
-                if patchRequests.count == 1 {
+                if requestCount == 1 {
                     started.fulfill()
                     return try await withCheckedThrowingContinuation { next in
-                        continuation = next
+                        patchState.store(next)
                     }
                 }
 
@@ -52,22 +51,21 @@ final class TelemetryViewModelTests: XCTestCase {
 
         await Task.yield()
 
-        XCTAssertEqual(patchRequests.count, 1)
+        XCTAssertEqual(patchState.requestCount, 1)
         XCTAssertEqual(sut.pendingCategories, Set(["errors"]))
 
-        continuation?.resume(returning: response)
+        patchState.resume(returning: response)
 
         await firstTask.value
         await secondTask.value
 
-        XCTAssertEqual(patchRequests.count, 1)
+        XCTAssertEqual(patchState.requestCount, 1)
         XCTAssertFalse(sut.pendingCategories.contains("performance"))
     }
 
     func testSetEnabledReturnsEarlyWhileCategoryMutationIsPending() async {
         let started = expectation(description: "Category mutation started")
-        var continuation: CheckedContinuation<TelemetryConsentResponse, Error>?
-        var patchRequests: [TelemetryConsentPatchRequest] = []
+        let patchState = TelemetryPatchState()
 
         let response = makeTelemetryResponse(
             enabled: true,
@@ -81,10 +79,10 @@ final class TelemetryViewModelTests: XCTestCase {
             appState: AppState(),
             fetchConsent: { response },
             patchConsent: { request in
-                patchRequests.append(request)
+                _ = patchState.append(request)
                 started.fulfill()
                 return try await withCheckedThrowingContinuation { next in
-                    continuation = next
+                    patchState.store(next)
                 }
             }
         )
@@ -102,10 +100,10 @@ final class TelemetryViewModelTests: XCTestCase {
         await fulfillment(of: [started], timeout: 1)
         await sut.setEnabled(false)
 
-        XCTAssertEqual(patchRequests.count, 1)
+        XCTAssertEqual(patchState.requestCount, 1)
         XCTAssertTrue(sut.isEnabled)
 
-        continuation?.resume(returning: response)
+        patchState.resume(returning: response)
         await categoryTask.value
     }
 
@@ -128,5 +126,38 @@ final class TelemetryViewModelTests: XCTestCase {
             ),
             updatedAt: "2026-03-16T00:00:00Z"
         )
+    }
+}
+
+private final class TelemetryPatchState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var patchRequests: [TelemetryConsentPatchRequest] = []
+    private var continuation: CheckedContinuation<TelemetryConsentResponse, Error>?
+
+    func append(_ request: TelemetryConsentPatchRequest) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        patchRequests.append(request)
+        return patchRequests.count
+    }
+
+    func store(_ continuation: CheckedContinuation<TelemetryConsentResponse, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.continuation = continuation
+    }
+
+    func resume(returning response: TelemetryConsentResponse) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: response)
+    }
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return patchRequests.count
     }
 }

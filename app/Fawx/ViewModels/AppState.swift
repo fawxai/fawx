@@ -268,10 +268,13 @@ final class AppState {
     }
 
     var displayedHost: String {
-        if let advertisedHost {
-            return advertisedHost
-        }
         if let host = URL(string: serverURLString)?.host, !host.isEmpty {
+            return host
+        }
+        if let host = localServerStatus?.host, !host.isEmpty {
+            return host
+        }
+        if let host = setupStatus?.localServer.host, !host.isEmpty {
             return host
         }
         return "Not connected"
@@ -284,31 +287,23 @@ final class AppState {
         if let port = localServerStatus?.port {
             return port
         }
-        if let port = qrPairingResponse?.port {
+        if let port = setupStatus?.localServer.port {
             return port
         }
         return nil
     }
 
     var displayedServerURLString: String {
-        if let advertisedHost, let port = displayedPort {
-            let scheme = prefersHTTPSDisplay ? "https" : "http"
-            return "\(scheme)://\(advertisedHost):\(port)"
+        if !serverURLString.isEmpty {
+            return serverURLString
         }
-        return serverURLString
-    }
-
-    private var prefersHTTPSDisplay: Bool {
-        if qrPairingResponse?.transport == "tailscale_https" {
-            return true
+        let host = localServerStatus?.host ?? setupStatus?.localServer.host
+        let port = localServerStatus?.port ?? setupStatus?.localServer.port
+        let prefersHTTPS = localServerStatus?.httpsEnabled ?? setupStatus?.localServer.httpsEnabled ?? false
+        if let host, let port {
+            return "\(prefersHTTPS ? "https" : "http")://\(host):\(port)"
         }
-        if localServerStatus?.httpsEnabled == true || setupStatus?.localServer.httpsEnabled == true {
-            return true
-        }
-        if let advertisedHost, advertisedHost.contains(".ts.net") {
-            return true
-        }
-        return false
+        return ""
     }
 
     var serverStatusLabel: String {
@@ -789,6 +784,10 @@ final class AppState {
         let response = try await client.qrPairing()
         qrPairingResponse = response
         return response
+    }
+
+    func generatePairingCode() async throws -> PairingCodeResponse {
+        try await client.generatePairingCode()
     }
 
     func requestTailscaleCertificate(hostname: String) async throws -> TailscaleCertResponse {

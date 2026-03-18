@@ -94,9 +94,10 @@ final class RipcordTests: XCTestCase {
         )
 
         let status = try JSONDecoder().decode(RipcordStatusResponse.self, from: data)
+        let activatedAt = try XCTUnwrap(status.activatedAt)
 
         XCTAssertTrue(status.active)
-        XCTAssertEqual(status.activatedAt?.timeIntervalSince1970, 1_742_187_600.25, accuracy: 0.000_001)
+        XCTAssertEqual(activatedAt.timeIntervalSince1970, 1_742_187_600.25, accuracy: 0.000_001)
     }
 
     func testRipcordStatusFallsBackToGenericDescription() {

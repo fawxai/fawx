@@ -14,6 +14,7 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: FawxSpacing.paddingXL) {
+                autosaveNotice
                 connectionSection
                 serverSection
                 pairingSection
@@ -50,7 +51,7 @@ struct SettingsView: View {
                 settingsDivider
 
                 settingsValueRow(
-                    label: "Server URL",
+                    label: "Configured URL",
                     value: appState.displayedServerURLString.isEmpty ? "Not configured" : appState.displayedServerURLString,
                     isSecondary: appState.displayedServerURLString.isEmpty,
                     allowsSelection: true
@@ -202,6 +203,13 @@ struct SettingsView: View {
                 )
                 .navigationTitle("Server Model")
                 .frame(minWidth: 500, minHeight: 420)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") {
+                            isPresentingModelSelector = false
+                        }
+                    }
+                }
             }
         }
     }
@@ -281,6 +289,21 @@ struct SettingsView: View {
 
     private var hasActiveModel: Bool {
         appState.activeModel != nil
+    }
+
+    private var autosaveNotice: some View {
+        settingsCard {
+            HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+                Image(systemName: "checkmark.circle")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.fawxSuccess)
+
+                Text("Settings save automatically. Use buttons labeled Save, Update, or Generate when you want to apply a specific action.")
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func settingsSection<Content: View>(

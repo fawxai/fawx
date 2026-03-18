@@ -113,6 +113,15 @@ actor FawxClient {
         try await performSetupRequest(path: "/v1/pair/qr", decodeAs: QrPairingResponse.self)
     }
 
+    func generatePairingCode() async throws -> PairingCodeResponse {
+        try await performRequest(
+            path: "/v1/pair/generate",
+            method: "POST",
+            bodyData: Data("{}".utf8),
+            decodeAs: PairingCodeResponse.self
+        )
+    }
+
     func tailscaleCert(hostname: String) async throws -> TailscaleCertResponse {
         let body = try encoder.encode(TailscaleCertRequest(hostname: hostname))
         return try await performSetupRequest(
