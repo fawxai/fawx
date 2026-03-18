@@ -50,6 +50,35 @@ final class FleetViewModelTests: XCTestCase {
         XCTAssertEqual(appState.toast?.style, .warning)
     }
 
+    func testRemoveSelectedNodePreservesSelectionWhenRequestThrows() async {
+        struct TestError: LocalizedError {
+            var errorDescription: String? {
+                "Network unavailable"
+            }
+        }
+
+        let appState = AppState()
+        let sut = FleetViewModel(
+            appState: appState,
+            removeNodeRequest: { _ in
+                throw TestError()
+            }
+        )
+
+        sut.nodes = [makeNodeSummary(id: "node-1", name: "MacBook Pro")]
+        sut.selectedNodeID = "node-1"
+        sut.selectedNodeDetail = makeNodeDetail(id: "node-1", name: "MacBook Pro")
+
+        let removed = await sut.removeSelectedNode()
+
+        XCTAssertFalse(removed)
+        XCTAssertEqual(sut.selectedNodeID, "node-1")
+        XCTAssertEqual(sut.selectedNodeDetail?.id, "node-1")
+        XCTAssertEqual(sut.detailErrorMessage, "Network unavailable")
+        XCTAssertEqual(appState.toast?.message, "Network unavailable")
+        XCTAssertEqual(appState.toast?.style, .error)
+    }
+
     private func makeNodeSummary(id: String, name: String) -> FleetNodeSummary {
         FleetNodeSummary(
             id: id,
