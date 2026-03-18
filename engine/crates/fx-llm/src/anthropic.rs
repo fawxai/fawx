@@ -224,6 +224,19 @@ impl AnthropicProvider {
         self.ensure_supported_model(&request.model)?;
 
         let mut system_prompt = request.system_prompt.clone();
+
+        // Setup tokens require Claude Code identity in the system prompt.
+        // Anthropic validates that OAuth/setup-token requests identify as Claude Code.
+        if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
+            let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+            system_prompt = Some(match system_prompt {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{identity}\n{existing}")
+                }
+                _ => identity.to_string(),
+            });
+        }
+
         let mut messages = Vec::new();
 
         for message in &request.messages {
