@@ -85,7 +85,7 @@ struct AuthStatusList: View {
         defer { activeOAuthProvider = nil }
 
         do {
-            let startResponse = try await appState.client.oauthStart(provider: provider)
+            let startResponse = try await appState.startOAuth(provider: provider)
             guard let authorizeURL = URL(string: startResponse.authorizeUrl) else {
                 throw APIError.invalidURL(startResponse.authorizeUrl)
             }
@@ -120,13 +120,12 @@ struct AuthStatusList: View {
                 throw APIError.decoding("Missing authorization code")
             }
 
-            let response = try await appState.client.oauthCallback(
+            let response = try await appState.completeOAuth(
                 provider: provider,
                 code: code,
                 flowToken: startResponse.flowToken
             )
 
-            await appState.refreshSettingsState()
             localErrorMessage = nil
             appState.showToast(
                 message: response.verified
@@ -487,25 +486,19 @@ private struct ProviderManagementSheet: View {
     }
 
     private var saveButtonTitle: String {
-        switch (selectedProvider, selectedAuthMethod) {
-        case (.anthropic, .subscription):
-            "Save Setup Token"
-        case (_, .apiKey):
-            "Save API Key"
-        case (.openai, .subscription):
-            "Sign in with ChatGPT"
+        if selectedProvider == .anthropic && selectedAuthMethod == .subscription {
+            return "Save Setup Token"
         }
+        return "Save API Key"
     }
 
     private var providerFieldPrompt: String {
-        switch (selectedProvider, selectedAuthMethod) {
-        case (.anthropic, .subscription):
-            "Paste the Anthropic setup token"
-        case (.anthropic, .apiKey):
-            "Paste your Anthropic API key"
-        case (.openai, _):
-            "Paste your OpenAI API key"
+        if selectedProvider == .anthropic && selectedAuthMethod == .subscription {
+            return "Paste the Anthropic setup token"
+        } else if selectedProvider == .anthropic {
+            return "Paste your Anthropic API key"
         }
+        return "Paste your OpenAI API key"
     }
 
     private func settingsBlock<Content: View>(
@@ -620,7 +613,7 @@ private struct ProviderManagementSheet: View {
         defer { isSubmitting = false }
 
         do {
-            let startResponse = try await appState.client.oauthStart(provider: SetupProvider.openai.providerID)
+            let startResponse = try await appState.startOAuth(provider: SetupProvider.openai.providerID)
             guard let authorizeURL = URL(string: startResponse.authorizeUrl) else {
                 throw APIError.invalidURL(startResponse.authorizeUrl)
             }
@@ -655,13 +648,12 @@ private struct ProviderManagementSheet: View {
                 throw APIError.decoding("Missing authorization code")
             }
 
-            let response = try await appState.client.oauthCallback(
+            let response = try await appState.completeOAuth(
                 provider: SetupProvider.openai.providerID,
                 code: code,
                 flowToken: startResponse.flowToken
             )
 
-            await appState.refreshSettingsState()
             configuredProviderIDs.insert(SetupProvider.openai.providerID)
             statusKind = response.verified ? .success : .warning
             statusMessage = response.verified

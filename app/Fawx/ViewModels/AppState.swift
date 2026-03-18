@@ -816,6 +816,28 @@ final class AppState {
         return response
     }
 
+    func startOAuth(provider: String) async throws -> OAuthStartResponse {
+        try await client.oauthStart(provider: provider)
+    }
+
+    func completeOAuth(
+        provider: String,
+        code: String,
+        flowToken: String
+    ) async throws -> OAuthCallbackResponse {
+        let response = try await client.oauthCallback(
+            provider: provider,
+            code: code,
+            flowToken: flowToken
+        )
+        if isConfigured {
+            try await refreshServerState()
+        } else {
+            await refreshPhase4State()
+        }
+        return response
+    }
+
     func verifyProvider(_ provider: String) async throws -> ProviderVerificationResponse {
         let response = try await client.verifyProvider(provider)
         if isConfigured {
