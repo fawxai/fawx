@@ -16,6 +16,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod events;
+pub mod kernel_manifest;
 pub mod memory;
 pub mod message;
 pub mod runtime_info;
