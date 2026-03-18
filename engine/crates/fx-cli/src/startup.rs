@@ -719,17 +719,22 @@ impl CredentialStoreBridge {
     }
 
     fn borrow_github_token(&self) -> Option<zeroize::Zeroizing<String>> {
-        let Some(broker) = self.token_broker.as_ref() else {
-            return self.github_token();
-        };
-        match broker.borrow_github_default() {
-            Ok(borrow) => Some(borrow.into_token()),
-            Err(fx_auth::token_broker::BorrowError::NotConfigured) => None,
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to borrow GitHub token");
-                None
+        // Try broker first (scoped borrow for subagents).
+        if let Some(broker) = self.token_broker.as_ref() {
+            match broker.borrow_github_default() {
+                Ok(borrow) => return Some(borrow.into_token()),
+                Err(fx_auth::token_broker::BorrowError::NotConfigured) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to borrow GitHub token");
+                }
             }
         }
+        // Try encrypted credential store (fawx setup).
+        if let Some(token) = self.github_token() {
+            return Some(token);
+        }
+        // Fall back to AuthManager (legacy /auth github set-token).
+        self.auth_api_key("github")
     }
 
     fn github_token(&self) -> Option<zeroize::Zeroizing<String>> {
