@@ -9,6 +9,8 @@ struct AuthStatusList: View {
     @State private var isPresentingProviderEditor = false
     @State private var selectedProviderForEditor: SetupProvider = .openai
     @State private var localErrorMessage: String?
+    @State private var githubTokenInput = ""
+    @State private var isSavingGitHub = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
@@ -59,6 +61,13 @@ struct AuthStatusList: View {
                     )
                 }
             }
+
+            GitHubTokenSection(
+                tokenInput: $githubTokenInput,
+                isSaving: $isSavingGitHub,
+                isConfigured: isGitHubConfigured,
+                onSave: saveGitHubToken
+            )
         }
         .sheet(isPresented: $isPresentingProviderEditor) {
             NavigationStack {
@@ -72,6 +81,36 @@ struct AuthStatusList: View {
 
     private var displayedErrorMessage: String? {
         localErrorMessage ?? appState.authProvidersError
+    }
+
+    private var isGitHubConfigured: Bool {
+        appState.authProviders.contains(where: { $0.provider.lowercased() == "github" && $0.isConfigured })
+    }
+
+    @MainActor
+    private func saveGitHubToken(_ token: String) async {
+        guard !isSavingGitHub else {
+            return
+        }
+
+        isSavingGitHub = true
+        defer { isSavingGitHub = false }
+
+        do {
+            _ = try await appState.client.storeAPIKey(
+                provider: "github",
+                apiKey: token,
+                label: "GitHub PAT"
+            )
+            githubTokenInput = ""
+            await appState.refreshSettingsState()
+            localErrorMessage = nil
+            appState.showToast(message: "GitHub token saved.", style: .success)
+        } catch {
+            localErrorMessage = error.localizedDescription
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+        }
     }
 
     private func startOAuthLogin(
@@ -226,6 +265,72 @@ struct AuthStatusList: View {
                 .map { $0.capitalized }
                 .joined(separator: " ")
         }
+    }
+}
+
+private struct GitHubTokenSection: View {
+    @Binding var tokenInput: String
+    @Binding var isSaving: Bool
+    let isConfigured: Bool
+    let onSave: @MainActor (String) async -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+            HStack(alignment: .firstTextBaseline, spacing: FawxSpacing.paddingMD) {
+                Text("GitHub")
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+
+                Spacer(minLength: FawxSpacing.paddingMD)
+
+                Text(isConfigured ? "Configured" : "Not configured")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(isConfigured ? Color.fawxSuccess : Color.fawxWarning)
+                    .padding(.horizontal, FawxSpacing.paddingSM)
+                    .padding(.vertical, 4)
+                    .background(
+                        (isConfigured ? Color.fawxSuccess : Color.fawxWarning).opacity(0.12)
+                    )
+                    .clipShape(Capsule())
+            }
+
+            Text("Required for git push and pull request creation.")
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            HStack(spacing: FawxSpacing.paddingSM) {
+                SecureField("Personal Access Token", text: $tokenInput)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("GitHub personal access token")
+
+                Button(isSaving ? "Saving..." : "Save") {
+                    let token = trimmedToken
+                    guard !token.isEmpty else {
+                        return
+                    }
+
+                    Task {
+                        await onSave(token)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(trimmedToken.isEmpty || isSaving)
+                .accessibilityLabel("Save GitHub token")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(FawxSpacing.paddingMD)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        )
+        .accessibilityIdentifier("authProvider_github")
+    }
+
+    private var trimmedToken: String {
+        tokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

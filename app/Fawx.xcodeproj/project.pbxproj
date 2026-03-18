@@ -13,12 +13,15 @@
 		01C5301484465E3E7C541A9D /* InputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 087BAB7361F5CCDC27BA6864 /* InputBar.swift */; };
 		02524E6761A54713555B986F /* SynthesisViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068E87A8E0FC1B301B9E706B /* SynthesisViewModel.swift */; };
 		029F3C1417EF1B8DAA9269F6 /* OAuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F07B3D54545DE045D7EC042 /* OAuthFlow.swift */; };
+		04D60601649EDAFF3F44B374 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 398509CAAD2618C9DB47D484 /* PermissionsViewModelTests.swift */; };
+		062D5EBC5997D75407B2A09A /* GitHubPATSettingsSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C68A15A6BE471C704462C43 /* GitHubPATSettingsSmokeTests.swift */; };
 		0726A6DE34EB33231173E1C2 /* SkillsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFFB5D0979E7B04955A759A9 /* SkillsViewModel.swift */; };
 		078E407AA4F2E807B6B04952 /* ChatDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66BB4F24881B0920C360CCD2 /* ChatDetailView.swift */; };
 		083BFB742FEB1646BADEED64 /* MenuBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3138A7C7D1CC4B4A2E63C767 /* MenuBarView.swift */; };
 		08859F99F1DCFF038B1BB36F /* AuthenticatedChatFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */; };
 		09B4993D6B657C1DFB8BBF50 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DBD84A122470F37BFA9E2CA /* ChatViewModel.swift */; };
 		09C5AD3E52F229B2B9CEC431 /* SynthesisViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068E87A8E0FC1B301B9E706B /* SynthesisViewModel.swift */; };
+		0A4FC9B5D879B69120E6E900 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA7175883B417E3BA5409E39 /* SandboxStatusCard.swift */; };
 		0D04F1C36E70E3200A207E3E /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2822C7AA61307F89BAE00E0 /* Formatters.swift */; };
 		0D5AABB34F7D813CEEFA2199 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 253B9222FA7883A471548AB5 /* README.md */; };
 		0E7F83F21C2A2C67928A8532 /* MarketplaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E4BE9EBBB93059B1E6AA12C /* MarketplaceView.swift */; };
@@ -40,6 +43,7 @@
 		1F7B93F253ED8235A55625FA /* Synthesis.swift in Sources */ = {isa = PBXBuildFile; fileRef = C379D0DE77BBC0F8135DDD2C /* Synthesis.swift */; };
 		1FE328F23A3906A844187753 /* ConnectionStateMachineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EEB1F0A4C398B611C3A76C4 /* ConnectionStateMachineTests.swift */; };
 		217A01A567A6EDD48F348CBF /* CodeBlock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03C785F44719A3574998323 /* CodeBlock.swift */; };
+		235B5DEEA2F8DFE97A684C49 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C24501659F38504C01D1698C /* RipcordTests.swift */; };
 		23C4B0BE9349C4A73A13AE67 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C2E500BF4B907FA02585BB44 /* Assets.xcassets */; };
 		24F7E781CDE097CE71703485 /* QRCodeScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 970450369EC2BC67A04E243C /* QRCodeScannerSheet.swift */; };
 		25AE7550A9CBBBE2AE4035C2 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C13099200335A9EA37CBC02 /* ContentView.swift */; };
@@ -58,6 +62,7 @@
 		36094D1F79A94CD4D30567B7 /* ServerStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BBC676908E289F8BF2330C /* ServerStatusTests.swift */; };
 		36E29AE34DC5456DE8BA81C8 /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8D4FC172453166D85114D88 /* SettingsViewModel.swift */; };
 		37603F5EFF882EE8E4EF50B8 /* TestConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6333ABC39A5F77ED86604EA0 /* TestConfig.swift */; };
+		376714915EDDDCE029DCE0AB /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E668A7D03428CDE795DA756C /* RipcordReportView.swift */; };
 		380A0F039EE1222D4681D24E /* GitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 040A9F601AB8F38E19635FB7 /* GitView.swift */; };
 		3B97241D0EE53CE635301A75 /* SetupViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */; };
 		3C14A04D5C6119E544E8FDC0 /* ChatTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1220A4A2A4B7E97E698344D0 /* ChatTranscript.swift */; };
@@ -74,13 +79,16 @@
 		5175700329230E7A5F11A4B6 /* IOSViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EBEBAEBE84A36EC81E2FC6C /* IOSViewModifiers.swift */; };
 		518B0C1E3C8F9C25C2522CE9 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1AB5E3BFD623318C9101192 /* MessageBubble.swift */; };
 		5295DBC82082FCA160FFBDA3 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = D077EA1389A1D84FDB7D0DF4 /* LaunchScreen.storyboard */; };
+		52ACB795B67009D49D637A27 /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C06784CE5006E4E7AC8B8C /* Ripcord.swift */; };
 		5445C7F910328E9339D9BDAF /* TelemetryViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */; };
 		5548F89BFF81AE8162E0FB1A /* SidebarSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946A14621A9A282DEB705EEC /* SidebarSelection.swift */; };
 		55DA1C3F904256BE16231AD0 /* APIError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78ACEF7490947C5BD47AF87D /* APIError.swift */; };
+		561A9EB0F2F4E07F4CB269D9 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA7175883B417E3BA5409E39 /* SandboxStatusCard.swift */; };
 		56C2896BCB25E4A60ECBC5D1 /* MarketplaceSkill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7293FD0C7B8C4BFD74D1D776 /* MarketplaceSkill.swift */; };
 		572566D5771D9DBAB1617514 /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F387D59910781C5ED91C8C79 /* SetupWizardView.swift */; };
 		573397B0E9E88B8B4C423AE1 /* TailscaleStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DD86B5AB3DDA868D2C0CB4C /* TailscaleStep.swift */; };
 		585DA307C69ED769501B0404 /* SSEParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADFE086ECAE74F74DEC95BBF /* SSEParserTests.swift */; };
+		59DFCC68DAEDB53D58AB623E /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1465237739F91F44893DDD1 /* RipcordBanner.swift */; };
 		5BFD9FEE5D8675E1DC4C8080 /* QueuedMessageChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = B43FE3356B111C8A9C1185ED /* QueuedMessageChip.swift */; };
 		5C7D7C74102BEBF4861C722D /* Usage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11BFF651D03E0E963581BB73 /* Usage.swift */; };
 		5DFA283464AA5A133BC3F45A /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30D703AD586AB7D1F2B5D6F4 /* OnboardingView.swift */; };
@@ -104,6 +112,7 @@
 		6F214FB0313BC5F080A5E823 /* SessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0472FB42E7C8822B57CF98DC /* SessionTests.swift */; };
 		6F918EA2D8286A740B6076AD /* FawxApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF12295CE0C29C6C7ED2BD54 /* FawxApp.swift */; };
 		6FBA806241C100A1CC842441 /* FleetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02AD2A9B134E41146C48162A /* FleetView.swift */; };
+		722A182A4FD70F28CB3DB5A6 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C24501659F38504C01D1698C /* RipcordTests.swift */; };
 		7315880F2B612C22DD5A7E57 /* PairingSettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14825FF3E60773EFE60D54AC /* PairingSettingsPanel.swift */; };
 		73280038CF767DFBF17FC4A1 /* Fleet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1743DA61404F2A22BCD62EF9 /* Fleet.swift */; };
 		746302DED3511E58726ADB29 /* ToolCallCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A6130E5920E7904DA6D6312 /* ToolCallCard.swift */; };
@@ -120,22 +129,6 @@
 		800A8B285C96FCBFFA367BDE /* PermissionsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC1890444EF1EA2B509EA92 /* PermissionsViewModel.swift */; };
 		824571D15BD23EED555159CE /* ChatViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */; };
 		82615B4AEFB902509D685C25 /* TelemetryViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */; };
-		A1B2C3D4E5F60718293A4B5E /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */; };
-		A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */; };
-		A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
-		A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */; };
-		A1B2C3D4E5F60718293A4B69 /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */; };
-		A1B2C3D4E5F60718293A4B6A /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */; };
-		A1B2C3D4E5F60718293A4B6B /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */; };
-		A1B2C3D4E5F60718293A4B6C /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */; };
-		A1B2C3D4E5F60718293A4B6D /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */; };
-		A1B2C3D4E5F60718293A4B6E /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */; };
-		A1B2C3D4E5F60718293A4B6F /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */; };
-		A1B2C3D4E5F60718293A4B70 /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */; };
-		A1B2C3D4E5F60718293A4B71 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */; };
-		A1B2C3D4E5F60718293A4B72 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */; };
-		A1B2C3D4E5F60718293A4B73 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */; };
-		A1B2C3D4E5F60718293A4B74 /* RipcordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */; };
 		82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */; };
 		831393D1D284C205D00620B8 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 338FB5CB6D406E401F27B7B2 /* TelemetrySettingsPanel.swift */; };
 		833CF32214E7354D7C2FC3CB /* OAuthSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFDA886EBEC15236873ABBFE /* OAuthSessionCoordinator.swift */; };
@@ -181,6 +174,7 @@
 		B0A29A575DA6F613BCFD699D /* DeviceNameProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D2C367B42A262A99B189165 /* DeviceNameProvider.swift */; };
 		B0EA7CDED8A5AA50C31D1BF8 /* ServerStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BBC676908E289F8BF2330C /* ServerStatusTests.swift */; };
 		B2AB85937D343FC9A53452FE /* SessionRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43A75068C7EB266AD29AF348 /* SessionRowView.swift */; };
+		B4679B7D5FE466DE4896D70B /* RipcordBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1465237739F91F44893DDD1 /* RipcordBanner.swift */; };
 		B6645E106D3B8B60D5A7927E /* Permission.swift in Sources */ = {isa = PBXBuildFile; fileRef = 590BBABC228DCE73046BAEC0 /* Permission.swift */; };
 		B701CFFCB5584D5BDAC5B45D /* QRCodeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */; };
 		BA2406DFD555D8DEF04CA9AC /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 885518D8683BE24830C5A072 /* SettingsView.swift */; };
@@ -196,6 +190,7 @@
 		C4C01F08A799FF8433327A8E /* SessionRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43A75068C7EB266AD29AF348 /* SessionRowView.swift */; };
 		C611442CECB052D61D6D94BA /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C2E500BF4B907FA02585BB44 /* Assets.xcassets */; };
 		C68E000944DEE04BCD700B8D /* ModelInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A283E2181E2E7E4F28576BB /* ModelInfo.swift */; };
+		C7759A5380F3A3EAB75A420C /* PermissionsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 398509CAAD2618C9DB47D484 /* PermissionsViewModelTests.swift */; };
 		C86B9C2CBFA9411F82271B9B /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1C102D83B027ED47E7EFCC /* Typography.swift */; };
 		C91E3CBA9479CBB77C0F118B /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F387D59910781C5ED91C8C79 /* SetupWizardView.swift */; };
 		CA7BB428CDB1F75FE846A4A4 /* KeychainHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4D5070D2FD9D2FED69F7DC3 /* KeychainHelperTests.swift */; };
@@ -204,6 +199,7 @@
 		D124E354061B4491FCED1045 /* FormattersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A3D04ACC1D05027C3551689 /* FormattersTests.swift */; };
 		D1258D520042B6A16E6D9D74 /* Spacing.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEF8FA94EB39B4D617D573B7 /* Spacing.swift */; };
 		D1DB2A1AD49C6CDA4BDCE2BB /* AuthStatusList.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3B371C78535A507F7E60D5C /* AuthStatusList.swift */; };
+		D31F2361D1230EAFCABA8FCF /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 936521865A4419B34844339A /* RipcordJournalPanel.swift */; };
 		D43BAA2E7061092AB00802E2 /* ServerSettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A5C2E77F42EF3DD71F4EDF /* ServerSettingsPanel.swift */; };
 		D4551B798E24F3271AE6B2A6 /* MenuBarManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12A4977E0D29A4297B8B99FE /* MenuBarManager.swift */; };
 		D4C3EC6435189F65F9A917CA /* OAuthSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFDA886EBEC15236873ABBFE /* OAuthSessionCoordinator.swift */; };
@@ -218,6 +214,7 @@
 		DB2BB8F9E7360D924172A083 /* WelcomeStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A9C21AC1A11C1AF59991A90 /* WelcomeStep.swift */; };
 		DB961DAE860B5BF73C75D468 /* Sidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4567A3E8C8FEA6832E659D6 /* Sidebar.swift */; };
 		DD6C3C3BDBEB32040E2BCB54 /* FawxLaunchSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8289C541AC8F222B20A54ADC /* FawxLaunchSmokeTests.swift */; };
+		DEB066BE5063200FB1C4C40D /* RipcordReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E668A7D03428CDE795DA756C /* RipcordReportView.swift */; };
 		DF77B2489E9B55305CA4A664 /* TelemetrySettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 338FB5CB6D406E401F27B7B2 /* TelemetrySettingsPanel.swift */; };
 		DFB31606918FE6868D41DEE8 /* QueuedMessageChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = B43FE3356B111C8A9C1185ED /* QueuedMessageChip.swift */; };
 		E219FC3B879329F84DEBFC1A /* SessionMessageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F1BED295F170968B50CE715 /* SessionMessageTests.swift */; };
@@ -225,8 +222,10 @@
 		E5623AE726785F2180576E2C /* AuthStatusList.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3B371C78535A507F7E60D5C /* AuthStatusList.swift */; };
 		E615FB7472BF1E52DCAF5295 /* ReadyStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4F028D9A2F45FDF68988B92 /* ReadyStep.swift */; };
 		E74AD10CBBBB40389252474A /* SectionMenuButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = FED5328018149000B95E5360 /* SectionMenuButton.swift */; };
+		E75F2DF8B03365DD3A3D66EA /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0824368A956175BC978FD520 /* PermissionTests.swift */; };
 		E8BB9E4C5DC8BD3500923A81 /* CodeBlock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03C785F44719A3574998323 /* CodeBlock.swift */; };
 		EA296FD3AADB876AD80D7FBD /* SynthesisSettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E21E51BEE32606C108B28 /* SynthesisSettingsPanel.swift */; };
+		EB656AEC4D3E40F6B61ED89E /* RipcordJournalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 936521865A4419B34844339A /* RipcordJournalPanel.swift */; };
 		EB848969D77A4C85340C4E79 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 658865F5DEF00EE2E5B20502 /* JSONValue.swift */; };
 		ED0906922F002108F4685E4A /* ConnectionBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD3B2154B09BF7D99E20294A /* ConnectionBannerView.swift */; };
 		EDEBDE566D44E8FA7DBBB242 /* GitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 040A9F601AB8F38E19635FB7 /* GitView.swift */; };
@@ -239,9 +238,11 @@
 		F62F9353122ADFDA2A587DB4 /* TabRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1482F4460CF967889AEDF95C /* TabRootView.swift */; };
 		F6BEF29A7856BE584C69DFDB /* ToastView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2E8890F4C465F005286B345 /* ToastView.swift */; };
 		F90AC4D7842EE0D53A5B8EDC /* BottomSearchBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4F277A2A15DFC3ACFC85EF /* BottomSearchBar.swift */; };
+		F923D3DB219834F94D77C559 /* Ripcord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C06784CE5006E4E7AC8B8C /* Ripcord.swift */; };
 		FA78E22E16014BAAC2D9AD1D /* TelemetryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85A1065FBFE708DC41CC9D13 /* TelemetryViewModel.swift */; };
 		FB1870F824A4B87A707A57A6 /* InputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 087BAB7361F5CCDC27BA6864 /* InputBar.swift */; };
 		FD4A2D549907A7F8710C397A /* FleetViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C85CD0F4CD9716223807DAD0 /* FleetViewModel.swift */; };
+		FD981779C90811861B5148F7 /* PermissionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0824368A956175BC978FD520 /* PermissionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -276,6 +277,7 @@
 		0472FB42E7C8822B57CF98DC /* SessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTests.swift; sourceTree = "<group>"; };
 		0645336AA58827C42F871751 /* FawxTests-macOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "FawxTests-macOS.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		068E87A8E0FC1B301B9E706B /* SynthesisViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SynthesisViewModel.swift; sourceTree = "<group>"; };
+		0824368A956175BC978FD520 /* PermissionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTests.swift; sourceTree = "<group>"; };
 		087BAB7361F5CCDC27BA6864 /* InputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputBar.swift; sourceTree = "<group>"; };
 		0BC1890444EF1EA2B509EA92 /* PermissionsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModel.swift; sourceTree = "<group>"; };
 		11BFF651D03E0E963581BB73 /* Usage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Usage.swift; sourceTree = "<group>"; };
@@ -286,6 +288,7 @@
 		1482F4460CF967889AEDF95C /* TabRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabRootView.swift; sourceTree = "<group>"; };
 		1743DA61404F2A22BCD62EF9 /* Fleet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Fleet.swift; sourceTree = "<group>"; };
 		1AE7933DA211E263335C45A9 /* FawxUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = FawxUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		1C68A15A6BE471C704462C43 /* GitHubPATSettingsSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubPATSettingsSmokeTests.swift; sourceTree = "<group>"; };
 		1DD86B5AB3DDA868D2C0CB4C /* TailscaleStep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TailscaleStep.swift; sourceTree = "<group>"; };
 		2195E08A29FF3F9D82C1FBE6 /* Telemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Telemetry.swift; sourceTree = "<group>"; };
 		232351F0DF7FF0EBB90785CE /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
@@ -298,11 +301,13 @@
 		3250B13645E296DC323C0BBE /* PermissionsSettingsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsSettingsPanel.swift; sourceTree = "<group>"; };
 		338FB5CB6D406E401F27B7B2 /* TelemetrySettingsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetrySettingsPanel.swift; sourceTree = "<group>"; };
 		3791E9164CA37931879871FD /* FawxMacCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxMacCommands.swift; sourceTree = "<group>"; };
+		398509CAAD2618C9DB47D484 /* PermissionsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModelTests.swift; sourceTree = "<group>"; };
 		3A3D04ACC1D05027C3551689 /* FormattersTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormattersTests.swift; sourceTree = "<group>"; };
 		3BB6FBE502B0B717CF55A760 /* SessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionViewModel.swift; sourceTree = "<group>"; };
 		3BBB44402114DCE05A78C36B /* StringNonEmpty.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StringNonEmpty.swift; sourceTree = "<group>"; };
 		3D2C367B42A262A99B189165 /* DeviceNameProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceNameProvider.swift; sourceTree = "<group>"; };
 		3F07B3D54545DE045D7EC042 /* OAuthFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthFlow.swift; sourceTree = "<group>"; };
+		41C06784CE5006E4E7AC8B8C /* Ripcord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ripcord.swift; sourceTree = "<group>"; };
 		43A75068C7EB266AD29AF348 /* SessionRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionRowView.swift; sourceTree = "<group>"; };
 		499D9DF1AC854550AAB058AE /* ConnectionStateMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStateMachine.swift; sourceTree = "<group>"; };
 		4A283E2181E2E7E4F28576BB /* ModelInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelInfo.swift; sourceTree = "<group>"; };
@@ -314,14 +319,6 @@
 		5C13099200335A9EA37CBC02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		5CB40DD2F1D7B9B76438587D /* JSONValueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValueTests.swift; sourceTree = "<group>"; };
 		5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupViewModel.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTests.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModelTests.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ripcord.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordBanner.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordJournalPanel.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordReportView.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxStatusCard.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordTests.swift; sourceTree = "<group>"; };
 		6333ABC39A5F77ED86604EA0 /* TestConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestConfig.swift; sourceTree = "<group>"; };
 		63B30D0D5C6FC23F9116A401 /* GitViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitViewModel.swift; sourceTree = "<group>"; };
 		658865F5DEF00EE2E5B20502 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -343,6 +340,7 @@
 		899F96DF90B6DC0942D687E6 /* FawxHaptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxHaptics.swift; sourceTree = "<group>"; };
 		8B99CDA130819D7E72CEA8AA /* iOSSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSSettingsView.swift; sourceTree = "<group>"; };
 		8EEB1F0A4C398B611C3A76C4 /* ConnectionStateMachineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStateMachineTests.swift; sourceTree = "<group>"; };
+		936521865A4419B34844339A /* RipcordJournalPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordJournalPanel.swift; sourceTree = "<group>"; };
 		946A14621A9A282DEB705EEC /* SidebarSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarSelection.swift; sourceTree = "<group>"; };
 		94EBE1811C9FC5658072CEA1 /* ExperimentsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExperimentsViewModelTests.swift; sourceTree = "<group>"; };
 		970450369EC2BC67A04E243C /* QRCodeScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeScannerSheet.swift; sourceTree = "<group>"; };
@@ -351,6 +349,7 @@
 		9E4BE9EBBB93059B1E6AA12C /* MarketplaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarketplaceView.swift; sourceTree = "<group>"; };
 		9F7F2D94A7051FB960EE5620 /* Message.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Message.swift; sourceTree = "<group>"; };
 		A03C785F44719A3574998323 /* CodeBlock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeBlock.swift; sourceTree = "<group>"; };
+		A1465237739F91F44893DDD1 /* RipcordBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordBanner.swift; sourceTree = "<group>"; };
 		A2E8890F4C465F005286B345 /* ToastView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToastView.swift; sourceTree = "<group>"; };
 		A34A4F474A3C63738988C4F0 /* ModelBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelBadge.swift; sourceTree = "<group>"; };
 		AB4F277A2A15DFC3ACFC85EF /* BottomSearchBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BottomSearchBar.swift; sourceTree = "<group>"; };
@@ -366,6 +365,7 @@
 		BF12295CE0C29C6C7ED2BD54 /* FawxApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxApp.swift; sourceTree = "<group>"; };
 		BFFF4154D4D9B8169FD9D9F7 /* FawxClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxClient.swift; sourceTree = "<group>"; };
 		C0F3654454E2926DF38F0ED7 /* ThinkingLevel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkingLevel.swift; sourceTree = "<group>"; };
+		C24501659F38504C01D1698C /* RipcordTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordTests.swift; sourceTree = "<group>"; };
 		C2E500BF4B907FA02585BB44 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C379D0DE77BBC0F8135DDD2C /* Synthesis.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Synthesis.swift; sourceTree = "<group>"; };
 		C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeView.swift; sourceTree = "<group>"; };
@@ -383,6 +383,7 @@
 		D7F8C22A99D83FF3BD92A7BE /* Skill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Skill.swift; sourceTree = "<group>"; };
 		E0B681FEBC9D221AE3782A46 /* SSEStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSEStream.swift; sourceTree = "<group>"; };
 		E18754621C979C83DDCD5C22 /* Fawx-iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "Fawx-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		E668A7D03428CDE795DA756C /* RipcordReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RipcordReportView.swift; sourceTree = "<group>"; };
 		E8D4FC172453166D85114D88 /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
 		EF1C102D83B027ED47E7EFCC /* Typography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Typography.swift; sourceTree = "<group>"; };
 		F16E21E51BEE32606C108B28 /* SynthesisSettingsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SynthesisSettingsPanel.swift; sourceTree = "<group>"; };
@@ -392,6 +393,7 @@
 		F5C5B0EE3FBA10BED5CC69D7 /* ServerStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStatus.swift; sourceTree = "<group>"; };
 		F63C54AE299C36F1E5F0091A /* FawxTests-iOS.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = "FawxTests-iOS.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		F836BAF2755ADDBE8ED750D9 /* Experiments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Experiments.swift; sourceTree = "<group>"; };
+		FA7175883B417E3BA5409E39 /* SandboxStatusCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxStatusCard.swift; sourceTree = "<group>"; };
 		FED5328018149000B95E5360 /* SectionMenuButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionMenuButton.swift; sourceTree = "<group>"; };
 		FFFB5D0979E7B04955A759A9 /* SkillsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillsViewModel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -448,7 +450,7 @@
 				CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */,
 				8EEB1F0A4C398B611C3A76C4 /* ConnectionStateMachineTests.swift */,
 				94EBE1811C9FC5658072CEA1 /* ExperimentsViewModelTests.swift */,
-				A1B2C3D4E5F60718293A4B5D /* PermissionsViewModelTests.swift */,
+				398509CAAD2618C9DB47D484 /* PermissionsViewModelTests.swift */,
 				146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */,
 			);
 			path = ViewModels;
@@ -478,8 +480,8 @@
 		3FC684A19A8993BF3C582F36 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				A1B2C3D4E5F60718293A4B5C /* PermissionTests.swift */,
-				A1B2C3D4E5F60718293A4B67 /* RipcordTests.swift */,
+				0824368A956175BC978FD520 /* PermissionTests.swift */,
+				C24501659F38504C01D1698C /* RipcordTests.swift */,
 				D6BBC676908E289F8BF2330C /* ServerStatusTests.swift */,
 				7F1BED295F170968B50CE715 /* SessionMessageTests.swift */,
 				0472FB42E7C8822B57CF98DC /* SessionTests.swift */,
@@ -492,6 +494,7 @@
 			children = (
 				C776E422C5C96EDE2315C698 /* AuthenticatedChatFlowTests.swift */,
 				8289C541AC8F222B20A54ADC /* FawxLaunchSmokeTests.swift */,
+				1C68A15A6BE471C704462C43 /* GitHubPATSettingsSmokeTests.swift */,
 				820A7E36F11D83635B504EE7 /* PairingFlowTests.swift */,
 				6333ABC39A5F77ED86604EA0 /* TestConfig.swift */,
 			);
@@ -525,7 +528,7 @@
 			children = (
 				8AD5952B591EF81CF6D4461A /* iOS */,
 				2F709E76FBE3BF26987D15C2 /* macOS */,
-				A1B2C3D4E5F60718293A4B68 /* Ripcord */,
+				9726879A4B217B98F1B244EA /* Ripcord */,
 				99DA719B17358090192EDCE7 /* Shared */,
 			);
 			path = Views;
@@ -555,6 +558,16 @@
 			path = iOS;
 			sourceTree = "<group>";
 		};
+		9726879A4B217B98F1B244EA /* Ripcord */ = {
+			isa = PBXGroup;
+			children = (
+				A1465237739F91F44893DDD1 /* RipcordBanner.swift */,
+				936521865A4419B34844339A /* RipcordJournalPanel.swift */,
+				E668A7D03428CDE795DA756C /* RipcordReportView.swift */,
+			);
+			path = Ripcord;
+			sourceTree = "<group>";
+		};
 		99DA719B17358090192EDCE7 /* Shared */ = {
 			isa = PBXGroup;
 			children = (
@@ -576,7 +589,7 @@
 				3250B13645E296DC323C0BBE /* PermissionsSettingsPanel.swift */,
 				C3C3DCF44A57457AA7191D19 /* QRCodeView.swift */,
 				B43FE3356B111C8A9C1185ED /* QueuedMessageChip.swift */,
-				A1B2C3D4E5F60718293A4B66 /* SandboxStatusCard.swift */,
+				FA7175883B417E3BA5409E39 /* SandboxStatusCard.swift */,
 				B1A5C2E77F42EF3DD71F4EDF /* ServerSettingsPanel.swift */,
 				43A75068C7EB266AD29AF348 /* SessionRowView.swift */,
 				266FDB9D5C4C4294B9824915 /* SkillsView.swift */,
@@ -589,16 +602,6 @@
 				5CE85AFC1F0D6FCEFDE64141 /* SetupWizard */,
 			);
 			path = Shared;
-			sourceTree = "<group>";
-		};
-		A1B2C3D4E5F60718293A4B68 /* Ripcord */ = {
-			isa = PBXGroup;
-			children = (
-				A1B2C3D4E5F60718293A4B63 /* RipcordBanner.swift */,
-				A1B2C3D4E5F60718293A4B64 /* RipcordJournalPanel.swift */,
-				A1B2C3D4E5F60718293A4B65 /* RipcordReportView.swift */,
-			);
-			path = Ripcord;
 			sourceTree = "<group>";
 		};
 		9F21CFB0CAF17DFCEFF99251 /* FawxTests */ = {
@@ -659,7 +662,7 @@
 				4A283E2181E2E7E4F28576BB /* ModelInfo.swift */,
 				3F07B3D54545DE045D7EC042 /* OAuthFlow.swift */,
 				590BBABC228DCE73046BAEC0 /* Permission.swift */,
-				A1B2C3D4E5F60718293A4B62 /* Ripcord.swift */,
+				41C06784CE5006E4E7AC8B8C /* Ripcord.swift */,
 				F5C5B0EE3FBA10BED5CC69D7 /* ServerStatus.swift */,
 				C7F19EE118E04C627C071358 /* Session.swift */,
 				946A14621A9A282DEB705EEC /* SidebarSelection.swift */,
@@ -884,6 +887,7 @@
 			files = (
 				08859F99F1DCFF038B1BB36F /* AuthenticatedChatFlowTests.swift in Sources */,
 				DD6C3C3BDBEB32040E2BCB54 /* FawxLaunchSmokeTests.swift in Sources */,
+				062D5EBC5997D75407B2A09A /* GitHubPATSettingsSmokeTests.swift in Sources */,
 				8B2DFC34BD8C1F3D7DA57EBF /* PairingFlowTests.swift in Sources */,
 				37603F5EFF882EE8E4EF50B8 /* TestConfig.swift in Sources */,
 			);
@@ -943,17 +947,17 @@
 				B6645E106D3B8B60D5A7927E /* Permission.swift in Sources */,
 				7BA020D7753EE877E81D979B /* PermissionsSettingsPanel.swift in Sources */,
 				0190B1F3E250D3220089AABB /* PermissionsViewModel.swift in Sources */,
-				A1B2C3D4E5F60718293A4B69 /* Ripcord.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6B /* RipcordBanner.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6D /* RipcordJournalPanel.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6F /* RipcordReportView.swift in Sources */,
 				3F7B8BA7AC464855EB212A79 /* ProviderStep.swift in Sources */,
 				6CE5644EEE9CD995BB0D8788 /* QRCodeScannerSheet.swift in Sources */,
 				82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */,
 				DFB31606918FE6868D41DEE8 /* QueuedMessageChip.swift in Sources */,
 				E615FB7472BF1E52DCAF5295 /* ReadyStep.swift in Sources */,
+				52ACB795B67009D49D637A27 /* Ripcord.swift in Sources */,
+				B4679B7D5FE466DE4896D70B /* RipcordBanner.swift in Sources */,
+				EB656AEC4D3E40F6B61ED89E /* RipcordJournalPanel.swift in Sources */,
+				DEB066BE5063200FB1C4C40D /* RipcordReportView.swift in Sources */,
 				7EE2EBCADD290969C00F85FB /* SSEStream.swift in Sources */,
-				A1B2C3D4E5F60718293A4B71 /* SandboxStatusCard.swift in Sources */,
+				561A9EB0F2F4E07F4CB269D9 /* SandboxStatusCard.swift in Sources */,
 				A2E158115FEBBEDB17A1B64D /* SectionMenuButton.swift in Sources */,
 				D43BAA2E7061092AB00802E2 /* ServerSettingsPanel.swift in Sources */,
 				D6CEFF568F334A5762C8AB24 /* ServerStatus.swift in Sources */,
@@ -1048,17 +1052,17 @@
 				AE525794B13CB7C413138BCE /* Permission.swift in Sources */,
 				F1680DCC5CE83B52D2D3A852 /* PermissionsSettingsPanel.swift in Sources */,
 				800A8B285C96FCBFFA367BDE /* PermissionsViewModel.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6A /* Ripcord.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6C /* RipcordBanner.swift in Sources */,
-				A1B2C3D4E5F60718293A4B6E /* RipcordJournalPanel.swift in Sources */,
-				A1B2C3D4E5F60718293A4B70 /* RipcordReportView.swift in Sources */,
 				2AF4D9AA513268FF12E565F6 /* ProviderStep.swift in Sources */,
 				24F7E781CDE097CE71703485 /* QRCodeScannerSheet.swift in Sources */,
 				B701CFFCB5584D5BDAC5B45D /* QRCodeView.swift in Sources */,
 				5BFD9FEE5D8675E1DC4C8080 /* QueuedMessageChip.swift in Sources */,
 				BDFDB4129E1B917E09B1F2F3 /* ReadyStep.swift in Sources */,
+				F923D3DB219834F94D77C559 /* Ripcord.swift in Sources */,
+				59DFCC68DAEDB53D58AB623E /* RipcordBanner.swift in Sources */,
+				D31F2361D1230EAFCABA8FCF /* RipcordJournalPanel.swift in Sources */,
+				376714915EDDDCE029DCE0AB /* RipcordReportView.swift in Sources */,
 				7BDE8D38EE1ED8C89158ECA9 /* SSEStream.swift in Sources */,
-				A1B2C3D4E5F60718293A4B72 /* SandboxStatusCard.swift in Sources */,
+				0A4FC9B5D879B69120E6E900 /* SandboxStatusCard.swift in Sources */,
 				E74AD10CBBBB40389252474A /* SectionMenuButton.swift in Sources */,
 				A147900E8DAFE3576A0E694A /* ServerSettingsPanel.swift in Sources */,
 				F369BDF371346F985AD3A6BB /* ServerStatus.swift in Sources */,
@@ -1109,9 +1113,9 @@
 				3F5C75AD2C13BEE5E66C3AEF /* FormattersTests.swift in Sources */,
 				1EDD1D9AD144B5652F786711 /* JSONValueTests.swift in Sources */,
 				CA7BB428CDB1F75FE846A4A4 /* KeychainHelperTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B5E /* PermissionTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B60 /* PermissionsViewModelTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B73 /* RipcordTests.swift in Sources */,
+				E75F2DF8B03365DD3A3D66EA /* PermissionTests.swift in Sources */,
+				04D60601649EDAFF3F44B374 /* PermissionsViewModelTests.swift in Sources */,
+				235B5DEEA2F8DFE97A684C49 /* RipcordTests.swift in Sources */,
 				628187E4687D83596CCF2D60 /* SSEParserTests.swift in Sources */,
 				36094D1F79A94CD4D30567B7 /* ServerStatusTests.swift in Sources */,
 				E219FC3B879329F84DEBFC1A /* SessionMessageTests.swift in Sources */,
@@ -1130,9 +1134,9 @@
 				D124E354061B4491FCED1045 /* FormattersTests.swift in Sources */,
 				68B1AA744FF35DA153136D09 /* JSONValueTests.swift in Sources */,
 				928985F53FFA38F2155ED817 /* KeychainHelperTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B5F /* PermissionTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B61 /* PermissionsViewModelTests.swift in Sources */,
-				A1B2C3D4E5F60718293A4B74 /* RipcordTests.swift in Sources */,
+				FD981779C90811861B5148F7 /* PermissionTests.swift in Sources */,
+				C7759A5380F3A3EAB75A420C /* PermissionsViewModelTests.swift in Sources */,
+				722A182A4FD70F28CB3DB5A6 /* RipcordTests.swift in Sources */,
 				585DA307C69ED769501B0404 /* SSEParserTests.swift in Sources */,
 				B0EA7CDED8A5AA50C31D1BF8 /* ServerStatusTests.swift in Sources */,
 				1C2C64297CB3D722F038BDBE /* SessionMessageTests.swift in Sources */,
