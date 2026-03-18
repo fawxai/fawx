@@ -89,6 +89,11 @@ struct FleetDispatchTaskResponse: Codable, Sendable, Hashable {
     }
 }
 
+struct FleetRemoveNodeResponse: Codable, Sendable, Hashable {
+    let id: String
+    let removed: Bool
+}
+
 enum FleetNodeHealth: String, Codable, Sendable, Hashable {
     case healthy
     case degraded

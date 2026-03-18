@@ -525,7 +525,18 @@ actor FawxClient {
     }
 
     func fleetNode(id: String) async throws -> FleetNodeDetailResponse {
-        try await performRequest(path: "/v1/fleet/nodes/\(id)", decodeAs: FleetNodeDetailResponse.self)
+        try await performRequest(
+            path: "/v1/fleet/nodes/\(Self.encodedPathComponent(id))",
+            decodeAs: FleetNodeDetailResponse.self
+        )
+    }
+
+    func removeFleetNode(id: String) async throws -> FleetRemoveNodeResponse {
+        try await performRequest(
+            path: "/v1/fleet/nodes/\(Self.encodedPathComponent(id))",
+            method: "DELETE",
+            decodeAs: FleetRemoveNodeResponse.self
+        )
     }
 
     func dispatchFleetTask(
@@ -535,12 +546,22 @@ actor FawxClient {
     ) async throws -> FleetDispatchTaskResponse {
         let body = try encoder.encode(FleetDispatchTaskBody(task: task, priority: priority))
         return try await performRequest(
-            path: "/v1/fleet/nodes/\(nodeID)/tasks",
+            path: "/v1/fleet/nodes/\(Self.encodedPathComponent(nodeID))/tasks",
             method: "POST",
             bodyData: body,
             decodeAs: FleetDispatchTaskResponse.self
         )
     }
+
+#if DEBUG
+    func removeFleetNodeRequestForTesting(id: String) throws -> URLRequest {
+        try makeRequest(
+            path: "/v1/fleet/nodes/\(Self.encodedPathComponent(id))",
+            method: "DELETE",
+            authRequired: true
+        )
+    }
+#endif
 
     func experiments() async throws -> ExperimentsListResponse {
         try await performRequest(path: "/v1/experiments", decodeAs: ExperimentsListResponse.self)
@@ -893,6 +914,11 @@ actor FawxClient {
         }
 
         return .httpStatus(statusCode, nil)
+    }
+
+    private static func encodedPathComponent(_ value: String) -> String {
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 }
 
