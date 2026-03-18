@@ -102,6 +102,18 @@ struct QrPairingResponse: Codable, Sendable, Hashable {
     }
 }
 
+struct PairingCodeResponse: Codable, Sendable, Hashable {
+    let code: String
+    let expiresAt: Int
+    let ttlSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case expiresAt = "expires_at"
+        case ttlSeconds = "ttl_seconds"
+    }
+}
+
 struct LocalServerRuntimeStatus: Codable, Sendable, Hashable {
     let status: String
     let version: String
