@@ -639,7 +639,26 @@ impl LlmProvider for AnthropicProvider {
             .client
             .post(self.endpoint())
             .header("anthropic-version", &self.api_version);
-        let response = self.apply_auth(request_builder).json(&body).send().await?;
+        let request_builder = self.apply_auth(request_builder).json(&body);
+
+        // Debug: print actual headers being sent
+        let debug_req = request_builder
+            .try_clone()
+            .and_then(|r| r.build().ok());
+        if let Some(req) = debug_req {
+            for (name, value) in req.headers() {
+                if let Ok(v) = value.to_str() {
+                    let display = if name == "authorization" {
+                        "Bearer <redacted>".to_string()
+                    } else {
+                        v.to_string()
+                    };
+                    eprintln!("[anthropic] header: {name}: {display}");
+                }
+            }
+        }
+
+        let response = request_builder.send().await?;
 
         let status = response.status();
         if !status.is_success() {
