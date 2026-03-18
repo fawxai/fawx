@@ -9,6 +9,7 @@ struct ChatDetailView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
+    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
     @State private var isShowingRipcordSheet = false
     @State private var isLoadingRipcordJournal = false
     @State private var ripcordJournalEntries: [JournalEntry] = []
@@ -245,13 +246,13 @@ struct ChatDetailView: View {
                 .foregroundStyle(Color.fawxTextSecondary)
         }
         .padding(FawxSpacing.paddingXL)
-        .background(Color.fawxSurface.opacity(0.96))
+        .background(Color.fawxSurface.opacity(FawxOpacity.surfaceOverlay))
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                .stroke(Color.fawxBorder.opacity(0.8), lineWidth: 1)
+                .stroke(Color.fawxBorder.opacity(FawxOpacity.borderMedium), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+        .fawxShadow(FawxShadow.loadingOverlay)
     }
 
     private var cachedRefreshIndicator: some View {
@@ -265,13 +266,13 @@ struct ChatDetailView: View {
         }
         .padding(.horizontal, FawxSpacing.paddingMD)
         .padding(.vertical, FawxSpacing.paddingSM)
-        .background(Color.fawxSurface.opacity(0.94))
+        .background(Color.fawxSurface.opacity(FawxOpacity.surfaceMuted))
         .overlay(
             Capsule()
-                .stroke(Color.fawxBorder.opacity(0.7), lineWidth: 1)
+                .stroke(Color.fawxBorder.opacity(FawxOpacity.borderSubtle), lineWidth: 1)
         )
         .clipShape(Capsule())
-        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+        .fawxShadow(FawxShadow.elevatedCapsule)
     }
 
     @ViewBuilder
@@ -287,10 +288,11 @@ struct ChatDetailView: View {
     private var emptyState: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
             Text("🦊")
-                .font(.system(size: 30))
+                .font(.system(size: emptyStateEmojiSize))
                 .padding(FawxSpacing.paddingMD)
                 .background(Color.fawxAccentSubtle)
                 .clipShape(Circle())
+                .accessibilityHidden(true)
 
             Text(emptyStateTitle)
                 .font(FawxTypography.heading1)
@@ -303,13 +305,13 @@ struct ChatDetailView: View {
         }
         .frame(maxWidth: 440)
         .padding(FawxSpacing.paddingXL)
-        .background(Color.fawxSurface.opacity(0.98))
+        .background(Color.fawxSurface.opacity(FawxOpacity.surfaceStrong))
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius + 4)
-                .stroke(Color.fawxBorder.opacity(0.85), lineWidth: 1)
+                .stroke(Color.fawxBorder.opacity(FawxOpacity.borderStrong), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius + 4))
-        .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
+        .fawxShadow(FawxShadow.floatingPanel)
         .frame(maxWidth: .infinity, minHeight: 320)
     }
 
@@ -339,10 +341,10 @@ struct ChatDetailView: View {
                     }
                 }
                 .padding(FawxSpacing.paddingMD)
-                .background(Color.fawxError.opacity(0.08))
+                .background(Color.fawxError.opacity(FawxOpacity.fillMuted))
                 .overlay(
                     RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                        .stroke(Color.fawxError.opacity(0.3), lineWidth: 1)
+                        .stroke(Color.fawxError.opacity(FawxOpacity.borderHighlight), lineWidth: 1)
                 )
                 .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
             }
@@ -385,7 +387,7 @@ struct ChatDetailView: View {
             LinearGradient(
                 colors: [
                     Color.fawxBackground.opacity(0),
-                    Color.fawxBackground.opacity(0.86),
+                    Color.fawxBackground.opacity(FawxOpacity.backgroundScrim),
                     Color.fawxBackground
                 ],
                 startPoint: .top,
@@ -393,7 +395,7 @@ struct ChatDetailView: View {
             )
                 .overlay(alignment: .top) {
                     Divider()
-                        .opacity(0.35)
+                        .opacity(FawxOpacity.iconSecondary)
                 }
                 .ignoresSafeArea(edges: .bottom)
         }
@@ -616,7 +618,7 @@ struct PermissionPromptSheetView: View {
                         .foregroundStyle(promptAccentColor)
                         .padding(.horizontal, FawxSpacing.paddingSM)
                         .padding(.vertical, FawxSpacing.paddingXS)
-                        .background(promptAccentColor.opacity(0.12))
+                        .background(promptAccentColor.opacity(FawxOpacity.fillSubtle))
                         .clipShape(Capsule())
                 }
             }
@@ -646,10 +648,10 @@ struct PermissionPromptSheetView: View {
                     .foregroundStyle(Color.fawxError)
                     .padding(FawxSpacing.paddingMD)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.fawxError.opacity(0.08))
+                    .background(Color.fawxError.opacity(FawxOpacity.fillMuted))
                     .overlay(
                         RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                            .stroke(Color.fawxError.opacity(0.25), lineWidth: 1)
+                            .stroke(Color.fawxError.opacity(FawxOpacity.errorBorder), lineWidth: 1)
                     )
                     .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
             }
@@ -745,15 +747,15 @@ private struct PermissionPromptInlineNotice: View {
                     .foregroundStyle(Color.fawxWarning)
                     .padding(.horizontal, FawxSpacing.paddingSM)
                     .padding(.vertical, FawxSpacing.paddingXS)
-                    .background(Color.fawxWarning.opacity(0.12))
+                    .background(Color.fawxWarning.opacity(FawxOpacity.fillSubtle))
                     .clipShape(Capsule())
             }
         }
         .padding(FawxSpacing.paddingMD)
-        .background(Color.fawxWarning.opacity(0.08))
+        .background(Color.fawxWarning.opacity(FawxOpacity.fillMuted))
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                .stroke(Color.fawxWarning.opacity(0.2), lineWidth: 1)
+                .stroke(Color.fawxWarning.opacity(FawxOpacity.accentBorder), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
     }

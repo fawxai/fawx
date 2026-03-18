@@ -107,7 +107,7 @@ struct MessageBubble: View {
                     FontFamilyVariant(.monospaced)
                     FontSize(.em(0.92))
                     ForegroundColor(Color.fawxText)
-                    BackgroundColor(Color.fawxCode.opacity(0.9))
+                    BackgroundColor(Color.fawxCode.opacity(FawxOpacity.codeBackground))
                 }
                 .markdownTextStyle(\.link) {
                     ForegroundColor(Color.fawxAccent)
@@ -153,9 +153,9 @@ struct MessageBubble: View {
             if isStreaming {
                 return Color.fawxBorder
             }
-            return Color.fawxBorder.opacity(0.8)
+            return Color.fawxBorder.opacity(FawxOpacity.borderMedium)
         case .system:
-            return Color.fawxAccent.opacity(0.2)
+            return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
     }
 

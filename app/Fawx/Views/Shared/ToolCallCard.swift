@@ -21,7 +21,7 @@ struct ToolCallCard: View {
                     Image(systemName: "wrench.and.screwdriver")
                         .foregroundStyle(statusColor)
                         .padding(8)
-                        .background(statusColor.opacity(0.12))
+                        .background(statusColor.opacity(FawxOpacity.fillSubtle))
                         .clipShape(Circle())
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -48,8 +48,10 @@ struct ToolCallCard: View {
                         .foregroundStyle(statusColor)
                         .padding(.horizontal, FawxSpacing.paddingSM)
                         .padding(.vertical, FawxSpacing.paddingXS)
-                        .background(statusColor.opacity(0.12))
+                        .background(statusColor.opacity(FawxOpacity.fillSubtle))
                         .clipShape(Capsule())
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Status \(statusText)")
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 11, weight: .semibold))
@@ -140,17 +142,17 @@ struct ToolCallCard: View {
             return Color.fawxAccentSubtle
         }
         if toolCall.isError {
-            return Color.fawxError.opacity(0.06)
+            return Color.fawxError.opacity(FawxOpacity.errorFill)
         }
         return Color.fawxSurface
     }
 
     private var cardBorderColor: Color {
         if toolCall.isRunning {
-            return Color.fawxAccent.opacity(0.2)
+            return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
         if toolCall.isError {
-            return Color.fawxError.opacity(0.25)
+            return Color.fawxError.opacity(FawxOpacity.errorBorder)
         }
         return Color.fawxBorder
     }
@@ -164,8 +166,10 @@ struct ToolCallCard: View {
                 .font(FawxTypography.status)
                 .foregroundStyle(Color.fawxTextSecondary)
                 .textCase(.uppercase)
+                .accessibilityAddTraits(.isHeader)
 
             content()
         }
+        .accessibilityElement(children: .contain)
     }
 }

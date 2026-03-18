@@ -40,13 +40,13 @@ struct InputBar: View {
             }
         }
         .padding(FawxSpacing.paddingMD)
-        .background(Color.fawxSurface.opacity(0.98))
+        .background(Color.fawxSurface.opacity(FawxOpacity.surfaceStrong))
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
                 .stroke(Color.fawxBorder, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        .shadow(color: .black.opacity(0.08), radius: 10, y: 3)
+        .fawxShadow(FawxShadow.floatingPanel)
     }
 
     private var effectivePlaceholder: String {
@@ -85,28 +85,17 @@ struct InputBar: View {
 #endif
     }
 
+#if os(iOS)
     private var baseMessageField: some View {
-#if os(macOS)
-        EmptyView()
-#else
         TextField(effectivePlaceholder, text: $text, axis: .vertical)
             .textFieldStyle(.plain)
             .font(FawxTypography.input)
             .foregroundStyle(Color.fawxText)
             .lineLimit(1 ... 6)
             .accessibilityIdentifier("messageInput")
-#if os(macOS)
-            .padding(.vertical, FawxSpacing.paddingXS)
-            .frame(
-                maxWidth: .infinity,
-                minHeight: FawxSpacing.inputBarMinHeight - (FawxSpacing.paddingMD * 2),
-                alignment: .leading
-            )
-#else
             .frame(maxWidth: .infinity, alignment: .leading)
-#endif
-#endif
     }
+#endif
 
     private var messageFieldPanel: some View {
         messageField
@@ -222,12 +211,12 @@ struct InputBar: View {
 
     private var messageFieldBorderColor: Color {
         if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return Color.fawxAccent.opacity(0.2)
+            return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
         if connectionStatus != .connected && !isStreaming {
-            return Color.fawxWarning.opacity(0.28)
+            return Color.fawxWarning.opacity(FawxOpacity.warningBorder)
         }
-        return Color.fawxBorder.opacity(0.9)
+        return Color.fawxBorder.opacity(FawxOpacity.borderEmphasis)
     }
 
     private func performPrimaryAction() {
