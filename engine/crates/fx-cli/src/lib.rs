@@ -129,17 +129,20 @@ fn build_app_with_dependencies(
         &build_config.config,
         build_config.improvement_provider.clone(),
         session_bus.clone(),
-        credential_store,
+        credential_store.clone(),
     );
     let bundle = startup::build_headless_loop_engine_bundle(
         &build_config.config,
         build_config.improvement_provider,
-        parent_loop_build_options(
-            &subagent_manager,
-            build_config.config_manager.clone(),
-            session_bus.clone(),
-            build_config.experiment_progress,
-        ),
+        startup::HeadlessLoopBuildOptions {
+            credential_store: credential_store.clone(),
+            ..parent_loop_build_options(
+                &subagent_manager,
+                build_config.config_manager.clone(),
+                session_bus.clone(),
+                build_config.experiment_progress,
+            )
+        },
     )?;
 
     headless::HeadlessApp::new(headless::HeadlessAppDeps {

@@ -47,6 +47,7 @@ struct ExperimentsView: View {
             )
         ) {
             ExperimentDetailSheet(viewModel: viewModel)
+                .fawxOpaqueModalPresentation()
         }
     }
 

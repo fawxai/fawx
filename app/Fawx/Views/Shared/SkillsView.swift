@@ -77,6 +77,7 @@ struct SkillsView: View {
                         skillsViewModel.cancelEditingPermissions()
                     }
                 )
+                .fawxOpaqueModalPresentation()
             }
         }
     }

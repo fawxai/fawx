@@ -531,13 +531,14 @@ fn build_headless_app(
         &config,
         improvement_provider.clone(),
         session_bus.clone(),
-        credential_store,
+        credential_store.clone(),
     );
     let session_registry = (!skip_session_db)
         .then(|| startup::open_session_registry(&data_dir))
         .flatten();
     let options = startup::HeadlessLoopBuildOptions {
         session_registry,
+        credential_store: credential_store.clone(),
         #[cfg(feature = "http")]
         experiment_registry: experiment_registry.clone(),
         ..parent_loop_build_options(

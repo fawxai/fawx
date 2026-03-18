@@ -48,6 +48,7 @@ struct OnboardingView: View {
                     }
                 }
             )
+            .fawxOpaqueModalPresentation()
         }
 #endif
     }

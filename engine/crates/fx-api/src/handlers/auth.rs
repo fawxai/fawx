@@ -8,9 +8,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use fx_auth::auth::AuthMethod;
+use fx_auth::github::validate_github_pat;
 use fx_llm::{ModelCatalog, OpenAiResponsesProvider};
 use std::time::Duration;
 use tokio::time;
+use zeroize::Zeroizing;
 
 use super::HandlerResult;
 
@@ -98,11 +100,11 @@ pub async fn handle_verify_provider(
     let timeout = Duration::from_secs(timeout_seconds);
 
     match verify_auth_method(&provider, &auth_method, timeout).await {
-        Ok(_) => Ok(Json(VerifyResponse {
+        Ok(message) => Ok(Json(VerifyResponse {
             provider,
             verified: true,
             status: "authenticated".to_string(),
-            message: "Credentials verified successfully.".to_string(),
+            message,
             checked_at,
         })),
         Err(message) => Ok(Json(VerifyResponse {
@@ -119,8 +121,9 @@ async fn verify_auth_method(
     provider: &str,
     auth_method: &AuthMethod,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<String, String> {
     match auth_method {
+        AuthMethod::ApiKey { key, .. } if provider == "github" => verify_github_token(key).await,
         AuthMethod::OAuth {
             provider: stored_provider,
             access_token,
@@ -153,7 +156,7 @@ async fn verify_auth_method(
                     })?;
 
                 verification
-                    .map(|_| ())
+                    .map(|_| "Credentials verified successfully.".to_string())
                     .map_err(|error| verification_error_message(provider, error.to_string()))
             } else {
                 verify_with_catalog(provider, access_token, "oauth", timeout).await
@@ -171,13 +174,37 @@ async fn verify_with_catalog(
     token: &str,
     auth_mode: &str,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let catalog = ModelCatalog::with_timeout(timeout);
     catalog
         .verify_credentials(provider, token, auth_mode)
         .await
-        .map(|_| ())
+        .map(|_| "Credentials verified successfully.".to_string())
         .map_err(|error| verification_error_message(provider, error))
+}
+
+async fn verify_github_token(token: &str) -> Result<String, String> {
+    let token = Zeroizing::new(token.to_string());
+    let info = validate_github_pat(&token)
+        .await
+        .map_err(|error| verification_error_message("github", error.to_string()))?;
+
+    if info.missing_scopes.is_empty() {
+        return Ok(format!("GitHub token verified for @{}.", info.login));
+    }
+
+    if token.as_str().starts_with("github_pat_") {
+        return Ok(format!(
+            "GitHub token verified for @{}. Fine-grained PAT scopes couldn't be confirmed from GitHub headers.",
+            info.login
+        ));
+    }
+
+    Err(format!(
+        "GitHub token is valid for @{}, but it's missing required scopes: {}.",
+        info.login,
+        info.missing_scopes.join(", ")
+    ))
 }
 
 fn verification_request<'a>(
@@ -214,6 +241,10 @@ fn verification_error_message(provider: &str, error: String) -> String {
         return format!("{provider_label} rejected these credentials.");
     }
 
+    if error.contains("invalid or expired") {
+        return format!("{provider_label} rejected these credentials.");
+    }
+
     if error.contains("timed out") || error.contains("deadline has elapsed") {
         return format!("Timed out while contacting {provider_label}.");
     }
@@ -232,6 +263,7 @@ fn verification_error_message(provider: &str, error: String) -> String {
 fn provider_display_name(provider: &str) -> &str {
     match provider {
         "anthropic" => "Anthropic",
+        "github" => "GitHub",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
         _ => provider,

@@ -2,6 +2,9 @@ import Observation
 import SwiftUI
 
 struct Sidebar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.controlActiveState) private var controlActiveState
+
     @Bindable var sessionViewModel: SessionViewModel
     let selection: SidebarSelection?
 
@@ -78,7 +81,17 @@ struct Sidebar: View {
 
     private var newSessionButton: some View {
         Button(action: newSessionAction) {
-            Label("New Session", systemImage: "plus")
+            Label {
+                Text("New Session")
+            } icon: {
+                if shouldUseActiveLightSessionIconColor {
+                    Image(systemName: "plus")
+                        .symbolRenderingMode(.monochrome)
+                        .foregroundStyle(Color.white)
+                } else {
+                    Image(systemName: "plus")
+                }
+            }
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
@@ -86,6 +99,10 @@ struct Sidebar: View {
         .accessibilityIdentifier("newSessionButton")
         .disabled(isSelectingSessions)
         .listRowBackground(Color.clear)
+    }
+
+    private var shouldUseActiveLightSessionIconColor: Bool {
+        colorScheme == .light && controlActiveState == .key && isSelectingSessions == false
     }
 
     @ViewBuilder

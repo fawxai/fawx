@@ -9,6 +9,13 @@ struct AuthStatusList: View {
     @State private var isPresentingProviderEditor = false
     @State private var selectedProviderForEditor: SetupProvider = .openai
     @State private var localErrorMessage: String?
+    @State private var githubTokenInput = ""
+    @State private var isSavingGitHub = false
+    @State private var isVerifyingGitHub = false
+    @State private var isRemovingGitHub = false
+    @State private var githubFeedbackMessage: String?
+    @State private var githubFeedbackStyle: AppToastStyle = .info
+    @State private var githubVerificationState: GitHubVerificationState = .unknown
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
@@ -27,18 +34,18 @@ struct AuthStatusList: View {
                     .foregroundStyle(Color.fawxError)
             }
 
-            if appState.authProviders.isEmpty {
+            if displayedAuthProviders.isEmpty {
                 VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
-                    Text("No authentication configured yet.")
+                    Text(hasSavedGitHubToken ? "No model provider credentials configured yet." : "No authentication configured yet.")
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxText)
 
-                    Text("Add Claude or ChatGPT credentials here instead of dropping to setup commands.")
+                    Text("Add Claude or ChatGPT credentials here instead of dropping to setup commands. GitHub PAT management lives below for git push and pull request creation.")
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
                 }
             } else {
-                ForEach(appState.authProviders) { provider in
+                ForEach(displayedAuthProviders) { provider in
                     AuthProviderCard(
                         provider: provider,
                         isAuthenticating: activeOAuthProvider == provider.provider.lowercased(),
@@ -59,6 +66,21 @@ struct AuthStatusList: View {
                     )
                 }
             }
+
+            GitHubTokenSection(
+                tokenInput: $githubTokenInput,
+                isSaving: $isSavingGitHub,
+                isVerifying: isVerifyingGitHub,
+                isRemoving: isRemovingGitHub,
+                statusLabel: githubStatusLabel,
+                statusStyle: githubStatusStyle,
+                detailMessage: githubDetailMessage,
+                detailStyle: githubDetailStyle,
+                canVerify: hasSavedGitHubToken,
+                onSave: saveGitHubToken,
+                onVerify: verifyGitHubToken,
+                onRemove: removeGitHubToken
+            )
         }
         .sheet(isPresented: $isPresentingProviderEditor) {
             NavigationStack {
@@ -67,11 +89,195 @@ struct AuthStatusList: View {
                     initialProvider: selectedProviderForEditor
                 )
             }
+            .fawxOpaqueModalPresentation()
         }
     }
 
     private var displayedErrorMessage: String? {
         localErrorMessage ?? appState.authProvidersError
+    }
+
+    private var displayedAuthProviders: [AuthProvider] {
+        appState.authProviders.filter { $0.provider.lowercased() != "github" }
+    }
+
+    private var githubProvider: AuthProvider? {
+        appState.authProviders.first(where: { $0.provider.lowercased() == "github" })
+    }
+
+    private var hasSavedGitHubToken: Bool {
+        githubProvider != nil
+    }
+
+    private var githubStatusLabel: String {
+        if isRemovingGitHub {
+            return "Removing..."
+        }
+        if isSavingGitHub {
+            return "Saving..."
+        }
+        if isVerifyingGitHub {
+            return "Verifying..."
+        }
+
+        switch githubVerificationState {
+        case .verified:
+            return "Verified"
+        case .invalid:
+            return "Invalid"
+        case .unknown:
+            return githubProvider?.displayStatus ?? "Not saved"
+        }
+    }
+
+    private var githubStatusStyle: AppToastStyle {
+        if isSavingGitHub || isVerifyingGitHub || isRemovingGitHub {
+            return .info
+        }
+
+        switch githubVerificationState {
+        case .verified:
+            return .success
+        case .invalid:
+            return .error
+        case .unknown:
+            guard let githubProvider else {
+                return .warning
+            }
+
+            switch githubProvider.status.lowercased() {
+            case "saved":
+                return .info
+            case "invalid":
+                return .error
+            default:
+                return githubProvider.isConfigured ? .success : .warning
+            }
+        }
+    }
+
+    private var githubDetailMessage: String? {
+        if let githubFeedbackMessage, !githubFeedbackMessage.isEmpty {
+            return githubFeedbackMessage
+        }
+        if hasSavedGitHubToken {
+            return "Token is stored on this server. Verify it to confirm GitHub can use it."
+        }
+        return nil
+    }
+
+    private var githubDetailStyle: AppToastStyle {
+        if let githubFeedbackMessage, !githubFeedbackMessage.isEmpty {
+            return githubFeedbackStyle
+        }
+        return hasSavedGitHubToken ? .info : .warning
+    }
+
+    @MainActor
+    private func saveGitHubToken(_ token: String) async {
+        guard !isSavingGitHub else {
+            return
+        }
+
+        isSavingGitHub = true
+        defer { isSavingGitHub = false }
+        githubVerificationState = .unknown
+
+        do {
+            _ = try await appState.client.storeAPIKey(
+                provider: "github",
+                apiKey: token,
+                label: "GitHub PAT"
+            )
+            githubTokenInput = ""
+            await appState.refreshSettingsState()
+            localErrorMessage = nil
+            githubFeedbackMessage = "GitHub token stored. Verifying..."
+            githubFeedbackStyle = .info
+            await verifyGitHubToken(afterSave: true)
+        } catch {
+            localErrorMessage = error.localizedDescription
+            githubFeedbackMessage = error.localizedDescription
+            githubFeedbackStyle = .error
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    @MainActor
+    private func verifyGitHubToken() async {
+        await verifyGitHubToken(afterSave: false)
+    }
+
+    @MainActor
+    private func verifyGitHubToken(afterSave: Bool) async {
+        guard !isVerifyingGitHub else {
+            return
+        }
+        guard hasSavedGitHubToken || afterSave else {
+            return
+        }
+
+        isVerifyingGitHub = true
+        defer { isVerifyingGitHub = false }
+
+        do {
+            let response = try await appState.client.verifyProvider("github")
+            localErrorMessage = nil
+            githubVerificationState = response.verified ? .verified : .invalid
+            githubFeedbackMessage = response.message
+            githubFeedbackStyle = response.verified ? .success : .warning
+            appState.showToast(
+                message: response.message,
+                style: response.verified ? .success : .warning
+            )
+        } catch {
+            githubVerificationState = .unknown
+
+            if afterSave {
+                localErrorMessage = nil
+                githubFeedbackMessage = "GitHub token stored. Verify again when the server can reach GitHub."
+                githubFeedbackStyle = .warning
+                appState.showToast(
+                    message: "GitHub token stored, but verification could not complete.",
+                    style: .warning
+                )
+            } else {
+                localErrorMessage = error.localizedDescription
+                githubFeedbackMessage = error.localizedDescription
+                githubFeedbackStyle = .error
+                appState.showToast(message: error.localizedDescription, style: .error)
+            }
+
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    @MainActor
+    private func removeGitHubToken() async {
+        guard !isRemovingGitHub else {
+            return
+        }
+
+        isRemovingGitHub = true
+        defer { isRemovingGitHub = false }
+
+        do {
+            _ = try await appState.client.deleteProvider("github")
+            githubTokenInput = ""
+            githubVerificationState = .unknown
+            await appState.refreshSettingsState()
+            localErrorMessage = nil
+            githubFeedbackMessage = "GitHub token removed."
+            githubFeedbackStyle = .info
+            appState.showToast(message: "Removed GitHub token.", style: .info)
+        } catch {
+            localErrorMessage = error.localizedDescription
+            githubFeedbackMessage = error.localizedDescription
+            githubFeedbackStyle = .error
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+        }
     }
 
     private func startOAuthLogin(
@@ -211,6 +417,8 @@ struct AuthStatusList: View {
 
     private func providerDisplayName(_ provider: String) -> String {
         switch provider.lowercased() {
+        case "github":
+            "GitHub"
         case "openai":
             "OpenAI"
         case "anthropic":
@@ -225,6 +433,144 @@ struct AuthStatusList: View {
                 .split(separator: " ")
                 .map { $0.capitalized }
                 .joined(separator: " ")
+        }
+    }
+}
+
+private enum GitHubVerificationState {
+    case unknown
+    case verified
+    case invalid
+}
+
+private struct GitHubTokenSection: View {
+    @Binding var tokenInput: String
+    @Binding var isSaving: Bool
+    let isVerifying: Bool
+    let isRemoving: Bool
+    let statusLabel: String
+    let statusStyle: AppToastStyle
+    let detailMessage: String?
+    let detailStyle: AppToastStyle
+    let canVerify: Bool
+    let onSave: @MainActor (String) async -> Void
+    let onVerify: @MainActor () async -> Void
+    let onRemove: @MainActor () async -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+            HStack(alignment: .firstTextBaseline, spacing: FawxSpacing.paddingMD) {
+                Text("GitHub")
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+
+                Spacer(minLength: FawxSpacing.paddingMD)
+
+                Text(statusLabel)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, FawxSpacing.paddingSM)
+                    .padding(.vertical, 4)
+                    .background(
+                        statusColor.opacity(0.12)
+                    )
+                    .clipShape(Capsule())
+            }
+
+            Text("Required for git push and pull request creation.")
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            if let detailMessage, !detailMessage.isEmpty {
+                Text(detailMessage)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(detailColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: FawxSpacing.paddingSM) {
+                SecureField("Personal Access Token", text: $tokenInput)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("GitHub personal access token")
+
+                Button(saveButtonTitle) {
+                    let token = trimmedToken
+                    guard !token.isEmpty else {
+                        return
+                    }
+
+                    Task {
+                        await onSave(token)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(trimmedToken.isEmpty || isSaving || isVerifying || isRemoving)
+                .accessibilityLabel("Save GitHub token")
+
+                if canVerify {
+                    Button(isVerifying ? "Verifying..." : "Verify") {
+                        Task {
+                            await onVerify()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isSaving || isVerifying || isRemoving)
+                    .accessibilityLabel("Verify GitHub token")
+
+                    Button(isRemoving ? "Removing..." : "Remove", role: .destructive) {
+                        Task {
+                            await onRemove()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isSaving || isVerifying || isRemoving)
+                    .accessibilityLabel("Remove GitHub token")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(FawxSpacing.paddingMD)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        )
+        .accessibilityIdentifier("authProvider_github")
+    }
+
+    private var trimmedToken: String {
+        tokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var saveButtonTitle: String {
+        if isSaving {
+            return "Saving..."
+        }
+        return canVerify ? "Update" : "Save"
+    }
+
+    private var statusColor: Color {
+        switch statusStyle {
+        case .info:
+            .fawxAccent
+        case .success:
+            .fawxSuccess
+        case .warning:
+            .fawxWarning
+        case .error:
+            .fawxError
+        }
+    }
+
+    private var detailColor: Color {
+        switch detailStyle {
+        case .error:
+            .fawxError
+        case .warning:
+            .fawxWarning
+        default:
+            .fawxTextSecondary
         }
     }
 }
