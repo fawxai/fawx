@@ -20,6 +20,95 @@ final class SessionTests: XCTestCase {
 
         XCTAssertEqual(title, "This session title should...")
     }
+
+    func testFilterSessionSectionsMatchesTitlePreviewModelAndKey() {
+        let sections = [
+            SessionSection(
+                title: "Today",
+                sessions: [
+                    makeSession(
+                        key: "sess-alpha",
+                        label: "Debug streaming issue",
+                        preview: "The SSE connection drops after 30 seconds",
+                        model: "gpt-5.4"
+                    ),
+                    makeSession(
+                        key: "sess-beta",
+                        label: "Git pane polish",
+                        preview: "Need a cleaner diff viewer",
+                        model: "claude-sonnet"
+                    ),
+                ]
+            )
+        ]
+
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: "streaming").first?.sessions.map(\.id), ["sess-alpha"])
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: "diff viewer").first?.sessions.map(\.id), ["sess-beta"])
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: "gpt-5.4").first?.sessions.map(\.id), ["sess-alpha"])
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: "sess-beta").first?.sessions.map(\.id), ["sess-beta"])
+    }
+
+    func testFilterSessionSectionsRemovesEmptyGroupsAndReturnsOriginalSectionsForBlankQuery() {
+        let today = SessionSection(
+            title: "Today",
+            sessions: [makeSession(key: "sess-today", label: "Session browser polish")]
+        )
+        let older = SessionSection(
+            title: "Older",
+            sessions: [makeSession(key: "sess-older", label: "Fleet panel")]
+        )
+        let sections = [today, older]
+
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: " ").map(\.title), ["Today", "Older"])
+        XCTAssertEqual(SessionViewModel.filterSessionSections(sections, query: "browser").map(\.title), ["Today"])
+    }
+
+    func testSessionRowSubtitleTextUsesPreviewWhenAvailable() {
+        let session = makeSession(
+            key: "sess-preview",
+            preview: "Most recent assistant reply",
+            messageCount: 3
+        )
+
+        XCTAssertEqual(SessionRowView.subtitleText(for: session), "Most recent assistant reply")
+    }
+
+    func testSessionRowSubtitleTextShowsNoMessagesFallback() {
+        let session = makeSession(key: "sess-empty", preview: nil, messageCount: 0)
+
+        XCTAssertEqual(SessionRowView.subtitleText(for: session), "No messages yet")
+    }
+
+    func testSessionRowSubtitleTextShowsPluralizedMessageCounts() {
+        let singleMessageSession = makeSession(key: "sess-one", preview: nil, messageCount: 1)
+        let multiMessageSession = makeSession(key: "sess-many", preview: nil, messageCount: 4)
+
+        XCTAssertEqual(SessionRowView.subtitleText(for: singleMessageSession), "1 message")
+        XCTAssertEqual(SessionRowView.subtitleText(for: multiMessageSession), "4 messages")
+    }
+
+    private func makeSession(
+        key: String,
+        label: String? = nil,
+        title: String? = nil,
+        preview: String? = nil,
+        model: String = "test-model",
+        updatedAt: Int = 1,
+        messageCount: Int = 0
+    ) -> Session {
+        Session(
+            key: key,
+            kind: .main,
+            status: .idle,
+            label: label,
+            title: title,
+            preview: preview,
+            model: model,
+            createdAt: 0,
+            updatedAt: updatedAt,
+            messageCount: messageCount
+        )
+    }
 }
 
 final class IOSViewSourceRegressionTests: XCTestCase {
