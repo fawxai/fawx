@@ -189,8 +189,7 @@ impl AnthropicProvider {
             AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
             AnthropicAuthMode::SetupToken(token) => builder
                 .header("Authorization", format!("Bearer {token}"))
-                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-                .header("x-app", "cli"),
+                .header("anthropic-beta", "oauth-2025-04-20"),
         }
     }
 
