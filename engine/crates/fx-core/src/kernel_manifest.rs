@@ -365,6 +365,30 @@ mod tests {
     }
 
     #[test]
+    fn build_kernel_manifest_includes_self_modify() {
+        let fixture = test_fixture();
+        let manifest = build_kernel_manifest(&fixture.sources());
+        assert!(manifest.self_modify.enabled);
+        assert_eq!(
+            manifest.self_modify.allow_paths,
+            vec!["/workspace/fawx/docs", "/workspace/fawx/scripts"]
+        );
+        assert_eq!(
+            manifest.self_modify.deny_paths,
+            vec![".git/**", "*.pem"]
+        );
+    }
+
+    #[test]
+    fn build_writable_roots_deduplicates_working_dir() {
+        let roots = build_writable_roots(
+            "/workspace/fawx",
+            &["/workspace/fawx".to_string(), "/other".to_string()],
+        );
+        assert_eq!(roots, vec!["/workspace/fawx", "/other"]);
+    }
+
+    #[test]
     fn build_kernel_manifest_includes_escalation_flag() {
         let mut fixture = test_fixture();
         let manifest = build_kernel_manifest(&fixture.sources());

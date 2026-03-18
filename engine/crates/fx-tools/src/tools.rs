@@ -652,15 +652,10 @@ impl FawxToolExecutor {
     fn handle_kernel_manifest(&self) -> Result<String, String> {
         let runtime = self.locked_runtime_info()?;
         let config = self.locked_config()?;
-        let sm_enabled = self.self_modify.as_ref().is_some_and(|sm| sm.enabled);
-        let sm_allow = self
-            .self_modify
-            .as_ref()
-            .map_or_else(Vec::new, |sm| sm.allow_paths.clone());
-        let sm_deny = self
-            .self_modify
-            .as_ref()
-            .map_or_else(Vec::new, |sm| sm.deny_paths.clone());
+        let (sm_enabled, sm_allow, sm_deny) = match &self.self_modify {
+            Some(sm) => (sm.enabled, sm.allow_paths.clone(), sm.deny_paths.clone()),
+            None => (false, Vec::new(), Vec::new()),
+        };
         let working_dir = self.working_dir.to_string_lossy().into_owned();
         let budget = build_budget_summary(&self.kernel_budget);
         let can_request_capabilities = runtime
@@ -5287,6 +5282,44 @@ three
         let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
         // sample_runtime_info has 1 skill
         assert_eq!(json["skills_loaded"], 1);
+    }
+
+    // ── kernel_manifest tests ─────────────────────────────────────────
+
+    #[test]
+    fn kernel_manifest_returns_valid_json() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = fx_config::FawxConfig::default();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let manager = fx_config::manager::ConfigManager::from_config(config, config_path);
+        let exec = test_executor(temp.path())
+            .with_runtime_info(sample_runtime_info("gpt-5.4"))
+            .with_config_manager(Arc::new(Mutex::new(manager)));
+        let result = exec.handle_kernel_manifest().expect("manifest");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert_eq!(json["model"]["active_model"], "gpt-5.4");
+        assert!(json["permissions"]["mode"].is_string());
+        assert!(json["budget"]["max_llm_calls"].is_number());
+        assert!(json.get("tripwire").is_none(), "must not expose tripwires");
+        assert!(json.get("ripcord").is_none(), "must not expose ripcord");
+    }
+
+    #[test]
+    fn kernel_manifest_fails_without_runtime_info() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path());
+        let error = exec.handle_kernel_manifest().expect_err("should fail");
+        assert!(error.contains("runtime info"));
+    }
+
+    #[test]
+    fn kernel_manifest_fails_without_config_manager() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path())
+            .with_runtime_info(sample_runtime_info("m"));
+        let error = exec.handle_kernel_manifest().expect_err("should fail");
+        assert!(error.contains("config manager"));
     }
 
     // ── fawx_restart tests ──────────────────────────────────────────────
