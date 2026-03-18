@@ -384,6 +384,7 @@ pub struct HeadlessLoopBuildOptions {
     pub session_bus: Option<SessionBus>,
     pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
     pub ripcord_journal: Option<Arc<RipcordJournal>>,
+    pub credential_store: Option<SharedCredentialStore>,
     pub token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<SharedExperimentRegistry>,
@@ -402,6 +403,7 @@ impl HeadlessLoopBuildOptions {
             session_bus: None,
             permission_prompt_state: None,
             ripcord_journal: None,
+            credential_store: None,
             token_broker: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -420,6 +422,7 @@ impl HeadlessLoopBuildOptions {
             session_bus: None,
             permission_prompt_state: None,
             ripcord_journal: None,
+            credential_store: None,
             token_broker: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -437,6 +440,7 @@ struct SkillRegistryBuildOptions {
     session_registry: Option<fx_session::SessionRegistry>,
     session_bus: Option<SessionBus>,
     kernel_budget: BudgetConfig,
+    credential_store: Option<SharedCredentialStore>,
     token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
     experiment_registry: Option<SharedExperimentRegistry>,
@@ -607,6 +611,7 @@ fn build_skill_registry_options(
         session_registry: options.session_registry.clone(),
         session_bus: options.session_bus.clone(),
         kernel_budget: kernel_budget.clone(),
+        credential_store: options.credential_store.clone(),
         token_broker: options.token_broker.clone(),
         #[cfg(feature = "http")]
         experiment_registry: options.experiment_registry.clone(),
@@ -938,14 +943,16 @@ fn build_skill_registry(
     };
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
-    let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
-        match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
+    let credential_store = match options.credential_store.clone() {
+        Some(store) => Some(store),
+        None => match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!("credential store unavailable: {e}");
                 None
             }
-        };
+        },
+    };
 
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
@@ -960,9 +967,7 @@ fn build_skill_registry(
     let github_token_fn: Option<fx_tools::GitHubTokenProvider> =
         credential_provider.clone().map(|cp| {
             std::sync::Arc::new(move || cp.get_credential("github_token"))
-                as std::sync::Arc<
-                    dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync,
-                >
+                as std::sync::Arc<dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync>
         });
     let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn);
     registry.register(Arc::new(git_skill));
@@ -2258,6 +2263,32 @@ mod tests {
     }
 
     #[test]
+    fn headless_bundle_reuses_supplied_credential_store_for_github_credentials() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_github_pat(&data_dir, "ghp-store-token");
+        let credential_store =
+            open_credential_store(&data_dir).expect("shared credential store should open");
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                credential_store: Some(credential_store),
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let provider = bundle
+            .credential_provider
+            .expect("credential provider should be available");
+        let token = provider
+            .get_credential("github_token")
+            .expect("github token should be available");
+
+        assert_eq!(*token, "ghp-store-token");
+    }
+
+    #[test]
     fn headless_bundle_includes_node_run_when_fleet_nodes_configured() {
         let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.fleet.nodes.push(test_fleet_node_config());
@@ -2295,6 +2326,7 @@ mod tests {
             session_registry: None,
             session_bus: None,
             kernel_budget: BudgetConfig::default(),
+            credential_store: None,
             token_broker: None,
             experiment_registry: Some(
                 build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
