@@ -232,10 +232,7 @@ private struct FleetNodeDetailSheet: View {
         .alert("Remove this fleet node?", isPresented: $isShowingRemoveAlert) {
             Button("Remove", role: .destructive) {
                 Task {
-                    let removed = await viewModel.removeSelectedNode()
-                    if removed {
-                        dismiss()
-                    }
+                    _ = await viewModel.removeSelectedNode()
                 }
             }
             .disabled(viewModel.isRemovingNode)

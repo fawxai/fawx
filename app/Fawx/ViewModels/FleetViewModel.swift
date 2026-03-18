@@ -18,9 +18,16 @@ final class FleetViewModel {
     var isRemovingNode = false
 
     private let appState: AppState
+    private let removeNodeRequest: (String) async throws -> FleetRemoveNodeResponse
 
-    init(appState: AppState) {
+    init(
+        appState: AppState,
+        removeNodeRequest: ((String) async throws -> FleetRemoveNodeResponse)? = nil
+    ) {
         self.appState = appState
+        self.removeNodeRequest = removeNodeRequest ?? { id in
+            try await appState.client.removeFleetNode(id: id)
+        }
     }
 
     var summaryLine: String {
@@ -176,7 +183,7 @@ final class FleetViewModel {
             ?? "node"
 
         do {
-            let response = try await appState.client.removeFleetNode(id: selectedNodeID)
+            let response = try await removeNodeRequest(selectedNodeID)
             guard response.removed else {
                 detailErrorMessage = "The node could not be removed."
                 appState.showToast(message: "Could not remove \(nodeName).", style: .warning)
