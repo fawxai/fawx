@@ -236,6 +236,7 @@ fn build_subagent_runner(
             config: config.clone(),
             improvement_provider,
             session_bus: None,
+            token_broker: None,
         },
     );
     let builder = SubagentRoundNodesBuilder {
