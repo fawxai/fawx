@@ -952,7 +952,7 @@ fn build_skill_registry(
         });
 
     // Wire GitSkill with GitHub token provider from credential bridge.
-    let github_token_fn: Option<fx_tools::git_skill::GitHubTokenProvider> =
+    let github_token_fn: Option<fx_tools::GitHubTokenProvider> =
         credential_provider.clone().map(|cp| {
             std::sync::Arc::new(move || cp.get_credential("github_token"))
                 as std::sync::Arc<
