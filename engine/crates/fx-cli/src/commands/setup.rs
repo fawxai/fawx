@@ -1727,7 +1727,9 @@ mod tests {
 
     #[test]
     fn setup_wizard_stores_skill_credentials_without_reopening_database() {
-        let _home_lock = TEST_HOME_LOCK.lock().expect("home lock");
+        let _home_lock = TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_home = TempDir::new().expect("temp home");
         let _home = HomeGuard::set(&temp_home);
         let mut wizard = SetupWizard::new(false).expect("setup wizard");
