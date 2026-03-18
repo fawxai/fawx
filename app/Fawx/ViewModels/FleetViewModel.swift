@@ -15,6 +15,7 @@ final class FleetViewModel {
     var detailErrorMessage: String?
     var draftTaskDescription = ""
     var isDispatchingTask = false
+    var isRemovingNode = false
 
     private let appState: AppState
 
@@ -157,6 +158,43 @@ final class FleetViewModel {
         }
     }
 
+    @discardableResult
+    func removeSelectedNode() async -> Bool {
+        guard let selectedNodeID else {
+            return false
+        }
+
+        guard !isRemovingNode else {
+            return false
+        }
+
+        isRemovingNode = true
+        defer { isRemovingNode = false }
+
+        let nodeName = selectedNodeDetail?.name
+            ?? nodes.first(where: { $0.id == selectedNodeID })?.name
+            ?? "node"
+
+        do {
+            let response = try await appState.client.removeFleetNode(id: selectedNodeID)
+            guard response.removed else {
+                detailErrorMessage = "The node could not be removed."
+                appState.showToast(message: "Could not remove \(nodeName).", style: .warning)
+                return false
+            }
+
+            appState.showToast(message: "Removed \(nodeName) from fleet.", style: .info)
+            closeDetail()
+            await refresh()
+            return true
+        } catch {
+            detailErrorMessage = error.localizedDescription
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+            return false
+        }
+    }
+
     func closeDetail() {
         selectedNodeID = nil
         selectedNodeDetail = nil
@@ -164,5 +202,6 @@ final class FleetViewModel {
         detailErrorMessage = nil
         draftTaskDescription = ""
         isDispatchingTask = false
+        isRemovingNode = false
     }
 }

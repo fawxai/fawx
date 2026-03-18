@@ -183,6 +183,7 @@ private struct FleetNodeCard: View {
 
 private struct FleetNodeDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var isShowingRemoveAlert = false
 
     @Bindable var viewModel: FleetViewModel
 
@@ -228,6 +229,21 @@ private struct FleetNodeDetailSheet: View {
             }
         }
         .frame(minWidth: 420, minHeight: 480)
+        .alert("Remove this fleet node?", isPresented: $isShowingRemoveAlert) {
+            Button("Remove", role: .destructive) {
+                Task {
+                    let removed = await viewModel.removeSelectedNode()
+                    if removed {
+                        dismiss()
+                    }
+                }
+            }
+            .disabled(viewModel.isRemovingNode)
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the node from the fleet and revokes its join token.")
+        }
     }
 
     private func detailCard(_ detail: FleetNodeDetailResponse) -> some View {
@@ -263,6 +279,29 @@ private struct FleetNodeDetailSheet: View {
 
                     CapabilityChipGrid(capabilities: detail.capabilities)
                 }
+            }
+
+            Divider()
+                .overlay(Color.fawxBorder)
+
+            HStack {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                    Text("Node Management")
+                        .font(FawxTypography.sidebarTitle)
+                        .foregroundStyle(Color.fawxText)
+
+                    Text("Remove this node if it should no longer receive fleet work.")
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+
+                Spacer(minLength: 0)
+
+                Button(viewModel.isRemovingNode ? "Removing..." : "Remove Node", role: .destructive) {
+                    isShowingRemoveAlert = true
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isRemovingNode)
             }
         }
         .padding(FawxSpacing.paddingLG)
@@ -357,7 +396,8 @@ private struct CapabilityChipGrid: View {
                     .foregroundStyle(Color.fawxText)
                     .padding(.horizontal, FawxSpacing.paddingSM)
                     .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .multilineTextAlignment(.center)
                     .background(Color.fawxAccentSubtle)
                     .clipShape(Capsule())
             }
@@ -378,7 +418,7 @@ private struct FleetMetricPill: View {
     let value: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(spacing: 2) {
             Text(title)
                 .font(FawxTypography.status)
                 .foregroundStyle(Color.fawxTextSecondary)
@@ -387,6 +427,8 @@ private struct FleetMetricPill: View {
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxText)
         }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .multilineTextAlignment(.center)
         .padding(.horizontal, FawxSpacing.paddingMD)
         .padding(.vertical, FawxSpacing.paddingSM)
         .background(Color.fawxBackground)

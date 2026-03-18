@@ -528,6 +528,14 @@ actor FawxClient {
         try await performRequest(path: "/v1/fleet/nodes/\(id)", decodeAs: FleetNodeDetailResponse.self)
     }
 
+    func removeFleetNode(id: String) async throws -> FleetRemoveNodeResponse {
+        try await performRequest(
+            path: "/v1/fleet/nodes/\(id)",
+            method: "DELETE",
+            decodeAs: FleetRemoveNodeResponse.self
+        )
+    }
+
     func dispatchFleetTask(
         nodeID: String,
         task: String,
