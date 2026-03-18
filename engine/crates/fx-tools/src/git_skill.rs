@@ -6,9 +6,11 @@ use fx_loadable::{Skill, SkillError};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIFF_TIMEOUT: Duration = Duration::from_secs(15);
@@ -16,13 +18,29 @@ const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(10);
 const REVERT_TIMEOUT: Duration = Duration::from_secs(10);
+const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+const PR_CREATE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DIFF_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATED_SUFFIX: &str = "\n(truncated)";
 
-#[derive(Debug, Clone)]
+/// Provider for the GitHub PAT used in remote git operations.
+pub type GitHubTokenProvider = Arc<dyn Fn() -> Option<Zeroizing<String>> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct GitSkill {
     working_dir: PathBuf,
     self_modify: Option<SelfModifyConfig>,
+    github_token: Option<GitHubTokenProvider>,
+}
+
+impl std::fmt::Debug for GitSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitSkill")
+            .field("working_dir", &self.working_dir)
+            .field("self_modify", &self.self_modify)
+            .field("github_token", &self.github_token.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -64,11 +82,31 @@ struct GitRevertArgs {
     commit_sha: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct GitPushArgs {
+    remote: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPrCreateArgs {
+    title: String,
+    body: Option<String>,
+    base: Option<String>,
+    head: Option<String>,
+    draft: Option<bool>,
+}
+
 impl GitSkill {
-    pub fn new(working_dir: PathBuf, self_modify: Option<SelfModifyConfig>) -> Self {
+    pub fn new(
+        working_dir: PathBuf,
+        self_modify: Option<SelfModifyConfig>,
+        github_token: Option<GitHubTokenProvider>,
+    ) -> Self {
         Self {
             working_dir,
             self_modify,
+            github_token,
         }
     }
 
@@ -230,6 +268,90 @@ impl GitSkill {
         self.run_git_with_timeout(&["revert", &parsed.commit_sha, "--no-edit"], REVERT_TIMEOUT)
             .await
     }
+
+    async fn execute_push(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitPushArgs = parse_args(arguments)?;
+        let remote = parsed.remote.as_deref().unwrap_or("origin");
+        let branch = match &parsed.branch {
+            Some(branch) => branch.clone(),
+            None => self.current_branch().await?,
+        };
+        validate_remote_name(remote)?;
+        validate_branch_name(&branch)?;
+        let token = self.require_github_token()?;
+        self.run_git_with_token_auth(&["push", remote, &branch], &token, PUSH_TIMEOUT)
+            .await
+    }
+
+    async fn execute_pr_create(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitHubPrCreateArgs = parse_args(arguments)?;
+        if parsed.title.trim().is_empty() {
+            return Err("missing required field: title".to_string());
+        }
+        let token = self.require_github_token()?;
+        let head = match &parsed.head {
+            Some(head) => head.clone(),
+            None => self.current_branch().await?,
+        };
+        let remote_url = self.run_git(&["remote", "get-url", "origin"]).await?;
+        let (owner, repo) = parse_github_remote(remote_url.trim())?;
+        let base = parsed.base.as_deref().unwrap_or("main");
+        let request = PullRequestRequest {
+            title: &parsed.title,
+            body: parsed.body.as_deref(),
+            base,
+            head: &head,
+            draft: parsed.draft.unwrap_or(false),
+        };
+        create_pull_request(&token, &owner, &repo, &request).await
+    }
+
+    async fn current_branch(&self) -> Result<String, String> {
+        let output = self.run_git(&["branch", "--show-current"]).await?;
+        let branch = output.trim().to_string();
+        if branch.is_empty() {
+            return Err("not on a branch (detached HEAD)".to_string());
+        }
+        Ok(branch)
+    }
+
+    fn require_github_token(&self) -> Result<Zeroizing<String>, String> {
+        let provider = self.github_token.as_ref().ok_or_else(|| {
+            "GitHub token not configured. Set up GitHub auth via `fawx setup` or configure a PAT."
+                .to_string()
+        })?;
+        provider().ok_or_else(|| {
+            "GitHub token not available. Configure a PAT via `fawx setup`.".to_string()
+        })
+    }
+
+    async fn run_git_with_token_auth(
+        &self,
+        args: &[&str],
+        token: &str,
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let config_value = format!(
+            "url.https://x-access-token:{}@github.com/.insteadOf=https://github.com/",
+            token
+        );
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&self.working_dir)
+            .arg("-c")
+            .arg(&config_value)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to spawn git: {error}"))?;
+        let output = wait_for_git_output(child, timeout_duration).await?;
+        parse_git_output(output, &self.working_dir, args)
+    }
 }
 
 #[async_trait]
@@ -248,6 +370,8 @@ impl Skill for GitSkill {
             git_branch_delete_definition(),
             git_merge_definition(),
             git_revert_definition(),
+            git_push_definition(),
+            github_pr_create_definition(),
         ]
     }
 
@@ -266,6 +390,8 @@ impl Skill for GitSkill {
             "git_branch_delete" => self.execute_branch_delete(arguments).await,
             "git_merge" => self.execute_merge(arguments).await,
             "git_revert" => self.execute_revert(arguments).await,
+            "git_push" => self.execute_push(arguments).await,
+            "github_pr_create" => self.execute_pr_create(arguments).await,
             _ => return None,
         };
         Some(result)
@@ -516,6 +642,124 @@ fn validate_sha(sha: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn git_push_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_push".to_string(),
+        description: "Push commits to a remote repository. Use this when the user asks to push changes, upload commits, or sync a branch with the remote. Requires GitHub authentication."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "remote": { "type": "string", "description": "Remote name. Defaults to 'origin'." },
+                "branch": { "type": "string", "description": "Branch to push. Defaults to current branch." }
+            },
+            "required": []
+        }),
+    }
+}
+
+fn github_pr_create_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "github_pr_create".to_string(),
+        description: "Create a GitHub pull request. Use this when the user asks to open a PR or submit changes for review. Requires GitHub authentication."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "PR title" },
+                "body": { "type": "string", "description": "PR description" },
+                "base": { "type": "string", "description": "Base branch. Defaults to 'main'." },
+                "head": { "type": "string", "description": "Head branch. Defaults to current." },
+                "draft": { "type": "boolean", "description": "Create as draft. Defaults to false." }
+            },
+            "required": ["title"]
+        }),
+    }
+}
+
+fn validate_remote_name(name: &str) -> Result<(), String> {
+    if name.starts_with('-') {
+        return Err("invalid remote name: cannot start with '-'".to_string());
+    }
+    if name.contains(' ') {
+        return Err("invalid remote name: cannot contain spaces".to_string());
+    }
+    if name.contains("..") {
+        return Err("invalid remote name: cannot contain '..'".to_string());
+    }
+    Ok(())
+}
+
+fn parse_github_remote(url: &str) -> Result<(String, String), String> {
+    let url = url.trim_end_matches(".git");
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    Err(format!(
+        "could not parse GitHub owner/repo from remote URL: {url}"
+    ))
+}
+
+struct PullRequestRequest<'a> {
+    title: &'a str,
+    body: Option<&'a str>,
+    base: &'a str,
+    head: &'a str,
+    draft: bool,
+}
+
+async fn create_pull_request(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    request: &PullRequestRequest<'_>,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(PR_CREATE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls");
+    let mut payload = serde_json::json!({
+        "title": request.title,
+        "head": request.head,
+        "base": request.base,
+        "draft": request.draft,
+    });
+    if let Some(body) = request.body {
+        payload["body"] = serde_json::Value::String(body.to_string());
+    }
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "fawx-cli")
+        .header("Accept", "application/vnd.github+json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("GitHub API request failed: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("failed to parse GitHub response: {error}"))?;
+    if !status.is_success() {
+        let message = body["message"].as_str().unwrap_or("unknown error");
+        return Err(format!("GitHub API error (HTTP {status}): {message}"));
+    }
+    let pr_number = body["number"].as_u64().unwrap_or(0);
+    let pr_url = body["html_url"].as_str().unwrap_or("(no URL)");
+    Ok(format!("Pull request #{pr_number} created: {pr_url}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,14 +819,14 @@ mod tests {
     }
 
     #[test]
-    fn git_skill_provides_eight_tool_definitions() {
-        let skill = GitSkill::new(PathBuf::from("."), None);
+    fn git_skill_provides_ten_tool_definitions() {
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
         let defs = skill.tool_definitions();
         let names: Vec<_> = defs
             .iter()
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 10);
         assert!(names.contains(&"git_status"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"git_checkpoint"));
@@ -591,11 +835,13 @@ mod tests {
         assert!(names.contains(&"git_branch_delete"));
         assert!(names.contains(&"git_merge"));
         assert!(names.contains(&"git_revert"));
+        assert!(names.contains(&"git_push"));
+        assert!(names.contains(&"github_pr_create"));
     }
 
     #[test]
     fn git_tool_descriptions_include_when_to_use_guidance() {
-        let skill = GitSkill::new(PathBuf::from("."), None);
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
         let definitions = skill.tool_definitions();
         for tool_name in [
             "git_status",
@@ -606,6 +852,8 @@ mod tests {
             "git_branch_delete",
             "git_merge",
             "git_revert",
+            "git_push",
+            "github_pr_create",
         ] {
             let definition = definitions
                 .iter()
@@ -620,13 +868,13 @@ mod tests {
 
     #[test]
     fn git_skill_name_is_git() {
-        let skill = GitSkill::new(PathBuf::from("."), None);
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
         assert_eq!(skill.name(), "git");
     }
 
     #[tokio::test]
     async fn git_skill_returns_none_for_unknown_tool() {
-        let skill = GitSkill::new(PathBuf::from("."), None);
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
         let result = skill.execute("unknown_tool", "{}", None).await;
         assert!(result.is_none());
     }
@@ -634,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn git_status_in_git_repo() {
         let repo = init_test_repo();
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(&skill, "git_status", serde_json::json!({}))
             .await
             .expect("status should work");
@@ -644,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn git_status_outside_git_repo() {
         let dir = TempDir::new().expect("tempdir should be created");
-        let skill = GitSkill::new(dir.path().to_path_buf(), None);
+        let skill = GitSkill::new(dir.path().to_path_buf(), None, None);
         let error = run_tool(&skill, "git_status", serde_json::json!({}))
             .await
             .expect_err("status should fail");
@@ -658,7 +906,7 @@ mod tests {
         fs::write(repo.path().join("notes.txt"), "before\nchanged\n")
             .expect("notes file should be updated");
 
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(&skill, "git_diff", serde_json::json!({}))
             .await
             .expect("diff should work");
@@ -679,7 +927,7 @@ mod tests {
             .output()
             .expect("git command should run in test setup");
 
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(&skill, "git_diff", serde_json::json!({ "staged": true }))
             .await
             .expect("staged diff should work");
@@ -693,7 +941,7 @@ mod tests {
     async fn git_branch_create_creates_branch() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_branch_create",
@@ -720,7 +968,7 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .expect("git command should run");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_branch_create",
@@ -735,7 +983,7 @@ mod tests {
     async fn git_branch_create_rejects_invalid_name() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
 
         let err1 = run_tool(
             &skill,
@@ -769,7 +1017,7 @@ mod tests {
     async fn git_branch_create_rejects_invalid_from_ref() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(
             &skill,
             "git_branch_create",
@@ -799,7 +1047,7 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .expect("git command should run");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_branch_switch",
@@ -814,7 +1062,7 @@ mod tests {
     async fn git_branch_switch_errors_on_nonexistent() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(
             &skill,
             "git_branch_switch",
@@ -844,7 +1092,7 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .expect("git command should run");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_branch_delete",
@@ -864,7 +1112,7 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .expect("git command should run");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(
             &skill,
             "git_branch_delete",
@@ -890,7 +1138,7 @@ mod tests {
             enabled: true,
             ..SelfModifyConfig::default()
         };
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let output = run_tool(
             &skill,
             "git_merge",
@@ -912,7 +1160,7 @@ mod tests {
             enabled: false,
             ..SelfModifyConfig::default()
         };
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let error = run_tool(
             &skill,
             "git_merge",
@@ -927,7 +1175,7 @@ mod tests {
     async fn git_merge_blocked_when_none() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(
             &skill,
             "git_merge",
@@ -962,7 +1210,7 @@ mod tests {
             .expect("valid utf8")
             .trim()
             .to_string();
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_revert",
@@ -980,7 +1228,7 @@ mod tests {
     async fn git_revert_rejects_invalid_sha() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "content\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
 
         let invalid_values = [
             "zzzzzzz",
@@ -1004,7 +1252,7 @@ mod tests {
         let repo = init_test_repo();
         fs::write(repo.path().join("checkpoint.txt"), "saved\n")
             .expect("checkpoint file should be written");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
 
         let output = run_tool(
             &skill,
@@ -1028,7 +1276,7 @@ mod tests {
     async fn git_checkpoint_nothing_to_commit() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "clean.txt", "clean\n");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
 
         let output = run_tool(
             &skill,
@@ -1044,7 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn git_checkpoint_requires_message() {
         let repo = init_test_repo();
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(&skill, "git_checkpoint", serde_json::json!({}))
             .await
             .expect_err("missing message should fail");
@@ -1054,7 +1302,7 @@ mod tests {
     #[tokio::test]
     async fn git_checkpoint_rejects_whitespace_only_message() {
         let repo = init_test_repo();
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(
             &skill,
             "git_checkpoint",
@@ -1073,7 +1321,7 @@ mod tests {
 
         let evil_output = repo.path().join("evil.patch");
         let reference = format!("--output={}", evil_output.display());
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let error = run_tool(&skill, "git_diff", serde_json::json!({ "ref": reference }))
             .await
             .expect_err("dash-prefixed ref should fail");
@@ -1101,7 +1349,7 @@ mod tests {
             .expect("git command should run in test setup");
         fs::write(repo.path().join("safe.txt"), "two\n").expect("safe file should be updated");
 
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(&skill, "git_diff", serde_json::json!({ "ref": "main" }))
             .await
             .expect("valid ref diff should succeed");
@@ -1125,7 +1373,7 @@ mod tests {
         seed_initial_commit(&repo, "huge.txt", &large_old);
         fs::write(repo.path().join("huge.txt"), &large_new).expect("large file should be updated");
 
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(&skill, "git_diff", serde_json::json!({}))
             .await
             .expect("diff should work");
@@ -1143,7 +1391,7 @@ mod tests {
             ..SelfModifyConfig::default()
         };
         fs::write(repo.path().join("secret.txt"), "private").expect("write text file");
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let error = run_tool(
             &skill,
             "git_checkpoint",
@@ -1165,7 +1413,7 @@ mod tests {
         fs::create_dir_all(repo.path().join("kernel")).expect("create kernel dir");
         fs::write(repo.path().join("kernel/loop.rs"), "pub fn tick() {}")
             .expect("write kernel file");
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let error = run_tool(
             &skill,
             "git_checkpoint",
@@ -1186,7 +1434,7 @@ mod tests {
             ..SelfModifyConfig::default()
         };
         fs::write(repo.path().join("notes.txt"), "hello").expect("write txt file");
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let output = run_tool(
             &skill,
             "git_checkpoint",
@@ -1201,7 +1449,7 @@ mod tests {
     async fn git_checkpoint_no_enforcement_when_disabled() {
         let repo = init_test_repo();
         fs::write(repo.path().join("secret.key"), "private").expect("write key file");
-        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
         let output = run_tool(
             &skill,
             "git_checkpoint",
@@ -1220,7 +1468,7 @@ mod tests {
             ..SelfModifyConfig::default()
         };
         fs::write(repo.path().join("secret.key"), "private").expect("write key file");
-        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
         let _error = run_tool(
             &skill,
             "git_checkpoint",
@@ -1241,5 +1489,84 @@ mod tests {
             status_text.contains("?? secret.key"),
             "secret.key should be unstaged after denied checkpoint, got: {status_text}"
         );
+    }
+
+    #[test]
+    fn parse_github_remote_https() {
+        let (owner, repo) = parse_github_remote("https://github.com/abbudjoe/fawx.git").unwrap();
+        assert_eq!(owner, "abbudjoe");
+        assert_eq!(repo, "fawx");
+    }
+
+    #[test]
+    fn parse_github_remote_https_no_suffix() {
+        let (owner, repo) = parse_github_remote("https://github.com/abbudjoe/fawx").unwrap();
+        assert_eq!(owner, "abbudjoe");
+        assert_eq!(repo, "fawx");
+    }
+
+    #[test]
+    fn parse_github_remote_ssh() {
+        let (owner, repo) = parse_github_remote("git@github.com:abbudjoe/fawx.git").unwrap();
+        assert_eq!(owner, "abbudjoe");
+        assert_eq!(repo, "fawx");
+    }
+
+    #[test]
+    fn parse_github_remote_invalid() {
+        assert!(parse_github_remote("https://gitlab.com/foo/bar").is_err());
+    }
+
+    #[test]
+    fn validate_remote_name_rejects_dash() {
+        assert!(validate_remote_name("-evil").is_err());
+    }
+
+    #[test]
+    fn validate_remote_name_accepts_origin() {
+        assert!(validate_remote_name("origin").is_ok());
+    }
+
+    #[tokio::test]
+    async fn git_push_requires_github_token() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "f.txt", "data\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
+        let error = run_tool(&skill, "git_push", serde_json::json!({}))
+            .await
+            .expect_err("push without token should fail");
+        assert!(error.contains("GitHub token not configured"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_create_requires_github_token() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "f.txt", "data\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
+        let error = run_tool(
+            &skill,
+            "github_pr_create",
+            serde_json::json!({"title": "test"}),
+        )
+        .await
+        .expect_err("PR create without token should fail");
+        assert!(error.contains("GitHub token not configured"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_create_rejects_empty_title() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "f.txt", "data\n");
+        let token_fn: Option<GitHubTokenProvider> =
+            Some(Arc::new(|| Some(Zeroizing::new("ghp_fake".to_string()))));
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, token_fn);
+        let error = run_tool(
+            &skill,
+            "github_pr_create",
+            serde_json::json!({"title": "  "}),
+        )
+        .await
+        .expect_err("empty title should fail");
+        assert!(error.contains("title"));
     }
 }

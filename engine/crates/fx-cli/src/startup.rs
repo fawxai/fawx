@@ -859,7 +859,7 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone());
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone(), None);
     registry.register(Arc::new(git_skill));
     let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm);
     registry.register(Arc::new(tx_skill));
