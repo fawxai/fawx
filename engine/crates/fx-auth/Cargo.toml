@@ -16,6 +16,7 @@ zeroize.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+fx-config.workspace = true
 fx-storage.workspace = true
 
 [dev-dependencies]

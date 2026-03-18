@@ -60,7 +60,7 @@ use crate::proposal_review::{approve_pending, reject_pending, render_pending, Re
 use crate::startup::{
     build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
     configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,
-    SharedMemoryStore,
+    SharedMemoryStore, SharedTokenBroker,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
@@ -213,6 +213,7 @@ pub struct HeadlessSubagentFactoryDeps {
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
     pub session_bus: Option<SessionBus>,
+    pub token_broker: Option<SharedTokenBroker>,
 }
 
 #[derive(Clone)]
@@ -1957,7 +1958,8 @@ impl HeadlessSubagentFactory {
         config: &SpawnConfig,
         cancel_token: CancellationToken,
     ) -> Result<HeadlessApp, SubagentError> {
-        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        let mut options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        options.token_broker = self.deps.token_broker.clone();
         let bundle = build_headless_loop_engine_bundle(
             &self.deps.config,
             self.deps.improvement_provider.clone(),
@@ -3612,6 +3614,7 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: Some(bus.clone()),
+            token_broker: None,
         });
         let app = factory
             .build_app(&SpawnConfig::new("report status"), CancellationToken::new())
@@ -3654,6 +3657,7 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: None,
+            token_broker: None,
         };
         let factory = HeadlessSubagentFactory::new(deps);
         let debug = format!("{factory:?}");

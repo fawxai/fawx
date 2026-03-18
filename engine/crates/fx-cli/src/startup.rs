@@ -110,6 +110,9 @@ const LOG_FILE_SUFFIX: &str = "log";
 
 pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 pub(crate) type SharedEmbeddingIndex = Arc<Mutex<EmbeddingIndex>>;
+pub(crate) type SharedCredentialStore =
+    Arc<fx_auth::credential_store::EncryptedFileCredentialStore>;
+pub(crate) type SharedTokenBroker = Arc<dyn fx_auth::token_broker::TokenBroker>;
 
 #[derive(Clone)]
 pub struct EmbeddingIndexPersistence {
@@ -381,6 +384,7 @@ pub struct HeadlessLoopBuildOptions {
     pub session_bus: Option<SessionBus>,
     pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
     pub ripcord_journal: Option<Arc<RipcordJournal>>,
+    pub token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -398,6 +402,7 @@ impl HeadlessLoopBuildOptions {
             session_bus: None,
             permission_prompt_state: None,
             ripcord_journal: None,
+            token_broker: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -415,6 +420,7 @@ impl HeadlessLoopBuildOptions {
             session_bus: None,
             permission_prompt_state: None,
             ripcord_journal: None,
+            token_broker: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -431,6 +437,7 @@ struct SkillRegistryBuildOptions {
     session_registry: Option<fx_session::SessionRegistry>,
     session_bus: Option<SessionBus>,
     kernel_budget: BudgetConfig,
+    token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
     experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -600,6 +607,7 @@ fn build_skill_registry_options(
         session_registry: options.session_registry.clone(),
         session_bus: options.session_bus.clone(),
         kernel_budget: kernel_budget.clone(),
+        token_broker: options.token_broker.clone(),
         #[cfg(feature = "http")]
         experiment_registry: options.experiment_registry.clone(),
     }
@@ -607,6 +615,24 @@ fn build_skill_registry_options(
 
 pub fn open_session_registry(data_dir: &Path) -> Option<fx_session::SessionRegistry> {
     fx_session::SessionRegistry::open(&data_dir.join("sessions.redb"))
+}
+
+pub(crate) fn open_credential_store(data_dir: &Path) -> Result<SharedCredentialStore, String> {
+    fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn build_token_broker(
+    config: &FawxConfig,
+    credential_store: Option<&SharedCredentialStore>,
+) -> Option<SharedTokenBroker> {
+    credential_store.map(|store| {
+        Arc::new(fx_auth::token_broker::CredentialStoreBroker::new(
+            Arc::clone(store),
+            config.security.github_borrow_scope,
+        )) as SharedTokenBroker
+    })
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, StartupError> {
@@ -659,7 +685,8 @@ impl ScratchpadProvider for ScratchpadBridge {
 /// Unknown keys fall back to generic encrypted skill credentials.
 struct CredentialStoreBridge {
     data_dir: PathBuf,
-    store: Arc<fx_auth::credential_store::EncryptedFileCredentialStore>,
+    store: SharedCredentialStore,
+    token_broker: Option<SharedTokenBroker>,
 }
 
 impl CredentialStoreBridge {
@@ -667,7 +694,7 @@ impl CredentialStoreBridge {
         match key {
             "openai_api_key" => self.auth_api_key("openai"),
             "anthropic_api_key" => self.auth_api_key("anthropic"),
-            "github_token" => self.github_token(),
+            "github_token" => self.borrow_github_token(),
             _ => None,
         }
     }
@@ -688,6 +715,20 @@ impl CredentialStoreBridge {
         match manager.get(provider) {
             Some(AuthMethod::ApiKey { key, .. }) => Some(zeroize::Zeroizing::new(key.clone())),
             _ => None,
+        }
+    }
+
+    fn borrow_github_token(&self) -> Option<zeroize::Zeroizing<String>> {
+        let Some(broker) = self.token_broker.as_ref() else {
+            return self.github_token();
+        };
+        match broker.borrow_github_default() {
+            Ok(borrow) => Some(borrow.into_token()),
+            Err(fx_auth::token_broker::BorrowError::NotConfigured) => None,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to borrow GitHub token");
+                None
+            }
         }
     }
 
@@ -908,6 +949,7 @@ fn build_skill_registry(
             Arc::new(CredentialStoreBridge {
                 data_dir: data_dir.to_path_buf(),
                 store: Arc::clone(store),
+                token_broker: options.token_broker.clone(),
             }) as Arc<dyn CredentialProvider>
         });
 
@@ -1783,6 +1825,7 @@ mod tests {
         CredentialStoreBridge {
             data_dir: data_dir.to_path_buf(),
             store: Arc::new(store),
+            token_broker: None,
         }
     }
 
@@ -1799,6 +1842,66 @@ mod tests {
         store
             .save_auth_manager(&manager)
             .expect("save auth manager");
+    }
+
+    fn store_github_pat(data_dir: &Path, token: &str) {
+        use fx_auth::credential_store::{
+            AuthProvider, CredentialMetadata, CredentialMethod, CredentialStore,
+        };
+        use zeroize::Zeroizing;
+
+        let metadata = CredentialMetadata {
+            provider: AuthProvider::GitHub,
+            method: CredentialMethod::Pat,
+            last_validated_ms: 0,
+            login: None,
+            scopes: Vec::new(),
+            token_kind: None,
+        };
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
+            .expect("credential store");
+        store
+            .set(
+                AuthProvider::GitHub,
+                CredentialMethod::Pat,
+                &Zeroizing::new(token.to_string()),
+                &metadata,
+            )
+            .expect("set github token");
+    }
+
+    struct StubTokenBroker {
+        token: String,
+        default_scope: fx_config::BorrowScope,
+    }
+
+    impl StubTokenBroker {
+        fn new(token: &str, default_scope: fx_config::BorrowScope) -> Self {
+            Self {
+                token: token.to_string(),
+                default_scope,
+            }
+        }
+    }
+
+    impl fx_auth::token_broker::TokenBroker for StubTokenBroker {
+        fn borrow_github(
+            &self,
+            scope: fx_config::BorrowScope,
+        ) -> Result<fx_auth::token_broker::TokenBorrow, fx_auth::token_broker::BorrowError>
+        {
+            Ok(fx_auth::token_broker::TokenBorrow::new(
+                zeroize::Zeroizing::new(self.token.clone()),
+                scope,
+            ))
+        }
+
+        fn borrow_github_default(
+            &self,
+        ) -> Result<fx_auth::token_broker::TokenBorrow, fx_auth::token_broker::BorrowError>
+        {
+            self.borrow_github(self.default_scope)
+        }
     }
 
     #[derive(Clone)]
@@ -2114,6 +2217,33 @@ mod tests {
     }
 
     #[test]
+    fn headless_bundle_uses_token_broker_for_github_credentials() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_github_pat(&data_dir, "ghp-store-token");
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                token_broker: Some(Arc::new(StubTokenBroker::new(
+                    "ghp-broker-token",
+                    fx_config::BorrowScope::Contribution,
+                ))),
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let provider = bundle
+            .credential_provider
+            .expect("credential provider should be available");
+        let token = provider
+            .get_credential("github_token")
+            .expect("github token should be available");
+
+        assert_eq!(*token, "ghp-broker-token");
+    }
+
+    #[test]
     fn headless_bundle_includes_node_run_when_fleet_nodes_configured() {
         let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.fleet.nodes.push(test_fleet_node_config());
@@ -2151,6 +2281,7 @@ mod tests {
             session_registry: None,
             session_bus: None,
             kernel_budget: BudgetConfig::default(),
+            token_broker: None,
             experiment_registry: Some(
                 build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
             ),
