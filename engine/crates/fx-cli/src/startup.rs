@@ -1577,10 +1577,11 @@ fn register_auth_provider_with_models(
     let models = ensure_supported_models(auth_method, supported_models);
 
     match auth_method {
-        AuthMethod::SetupToken { .. } => tracing::warn!(
-            supported_models = models.len(),
-            "skipping Anthropic setup token provider: raw setup tokens are not usable with the Messages API until exchanged for runtime credentials"
-        ),
+        AuthMethod::SetupToken { token } => {
+            // Setup tokens (sk-ant-oat...) are usable directly with the Messages API
+            // via Bearer auth. AnthropicProvider::detect() handles the auth mode.
+            register_keyed_provider(router, "anthropic", token, "setup_token", models)?;
+        }
         AuthMethod::ApiKey { provider, key } => {
             register_api_key_provider(router, provider, key, models)?;
         }
@@ -1609,13 +1610,23 @@ fn register_api_key_provider(
     key: &str,
     supported_models: Vec<String>,
 ) -> Result<(), StartupError> {
+    register_keyed_provider(router, provider, key, "api_key", supported_models)
+}
+
+fn register_keyed_provider(
+    router: &mut ModelRouter,
+    provider: &str,
+    key: &str,
+    auth_label: &str,
+    supported_models: Vec<String>,
+) -> Result<(), StartupError> {
     if provider == "anthropic" {
         let anthropic = AnthropicProvider::new(base_url_for_provider("anthropic"), key.to_string())
             .map_err(|error| {
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
             })?
             .with_supported_models(supported_models);
-        router.register_provider_with_auth(Box::new(anthropic), "api_key");
+        router.register_provider_with_auth(Box::new(anthropic), auth_label);
         return Ok(());
     }
 
@@ -1626,7 +1637,7 @@ fn register_api_key_provider(
         .with_name(provider.to_string())
         .with_supported_models(supported_models);
 
-    router.register_provider_with_auth(Box::new(provider_client), "api_key");
+    router.register_provider_with_auth(Box::new(provider_client), auth_label);
     Ok(())
 }
 
@@ -2494,12 +2505,34 @@ mod tests {
     }
 
     #[test]
-    fn build_router_with_mixed_credentials_skips_raw_anthropic_setup_tokens() {
+    fn build_router_with_setup_token_registers_anthropic_models() {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
             "anthropic",
             AuthMethod::SetupToken {
-                token: "setup-token-mixed".to_string(),
+                token: "sk-ant-oat01-test-setup-token".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+        let models = router.available_models();
+
+        assert!(
+            models
+                .iter()
+                .any(|model| model.provider_name == "anthropic"
+                    && model.auth_method == "setup_token"),
+            "setup tokens should register Anthropic models with setup_token auth label"
+        );
+    }
+
+    #[test]
+    fn build_router_with_mixed_setup_token_and_api_key() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "sk-ant-oat01-test-mixed".to_string(),
             },
         );
         auth_manager.store(
@@ -2514,16 +2547,17 @@ mod tests {
         let models = router.available_models();
 
         assert!(
-            !models
+            models
                 .iter()
                 .any(|model| model.provider_name == "anthropic"),
-            "raw setup tokens should not register Anthropic runtime models"
+            "setup token should register Anthropic models"
         );
-        assert!(models.iter().any(|model| {
-            model.model_id == "openai/gpt-4o-mini"
-                && model.provider_name == "openrouter"
-                && model.auth_method == "api_key"
-        }));
+        assert!(
+            models
+                .iter()
+                .any(|model| model.provider_name == "openrouter" && model.auth_method == "api_key"),
+            "API key should register OpenRouter models"
+        );
     }
 
     #[test]
@@ -2557,19 +2591,21 @@ mod tests {
     }
 
     #[test]
-    fn build_router_with_setup_token_only_has_no_runtime_models() {
+    fn build_router_with_setup_token_only_registers_anthropic_models() {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
             "anthropic",
             AuthMethod::SetupToken {
-                token: "setup-token-no-default".to_string(),
+                token: "sk-ant-oat01-test-token-only".to_string(),
             },
         );
 
         let router = build_router(&auth_manager).expect("router should build");
 
-        assert!(router.available_models().is_empty());
-        assert_eq!(router.active_model(), None);
+        assert!(
+            !router.available_models().is_empty(),
+            "setup token should register Anthropic models"
+        );
     }
 
     #[test]
