@@ -22,7 +22,7 @@ use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ToolCall, ToolUseDelta, Usage,
+    StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -98,8 +98,18 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    /// Model discovery endpoint.
+    ///
+    /// For `chatgpt.com` subscription flows, uses the canonical
+    /// `api.openai.com/v1/models` endpoint (the backend-api/models
+    /// path doesn't return all available models). For all other base
+    /// URLs (including api.openai.com and test servers), derives the
+    /// models path from the base.
     fn models_endpoint(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
+        if base.contains("chatgpt.com") {
+            return "https://api.openai.com/v1/models".to_string();
+        }
         if base.ends_with("/responses") {
             return format!(
                 "{}/models",
@@ -107,8 +117,8 @@ impl OpenAiResponsesProvider {
                     .trim_end_matches("/codex")
             );
         }
-        if base.ends_with("/codex") || base.ends_with("/backend-api") {
-            return format!("{}/models", base.trim_end_matches("/codex"));
+        if base.ends_with("/v1") {
+            return format!("{base}/models");
         }
         format!("{base}/v1/models")
     }
@@ -159,6 +169,13 @@ impl OpenAiResponsesProvider {
             })
             .collect();
 
+        let reasoning = match &request.thinking {
+            Some(ThinkingConfig::Reasoning { effort }) => Some(ReasoningConfig {
+                effort: effort.clone(),
+            }),
+            _ => None,
+        };
+
         Ok(ResponsesRequestBody {
             model: request.model.clone(),
             instructions: request.system_prompt.clone(),
@@ -168,6 +185,7 @@ impl OpenAiResponsesProvider {
             store: false,
             temperature: request.temperature,
             tool_choice: None,
+            reasoning,
         })
     }
 
@@ -921,6 +939,13 @@ struct ResponsesRequestBody {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    effort: String,
 }
 
 /// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
@@ -1390,6 +1415,46 @@ mod tests {
             serde_json::json!({"type": "input_text", "text": "Hello"})
         );
         assert!(!body.stream);
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![crate::types::Message::user("Hello")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: Some(ThinkingConfig::Reasoning {
+                effort: "xhigh".to_string(),
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(serialized["reasoning"], serde_json::json!({"effort": "xhigh"}));
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_when_disabled() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![crate::types::Message::user("Hello")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: Some(ThinkingConfig::Off),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+
+        assert!(serialized.get("reasoning").is_none());
     }
 
     #[test]

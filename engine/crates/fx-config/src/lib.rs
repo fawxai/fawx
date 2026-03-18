@@ -598,10 +598,24 @@ pub enum ThinkingBudget {
     Adaptive,
     #[serde(rename = "high")]
     High,
+    #[serde(rename = "medium")]
+    Medium,
     #[serde(rename = "low")]
     Low,
     #[serde(rename = "off")]
     Off,
+    /// OpenAI "none" — reasoning disabled.
+    #[serde(rename = "none")]
+    None,
+    /// OpenAI GPT-5 "minimal".
+    #[serde(rename = "minimal")]
+    Minimal,
+    /// Anthropic Opus 4.6 "max".
+    #[serde(rename = "max")]
+    Max,
+    /// OpenAI GPT-5.4 "xhigh".
+    #[serde(rename = "xhigh")]
+    Xhigh,
 }
 
 impl std::fmt::Display for ThinkingBudget {
@@ -609,20 +623,26 @@ impl std::fmt::Display for ThinkingBudget {
         match self {
             Self::Adaptive => write!(f, "adaptive"),
             Self::High => write!(f, "high"),
+            Self::Medium => write!(f, "medium"),
             Self::Low => write!(f, "low"),
             Self::Off => write!(f, "off"),
+            Self::None => write!(f, "none"),
+            Self::Minimal => write!(f, "minimal"),
+            Self::Max => write!(f, "max"),
+            Self::Xhigh => write!(f, "xhigh"),
         }
     }
 }
 
 impl ThinkingBudget {
-    /// Map a budget level to its token count, or `None` for `Off`.
+    /// Map a budget level to its token count, or `None` for disabled variants.
     pub fn budget_tokens(&self) -> Option<u32> {
         match self {
+            Self::Xhigh | Self::Max => Some(32_000),
             Self::High => Some(10_000),
-            Self::Adaptive => Some(5_000),
-            Self::Low => Some(1_024),
-            Self::Off => None,
+            Self::Adaptive | Self::Medium => Some(5_000),
+            Self::Low | Self::Minimal => Some(1_024),
+            Self::Off | Self::None => Option::None,
         }
     }
 }
@@ -634,10 +654,15 @@ impl std::str::FromStr for ThinkingBudget {
         match s.to_ascii_lowercase().as_str() {
             "adaptive" => Ok(Self::Adaptive),
             "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
             "low" => Ok(Self::Low),
             "off" => Ok(Self::Off),
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "max" => Ok(Self::Max),
+            "xhigh" => Ok(Self::Xhigh),
             other => Err(format!(
-                "unknown thinking budget \'{other}\'; expected adaptive, high, low, or off"
+                "unknown thinking level '{other}'; expected off, none, minimal, low, medium, high, xhigh, max, or adaptive"
             )),
         }
     }

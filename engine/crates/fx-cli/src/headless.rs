@@ -28,7 +28,7 @@ use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter, ThinkingRegistry};
+use fx_llm::{valid_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
 use fx_session::SessionKey;
 use sha2::{Digest, Sha256};
@@ -54,8 +54,8 @@ use crate::commands::slash::{
 use crate::context::load_context_files;
 use crate::helpers::{
     available_provider_names, format_memory_for_prompt, render_model_menu_text, render_status_text,
-    resolve_model_alias, thinking_config_from_budget, trim_history, AnalysisCompletionProvider,
-    RouterLoopLlmProvider,
+    resolve_model_alias, thinking_config_for_active_model, trim_history,
+    AnalysisCompletionProvider, RouterLoopLlmProvider,
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::startup::{
@@ -204,8 +204,6 @@ pub struct HeadlessApp {
     /// process incoming cross-session messages during conversation.
     #[allow(dead_code)]
     bus_receiver: Option<mpsc::Receiver<Envelope>>,
-    /// Per-model thinking capability registry.
-    thinking_registry: ThinkingRegistry,
 }
 
 #[derive(Clone)]
@@ -355,7 +353,6 @@ impl HeadlessApp {
             permission_callback_slot: deps.permission_callback_slot,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
-            thinking_registry: ThinkingRegistry::with_defaults(),
         };
         app.seed_runtime_info();
         app.record_startup_warning_history();
@@ -644,7 +641,10 @@ impl HeadlessApp {
     }
 
     pub fn thinking_available_levels(&self) -> Vec<String> {
-        self.thinking_registry.available_levels(&self.active_model)
+        valid_thinking_levels(&self.active_model)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -700,6 +700,7 @@ impl HeadlessApp {
             &mut self.loop_engine,
             self.config_manager.as_ref(),
             &fawx_data_dir(),
+            &self.active_model,
             Some(&budget.to_string()),
         )?;
         Ok(())
@@ -770,6 +771,7 @@ impl HeadlessApp {
             &mut self.loop_engine,
             self.config_manager.as_ref(),
             &fawx_data_dir(),
+            &self.active_model,
             Some(&adjusted.to_string()),
         )?;
         Ok(Some((current, adjusted)))
@@ -1285,11 +1287,13 @@ impl CommandHost for HeadlessApp {
         let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
         self.config = reload_runtime_config(self.config_manager.as_ref(), &config_path)?;
         self.max_history = self.config.general.max_history;
-        self.loop_engine
-            .set_thinking_config(thinking_config_from_budget(
-                &self.config.general.thinking.unwrap_or_default(),
-            ));
+        let thinking_budget = self.config.general.thinking.unwrap_or_default();
         sync_headless_model_from_config(self, self.config.model.default_model.clone())?;
+        self.loop_engine
+            .set_thinking_config(thinking_config_for_active_model(
+                &thinking_budget,
+                &self.active_model,
+            ));
         Ok(config_reload_success_message(&config_path))
     }
 
@@ -2497,7 +2501,6 @@ mod tests {
                 std::env::temp_dir().as_path(),
             )),
             bus_receiver: None,
-            thinking_registry: ThinkingRegistry::with_defaults(),
         }
     }
 
@@ -2991,7 +2994,7 @@ mod tests {
             }
 
             fn supported_models(&self) -> Vec<String> {
-                vec!["old-model".to_string(), "new-model".to_string()]
+                vec!["claude-opus-4-6".to_string(), "gpt-5.4".to_string()]
             }
 
             fn capabilities(&self) -> fx_llm::ProviderCapabilities {
@@ -3005,7 +3008,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("config.toml"),
-            "[model]\ndefault_model = \"old-model\"\n",
+            "[general]\nthinking = \"low\"\n\n[model]\ndefault_model = \"claude-opus-4-6\"\n",
         )
         .expect("write initial config");
         let manager = Arc::new(Mutex::new(
@@ -3016,7 +3019,7 @@ mod tests {
 
         let mut router = ModelRouter::new();
         router.register_provider(Box::new(ReloadProvider));
-        router.set_active("old-model").expect("set old model");
+        router.set_active("claude-opus-4-6").expect("set old model");
 
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
@@ -3026,7 +3029,7 @@ mod tests {
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
-            active_model: "old-model".to_string(),
+            active_model: "claude-opus-4-6".to_string(),
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
             max_history: 20,
@@ -3046,19 +3049,18 @@ mod tests {
                 std::env::temp_dir().as_path(),
             )),
             bus_receiver: None,
-            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         std::fs::write(
             temp.path().join("config.toml"),
-            "[model]\ndefault_model = \"new-model\"\n",
+            "[general]\nthinking = \"low\"\n\n[model]\ndefault_model = \"gpt-5.4\"\n",
         )
         .expect("write updated config");
 
         let response = app.reload_config().expect("reload config");
 
-        assert_eq!(app.active_model, "new-model");
-        assert_eq!(app.router.active_model(), Some("new-model"));
+        assert_eq!(app.active_model, "gpt-5.4");
+        assert_eq!(app.router.active_model(), Some("gpt-5.4"));
         assert_eq!(
             response,
             crate::commands::slash::config_reload_success_message(&temp.path().join("config.toml"))
@@ -3460,7 +3462,6 @@ mod tests {
                 std::env::temp_dir().as_path(),
             )),
             bus_receiver: None,
-            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         let result = app.process_message("hello").await.expect("process message");
@@ -3509,7 +3510,6 @@ mod tests {
                 std::env::temp_dir().as_path(),
             )),
             bus_receiver: None,
-            thinking_registry: ThinkingRegistry::with_defaults(),
         };
 
         app.process_message("hello")

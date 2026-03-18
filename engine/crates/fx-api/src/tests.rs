@@ -1214,6 +1214,28 @@ mod routing_and_status {
         router
     }
 
+    fn thinking_test_router() -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "anthropic",
+                models: vec!["claude-sonnet-4-6", "claude-opus-4-6"],
+            }),
+            "api_key",
+        );
+        router.register_provider_with_auth(
+            Box::new(StaticProvider {
+                name: "openai",
+                models: vec!["gpt-5.4"],
+            }),
+            "api_key",
+        );
+        router
+            .set_active("claude-sonnet-4-6")
+            .expect("set active");
+        router
+    }
+
     fn make_test_app(config_manager: Option<Arc<StdMutex<ConfigManager>>>) -> HeadlessApp {
         make_test_app_with_config(fx_config::FawxConfig::default(), config_manager)
     }
@@ -2807,13 +2829,11 @@ allowed_chat_ids = [123]
 
     #[tokio::test]
     async fn get_thinking_returns_current_level() {
+        let mut config = fx_config::FawxConfig::default();
+        config.model.default_model = Some("claude-sonnet-4-6".to_string());
+        // Default ThinkingBudget is Adaptive
         let state = test_state_with_app(
-            build_test_app(
-                settings_router(),
-                fx_config::FawxConfig::default(),
-                None,
-                test_runtime_info(),
-            ),
+            build_test_app(thinking_test_router(), config, None, test_runtime_info()),
             Vec::new(),
         );
         let app = build_router(state, None);
@@ -2825,21 +2845,20 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["level"], "adaptive");
-        assert_eq!(json["budget_tokens"], 5000);
         assert_eq!(
             json["available"],
-            serde_json::json!(["adaptive", "low", "medium", "high"])
+            serde_json::json!(["off", "adaptive", "low", "medium", "high"])
         );
     }
 
     #[tokio::test]
     async fn set_thinking_valid_level_returns_200() {
         let (_temp, config, manager) = temp_config_manager(
-            "[model]\ndefault_model = \"claude-sonnet-4-20250514\"\n\n[general]\nthinking = \"adaptive\"\n",
+            "[model]\ndefault_model = \"claude-sonnet-4-6\"\n\n[general]\nthinking = \"high\"\n",
         );
         let state = test_state_with_app(
             build_test_app(
-                settings_router(),
+                thinking_test_router(),
                 config,
                 Some(manager),
                 test_runtime_info(),
@@ -2859,9 +2878,8 @@ allowed_chat_ids = [123]
             .expect("response");
         assert_eq!(update.status(), StatusCode::OK);
         let update_json = response_json(update).await;
-        assert_eq!(update_json["previous_level"], "adaptive");
+        assert_eq!(update_json["previous_level"], "high");
         assert_eq!(update_json["level"], "high");
-        assert_eq!(update_json["budget_tokens"], 10000);
 
         let thinking = app
             .oneshot(authed_request("GET", "/v1/thinking"))
@@ -2887,7 +2905,7 @@ allowed_chat_ids = [123]
         let json = response_json(response).await;
         assert_eq!(
             json["error"],
-            "unknown thinking budget 'turbo'; expected adaptive, high, low, or off"
+            "unknown thinking level 'turbo'; expected off, none, minimal, low, medium, high, xhigh, max, or adaptive"
         );
     }
 
@@ -2895,7 +2913,7 @@ allowed_chat_ids = [123]
     async fn set_thinking_rejects_level_unsupported_by_current_provider() {
         let (_temp, config, manager) = temp_config_manager(
             r#"[model]
-default_model = "gpt-4o"
+default_model = "gpt-5.4"
 
 [general]
 thinking = "low"
@@ -2903,7 +2921,7 @@ thinking = "low"
         );
         let state = test_state_with_app(
             build_test_app(
-                settings_router(),
+                thinking_test_router(),
                 config,
                 Some(manager),
                 test_runtime_info(),
@@ -2925,7 +2943,7 @@ thinking = "low"
         let json = response_json(response).await;
         assert_eq!(
             json["error"],
-            "Thinking level 'adaptive' is not supported by the current model. Available: off, low, medium, high, xhigh"
+            "Thinking level 'adaptive' is not supported by the current model. Available: none, low, medium, high, xhigh"
         );
     }
 
@@ -2933,7 +2951,7 @@ thinking = "low"
     async fn set_model_auto_downgrades_unsupported_thinking_level() {
         let (_temp, config, manager) = temp_config_manager(
             r#"[model]
-default_model = "claude-sonnet-4-20250514"
+default_model = "claude-sonnet-4-6"
 
 [general]
 thinking = "adaptive"
@@ -2941,7 +2959,7 @@ thinking = "adaptive"
         );
         let state = test_state_with_app(
             build_test_app(
-                settings_router(),
+                thinking_test_router(),
                 config,
                 Some(manager),
                 test_runtime_info(),
@@ -2955,14 +2973,14 @@ thinking = "adaptive"
             .oneshot(authed_json_request(
                 "PUT",
                 "/v1/model",
-                r#"{"model":"gpt-4o"}"#,
+                r#"{"model":"gpt-5.4"}"#,
             ))
             .await
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["active_model"], "gpt-4o");
+        assert_eq!(json["active_model"], "gpt-5.4");
         assert_eq!(json["thinking_adjusted"]["from"], "adaptive");
         assert_eq!(json["thinking_adjusted"]["to"], "high");
         assert_eq!(
@@ -2978,7 +2996,7 @@ thinking = "adaptive"
         assert_eq!(thinking_json["level"], "high");
         assert_eq!(
             thinking_json["available"],
-            serde_json::json!(["off", "low", "medium", "high", "xhigh"])
+            serde_json::json!(["none", "low", "medium", "high", "xhigh"])
         );
     }
 
@@ -2986,22 +3004,22 @@ thinking = "adaptive"
     async fn set_model_same_provider_preserves_thinking_level() {
         let (_temp, config, manager) = temp_config_manager(
             r#"[model]
-default_model = "claude-sonnet-4-20250514"
+default_model = "claude-sonnet-4-6"
 
 [general]
-thinking = "adaptive"
+thinking = "high"
 "#,
         );
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
             Box::new(StaticProvider {
                 name: "anthropic",
-                models: vec!["claude-sonnet-4-20250514", "claude-opus-4-1-20250805"],
+                models: vec!["claude-sonnet-4-6", "claude-opus-4-6"],
             }),
             "api_key",
         );
         router
-            .set_active("claude-sonnet-4-20250514")
+            .set_active("claude-sonnet-4-6")
             .expect("set active");
         let state = test_state_with_app(
             build_test_app(router, config, Some(manager), test_runtime_info()),
@@ -3014,7 +3032,7 @@ thinking = "adaptive"
             .oneshot(authed_json_request(
                 "PUT",
                 "/v1/model",
-                r#"{"model":"claude-opus-4-1-20250805"}"#,
+                r#"{"model":"claude-opus-4-6"}"#,
             ))
             .await
             .expect("response");
@@ -3028,7 +3046,7 @@ thinking = "adaptive"
             .await
             .expect("response");
         let thinking_json = response_json(thinking).await;
-        assert_eq!(thinking_json["level"], "adaptive");
+        assert_eq!(thinking_json["level"], "high");
     }
 
     #[tokio::test]

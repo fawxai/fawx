@@ -20,12 +20,16 @@ pub const THINKING_BUDGET_ADAPTIVE: u32 = 5_000;
 /// Token budget for "low" thinking mode.
 pub const THINKING_BUDGET_LOW: u32 = 1_024;
 
-/// Extended thinking configuration for a completion request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Thinking/reasoning configuration for LLM requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ThinkingConfig {
-    /// Enable extended thinking with the given token budget.
+    /// Anthropic Claude 4.6 adaptive thinking with effort parameter.
+    Adaptive { effort: String },
+    /// Anthropic Claude 4.5/older manual thinking with fixed token budget.
     Enabled { budget_tokens: u32 },
-    /// Disable extended thinking entirely.
+    /// OpenAI reasoning effort.
+    Reasoning { effort: String },
+    /// Thinking/reasoning disabled.
     Off,
 }
 
@@ -383,8 +387,36 @@ mod tests {
         };
         match config {
             ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 10_000),
-            ThinkingConfig::Off => panic!("expected Enabled"),
+            ThinkingConfig::Adaptive { .. }
+            | ThinkingConfig::Reasoning { .. }
+            | ThinkingConfig::Off => panic!("expected Enabled"),
         }
+    }
+
+    #[test]
+    fn thinking_config_adaptive_stores_effort() {
+        let config = ThinkingConfig::Adaptive {
+            effort: "high".to_string(),
+        };
+        assert_eq!(
+            config,
+            ThinkingConfig::Adaptive {
+                effort: "high".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_config_reasoning_stores_effort() {
+        let config = ThinkingConfig::Reasoning {
+            effort: "xhigh".to_string(),
+        };
+        assert_eq!(
+            config,
+            ThinkingConfig::Reasoning {
+                effort: "xhigh".to_string(),
+            }
+        );
     }
 
     #[test]

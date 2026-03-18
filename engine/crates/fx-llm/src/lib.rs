@@ -22,7 +22,7 @@ mod router;
 mod routing;
 mod sse;
 pub mod streaming;
-pub use thinking::ThinkingRegistry;
+pub use thinking::{default_thinking_level, thinking_config_for_model, valid_thinking_levels};
 
 #[cfg(test)]
 mod test_helpers;

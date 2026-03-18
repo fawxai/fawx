@@ -1362,6 +1362,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1369,6 +1370,7 @@ name = "fx-auth"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "fx-config",
  "fx-storage",
  "reqwest",
  "ring",
@@ -1564,6 +1566,7 @@ dependencies = [
 name = "fx-core"
 version = "0.1.0"
 dependencies = [
+ "fx-config",
  "glob",
  "serde",
  "serde_json",
@@ -1970,12 +1973,14 @@ dependencies = [
  "fx-storage",
  "fx-subagent",
  "nix",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use fx_kernel::signals::{Signal, SignalCollector};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::helpers::thinking_config_from_budget;
+use crate::helpers::thinking_config_for_active_model;
 
 pub(crate) const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
     "Use the tool output to directly answer the user's question. Be natural and specific — \
@@ -407,6 +407,7 @@ pub(crate) fn apply_thinking_budget(
     loop_engine: &mut LoopEngine,
     config_manager: Option<&Arc<Mutex<ConfigManager>>>,
     data_dir: &Path,
+    model_id: &str,
     level: Option<&str>,
 ) -> Result<String> {
     let current = config.general.thinking.unwrap_or_default();
@@ -417,7 +418,7 @@ pub(crate) fn apply_thinking_budget(
         .parse()
         .map_err(|error: String| anyhow::anyhow!(error))?;
     config.general.thinking = Some(budget);
-    loop_engine.set_thinking_config(thinking_config_from_budget(&budget));
+    loop_engine.set_thinking_config(thinking_config_for_active_model(&budget, model_id));
     persist_thinking_budget(config_manager, data_dir, budget)?;
     Ok(format!("Thinking budget set to: {budget}"))
 }
@@ -1175,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_thinking_budget_updates_config_and_disk() {
+    fn apply_thinking_budget_updates_config_disk_and_wire_format() {
         let temp = tempdir().expect("tempdir");
         let mut config = FawxConfig::default();
         config.general.data_dir = Some(temp.path().to_path_buf());
@@ -1188,13 +1189,14 @@ mod tests {
             &mut bundle.engine,
             None,
             temp.path(),
-            Some("low"),
+            "gpt-5.4",
+            Some("high"),
         )
         .expect("apply thinking budget");
 
-        assert_eq!(response, "Thinking budget set to: low");
-        assert_eq!(config.general.thinking, Some(ThinkingBudget::Low));
+        assert_eq!(response, "Thinking budget set to: high");
+        assert_eq!(config.general.thinking, Some(ThinkingBudget::High));
         let stored = FawxConfig::load(temp.path()).expect("load config");
-        assert_eq!(stored.general.thinking, Some(ThinkingBudget::Low));
+        assert_eq!(stored.general.thinking, Some(ThinkingBudget::High));
     }
 }

@@ -59,6 +59,54 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
 }
 
+fn is_claude_4_6(model: &str) -> bool {
+    let normalized = model.split('/').next_back().unwrap_or(model);
+    normalized.contains("opus-4-6") || normalized.contains("sonnet-4-6")
+}
+
+fn build_anthropic_thinking(
+    model: &str,
+    config: &Option<ThinkingConfig>,
+) -> (Option<AnthropicThinking>, Option<AnthropicOutputConfig>) {
+    match config {
+        Some(ThinkingConfig::Adaptive { effort }) => {
+            if !is_claude_4_6(model) {
+                tracing::warn!(
+                    model,
+                    "adaptive thinking requested for non-Claude 4.6 model"
+                );
+            }
+            (
+                Some(AnthropicThinking::Adaptive {
+                    thinking_type: "adaptive".to_string(),
+                }),
+                Some(AnthropicOutputConfig {
+                    effort: effort.clone(),
+                }),
+            )
+        }
+        Some(ThinkingConfig::Enabled { budget_tokens }) => {
+            let capped = (*budget_tokens).min(MAX_THINKING_BUDGET);
+            if *budget_tokens > MAX_THINKING_BUDGET {
+                tracing::warn!(
+                    requested = budget_tokens,
+                    capped,
+                    "thinking budget exceeds maximum, capping at {MAX_THINKING_BUDGET}"
+                );
+            }
+            (
+                Some(AnthropicThinking::Manual {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: capped,
+                }),
+                None,
+            )
+        }
+        Some(ThinkingConfig::Off) | None => (None, None),
+        Some(ThinkingConfig::Reasoning { .. }) => (None, None),
+    }
+}
+
 impl AnthropicProvider {
     /// Create a new Anthropic provider. Auto-detects auth mode from the credential.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
@@ -200,23 +248,8 @@ impl AnthropicProvider {
             })
             .collect::<Vec<_>>();
 
-        let thinking = match &request.thinking {
-            Some(ThinkingConfig::Enabled { budget_tokens }) => {
-                let capped = (*budget_tokens).min(MAX_THINKING_BUDGET);
-                if *budget_tokens > MAX_THINKING_BUDGET {
-                    tracing::warn!(
-                        requested = budget_tokens,
-                        capped = capped,
-                        "thinking budget exceeds maximum, capping at {MAX_THINKING_BUDGET}"
-                    );
-                }
-                Some(AnthropicThinking {
-                    thinking_type: "enabled".to_string(),
-                    budget_tokens: capped,
-                })
-            }
-            Some(ThinkingConfig::Off) | None => None,
-        };
+        let (thinking, output_config) =
+            build_anthropic_thinking(&request.model, &request.thinking);
 
         let body = AnthropicRequestBody {
             model: request.model.clone(),
@@ -229,15 +262,17 @@ impl AnthropicProvider {
                 request.temperature
             },
             max_tokens: match &thinking {
-                Some(t) => request
+                Some(AnthropicThinking::Manual { budget_tokens, .. }) => request
                     .max_tokens
                     .unwrap_or(4096)
-                    .max(t.budget_tokens + MIN_RESPONSE_TOKENS),
+                    .max(budget_tokens + MIN_RESPONSE_TOKENS),
+                Some(AnthropicThinking::Adaptive { .. }) => request.max_tokens.unwrap_or(16_000),
                 None => request.max_tokens.unwrap_or(4096),
             },
             system: system_prompt,
             stream,
             thinking,
+            output_config,
         };
 
         #[cfg(debug_assertions)]
@@ -758,14 +793,29 @@ struct AnthropicRequestBody {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+}
+
+/// Anthropic `output_config` parameter for effort control.
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: String,
 }
 
 /// Anthropic extended thinking parameter.
 #[derive(Debug, Serialize)]
-struct AnthropicThinking {
-    #[serde(rename = "type")]
-    thinking_type: String,
-    budget_tokens: u32,
+#[serde(untagged)]
+enum AnthropicThinking {
+    Adaptive {
+        #[serde(rename = "type")]
+        thinking_type: String,
+    },
+    Manual {
+        #[serde(rename = "type")]
+        thinking_type: String,
+        budget_tokens: u32,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -929,22 +979,38 @@ fn validate_request(body: &AnthropicRequestBody) {
             "temperature must be None when thinking is enabled \
              (Anthropic requires temperature=1 or omitted)"
         );
-        assert!(
-            thinking.budget_tokens > 0,
-            "thinking.budget_tokens must be > 0 when thinking is enabled"
-        );
-        assert!(
-            thinking.budget_tokens <= MAX_THINKING_BUDGET,
-            "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
-            thinking.budget_tokens
-        );
-        assert!(
-            body.max_tokens > thinking.budget_tokens,
-            "max_tokens must be greater than thinking.budget_tokens \
-             ({} <= {})",
-            body.max_tokens,
-            thinking.budget_tokens
-        );
+        match thinking {
+            AnthropicThinking::Adaptive { .. } => {
+                assert!(
+                    body.output_config.as_ref().is_some_and(|c| !c.effort.is_empty()),
+                    "adaptive thinking requires a non-empty effort"
+                );
+            }
+            AnthropicThinking::Manual { budget_tokens, .. } => {
+                assert!(
+                    *budget_tokens > 0,
+                    "thinking.budget_tokens must be > 0 when thinking is enabled"
+                );
+                assert!(
+                    *budget_tokens <= MAX_THINKING_BUDGET,
+                    "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
+                    budget_tokens
+                );
+                assert!(
+                    body.max_tokens > *budget_tokens,
+                    "max_tokens must be greater than thinking.budget_tokens \
+                     ({} <= {})",
+                    body.max_tokens,
+                    budget_tokens
+                );
+                assert!(
+                    body.output_config.is_none(),
+                    "manual thinking must not include effort"
+                );
+            }
+        }
+    } else {
+        assert!(body.output_config.is_none(), "effort must be None when thinking is disabled");
     }
 }
 
@@ -1871,6 +1937,13 @@ mod tests {
 
     /// Helper to build a minimal valid `AnthropicRequestBody` for validation tests.
     fn valid_request_body(thinking: Option<AnthropicThinking>) -> AnthropicRequestBody {
+        let max_tokens = match &thinking {
+            Some(AnthropicThinking::Manual { budget_tokens, .. }) => {
+                budget_tokens + MIN_RESPONSE_TOKENS
+            }
+            Some(AnthropicThinking::Adaptive { .. }) => 16_000,
+            None => 4096,
+        };
         AnthropicRequestBody {
             model: "claude-sonnet-4-20250514".to_string(),
             messages: vec![AnthropicMessage {
@@ -1881,20 +1954,18 @@ mod tests {
             }],
             tools: Vec::new(),
             temperature: if thinking.is_some() { None } else { Some(0.7) },
-            max_tokens: match &thinking {
-                Some(t) => t.budget_tokens + MIN_RESPONSE_TOKENS,
-                None => 4096,
-            },
+            max_tokens,
             system: None,
             stream: false,
             thinking,
+            output_config: None,
         }
     }
 
     #[test]
     #[should_panic(expected = "temperature must be None")]
     fn validate_request_rejects_temperature_with_thinking() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1905,7 +1976,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_tokens must be greater")]
     fn validate_request_rejects_low_max_tokens() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1915,7 +1986,7 @@ mod tests {
 
     #[test]
     fn validate_request_accepts_valid_thinking_request() {
-        let body = valid_request_body(Some(AnthropicThinking {
+        let body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1955,7 +2026,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "budget_tokens must be > 0")]
     fn validate_request_rejects_zero_budget() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 0,
         }));
@@ -1966,7 +2037,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be <= MAX_THINKING_BUDGET")]
     fn validate_request_rejects_budget_over_cap() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: MAX_THINKING_BUDGET + 1,
         }));

@@ -124,14 +124,21 @@ pub(crate) fn available_provider_names(router: &ModelRouter) -> Vec<String> {
     providers
 }
 
-/// Convert a [`ThinkingBudget`] to the wire-level [`ThinkingConfig`].
+/// Convert a thinking budget level into a provider-specific [`ThinkingConfig`].
 ///
-/// Returns `None` when thinking is disabled (`Off`), which keeps the
-/// `CompletionRequest.thinking` field empty.
-pub(crate) fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig> {
-    budget
-        .budget_tokens()
-        .map(|budget_tokens| ThinkingConfig::Enabled { budget_tokens })
+/// Uses the active model ID to determine the correct wire format:
+/// - Anthropic 4.6: `Adaptive { effort }`
+/// - Anthropic 4.5: `Enabled { budget_tokens }`
+/// - OpenAI: `Reasoning { effort }`
+pub(crate) fn thinking_config_for_active_model(
+    budget: &ThinkingBudget,
+    model_id: &str,
+) -> Option<ThinkingConfig> {
+    let level = budget.to_string();
+    if level == "off" {
+        return None;
+    }
+    fx_llm::thinking_config_for_model(model_id, &level)
 }
 
 pub(crate) fn format_memory_for_prompt(
@@ -554,15 +561,48 @@ mod tests {
     }
 
     #[test]
-    fn thinking_config_from_budget_maps_enabled_budget() {
-        let thinking = thinking_config_from_budget(&ThinkingBudget::Low);
+    fn thinking_config_for_active_model_maps_claude_4_6_to_adaptive() {
+        let thinking =
+            thinking_config_for_active_model(&ThinkingBudget::Low, "claude-opus-4-6-20250929");
+
+        assert_eq!(
+            thinking,
+            Some(ThinkingConfig::Adaptive {
+                effort: "low".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_config_for_active_model_maps_claude_4_5_to_enabled_budget() {
+        let thinking =
+            thinking_config_for_active_model(&ThinkingBudget::High, "claude-sonnet-4-5-20250929");
 
         assert_eq!(
             thinking,
             Some(ThinkingConfig::Enabled {
-                budget_tokens: 1_024,
+                budget_tokens: 10_000,
             })
         );
+    }
+
+    #[test]
+    fn thinking_config_for_active_model_maps_openai_to_reasoning() {
+        let thinking = thinking_config_for_active_model(&ThinkingBudget::High, "gpt-5.4");
+
+        assert_eq!(
+            thinking,
+            Some(ThinkingConfig::Reasoning {
+                effort: "high".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_config_for_active_model_returns_none_when_disabled() {
+        let thinking = thinking_config_for_active_model(&ThinkingBudget::Off, "claude-opus-4-6");
+
+        assert_eq!(thinking, None);
     }
 
     #[test]

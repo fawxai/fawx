@@ -1,6 +1,6 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::headless::StartupWarning;
-use crate::helpers::{format_memory_for_prompt, thinking_config_from_budget};
+use crate::helpers::{format_memory_for_prompt, thinking_config_for_active_model};
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use fx_analysis::AnalysisError;
@@ -94,8 +94,14 @@ const DEFAULT_OPENAI_MODELS: &[&str] = &[
     "gpt-4o",
     "gpt-4o-mini",
 ];
-const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
-    &["gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "o4-mini"];
+const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1",
+    "o4-mini",
+];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4o-mini",
     "anthropic/claude-3.5-sonnet",
@@ -562,7 +568,8 @@ fn build_loop_engine_with_options(
         builder = builder.memory_context(snapshot_text);
     }
     let thinking_budget = config.general.thinking.unwrap_or_default();
-    if let Some(thinking) = thinking_config_from_budget(&thinking_budget) {
+    let model_id = config.model.default_model.as_deref().unwrap_or("");
+    if let Some(thinking) = thinking_config_for_active_model(&thinking_budget, model_id) {
         builder = builder.thinking_config(thinking);
     }
     if let Some(journal) = &skills.journal {
@@ -2469,6 +2476,8 @@ mod tests {
 
         assert!(bundle.embedding_index_persistence.is_none());
     }
+
+
 
     #[test]
     fn build_loop_engine_from_builder_returns_startup_error_on_failure() {
