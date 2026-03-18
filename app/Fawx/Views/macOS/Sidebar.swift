@@ -79,8 +79,6 @@ struct Sidebar: View {
     private var newSessionButton: some View {
         Button(action: newSessionAction) {
             Label("New Session", systemImage: "plus")
-                .symbolRenderingMode(.monochrome)
-                .foregroundStyle(Color.white)
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
