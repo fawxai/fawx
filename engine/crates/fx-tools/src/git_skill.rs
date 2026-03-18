@@ -290,9 +290,15 @@ impl GitSkill {
         }
         let token = self.require_github_token()?;
         let head = match &parsed.head {
-            Some(head) => head.clone(),
+            Some(head) => {
+                validate_branch_name(head)?;
+                head.clone()
+            }
             None => self.current_branch().await?,
         };
+        if let Some(ref base) = parsed.base {
+            validate_branch_name(base)?;
+        }
         let remote_url = self.run_git(&["remote", "get-url", "origin"]).await?;
         let (owner, repo) = parse_github_remote(remote_url.trim())?;
         let base = parsed.base.as_deref().unwrap_or("main");
@@ -331,16 +337,16 @@ impl GitSkill {
         token: &str,
         timeout_duration: Duration,
     ) -> Result<String, String> {
-        let config_value = format!(
+        let config_value = Zeroizing::new(format!(
             "url.https://x-access-token:{}@github.com/.insteadOf=https://github.com/",
             token
-        );
+        ));
         let mut command = Command::new("git");
         command
             .arg("-C")
             .arg(&self.working_dir)
             .arg("-c")
-            .arg(&config_value)
+            .arg(config_value.as_str())
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdout(Stdio::piped())
