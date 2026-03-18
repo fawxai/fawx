@@ -2275,6 +2275,7 @@ mod tests {
             experiment_progress: None,
             session_registry: None,
             session_bus: None,
+            token_broker: None,
             experiment_registry: Some(
                 build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
             ),
