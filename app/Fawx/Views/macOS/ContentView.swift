@@ -240,16 +240,13 @@ struct ContentView: View {
 
         Task {
             let deletedCurrentSelection = orderedSessionIDs.contains { $0 == selectedSessionID }
+            for sessionID in orderedSessionIDs where chatViewModel.activeStreamSessionID == sessionID {
+                chatViewModel.stopStreaming()
+            }
 
-            for sessionID in orderedSessionIDs {
-                if chatViewModel.activeStreamSessionID == sessionID {
-                    chatViewModel.stopStreaming()
-                }
-
-                let didDelete = await sessionViewModel.deleteSession(id: sessionID)
-                if didDelete {
-                    chatViewModel.invalidateSession(sessionID)
-                }
+            let deletedSessionIDs = await sessionViewModel.deleteSessions(ids: orderedSessionIDs)
+            for sessionID in deletedSessionIDs {
+                chatViewModel.invalidateSession(sessionID)
             }
 
             if deletedCurrentSelection {

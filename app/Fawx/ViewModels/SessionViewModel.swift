@@ -160,6 +160,49 @@ final class SessionViewModel {
         }
     }
 
+    func deleteSessions(ids: [String]) async -> [String] {
+        guard ids.isEmpty == false else {
+            return []
+        }
+
+        isMutatingSession = true
+        defer { isMutatingSession = false }
+
+        let client = appState.client
+        let deletionResults = await withTaskGroup(of: (String, String?).self, returning: [(String, String?)].self) { group in
+            for id in ids {
+                group.addTask {
+                    do {
+                        _ = try await client.deleteSession(id: id)
+                        return (id, nil)
+                    } catch {
+                        return (id, error.localizedDescription)
+                    }
+                }
+            }
+
+            var results: [(String, String?)] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+
+        let deletedIDs = Set(
+            deletionResults.compactMap { id, errorMessage in
+                errorMessage == nil ? id : nil
+            }
+        )
+
+        for id in ids where deletedIDs.contains(id) {
+            removeSession(id)
+        }
+
+        errorMessage = deletionResults.compactMap { $0.1 }.last
+
+        return ids.filter { deletedIDs.contains($0) }
+    }
+
     func upsert(_ session: Session) {
         if let index = sessions.firstIndex(where: { $0.id == session.id }) {
             sessions[index] = session
@@ -189,6 +232,7 @@ final class SessionViewModel {
     }
 
     private nonisolated static func searchFields(for session: Session) -> [String] {
+        // Search intentionally covers both visible chat metadata and stable server-side identifiers.
         [
             session.key,
             session.label ?? "",
