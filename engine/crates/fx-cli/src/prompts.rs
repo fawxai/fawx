@@ -17,6 +17,7 @@ pub(crate) enum AuthSelection {
     ClaudeSubscription,
     ChatGptSubscription,
     ApiKey,
+    Skip,
 }
 
 pub(crate) fn parse_auth_selection(value: &str) -> Option<AuthSelection> {
@@ -24,6 +25,7 @@ pub(crate) fn parse_auth_selection(value: &str) -> Option<AuthSelection> {
         "1" => Some(AuthSelection::ClaudeSubscription),
         "2" => Some(AuthSelection::ChatGptSubscription),
         "3" => Some(AuthSelection::ApiKey),
+        "" | "4" | "s" | "skip" => Some(AuthSelection::Skip),
         _ => None,
     }
 }

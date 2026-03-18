@@ -250,11 +250,12 @@ impl SetupWizard {
         println!("    [1] Claude subscription (setup token)");
         println!("    [2] ChatGPT subscription (browser sign-in)");
         println!("    [3] API key (Anthropic, OpenAI, OpenRouter, etc.)");
+        println!("    [4] Skip (configure later)");
 
         let selection = prompt_choice_with_surface(
             PromptSurface::PlainTerminal,
             "  > ",
-            "Please choose 1, 2, or 3.\n",
+            "Please choose 1-4 (or press Enter to skip).\n",
             "setup auth selection",
             parse_auth_selection,
         )?;
@@ -263,6 +264,9 @@ impl SetupWizard {
             crate::prompts::AuthSelection::ClaudeSubscription => self.store_claude_setup_token()?,
             crate::prompts::AuthSelection::ChatGptSubscription => self.store_openai_oauth().await?,
             crate::prompts::AuthSelection::ApiKey => self.store_api_key()?,
+            crate::prompts::AuthSelection::Skip => {
+                println!("  ⏭ Skipped LLM provider setup (configure later with `fawx setup`)");
+            }
         }
         println!();
         Ok(())
