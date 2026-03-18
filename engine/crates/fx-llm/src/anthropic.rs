@@ -192,7 +192,11 @@ impl AnthropicProvider {
                 .header(
                     "anthropic-beta",
                     "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-                ),
+                )
+                .header("user-agent", "claude-cli/2.1.75")
+                .header("x-app", "cli")
+                .header("accept", "application/json")
+                .header("anthropic-dangerous-direct-browser-access", "true"),
         }
     }
 
