@@ -179,3 +179,13 @@ For tomorrow ship pressure, target this:
 - **Fitness backpropagation**
 
 This gets the maximum “complete system” gain without wandering too deep into forge-adjacent architecture work on the eve of ship.
+
+---
+
+## Post-Ship Backlog (captured during build session 2026-03-18)
+
+### `fawx clean` — Storage Cleanup Command
+- Show sizes: `target/debug`, `target/release`, incremental cache, WASM cache
+- Subcommands: `--debug`, `--cache`, `--all`, `--dry-run`
+- TUI status indicator for build cache size
+- Motivation: 75GB debug target discovered during ship night; `rm -rf` is not a product experience

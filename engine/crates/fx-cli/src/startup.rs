@@ -904,10 +904,7 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
-    // TODO: Wire GitHubTokenProvider from credential_provider once PAT borrowing lands (#1485)
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone(), None);
-    registry.register(Arc::new(git_skill));
-    let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm);
+    let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm.clone());
     registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -953,6 +950,17 @@ fn build_skill_registry(
                 token_broker: options.token_broker.clone(),
             }) as Arc<dyn CredentialProvider>
         });
+
+    // Wire GitSkill with GitHub token provider from credential bridge.
+    let github_token_fn: Option<fx_tools::git_skill::GitHubTokenProvider> =
+        credential_provider.clone().map(|cp| {
+            std::sync::Arc::new(move || cp.get_credential("github_token"))
+                as std::sync::Arc<
+                    dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync,
+                >
+        });
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn);
+    registry.register(Arc::new(git_skill));
 
     // Load WASM skills from ~/.fawx/skills/
     let trusted_keys = fx_loadable::wasm_skill::load_trusted_keys().unwrap_or_else(|e| {
