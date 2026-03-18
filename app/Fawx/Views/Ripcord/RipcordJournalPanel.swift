@@ -115,7 +115,7 @@ struct RipcordJournalPanel: View {
             .padding(.top, FawxSpacing.paddingSM)
             .padding(.bottom, FawxSpacing.paddingLG)
         }
-        .background(Color.fawxBackground.opacity(0.96))
+        .background(Color.fawxBackground)
     }
 
     private var footerButtons: some View {

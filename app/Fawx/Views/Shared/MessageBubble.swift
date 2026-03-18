@@ -41,17 +41,23 @@ struct MessageBubble: View {
 
             VStack(alignment: role == .user ? .trailing : .leading, spacing: FawxSpacing.paddingSM) {
                 bubbleLabel
-                    .padding(.horizontal, FawxSpacing.paddingLG)
+                    .padding(.horizontal, bubbleHorizontalPadding)
                     .padding(.vertical, FawxSpacing.paddingMD)
-                    .background(backgroundColor)
-                    .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+                    .background(bubbleBackground)
+                    .overlay(bubbleBorder)
+                    .clipShape(RoundedRectangle(cornerRadius: bubbleCornerRadius))
 
                 if let timestamp {
                     Text(timeString(timestamp))
                         .font(FawxTypography.status)
                         .foregroundStyle(Color.fawxTextSecondary)
+                        .monospacedDigit()
                 }
             }
+            .frame(
+                maxWidth: FawxSpacing.maxMessageWidth,
+                alignment: role == .user ? .trailing : .leading
+            )
 
             if role != .user {
                 Spacer(minLength: 48)
@@ -70,6 +76,14 @@ struct MessageBubble: View {
             messageContent
                 .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: .leading)
         }
+    }
+
+    private var bubbleHorizontalPadding: CGFloat {
+        role == .assistant ? FawxSpacing.paddingXL : FawxSpacing.paddingLG
+    }
+
+    private var bubbleCornerRadius: CGFloat {
+        FawxSpacing.cornerRadius + 4
     }
 
     @ViewBuilder
@@ -93,7 +107,7 @@ struct MessageBubble: View {
                     FontFamilyVariant(.monospaced)
                     FontSize(.em(0.92))
                     ForegroundColor(Color.fawxText)
-                    BackgroundColor(Color.fawxCode.opacity(0.9))
+                    BackgroundColor(Color.fawxCode.opacity(FawxOpacity.codeBackground))
                 }
                 .markdownTextStyle(\.link) {
                     ForegroundColor(Color.fawxAccent)
@@ -112,9 +126,36 @@ struct MessageBubble: View {
         case .user:
             return Color.fawxUserBubble
         case .assistant:
-            return Color.fawxSurface
+            return isStreaming ? Color.fawxSurfaceHover : Color.fawxSurface
         case .system:
             return Color.fawxAccentSubtle
+        }
+    }
+
+    private var bubbleBackground: some View {
+        RoundedRectangle(cornerRadius: bubbleCornerRadius)
+            .fill(backgroundColor)
+    }
+
+    @ViewBuilder
+    private var bubbleBorder: some View {
+        if let borderColor {
+            RoundedRectangle(cornerRadius: bubbleCornerRadius)
+                .stroke(borderColor, lineWidth: 1)
+        }
+    }
+
+    private var borderColor: Color? {
+        switch role {
+        case .user:
+            return nil
+        case .assistant:
+            if isStreaming {
+                return Color.fawxBorder
+            }
+            return Color.fawxBorder.opacity(FawxOpacity.borderMedium)
+        case .system:
+            return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
     }
 
