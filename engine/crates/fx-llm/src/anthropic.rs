@@ -624,12 +624,9 @@ impl LlmProvider for AnthropicProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
-        tracing::debug!(
-            endpoint = %self.endpoint(),
-            auth_mode = ?self.auth_mode,
-            body = %serde_json::to_string(&body).unwrap_or_default(),
-            "anthropic request"
-        );
+        let body_json = serde_json::to_string_pretty(&body).unwrap_or_default();
+        eprintln!("[anthropic] POST {} auth={:?}", self.endpoint(), self.auth_mode);
+        eprintln!("[anthropic] body: {body_json}");
 
         let request_builder = self
             .client
@@ -643,7 +640,7 @@ impl LlmProvider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("unable to read error body: {error}"));
-            tracing::debug!(status = %status, body = %body, "anthropic error response");
+            eprintln!("[anthropic] error {status}: {body}");
             return Err(Self::map_http_error(status, body));
         }
 
