@@ -593,7 +593,11 @@ impl SetupWizard {
             }
             Err(error) => {
                 eprintln!("  ✗ Validation failed for {model}: {error}");
-                eprintln!("    Auth method: {:?}", self.auth_manager.get(model.split('/').next().unwrap_or("unknown")));
+                eprintln!(
+                    "    Auth method: {:?}",
+                    self.auth_manager
+                        .get(model.split('/').next().unwrap_or("unknown"))
+                );
                 Err(anyhow!(error.to_string()))
             }
         }

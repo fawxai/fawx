@@ -7,6 +7,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
@@ -25,15 +26,28 @@ const MAX_THINKING_BUDGET: u32 = 32_000;
 /// Minimum token headroom reserved for the model's response output
 /// when thinking is enabled. Ensures max_tokens > budget_tokens.
 const MIN_RESPONSE_TOKENS: u32 = 1024;
+const VALID_ANTHROPIC_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+const CLAUDE_CODE_SYSTEM_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Anthropic auth mode — determines how credentials are sent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AnthropicAuthMode {
     /// Standard API key: sent as `x-api-key` header.
     ApiKey(String),
     /// OAuth/setup-token (`sk-ant-oat...`): sent as `Authorization: Bearer` with
     /// Claude Code identity headers. Matches OpenClaw's behavior.
     SetupToken(String),
+}
+
+impl fmt::Debug for AnthropicAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::ApiKey(_) => "ApiKey",
+            Self::SetupToken(_) => "SetupToken",
+        };
+        write!(f, "{variant}(<redacted>)")
+    }
 }
 
 impl AnthropicAuthMode {
@@ -64,6 +78,16 @@ fn is_claude_4_6(model: &str) -> bool {
     normalized.contains("opus-4-6") || normalized.contains("sonnet-4-6")
 }
 
+fn is_valid_anthropic_effort(effort: &str) -> bool {
+    VALID_ANTHROPIC_EFFORTS.contains(&effort)
+}
+
+fn build_output_config(effort: &str) -> Option<AnthropicOutputConfig> {
+    is_valid_anthropic_effort(effort).then(|| AnthropicOutputConfig {
+        effort: effort.to_string(),
+    })
+}
+
 fn build_anthropic_thinking(
     model: &str,
     config: &Option<ThinkingConfig>,
@@ -79,14 +103,7 @@ fn build_anthropic_thinking(
             // output_config.effort must be a valid Anthropic value.
             // If the effort is "adaptive" or not a recognized value, omit
             // output_config entirely and let the API use its default.
-            let valid_efforts = ["low", "medium", "high", "max"];
-            let output_config = if valid_efforts.contains(&effort.as_str()) {
-                Some(AnthropicOutputConfig {
-                    effort: effort.clone(),
-                })
-            } else {
-                None
-            };
+            let output_config = build_output_config(effort);
             (
                 Some(AnthropicThinking::Adaptive {
                     thinking_type: "adaptive".to_string(),
@@ -205,6 +222,9 @@ impl AnthropicProvider {
                 .header("user-agent", "claude-cli/2.1.75")
                 .header("x-app", "cli")
                 .header("accept", "application/json")
+                // Required by Anthropic's API for OAuth/setup-token auth.
+                // Despite the name, this does not enable browser access — it's
+                // an Anthropic SDK misnomer for non-browser clients using Bearer auth.
                 .header("anthropic-dangerous-direct-browser-access", "true"),
         }
     }
@@ -302,8 +322,8 @@ impl AnthropicProvider {
     /// first content block in an array format. For API keys, a plain string.
     fn build_system_value(&self, prompt: Option<String>) -> Option<serde_json::Value> {
         if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
-            let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
-            let mut blocks = vec![serde_json::json!({"type": "text", "text": identity})];
+            let mut blocks =
+                vec![serde_json::json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY})];
             if let Some(text) = prompt {
                 if !text.is_empty() {
                     blocks.push(serde_json::json!({"type": "text", "text": text}));
@@ -688,17 +708,22 @@ impl LlmProvider for AnthropicProvider {
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
+        let endpoint = self.endpoint();
 
         tracing::debug!(
-            endpoint = %self.endpoint(),
+            endpoint = %endpoint,
             auth_mode = ?self.auth_mode,
-            body = %serde_json::to_string(&body).unwrap_or_default(),
             "anthropic streaming request"
+        );
+        tracing::trace!(
+            endpoint = %endpoint,
+            body = %serde_json::to_string(&body).unwrap_or_default(),
+            "anthropic streaming request body"
         );
 
         let request_builder = self
             .client
-            .post(self.endpoint())
+            .post(endpoint)
             .header("anthropic-version", &self.api_version);
         let response = self.apply_auth(request_builder).json(&body).send().await?;
 
@@ -1034,12 +1059,12 @@ fn validate_request(body: &AnthropicRequestBody) {
         );
         match thinking {
             AnthropicThinking::Adaptive { .. } => {
-                assert!(
-                    body.output_config
-                        .as_ref()
-                        .is_some_and(|c| !c.effort.is_empty()),
-                    "adaptive thinking requires a non-empty effort"
-                );
+                if let Some(output_config) = &body.output_config {
+                    assert!(
+                        is_valid_anthropic_effort(&output_config.effort),
+                        "adaptive thinking effort must be a valid Anthropic value"
+                    );
+                }
             }
             AnthropicThinking::Manual { budget_tokens, .. } => {
                 assert!(
@@ -1681,6 +1706,151 @@ mod tests {
         assert!(done_ids.contains(&"t1"));
         assert!(done_ids.contains(&"t2"));
         assert!(done_ids.contains(&"t3"));
+    }
+
+    #[test]
+    fn anthropic_auth_mode_debug_redacts_credentials() {
+        let api_key_debug = format!(
+            "{:?}",
+            AnthropicAuthMode::ApiKey("sk-ant-api03-secret".to_string())
+        );
+        assert_eq!(api_key_debug, "ApiKey(<redacted>)");
+        assert!(
+            !api_key_debug.contains("sk-ant-api03-secret"),
+            "API key must be redacted in Debug output"
+        );
+
+        let setup_token_debug = format!(
+            "{:?}",
+            AnthropicAuthMode::SetupToken("sk-ant-oat01-secret".to_string())
+        );
+        assert_eq!(setup_token_debug, "SetupToken(<redacted>)");
+        assert!(
+            !setup_token_debug.contains("sk-ant-oat01-secret"),
+            "setup token must be redacted in Debug output"
+        );
+    }
+
+    #[test]
+    fn build_system_value_uses_claude_code_identity_blocks_for_setup_tokens() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider
+            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .expect("system");
+
+        assert_eq!(
+            system,
+            json!([
+                {"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY},
+                {"type": "text", "text": "Follow the user's instructions."}
+            ])
+        );
+    }
+
+    #[test]
+    fn build_system_value_uses_plain_string_for_api_keys() {
+        let provider =
+            AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
+
+        let system = provider
+            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .expect("system");
+
+        assert_eq!(system, json!("Follow the user's instructions."));
+    }
+
+    #[test]
+    fn build_system_value_setup_token_none_prompt_returns_identity_only() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider.build_system_value(None).expect("system");
+        assert_eq!(
+            system,
+            json!([{"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY}])
+        );
+    }
+
+    #[test]
+    fn build_system_value_setup_token_empty_prompt_returns_identity_only() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider
+            .build_system_value(Some(String::new()))
+            .expect("system");
+        assert_eq!(
+            system,
+            json!([{"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY}])
+        );
+    }
+
+    #[test]
+    fn build_system_value_api_key_none_returns_none() {
+        let provider =
+            AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
+
+        assert!(provider.build_system_value(None).is_none());
+    }
+
+    #[test]
+    fn build_anthropic_thinking_omits_output_config_for_invalid_effort() {
+        let (thinking, output_config) = build_anthropic_thinking(
+            "claude-opus-4-6-20250301",
+            &Some(ThinkingConfig::Adaptive {
+                effort: "adaptive".to_string(),
+            }),
+        );
+
+        assert!(matches!(thinking, Some(AnthropicThinking::Adaptive { .. })));
+        assert!(
+            output_config.is_none(),
+            "invalid effort must omit output_config"
+        );
+    }
+
+    #[test]
+    fn build_anthropic_thinking_keeps_output_config_for_valid_efforts() {
+        for effort in VALID_ANTHROPIC_EFFORTS {
+            let (thinking, output_config) = build_anthropic_thinking(
+                "claude-opus-4-6-20250301",
+                &Some(ThinkingConfig::Adaptive {
+                    effort: effort.to_string(),
+                }),
+            );
+
+            assert!(matches!(thinking, Some(AnthropicThinking::Adaptive { .. })));
+            assert_eq!(
+                output_config
+                    .expect("valid effort must produce output_config")
+                    .effort,
+                effort
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_body_omits_output_config_for_invalid_adaptive_effort() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-opus-4-6-20250301".to_string()]);
+        let request = CompletionRequest {
+            model: "claude-opus-4-6-20250301".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Adaptive {
+                effort: "adaptive".to_string(),
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).expect("body");
+
+        assert!(body.output_config.is_none());
     }
 
     /// Regression test: when thinking is enabled, Anthropic requires
