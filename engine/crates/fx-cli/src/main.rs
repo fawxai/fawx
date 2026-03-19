@@ -113,6 +113,19 @@ enum Commands {
     /// Create a compressed backup of ~/.fawx
     Backup(commands::backup::BackupArgs),
 
+    /// Non-interactive zero-to-one local setup for GUI/embedded use
+    Bootstrap {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        /// Override default port (scans 8400-8410 if unset)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
+
     /// Import memory and context from another workspace
     Import(commands::import::ImportArgs),
 
@@ -948,6 +961,11 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Logs(args) => commands::logs::run(&args),
         Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
         Commands::Backup(args) => commands::backup::run(&args),
+        Commands::Bootstrap {
+            json,
+            port,
+            data_dir,
+        } => Ok(commands::bootstrap::run(json, port, data_dir).await?),
         Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Tailscale { command } => dispatch_tailscale(command),
@@ -1178,6 +1196,27 @@ mod tests {
     fn cli_parses_setup_command() {
         let cli = Cli::parse_from(["fawx", "setup", "--force"]);
         assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
+    }
+
+    #[test]
+    fn cli_parses_bootstrap_command() {
+        let cli = Cli::parse_from([
+            "fawx",
+            "bootstrap",
+            "--json",
+            "--port",
+            "9500",
+            "--data-dir",
+            "/tmp/fawx",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Bootstrap {
+                json: true,
+                port: Some(9500),
+                data_dir: Some(path),
+            }) if path == *std::path::Path::new("/tmp/fawx")
+        ));
     }
 
     #[test]

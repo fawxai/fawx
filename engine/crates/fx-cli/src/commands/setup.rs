@@ -1025,7 +1025,7 @@ fn completion_lines() -> [&'static str; 7] {
     ]
 }
 
-fn load_config_document(config_path: &Path) -> anyhow::Result<DocumentMut> {
+pub(crate) fn load_config_document(config_path: &Path) -> anyhow::Result<DocumentMut> {
     let content = if config_path.exists() {
         fs::read_to_string(config_path)?
     } else {
@@ -1378,7 +1378,7 @@ fn permission_action_names(actions: &[PermissionAction]) -> Vec<&'static str> {
         .collect()
 }
 
-fn set_string(
+pub(crate) fn set_string(
     document: &mut DocumentMut,
     sections: &[&str],
     key: &str,
@@ -1389,7 +1389,7 @@ fn set_string(
     Ok(())
 }
 
-fn set_bool(
+pub(crate) fn set_bool(
     document: &mut DocumentMut,
     sections: &[&str],
     key: &str,
@@ -1400,7 +1400,7 @@ fn set_bool(
     Ok(())
 }
 
-fn set_integer(
+pub(crate) fn set_integer(
     document: &mut DocumentMut,
     sections: &[&str],
     key: &str,
@@ -1461,7 +1461,7 @@ fn table_mut_in<'a>(table: &'a mut Table, sections: &[&str]) -> anyhow::Result<&
     table_mut_in(child, rest)
 }
 
-fn random_hex(bytes: usize) -> anyhow::Result<String> {
+pub(crate) fn random_hex(bytes: usize) -> anyhow::Result<String> {
     use ring::rand::{SecureRandom, SystemRandom};
     let rng = SystemRandom::new();
     let mut buffer = vec![0u8; bytes];

@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth;
 #[allow(dead_code)]
 pub mod backup;
+pub mod bootstrap;
 #[allow(dead_code)]
 pub mod completions;
 #[allow(dead_code)]
