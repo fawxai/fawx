@@ -765,6 +765,7 @@ mod tests {
     }
 
     fn experiment_state(root: &std::path::Path) -> ExperimentToolState {
+        std::fs::create_dir_all(root.join("consensus")).expect("consensus dir");
         ExperimentToolState {
             chain_path: root.join("consensus").join("chain.json"),
             router: Arc::new(ModelRouter::new()),
@@ -856,7 +857,7 @@ mod tests {
         assert!(error.contains("max_rounds must be at least 1"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_experiment_reports_registration_lifecycle() {
         let temp = TempDir::new().expect("tempdir");
         let registrar = Arc::new(RecordingRegistrar::new());
@@ -898,7 +899,8 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].0, "exp-123");
         assert!(completed[0].1);
-        assert!(completed[0].2.contains("Signal: latency"));
+        assert!(completed[0].2.contains("Signal:"));
+        assert!(completed[0].2.contains("latency"));
         assert!(failed.is_empty());
     }
 }

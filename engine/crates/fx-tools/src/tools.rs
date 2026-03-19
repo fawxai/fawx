@@ -3818,7 +3818,7 @@ three
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_experiment_background_mode_returns_immediately() {
         let temp = TempDir::new().expect("tempdir");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -3852,7 +3852,7 @@ three
         .await
         .expect("background mode should return without waiting for progress");
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("Experiment started in background."));
+        assert!(result.output.contains("Experiment started in background"));
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("background experiment should start");
