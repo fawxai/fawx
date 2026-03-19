@@ -72,6 +72,8 @@ final class SetupViewModel {
     var isRefreshing = false
     var isSubmittingProvider = false
     var isTogglingAutoStart = false
+    var isBootstrapping = false
+    var bootstrapProgress: String?
 
     private let appState: AppState
     private var attemptedCertificateHostname: String?
@@ -363,8 +365,23 @@ final class SetupViewModel {
     }
 
     func finishSetup() async {
+        guard !isBootstrapping else {
+            return
+        }
+
+        isBootstrapping = true
+        bootstrapProgress = "Creating Fawx configuration..."
+        readyStatusKind = .idle
+        readyStatusMessage = nil
+        defer {
+            isBootstrapping = false
+            bootstrapProgress = nil
+        }
+
         do {
-            try await appState.completeLocalSetup()
+            try await appState.completeLocalSetup { [weak self] message in
+                self?.bootstrapProgress = message
+            }
         } catch {
             readyStatusKind = .failure
             readyStatusMessage = error.localizedDescription
