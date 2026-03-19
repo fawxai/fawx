@@ -11,10 +11,7 @@ struct ReadyStep: View {
                 Text("🎉")
                     .font(.system(size: 48))
 
-                Text("Fawx is running on this Mac")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(Color.fawxText)
-                    .multilineTextAlignment(.center)
+                headline
 
                 autoStartRow
 
@@ -30,19 +27,41 @@ struct ReadyStep: View {
                         viewModel.goBack()
                     }
                     .buttonStyle(.bordered)
+                    .disabled(viewModel.isBootstrapping)
 
                     Spacer(minLength: 0)
 
-                    Button("Start chatting") {
+                    Button(viewModel.isBootstrapping ? "Starting..." : "Start chatting") {
                         Task {
                             await viewModel.finishSetup()
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.fawxAccent)
+                    .disabled(viewModel.isBootstrapping)
                 }
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var headline: some View {
+        if viewModel.isBootstrapping {
+            VStack(spacing: FawxSpacing.paddingSM) {
+                ProgressView()
+                    .controlSize(.large)
+
+                Text(viewModel.bootstrapProgress ?? "Setting up Fawx...")
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .multilineTextAlignment(.center)
+            }
+        } else {
+            Text("Ready to start")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(Color.fawxText)
+                .multilineTextAlignment(.center)
         }
     }
 
@@ -72,7 +91,7 @@ struct ReadyStep: View {
                 )
             )
             .labelsHidden()
-            .disabled(viewModel.isTogglingAutoStart)
+            .disabled(viewModel.isTogglingAutoStart || viewModel.isBootstrapping)
         }
         .padding(FawxSpacing.paddingMD)
         .background(Color.fawxBackground)

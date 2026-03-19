@@ -101,6 +101,9 @@ fn xml_escape(s: &str) -> String {
 }
 
 pub fn generate_plist(config: &LaunchAgentConfig) -> String {
+    // Keep this LaunchAgent template in sync with
+    // app/Fawx/Services/LocalBootstrapService.swift::generatePlist.
+    // Swift duplicates it during first-launch bootstrap before this API is available.
     let binary = xml_escape(&config.server_binary_path.display().to_string());
     let port = config.port;
     let data_dir = xml_escape(&config.data_dir.display().to_string());
