@@ -43,15 +43,21 @@ pub mod input;
 pub mod learn;
 pub mod loop_engine;
 pub mod perceive;
+pub mod permission_gate;
+pub mod permission_prompt;
 pub mod permissions;
 pub mod policy;
+pub mod process_registry;
 pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
 pub mod signals;
+pub mod streaming;
 pub mod types;
+pub mod user_facing_error;
 pub mod verify;
 pub mod watchdog;
+pub mod yield_primitive;
 
 pub use act::{
     cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
@@ -70,7 +76,17 @@ pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSend
 pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
-pub use proposal_gate::{ProposalGateExecutor, ProposalGateState};
+pub use permission_gate::{PermissionGateExecutor, PermissionPolicy};
+pub use permission_prompt::{
+    PermissionDecision, PermissionPrompt, PermissionPromptState, PromptError, ResolveResult,
+    PROMPT_TTL,
+};
+pub use process_registry::{
+    ListEntry, ProcessConfig, ProcessRegistry, ProcessStatus, SpawnResult, StatusResult,
+};
+pub use proposal_gate::{is_tier3_path, ProposalGateExecutor, ProposalGateState};
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
+pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
 pub use verify::Verification;
+pub use yield_primitive::{WakeCondition, WakeReason, YieldHandle, YieldRequest, YieldWaker};

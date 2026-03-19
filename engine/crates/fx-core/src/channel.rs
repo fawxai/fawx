@@ -9,6 +9,18 @@
 use crate::types::InputSource;
 use std::fmt;
 
+/// Routing context for response delivery.
+///
+/// Channels extract what they need from this structure. Channels that do not
+/// require routing metadata can ignore it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseContext {
+    /// Channel-specific routing key (for example, a Telegram `chat_id`).
+    pub routing_key: Option<String>,
+    /// Original message identifier for reply threading.
+    pub reply_to: Option<String>,
+}
+
 /// A channel represents an input/output source for the agentic loop.
 ///
 /// Channels feed user messages into the kernel and receive responses.
@@ -34,7 +46,7 @@ pub trait Channel: Send + Sync {
     ///
     /// Channels that don't handle their own output (e.g., TUI, which renders
     /// directly) can return `Ok(())` as a no-op.
-    fn send_response(&self, message: &str) -> Result<(), ChannelError>;
+    fn send_response(&self, message: &str, context: &ResponseContext) -> Result<(), ChannelError>;
 }
 
 /// Errors from channel operations.

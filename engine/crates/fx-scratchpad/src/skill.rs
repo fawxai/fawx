@@ -59,7 +59,7 @@ impl ScratchpadSkill {
         })?;
         let parent_id = args["parent_id"].as_u64().map(|v| v as u32);
         let mut sp = self.lock_scratchpad()?;
-        let id = sp
+        let result = sp
             .add(AddParams {
                 kind,
                 label: label.clone(),
@@ -69,7 +69,13 @@ impl ScratchpadSkill {
                 iteration: self.current_iteration(),
             })
             .map_err(|e| e.to_string())?;
-        Ok(format!("Added entry #{id}: {label}"))
+        match result.parent_dropped {
+            Some(pid) => Ok(format!(
+                "Added entry #{}: {} (warning: parent #{} not found, created as top-level)",
+                result.id, label, pid
+            )),
+            None => Ok(format!("Added entry #{}: {}", result.id, label)),
+        }
     }
 
     fn execute_update(&self, arguments: &str) -> Result<String, SkillError> {
@@ -167,7 +173,7 @@ impl Skill for ScratchpadSkill {
             ToolDefinition {
                 name: "scratchpad_add".to_string(),
                 description: "Add a new entry to your scratchpad (working notes). Use to track hypotheses, observations, conclusions, or notes.".to_string(),
-                parameters: json!({"type":"object","properties":{"kind":{"type":"string","enum":["hypothesis","observation","conclusion","note"],"description":"Entry type"},"label":{"type":"string","description":"Short label"},"content":{"type":"string","description":"Content body"},"confidence":{"type":"string","enum":["high","medium","low"],"description":"Confidence (default: medium)"},"parent_id":{"type":"integer","description":"Parent entry ID (optional)"}},"required":["kind","label","content"]}),
+                parameters: json!({"type":"object","properties":{"kind":{"type":"string","enum":["hypothesis","observation","conclusion","note"],"description":"Entry type"},"label":{"type":"string","description":"Short label"},"content":{"type":"string","description":"Content body"},"confidence":{"type":"string","enum":["high","medium","low"],"description":"Confidence (default: medium)"},"parent_id":{"type":"integer","description":"ID of an existing entry to nest under. Omit entirely for top-level entries. Do not pass 0 as a default."}},"required":["kind","label","content"]}),
             },
             ToolDefinition {
                 name: "scratchpad_update".to_string(),
@@ -429,16 +435,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_invalid_parent() {
+    async fn add_invalid_parent_falls_back_with_warning() {
         let s = test_skill();
-        assert!(s
+        let result = s
             .execute(
                 "scratchpad_add",
                 r#"{"kind":"note","label":"o","content":"n","parent_id":99}"#,
-                None
+                None,
             )
             .await
-            .expect("h")
-            .is_err());
+            .expect("handler returned")
+            .expect("should succeed with fallback");
+        assert!(
+            result.contains("warning"),
+            "response should contain warning: {result}"
+        );
+        assert!(
+            result.contains("parent #99 not found"),
+            "response should mention dropped parent: {result}"
+        );
     }
 }

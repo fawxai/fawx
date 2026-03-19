@@ -6,20 +6,60 @@
 //! responses, and calling the Bot API. No agentic loop logic — that stays
 //! in HeadlessApp.
 
-use fx_core::channel::{Channel, ChannelError};
+pub mod progress;
+
+pub use progress::build_telegram_progress_callback;
+
+/// Redact Telegram bot tokens from error messages to prevent log leaks.
+pub fn sanitize_telegram_error(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text.as_str();
+    while let Some(start) = remaining.find("/bot") {
+        result.push_str(&remaining[..start]);
+        result.push_str("/bot<REDACTED>");
+        let after_bot = &remaining[start + 4..];
+        match after_bot.find('/') {
+            Some(end) => remaining = &after_bot[end..],
+            None => {
+                remaining = "";
+                break;
+            }
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// Telegram Bot API maximum message length in UTF-8 code units.
-const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+pub(crate) const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+
+/// Slash commands registered with Telegram on startup via `setMyCommands`.
+/// Keep in sync with `fx-cli/src/commands/slash.rs`.
+const TELEGRAM_COMMANDS: &[(&str, &str)] = &[
+    ("model", "Switch or list LLM models"),
+    ("status", "Engine status and health"),
+    ("budget", "Show token budget"),
+    ("new", "Start a new conversation"),
+    ("history", "Show conversation history"),
+    ("thinking", "Toggle thinking mode"),
+    ("config", "Show or reload configuration"),
+    ("help", "Show available commands"),
+];
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -123,6 +163,15 @@ pub struct OutgoingMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+}
+
+/// Internal queued Telegram response awaiting API delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMessage {
+    pub chat_id: i64,
+    pub text: String,
+    pub parse_mode: Option<String>,
     pub reply_to_message_id: Option<i64>,
 }
 
@@ -233,11 +282,11 @@ struct TgFile {
 }
 
 /// Check a Telegram Bot API response for errors.
-async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError> {
+pub(crate) async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError> {
     let api_resp: ApiResponse = resp
         .json()
         .await
-        .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+        .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
     if !api_resp.ok {
         let desc = api_resp
@@ -266,7 +315,7 @@ async fn send_single_message(
         .json(msg)
         .send()
         .await
-        .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+        .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
     check_api_response(resp).await
 }
 
@@ -315,6 +364,175 @@ fn find_split_point(text: &str) -> usize {
     idx
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MarkdownSegment {
+    Text(String),
+    CodeBlock(String),
+}
+
+fn markdown_to_telegram_html(message: &str) -> String {
+    split_markdown_segments(message)
+        .into_iter()
+        .map(render_markdown_segment)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn split_markdown_segments(message: &str) -> Vec<MarkdownSegment> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = message[cursor..].find("```") {
+        let start = cursor + rel_start;
+        if start > cursor {
+            segments.push(MarkdownSegment::Text(message[cursor..start].to_string()));
+        }
+        if let Some((end, block)) = take_code_block(message, start) {
+            segments.push(block);
+            cursor = end;
+            continue;
+        }
+        segments.push(MarkdownSegment::Text(message[start..].to_string()));
+        return segments;
+    }
+
+    segments.push(MarkdownSegment::Text(message[cursor..].to_string()));
+    segments
+}
+
+fn take_code_block(message: &str, start: usize) -> Option<(usize, MarkdownSegment)> {
+    let content_start = start + 3;
+    let rel_end = message[content_start..].find("```")?;
+    let content_end = content_start + rel_end;
+    let code = code_block_contents(&message[content_start..content_end]);
+    let end = content_end + 3;
+    Some((end, MarkdownSegment::CodeBlock(code.to_string())))
+}
+
+fn code_block_contents(block: &str) -> &str {
+    let without_language = match block.find('\n') {
+        Some(newline) => &block[newline + 1..],
+        None => block,
+    };
+    without_language
+        .strip_suffix('\n')
+        .unwrap_or(without_language)
+}
+
+fn render_markdown_segment(segment: MarkdownSegment) -> String {
+    match segment {
+        MarkdownSegment::Text(text) => render_text_segment(&text),
+        MarkdownSegment::CodeBlock(code) => format!("<pre>{}</pre>", escape_html(&code)),
+    }
+}
+
+fn render_text_segment(text: &str) -> String {
+    let escaped = escape_html(text);
+    let (protected, codes) = protect_inline_code(&escaped);
+    let bolded = bold_regex()
+        .replace_all(&protected, "<b>$1</b>")
+        .into_owned();
+    let italicized = apply_italic_tags(&bolded);
+    restore_code_tokens(italicized, codes)
+}
+
+fn protect_inline_code(text: &str) -> (String, Vec<String>) {
+    let mut output = String::new();
+    let mut codes = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find('`') {
+        let start = cursor + rel_start;
+        output.push_str(&text[cursor..start]);
+        let code_start = start + 1;
+        let Some(rel_end) = text[code_start..].find('`') else {
+            output.push_str(&text[start..]);
+            return (output, codes);
+        };
+        let code_end = code_start + rel_end;
+        if code_end == code_start {
+            output.push('`');
+            cursor = code_start;
+            continue;
+        }
+        push_code_token(&mut output, &mut codes, &text[code_start..code_end]);
+        cursor = code_end + 1;
+    }
+
+    output.push_str(&text[cursor..]);
+    (output, codes)
+}
+
+fn push_code_token(output: &mut String, codes: &mut Vec<String>, code: &str) {
+    let index = codes.len();
+    output.push_str(&format!("\u{E000}CODE{index}\u{E001}"));
+    codes.push(format!("<code>{code}</code>"));
+}
+
+fn restore_code_tokens(mut text: String, codes: Vec<String>) -> String {
+    for (index, code) in codes.into_iter().enumerate() {
+        text = text.replace(&format!("\u{E000}CODE{index}\u{E001}"), &code);
+    }
+    text
+}
+
+fn bold_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\*\*(.+?)\*\*").expect("valid bold regex"))
+}
+
+fn apply_italic_tags(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find('*') {
+        let start = cursor + rel_start;
+        output.push_str(&text[cursor..start]);
+        if !is_single_asterisk(text, start) {
+            output.push('*');
+            cursor = start + 1;
+            continue;
+        }
+        let Some(end) = find_italic_end(text, start + 1) else {
+            output.push('*');
+            cursor = start + 1;
+            continue;
+        };
+        output.push_str("<i>");
+        output.push_str(&text[start + 1..end]);
+        output.push_str("</i>");
+        cursor = end + 1;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn is_single_asterisk(text: &str, index: usize) -> bool {
+    let bytes = text.as_bytes();
+    bytes[index] == b'*'
+        && (index == 0 || bytes[index - 1] != b'*')
+        && (index + 1 == bytes.len() || bytes[index + 1] != b'*')
+}
+
+fn find_italic_end(text: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while let Some(rel_index) = text[cursor..].find('*') {
+        let index = cursor + rel_index;
+        if index > start && is_single_asterisk(text, index) {
+            return Some(index);
+        }
+        cursor = index + 1;
+    }
+    None
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 // ---------------------------------------------------------------------------
 // TelegramChannel
 // ---------------------------------------------------------------------------
@@ -324,14 +542,14 @@ pub struct TelegramChannel {
     config: TelegramConfig,
     client: reqwest::Client,
     active: AtomicBool,
-    last_chat_id: Mutex<Option<i64>>,
+    outbound: Mutex<VecDeque<QueuedMessage>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Overridable for testing via [`TelegramChannel::new_with_base_url`].
     base_url: String,
 }
 
 /// Default Telegram Bot API base URL.
-const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
 impl TelegramChannel {
     /// Create a new Telegram channel with the given configuration.
@@ -347,9 +565,27 @@ impl TelegramChannel {
             config,
             client: reqwest::Client::new(),
             active: AtomicBool::new(true),
-            last_chat_id: Mutex::new(None),
+            outbound: Mutex::new(VecDeque::new()),
             base_url,
         }
+    }
+
+    /// Build a Telegram-backed experiment progress callback for one
+    /// `run_experiment` invocation in `chat_id`.
+    ///
+    /// Headless callers should install the returned callback on a short-lived
+    /// `FawxToolExecutor` or per-call tool context, drop that callback when the
+    /// tool returns, then await the join handle so the last buffered edit is
+    /// flushed to Telegram.
+    pub fn build_experiment_progress(
+        &self,
+        chat_id: i64,
+    ) -> (fx_consensus::ProgressCallback, tokio::task::JoinHandle<()>) {
+        progress::build_telegram_progress_callback_with_base_url(
+            self.config.bot_token.clone(),
+            chat_id,
+            self.base_url.clone(),
+        )
     }
 
     /// Build the Bot API URL for a given method.
@@ -393,16 +629,41 @@ impl TelegramChannel {
         }))
     }
 
-    /// Set the last chat ID (for Channel::send_response return path).
-    pub fn set_last_chat_id(&self, chat_id: i64) {
-        if let Ok(mut guard) = self.last_chat_id.lock() {
-            *guard = Some(chat_id);
+    /// Take all queued outbound messages.
+    pub fn drain_outbound(&self) -> Vec<QueuedMessage> {
+        match self.outbound.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => Vec::new(),
         }
     }
 
-    /// Get the last chat ID, if set.
-    pub fn last_chat_id(&self) -> Option<i64> {
-        self.last_chat_id.lock().ok().and_then(|g| *g)
+    pub fn queue_response(
+        &self,
+        message: &str,
+        context: &ResponseContext,
+        parse_mode: Option<String>,
+    ) -> Result<(), ChannelError> {
+        let chat_id = parse_chat_id(context)?;
+        let reply_to_message_id = parse_reply_to(context)?;
+        self.queue_outbound(QueuedMessage {
+            chat_id,
+            text: message.to_string(),
+            parse_mode,
+            reply_to_message_id,
+        })
+    }
+
+    fn queue_outbound(&self, message: QueuedMessage) -> Result<(), ChannelError> {
+        const MAX_OUTBOUND_MESSAGES: usize = 100;
+        let mut queue = self
+            .outbound
+            .lock()
+            .map_err(|error| ChannelError::DeliveryFailed(error.to_string()))?;
+        if queue.len() >= MAX_OUTBOUND_MESSAGES {
+            queue.pop_front();
+        }
+        queue.push_back(message);
+        Ok(())
     }
 
     // Finding #1: Webhook secret validation
@@ -443,13 +704,13 @@ impl TelegramChannel {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?
             .error_for_status()
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let safe_name = sanitize_file_id(file_id);
         let dest = dest_dir.join(format!("{message_id}-{safe_name}.jpg"));
@@ -467,12 +728,12 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let file_resp: GetFileResponse = resp
             .json()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         if !file_resp.ok {
             return Err(TelegramError::ApiError("getFile failed".to_string()));
@@ -519,7 +780,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -539,7 +800,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -551,7 +812,7 @@ impl TelegramChannel {
             .post(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
@@ -563,11 +824,38 @@ impl TelegramChannel {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
         check_api_response(resp).await
     }
 
-    // Finding #6: get_updates as a method
+    /// Register slash commands with Telegram via `setMyCommands`.
+    ///
+    /// Called on startup to keep bot commands in sync with the codebase.
+    /// Fire-and-forget: logs a warning on failure but does not block startup.
+    pub async fn register_commands(&self) {
+        let commands = serde_json::json!({
+            "commands": TELEGRAM_COMMANDS.iter().map(|(cmd, desc)| {
+                serde_json::json!({ "command": cmd, "description": desc })
+            }).collect::<Vec<_>>()
+        });
+
+        let url = self.bot_url("setMyCommands");
+        let result = async {
+            let resp = self
+                .client
+                .post(&url)
+                .json(&commands)
+                .send()
+                .await
+                .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
+            check_api_response(resp).await
+        }
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!("failed to register Telegram commands: {e}");
+        }
+    }
 
     /// Fetch updates via long polling.
     pub async fn get_updates(
@@ -591,12 +879,12 @@ impl TelegramChannel {
             ))
             .send()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         let api_resp: GetUpdatesResponse = resp
             .json()
             .await
-            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            .map_err(|e| TelegramError::ApiError(sanitize_telegram_error(&e)))?;
 
         if !api_resp.ok {
             return Err(TelegramError::ApiError(format!(
@@ -647,6 +935,26 @@ fn compute_next_offset(updates: &[serde_json::Value], current: i64) -> i64 {
     next
 }
 
+fn parse_chat_id(context: &ResponseContext) -> Result<i64, ChannelError> {
+    let value = context
+        .routing_key
+        .as_deref()
+        .ok_or(ChannelError::NotConnected)?;
+    value.parse::<i64>().map_err(|error| {
+        ChannelError::DeliveryFailed(format!("invalid telegram chat_id `{value}`: {error}"))
+    })
+}
+
+fn parse_reply_to(context: &ResponseContext) -> Result<Option<i64>, ChannelError> {
+    let Some(value) = context.reply_to.as_deref() else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<i64>().map_err(|error| {
+        ChannelError::DeliveryFailed(format!("invalid telegram reply_to `{value}`: {error}"))
+    })?;
+    Ok(Some(parsed))
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait implementation
 // ---------------------------------------------------------------------------
@@ -668,36 +976,9 @@ impl Channel for TelegramChannel {
         self.active.load(Ordering::Relaxed)
     }
 
-    // Finding #3: Reuse send_single_message + split_message
-    fn send_response(&self, message: &str) -> Result<(), ChannelError> {
-        let chat_id = self
-            .last_chat_id
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .ok_or(ChannelError::NotConnected)?;
-
-        let chunks = split_message(message);
-        let client = self.client.clone();
-        let base_url = self.base_url.clone();
-        let token = self.config.bot_token.clone();
-
-        tokio::spawn(async move {
-            for chunk in chunks {
-                let msg = OutgoingMessage {
-                    chat_id,
-                    text: chunk,
-                    parse_mode: Some("Markdown".to_string()),
-                    reply_to_message_id: None,
-                };
-                if let Err(e) = send_single_message(&client, &base_url, &token, &msg).await {
-                    tracing::error!("Telegram send failed: {e}");
-                    break;
-                }
-            }
-        });
-
-        Ok(())
+    fn send_response(&self, message: &str, context: &ResponseContext) -> Result<(), ChannelError> {
+        let html = markdown_to_telegram_html(message);
+        self.queue_response(&html, context, Some("HTML".to_string()))
     }
 }
 
@@ -767,6 +1048,10 @@ mod tests {
                 }}
             }}"#
         )
+    }
+
+    fn assert_markdown_to_html(input: &str, expected: &str) {
+        assert_eq!(markdown_to_telegram_html(input), expected);
     }
 
     // ── Parse update tests ──────────────────────────────────────────────
@@ -1122,17 +1407,151 @@ mod tests {
         assert!(!json_str.contains("reply_to_message_id"));
     }
 
+    #[test]
+    fn markdown_to_html_converts_bold() {
+        assert_markdown_to_html("**hello**", "<b>hello</b>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_italic() {
+        assert_markdown_to_html("*hello*", "<i>hello</i>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_inline_code() {
+        assert_markdown_to_html("`foo`", "<code>foo</code>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_code_block() {
+        assert_markdown_to_html("```\ncode\n```", "<pre>code</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_escapes_html_in_plain_text() {
+        assert_markdown_to_html("<script>", "&lt;script&gt;");
+    }
+
+    #[test]
+    fn markdown_to_html_handles_mixed_formatting() {
+        assert_markdown_to_html(
+            "**hello** `foo` world",
+            "<b>hello</b> <code>foo</code> world",
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_plain_text_unchanged() {
+        assert_markdown_to_html("just plain text", "just plain text");
+    }
+
+    #[test]
+    fn markdown_to_html_keeps_code_blocks_literal() {
+        assert_markdown_to_html("```\n**hello**\n```", "<pre>**hello**</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_handles_bold_with_inline_code_inside() {
+        assert_markdown_to_html(
+            "**bold with `code` inside**",
+            "<b>bold with <code>code</code> inside</b>",
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_returns_empty_string_for_empty_input() {
+        assert_markdown_to_html("", "");
+    }
+
+    #[test]
+    fn markdown_to_html_escapes_ampersands() {
+        assert_markdown_to_html("AT&T", "AT&amp;T");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_bold_as_plain_text() {
+        assert_markdown_to_html("**hello", "**hello");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_inline_code_as_plain_text() {
+        assert_markdown_to_html("`hello", "`hello");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_code_block_as_plain_text() {
+        assert_markdown_to_html("```\nhello", "```\nhello");
+    }
+
+    #[test]
+    fn markdown_to_html_strips_code_block_language_tag() {
+        assert_markdown_to_html("```rust\nlet x = 1;\n```", "<pre>let x = 1;</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_double_escapes_existing_html_entities() {
+        assert_markdown_to_html("&amp; &lt;", "&amp;amp; &amp;lt;");
+    }
+
     // ── Channel trait tests ─────────────────────────────────────────────
 
     #[test]
-    fn send_response_fails_without_chat_id() {
+    fn send_response_fails_without_routing_key() {
         let ch = make_channel();
-        let result = ch.send_response("hello");
+        let result = ch.send_response("hello", &ResponseContext::default());
         assert!(result.is_err());
         match result.unwrap_err() {
             ChannelError::NotConnected => {}
             other => panic!("expected NotConnected, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_response_queues_html_formatted_message() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: Some("99".to_string()),
+        };
+        ch.send_response("**hello**", &context)
+            .expect("queue response");
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(
+            outbound,
+            vec![QueuedMessage {
+                chat_id: 12345,
+                text: "<b>hello</b>".to_string(),
+                parse_mode: Some("HTML".to_string()),
+                reply_to_message_id: Some(99),
+            }]
+        );
+    }
+
+    #[test]
+    fn queue_response_allows_plain_text_messages() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: Some("99".to_string()),
+        };
+        ch.queue_response("hello_error", &context, None)
+            .expect("queue response");
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(outbound[0].parse_mode, None);
+    }
+
+    #[test]
+    fn send_response_rejects_invalid_routing_key() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("not-a-chat".to_string()),
+            reply_to: None,
+        };
+
+        let result = ch.send_response("hello", &context);
+        assert!(matches!(result, Err(ChannelError::DeliveryFailed(_))));
     }
 
     #[test]
@@ -1327,14 +1746,41 @@ mod tests {
         assert_eq!(compute_next_offset(&updates, 0), 104);
     }
 
-    // ── set_last_chat_id ────────────────────────────────────────────────
+    // ── outbound queue ─────────────────────────────────────────────────
 
     #[test]
-    fn set_last_chat_id_enables_send_response() {
+    fn drain_outbound_clears_queue() {
         let ch = make_channel();
-        assert!(ch.send_response("test").is_err());
-        ch.set_last_chat_id(12345);
-        // After setting, send_response would succeed (fire-and-forget spawn).
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: None,
+        };
+        ch.send_response("first", &context).expect("first response");
+
+        assert_eq!(ch.drain_outbound().len(), 1);
+        assert!(ch.drain_outbound().is_empty());
+    }
+
+    #[test]
+    fn outbound_queue_is_bounded_to_one_hundred_messages() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: None,
+        };
+
+        for idx in 0..101 {
+            ch.send_response(&format!("msg-{idx}"), &context)
+                .expect("queued response");
+        }
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(outbound.len(), 100);
+        assert_eq!(outbound.first().map(|msg| msg.text.as_str()), Some("msg-1"));
+        assert_eq!(
+            outbound.last().map(|msg| msg.text.as_str()),
+            Some("msg-100")
+        );
     }
 
     // ── Integration tests (require real bot token) ──────────────────────
@@ -1376,5 +1822,123 @@ mod tests {
         let resp: GetUpdatesResponse = serde_json::from_str(json).expect("should deserialize");
         assert!(resp.ok);
         assert!(resp.description.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_commands_sends_set_my_commands() {
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let captured_clone = captured.clone();
+
+        let app = axum::Router::new().route(
+            "/bot123456:ABC-DEF/setMyCommands",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    axum::Json(serde_json::json!({ "ok": true, "result": true }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let ch = TelegramChannel::new_with_base_url(make_config(), format!("http://{addr}"));
+        ch.register_commands().await;
+
+        let body = captured.lock().await;
+        let body = body.as_ref().expect("should have received request");
+        let commands = body["commands"].as_array().expect("commands array");
+        assert_eq!(commands.len(), TELEGRAM_COMMANDS.len());
+        // Verify first and last command match
+        assert_eq!(commands[0]["command"], TELEGRAM_COMMANDS[0].0);
+        assert_eq!(commands[0]["description"], TELEGRAM_COMMANDS[0].1);
+        let last = TELEGRAM_COMMANDS.len() - 1;
+        assert_eq!(commands[last]["command"], TELEGRAM_COMMANDS[last].0);
+    }
+
+    #[tokio::test]
+    async fn register_commands_logs_warning_on_api_failure() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let app = axum::Router::new().route(
+            "/bot123456:ABC-DEF/setMyCommands",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "description": "Unauthorized"
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let ch = TelegramChannel::new_with_base_url(make_config(), format!("http://{addr}"));
+        // Should not panic — fire-and-forget with warning
+        ch.register_commands().await;
+    }
+
+    #[test]
+    fn telegram_commands_all_have_nonempty_descriptions() {
+        for (cmd, desc) in TELEGRAM_COMMANDS {
+            assert!(!cmd.is_empty(), "command name is empty");
+            assert!(!desc.is_empty(), "description for /{cmd} is empty");
+            assert!(
+                !cmd.starts_with('/'),
+                "/{cmd} should not include the slash prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_telegram_error_redacts_bot_token() {
+        let error = "error for url (https://api.telegram.org/bot123456:ABC-DEF/getUpdates)";
+        let sanitized = sanitize_telegram_error(&error);
+        assert!(!sanitized.contains("123456:ABC-DEF"));
+        assert!(sanitized.contains("/bot<REDACTED>/getUpdates"));
+    }
+
+    #[test]
+    fn sanitize_telegram_error_preserves_non_telegram_errors() {
+        let error = "connection refused";
+        assert_eq!(sanitize_telegram_error(&error), "connection refused");
+    }
+
+    #[test]
+    fn api_error_from_reqwest_style_error_is_sanitized_at_construction() {
+        // Simulate what happens when reqwest returns an error containing a bot
+        // token URL — the token should already be redacted inside the ApiError
+        // because construction sites call sanitize_telegram_error.
+        let fake_reqwest_error =
+            "error sending request for url (https://api.telegram.org/bot123456:ABC-DEF/getUpdates): connection reset";
+        let err = TelegramError::ApiError(sanitize_telegram_error(&fake_reqwest_error));
+        let displayed = format!("{err}");
+        assert!(
+            !displayed.contains("123456:ABC-DEF"),
+            "token leaked in display: {displayed}"
+        );
+        assert!(
+            displayed.contains("/bot<REDACTED>/getUpdates"),
+            "expected redacted URL in: {displayed}"
+        );
+    }
+
+    #[test]
+    fn sanitize_telegram_error_handles_multiple_occurrences() {
+        let error = "tried /bot111:AAA/send then /bot222:BBB/edit";
+        let sanitized = sanitize_telegram_error(&error);
+        assert!(!sanitized.contains("111:AAA"));
+        assert!(!sanitized.contains("222:BBB"));
     }
 }

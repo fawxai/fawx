@@ -119,6 +119,34 @@ pub fn parse_index(json: &str) -> Result<Vec<SkillEntry>, MarketplaceError> {
     Ok(index.skills)
 }
 
+/// Validate that a skill name contains only safe characters.
+///
+/// Rejects names that contain path separators, `..`, or any characters
+/// that could lead to path traversal when used in filesystem paths or URLs.
+/// Only alphanumeric characters, hyphens, and underscores are allowed.
+pub fn validate_skill_name(name: &str) -> Result<(), MarketplaceError> {
+    if name.is_empty() {
+        return Err(MarketplaceError::InstallError(
+            "skill name must not be empty".to_string(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        return Err(MarketplaceError::InstallError(format!(
+            "skill name contains forbidden characters: '{name}'"
+        )));
+    }
+    // Allow only alphanumeric, hyphens, and underscores.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(MarketplaceError::InstallError(format!(
+            "skill name contains invalid characters (only alphanumeric, '-', '_' allowed): '{name}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that a registry URL uses HTTPS.
 fn require_https(url: &str) -> Result<(), MarketplaceError> {
     if !url.starts_with("https://") {
@@ -214,6 +242,7 @@ pub fn install(
     skill_name: &str,
 ) -> Result<InstallResult, MarketplaceError> {
     require_https(&config.registry_url)?;
+    validate_skill_name(skill_name)?;
 
     let entries = fetch_index(&config.registry_url)?;
     let name_lower = skill_name.to_lowercase();
@@ -224,11 +253,32 @@ pub fn install(
             MarketplaceError::SkillNotFound(format!("'{skill_name}' not in registry"))
         })?;
 
+    validate_skill_name(&entry.name)?;
+
     let files = download_skill_files(&config.registry_url, &entry.name)?;
     verify_against_trusted_keys(&files.wasm, &files.signature, &config.trusted_keys)?;
     validate_manifest_toml(&files.manifest)?;
 
     let install_dir = config.data_dir.join("skills").join(&entry.name);
+    // Verify the resolved install path is actually under the skills directory.
+    let skills_dir = config.data_dir.join("skills");
+    let canonical_skills = skills_dir
+        .canonicalize()
+        .unwrap_or_else(|_| skills_dir.clone());
+    let canonical_install = install_dir.canonicalize().unwrap_or_else(|_| {
+        // If install_dir doesn't exist yet, canonicalize the parent and append.
+        let parent = install_dir.parent().unwrap_or(&skills_dir);
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        canonical_parent.join(install_dir.file_name().unwrap_or_default())
+    });
+    if !canonical_install.starts_with(&canonical_skills) {
+        return Err(MarketplaceError::InstallError(format!(
+            "install path escapes skills directory: {}",
+            install_dir.display()
+        )));
+    }
     write_skill_files(
         &install_dir,
         &entry.name,
@@ -479,7 +529,30 @@ capabilities = ["network"]
         }
     }
 
-    // 9. list_installed_empty_dir
+    // 9. validate_skill_name rejects path traversal
+    #[test]
+    fn validate_skill_name_rejects_path_traversal() {
+        assert!(validate_skill_name("../../etc").is_err());
+        assert!(validate_skill_name("skill/../../../target").is_err());
+        assert!(validate_skill_name("skill/subdir").is_err());
+        assert!(validate_skill_name("skill\\subdir").is_err());
+        assert!(validate_skill_name("").is_err());
+        assert!(validate_skill_name("skill\0name").is_err());
+        assert!(validate_skill_name("skill name").is_err());
+        assert!(validate_skill_name("skill.name").is_err());
+        assert!(validate_skill_name("-o ProxyCommand").is_err());
+    }
+
+    // 10. validate_skill_name accepts valid names
+    #[test]
+    fn validate_skill_name_accepts_valid() {
+        assert!(validate_skill_name("weather").is_ok());
+        assert!(validate_skill_name("my-skill").is_ok());
+        assert!(validate_skill_name("my_skill_v2").is_ok());
+        assert!(validate_skill_name("GitHub123").is_ok());
+    }
+
+    // 11. list_installed_empty_dir
     #[test]
     fn list_installed_empty_dir() {
         let tmp = TempDir::new().expect("tempdir");

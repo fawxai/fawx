@@ -1,505 +1,438 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fawx Roadmap — From Engine to OS</title>
-<style>
-  :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --surface2: #1c2333;
-    --border: #30363d;
-    --text: #e6edf3;
-    --text-dim: #8b949e;
-    --accent: #f0883e;
-    --accent-glow: rgba(240, 136, 62, 0.15);
-    --green: #3fb950;
-    --green-glow: rgba(63, 185, 80, 0.15);
-    --blue: #58a6ff;
-    --blue-glow: rgba(88, 166, 255, 0.15);
-    --purple: #bc8cff;
-    --purple-glow: rgba(188, 140, 255, 0.15);
-    --red: #f85149;
-    --red-glow: rgba(248, 81, 73, 0.15);
-    --yellow: #d29922;
-    --yellow-glow: rgba(210, 153, 34, 0.15);
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: var(--bg); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-    line-height: 1.6; padding: 0; overflow-x: hidden;
-  }
-  .header {
-    text-align: center; padding: 48px 24px 32px;
-    background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
-    border-bottom: 1px solid var(--border);
-  }
-  .header h1 { font-size: 2.4em; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; }
-  .header h1 span { color: var(--accent); }
-  .header .subtitle { color: var(--text-dim); font-size: 1.1em; max-width: 600px; margin: 0 auto; }
-  .header .thesis {
-    margin-top: 16px; padding: 12px 20px;
-    background: var(--accent-glow); border: 1px solid rgba(240, 136, 62, 0.3);
-    border-radius: 8px; display: inline-block; font-size: 0.95em; color: var(--accent); font-weight: 500;
-  }
-  .progress-bar {
-    display: flex; align-items: center; justify-content: center; gap: 0;
-    padding: 32px 24px 16px; max-width: 900px; margin: 0 auto;
-  }
-  .progress-segment {
-    flex: 1; height: 6px; background: var(--border); position: relative; cursor: pointer; transition: all 0.3s;
-  }
-  .progress-segment:first-child { border-radius: 3px 0 0 3px; }
-  .progress-segment:last-child { border-radius: 0 3px 3px 0; }
-  .progress-segment.done { background: var(--green); }
-  .progress-segment.active { background: var(--accent); animation: pulse-bar 2s ease-in-out infinite; }
-  .progress-segment:hover { transform: scaleY(2); }
-  .progress-label {
-    position: absolute; top: -24px; left: 50%; transform: translateX(-50%);
-    font-size: 0.7em; color: var(--text-dim); white-space: nowrap;
-    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
-  }
-  @keyframes pulse-bar { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-  .waves { max-width: 1000px; margin: 24px auto; padding: 0 24px; }
-  .wave {
-    margin-bottom: 24px; border: 1px solid var(--border); border-radius: 12px;
-    overflow: hidden; transition: all 0.3s;
-  }
-  .wave:hover { border-color: rgba(255,255,255,0.1); }
-  .wave.expanded { box-shadow: 0 0 30px rgba(0,0,0,0.3); }
-  .wave-header {
-    display: flex; align-items: center; gap: 16px; padding: 20px 24px;
-    background: var(--surface); cursor: pointer; user-select: none; transition: background 0.2s;
-  }
-  .wave-header:hover { background: var(--surface2); }
-  .wave-icon {
-    width: 44px; height: 44px; border-radius: 10px;
-    display: flex; align-items: center; justify-content: center; font-size: 1.4em; flex-shrink: 0;
-  }
-  .wave-info { flex: 1; }
-  .wave-title { font-size: 1.15em; font-weight: 600; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .wave-desc { color: var(--text-dim); font-size: 0.85em; margin-top: 2px; }
-  .wave-meta { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-  .wave-count { font-size: 0.8em; color: var(--text-dim); background: var(--bg); padding: 4px 10px; border-radius: 12px; }
-  .wave-chevron { color: var(--text-dim); font-size: 1.2em; transition: transform 0.3s; }
-  .wave.expanded .wave-chevron { transform: rotate(90deg); }
-  .wave-badge {
-    font-size: 0.65em; padding: 3px 8px; border-radius: 4px;
-    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
-  }
-  .badge-done { background: var(--green-glow); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
-  .badge-active { background: var(--accent-glow); color: var(--accent); border: 1px solid rgba(240,136,62,0.3); }
-  .badge-planned { background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(88,166,255,0.3); }
-  .badge-vision { background: var(--purple-glow); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
-  .badge-blocker { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
-  .badge-debt { background: var(--yellow-glow); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
-  .wave-body { display: none; padding: 0 24px 24px; background: var(--surface); border-top: 1px solid var(--border); }
-  .wave.expanded .wave-body { display: block; }
-  .tree { padding-top: 16px; }
-  .tree-item { position: relative; padding-left: 28px; margin-bottom: 4px; }
-  .tree-item::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 1px; background: var(--border); }
-  .tree-item:last-child::before { bottom: 50%; }
-  .tree-item::after { content: ''; position: absolute; left: 8px; top: 18px; width: 14px; height: 1px; background: var(--border); }
-  .tree-node {
-    padding: 10px 14px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border);
-    cursor: pointer; transition: all 0.2s; display: flex; align-items: flex-start; gap: 10px;
-  }
-  .tree-node:hover { border-color: rgba(255,255,255,0.15); background: var(--surface2); }
-  .node-status { width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; flex-shrink: 0; }
-  .status-done { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .status-active { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse-dot 2s ease-in-out infinite; }
-  .status-planned { background: var(--blue); }
-  .status-vision { background: var(--purple); }
-  .status-blocker { background: var(--red); box-shadow: 0 0 6px var(--red); animation: pulse-dot 2s ease-in-out infinite; }
-  .status-debt { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
-  @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .node-content { flex: 1; min-width: 0; }
-  .node-title { font-weight: 600; font-size: 0.9em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .node-title .issue-link { font-size: 0.8em; color: var(--text-dim); text-decoration: none; font-weight: 400; }
-  .node-title .issue-link:hover { color: var(--blue); }
-  .node-detail { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 0.85em; color: var(--text-dim); line-height: 1.7; }
-  .tree-node.open .node-detail { display: block; }
-  .node-expand { color: var(--text-dim); font-size: 0.85em; flex-shrink: 0; margin-top: 3px; transition: transform 0.2s; }
-  .tree-node.open .node-expand { transform: rotate(90deg); }
-  .tree-divider { padding: 12px 0 8px 28px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); font-weight: 600; }
-  .parallel-badge { font-size: 0.6em; padding: 2px 6px; border-radius: 3px; background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(88,166,255,0.2); margin-left: 6px; vertical-align: middle; }
-  .stats-banner {
-    max-width: 1000px; margin: 24px auto 0; padding: 0 24px;
-    display: flex; gap: 16px; flex-wrap: wrap; justify-content: center;
-  }
-  .stat-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-    padding: 16px 24px; text-align: center; flex: 1; min-width: 140px; max-width: 200px;
-  }
-  .stat-value { font-size: 1.8em; font-weight: 700; color: var(--accent); }
-  .stat-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
-  .dep-graph-section { max-width: 1000px; margin: 40px auto; padding: 0 24px; }
-  .dep-graph-section h2 { font-size: 1.3em; margin-bottom: 16px; color: var(--text-dim); font-weight: 500; }
-  .dep-graph { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; overflow-x: auto; }
-  .dep-flow { display: flex; align-items: center; gap: 8px; min-width: max-content; padding: 8px 0; flex-wrap: wrap; }
-  .dep-flow-node { padding: 8px 14px; border-radius: 8px; font-size: 0.78em; font-weight: 600; white-space: nowrap; border: 1px solid; }
-  .dep-arrow { color: var(--text-dim); font-size: 1.1em; flex-shrink: 0; }
-  .dep-parallel { display: flex; flex-direction: column; gap: 4px; align-items: center; }
-  .dep-parallel-label { font-size: 0.6em; color: var(--blue); text-transform: uppercase; letter-spacing: 0.06em; }
-  .footer {
-    text-align: center; padding: 48px 24px; color: var(--text-dim);
-    font-size: 0.8em; border-top: 1px solid var(--border); margin-top: 48px;
-  }
-  .footer strong { color: var(--accent); }
-  @media (max-width: 600px) {
-    .header h1 { font-size: 1.6em; }
-    .wave-header { padding: 16px; gap: 12px; }
-    .wave-icon { width: 36px; height: 36px; font-size: 1.1em; }
-    .wave-body { padding: 0 16px 16px; }
-    .tree-item { padding-left: 20px; }
-    .stats-banner { gap: 8px; }
-    .stat-card { min-width: 100px; padding: 12px 16px; }
-    .stat-value { font-size: 1.4em; }
-  }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fawx — Roadmap</title>
+  <meta name="description" content="What's built, what's next, and where Fawx is headed.">
+  <style>
+    :root {
+      --orange-50: #FFF8F0; --orange-100: #FFEDD5; --orange-200: #FED7AA;
+      --orange-400: #FB923C; --orange-500: #F97316; --orange-600: #EA580C;
+      --cream: #FFFBF5; --cream-dark: #FFF5EB;
+      --charcoal: #1C1917; --charcoal-light: #44403C; --charcoal-muted: #78716C;
+      --white: #FFFFFF;
+      --terminal-bg: #1E1E2E; --terminal-green: #A6E3A1; --terminal-yellow: #F9E2AF;
+      --terminal-text: #CDD6F4; --terminal-muted: #6C7086;
+      --shadow-sm: 0 1px 3px rgba(0,0,0,0.06); --shadow-md: 0 4px 12px rgba(0,0,0,0.07);
+      --radius: 12px; --radius-lg: 20px;
+      --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+      --max-width: 860px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --cream: #1C1917; --cream-dark: #292524; --charcoal: #FAFAF9;
+        --charcoal-light: #D6D3D1; --charcoal-muted: #A8A29E; --white: #292524; }
+    }
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: var(--font-body); background: var(--cream); color: var(--charcoal); line-height: 1.6; }
+
+    .page-header { padding: 60px 24px 48px; text-align: center; }
+    .page-header h1 { font-size: 2.4rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 12px; }
+    .page-header p { font-size: 1.1rem; color: var(--charcoal-muted); max-width: 560px; margin: 0 auto; }
+
+    .timeline { max-width: var(--max-width); margin: 0 auto; padding: 0 24px 80px; }
+    .phase { margin-bottom: 48px; }
+    .phase-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .phase-badge { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em; padding: 4px 12px; border-radius: 20px; }
+    .badge-shipped { background: var(--terminal-green); color: #1E1E2E; }
+    .badge-building { background: var(--orange-400); color: #fff; }
+    .badge-planned { background: var(--charcoal-muted); color: #fff; }
+    .phase-title { font-size: 1.3rem; font-weight: 700; }
+    .phase-desc { color: var(--charcoal-muted); font-size: 0.95rem; margin-bottom: 16px; line-height: 1.7; }
+    .feature-list { list-style: none; display: grid; gap: 8px; }
+    .feature-list li { display: flex; align-items: flex-start; gap: 10px; font-size: 0.92rem; color: var(--charcoal-light); }
+    .feature-list .check { color: var(--terminal-green); flex-shrink: 0; }
+    .feature-list .wip { color: var(--orange-400); flex-shrink: 0; }
+    .feature-list .planned { color: var(--charcoal-muted); flex-shrink: 0; }
+    .divider { border: none; border-top: 1px solid var(--orange-100); margin: 0; }
+    @media (prefers-color-scheme: dark) { .divider { border-top-color: #44403C; } }
+
+    details.phase-collapsible { margin-bottom: 48px; }
+    details.phase-collapsible summary { cursor: pointer; list-style: none; }
+    details.phase-collapsible summary::-webkit-details-marker { display: none; }
+    details.phase-collapsible summary::marker { display: none; content: ""; }
+    details.phase-collapsible summary .phase-header { position: relative; }
+    details.phase-collapsible summary .phase-header::after {
+      content: "▸"; font-size: 0.9rem; color: var(--charcoal-muted);
+      position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+      transition: transform 0.2s;
+    }
+    details.phase-collapsible[open] summary .phase-header::after {
+      transform: translateY(-50%) rotate(90deg);
+    }
+  </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>🦊 <span>Fawx</span> Roadmap</h1>
-  <div class="subtitle">From self-improving engine to distributed agentic OS</div>
-  <div class="thesis">Fully Autonomous WASM eXtensible — the engine that builds itself</div>
-</div>
+  <header class="page-header">
+    <h1>Fawx Roadmap</h1>
+    <p>Internal. What's built, what's in progress, and where we're headed.</p>
+  </header>
 
-<div class="stats-banner">
-  <div class="stat-card"><div class="stat-value">8</div><div class="stat-label">Waves</div></div>
-  <div class="stat-card"><div class="stat-value">65+</div><div class="stat-label">PRs Merged</div></div>
-  <div class="stat-card"><div class="stat-value">108k</div><div class="stat-label">Lines of Rust</div></div>
-  <div class="stat-card"><div class="stat-value">1,900+</div><div class="stat-label">Tests</div></div>
-</div>
+  <div class="timeline">
 
-<div class="progress-bar">
-  <div class="progress-segment done"><span class="progress-label">W1-4</span></div>
-  <div class="progress-segment done"><span class="progress-label">W5</span></div>
-  <div class="progress-segment done"><span class="progress-label">W6</span></div>
-  <div class="progress-segment done"><span class="progress-label">W7</span></div>
-  <div class="progress-segment active"><span class="progress-label">W8</span></div>
-  <div class="progress-segment"><span class="progress-label">W9</span></div>
-</div>
-
-<div class="waves">
-
-  <!-- ═══════════ WAVES 1-7 (collapsed) ═══════════ -->
-  <div class="wave" id="wave-1-7">
-    <div class="wave-header" onclick="toggleWave('wave-1-7')">
-      <div class="wave-icon" style="background: var(--green-glow); color: var(--green);">✓</div>
-      <div class="wave-info">
-        <div class="wave-title">Waves 1–7: Engine → Self-Improvement → Distributed OS <span class="wave-badge badge-done">Complete</span></div>
-        <div class="wave-desc">Agentic loop, tools, memory, plugins, WASM, signing, headless, marketplace, fleet, orchestrator, channels, thinking</div>
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Core Engine</h2>
       </div>
-      <div class="wave-meta"><span class="wave-count">54+ items shipped</span><span class="wave-chevron">›</span></div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W1-4: 7-step agentic loop, 13 tools, fx-loadable, encrypted credentials, structured memory, streaming, security model (14 attack surfaces)</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W5: WASM bridge + hot-reload + signing, steer/abort, scratchpad, auth + credential store, headless + HTTP API, prompt preprocessing</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W6: Self-improvement tools, canary, ripcord, fawx-test, marketplace client, fx-author, dedup, thinking config</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W7: Channel trait, webhook channel, host_api_v2, fx-fleet, task router, orchestrator, thinking hardening (3 PRs)</div></div><div class="node-expand">›</div></div></div>
+      </summary>
+      <p class="phase-desc">Single Rust binary. Agentic loop with tool calling, memory, and multi-provider support.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> 7-step agentic loop with multi-tool calls</li>
+        <li><span class="check">✓</span> 13+ built-in tools (files, web, browser, code execution)</li>
+        <li><span class="check">✓</span> Persistent memory with semantic search</li>
+        <li><span class="check">✓</span> Multi-provider (Claude, GPT, local models)</li>
+        <li><span class="check">✓</span> Encrypted credential store (AES-256-GCM)</li>
+        <li><span class="check">✓</span> Config management with hot-reload (SIGHUP restart)</li>
+        <li><span class="check">✓</span> Token-by-token streaming over SSE</li>
+        <li><span class="check">✓</span> Reflective memory (fx-journal crate)</li>
+        <li><span class="check">✓</span> Conversation compaction (sliding window + LLM summarization)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">TUI + Multi-Channel</h2>
       </div>
+      </summary>
+      <p class="phase-desc">Terminal UI (ratatui), Telegram bot, HTTP API. Same engine, same memory, different surfaces.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Full terminal UI with streaming, markdown, and tool rendering</li>
+        <li><span class="check">✓</span> Telegram bot channel with image support</li>
+        <li><span class="check">✓</span> Webhook channel for external integrations</li>
+        <li><span class="check">✓</span> HTTP API (headless mode, dual-bind localhost + Tailscale)</li>
+        <li><span class="check">✓</span> Interactive setup wizard with credential store + permission presets</li>
+        <li><span class="check">✓</span> Model switching mid-conversation</li>
+        <li><span class="check">✓</span> Multi-session management</li>
+        <li><span class="check">✓</span> OAuth + API key + setup token authentication flows</li>
+        <li><span class="check">✓</span> CronSkill registered in startup (TUI + HTTP parity)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Kernel Safety Architecture</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Hard kernel/loadable separation. Compiled safety invariants that the agent cannot modify, now shifted to an AX-first model: capability space up front, tripwire/ripcord inside the boundary, hard stops outside it.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Capability space defaults (Open / Standard / Restricted) replace prompt-first approvals</li>
+        <li><span class="check">✓</span> Tripwire → Ripcord pipeline with journaling, approve/pull APIs, and revert engine</li>
+        <li><span class="check">✓</span> request_capability tool for agent-initiated escalation</li>
+        <li><span class="check">✓</span> Tier-3 immutable paths (compiled into binary)</li>
+        <li><span class="check">✓</span> OS-level sandbox framework (Landlock / seccomp / network policy, graceful degradation off Linux)</li>
+        <li><span class="check">✓</span> Retry budget and loop guards</li>
+        <li><span class="check">✓</span> Memory decay and boundary enforcement</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">WASM Skill Plugins</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Hot-loadable WebAssembly skills with cryptographic signature verification.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> WASI runtime with sandboxing</li>
+        <li><span class="check">✓</span> Ed25519 signature verification</li>
+        <li><span class="check">✓</span> Hot-reload without restart</li>
+        <li><span class="check">✓</span> Skill creation CLI (`fawx skill create`)</li>
+        <li><span class="check">✓</span> Marketplace skills: weather, TTS, calculator, GitHub</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Goal-agnostic experimentation that works end-to-end.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Core protocol engine (fx-consensus crate, 74+ tests)</li>
+        <li><span class="check">✓</span> Orchestrator with cross-evaluation and safety gates</li>
+        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
+        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
+        <li><span class="check">✓</span> Subagent-driven nodes (full Fawx agents as experiment nodes)</li>
+        <li><span class="check">✓</span> Experiment tool callable from chat and channels</li>
+        <li><span class="check">✓</span> Post-hoc build verification with retry</li>
+        <li><span class="check">✓</span> Recursive learning (chain history feeds into prompts)</li>
+        <li><span class="check">✓</span> Auto-chain iterative refinement (--max-rounds)</li>
+        <li><span class="check">✓</span> Canonical chain hashing with legacy fallback</li>
+        <li><span class="check">✓</span> Cargo-scoped evaluation (-p target crate only)</li>
+        <li><span class="check">✓</span> Candidate patch persistence in chain</li>
+        <li><span class="check">✓</span> Sequential node execution (--sequential)</li>
+        <li><span class="check">✓</span> Diagnostics (--detail, --raw)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Experiment UX</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Live progress streaming to every surface. Channel-appropriate rendering: side panel in TUI, edit_message on Telegram.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Verbose mode with progress callbacks (--verbose)</li>
+        <li><span class="check">✓</span> TUI side panel with live experiment progress (70/30 split)</li>
+        <li><span class="check">✓</span> Telegram edit_message progress updates (mpsc bridge)</li>
+        <li><span class="check">✓</span> Remote evaluation via SSH (--eval-node, cross-machine)</li>
+        <li><span class="check">✓</span> Progress callback wired through FawxToolExecutor</li>
+        <li><span class="check">✓</span> TUI experiment panel widget with auto-hide</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Distributed Fleet</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Tailnet-only distributed fleet. Token-based auth, fleet management CLI, worker registration across machines.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Fleet signing key (HMAC-SHA256) + bearer tokens</li>
+        <li><span class="check">✓</span> FleetManager with file persistence (nodes.json, tokens.json)</li>
+        <li><span class="check">✓</span> Fleet CLI: fawx fleet init / add / remove / list</li>
+        <li><span class="check">✓</span> Secure file permissions (0600) + atomic persist</li>
+        <li><span class="check">✓</span> Node registry with capability-based routing</li>
+        <li><span class="check">✓</span> HTTP fleet endpoints (register, heartbeat, result)</li>
+        <li><span class="check">✓</span> Worker join flow (fawx fleet join — tested MacBook → Mac Mini over Tailscale, confirmed working 2026-03-13)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Agent Foundation — Migration Readiness</h2>
+      </div>
+      <p class="phase-desc">The critical path to replacing external AI assistants. Context compaction with memory persistence, robust error surfacing, cross-session communication, device pairing, and scheduled tasks.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Context compaction w/ memory flush — SHIPPED (JournalCompactionFlush)</li>
+        <li><span class="check">✓</span> Error surfacing — startup warnings, SSE error emission, /v1/errors/recent endpoint — StreamEvent::Error exists, but async failures still need to surface to users instead of being swallowed</li>
+        <li><span class="check">✓</span> Cross-session messaging — SHIPPED (fx-bus crate)</li>
+        <li><span class="check">✓</span> Device pairing — SHIPPED (fawx pair, fawx devices, /v1/devices endpoints)</li>
+        <li><span class="check">✓</span> Cron / scheduled tasks — SHIPPED (fx-cron crate, 7 HTTP endpoints, 6 agent tools)</li>
+        <li><span class="check">✓</span> Fleet worker mode — serve --fleet SHIPPED (#1422)</li>
+        <li><span class="check">✓</span> Git UI endpoints — 6 real endpoints (status/log/diff/stage/commit/push)</li>
+      </ul>
     </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Native GUI (macOS + iOS)</h2>
+      </div>
+      <p class="phase-desc">Swift native app for macOS and iOS. Phases 1-3 complete (chat client). Phase 4 (self-contained install) and Phase 5 (full TUI parity) specs approved and merged. Codex builds SwiftUI, engine team builds backend endpoints.</p>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">SwiftUI App</h3>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Phase 1: Project setup, networking (FawxClient + SSE), onboarding, basic chat</li>
+        <li><span class="check">✓</span> Phase 2: Markdown rendering, session management, model/thinking pickers, code blocks</li>
+        <li><span class="check">✓</span> Phase 3: Skills browser, settings, error handling, iOS adaptations, keyboard shortcuts</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 4: Self-Contained Install</h3>
+      <ul class="feature-list">
+        <li><span class="wip">◐</span> DMG / distribution pipeline polish (notarization, packaging, launch readiness)</li>
+        <li><span class="check">✓</span> Setup wizard — skippable, non-destructive, re-enterable from Settings</li>
+        <li><span class="check">✓</span> Tailscale-first networking with auto HTTPS via tailscale cert</li>
+        <li><span class="check">✓</span> LaunchAgent daemon — GUI is just a client + manager</li>
+        <li><span class="check">✓</span> Menu bar status icon (start/stop/restart)</li>
+        <li><span class="check">✓</span> iPhone QR code pairing (backend)</li>
+        <li><span class="check">✓</span> 13+ backend endpoints (setup, auth, config presets, pairing, server lifecycle)</li>
+        <li><span class="check">✓</span> <strong>Kernel blindness</strong> — deny agent reads to kernel source paths (compiled const)</li>
+        <li><span class="check">✓</span> <strong>Release profile hardening</strong> — panic=abort, strip=true, lto=true</li>
+        <li><span class="check">✓</span> Swift GUI — setup, chat, fleet, experiments, telemetry, and git flows polished and merged</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5: Full TUI Parity — Backend Complete</h3>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Capability gate executor — action-level permission checks with capability mode as the default</li>
+        <li><span class="check">✓</span> Permission system API — GET/PATCH /v1/permissions with presets, aliases, and mode field</li>
+        <li><span class="check">✓</span> Legacy prompt mode retained as opt-in; default path is capability-space planning, not modal interruption</li>
+        <li><span class="check">✓</span> OpenAI PKCE OAuth — start/callback/refresh endpoints, credential store integration</li>
+        <li><span class="check">✓</span> Synthesis / custom instructions — GET/PUT/DELETE with optimistic concurrency</li>
+        <li><span class="check">✓</span> Usage / cost tracking — real session token counts + estimated cost</li>
+        <li><span class="check">✓</span> Marketplace stub endpoints (search/install/remove)</li>
+        <li><span class="check">✓</span> Proposal endpoints wired to real filesystem proposals</li>
+        <li><span class="check">✓</span> <strong>WASM domain allowlist</strong> — NetworkRestricted capability with per-skill domain control</li>
+        <li><span class="check">✓</span> Subagent model/thinking overrides</li>
+        <li><span class="check">✓</span> request_capability flow wired end-to-end</li>
+        <li><span class="check">✓</span> Swift GUI — all screens polished and merged</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 5.5: Fleet + Experiments + Ripcord</h3>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Fleet dashboard — 5 endpoints (overview, nodes, detail, remove, dispatch)</li>
+        <li><span class="check">✓</span> Fleet task dispatch — wired to FleetHttpClient, sends tasks to worker nodes</li>
+        <li><span class="check">✓</span> ExperimentRegistry — CRUD lifecycle, JSON persistence, cancellation, restart recovery</li>
+        <li><span class="check">✓</span> Experiment execution — tokio::spawn runs run_improvement_cycle() on create</li>
+        <li><span class="check">✓</span> Kernel yield primitive — WakeCondition, YieldRequest, YieldHandle, loop integration</li>
+        <li><span class="check">✓</span> Ripcord API + journal review flow</li>
+        <li><span class="check">✓</span> Telemetry consent backend + Swift settings UI</li>
+        <li><span class="check">✓</span> Swift fleet dashboard + experiment monitor screens — polished and merged</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 6: Ship</h3>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Final chat / UX polish pass — session browser, chat surfaces, fleet UI, settings (4 PRs merged)</li>
+        <li><span class="check">✓</span> GitHub PAT settings UI (spec ready, SecureField + Save in AuthStatusList)</li>
+        <li><span class="check">✓</span> Setup wizard skip (LLM provider step now skippable)</li>
+        <li><span class="check">✓</span> Auth fallback chain (broker → credential store → AuthManager)</li>
+        <li><span class="check">✓</span> Setup token auth — full Claude Code client impersonation (headers + system prompt array)</li>
+        <li><span class="check">✓</span> Thinking levels overhaul — all providers, effort validation, dynamic Swift picker</li>
+        <li><span class="check">✓</span> Tool retry budget (5 retries, 6 total attempts per tool per cycle)</li>
+        <li><span class="wip">◐</span> Streaming scroll smoothing (spec written, in progress)</li>
+        <li><span class="wip">◐</span> Swift main thread I/O audit — RW lock deadlock fix (spec written, in progress)</li>
+        <li><span class="wip">◐</span> EULA, Terms of Service, Privacy Policy (drafted, needs embedding in app/package)</li>
+        <li><span class="planned">○</span> App icon + branding</li>
+        <li><span class="planned">○</span> Sparkle auto-updater (with signature verification — security-critical)</li>
+        <li><span class="planned">○</span> Notarized DMG / distribution packaging</li>
+        <li><span class="planned">○</span> Delaware incorporation</li>
+        <li><span class="planned">○</span> fawx.ai download page</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Git UI Pane</h2>
+      </div>
+      <p class="phase-desc">Built-in Git interface in the native app. Branch status, diff viewer, stage/commit/push — powered by the same git tools the agent uses.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Backend endpoints shipped (GET status/log/diff, POST stage/commit/push)</li>
+        <li><span class="check">✓</span> Swift Git pane — polished and merged</li>
+        <li><span class="check">✓</span> Stage/unstage individual files</li>
+        <li><span class="check">✓</span> Commit with message + push in one flow</li>
+        <li><span class="check">✓</span> Pull/fetch with conflict indication</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Fleet Task Execution</h2>
+      </div>
+      <p class="phase-desc">Distributed task dispatch. Workers receive and execute tasks from the primary, report results. Fleet-aware experiment scheduling.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Worker mode (fawx serve --fleet)</li>
+        <li><span class="check">✓</span> Task dispatch over Tailscale HTTP</li>
+        <li><span class="check">✓</span> Heartbeat monitoring + health checks</li>
+        <li><span class="check">✓</span> PAT borrowing — scoped GitHub credential lending to subagents (ReadOnly / Contribution modes, configurable max)</li>
+        <li><span class="check">✓</span> git_push + github_pr_create tools — agents can push branches and open PRs with token auth</li>
+        <li><span class="check">✓</span> Kernel manifest — structured self-introspection tool (Layer 1/3 visible, Layer 2 excluded per AX)</li>
+        <li><span class="planned">○</span> Fleet-aware experiment scheduling (--fleet flag)</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Self-Improving Fleet Coordination</h2>
+      </div>
+      <p class="phase-desc">Hybrid DAG decomposition + linear refinement chains. Cross-branch tournaments, auto-decomposition engine, per-model thinking profiles.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Cross-branch tournament types (TournamentConfig, BranchScore, TournamentResult)</li>
+        <li><span class="check">✓</span> Auto-decomposition engine — DAG parser, sequential/parallel/DAG dispatchers, aggregator (fx-decompose)</li>
+        <li><span class="check">✓</span> Thinking registry — per-model profiles, runtime rejection cache, priority matching (fx-llm)</li>
+        <li><span class="check">✓</span> Training data curation — chain extraction, quality filters, dataset manager, 4 export formats (fx-training)</li>
+        <li><span class="check">✓</span> ThinkingRegistry wired into HeadlessApp with recent adaptive-profile cleanup</li>
+        <li><span class="check">✓</span> Semantic merge validation — BuildVerifyAggregator with git apply + cargo check</li>
+        <li><span class="check">✓</span> Fitness backpropagation — FitnessContext types + prompt formatter wired into decomposer</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Local Model Integration</h2>
+      </div>
+      <p class="phase-desc">Zero-cost experimentation with local 1-bit models. No API, no cloud, fully private.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> BitNet provider (1-bit LLM on CPU)</li>
+        <li><span class="planned">○</span> Model download + setup wizard</li>
+        <li><span class="planned">○</span> Hardware-aware model selection</li>
+        <li><span class="planned">○</span> Continuous local experimentation</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">fx-forge — Model Forge</h2>
+      </div>
+      <p class="phase-desc">Fawx doesn't just use models — it builds them. Unified pipeline from LoRA on your Mac to from-scratch on Prime Intellect. Same orchestrator, pluggable backends.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Training data curation (fx-training) — extraction, filters, dataset manager, OpenAI/Alpaca/DPO/raw export</li>
+        <li><span class="check">✓</span> fx-forge spec — reviewed and approved</li>
+        <li><span class="check">✓</span> Phase 1: Core types + MockBackend + ArtifactManager + orchestrator</li>
+        <li><span class="planned">○</span> Phase 2: LocalBackend (Unsloth) + LlamaCppConverter (safetensors → GGUF)</li>
+        <li><span class="planned">○</span> Phase 3: CloudBackend (RunPod/Lambda) — remote GPU training</li>
+        <li><span class="planned">○</span> Phase 4: ClusterBackend (Prime Intellect) — distributed pre-training</li>
+        <li><span class="planned">○</span> Phase 5: ServingBackend (vLLM multi-user, llama.cpp single-user)</li>
+        <li><span class="planned">○</span> Phase 6: Self-improvement loop — experiments → curate → train → eval → activate → repeat</li>
+      </ul>
+    </div>
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Android — Embedded Engine</h2>
+      </div>
+      <p class="phase-desc">Fawx engine running on Android devices. No root required — engine runs inside the app as a foreground service. Connect from any client on the Tailnet.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Cross-compile engine to aarch64-linux-android</li>
+        <li><span class="planned">○</span> Embedded engine as Android foreground service</li>
+        <li><span class="planned">○</span> Jetpack Compose UI (mirroring SwiftUI app)</li>
+        <li><span class="planned">○</span> App-first setup (no terminal required)</li>
+        <li><span class="planned">○</span> Localhost HTTP API binding</li>
+        <li><span class="planned">○</span> Tailscale fleet integration from phone</li>
+      </ul>
+    </div>
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-planned">Planned</span>
+        <h2 class="phase-title">Fawx OS — AOSP Fork</h2>
+      </div>
+      <p class="phase-desc">A phone OS where the AI is the operating system, not an app. Custom AOSP fork with Fawx as a first-class system service, purpose-built launcher, root by default.</p>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> AOSP fork with Fawx system service</li>
+        <li><span class="planned">○</span> Custom launcher — AI is the home screen</li>
+        <li><span class="planned">○</span> Root by default, no bootloader dance</li>
+        <li><span class="planned">○</span> Pixel device support (reference hardware)</li>
+        <li><span class="planned">○</span> On-device local model support (GPU inference)</li>
+        <li><span class="planned">○</span> OTA updates with signed builds</li>
+      </ul>
+    </div>
+
   </div>
-
-  <!-- ═══════════ WAVE 8 ═══════════ -->
-  <div class="wave expanded" id="wave-8">
-    <div class="wave-header" onclick="toggleWave('wave-8')">
-      <div class="wave-icon" style="background: var(--accent-glow); color: var(--accent);">8</div>
-      <div class="wave-info">
-        <div class="wave-title">Wave 8: Polish, Parity &amp; Launch <span class="wave-badge badge-active">Active</span></div>
-        <div class="wave-desc">Wire existing features, setup wizard, engine tools, skills, docs, launch</div>
-      </div>
-      <div class="wave-meta"><span class="wave-count">14 done · 5 phases remaining</span><span class="wave-chevron">›</span></div>
-    </div>
-    <div class="wave-body">
-
-      <div class="tree-divider">✅ Shipped (14)</div>
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">API contract tests L1–L3 (199+ tests) · Reflective memory (fx-journal) · TUI fork (Sparx)</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">Telegram channel (4 PRs) · Credential store fix · Subagent spawning · Node commands · Sessions · Config management</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">3 marketplace skills · Tilde fix · Dogfooding Phase 0 proven · 9 parity specs</div></div><div class="node-expand">›</div></div></div>
-      </div>
-
-      <div class="tree-divider">🟡 Phase 0 — Wire Existing Features (5 PRs, ~1,150 lines) <span class="wave-badge badge-debt">Tech Debt</span></div>
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title"><code>node_run</code> tool — wire to TUI + HTTP</div>
-              <div class="node-detail">Tool exists in fx-tools/node_run.rs. FawxToolExecutor has <code>with_node_run()</code>. But nobody calls it — NodeRunState is never attached. SshTransport is implemented but never instantiated. The tool will always return "node_run not configured." Fix: instantiate SshTransport from fleet config, attach via <code>with_node_run()</code> in build_skill_registry.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title"><code>spawn_agent</code> / <code>subagent_status</code> — wire to TUI mode</div>
-              <div class="node-detail">Subagent tools work in headless/HTTP mode (SubagentManager + SubagentControl attached). TUI mode uses <code>HeadlessLoopBuildOptions::default()</code> which has <code>subagent_control: None</code> — so spawn_agent is excluded from the tool list entirely. Fix: create SubagentManager in <code>run_tui()</code> and pass it through <code>HeadlessLoopBuildOptions::parent()</code>.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">Proposal approval flow — <code>/proposals</code>, <code>/approve</code>, <code>/reject</code></div>
-              <div class="node-detail">ProposalGateExecutor writes proposals to <code>~/.fawx/proposals/</code>. ProposalGateState has <code>set_active_proposal()</code>. But no TUI commands exist to list, review, approve, or reject proposals. <code>set_active_proposal()</code> is only called in tests. The self-improvement loop dead-ends at proposal generation. Fix: add /proposals (list pending), /approve &lt;id&gt; (set active + apply), /reject &lt;id&gt; (delete).</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">ChannelRegistry + ResponseRouter — wire the abstraction</div>
-              <div class="node-detail">Built in fx-kernel/channels.rs. Never instantiated in fx-cli. Telegram is wired directly in http_serve.rs bypassing the Channel trait. WebhookChannel (fx-channel-webhook) is a complete implementation that's never used. Fix: instantiate ChannelRegistry, register Telegram + Webhook channels, route through ResponseRouter instead of direct wiring.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">fx-fleet — wire NodeRegistry + TaskRouter + Orchestrator <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
-              <div class="node-detail">Deferred from Phase 0 — fleet model assumes Fawx nodes that heartbeat in, but we only have SSH machines. <code>node_run</code> (PR 3) covers current needs. Full fleet wiring requires: (1) fleet client agent for remote nodes, (2) task dispatch protocol, (3) heartbeat infrastructure. Moved to post-launch. See Phase 5.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">ConfigManager — wire to TUI mode</div>
-              <div class="node-detail">ConfigManager + SIGHUP graceful restart wired in headless/HTTP mode only. TUI's <code>run_tui()</code> doesn't create a ConfigManager, so <code>config_get</code>/<code>config_set</code> model-callable tools may not have the manager to work with. Fix: create ConfigManager in run_tui, pass through TuiAppDeps.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">Canary + ripcord — wire together</div>
-              <div class="node-detail">Signal quality canary (fx-canary) and emergency rollback (fawx-ripcord) both exist as standalone components. Never connected — canary detects regression but doesn't trigger ripcord. Fix: canary threshold breach → invoke ripcord binary automatically.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="tree-divider">🔴 Phase 1 — Setup Wizard + Server Fix <span class="wave-badge badge-blocker">Launch Blocker</span></div>
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-inprogress"></div>
-            <div class="node-content">
-              <div class="node-title"><code>fawx setup</code> — interactive first-run wizard <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1253">#1253</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
-              <div class="node-detail">Provider auth, model selection, channel config (Telegram), HTTP API setup. Smoke tested on Mac Mini — wizard flow works. PR #1254 reviewed + approved, reverted for clippy fixes (derive Default, MutexGuard across await). Re-landing as new PR.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-debt"></div>
-            <div class="node-content">
-              <div class="node-title">Localhost binding for HTTP server <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1256">#1256</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
-              <div class="node-detail"><code>fawx serve --http</code> binds Tailscale-only (100.x.x.x) but <code>fawx-tui</code> expects localhost:8400. Blocks the setup→serve→TUI flow. Also: <code>headless_http.rs</code> (localhost server) is entirely dead code — 18 clippy errors. Fix: dual-bind (Tailscale + localhost) or merge localhost binding into <code>http_serve.rs</code>. Must also clean up dead <code>headless_http.rs</code> and unused streaming code in <code>headless.rs</code>.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="tree-divider">⚡ Phase 1b — TUI Unification <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Wire <code>fawx tui</code> to launch new ratatui TUI</div><div class="node-detail">New ratatui TUI already exists in <code>tui/</code> dir (PR #1243) with <code>FawxBackend</code> that connects via HTTP to the engine. Currently a separate binary (<code>fawx-tui</code>). Old TUI (<code>tui.rs</code>, 3,600 lines) still launches from <code>fawx tui</code>. Fix: make <code>fawx tui</code> launch the new TUI binary or embed it. Smaller scope than originally estimated — backend already works, just needs CLI dispatch. ~50-100 lines in fx-cli.</div></div><div class="node-expand">›</div></div></div>
-      </div>
-
-      <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-active"></div>
-            <div class="node-content">
-              <div class="node-title"><code>edit</code> tool — surgical file editing <span class="parallel-badge">2a engine</span></div>
-              <div class="node-detail">Replace exact text without rewriting files. Add offset/limit to read_file. Must be added to WRITE_TOOLS in ProposalGateExecutor. Security: Tier 3 immutability, path traversal prevention, proposal flow.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Background process management <span class="parallel-badge">2a engine</span></div>
-              <div class="node-detail">Background exec, session IDs, poll/log/kill. Security: kernel-level ProcessRegistry, max concurrent, max lifetime, working dir enforcement, session cleanup, output capture.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Embedding-based memory search <span class="parallel-badge">2c engine</span></div>
-              <div class="node-detail">Engine-level, not WASM. Local embedding model (nomic/candle). Index on write, vector search on read. Layers on existing CRUD memory. Security: model integrity verification, resource budgeting, poisoning defense (#1137).</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Vision skill — image analysis <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Send images to VLM. WASM skill using Network capability. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">TTS skill — text-to-speech <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Edge TTS / ElevenLabs / OpenAI. WASM skill using Network + FileSystem. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Browser skill — web automation <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Headless browser control. WASM + subprocess hybrid. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Canvas skill — UI rendering <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">HTML/data visualization. Lower priority — CLI-first. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="tree-divider">📝 Phase 3 — Polish + Docs (parallel)</div>
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Config commands polish <span class="parallel-badge">3a</span></div><div class="node-detail">Clean up config_get/config_set UX. Validation, errors, help text.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo documentation <span class="parallel-badge">3b</span></div><div class="node-detail">Setup guide, config reference, ripcord docs, command reference. README, CONTRIBUTING, SECURITY, LICENSE.</div></div><div class="node-expand">›</div></div></div>
-      </div>
-
-      <div class="tree-divider">🚀 Phase 4 — Launch (parallel)</div>
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo transfer to fawxai org <span class="parallel-badge">4a</span></div><div class="node-detail">abbudjoe/fawx → fawxai/fawx. Update CI, URLs, references.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">fawx.ai landing page <span class="parallel-badge">4b</span></div><div class="node-detail">Product website. Hero, architecture, demo, features. Dark theme. Static site.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Launch Fest 2026 prep <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1131">#1131</a></div><div class="node-detail">Pitch deck, demo recording. Safety architecture is the moat.</div></div><div class="node-expand">›</div></div></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════ Phase 5: Fleet (Post-Launch) ═══════════ -->
-  <div class="wave" id="phase-5">
-    <div class="wave-header" onclick="toggleWave('phase-5')">
-      <div class="wave-icon" style="background: var(--purple-glow); color: var(--purple);">5</div>
-      <div class="wave-info">
-        <div class="wave-title">Phase 5: Distributed Fleet <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Post-Launch</span></div>
-        <div class="wave-desc">Wire fx-fleet for real multi-node orchestration. Deferred from Phase 0 — requires fleet client agent.</div>
-      </div>
-      <div class="wave-meta"><span class="wave-count">0/5 done</span><span class="wave-chevron">›</span></div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet client agent</div><div class="node-detail">Lightweight daemon that runs on remote nodes (Mac Mini, MacBook, future VPS). Heartbeats to coordinator, receives tasks, reports results. Must be a separate binary (<code>fawx-node</code>), not the full engine.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">NodeRegistry wiring</div><div class="node-detail">Wire NodeRegistry from config (auto-register known nodes). Heartbeat processing. Stale detection + status reporting. <code>/fleet</code> TUI command for visibility.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">TaskRouter + Orchestrator wiring</div><div class="node-detail">Capability-based task routing to fleet nodes. Task lifecycle (submit → dispatch → running → complete/failed). Retry on node failure. Complements <code>node_run</code> (SSH) with structured task dispatch.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Binary rollback via ripcord</div><div class="node-detail">Extend fawx-ripcord to snapshot + restore the <code>fawx</code> binary itself. Versioned binary storage (keep last 3, symlink swap). Triggered by canary or manual. Deferred from Phase 0 — binary bugs are CI/release failures, not agent-caused regressions.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet security hardening</div><div class="node-detail">mTLS between coordinator and nodes. Task signing (coordinator signs, node verifies). Capability allowlists per node. Audit log for cross-node operations.</div></div><div class="node-expand">›</div></div></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════ WAVE 9 ═══════════ -->
-  <div class="wave" id="wave-9">
-    <div class="wave-header" onclick="toggleWave('wave-9')">
-      <div class="wave-icon" style="background: var(--purple-glow); color: var(--purple);">9</div>
-      <div class="wave-info">
-        <div class="wave-title">Wave 9: Training Pipeline — The Model Improves Itself <span class="wave-badge badge-vision">Vision</span></div>
-        <div class="wave-desc">GPU cloud skills, LoRA fine-tuning, training data curation, model eval + deployment</div>
-      </div>
-      <div class="wave-meta"><span class="wave-count">0/5 done</span><span class="wave-chevron">›</span></div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Cloud resource skills · Training data curation · LoRA orchestration · Model eval · Signed adapter deployment</div></div><div class="node-expand">›</div></div></div>
-      </div>
-    </div>
-  </div>
-
-</div>
-
-<!-- ═══════════ Execution Plan ═══════════ -->
-<div class="dep-graph-section">
-  <h2>Execution Plan</h2>
-  <div class="dep-graph">
-    <div class="dep-flow">
-      <div class="dep-flow-node" style="background:var(--yellow-glow);border-color:rgba(210,153,34,0.3);color:var(--yellow);">P0: Wire 6 gaps (5 PRs) 🟡</div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--red-glow);border-color:rgba(248,81,73,0.3);color:var(--red);">P1: fawx setup 🔴</div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-parallel">
-        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">2a: edit + bg procs</div>
-        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">2c: memory embeddings</div>
-        <div class="dep-flow-node" style="background:var(--blue-glow);border-color:rgba(88,166,255,0.3);color:var(--blue);">2b: WASM skills</div>
-        <div class="dep-parallel-label">parallel</div>
-      </div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-parallel">
-        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">3a: config polish</div>
-        <div class="dep-flow-node" style="background:var(--blue-glow);border-color:rgba(88,166,255,0.3);color:var(--blue);">3b: repo docs</div>
-        <div class="dep-parallel-label">parallel</div>
-      </div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-parallel">
-        <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">4a: repo transfer</div>
-        <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">4b: fawx.ai</div>
-        <div class="dep-parallel-label">parallel</div>
-      </div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--purple-glow);border-color:rgba(188,140,255,0.3);color:var(--purple);">Launch 🚀</div>
-    </div>
-  </div>
-</div>
-
-<div class="footer">
-  <strong>Fawx</strong> — Built by Joe + Clawdio 🦝<br>
-  8 waves · 65+ PRs merged · 108,000 lines of Rust · 1,900+ tests<br>
-  Last updated: March 8, 2026
-</div>
-
-<script>
-function toggleWave(id) { document.getElementById(id).classList.toggle('expanded'); }
-function toggleNode(el) { el.classList.toggle('open'); }
-</script>
-
 </body>
 </html>

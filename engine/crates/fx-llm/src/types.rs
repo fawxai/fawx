@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub use fx_core::types::ImageAttachment;
+
 /// Token budget for "high" thinking mode.
 pub const THINKING_BUDGET_HIGH: u32 = 10_000;
 /// Token budget for "adaptive" thinking mode.
@@ -18,12 +20,16 @@ pub const THINKING_BUDGET_ADAPTIVE: u32 = 5_000;
 /// Token budget for "low" thinking mode.
 pub const THINKING_BUDGET_LOW: u32 = 1_024;
 
-/// Extended thinking configuration for a completion request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Thinking/reasoning configuration for LLM requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ThinkingConfig {
-    /// Enable extended thinking with the given token budget.
+    /// Anthropic Claude 4.6 adaptive thinking with effort parameter.
+    Adaptive { effort: String },
+    /// Anthropic Claude 4.5/older manual thinking with fixed token budget.
     Enabled { budget_tokens: u32 },
-    /// Disable extended thinking entirely.
+    /// OpenAI reasoning effort.
+    Reasoning { effort: String },
+    /// Thinking/reasoning disabled.
     Off,
 }
 
@@ -78,6 +84,25 @@ impl Message {
         Self {
             role: MessageRole::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Create a user message with text and optional images.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        let mut content: Vec<ContentBlock> = images
+            .into_iter()
+            .map(|image| ContentBlock::Image {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
+        let text = text.into();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        Self {
+            role: MessageRole::User,
+            content,
         }
     }
 
@@ -136,6 +161,13 @@ pub enum ContentBlock {
         tool_use_id: String,
         /// Tool output content.
         content: Value,
+    },
+    /// Base64-encoded image content block for vision-capable models.
+    Image {
+        /// MIME type (e.g., "image/jpeg", "image/png").
+        media_type: String,
+        /// Base64-encoded image data (no data URI prefix).
+        data: String,
     },
 }
 
@@ -274,6 +306,65 @@ mod tests {
     }
 
     #[test]
+    fn user_with_images_creates_correct_blocks() {
+        let message = Message::user_with_images(
+            "describe this",
+            vec![ImageAttachment {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content.len(), 2);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }
+        );
+        assert_eq!(
+            message.content[1],
+            ContentBlock::Text {
+                text: "describe this".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_with_images_empty_text_omits_text_block() {
+        let message = Message::user_with_images(
+            "",
+            vec![ImageAttachment {
+                media_type: "image/jpeg".to_string(),
+                data: "xyz789".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content.len(), 1);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Image {
+                media_type: "image/jpeg".to_string(),
+                data: "xyz789".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn image_content_block_serde_round_trip() {
+        let block = ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, deserialized);
+    }
+
+    #[test]
     fn test_stream_chunk_default_is_empty() {
         let chunk = StreamChunk::default();
         assert!(chunk.delta_content.is_none());
@@ -296,8 +387,36 @@ mod tests {
         };
         match config {
             ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 10_000),
-            ThinkingConfig::Off => panic!("expected Enabled"),
+            ThinkingConfig::Adaptive { .. }
+            | ThinkingConfig::Reasoning { .. }
+            | ThinkingConfig::Off => panic!("expected Enabled"),
         }
+    }
+
+    #[test]
+    fn thinking_config_adaptive_stores_effort() {
+        let config = ThinkingConfig::Adaptive {
+            effort: "high".to_string(),
+        };
+        assert_eq!(
+            config,
+            ThinkingConfig::Adaptive {
+                effort: "high".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_config_reasoning_stores_effort() {
+        let config = ThinkingConfig::Reasoning {
+            effort: "xhigh".to_string(),
+        };
+        assert_eq!(
+            config,
+            ThinkingConfig::Reasoning {
+                effort: "xhigh".to_string(),
+            }
+        );
     }
 
     #[test]

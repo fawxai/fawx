@@ -4,7 +4,10 @@
 //! operations, validation before write, and comment-preserving persistence
 //! using `toml_edit`.
 
-use crate::{parse_config_document, set_typed_field, write_config_file, FawxConfig};
+use crate::{
+    parse_config_document, parse_log_level, set_typed_field, validate_synthesis_instruction,
+    write_config_file, FawxConfig, VALID_LOG_LEVELS,
+};
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
 
@@ -54,9 +57,9 @@ impl ConfigManager {
         &self.current
     }
 
-    /// Read a config section as JSON. Use `"all"` for the entire config.
+    /// Read a config key or section as JSON. Use `"all"` for the entire config.
     pub fn get(&self, section: &str) -> Result<JsonValue, String> {
-        serialize_section(&self.current, section)
+        serialize_selection(&self.current, section)
     }
 
     /// Update a config value by dot-separated key path.
@@ -71,6 +74,14 @@ impl ConfigManager {
         self.apply_to_file(&sections, field, value)?;
 
         // Reload to pick up the change and re-validate the full config.
+        self.reload()
+    }
+
+    /// Remove a config key by dot-separated path.
+    pub fn clear(&mut self, key: &str) -> Result<(), String> {
+        reject_immutable(key)?;
+        let (sections, field) = parse_key_path(key)?;
+        self.clear_from_file(&sections, field)?;
         self.reload()
     }
 
@@ -120,6 +131,16 @@ impl ConfigManager {
         set_typed_field(&mut document, sections, field, value)?;
         write_config_file(&self.config_path, document.to_string())
     }
+
+    fn clear_from_file(&self, sections: &[&str], field: &str) -> Result<(), String> {
+        let content = read_or_default(&self.config_path)?;
+        if content.is_empty() {
+            return Ok(());
+        }
+        let mut document = parse_config_document(&content)?;
+        remove_field(document.as_table_mut(), sections, field)?;
+        write_config_file(&self.config_path, document.to_string())
+    }
 }
 
 // ── Free functions ──────────────────────────────────────────────────────────
@@ -139,7 +160,7 @@ fn reject_immutable(key: &str) -> Result<(), String> {
 /// Example: `"model.default_model"` → `(["model"], "default_model")`
 fn parse_key_path(key: &str) -> Result<(Vec<&str>, &str), String> {
     let parts: Vec<&str> = key.split('.').collect();
-    if parts.len() < 2 {
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
         return Err(format!(
             "key must be dot-separated (e.g. 'model.default_model'), got '{key}'"
         ));
@@ -158,8 +179,18 @@ fn validate_field_value(key: &str, value: &str) -> Result<(), String> {
         "tools.max_read_size" => validate_min_u64(key, value, 1024),
         "memory.max_entries" => validate_positive_usize(key, value),
         "model.default_model" => validate_model_name(value),
+        "model.synthesis_instruction" => validate_synthesis_instruction(value),
+        "logging.max_files" => validate_positive_usize(key, value),
+        "logging.file_level" | "logging.stderr_level" => validate_log_level(value),
         _ => Ok(()),
     }
+}
+
+fn validate_log_level(value: &str) -> Result<(), String> {
+    if parse_log_level(value).is_some() {
+        return Ok(());
+    }
+    Err(format!("log level must be one of: {VALID_LOG_LEVELS}"))
 }
 
 fn validate_model_name(value: &str) -> Result<(), String> {
@@ -285,6 +316,33 @@ fn toml_value_to_edit_item(val: &toml::Value) -> toml_edit::Item {
     }
 }
 
+fn remove_field(
+    table: &mut toml_edit::Table,
+    sections: &[&str],
+    field: &str,
+) -> Result<(), String> {
+    if let Some(target) = table_for_path(table, sections)? {
+        target.remove(field);
+    }
+    Ok(())
+}
+
+fn table_for_path<'a>(
+    table: &'a mut toml_edit::Table,
+    sections: &[&str],
+) -> Result<Option<&'a mut toml_edit::Table>, String> {
+    let Some((section, rest)) = sections.split_first() else {
+        return Ok(Some(table));
+    };
+    let Some(item) = table.get_mut(section) else {
+        return Ok(None);
+    };
+    let child = item
+        .as_table_mut()
+        .ok_or_else(|| format!("config section '{section}' must be a table"))?;
+    table_for_path(child, rest)
+}
+
 /// Read config file contents, or return an empty string if it doesn't exist.
 fn read_or_default(path: &Path) -> Result<String, String> {
     if path.exists() {
@@ -294,16 +352,25 @@ fn read_or_default(path: &Path) -> Result<String, String> {
     }
 }
 
-/// Serialize a section of the config to JSON.
-fn serialize_section(config: &FawxConfig, section: &str) -> Result<JsonValue, String> {
+/// Serialize a config selection to JSON.
+fn serialize_selection(config: &FawxConfig, selection: &str) -> Result<JsonValue, String> {
     let full =
         serde_json::to_value(config).map_err(|e| format!("failed to serialize config: {e}"))?;
-    if section == "all" {
+    if selection == "all" {
         return Ok(full);
     }
-    full.get(section)
+    lookup_selection(&full, selection)
         .cloned()
-        .ok_or_else(|| format!("unknown config section: '{section}'"))
+        .ok_or_else(|| format!("unknown config key or section: '{selection}'"))
+}
+
+fn lookup_selection<'a>(value: &'a JsonValue, selection: &str) -> Option<&'a JsonValue> {
+    selection
+        .split('.')
+        .try_fold(value, |current, segment| match current {
+            JsonValue::Object(map) => map.get(segment),
+            _ => None,
+        })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -355,7 +422,16 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let mgr = ConfigManager::new(temp.path()).expect("manager");
         let err = mgr.get("nonexistent").unwrap_err();
-        assert!(err.contains("unknown config section"));
+        assert!(err.contains("unknown config key or section"));
+    }
+
+    #[test]
+    fn get_returns_nested_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[model]\ndefault_model = \"test-model\"\n");
+        let mgr = ConfigManager::new(temp.path()).expect("manager");
+        let val = mgr.get("model.default_model").expect("get key");
+        assert_eq!(val, JsonValue::String("test-model".to_string()));
     }
 
     #[test]
@@ -394,6 +470,42 @@ mod tests {
     }
 
     #[test]
+    fn clear_removes_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(
+            temp.path(),
+            "[model]\ndefault_model = \"test-model\"\nsynthesis_instruction = \"Stay concise\"\n",
+        );
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.clear("model.synthesis_instruction")
+            .expect("clear synthesis");
+
+        assert_eq!(mgr.config().model.synthesis_instruction, None);
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(!content.contains("synthesis_instruction"));
+        assert!(content.contains("default_model = \"test-model\""));
+    }
+
+    #[test]
+    fn clear_preserves_comments() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(
+            temp.path(),
+            "# header comment\n[model]\n# keep this comment\ndefault_model = \"test-model\"\nsynthesis_instruction = \"Stay concise\"\n",
+        );
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.clear("model.synthesis_instruction")
+            .expect("clear synthesis");
+
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(content.contains("# header comment"));
+        assert!(content.contains("# keep this comment"));
+        assert!(content.contains("default_model = \"test-model\""));
+    }
+
+    #[test]
     fn set_rejects_immutable_data_dir() {
         let temp = TempDir::new().expect("tempdir");
         let mut mgr = ConfigManager::new(temp.path()).expect("manager");
@@ -428,6 +540,16 @@ mod tests {
     }
 
     #[test]
+    fn set_rejects_empty_synthesis_instruction() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[model]\ndefault_model = \"test-model\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        let err = mgr.set("model.synthesis_instruction", "   ").unwrap_err();
+        assert!(err.contains("synthesis_instruction must not be empty"));
+    }
+
+    #[test]
     fn set_validates_max_read_size_minimum() {
         let temp = TempDir::new().expect("tempdir");
         write_config(temp.path(), "[tools]\nmax_read_size = 2048\n");
@@ -435,6 +557,28 @@ mod tests {
 
         let err = mgr.set("tools.max_read_size", "100").unwrap_err();
         assert!(err.contains("must be >= 1024"));
+    }
+
+    #[test]
+    fn set_accepts_supported_log_level() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[logging]\nfile_level = \"info\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.set("logging.file_level", "TRACE")
+            .expect("set log level");
+
+        assert_eq!(mgr.config().logging.file_level.as_deref(), Some("TRACE"));
+    }
+
+    #[test]
+    fn set_rejects_invalid_log_level() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[logging]\nfile_level = \"info\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        let err = mgr.set("logging.file_level", "verbose").unwrap_err();
+        assert!(err.contains("log level must be one of"));
     }
 
     #[test]

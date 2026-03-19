@@ -3,13 +3,16 @@
 use async_trait::async_trait;
 use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
+use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
@@ -23,15 +26,28 @@ const MAX_THINKING_BUDGET: u32 = 32_000;
 /// Minimum token headroom reserved for the model's response output
 /// when thinking is enabled. Ensures max_tokens > budget_tokens.
 const MIN_RESPONSE_TOKENS: u32 = 1024;
+const VALID_ANTHROPIC_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+const CLAUDE_CODE_SYSTEM_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Anthropic auth mode — determines how credentials are sent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AnthropicAuthMode {
     /// Standard API key: sent as `x-api-key` header.
     ApiKey(String),
     /// OAuth/setup-token (`sk-ant-oat...`): sent as `Authorization: Bearer` with
     /// Claude Code identity headers. Matches OpenClaw's behavior.
     SetupToken(String),
+}
+
+impl fmt::Debug for AnthropicAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::ApiKey(_) => "ApiKey",
+            Self::SetupToken(_) => "SetupToken",
+        };
+        write!(f, "{variant}(<redacted>)")
+    }
 }
 
 impl AnthropicAuthMode {
@@ -55,6 +71,66 @@ pub struct AnthropicProvider {
     api_version: String,
     supported_models: Vec<String>,
     client: reqwest::Client,
+}
+
+fn is_claude_4_6(model: &str) -> bool {
+    let normalized = model.split('/').next_back().unwrap_or(model);
+    normalized.contains("opus-4-6") || normalized.contains("sonnet-4-6")
+}
+
+fn is_valid_anthropic_effort(effort: &str) -> bool {
+    VALID_ANTHROPIC_EFFORTS.contains(&effort)
+}
+
+fn build_output_config(effort: &str) -> Option<AnthropicOutputConfig> {
+    is_valid_anthropic_effort(effort).then(|| AnthropicOutputConfig {
+        effort: effort.to_string(),
+    })
+}
+
+fn build_anthropic_thinking(
+    model: &str,
+    config: &Option<ThinkingConfig>,
+) -> (Option<AnthropicThinking>, Option<AnthropicOutputConfig>) {
+    match config {
+        Some(ThinkingConfig::Adaptive { effort }) => {
+            if !is_claude_4_6(model) {
+                tracing::warn!(
+                    model,
+                    "adaptive thinking requested for non-Claude 4.6 model"
+                );
+            }
+            // output_config.effort must be a valid Anthropic value.
+            // If the effort is "adaptive" or not a recognized value, omit
+            // output_config entirely and let the API use its default.
+            let output_config = build_output_config(effort);
+            (
+                Some(AnthropicThinking::Adaptive {
+                    thinking_type: "adaptive".to_string(),
+                }),
+                output_config,
+            )
+        }
+        Some(ThinkingConfig::Enabled { budget_tokens }) => {
+            let capped = (*budget_tokens).min(MAX_THINKING_BUDGET);
+            if *budget_tokens > MAX_THINKING_BUDGET {
+                tracing::warn!(
+                    requested = budget_tokens,
+                    capped,
+                    "thinking budget exceeds maximum, capping at {MAX_THINKING_BUDGET}"
+                );
+            }
+            (
+                Some(AnthropicThinking::Manual {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: capped,
+                }),
+                None,
+            )
+        }
+        Some(ThinkingConfig::Off) | None => (None, None),
+        Some(ThinkingConfig::Reasoning { .. }) => (None, None),
+    }
 }
 
 impl AnthropicProvider {
@@ -103,14 +179,61 @@ impl AnthropicProvider {
         format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
     }
 
+    fn models_endpoint(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let mut url = Url::parse(&self.models_endpoint())
+            .map_err(|error| LlmError::Config(format!("invalid anthropic models url: {error}")))?;
+        let mut model_ids = Vec::new();
+
+        loop {
+            let response = self.fetch_models_page(url.clone()).await?;
+            model_ids.extend(filter_model_ids(response.data));
+
+            if !response.has_more {
+                return Ok(model_ids);
+            }
+
+            update_pagination_cursor(&mut url, response.last_id)?;
+        }
+    }
+
+    async fn fetch_models_page(&self, url: Url) -> Result<AnthropicModelsResponse, LlmError> {
+        let request_builder = self
+            .client
+            .get(url)
+            .header("anthropic-version", &self.api_version);
+        let response = self.apply_auth(request_builder).send().await?;
+        parse_model_response(response).await
+    }
+
     /// Apply auth headers to a request builder based on auth mode.
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_mode {
             AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
             AnthropicAuthMode::SetupToken(token) => builder
                 .header("Authorization", format!("Bearer {token}"))
-                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-                .header("x-app", "cli"),
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+                )
+                .header("user-agent", "claude-cli/2.1.75")
+                .header("x-app", "cli")
+                .header("accept", "application/json")
+                // Required by Anthropic's API for OAuth/setup-token auth.
+                // Despite the name, this does not enable browser access — it's
+                // an Anthropic SDK misnomer for non-browser clients using Bearer auth.
+                .header("anthropic-dangerous-direct-browser-access", "true"),
+        }
+    }
+
+    fn has_configured_auth(&self) -> bool {
+        match &self.auth_mode {
+            AnthropicAuthMode::ApiKey(key) | AnthropicAuthMode::SetupToken(key) => {
+                !key.trim().is_empty()
+            }
         }
     }
 
@@ -130,6 +253,7 @@ impl AnthropicProvider {
         self.ensure_supported_model(&request.model)?;
 
         let mut system_prompt = request.system_prompt.clone();
+
         let mut messages = Vec::new();
 
         for message in &request.messages {
@@ -160,23 +284,7 @@ impl AnthropicProvider {
             })
             .collect::<Vec<_>>();
 
-        let thinking = match &request.thinking {
-            Some(ThinkingConfig::Enabled { budget_tokens }) => {
-                let capped = (*budget_tokens).min(MAX_THINKING_BUDGET);
-                if *budget_tokens > MAX_THINKING_BUDGET {
-                    tracing::warn!(
-                        requested = budget_tokens,
-                        capped = capped,
-                        "thinking budget exceeds maximum, capping at {MAX_THINKING_BUDGET}"
-                    );
-                }
-                Some(AnthropicThinking {
-                    thinking_type: "enabled".to_string(),
-                    budget_tokens: capped,
-                })
-            }
-            Some(ThinkingConfig::Off) | None => None,
-        };
+        let (thinking, output_config) = build_anthropic_thinking(&request.model, &request.thinking);
 
         let body = AnthropicRequestBody {
             model: request.model.clone(),
@@ -189,21 +297,42 @@ impl AnthropicProvider {
                 request.temperature
             },
             max_tokens: match &thinking {
-                Some(t) => request
+                Some(AnthropicThinking::Manual { budget_tokens, .. }) => request
                     .max_tokens
                     .unwrap_or(4096)
-                    .max(t.budget_tokens + MIN_RESPONSE_TOKENS),
+                    .max(budget_tokens + MIN_RESPONSE_TOKENS),
+                Some(AnthropicThinking::Adaptive { .. }) => request.max_tokens.unwrap_or(16_000),
                 None => request.max_tokens.unwrap_or(4096),
             },
-            system: system_prompt,
+            system: self.build_system_value(system_prompt),
             stream,
             thinking,
+            output_config,
         };
 
         #[cfg(debug_assertions)]
         validate_request(&body);
 
         Ok(body)
+    }
+
+    /// Build the `system` field value.
+    ///
+    /// For setup tokens, Anthropic requires the Claude Code identity as the
+    /// first content block in an array format. For API keys, a plain string.
+    fn build_system_value(&self, prompt: Option<String>) -> Option<serde_json::Value> {
+        if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
+            let mut blocks =
+                vec![serde_json::json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY})];
+            if let Some(text) = prompt {
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+            }
+            Some(serde_json::Value::Array(blocks))
+        } else {
+            prompt.map(serde_json::Value::String)
+        }
     }
 
     fn map_message_to_anthropic(&self, message: &Message) -> Result<AnthropicMessage, LlmError> {
@@ -255,6 +384,12 @@ impl AnthropicProvider {
                     content.push(ContentBlock::ToolResult {
                         tool_use_id,
                         content: result,
+                    });
+                }
+                AnthropicContentBlock::Image { source } => {
+                    content.push(ContentBlock::Image {
+                        media_type: source.media_type,
+                        data: source.data,
                     });
                 }
                 AnthropicContentBlock::Thinking { .. } => {
@@ -518,6 +653,11 @@ impl AnthropicProvider {
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
+        if status.as_u16() == 400 && Self::mentions_thinking_rejection(&body) {
+            tracing::warn!(
+                "provider rejected thinking config — check effort/budget_tokens: {body}"
+            );
+        }
         match status.as_u16() {
             401 | 403 => LlmError::Authentication(body),
             429 => LlmError::RateLimited(body),
@@ -525,6 +665,13 @@ impl AnthropicProvider {
             500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
+    }
+
+    fn mentions_thinking_rejection(body: &str) -> bool {
+        let lowered = body.to_ascii_lowercase();
+        ["thinking", "effort", "budget_tokens", "output_config"]
+            .iter()
+            .any(|term| lowered.contains(term))
     }
 }
 
@@ -561,10 +708,22 @@ impl LlmProvider for AnthropicProvider {
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
+        let endpoint = self.endpoint();
+
+        tracing::debug!(
+            endpoint = %endpoint,
+            auth_mode = ?self.auth_mode,
+            "anthropic streaming request"
+        );
+        tracing::trace!(
+            endpoint = %endpoint,
+            body = %serde_json::to_string(&body).unwrap_or_default(),
+            "anthropic streaming request body"
+        );
 
         let request_builder = self
             .client
-            .post(self.endpoint())
+            .post(endpoint)
             .header("anthropic-version", &self.api_version);
         let response = self.apply_auth(request_builder).json(&body).send().await?;
 
@@ -580,6 +739,15 @@ impl LlmProvider for AnthropicProvider {
         Ok(Box::pin(Self::stream_from_sse(response)))
     }
 
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut stream = self.complete_stream(request).await?;
+        collect_completion_stream(&mut stream, &callback).await
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -588,12 +756,68 @@ impl LlmProvider for AnthropicProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if !self.has_configured_auth() {
+            return Ok(self.supported_models());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => {
+                tracing::warn!("anthropic models response was empty; using static fallback");
+                Ok(self.supported_models())
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to fetch anthropic models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
         }
     }
+}
+
+async fn parse_model_response(
+    response: reqwest::Response,
+) -> Result<AnthropicModelsResponse, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(AnthropicProvider::map_http_error(status, body));
+    }
+
+    response
+        .json::<AnthropicModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))
+}
+
+fn update_pagination_cursor(url: &mut Url, last_id: Option<String>) -> Result<(), LlmError> {
+    let cursor = last_id.ok_or_else(|| {
+        LlmError::InvalidResponse(
+            "anthropic models response set has_more without last_id".to_string(),
+        )
+    })?;
+    url.set_query(Some(&format!("after_id={cursor}")));
+    Ok(())
+}
+
+fn filter_model_ids(models: Vec<AnthropicModel>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|model| model.model_type == "model")
+        .map(|model| model.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBlock, LlmError> {
@@ -611,6 +835,13 @@ fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBloc
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
         }),
+        ContentBlock::Image { media_type, data } => Ok(AnthropicContentBlock::Image {
+            source: AnthropicImageSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.clone(),
+                data: data.clone(),
+            },
+        }),
     }
 }
 
@@ -619,6 +850,7 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -635,18 +867,33 @@ struct AnthropicRequestBody {
     temperature: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+}
+
+/// Anthropic `output_config` parameter for effort control.
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: String,
 }
 
 /// Anthropic extended thinking parameter.
 #[derive(Debug, Serialize)]
-struct AnthropicThinking {
-    #[serde(rename = "type")]
-    thinking_type: String,
-    budget_tokens: u32,
+#[serde(untagged)]
+enum AnthropicThinking {
+    Adaptive {
+        #[serde(rename = "type")]
+        thinking_type: String,
+    },
+    Manual {
+        #[serde(rename = "type")]
+        thinking_type: String,
+        budget_tokens: u32,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -677,12 +924,40 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Value,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
     Thinking {
         thinking: String,
     },
     RedactedThinking {
         data: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModelsResponse {
+    #[serde(default)]
+    data: Vec<AnthropicModel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    last_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModel {
+    id: String,
+    #[serde(rename = "type")]
+    model_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -782,21 +1057,42 @@ fn validate_request(body: &AnthropicRequestBody) {
             "temperature must be None when thinking is enabled \
              (Anthropic requires temperature=1 or omitted)"
         );
+        match thinking {
+            AnthropicThinking::Adaptive { .. } => {
+                if let Some(output_config) = &body.output_config {
+                    assert!(
+                        is_valid_anthropic_effort(&output_config.effort),
+                        "adaptive thinking effort must be a valid Anthropic value"
+                    );
+                }
+            }
+            AnthropicThinking::Manual { budget_tokens, .. } => {
+                assert!(
+                    *budget_tokens > 0,
+                    "thinking.budget_tokens must be > 0 when thinking is enabled"
+                );
+                assert!(
+                    *budget_tokens <= MAX_THINKING_BUDGET,
+                    "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
+                    budget_tokens
+                );
+                assert!(
+                    body.max_tokens > *budget_tokens,
+                    "max_tokens must be greater than thinking.budget_tokens \
+                     ({} <= {})",
+                    body.max_tokens,
+                    budget_tokens
+                );
+                assert!(
+                    body.output_config.is_none(),
+                    "manual thinking must not include effort"
+                );
+            }
+        }
+    } else {
         assert!(
-            thinking.budget_tokens > 0,
-            "thinking.budget_tokens must be > 0 when thinking is enabled"
-        );
-        assert!(
-            thinking.budget_tokens <= MAX_THINKING_BUDGET,
-            "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
-            thinking.budget_tokens
-        );
-        assert!(
-            body.max_tokens > thinking.budget_tokens,
-            "max_tokens must be greater than thinking.budget_tokens \
-             ({} <= {})",
-            body.max_tokens,
-            thinking.budget_tokens
+            body.output_config.is_none(),
+            "effort must be None when thinking is disabled"
         );
     }
 }
@@ -804,8 +1100,106 @@ fn validate_request(body: &AnthropicRequestBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::{collect_stream_chunks, StreamEvent};
+    use crate::test_helpers::{callback_events, read_events, spawn_json_server};
     use crate::types::ToolDefinition;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn anthropic_list_models_parses_response() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"claude-3-5-haiku-20241022","type":"model"},{"id":"claude-3-7-sonnet-latest","type":"alias"},{"id":"claude-sonnet-4-20250514","type":"model"}]}"#,
+        )
+        .await;
+        let provider = AnthropicProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-static".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec![
+                "claude-3-5-haiku-20241022".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_skips_fetch_when_auth_is_empty() {
+        let mut provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-opus-4-1-20250805".to_string()]);
+        provider.auth_mode = AnthropicAuthMode::ApiKey("   ".to_string());
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["claude-opus-4-1-20250805".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_follows_pagination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let first = r#"{"data":[{"id":"claude-3-5-haiku-20241022","type":"model"}],"has_more":true,"last_id":"page-1"}"#;
+            let second = r#"{"data":[{"id":"claude-sonnet-4-20250514","type":"model"}],"has_more":false,"last_id":"page-2"}"#;
+            for expected_after_id in [None, Some("page-1")] {
+                let (mut socket, _) = listener.accept().await.expect("accept connection");
+                let mut buffer = [0_u8; 2048];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                match expected_after_id {
+                    None => assert!(request.starts_with("GET /v1/models HTTP/1.1")),
+                    Some(after_id) => assert!(request
+                        .starts_with(&format!("GET /v1/models?after_id={after_id} HTTP/1.1"))),
+                }
+                let body = if expected_after_id.is_none() {
+                    first
+                } else {
+                    second
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let provider =
+            AnthropicProvider::new(format!("http://{address}"), "test-key").expect("provider");
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec![
+                "claude-3-5-haiku-20241022".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_falls_back_on_error() {
+        let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-opus-4-1-20250805".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["claude-opus-4-1-20250805".to_string()]);
+    }
 
     #[test]
     fn test_build_request_body_maps_system_tools_and_content() {
@@ -919,6 +1313,97 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_stream_collection_emits_text_and_tool_events() {
+        let payload = r#"
+            data: {"type":"content_block_delta","index":0,"delta":{"text":"Hi"}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"query\":\"fawx\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}
+
+            data: [DONE]
+        "#;
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+        let (callback, events) = callback_events();
+
+        let response = collect_stream_chunks(chunks, &callback);
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "search");
+        assert_eq!(response.tool_calls[0].arguments["query"], "fawx");
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            read_events(events),
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Hi".to_string()
+                },
+                StreamEvent::ToolCallStart {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string()
+                },
+                StreamEvent::ToolCallDelta {
+                    id: "toolu_01".to_string(),
+                    args_delta: "{\"query\":\"fawx\"}".to_string()
+                },
+                StreamEvent::ToolCallComplete {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string(),
+                    arguments: "{\"query\":\"fawx\"}".to_string()
+                },
+                StreamEvent::Done {
+                    response: "Hi".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_collection_matches_final_completion_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::Text {
+                    text: "I'll search".to_string(),
+                },
+                AnthropicContentBlock::ToolUse {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"query":"fawx"}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 11,
+            }),
+        };
+        let payload = r#"
+            data: {"type":"content_block_delta","index":0,"delta":{"text":"I'll search"}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"query\":\"fawx\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":10,"output_tokens":11}}
+
+            data: [DONE]
+        "#;
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+        let (callback, _) = callback_events();
+
+        let streamed = collect_stream_chunks(chunks, &callback);
+        let expected = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
     fn test_parse_completion_response_preserves_structured_tool_result_content() {
         let response = AnthropicResponseBody {
             content: vec![AnthropicContentBlock::ToolResult {
@@ -974,6 +1459,44 @@ mod tests {
         assert!(
             matches!(server_error, LlmError::Provider(message) if message.contains("server error 500"))
         );
+    }
+
+    #[test]
+    fn image_content_block_serializes_for_anthropic() {
+        let source = AnthropicImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "abc123".to_string(),
+        };
+        let block = AnthropicContentBlock::Image {
+            source: source.clone(),
+        };
+
+        let serialized = serde_json::to_value(&block).unwrap();
+
+        assert_eq!(serialized["type"], "image");
+        assert_eq!(serialized["source"]["type"], "base64");
+        assert_eq!(serialized["source"]["media_type"], "image/png");
+        assert_eq!(serialized["source"]["data"], "abc123");
+    }
+
+    #[test]
+    fn map_content_image_round_trips() {
+        let block = ContentBlock::Image {
+            media_type: "image/jpeg".to_string(),
+            data: "xyz789".to_string(),
+        };
+
+        let mapped = map_content_to_anthropic(&block).unwrap();
+
+        match mapped {
+            AnthropicContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/jpeg");
+                assert_eq!(source.data, "xyz789");
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1183,6 +1706,151 @@ mod tests {
         assert!(done_ids.contains(&"t1"));
         assert!(done_ids.contains(&"t2"));
         assert!(done_ids.contains(&"t3"));
+    }
+
+    #[test]
+    fn anthropic_auth_mode_debug_redacts_credentials() {
+        let api_key_debug = format!(
+            "{:?}",
+            AnthropicAuthMode::ApiKey("sk-ant-api03-secret".to_string())
+        );
+        assert_eq!(api_key_debug, "ApiKey(<redacted>)");
+        assert!(
+            !api_key_debug.contains("sk-ant-api03-secret"),
+            "API key must be redacted in Debug output"
+        );
+
+        let setup_token_debug = format!(
+            "{:?}",
+            AnthropicAuthMode::SetupToken("sk-ant-oat01-secret".to_string())
+        );
+        assert_eq!(setup_token_debug, "SetupToken(<redacted>)");
+        assert!(
+            !setup_token_debug.contains("sk-ant-oat01-secret"),
+            "setup token must be redacted in Debug output"
+        );
+    }
+
+    #[test]
+    fn build_system_value_uses_claude_code_identity_blocks_for_setup_tokens() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider
+            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .expect("system");
+
+        assert_eq!(
+            system,
+            json!([
+                {"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY},
+                {"type": "text", "text": "Follow the user's instructions."}
+            ])
+        );
+    }
+
+    #[test]
+    fn build_system_value_uses_plain_string_for_api_keys() {
+        let provider =
+            AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
+
+        let system = provider
+            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .expect("system");
+
+        assert_eq!(system, json!("Follow the user's instructions."));
+    }
+
+    #[test]
+    fn build_system_value_setup_token_none_prompt_returns_identity_only() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider.build_system_value(None).expect("system");
+        assert_eq!(
+            system,
+            json!([{"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY}])
+        );
+    }
+
+    #[test]
+    fn build_system_value_setup_token_empty_prompt_returns_identity_only() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
+            .expect("provider");
+
+        let system = provider
+            .build_system_value(Some(String::new()))
+            .expect("system");
+        assert_eq!(
+            system,
+            json!([{"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY}])
+        );
+    }
+
+    #[test]
+    fn build_system_value_api_key_none_returns_none() {
+        let provider =
+            AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
+
+        assert!(provider.build_system_value(None).is_none());
+    }
+
+    #[test]
+    fn build_anthropic_thinking_omits_output_config_for_invalid_effort() {
+        let (thinking, output_config) = build_anthropic_thinking(
+            "claude-opus-4-6-20250301",
+            &Some(ThinkingConfig::Adaptive {
+                effort: "adaptive".to_string(),
+            }),
+        );
+
+        assert!(matches!(thinking, Some(AnthropicThinking::Adaptive { .. })));
+        assert!(
+            output_config.is_none(),
+            "invalid effort must omit output_config"
+        );
+    }
+
+    #[test]
+    fn build_anthropic_thinking_keeps_output_config_for_valid_efforts() {
+        for effort in VALID_ANTHROPIC_EFFORTS {
+            let (thinking, output_config) = build_anthropic_thinking(
+                "claude-opus-4-6-20250301",
+                &Some(ThinkingConfig::Adaptive {
+                    effort: effort.to_string(),
+                }),
+            );
+
+            assert!(matches!(thinking, Some(AnthropicThinking::Adaptive { .. })));
+            assert_eq!(
+                output_config
+                    .expect("valid effort must produce output_config")
+                    .effort,
+                effort
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_body_omits_output_config_for_invalid_adaptive_effort() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-opus-4-6-20250301".to_string()]);
+        let request = CompletionRequest {
+            model: "claude-opus-4-6-20250301".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Adaptive {
+                effort: "adaptive".to_string(),
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).expect("body");
+
+        assert!(body.output_config.is_none());
     }
 
     /// Regression test: when thinking is enabled, Anthropic requires
@@ -1497,6 +2165,13 @@ mod tests {
 
     /// Helper to build a minimal valid `AnthropicRequestBody` for validation tests.
     fn valid_request_body(thinking: Option<AnthropicThinking>) -> AnthropicRequestBody {
+        let max_tokens = match &thinking {
+            Some(AnthropicThinking::Manual { budget_tokens, .. }) => {
+                budget_tokens + MIN_RESPONSE_TOKENS
+            }
+            Some(AnthropicThinking::Adaptive { .. }) => 16_000,
+            None => 4096,
+        };
         AnthropicRequestBody {
             model: "claude-sonnet-4-20250514".to_string(),
             messages: vec![AnthropicMessage {
@@ -1507,20 +2182,18 @@ mod tests {
             }],
             tools: Vec::new(),
             temperature: if thinking.is_some() { None } else { Some(0.7) },
-            max_tokens: match &thinking {
-                Some(t) => t.budget_tokens + MIN_RESPONSE_TOKENS,
-                None => 4096,
-            },
+            max_tokens,
             system: None,
             stream: false,
             thinking,
+            output_config: None,
         }
     }
 
     #[test]
     #[should_panic(expected = "temperature must be None")]
     fn validate_request_rejects_temperature_with_thinking() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1531,7 +2204,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_tokens must be greater")]
     fn validate_request_rejects_low_max_tokens() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1541,7 +2214,7 @@ mod tests {
 
     #[test]
     fn validate_request_accepts_valid_thinking_request() {
-        let body = valid_request_body(Some(AnthropicThinking {
+        let body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 5000,
         }));
@@ -1581,7 +2254,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "budget_tokens must be > 0")]
     fn validate_request_rejects_zero_budget() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: 0,
         }));
@@ -1592,7 +2265,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be <= MAX_THINKING_BUDGET")]
     fn validate_request_rejects_budget_over_cap() {
-        let mut body = valid_request_body(Some(AnthropicThinking {
+        let mut body = valid_request_body(Some(AnthropicThinking::Manual {
             thinking_type: "enabled".to_string(),
             budget_tokens: MAX_THINKING_BUDGET + 1,
         }));

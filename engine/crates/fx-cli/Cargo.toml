@@ -9,10 +9,10 @@ license.workspace = true
 default = ["http"]
 # Enable the HTTP API server for headless mode (`fawx serve --http`).
 # Tailscale-only binding. Pulls in axum.
-http = ["dep:axum", "dep:fx-channel-telegram"]
+http = ["dep:axum", "dep:fx-api", "dep:fx-channel-telegram", "dep:fx-channel-webhook"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
-oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
+oauth-bridge = ["dep:axum", "dep:base64", "dep:subtle", "dep:rand"]
 
 [[bin]]
 name = "fawx"
@@ -22,13 +22,20 @@ path = "src/main.rs"
 fx-config.workspace = true
 fx-tools = { workspace = true, features = ["improvement"] }
 fx-core.workspace = true
+fx-api = { path = "../fx-api", optional = true }
+fx-fleet.workspace = true
 fx-kernel.workspace = true
+fx-propose.workspace = true
+fx-ripcord = { path = "../fx-ripcord" }
+fx-canary = { path = "../fx-canary" }
+fx-consensus = { path = "../fx-consensus" }
 fx-subagent.workspace = true
 fx-auth.workspace = true
 fx-conversation.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-memory.workspace = true
+fx-embeddings.workspace = true
 fx-analysis.workspace = true
 fx-improve.workspace = true
 fx-security.workspace = true
@@ -38,19 +45,22 @@ fx-skills = { path = "../fx-skills" }
 fx-author = { path = "../fx-author" }
 fx-marketplace = { path = "../fx-marketplace" }
 fx-session.workspace = true
+fx-bus.workspace = true
+fx-cron.workspace = true
 fx-storage.workspace = true
 ring.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
 async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender = "0.2.4"
 anyhow.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
-ratatui.workspace = true
-tui-textarea.workspace = true
 libc = "0.2"
-nix = { version = "0.29", features = ["process"] }
+nix = { version = "0.29", features = ["process", "signal"] }
 futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,28 +69,29 @@ toml_edit = "0.22"
 reqwest.workspace = true
 axum = { version = "0.8", optional = true }
 fx-channel-telegram = { path = "../fx-channel-telegram", optional = true }
+fx-channel-webhook = { path = "../fx-channel-webhook", optional = true }
 uuid = { version = "1.13", features = ["v4"] }
 rand = { version = "0.8", optional = true }
 sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
-unicode-width = "0.2"
-unicode-segmentation = "1.12"
 zeroize.workspace = true
+which = "6.0"
+tempfile = "3.14"
 
 # subtle: used by oauth-bridge for constant-time comparison.
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
-# termimad: markdown rendering for terminal output.
-# Forked to abbudjoe/termimad for supply-chain safety. MIT licensed.
-termimad = { git = "https://github.com/abbudjoe/termimad.git", rev = "f93824f3010e8f7b2650973a2723dd6d36a2f0db" }
 
-# syntect: syntax highlighting for code blocks.
-# Forked to abbudjoe/syntect for supply-chain safety. MIT licensed.
-syntect = { git = "https://github.com/abbudjoe/syntect.git", rev = "6271d7dd8a63f13df08c151840f2358bf116cdcc", default-features = false, features = ["default-fancy"] }
+[build-dependencies]
+chrono = "0.4"
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
+fx-config = { workspace = true, features = ["test-support"] }
+fx-consensus = { workspace = true, features = ["test-support"] }
+fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { workspace = true, features = ["test-support"] }
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }

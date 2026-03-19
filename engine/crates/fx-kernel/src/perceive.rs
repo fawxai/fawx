@@ -4,7 +4,7 @@ use crate::budget::BudgetSnapshot;
 use crate::conversation_compactor::estimate_text_tokens;
 use crate::types::*;
 use fx_core::types::{Notification, UiElement, UserInput};
-use fx_llm::Message;
+use fx_llm::{ImageAttachment, Message};
 use serde::{Deserialize, Serialize};
 
 /// Processed perception payload passed from Perceive to Reason.
@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub struct ProcessedPerception {
     /// Latest user-facing text input.
     pub user_message: String,
+    /// Base64-encoded images attached to the latest user turn.
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
     /// Conversation context assembled for this reasoning turn.
     pub context_window: Vec<Message>,
     /// Goals currently active in this loop.
@@ -63,6 +66,7 @@ const CONVERSATION_MESSAGE_OVERHEAD_TOKENS: usize = 4;
 const MEMORY_ENTRY_OVERHEAD_TOKENS: usize = 3;
 const GOAL_OVERHEAD_TOKENS: usize = 4;
 const PREFERENCE_ENTRY_OVERHEAD_TOKENS: usize = 2;
+const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 
 impl PerceptionAssembler {
     /// Create a new [`PerceptionAssembler`] with fixed limits.
@@ -262,6 +266,7 @@ fn estimate_conversation_history_tokens(history: &[Message]) -> usize {
                         fx_llm::ContentBlock::ToolResult { tool_use_id, .. } => {
                             estimate_text_tokens(tool_use_id)
                         }
+                        fx_llm::ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
                     })
                     .sum::<usize>()
         })
@@ -599,6 +604,26 @@ mod tests {
             vec!["A reply was sent".to_owned()],
             Some(3),
         )
+    }
+
+    #[test]
+    fn estimate_conversation_history_uses_fixed_cost_for_images() {
+        let history = vec![Message::user_with_images(
+            "describe",
+            vec![ImageAttachment {
+                media_type: "image/png".to_string(),
+                data: "small".to_string(),
+            }],
+        )];
+
+        let tokens = estimate_conversation_history_tokens(&history);
+
+        assert_eq!(
+            tokens,
+            CONVERSATION_MESSAGE_OVERHEAD_TOKENS
+                + IMAGE_TOKEN_ESTIMATE
+                + estimate_text_tokens("describe")
+        );
     }
 
     #[test]

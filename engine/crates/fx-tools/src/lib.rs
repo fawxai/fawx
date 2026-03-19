@@ -1,3 +1,6 @@
+pub mod capability_request;
+mod cron_skill;
+mod experiment_tool;
 mod git_skill;
 #[cfg(feature = "improvement")]
 mod improvement_tools;
@@ -6,7 +9,10 @@ mod session_tools;
 mod skill_bridge;
 mod tools;
 
-pub use git_skill::GitSkill;
+pub use capability_request::{CapabilityRequest, CapabilityRequestHandler, CapabilityRequestSkill};
+pub use cron_skill::CronSkill;
+pub use experiment_tool::{ExperimentRegistrar, ExperimentToolState};
+pub use git_skill::{GitHubTokenProvider, GitSkill};
 #[cfg(feature = "improvement")]
 pub use improvement_tools::ImprovementToolsState;
 pub use node_run::NodeRunState;

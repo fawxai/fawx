@@ -1,0 +1,1237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx Design System</title>
+<style>
+  :root {
+    /* Dark mode (default) */
+    --bg: #1A1A1A;
+    --surface: #242424;
+    --surface-hover: #2E2E2E;
+    --surface-active: #383838;
+    --text: #E8E8E8;
+    --text-secondary: #999999;
+    --accent: #E8711A;
+    --accent-subtle: rgba(232, 113, 26, 0.125);
+    --success: #4ADE80;
+    --warning: #FBBF24;
+    --error: #F87171;
+    --border: #333333;
+    --code-bg: #2D2D2D;
+  }
+
+  .light {
+    --bg: #FFFFFF;
+    --surface: #F5F5F5;
+    --surface-hover: #EBEBEB;
+    --surface-active: #E0E0E0;
+    --text: #1A1A1A;
+    --text-secondary: #666666;
+    --accent: #D45E14;
+    --accent-subtle: rgba(212, 94, 20, 0.08);
+    --success: #22C55E;
+    --warning: #D97706;
+    --error: #DC2626;
+    --border: #E5E5E5;
+    --code-bg: #F0F0F0;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding: 0;
+    transition: background 0.3s, color 0.3s;
+  }
+
+  /* Theme toggle */
+  .theme-toggle {
+    position: fixed;
+    top: 16px;
+    right: 24px;
+    z-index: 100;
+    display: flex;
+    gap: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px;
+  }
+  .theme-toggle button {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+    transition: all 0.2s;
+  }
+  .theme-toggle button.active {
+    background: var(--surface-active);
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  /* Layout */
+  .page { max-width: 1100px; margin: 0 auto; padding: 48px 32px; }
+
+  h1 {
+    font-size: 32px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    letter-spacing: -0.5px;
+  }
+  .subtitle {
+    font-size: 15px;
+    color: var(--text-secondary);
+    margin-bottom: 48px;
+  }
+  .accent-text { color: var(--accent); }
+
+  h2 {
+    font-size: 20px;
+    font-weight: 600;
+    margin-top: 56px;
+    margin-bottom: 20px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.3px;
+  }
+
+  h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 32px;
+    margin-bottom: 12px;
+  }
+
+  /* Color swatches */
+  .swatch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .swatch {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .swatch-color {
+    height: 72px;
+    display: flex;
+    align-items: flex-end;
+    padding: 8px 12px;
+  }
+  .swatch-label {
+    padding: 10px 12px;
+    background: var(--surface);
+  }
+  .swatch-name {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .swatch-value {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+    color: var(--text-secondary);
+  }
+
+  /* Typography */
+  .type-row {
+    display: flex;
+    align-items: baseline;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 24px;
+  }
+  .type-label {
+    width: 140px;
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Menlo', monospace;
+  }
+  .type-sample { flex: 1; }
+  .type-meta {
+    width: 160px;
+    flex-shrink: 0;
+    text-align: right;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Menlo', monospace;
+  }
+
+  /* Spacing */
+  .spacing-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 8px;
+  }
+  .spacing-label {
+    width: 100px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    color: var(--text-secondary);
+  }
+  .spacing-bar {
+    height: 24px;
+    background: var(--accent-subtle);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 4px 4px 0;
+  }
+  .spacing-value {
+    font-size: 12px;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    color: var(--text-secondary);
+  }
+
+  /* Components */
+  .component-frame {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-top: 16px;
+    margin-bottom: 8px;
+  }
+  .component-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+    font-style: italic;
+  }
+
+  /* Buttons */
+  .btn-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    font-family: inherit;
+    border: none;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { filter: brightness(1.1); }
+  .btn-secondary { background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--surface-active); }
+  .btn-danger { background: var(--error); color: #fff; }
+  .btn-ghost { background: transparent; color: var(--text-secondary); }
+  .btn-ghost:hover { background: var(--surface-hover); color: var(--text); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+
+  /* Message bubbles */
+  .message-stack { display: flex; flex-direction: column; gap: 16px; max-width: 720px; }
+  .message {
+    padding: 12px 16px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.6;
+    max-width: 85%;
+  }
+  .message-user {
+    background: var(--accent);
+    color: #fff;
+    align-self: flex-end;
+    border-bottom-right-radius: 4px;
+  }
+  .message-assistant {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    align-self: flex-start;
+    border-bottom-left-radius: 4px;
+  }
+  .message-system {
+    align-self: center;
+    color: var(--text-secondary);
+    font-size: 12px;
+    background: none;
+    padding: 4px 0;
+  }
+  .message-error {
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid var(--error);
+    align-self: flex-start;
+    color: var(--error);
+    font-size: 13px;
+    border-bottom-left-radius: 4px;
+  }
+
+  /* Code block */
+  .code-block {
+    background: var(--code-bg);
+    border-radius: 8px;
+    margin: 8px 0;
+    overflow: hidden;
+    font-size: 13px;
+  }
+  .code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+  }
+  .code-copy {
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .code-copy:hover { color: var(--text); }
+  .code-body {
+    padding: 12px 16px;
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .code-body .kw { color: #C678DD; }
+  .code-body .fn { color: #61AFEF; }
+  .code-body .str { color: #98C379; }
+  .code-body .cm { color: #5C6370; font-style: italic; }
+  .code-body .ty { color: #E5C07B; }
+  .code-body .num { color: #D19A66; }
+  .light .code-body .kw { color: #A626A4; }
+  .light .code-body .fn { color: #4078F2; }
+  .light .code-body .str { color: #50A14F; }
+  .light .code-body .cm { color: #A0A1A7; font-style: italic; }
+  .light .code-body .ty { color: #C18401; }
+  .light .code-body .num { color: #986801; }
+
+  /* Tool call card */
+  .tool-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin: 8px 0;
+    overflow: hidden;
+    max-width: 85%;
+  }
+  .tool-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .tool-icon { color: var(--accent); font-size: 14px; }
+  .tool-chevron { color: var(--text-secondary); margin-left: auto; font-size: 12px; }
+  .tool-body {
+    padding: 10px 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    color: var(--text-secondary);
+    background: var(--code-bg);
+    line-height: 1.5;
+    white-space: pre;
+  }
+
+  /* Input bar */
+  .input-bar-wrapper {
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    background: var(--bg);
+  }
+  .steer-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--accent-subtle);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+  .steer-chip .dismiss { cursor: pointer; opacity: 0.6; }
+  .steer-chip .dismiss:hover { opacity: 1; }
+  .input-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px 12px;
+  }
+  .input-bar:focus-within { border-color: var(--accent); }
+  .input-field {
+    flex: 1;
+    background: none;
+    border: none;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    resize: none;
+    line-height: 1.5;
+    min-height: 24px;
+    max-height: 200px;
+  }
+  .input-field::placeholder { color: var(--text-secondary); }
+  .input-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .model-badge {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: var(--surface-hover);
+    color: var(--text-secondary);
+    cursor: pointer;
+    border: 1px solid var(--border);
+    font-family: 'SF Mono', 'Menlo', monospace;
+    white-space: nowrap;
+  }
+  .model-badge:hover { background: var(--surface-active); color: var(--text); }
+  .thinking-badge {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: var(--accent-subtle);
+    color: var(--accent);
+    cursor: pointer;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .send-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 16px;
+    transition: all 0.15s;
+  }
+  .send-btn.ready { background: var(--accent); color: #fff; }
+  .send-btn.idle { background: var(--surface-hover); color: var(--text-secondary); }
+  .send-btn.stop { background: var(--error); color: #fff; }
+
+  /* Session row */
+  .session-list { display: flex; flex-direction: column; gap: 2px; max-width: 260px; }
+  .session-group-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 16px 12px 6px;
+  }
+  .session-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .session-row:hover { background: var(--surface-hover); }
+  .session-row.active { background: var(--surface-active); }
+  .session-title {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .session-preview {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+  }
+  .session-time {
+    font-size: 11px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+    margin-left: 8px;
+  }
+  .session-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+    flex-shrink: 0;
+    margin-left: 6px;
+  }
+
+  /* Skill card */
+  .skill-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+  }
+  .skill-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .skill-card:hover { border-color: var(--accent); background: var(--surface-hover); }
+  .skill-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: var(--accent-subtle);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    margin-bottom: 10px;
+  }
+  .skill-name { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .skill-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
+  .skill-tools {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Menlo', monospace;
+  }
+
+  /* Status bar */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 6px 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--surface);
+  }
+  .status-segment {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+  .status-dot.connected { background: var(--success); }
+  .status-dot.reconnecting { background: var(--warning); }
+  .status-dot.disconnected { background: var(--error); }
+  .status-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border);
+  }
+  .ctx-bar-track {
+    width: 48px;
+    height: 6px;
+    background: var(--surface-hover);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .ctx-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+  }
+  .ctx-bar-fill.low { background: var(--success); }
+  .ctx-bar-fill.mid { background: var(--warning); }
+  .ctx-bar-fill.high { background: var(--error); }
+
+  /* Streaming indicator */
+  .streaming-dots {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px 0;
+  }
+  .streaming-dots span {
+    width: 6px;
+    height: 6px;
+    background: var(--text-secondary);
+    border-radius: 50%;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .streaming-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .streaming-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+
+  /* Streaming cursor */
+  .cursor {
+    display: inline-block;
+    width: 2px;
+    height: 16px;
+    background: var(--accent);
+    margin-left: 2px;
+    animation: blink 1s step-end infinite;
+    vertical-align: text-bottom;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  /* Full layout mockup */
+  .layout-mockup {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    grid-template-rows: 1fr auto;
+    height: 520px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-top: 16px;
+  }
+  .layout-sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 12px 0;
+    overflow-y: auto;
+    grid-row: 1 / 3;
+  }
+  .layout-sidebar-header {
+    padding: 8px 16px 16px;
+  }
+  .layout-main {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  .layout-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .layout-status {
+    grid-column: 2;
+  }
+
+  /* New session btn */
+  .new-session-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: calc(100% - 24px);
+    margin: 0 12px;
+    padding: 8px 12px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+</style>
+</head>
+<body>
+
+<div class="theme-toggle">
+  <button class="active" onclick="setTheme('dark')">Dark</button>
+  <button onclick="setTheme('light')">Light</button>
+</div>
+
+<div class="page">
+
+<h1>Fawx <span class="accent-text">Design System</span></h1>
+<p class="subtitle">Native App — macOS + iOS · SwiftUI · V1</p>
+
+<!-- ============ COLORS ============ -->
+<h2>🎨 Color Palette</h2>
+<p class="component-note">Toggle Dark/Light mode with the switch in the top-right corner.</p>
+
+<h3>Core</h3>
+<div class="swatch-grid">
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--bg);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Background</div>
+      <div class="swatch-value" data-dark="#1A1A1A" data-light="#FFFFFF">#1A1A1A</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--surface);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Surface</div>
+      <div class="swatch-value" data-dark="#242424" data-light="#F5F5F5">#242424</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--surface-hover);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Surface Hover</div>
+      <div class="swatch-value" data-dark="#2E2E2E" data-light="#EBEBEB">#2E2E2E</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--surface-active);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Surface Active</div>
+      <div class="swatch-value" data-dark="#383838" data-light="#E0E0E0">#383838</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--text); border: 1px solid var(--border);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Text</div>
+      <div class="swatch-value" data-dark="#E8E8E8" data-light="#1A1A1A">#E8E8E8</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--text-secondary);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Text Secondary</div>
+      <div class="swatch-value" data-dark="#999999" data-light="#666666">#999999</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--border);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Border</div>
+      <div class="swatch-value" data-dark="#333333" data-light="#E5E5E5">#333333</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--code-bg);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Code Background</div>
+      <div class="swatch-value" data-dark="#2D2D2D" data-light="#F0F0F0">#2D2D2D</div>
+    </div>
+  </div>
+</div>
+
+<h3>Accent & Status</h3>
+<div class="swatch-grid">
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--accent);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Accent (Fawx Orange)</div>
+      <div class="swatch-value" data-dark="#E8711A" data-light="#D45E14">#E8711A</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--accent-subtle);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Accent Subtle</div>
+      <div class="swatch-value">12% opacity</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--success);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Success</div>
+      <div class="swatch-value" data-dark="#4ADE80" data-light="#22C55E">#4ADE80</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--warning);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Warning</div>
+      <div class="swatch-value" data-dark="#FBBF24" data-light="#D97706">#FBBF24</div>
+    </div>
+  </div>
+  <div class="swatch">
+    <div class="swatch-color" style="background: var(--error);"></div>
+    <div class="swatch-label">
+      <div class="swatch-name">Error</div>
+      <div class="swatch-value" data-dark="#F87171" data-light="#DC2626">#F87171</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ TYPOGRAPHY ============ -->
+<h2>📝 Typography</h2>
+<p class="component-note">SF Pro (system) for UI text. SF Mono / Menlo for code.</p>
+
+<div>
+  <div class="type-row">
+    <div class="type-label">heading-1</div>
+    <div class="type-sample" style="font-size: 18px; font-weight: 700;">The quick brown fox jumps over the lazy dog</div>
+    <div class="type-meta">18pt / Bold</div>
+  </div>
+  <div class="type-row">
+    <div class="type-label">heading-2</div>
+    <div class="type-sample" style="font-size: 16px; font-weight: 600;">The quick brown fox jumps over the lazy dog</div>
+    <div class="type-meta">16pt / Semibold</div>
+  </div>
+  <div class="type-row">
+    <div class="type-label">body</div>
+    <div class="type-sample" style="font-size: 14px;">The quick brown fox jumps over the lazy dog</div>
+    <div class="type-meta">14pt / Regular</div>
+  </div>
+  <div class="type-row">
+    <div class="type-label">sidebar</div>
+    <div class="type-sample" style="font-size: 13px;">The quick brown fox jumps over the lazy dog</div>
+    <div class="type-meta">13pt / Regular</div>
+  </div>
+  <div class="type-row">
+    <div class="type-label">code</div>
+    <div class="type-sample" style="font-size: 13px; font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;">fn main() { println!("Hello, world!"); }</div>
+    <div class="type-meta">13pt / Mono</div>
+  </div>
+  <div class="type-row">
+    <div class="type-label">caption</div>
+    <div class="type-sample" style="font-size: 11px; color: var(--text-secondary);">Status bar, timestamps, metadata</div>
+    <div class="type-meta">11pt / Regular</div>
+  </div>
+</div>
+
+<!-- ============ SPACING ============ -->
+<h2>📐 Spacing Scale</h2>
+
+<div style="margin-top: 16px;">
+  <div class="spacing-row">
+    <div class="spacing-label">xs (4pt)</div>
+    <div class="spacing-bar" style="width: 16px;"></div>
+    <div class="spacing-value">4pt</div>
+  </div>
+  <div class="spacing-row">
+    <div class="spacing-label">sm (8pt)</div>
+    <div class="spacing-bar" style="width: 32px;"></div>
+    <div class="spacing-value">8pt</div>
+  </div>
+  <div class="spacing-row">
+    <div class="spacing-label">md (12pt)</div>
+    <div class="spacing-bar" style="width: 48px;"></div>
+    <div class="spacing-value">12pt</div>
+  </div>
+  <div class="spacing-row">
+    <div class="spacing-label">lg (16pt)</div>
+    <div class="spacing-bar" style="width: 64px;"></div>
+    <div class="spacing-value">16pt</div>
+  </div>
+  <div class="spacing-row">
+    <div class="spacing-label">xl (24pt)</div>
+    <div class="spacing-bar" style="width: 96px;"></div>
+    <div class="spacing-value">24pt</div>
+  </div>
+</div>
+
+<!-- ============ COMPONENTS ============ -->
+<h2>🧩 Components</h2>
+
+<h3>Buttons</h3>
+<div class="component-frame">
+  <div class="btn-row">
+    <button class="btn btn-primary">New Session</button>
+    <button class="btn btn-primary btn-sm">+ Add</button>
+    <button class="btn btn-secondary">Cancel</button>
+    <button class="btn btn-danger">Delete</button>
+    <button class="btn btn-danger btn-sm">■ Stop</button>
+    <button class="btn btn-ghost">Clear History</button>
+    <button class="btn btn-ghost btn-sm">Copy</button>
+  </div>
+</div>
+
+<h3>Message Bubbles</h3>
+<div class="component-frame">
+  <div class="message-stack">
+    <div class="message message-system">Session created · claude-sonnet-4-6 · High thinking</div>
+    <div class="message message-user">Show me the implementation of the SSE streaming handler</div>
+    <div class="message message-assistant">
+      Here's the SSE streaming implementation from <code style="background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 13px;">fx-api/src/streaming.rs</code>:
+      <div class="code-block">
+        <div class="code-header">
+          <span>rust</span>
+          <button class="code-copy">Copy</button>
+        </div>
+        <div class="code-body"><span class="kw">pub async fn</span> <span class="fn">stream_response</span>(
+    session: &<span class="ty">Session</span>,
+    message: <span class="ty">String</span>,
+) -> <span class="ty">Result</span><<span class="ty">impl Stream</span><<span class="ty">Item</span> = <span class="ty">SseEvent</span>>> {
+    <span class="kw">let</span> engine = session.<span class="fn">engine</span>();
+    <span class="kw">let</span> stream = engine
+        .<span class="fn">send_message</span>(message)
+        .<span class="kw">await</span>?;
+    <span class="ty">Ok</span>(stream.<span class="fn">map</span>(|event| event.<span class="fn">into_sse</span>()))
+}</div>
+      </div>
+      The handler creates an SSE stream that maps engine events to server-sent events.
+    </div>
+    <div class="message message-user">What about error handling?</div>
+    <div class="message message-assistant">
+      Looking into the error paths<span class="cursor"></span>
+    </div>
+  </div>
+</div>
+
+<h3>Streaming Indicator</h3>
+<div class="component-frame">
+  <div style="display: flex; align-items: center; gap: 12px;">
+    <span style="font-size: 13px; color: var(--text-secondary);">Thinking...</span>
+    <div class="streaming-dots"><span></span><span></span><span></span></div>
+  </div>
+</div>
+
+<h3>Tool Call Card</h3>
+<div class="component-frame">
+  <div class="tool-card">
+    <div class="tool-header">
+      <span class="tool-icon">⚡</span>
+      web_search
+      <span class="tool-chevron">▼</span>
+    </div>
+    <div class="tool-body">{"query": "SwiftUI NavigationSplitView sidebar", "count": 5}</div>
+  </div>
+  <div class="tool-card" style="margin-top: 8px;">
+    <div class="tool-header">
+      <span class="tool-icon">⚡</span>
+      read_file
+      <span style="font-size: 12px; color: var(--text-secondary); font-weight: 400; margin-left: 4px;">→ 142 lines</span>
+      <span class="tool-chevron">▶</span>
+    </div>
+  </div>
+</div>
+
+<h3>Input Bar — States</h3>
+<div class="component-frame">
+  <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 16px; font-weight: 600;">IDLE — Ready to send</p>
+  <div class="input-bar">
+    <textarea class="input-field" rows="1" placeholder="Ask Fawx anything..." disabled></textarea>
+    <div class="input-controls">
+      <span class="model-badge">sonnet-4.6</span>
+      <span class="thinking-badge">High</span>
+      <button class="send-btn idle">↑</button>
+    </div>
+  </div>
+</div>
+
+<div class="component-frame">
+  <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 16px; font-weight: 600;">STREAMING — Stop available</p>
+  <div class="input-bar">
+    <textarea class="input-field" rows="1" placeholder="Type a follow-up to queue..." disabled></textarea>
+    <div class="input-controls">
+      <span class="model-badge">sonnet-4.6</span>
+      <span class="thinking-badge">High</span>
+      <button class="send-btn stop">■</button>
+    </div>
+  </div>
+</div>
+
+<div class="component-frame">
+  <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 16px; font-weight: 600;">STREAMING — Message queued</p>
+  <div class="steer-chip">
+    <span style="font-weight: 600;">Queued</span>
+    <span>"Actually, use async/await instead of callbacks"</span>
+    <span class="dismiss">✕</span>
+  </div>
+  <div class="input-bar">
+    <textarea class="input-field" rows="1" disabled>Actually, use async/await instead of callbacks</textarea>
+    <div class="input-controls">
+      <span class="model-badge">sonnet-4.6</span>
+      <span class="thinking-badge">High</span>
+      <button class="send-btn ready">↑</button>
+    </div>
+  </div>
+</div>
+
+<h3>Session List Row</h3>
+<div class="component-frame">
+  <div class="session-list">
+    <div class="session-group-label">Today</div>
+    <div class="session-row active">
+      <div class="session-title">Sprint 2 — Model switching endpoints</div>
+      <div class="session-meta">
+        <span class="session-preview">Here's the implementation of the model...</span>
+        <span class="session-time">3m</span>
+        <span class="session-dot"></span>
+      </div>
+    </div>
+    <div class="session-row">
+      <div class="session-title">Fix compaction memory flush</div>
+      <div class="session-meta">
+        <span class="session-preview">The UTF-8 panic was caused by byte-index...</span>
+        <span class="session-time">2h</span>
+      </div>
+    </div>
+    <div class="session-row">
+      <div class="session-title">Architecture: self-improving fleet</div>
+      <div class="session-meta">
+        <span class="session-preview">Hybrid DAG + chain model makes sense...</span>
+        <span class="session-time">5h</span>
+      </div>
+    </div>
+    <div class="session-group-label">Yesterday</div>
+    <div class="session-row">
+      <div class="session-title">Telegram token leak security fix</div>
+      <div class="session-meta">
+        <span class="session-preview">Sanitization applied at 16 construction...</span>
+        <span class="session-time">1d</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>Skill Cards</h3>
+<div class="component-frame">
+  <div class="skill-grid">
+    <div class="skill-card">
+      <div class="skill-icon">🔍</div>
+      <div class="skill-name">Brave Search</div>
+      <div class="skill-desc">Web search via Brave Search API. Fast, private results.</div>
+      <div class="skill-tools">1 tool · web_search</div>
+    </div>
+    <div class="skill-card">
+      <div class="skill-icon">🌐</div>
+      <div class="skill-name">Web Fetch</div>
+      <div class="skill-desc">Fetch and extract readable content from URLs.</div>
+      <div class="skill-tools">1 tool · web_fetch</div>
+    </div>
+    <div class="skill-card">
+      <div class="skill-icon">⏰</div>
+      <div class="skill-name">Scheduler</div>
+      <div class="skill-desc">Schedule tasks and set reminders with cron expressions.</div>
+      <div class="skill-tools">2 tools · schedule, list_tasks</div>
+    </div>
+    <div class="skill-card">
+      <div class="skill-icon">🌤</div>
+      <div class="skill-name">Weather</div>
+      <div class="skill-desc">Current weather and forecasts via Open-Meteo.</div>
+      <div class="skill-tools">1 tool · get_weather</div>
+    </div>
+  </div>
+</div>
+
+<h3>Status Bar</h3>
+<div class="component-frame" style="padding: 0;">
+  <div class="status-bar">
+    <div class="status-segment">
+      <span class="status-dot connected"></span>
+      <span>Connected</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span>Power User</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span style="font-family: 'SF Mono', 'Menlo', monospace;">claude-sonnet-4-6</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <div class="ctx-bar-track">
+        <div class="ctx-bar-fill low" style="width: 35%;"></div>
+      </div>
+      <span>35%</span>
+    </div>
+  </div>
+</div>
+
+<div class="component-frame" style="padding: 0; margin-top: 8px;">
+  <div class="status-bar">
+    <div class="status-segment">
+      <span class="status-dot connected"></span>
+      <span>Connected</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span>Cautious</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span style="font-family: 'SF Mono', 'Menlo', monospace;">gpt-5.4</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <div class="ctx-bar-track">
+        <div class="ctx-bar-fill mid" style="width: 72%;"></div>
+      </div>
+      <span>72%</span>
+    </div>
+  </div>
+</div>
+
+<div class="component-frame" style="padding: 0; margin-top: 8px;">
+  <div class="status-bar">
+    <div class="status-segment">
+      <span class="status-dot disconnected"></span>
+      <span style="color: var(--error);">Disconnected</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span>Experimental</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <span style="font-family: 'SF Mono', 'Menlo', monospace;">—</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-segment">
+      <div class="ctx-bar-track">
+        <div class="ctx-bar-fill high" style="width: 91%;"></div>
+      </div>
+      <span style="color: var(--error);">91%</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============ FULL LAYOUT ============ -->
+<h2>🖥 Full Layout Mockup (macOS)</h2>
+<p class="component-note">Approximate layout showing sidebar + chat + status bar together.</p>
+
+<div class="layout-mockup">
+  <div class="layout-sidebar">
+    <div class="layout-sidebar-header">
+      <button class="new-session-btn">+ New Session</button>
+    </div>
+    <div class="session-list">
+      <div class="session-group-label">Today</div>
+      <div class="session-row active">
+        <div class="session-title">Sprint 2 — Model switching</div>
+        <div class="session-meta">
+          <span class="session-preview">Here's the implementation...</span>
+          <span class="session-time">3m</span>
+          <span class="session-dot"></span>
+        </div>
+      </div>
+      <div class="session-row">
+        <div class="session-title">Fix compaction flush</div>
+        <div class="session-meta">
+          <span class="session-preview">UTF-8 panic fixed...</span>
+          <span class="session-time">2h</span>
+        </div>
+      </div>
+      <div class="session-row">
+        <div class="session-title">Architecture planning</div>
+        <div class="session-meta">
+          <span class="session-preview">Hybrid DAG model...</span>
+          <span class="session-time">5h</span>
+        </div>
+      </div>
+      <div class="session-group-label">Yesterday</div>
+      <div class="session-row">
+        <div class="session-title">Security: token leak fix</div>
+        <div class="session-meta">
+          <span class="session-preview">Sanitization at 16 sites...</span>
+          <span class="session-time">1d</span>
+        </div>
+      </div>
+      <div class="session-row">
+        <div class="session-title">Fleet join testing</div>
+        <div class="session-meta">
+          <span class="session-preview">MacBook registered to...</span>
+          <span class="session-time">1d</span>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top: auto; padding: 12px 12px 4px; border-top: 1px solid var(--border);">
+      <div class="session-row" style="padding: 8px 12px;">
+        <div style="font-size: 13px; display: flex; align-items: center; gap: 8px;">🧩 Skills</div>
+      </div>
+      <div class="session-row" style="padding: 8px 12px;">
+        <div style="font-size: 13px; display: flex; align-items: center; gap: 8px;">⚙️ Settings</div>
+      </div>
+    </div>
+  </div>
+  <div class="layout-main">
+    <div class="layout-messages">
+      <div class="message message-system">Session created · claude-sonnet-4-6 · High thinking</div>
+      <div class="message message-user">Show me the Sprint 2 model switching implementation</div>
+      <div class="message message-assistant">
+        Here's the model switching endpoint from <code style="background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 13px;">fx-api/src/settings.rs</code>:
+        <div class="code-block">
+          <div class="code-header"><span>rust</span><button class="code-copy">Copy</button></div>
+          <div class="code-body"><span class="kw">pub async fn</span> <span class="fn">put_model</span>(
+    <span class="ty">State</span>(app): <span class="ty">State</span><<span class="ty">AppEngine</span>>,
+    <span class="ty">Json</span>(req): <span class="ty">Json</span><<span class="ty">SetModelRequest</span>>,
+) -> <span class="ty">Result</span><<span class="ty">Json</span><<span class="ty">ModelInfoDto</span>>> {
+    app.<span class="fn">set_model</span>(&req.model).<span class="kw">await</span>?;
+    <span class="ty">Ok</span>(<span class="ty">Json</span>(app.<span class="fn">active_model</span>().<span class="fn">into</span>()))
+}</div>
+        </div>
+        The endpoint validates the model exists in the catalog before switching.<span class="cursor"></span>
+      </div>
+    </div>
+    <div class="input-bar-wrapper">
+      <div class="input-bar">
+        <textarea class="input-field" rows="1" placeholder="Ask Fawx anything..." disabled></textarea>
+        <div class="input-controls">
+          <span class="model-badge">sonnet-4.6</span>
+          <span class="thinking-badge">High</span>
+          <button class="send-btn stop">■</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="layout-status">
+    <div class="status-bar">
+      <div class="status-segment">
+        <span class="status-dot connected"></span>
+        <span>Connected</span>
+      </div>
+      <div class="status-divider"></div>
+      <div class="status-segment">Power User</div>
+      <div class="status-divider"></div>
+      <div class="status-segment" style="font-family: 'SF Mono', 'Menlo', monospace;">claude-sonnet-4-6</div>
+      <div class="status-divider"></div>
+      <div class="status-segment">
+        <div class="ctx-bar-track"><div class="ctx-bar-fill low" style="width: 35%;"></div></div>
+        <span>35%</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+function setTheme(theme) {
+  document.body.classList.toggle('light', theme === 'light');
+  document.querySelectorAll('.theme-toggle button').forEach(b => {
+    b.classList.toggle('active', b.textContent.toLowerCase() === theme);
+  });
+  // Update swatch hex values
+  const mode = theme === 'light' ? 'light' : 'dark';
+  document.querySelectorAll('.swatch-value[data-' + mode + ']').forEach(el => {
+    el.textContent = el.getAttribute('data-' + mode);
+  });
+}
+</script>
+
+</body>
+</html>

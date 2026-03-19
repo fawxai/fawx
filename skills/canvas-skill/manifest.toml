@@ -1,0 +1,7 @@
+name = "canvas"
+version = "1.0.0"
+description = "Generate rich visual content: charts, tables, diagrams, and formatted documents"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["storage"]
+entry_point = "run"

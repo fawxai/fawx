@@ -10,6 +10,23 @@ use zeroize::Zeroizing;
 /// Maximum response body size: 1 MB.
 const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 
+/// Prefix for binary HTTP responses passed through the string-only WASM ABI.
+///
+/// Skills detect this sentinel and decode the remaining base64 back into the
+/// original bytes. Collision with a real text response is extremely unlikely
+/// because this prefix is not valid JSON, HTML, or any known API response
+/// format.
+// COUPLING: This sentinel must match the one in skills/tts-skill/src/lib.rs
+// and skills/stt-skill/src/lib.rs (and any skill that handles binary HTTP
+// responses).
+const HOST_BINARY_BASE64_PREFIX: &str = "__fawx_binary_base64__:";
+/// Prefix for binary HTTP request bodies passed over the string-only WASM ABI.
+///
+/// Skills encode raw request bytes as base64 with this sentinel so the host can
+/// reconstruct multipart/form-data or other non-UTF-8 payloads before sending.
+// COUPLING: This sentinel must match the one in skills/stt-skill/src/lib.rs.
+const HOST_REQUEST_BINARY_BASE64_PREFIX: &str = "__fawx_request_binary_base64__:";
+
 /// HTTP request timeout in seconds.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -81,6 +98,26 @@ fn parse_headers(headers_json: &str) -> Option<Vec<(String, String)>> {
     Some(result)
 }
 
+enum RequestBody<'a> {
+    Empty,
+    Text(&'a str),
+    Binary(Vec<u8>),
+}
+
+fn prepare_request_body(body: &str) -> RequestBody<'_> {
+    if body.is_empty() {
+        return RequestBody::Empty;
+    }
+
+    match body.strip_prefix(HOST_REQUEST_BINARY_BASE64_PREFIX) {
+        Some(encoded) => match base64_decode(encoded) {
+            Some(bytes) => RequestBody::Binary(bytes),
+            None => RequestBody::Text(body),
+        },
+        None => RequestBody::Text(body),
+    }
+}
+
 /// Execute an HTTP request via ureq.
 ///
 /// Enforces HTTPS-only, 30s timeout, and 1MB response limit.
@@ -131,10 +168,10 @@ pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) 
     }
 
     // Send request
-    let response = if body.is_empty() {
-        request.call()
-    } else {
-        request.send_string(body)
+    let response = match prepare_request_body(body) {
+        RequestBody::Empty => request.call(),
+        RequestBody::Text(text) => request.send_string(text),
+        RequestBody::Binary(bytes) => request.send_bytes(&bytes),
     };
 
     match response {
@@ -158,17 +195,114 @@ fn read_response_body(response: ureq::Response) -> Option<String> {
 
 /// Read a response body from a size-limited reader.
 ///
-/// Returns `None` if the body is not valid UTF-8 or on read errors.
-/// The caller is responsible for applying `.take(MAX_RESPONSE_BYTES)` to
-/// enforce the size limit before passing the reader here.
+/// Text responses are passed through unchanged. Binary responses are encoded as
+/// base64 with a sentinel prefix so skills can recover the original bytes over
+/// the string-only WASM host ABI.
 fn read_limited_body(mut reader: impl Read) -> Option<String> {
-    let mut body = String::new();
-    match reader.read_to_string(&mut body) {
-        Ok(_) => Some(body),
-        Err(e) => {
-            tracing::error!("http_request: failed to read response body: {}", e);
-            None
+    let mut body = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut body) {
+        tracing::error!("http_request: failed to read response body: {}", error);
+        return None;
+    }
+
+    Some(encode_http_response_body(&body))
+}
+
+fn encode_http_response_body(body: &[u8]) -> String {
+    if body.contains(&0) {
+        return format!("{HOST_BINARY_BASE64_PREFIX}{}", base64_encode(body));
+    }
+
+    match String::from_utf8(body.to_vec()) {
+        Ok(text) => text,
+        Err(error) => {
+            let bytes = error.into_bytes();
+            format!("{HOST_BINARY_BASE64_PREFIX}{}", base64_encode(&bytes))
         }
+    }
+}
+
+// COUPLING: This encoder must match the one in skills/tts-skill/src/lib.rs.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let combined = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+
+        output.push(TABLE[((combined >> 18) & 0x3F) as usize] as char);
+        output.push(TABLE[((combined >> 12) & 0x3F) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((combined >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(combined & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+// COUPLING: This decoder powers the binary request-body path and must stay
+// compatible with the request-body encoder in skills/stt-skill/src/lib.rs.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        decode_base64_chunk(chunk, &mut output)?;
+    }
+    Some(output)
+}
+
+fn decode_base64_chunk(chunk: &[u8], output: &mut Vec<u8>) -> Option<()> {
+    let v0 = decode_base64_value(chunk[0])?;
+    let v1 = decode_base64_value(chunk[1])?;
+    let v2 = decode_optional_base64_value(chunk[2])?;
+    let v3 = decode_optional_base64_value(chunk[3])?;
+    let combined = ((v0 as u32) << 18)
+        | ((v1 as u32) << 12)
+        | ((v2.unwrap_or(0) as u32) << 6)
+        | v3.unwrap_or(0) as u32;
+
+    output.push(((combined >> 16) & 0xFF) as u8);
+    if v2.is_some() {
+        output.push(((combined >> 8) & 0xFF) as u8);
+    }
+    if v3.is_some() {
+        output.push((combined & 0xFF) as u8);
+    }
+    Some(())
+}
+
+fn decode_optional_base64_value(byte: u8) -> Option<Option<u8>> {
+    if byte == b'=' {
+        return Some(None);
+    }
+    decode_base64_value(byte).map(Some)
+}
+
+fn decode_base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -324,11 +458,56 @@ mod tests {
     }
 
     #[test]
+    fn prepare_request_body_decodes_binary_prefix() {
+        let payload = prepare_request_body("__fawx_request_binary_base64__:AQID");
+
+        match payload {
+            RequestBody::Binary(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
+            _ => panic!("expected binary payload"),
+        }
+    }
+
+    #[test]
+    fn prepare_request_body_preserves_invalid_prefixed_text() {
+        let payload = prepare_request_body("__fawx_request_binary_base64__:%%%");
+
+        match payload {
+            RequestBody::Text(body) => {
+                assert_eq!(body, "__fawx_request_binary_base64__:%%%");
+            }
+            _ => panic!("expected text payload"),
+        }
+    }
+
+    #[test]
+    fn prepare_request_body_empty_returns_empty() {
+        let payload = prepare_request_body("");
+        assert!(matches!(payload, RequestBody::Empty));
+    }
+
+    #[test]
+    fn prepare_request_body_plain_text_passes_through() {
+        let payload = prepare_request_body(r#"{"key":"value"}"#);
+
+        match payload {
+            RequestBody::Text(body) => assert_eq!(body, r#"{"key":"value"}"#),
+            _ => panic!("expected text payload"),
+        }
+    }
+
+    #[test]
     fn read_limited_body_under_limit() {
         let data = "hello world";
         let reader = std::io::Cursor::new(data);
         let result = read_limited_body(reader);
         assert_eq!(result, Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn read_limited_body_empty_returns_empty_string() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let result = read_limited_body(reader);
+        assert_eq!(result, Some(String::new()));
     }
 
     #[test]
@@ -356,11 +535,19 @@ mod tests {
     }
 
     #[test]
-    fn read_limited_body_invalid_utf8_returns_none() {
-        let data: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01];
+    fn read_limited_body_invalid_utf8_returns_binary_base64() {
+        let data: Vec<u8> = vec![0xFF, 0xFE, 0x01];
         let reader = std::io::Cursor::new(data);
-        let result = read_limited_body(reader);
-        assert_eq!(result, None, "Invalid UTF-8 should return None");
+        let result = read_limited_body(reader).expect("binary response should encode");
+        assert_eq!(result, format!("{HOST_BINARY_BASE64_PREFIX}//4B"));
+    }
+
+    #[test]
+    fn read_limited_body_with_nul_byte_returns_binary_base64() {
+        let data: Vec<u8> = vec![b'O', 0, b'K'];
+        let reader = std::io::Cursor::new(data);
+        let result = read_limited_body(reader).expect("binary response should encode");
+        assert_eq!(result, format!("{HOST_BINARY_BASE64_PREFIX}TwBL"));
     }
 
     /// Mock credential provider for testing the KV bridge.

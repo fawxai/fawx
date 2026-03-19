@@ -17,11 +17,12 @@ use tokio_tungstenite::tungstenite::{
     Message as WsMessage,
 };
 
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ToolCall, ToolUseDelta, Usage,
+    StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -97,6 +98,47 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    /// Model discovery endpoint.
+    ///
+    /// For `chatgpt.com` subscription flows, uses the canonical
+    /// `api.openai.com/v1/models` endpoint (the backend-api/models
+    /// path doesn't return all available models). For all other base
+    /// URLs (including api.openai.com and test servers), derives the
+    /// models path from the base.
+    fn models_endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.contains("chatgpt.com") {
+            return "https://api.openai.com/v1/models".to_string();
+        }
+        if base.ends_with("/responses") {
+            return format!(
+                "{}/models",
+                base.trim_end_matches("/responses")
+                    .trim_end_matches("/codex")
+            );
+        }
+        if base.ends_with("/v1") {
+            return format!("{base}/models");
+        }
+        format!("{base}/v1/models")
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_endpoint())
+            .bearer_auth(&self.access_token)
+            .header("chatgpt-account-id", &self.account_id)
+            .send()
+            .await?;
+        parse_model_response(response, &self.supported_models).await
+    }
+
+    /// Validate the OAuth token by performing a live model-catalog fetch.
+    pub async fn verify_credentials(&self) -> Result<usize, LlmError> {
+        Ok(self.fetch_models().await?.len())
+    }
+
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
         if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
             return Ok(());
@@ -127,10 +169,11 @@ impl OpenAiResponsesProvider {
             })
             .collect();
 
-        let tool_choice = if tools.is_empty() {
-            None
-        } else {
-            Some(json!("required"))
+        let reasoning = match &request.thinking {
+            Some(ThinkingConfig::Reasoning { effort }) => Some(ReasoningConfig {
+                effort: effort.clone(),
+            }),
+            _ => None,
         };
 
         Ok(ResponsesRequestBody {
@@ -141,7 +184,8 @@ impl OpenAiResponsesProvider {
             stream,
             store: false,
             temperature: request.temperature,
-            tool_choice,
+            tool_choice: None,
+            reasoning,
         })
     }
 
@@ -322,6 +366,9 @@ impl OpenAiResponsesProvider {
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
+        if status.as_u16() == 400 && Self::mentions_reasoning_rejection(&body) {
+            tracing::warn!("provider rejected reasoning config — check effort level: {body}");
+        }
         match status.as_u16() {
             401 | 403 => LlmError::Authentication(body),
             429 => LlmError::RateLimited(body),
@@ -329,6 +376,13 @@ impl OpenAiResponsesProvider {
             500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
+    }
+
+    fn mentions_reasoning_rejection(body: &str) -> bool {
+        let lowered = body.to_ascii_lowercase();
+        ["reasoning", "effort", "supported values", "must be one of"]
+            .iter()
+            .any(|term| lowered.contains(term))
     }
 
     async fn complete_via_stream(
@@ -686,9 +740,36 @@ fn map_message_to_responses_input(
 }
 
 fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
-    let text = extract_text(blocks);
-    if !text.is_empty() {
-        input.push(json!({"role": role, "content": text}));
+    let content = response_input_content(role, blocks);
+    if content.is_empty() {
+        return;
+    }
+
+    input.push(json!({"role": role, "content": content}));
+}
+
+fn response_input_content(role: &str, blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter_map(|block| response_input_block(role, block))
+        .collect()
+}
+
+fn response_input_block(role: &str, block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text } => {
+            let block_type = match role {
+                "assistant" => "output_text",
+                _ => "input_text",
+            };
+            Some(json!({"type": block_type, "text": text}))
+        }
+        ContentBlock::Image { media_type, data } if role == "user" => Some(json!({
+            "type": "input_image",
+            "image_url": format!("data:{media_type};base64,{data}")
+        })),
+        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        ContentBlock::Image { .. } => None,
     }
 }
 
@@ -805,12 +886,49 @@ impl LlmProvider for OpenAiResponsesProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.access_token.trim().is_empty() {
+            return Ok(self.supported_models());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => Ok(self.supported_models()),
+            Err(error) => {
+                tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai responses models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: false,
             requires_streaming: true,
         }
     }
+}
+
+async fn parse_model_response(
+    response: reqwest::Response,
+    supported_models: &[String],
+) -> Result<Vec<String>, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(LlmError::Provider(format!(
+            "model list request failed ({status}): {body}"
+        )));
+    }
+
+    let parsed = response
+        .json::<OpenAiModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+    Ok(filter_model_ids(parsed.data, supported_models))
 }
 
 // ============================================================================
@@ -831,6 +949,13 @@ struct ResponsesRequestBody {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    effort: String,
 }
 
 /// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
@@ -951,6 +1076,7 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1119,6 +1245,7 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::spawn_json_server;
     use futures::{pin_mut, stream, StreamExt};
 
     #[test]
@@ -1139,6 +1266,48 @@ mod tests {
             already_full.endpoint(),
             "https://example.com/codex/responses"
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_dynamic_openai_catalog() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"gpt-4.1"},{"id":"text-embedding-3-small"},{"id":"o3-mini"}]}"#,
+        )
+        .await;
+        let provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(base_url)
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4.1".to_string(), "o3-mini".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_when_dynamic_fetch_fails() {
+        let base_url = spawn_json_server("500 Internal Server Error", r#"{"error":"nope"}"#).await;
+        let provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(base_url)
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_supported_models_when_token_is_empty() {
+        let mut provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+        provider.access_token.clear();
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
     }
 
     #[test]
@@ -1251,8 +1420,163 @@ mod tests {
         assert_eq!(body.instructions, Some("You are helpful.".to_string()));
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Hello");
+        assert_eq!(
+            input[0]["content"][0],
+            serde_json::json!({"type": "input_text", "text": "Hello"})
+        );
         assert!(!body.stream);
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![crate::types::Message::user("Hello")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: Some(ThinkingConfig::Reasoning {
+                effort: "xhigh".to_string(),
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(
+            serialized["reasoning"],
+            serde_json::json!({"effort": "xhigh"})
+        );
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_when_disabled() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![crate::types::Message::user("Hello")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: Some(ThinkingConfig::Off),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+
+        assert!(serialized.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn build_request_body_maps_user_images_for_responses_api() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message::user_with_images(
+                "describe this",
+                vec![crate::types::ImageAttachment {
+                    media_type: "image/png".to_string(),
+                    data: "abc123".to_string(),
+                }],
+            )],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+        let content = input[0]["content"].as_array().unwrap();
+
+        assert_eq!(
+            content[0],
+            serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abc123"
+            })
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({
+                "type": "input_text",
+                "text": "describe this"
+            })
+        );
+    }
+
+    #[test]
+    fn build_request_body_maps_assistant_text_as_output_text() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Hello"),
+                crate::types::Message::assistant("Hi there"),
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(
+            input[1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there"}]
+            })
+        );
+    }
+
+    #[test]
+    fn build_request_body_drops_image_on_assistant_message() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Hello"),
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: "abc123".to_string(),
+                        },
+                        ContentBlock::Text {
+                            text: "Hi there".to_string(),
+                        },
+                    ],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(
+            input[1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there"}]
+            })
+        );
     }
 
     #[test]
@@ -1267,7 +1591,10 @@ mod tests {
         assert_eq!(input.len(), 5);
         assert_eq!(
             input[0],
-            serde_json::json!({"role": "user", "content": "Find weather"})
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Find weather"}]
+            })
         );
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["id"], "call_1");
@@ -1295,6 +1622,26 @@ mod tests {
                 "output": "second result"
             })
         );
+    }
+
+    #[test]
+    fn build_tool_continuation_request_omits_tool_choice_with_tools_available() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let mut request = continuation_request();
+        request.tools = vec![crate::types::ToolDefinition {
+            name: "lookup".to_string(),
+            description: "look something up".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(serialized["tools"][0]["name"], "lookup");
+        assert!(serialized.get("tool_choice").is_none());
     }
 
     #[test]
@@ -1399,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_sets_tool_choice_when_tools_present() {
+    fn build_request_body_omits_tool_choice_when_tools_present() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
             model: "gpt-4.1".to_string(),
@@ -1417,7 +1764,7 @@ mod tests {
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
-        assert_eq!(serialized["tool_choice"], "required");
+        assert!(serialized.get("tool_choice").is_none());
     }
 
     #[test]

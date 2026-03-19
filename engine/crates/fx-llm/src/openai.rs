@@ -7,10 +7,13 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
+use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
@@ -84,6 +87,25 @@ impl OpenAiProvider {
         }
     }
 
+    fn models_endpoint(&self) -> String {
+        let base_url = self.base_url.trim_end_matches('/');
+        if base_url.ends_with("/v1") {
+            format!("{base_url}/models")
+        } else {
+            format!("{base_url}/v1/models")
+        }
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_endpoint())
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+        parse_model_response(response, &self.supported_models).await
+    }
+
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
         if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
             return Ok(());
@@ -106,7 +128,7 @@ impl OpenAiProvider {
                 0,
                 OpenAiMessage {
                     role: "system".to_string(),
-                    content: Some(system_prompt.clone()),
+                    content: Some(OpenAiMessageContent::Text(system_prompt.clone())),
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -146,7 +168,7 @@ impl OpenAiProvider {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
 
-        if let Some(text) = choice.message.content {
+        if let Some(OpenAiMessageContent::Text(text)) = choice.message.content {
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text });
             }
@@ -183,81 +205,33 @@ impl OpenAiProvider {
     fn parse_sse_payload(payload: &str) -> Result<Vec<StreamChunk>, LlmError> {
         let mut framer = SseFramer::default();
         let mut chunks = Vec::new();
+        let mut tool_calls_by_index = HashMap::new();
 
         for line in payload.lines() {
             let mut framed = framer.push_bytes(format!("{line}\n").as_bytes())?;
-            chunks.append(&mut Self::map_sse_frames(&mut framed)?);
+            let mut parsed = Self::map_sse_frames(&mut framed, &mut tool_calls_by_index)?;
+            chunks.append(&mut parsed);
         }
 
         let mut final_frames = framer.finish()?;
-        chunks.append(&mut Self::map_sse_frames(&mut final_frames)?);
+        let mut parsed = Self::map_sse_frames(&mut final_frames, &mut tool_calls_by_index)?;
+        chunks.append(&mut parsed);
         Ok(chunks)
     }
 
-    fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
+    fn parse_sse_data(
+        data: &str,
+        tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+    ) -> Result<Vec<StreamChunk>, LlmError> {
         let envelope: OpenAiStreamEnvelope = serde_json::from_str(data)
             .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
-
         let mut chunks = Vec::new();
 
-        if let Some(usage) = envelope.usage {
-            chunks.push(StreamChunk {
-                delta_content: None,
-                tool_use_deltas: Vec::new(),
-                usage: Some(Usage {
-                    input_tokens: usage.prompt_tokens,
-                    output_tokens: usage.completion_tokens,
-                }),
-                stop_reason: None,
-            });
-        }
-
+        maybe_push_usage_chunk(&mut chunks, envelope.usage);
         for choice in envelope.choices {
-            if let Some(content) = choice.delta.content {
-                chunks.push(StreamChunk {
-                    delta_content: Some(content),
-                    tool_use_deltas: Vec::new(),
-                    usage: None,
-                    stop_reason: None,
-                });
-            }
-
-            if let Some(tool_calls) = choice.delta.tool_calls {
-                let deltas = tool_calls
-                    .into_iter()
-                    .map(|tool_call| {
-                        let (name, arguments_delta) = match tool_call.function {
-                            Some(function) => (function.name, function.arguments),
-                            None => (None, None),
-                        };
-
-                        ToolUseDelta {
-                            id: tool_call.id,
-                            name,
-                            arguments_delta,
-                            arguments_done: false,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-
-                if !deltas.is_empty() {
-                    chunks.push(StreamChunk {
-                        delta_content: None,
-                        tool_use_deltas: deltas,
-                        usage: None,
-                        stop_reason: None,
-                    });
-                }
-            }
-
-            if let Some(stop_reason) = choice.finish_reason {
-                chunks.push(StreamChunk {
-                    delta_content: None,
-                    tool_use_deltas: Vec::new(),
-                    usage: None,
-                    stop_reason: Some(stop_reason),
-                });
-            }
+            maybe_push_text_chunk(&mut chunks, choice.delta.content);
+            maybe_push_tool_chunk(&mut chunks, choice.delta.tool_calls, tool_calls_by_index);
+            maybe_push_stop_chunk(&mut chunks, choice.finish_reason);
         }
 
         Ok(chunks)
@@ -288,7 +262,8 @@ impl OpenAiProvider {
                                 }
                             };
 
-                            match Self::map_sse_frames(&mut frames) {
+                            match Self::map_sse_frames(&mut frames, &mut state.tool_calls_by_index)
+                            {
                                 Ok(chunks) => {
                                     state.pending_chunks.extend(chunks.into_iter().map(Ok))
                                 }
@@ -311,7 +286,8 @@ impl OpenAiProvider {
                                 }
                             };
 
-                            match Self::map_sse_frames(&mut frames) {
+                            match Self::map_sse_frames(&mut frames, &mut state.tool_calls_by_index)
+                            {
                                 Ok(chunks) => {
                                     state.pending_chunks.extend(chunks.into_iter().map(Ok))
                                 }
@@ -329,15 +305,69 @@ impl OpenAiProvider {
         )
     }
 
-    fn map_sse_frames(frames: &mut Vec<SseFrame>) -> Result<Vec<StreamChunk>, LlmError> {
+    fn map_sse_frames(
+        frames: &mut Vec<SseFrame>,
+        tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+    ) -> Result<Vec<StreamChunk>, LlmError> {
         let mut chunks = Vec::new();
         for frame in frames.drain(..) {
             match frame {
-                SseFrame::Data(data) => chunks.append(&mut Self::parse_sse_data(&data)?),
+                SseFrame::Data(data) => {
+                    let mut parsed = Self::parse_sse_data(&data, tool_calls_by_index)?;
+                    chunks.append(&mut parsed);
+                }
                 SseFrame::Done => break,
             }
         }
         Ok(chunks)
+    }
+
+    fn update_tool_state(
+        tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+        delta: &OpenAiToolCallDelta,
+    ) -> OpenAiToolStreamState {
+        let state = if let Some(index) = delta.index {
+            tool_calls_by_index.entry(index).or_default()
+        } else {
+            tracing::warn!(?delta.index, "openai tool delta missing index; state may be incomplete");
+            tool_calls_by_index.entry(usize::MAX).or_default()
+        };
+
+        if let Some(id) = &delta.id {
+            state.id = Some(id.clone());
+        }
+        if let Some(function) = &delta.function {
+            if let Some(name) = &function.name {
+                state.name = Some(name.clone());
+            }
+        }
+
+        state.clone()
+    }
+
+    fn map_tool_delta(
+        delta: OpenAiToolCallDelta,
+        tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+    ) -> ToolUseDelta {
+        let state = Self::update_tool_state(tool_calls_by_index, &delta);
+        let arguments_delta = delta.function.and_then(|function| function.arguments);
+
+        ToolUseDelta {
+            id: state.id,
+            name: state.name,
+            arguments_delta,
+            arguments_done: false,
+        }
+    }
+
+    fn map_tool_deltas(
+        tool_calls: Vec<OpenAiToolCallDelta>,
+        tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+    ) -> Vec<ToolUseDelta> {
+        tool_calls
+            .into_iter()
+            .map(|tool_call| Self::map_tool_delta(tool_call, tool_calls_by_index))
+            .collect()
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
@@ -403,6 +433,15 @@ impl LlmProvider for OpenAiProvider {
         Ok(Box::pin(Self::stream_from_sse(response)))
     }
 
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut stream = self.complete_stream(request).await?;
+        collect_completion_stream(&mut stream, &callback).await
+    }
+
     fn name(&self) -> &str {
         &self.provider_name
     }
@@ -411,12 +450,110 @@ impl LlmProvider for OpenAiProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.api_key.trim().is_empty() {
+            return Ok(self.supported_models());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => {
+                tracing::warn!(provider = %self.provider_name, "openai models response was empty; using static fallback");
+                Ok(self.supported_models())
+            }
+            Err(error) => {
+                tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
         }
     }
+}
+
+async fn parse_model_response(
+    response: reqwest::Response,
+    supported_models: &[String],
+) -> Result<Vec<String>, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(OpenAiProvider::map_http_error(status, body));
+    }
+
+    let parsed = response
+        .json::<OpenAiModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+    Ok(filter_model_ids(parsed.data, supported_models))
+}
+
+fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    chunks.push(StreamChunk {
+        delta_content: None,
+        tool_use_deltas: Vec::new(),
+        usage: Some(Usage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+        }),
+        stop_reason: None,
+    });
+}
+
+fn maybe_push_text_chunk(chunks: &mut Vec<StreamChunk>, content: Option<String>) {
+    let Some(content) = content else {
+        return;
+    };
+    chunks.push(StreamChunk {
+        delta_content: Some(content),
+        tool_use_deltas: Vec::new(),
+        usage: None,
+        stop_reason: None,
+    });
+}
+
+fn maybe_push_tool_chunk(
+    chunks: &mut Vec<StreamChunk>,
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+    tool_calls_by_index: &mut HashMap<usize, OpenAiToolStreamState>,
+) {
+    let Some(tool_calls) = tool_calls else {
+        return;
+    };
+    let deltas = OpenAiProvider::map_tool_deltas(tool_calls, tool_calls_by_index);
+    if deltas.is_empty() {
+        return;
+    }
+
+    chunks.push(StreamChunk {
+        delta_content: None,
+        tool_use_deltas: deltas,
+        usage: None,
+        stop_reason: None,
+    });
+}
+
+fn maybe_push_stop_chunk(chunks: &mut Vec<StreamChunk>, stop_reason: Option<String>) {
+    let Some(stop_reason) = stop_reason else {
+        return;
+    };
+    chunks.push(StreamChunk {
+        delta_content: None,
+        tool_use_deltas: Vec::new(),
+        usage: None,
+        stop_reason: Some(stop_reason),
+    });
 }
 
 fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, LlmError> {
@@ -431,7 +568,7 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                         MessageRole::User => "user".to_string(),
                         _ => unreachable!(),
                     },
-                    content: Some(extract_text(&message.content)),
+                    content: map_openai_message_content(&message.content),
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -442,7 +579,11 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
 
                 mapped.push(OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: if text.is_empty() { None } else { Some(text) },
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(OpenAiMessageContent::Text(text))
+                    },
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -467,7 +608,7 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                 if tool_results.is_empty() {
                     mapped.push(OpenAiMessage {
                         role: "tool".to_string(),
-                        content: Some(extract_text(&message.content)),
+                        content: map_openai_message_content(&message.content),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -475,7 +616,9 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                     for (tool_call_id, content) in tool_results {
                         mapped.push(OpenAiMessage {
                             role: "tool".to_string(),
-                            content: Some(value_to_openai_content(content)),
+                            content: Some(OpenAiMessageContent::Text(value_to_openai_content(
+                                content,
+                            ))),
                             tool_calls: None,
                             tool_call_id: Some(tool_call_id),
                         });
@@ -514,10 +657,36 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn map_openai_message_content(blocks: &[ContentBlock]) -> Option<OpenAiMessageContent> {
+    let content = blocks
+        .iter()
+        .filter_map(map_openai_input_block)
+        .collect::<Vec<_>>();
+
+    match content.as_slice() {
+        [] => None,
+        [OpenAiInputBlock::Text { text }] => Some(OpenAiMessageContent::Text(text.clone())),
+        _ => Some(OpenAiMessageContent::Blocks(content)),
+    }
+}
+
+fn map_openai_input_block(block: &ContentBlock) -> Option<OpenAiInputBlock> {
+    match block {
+        ContentBlock::Text { text } => Some(OpenAiInputBlock::Text { text: text.clone() }),
+        ContentBlock::Image { media_type, data } => Some(OpenAiInputBlock::ImageUrl {
+            image_url: OpenAiImageUrl {
+                url: format!("data:{media_type};base64,{data}"),
+            },
+        }),
+        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+    }
 }
 
 fn parse_json_or_string(value: &str) -> Value {
@@ -562,11 +731,30 @@ struct OpenAiRequestBody {
 struct OpenAiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<OpenAiMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Blocks(Vec<OpenAiInputBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAiInputBlock {
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -646,9 +834,17 @@ struct OpenAiStreamDelta {
 #[derive(Debug, Deserialize)]
 struct OpenAiToolCallDelta {
     #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     function: Option<OpenAiToolFunctionDelta>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenAiToolStreamState {
+    id: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -665,6 +861,7 @@ struct OpenAiSseState {
     framer: SseFramer,
     pending_chunks: std::collections::VecDeque<Result<StreamChunk, LlmError>>,
     finished: bool,
+    tool_calls_by_index: HashMap<usize, OpenAiToolStreamState>,
 }
 
 impl OpenAiSseState {
@@ -677,6 +874,7 @@ impl OpenAiSseState {
             framer: SseFramer::default(),
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
+            tool_calls_by_index: HashMap::new(),
         }
     }
 }
@@ -684,8 +882,62 @@ impl OpenAiSseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::{collect_stream_chunks, StreamEvent};
+    use crate::test_helpers::{callback_events, read_events, spawn_json_server};
     use crate::types::ToolDefinition;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn openai_list_models_parses_response() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4.1-mini"},{"id":"text-embedding-3-small"},{"id":"o3-mini"}]}"#,
+        )
+        .await;
+        let provider = OpenAiProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["custom-openai-model".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec![
+                "gpt-4.1-mini".to_string(),
+                "gpt-4o".to_string(),
+                "o3-mini".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_list_models_filters_non_chat() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"text-embedding-ada-002"},{"id":"dall-e-3"},{"id":"gpt-4o"}]}"#,
+        )
+        .await;
+        let provider = OpenAiProvider::new(base_url, "test-key").expect("provider");
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn openai_list_models_falls_back_on_error() {
+        let base_url = spawn_json_server("500 Internal Server Error", r#"{"error":"nope"}"#).await;
+        let provider = OpenAiProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
 
     #[test]
     fn test_build_request_body_maps_messages_tools_and_system() {
@@ -716,8 +968,45 @@ mod tests {
         assert_eq!(serialized["messages"][0]["role"], "system");
         assert_eq!(serialized["messages"][0]["content"], "Be concise");
         assert_eq!(serialized["messages"][1]["role"], "user");
+        assert_eq!(serialized["messages"][1]["content"], "hello");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn image_content_block_serializes_for_openai() {
+        let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+        let request = CompletionRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![Message::user_with_images(
+                "describe this image",
+                vec![crate::types::ImageAttachment {
+                    media_type: "image/jpeg".to_string(),
+                    data: "abc123".to_string(),
+                }],
+            )],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(128),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert_eq!(serialized["messages"][0]["content"][0]["type"], "image_url");
+        assert_eq!(
+            serialized["messages"][0]["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64,abc123"
+        );
+        assert_eq!(serialized["messages"][0]["content"][1]["type"], "text");
+        assert_eq!(
+            serialized["messages"][0]["content"][1]["text"],
+            "describe this image"
+        );
     }
 
     #[test]
@@ -726,7 +1015,7 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: Some("I can call a tool".to_string()),
+                    content: Some(OpenAiMessageContent::Text("I can call a tool".to_string())),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".to_string(),
                         call_type: "function".to_string(),
@@ -764,7 +1053,7 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: Some("Partial response".to_string()),
+                    content: Some(OpenAiMessageContent::Text("Partial response".to_string())),
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -782,7 +1071,7 @@ mod tests {
         let payload = r#"
             data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}
 
-            data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"ci"}}]},"finish_reason":null}]}
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"ci"}}]},"finish_reason":null}]}
 
             data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":8}}
 
@@ -801,6 +1090,122 @@ mod tests {
         assert_eq!(chunks[2].usage.unwrap().input_tokens, 7);
         assert_eq!(chunks[2].usage.unwrap().output_tokens, 8);
         assert_eq!(chunks[3].stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn openai_stream_collection_emits_text_tool_and_done_events() {
+        let payload = r#"
+            data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"faw"}}]},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x\"}"}}]},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":8}}
+
+            data: [DONE]
+        "#;
+        let chunks = OpenAiProvider::parse_sse_payload(payload).unwrap();
+        let (callback, events) = callback_events();
+
+        let response = collect_stream_chunks(chunks, &callback);
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "lookup");
+        assert_eq!(response.tool_calls[0].arguments["q"], "fawx");
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            read_events(events),
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Hello".to_string()
+                },
+                StreamEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string()
+                },
+                StreamEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    args_delta: "{\"q\":\"faw".to_string()
+                },
+                StreamEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    args_delta: "x\"}".to_string()
+                },
+                StreamEvent::ToolCallComplete {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: "{\"q\":\"fawx\"}".to_string()
+                },
+                StreamEvent::Done {
+                    response: "Hello".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_stream_collection_matches_final_completion_response() {
+        let body = OpenAiResponseBody {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAiMessageContent::Text("I can call a tool".to_string())),
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_1".to_string(),
+                        call_type: "function".to_string(),
+                        function: OpenAiFunctionCall {
+                            name: "lookup".to_string(),
+                            arguments: "{\"q\":\"fawx\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+            }),
+        };
+        let payload = r#"
+            data: {"choices":[{"delta":{"content":"I can call a tool"},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"fawx\"}"}}]},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+
+            data: [DONE]
+        "#;
+        let chunks = OpenAiProvider::parse_sse_payload(payload).unwrap();
+        let (callback, _) = callback_events();
+
+        let streamed = collect_stream_chunks(chunks, &callback);
+        let expected = OpenAiProvider::parse_completion_response(body).unwrap();
+
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn openai_sse_preserves_tool_id_across_indexed_argument_deltas() {
+        let payload = r#"
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"fa"}}]},"finish_reason":null}]}
+
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"wx\"}"}}]},"finish_reason":null}]}
+
+            data: [DONE]
+        "#;
+
+        let chunks = OpenAiProvider::parse_sse_payload(payload).unwrap();
+        let deltas: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.tool_use_deltas)
+            .collect();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].id.as_deref(), Some("call_1"));
+        assert_eq!(deltas[1].id.as_deref(), Some("call_1"));
+        assert_eq!(deltas[1].name.as_deref(), Some("lookup"));
     }
 
     #[test]
@@ -862,7 +1267,10 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(mapped[0].content.as_deref(), Some("tool output"));
+        assert!(matches!(
+            mapped[0].content.as_ref(),
+            Some(OpenAiMessageContent::Text(text)) if text == "tool output"
+        ));
     }
 
     #[test]
@@ -879,10 +1287,10 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(
-            mapped[0].content.as_deref(),
-            Some("[ERROR] permission denied")
-        );
+        assert!(matches!(
+            mapped[0].content.as_ref(),
+            Some(OpenAiMessageContent::Text(text)) if text == "[ERROR] permission denied"
+        ));
     }
 
     fn continuation_assistant_message() -> Message {
@@ -933,7 +1341,10 @@ mod tests {
                 (
                     message.role.as_str(),
                     message.tool_call_id.as_deref(),
-                    message.content.as_deref(),
+                    match message.content.as_ref() {
+                        Some(OpenAiMessageContent::Text(text)) => Some(text.as_str()),
+                        _ => None,
+                    },
                 )
             })
             .collect::<Vec<_>>();

@@ -6,6 +6,17 @@
 //!
 //! Pure computation — no I/O, no file writes, no network.
 
+mod monitor;
+mod time;
+mod trigger;
+mod window;
+
+pub use monitor::CanaryMonitor;
+pub use trigger::{RipcordTrigger, RollbackError, RollbackReason, RollbackTrigger};
+pub use window::SignalWindow;
+
+pub(crate) use time::current_epoch_secs;
+
 use fx_kernel::{Signal, SignalKind};
 use serde::{Deserialize, Serialize};
 

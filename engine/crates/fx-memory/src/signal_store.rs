@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Errors that can occur during signal store operations.
 #[derive(Debug)]
@@ -66,6 +67,7 @@ impl std::error::Error for SignalStoreError {
 pub struct SignalStore {
     signals_dir: PathBuf,
     session_id: String,
+    write_lock: Mutex<()>,
 }
 
 const RETENTION_DAYS: u64 = 30;
@@ -96,6 +98,7 @@ impl SignalStore {
         Ok(Self {
             signals_dir,
             session_id: session_id.to_string(),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -187,18 +190,30 @@ impl SignalStore {
         if signals.is_empty() {
             return Ok(());
         }
+
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("signal store write lock poisoned; continuing");
+                poisoned.into_inner()
+            }
+        };
+
         let path = self.session_path();
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(SignalStoreError::FileOpen)?;
+        let mut writer = std::io::BufWriter::new(file);
+
         for signal in signals {
             let redacted = redact_signal_for_persist(signal);
             let json = serde_json::to_string(&redacted).map_err(SignalStoreError::Serialize)?;
-            writeln!(file, "{json}").map_err(SignalStoreError::FileWrite)?;
+            writeln!(writer, "{json}").map_err(SignalStoreError::FileWrite)?;
         }
-        Ok(())
+
+        writer.flush().map_err(SignalStoreError::FileWrite)
     }
 
     /// Remove signal files older than the retention period.
@@ -267,6 +282,7 @@ fn parse_signal_lines(
 ) -> Result<(Vec<Signal>, usize), SignalStoreError> {
     let mut signals = Vec::new();
     let mut skipped = 0usize;
+
     for (line_number, line) in lines.enumerate() {
         let line = line.map_err(SignalStoreError::FileRead)?;
         let trimmed = line.trim();
@@ -274,12 +290,8 @@ fn parse_signal_lines(
             continue;
         }
 
-        match serde_json::from_str::<Signal>(trimmed) {
-            Ok(signal) => {
-                if matches_kind_filter(&signal, kind_filter) {
-                    signals.push(signal);
-                }
-            }
+        match parse_signal_entries(trimmed) {
+            Ok(parsed) => extend_matching_signals(&mut signals, parsed, kind_filter),
             Err(error) => {
                 tracing::debug!(
                     "Skipping malformed signal line in {}:{}: {error}",
@@ -290,7 +302,73 @@ fn parse_signal_lines(
             }
         }
     }
+
     Ok((signals, skipped))
+}
+
+fn parse_signal_entries(line: &str) -> Result<Vec<Signal>, serde_json::Error> {
+    match serde_json::from_str::<Signal>(line) {
+        Ok(signal) => Ok(vec![signal]),
+        Err(error) => recover_concatenated_signals(line).ok_or(error),
+    }
+}
+
+fn recover_concatenated_signals(line: &str) -> Option<Vec<Signal>> {
+    let fragments = split_concatenated_json(line)?;
+    let mut signals = Vec::with_capacity(fragments.len());
+
+    for fragment in fragments {
+        let signal = serde_json::from_str::<Signal>(&fragment).ok()?;
+        signals.push(signal);
+    }
+
+    Some(signals)
+}
+
+/// Split a line containing concatenated JSON objects like `{...}{...}{...}`.
+///
+/// This uses naive `}{` boundary detection, so it will not recover lines where
+/// a JSON string value contains the literal `}{`. That limitation is acceptable
+/// because failed recovery falls through to the existing malformed-line skip
+/// path instead of producing a partial parse.
+fn split_concatenated_json(line: &str) -> Option<Vec<String>> {
+    let raw_fragments = line.split("}{").collect::<Vec<_>>();
+    if raw_fragments.len() <= 1 {
+        return None;
+    }
+
+    let last_index = raw_fragments.len() - 1;
+    Some(
+        raw_fragments
+            .into_iter()
+            .enumerate()
+            .map(|(index, fragment)| normalize_signal_fragment(fragment, index, last_index))
+            .collect(),
+    )
+}
+
+fn normalize_signal_fragment(fragment: &str, index: usize, last_index: usize) -> String {
+    let mut normalized = String::with_capacity(fragment.len() + 2);
+    if index > 0 {
+        normalized.push('{');
+    }
+    normalized.push_str(fragment);
+    if index < last_index {
+        normalized.push('}');
+    }
+    normalized
+}
+
+fn extend_matching_signals(
+    signals: &mut Vec<Signal>,
+    parsed: Vec<Signal>,
+    kind_filter: Option<SignalKind>,
+) {
+    signals.extend(
+        parsed
+            .into_iter()
+            .filter(|signal| matches_kind_filter(signal, kind_filter)),
+    );
 }
 
 fn matches_kind_filter(signal: &Signal, kind_filter: Option<SignalKind>) -> bool {
@@ -679,32 +757,68 @@ broken
     }
 
     #[test]
-    fn parse_signal_lines_keeps_good_signals_when_bad_lines_are_present() {
-        let good_a =
+    fn parse_signal_lines_recovers_concatenated_json_objects() {
+        let first =
             serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "first", 1))
                 .expect("serialize signal");
-        let good_b = serde_json::to_string(&mk_signal(
+        let second = serde_json::to_string(&mk_signal(
             LoopStep::Decide,
             SignalKind::Decision,
             "second",
             2,
         ))
         .expect("serialize signal");
-        let malformed_concatenated = format!("{good_a}{good_b}");
-        let lines = vec![
-            Ok(good_a),
-            Ok(malformed_concatenated),
-            Ok("# ignored".to_string()),
-            Ok(good_b),
-        ];
+        let lines = vec![Ok(format!("{first}{second}"))];
+
+        let (parsed, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+
+        assert_eq!(skipped, 0);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].message, "first");
+        assert_eq!(parsed[1].message, "second");
+    }
+
+    #[test]
+    fn parse_signal_lines_recovers_three_concatenated_json_objects() {
+        let first =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "first", 1))
+                .expect("serialize signal");
+        let second = serde_json::to_string(&mk_signal(
+            LoopStep::Decide,
+            SignalKind::Decision,
+            "second",
+            2,
+        ))
+        .expect("serialize signal");
+        let third =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Friction, "third", 3))
+                .expect("serialize signal");
+        let lines = vec![Ok(format!("{first}{second}{third}"))];
+
+        let (parsed, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+
+        assert_eq!(skipped, 0);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].message, "first");
+        assert_eq!(parsed[1].message, "second");
+        assert_eq!(parsed[2].message, "third");
+    }
+
+    #[test]
+    fn parse_signal_lines_skips_unrecoverable_concatenated_json_objects() {
+        let valid =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "kept", 1))
+                .expect("serialize signal");
+        let lines = vec![Ok(format!("{valid}{{\"broken\":")), Ok(valid.clone())];
 
         let (parsed, skipped) =
             parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
 
         assert_eq!(skipped, 1);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].message, "first");
-        assert_eq!(parsed[1].message, "second");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message, "kept");
     }
 
     #[test]

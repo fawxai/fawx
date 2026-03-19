@@ -17,9 +17,11 @@
 //! Loaded into memory on startup. Simple, debuggable, grep-friendly.
 
 pub mod error;
+pub mod flush;
 pub mod journal;
 pub mod skill;
 
 pub use error::JournalError;
+pub use flush::JournalCompactionFlush;
 pub use journal::{Journal, JournalEntry};
 pub use skill::JournalSkill;

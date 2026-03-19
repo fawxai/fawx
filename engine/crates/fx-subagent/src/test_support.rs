@@ -91,6 +91,11 @@ impl SubagentControl for StubSubagentControl {
         Ok(vec![self.handle()])
     }
 
+    async fn get(&self, id: &SubagentId) -> Result<Option<SubagentHandle>, SubagentError> {
+        let handle = self.handle();
+        Ok((handle.id == *id).then_some(handle))
+    }
+
     async fn cancel(&self, _id: &SubagentId) -> Result<(), SubagentError> {
         self.update_state(|state| {
             if state.status == SubagentStatus::Running {

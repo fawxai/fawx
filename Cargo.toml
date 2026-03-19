@@ -12,19 +12,23 @@ members = [
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
     "engine/crates/fx-security",
+    "engine/crates/fx-sandbox",
     "engine/crates/fx-skills",
     "engine/crates/fx-storage",
     "engine/crates/fx-tools",
     "engine/crates/fx-analysis",
+    "engine/crates/fx-api",
     "engine/crates/fx-cli",
     "engine/crates/fx-conversation",
     "engine/crates/fx-memory",
+    "engine/crates/fx-embeddings",
     "engine/crates/fx-improve",
     "engine/crates/fx-transactions",
     "engine/crates/fx-scratchpad",
     "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
     "engine/crates/fawx-ripcord",
+    "engine/crates/fx-ripcord",
     "engine/crates/fx-author",
     "engine/crates/fx-marketplace",
     "engine/crates/fawx-test",
@@ -35,6 +39,22 @@ members = [
     "engine/crates/fx-orchestrator",
     "engine/crates/fx-journal",
     "engine/crates/fx-session",
+    "engine/crates/fx-bus",
+    "engine/crates/fx-cron",
+    "engine/crates/fx-consensus",
+    "engine/crates/fx-training",
+  "engine/crates/fx-telemetry",
+  "engine/crates/fx-forge",
+]
+exclude = [
+    "skills/calculator-skill",
+    "skills/github-skill",
+    "skills/weather-skill",
+    "skills/vision-skill",
+    "skills/tts-skill",
+    "skills/stt-skill",
+    "skills/browser-skill",
+    "skills/canvas-skill",
 ]
 resolver = "2"
 
@@ -60,6 +80,7 @@ async-trait = "0.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 crossterm = "0.28"
 ratatui = "0.29"
 tui-textarea = "0.7"
@@ -98,6 +119,7 @@ fx-subagent = { path = "engine/crates/fx-subagent" }
 fx-decompose = { path = "engine/crates/fx-decompose" }
 fx-kernel = { path = "engine/crates/fx-kernel" }
 fx-auth = { path = "engine/crates/fx-auth" }
+fx-cli = { path = "engine/crates/fx-cli" }
 fx-conversation = { path = "engine/crates/fx-conversation" }
 fx-loadable = { path = "engine/crates/fx-loadable" }
 fx-agent = { path = "engine/crates/fx-agent" }
@@ -108,6 +130,7 @@ fx-tools = { path = "engine/crates/fx-tools" }
 fx-transactions = { path = "engine/crates/fx-transactions" }
 fx-analysis = { path = "engine/crates/fx-analysis" }
 fx-memory = { path = "engine/crates/fx-memory" }
+fx-embeddings = { path = "engine/crates/fx-embeddings" }
 fx-improve = { path = "engine/crates/fx-improve" }
 fx-scratchpad = { path = "engine/crates/fx-scratchpad" }
 fx-journal = { path = "engine/crates/fx-journal" }
@@ -118,3 +141,11 @@ fx-marketplace = { path = "engine/crates/fx-marketplace" }
 fx-fleet = { path = "engine/crates/fx-fleet" }
 fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
 fx-session = { path = "engine/crates/fx-session" }
+fx-bus = { path = "engine/crates/fx-bus" }
+fx-cron = { path = "engine/crates/fx-cron" }
+fx-consensus = { path = "engine/crates/fx-consensus" }
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true

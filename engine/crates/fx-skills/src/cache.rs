@@ -35,12 +35,6 @@ fn hash_bytes(data: &[u8]) -> String {
     hex::encode(hash.as_ref())
 }
 
-/// Get the cache marker file path for a given WASM hash.
-fn get_cache_path(hash: &str) -> Result<PathBuf, SkillError> {
-    let cache_dir = get_cache_dir()?;
-    Ok(cache_dir.join(format!("{}.module", hash)))
-}
-
 /// Safely compile a WASM module, using the cache for deduplication tracking.
 ///
 /// Always compiles from source WASM bytes via `Module::new()` (safe).
@@ -48,20 +42,27 @@ fn get_cache_path(hash: &str) -> Result<PathBuf, SkillError> {
 ///
 /// Returns `(Module, bool)` where the bool indicates if this WASM was seen before.
 pub fn compile_module(engine: &Engine, wasm_bytes: &[u8]) -> Result<(Module, bool), SkillError> {
+    let cache_dir = get_cache_dir()?;
+    compile_module_in(engine, wasm_bytes, &cache_dir)
+}
+
+/// Compile a WASM module using an explicit cache directory.
+pub fn compile_module_in(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    cache_dir: &std::path::Path,
+) -> Result<(Module, bool), SkillError> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|e| SkillError::Load(format!("Failed to create cache dir: {e}")))?;
     let hash = hash_bytes(wasm_bytes);
-    let cache_path = get_cache_path(&hash)?;
+    let cache_path = cache_dir.join(format!("{hash}.module"));
     let was_cached = cache_path.exists();
 
-    // Always compile safely from source
     let module = Module::new(engine, wasm_bytes)
-        .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {}", e)))?;
+        .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {e}")))?;
 
-    // Write cache marker (just the hash, not native code)
     if !was_cached {
         let _ = fs::write(&cache_path, hash.as_bytes());
-        tracing::debug!("Compiled and cached new module with hash {}", hash);
-    } else {
-        tracing::debug!("Recompiled known module with hash {}", hash);
     }
 
     Ok((module, was_cached))
@@ -69,57 +70,65 @@ pub fn compile_module(engine: &Engine, wasm_bytes: &[u8]) -> Result<(Module, boo
 
 /// Check if WASM bytes have been compiled before.
 pub fn has_cached_module(wasm_bytes: &[u8]) -> Result<bool, SkillError> {
+    let cache_dir = get_cache_dir()?;
+    has_cached_module_in(wasm_bytes, &cache_dir)
+}
+
+/// Check if WASM bytes have been compiled before, using an explicit cache dir.
+pub fn has_cached_module_in(
+    wasm_bytes: &[u8],
+    cache_dir: &std::path::Path,
+) -> Result<bool, SkillError> {
     let hash = hash_bytes(wasm_bytes);
-    let cache_path = get_cache_path(&hash)?;
-    Ok(cache_path.exists())
+    Ok(cache_dir.join(format!("{hash}.module")).exists())
 }
 
 /// Clear the entire module cache.
 pub fn clear_cache() -> Result<(), SkillError> {
     let cache_dir = get_cache_dir()?;
+    clear_cache_in(&cache_dir)
+}
 
+/// Clear the module cache in an explicit directory.
+pub fn clear_cache_in(cache_dir: &std::path::Path) -> Result<(), SkillError> {
     if !cache_dir.exists() {
         return Ok(());
     }
-
-    // Remove all .module files
-    for entry in fs::read_dir(&cache_dir)
-        .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {}", e)))?
+    for entry in fs::read_dir(cache_dir)
+        .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {e}")))?
     {
         let entry =
-            entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {}", e)))?;
-
+            entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {e}")))?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("module") {
             fs::remove_file(&path)
-                .map_err(|e| SkillError::Load(format!("Failed to remove cache file: {}", e)))?;
+                .map_err(|e| SkillError::Load(format!("Failed to remove cache file: {e}")))?;
         }
     }
-
-    tracing::info!("Cleared module cache");
     Ok(())
 }
 
 /// Get cache statistics.
 pub fn cache_stats() -> Result<CacheStats, SkillError> {
     let cache_dir = get_cache_dir()?;
+    cache_stats_in(&cache_dir)
+}
 
+/// Get cache statistics for an explicit directory.
+pub fn cache_stats_in(cache_dir: &std::path::Path) -> Result<CacheStats, SkillError> {
     if !cache_dir.exists() {
         return Ok(CacheStats {
             num_entries: 0,
             total_size: 0,
         });
     }
-
     let mut num_entries = 0;
     let mut total_size = 0u64;
-
-    for entry in fs::read_dir(&cache_dir)
-        .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {}", e)))?
+    for entry in fs::read_dir(cache_dir)
+        .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {e}")))?
     {
         let entry =
-            entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {}", e)))?;
-
+            entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {e}")))?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("module") {
             num_entries += 1;
@@ -128,7 +137,6 @@ pub fn cache_stats() -> Result<CacheStats, SkillError> {
             }
         }
     }
-
     Ok(CacheStats {
         num_entries,
         total_size,
@@ -147,11 +155,8 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tempfile::TempDir;
     use wasmtime::Engine;
-
-    // Serialize cache tests to prevent races on the shared cache directory
-    static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_minimal_wasm() -> Vec<u8> {
         vec![
@@ -174,102 +179,80 @@ mod tests {
 
     #[test]
     fn test_compile_new_module() {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        // Clear cache first
-        clear_cache().ok();
-
-        let (module, was_cached) = compile_module(&engine, &wasm).expect("Should compile");
+        let (module, was_cached) = compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
         assert!(!was_cached);
-        assert_eq!(module.exports().count(), 0); // Minimal WASM has no exports
+        assert_eq!(module.exports().count(), 0);
     }
 
     #[test]
     fn test_compile_cached_module() {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        // Clear cache first
-        clear_cache().ok();
+        let (_m1, cached1) = compile_module_in(&engine, &wasm, tmp.path()).expect("first compile");
+        assert!(!cached1);
 
-        // First compile
-        let (_module1, was_cached1) = compile_module(&engine, &wasm).expect("Should compile");
-        assert!(!was_cached1);
-
-        // Second compile — should report as previously seen
-        let (_module2, was_cached2) = compile_module(&engine, &wasm).expect("Should compile");
-        assert!(was_cached2);
+        let (_m2, cached2) = compile_module_in(&engine, &wasm, tmp.path()).expect("second compile");
+        assert!(cached2);
     }
 
     #[test]
     fn test_has_cached_module() {
-        let _lock = CACHE_LOCK.lock().unwrap();
-        let wasm = create_minimal_wasm();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
+        let wasm = create_minimal_wasm();
 
-        // Clear cache first
-        clear_cache().ok();
+        assert!(!has_cached_module_in(&wasm, tmp.path()).expect("check before"));
 
-        assert!(!has_cached_module(&wasm).expect("Should check"));
+        compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
 
-        compile_module(&engine, &wasm).expect("Should compile");
-
-        assert!(has_cached_module(&wasm).expect("Should check"));
+        assert!(has_cached_module_in(&wasm, tmp.path()).expect("check after"));
     }
 
     #[test]
     fn test_different_wasm_not_cached() {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
         let wasm1 = create_minimal_wasm();
+        let wasm2 = b"different content with different hash";
 
-        // Different bytes produce a different hash
-        let wasm2 = b"different content that won't compile but has a different hash";
+        compile_module_in(&engine, &wasm1, tmp.path()).expect("compile wasm1");
 
-        // Clear cache first
-        clear_cache().ok();
-
-        compile_module(&engine, &wasm1).expect("Should compile wasm1");
-
-        // Different bytes should not show as cached
-        assert!(!has_cached_module(wasm2).expect("Should check"));
+        assert!(!has_cached_module_in(wasm2, tmp.path()).expect("check wasm2"));
     }
 
     #[test]
     fn test_cache_stats() {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        // Clear cache first
-        clear_cache().ok();
+        let before = cache_stats_in(tmp.path()).expect("stats before");
+        assert_eq!(before.num_entries, 0);
 
-        let stats_before = cache_stats().expect("Should get stats");
-        assert_eq!(stats_before.num_entries, 0);
+        compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
 
-        compile_module(&engine, &wasm).expect("Should compile");
-
-        let stats_after = cache_stats().expect("Should get stats");
-        assert_eq!(stats_after.num_entries, 1);
+        let after = cache_stats_in(tmp.path()).expect("stats after");
+        assert_eq!(after.num_entries, 1);
     }
 
     #[test]
     fn test_clear_cache() {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let tmp = TempDir::new().expect("tempdir");
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        compile_module(&engine, &wasm).expect("Should compile");
-
-        let stats = cache_stats().expect("Should get stats");
+        compile_module_in(&engine, &wasm, tmp.path()).expect("compile");
+        let stats = cache_stats_in(tmp.path()).expect("stats");
         assert!(stats.num_entries > 0);
 
-        clear_cache().expect("Should clear");
-
-        let stats = cache_stats().expect("Should get stats");
+        clear_cache_in(tmp.path()).expect("clear");
+        let stats = cache_stats_in(tmp.path()).expect("stats after clear");
         assert_eq!(stats.num_entries, 0);
     }
 }

@@ -1,0 +1,35 @@
+name = "stt"
+version = "1.0.0"
+description = "Convert speech audio to text using OpenAI Whisper API"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
+
+[[tools]]
+name = "speech_to_text"
+description = "Transcribe speech audio to text. Accepts audio URLs or base64-encoded audio data."
+
+[[tools.parameters]]
+name = "audio"
+type = "string"
+description = "Audio source: a URL to an audio file, or base64-encoded audio data"
+required = true
+
+[[tools.parameters]]
+name = "language"
+type = "string"
+description = "Language code (ISO 639-1, e.g., 'en', 'es', 'fr'). Optional — Whisper auto-detects if omitted."
+required = false
+
+[[tools.parameters]]
+name = "prompt"
+type = "string"
+description = "Optional context/prompt to guide transcription accuracy (e.g., technical terms, names)"
+required = false
+
+[[tools.parameters]]
+name = "format"
+type = "string"
+description = "Response format: 'text' (default), 'verbose' (includes timestamps and segments)"
+required = false

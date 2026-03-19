@@ -103,19 +103,45 @@ impl MarkdownRenderer {
     }
 }
 
+fn term_indicates_truecolor(term: &str) -> bool {
+    term.ends_with("-direct") || term == "xterm-direct" || term.contains("truecolor")
+}
+
+fn supports_truecolor() -> bool {
+    if let Ok(value) = std::env::var("COLORTERM") {
+        if value == "truecolor" || value == "24bit" {
+            return true;
+        }
+    }
+
+    if let Ok(term) = std::env::var("TERM") {
+        return term_indicates_truecolor(&term);
+    }
+
+    false
+}
+
+fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> crossterm::style::Color {
+    if supports_truecolor() {
+        crossterm::style::Color::Rgb { r, g, b }
+    } else {
+        crossterm::style::Color::AnsiValue(fallback_256)
+    }
+}
+
 /// Format a header line with bold + color, differentiated by level.
 fn format_header(text: &str, level: u8) -> String {
     match level {
         1 => {
-            let bright = crate::tui::theme_color(100, 220, 255, 81);
+            let bright = theme_color(100, 220, 255, 81);
             format!("{}", text.bold().underlined().with(bright))
         }
         2 => {
-            let medium = crate::tui::theme_color(100, 200, 255, 75);
+            let medium = theme_color(100, 200, 255, 75);
             format!("{}", text.bold().with(medium))
         }
         _ => {
-            let dim = crate::tui::theme_color(130, 190, 230, 110);
+            let dim = theme_color(130, 190, 230, 110);
             format!("{}", text.bold().with(dim))
         }
     }
@@ -123,7 +149,7 @@ fn format_header(text: &str, level: u8) -> String {
 
 /// Format a code-block line: cyan/dim, indented.
 fn format_code_block_line(line: &str) -> String {
-    let green = crate::tui::theme_color(120, 220, 120, 114);
+    let green = theme_color(120, 220, 120, 114);
     format!("  {}", line.with(green))
 }
 
@@ -165,7 +191,7 @@ fn format_inline(text: &str) -> String {
         if chars[i] == '`' {
             if let Some(end) = find_closing(&chars, i + 1, '`') {
                 let code: String = chars[i + 1..end].iter().collect();
-                let cyan = crate::tui::theme_color(180, 220, 255, 117);
+                let cyan = theme_color(180, 220, 255, 117);
                 out.push_str(&format!("{}", code.with(cyan)));
                 i = end + 1;
                 continue;

@@ -95,8 +95,8 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Return a summary of each registered skill and its tool names.
-    pub fn skill_summaries(&self) -> Vec<(String, Vec<String>)> {
+    /// Return a summary of each registered skill, description, tool names, and declared capabilities.
+    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
         let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
         skills
             .iter()
@@ -106,7 +106,12 @@ impl SkillRegistry {
                     .into_iter()
                     .map(|definition| definition.name)
                     .collect();
-                (skill.name().to_string(), tools)
+                (
+                    skill.name().to_string(),
+                    skill.description().to_string(),
+                    tools,
+                    skill.capabilities(),
+                )
             })
             .collect()
     }
@@ -363,6 +368,7 @@ mod tests {
     #[derive(Debug)]
     struct MockSkill {
         skill_name: String,
+        description: String,
         tools: Vec<ToolDefinition>,
         cacheability: ToolCacheability,
     }
@@ -387,6 +393,7 @@ mod tests {
                 .collect();
             Self {
                 skill_name: name.to_string(),
+                description: format!("{name} skill"),
                 tools,
                 cacheability,
             }
@@ -397,6 +404,10 @@ mod tests {
     impl Skill for MockSkill {
         fn name(&self) -> &str {
             &self.skill_name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
         }
 
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -429,6 +440,10 @@ mod tests {
     impl Skill for FailingSkill {
         fn name(&self) -> &str {
             "failing"
+        }
+
+        fn description(&self) -> &str {
+            "failing skill"
         }
 
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -498,9 +513,11 @@ mod tests {
         let summaries = reg.skill_summaries();
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].0, "fs");
-        assert_eq!(summaries[0].1, vec!["read_file", "write_file"]);
+        assert_eq!(summaries[0].1, "fs skill");
+        assert_eq!(summaries[0].2, vec!["read_file", "write_file"]);
         assert_eq!(summaries[1].0, "net");
-        assert_eq!(summaries[1].1, vec!["http_get"]);
+        assert_eq!(summaries[1].1, "net skill");
+        assert_eq!(summaries[1].2, vec!["http_get"]);
     }
 
     #[tokio::test]
@@ -755,6 +772,10 @@ mod tests {
             "declining"
         }
 
+        fn description(&self) -> &str {
+            "declining skill"
+        }
+
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {
                 name: "decline_tool".to_string(),
@@ -844,6 +865,9 @@ mod tests {
             fn name(&self) -> &str {
                 "slow"
             }
+            fn description(&self) -> &str {
+                "slow skill"
+            }
             fn tool_definitions(&self) -> Vec<ToolDefinition> {
                 vec![ToolDefinition {
                     name: "slow_tool".to_string(),
@@ -908,6 +932,9 @@ mod security_boundary_tests {
         fn name(&self) -> &str {
             "probe_a"
         }
+        fn description(&self) -> &str {
+            "probe skill a"
+        }
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {
                 name: "tool_a".to_string(),
@@ -936,6 +963,9 @@ mod security_boundary_tests {
     impl Skill for ProbeSkillB {
         fn name(&self) -> &str {
             "probe_b"
+        }
+        fn description(&self) -> &str {
+            "probe skill b"
         }
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {

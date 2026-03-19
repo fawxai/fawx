@@ -1,10 +1,28 @@
 pub mod manager;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use toml_edit::{value, DocumentMut, Item, Table};
+use tracing_subscriber::filter::LevelFilter;
 
-const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
+pub const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const MIN_MAX_READ_SIZE: u64 = 1024;
+pub(crate) const VALID_LOG_LEVELS: &str = "error, warn, info, debug, trace";
+
+pub fn validate_synthesis_instruction(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("synthesis_instruction must not be empty".to_string());
+    }
+    if trimmed.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
+        return Err(format!(
+            "synthesis_instruction exceeds {MAX_SYNTHESIS_INSTRUCTION_LENGTH} characters"
+        ));
+    }
+    Ok(())
+}
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +46,13 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # default_model = "anthropic/claude-sonnet-4-20250514"
 # synthesis_instruction = "Be concise and direct."
 
+[logging]
+# file_logging = true
+# file_level = "info"
+# stderr_level = "warn"
+# max_files = 7
+# log_dir = "~/.fawx/logs"
+
 [tools]
 # working_dir = "/home/user/projects"
 # search_exclude = ["vendor", "dist"]
@@ -38,9 +63,38 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_value_size = 10240
 # max_snapshot_chars = 2000
 # max_relevant_results = 5
+# embeddings_enabled = true
+
+[workspace]
+# Workspace root. Defaults to the current directory.
+# root = "."
+
+[permissions]
+# Default preset for new configs. Use "custom" to manage lists manually.
+# preset = "power"
+# unrestricted = ["read_any", "web_search", "web_fetch", "code_execute", "file_write", "git", "shell", "tool_call", "self_modify"]
+# proposal_required = ["credential_change", "system_install", "network_listen", "outbound_message", "file_delete", "outside_workspace", "kernel_modify"]
+
+[budget]
+# Default cost guardrails in cents. Set to 0 for unlimited.
+# max_session_cost_cents = 500
+# max_daily_cost_cents = 2000
+# alert_threshold_cents = 200
+
+[sandbox]
+# Default sandbox preset for shell and skill execution.
+# allow_network = true
+# allow_subprocess = true
+# max_execution_seconds = 300
+
+[proposals]
+# Proposal defaults; leave auto_approve_timeout_minutes unset to keep approval manual.
+# notification_channels = ["tui"]
+# expiry_hours = 24
 
 # [security]
 # require_signatures = false
+# github_borrow_scope = "read_only"  # "read_only" | "contribution"
 
 # [self_modify]
 # enabled = false
@@ -67,6 +121,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 pub struct FawxConfig {
     pub general: GeneralConfig,
     pub model: ModelConfig,
+    pub logging: LoggingConfig,
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
     pub security: SecurityConfig,
@@ -78,6 +133,327 @@ pub struct FawxConfig {
     pub webhook: WebhookConfig,
     pub orchestrator: OrchestratorConfig,
     pub telegram: TelegramChannelConfig,
+    pub workspace: WorkspaceConfig,
+    pub permissions: PermissionsConfig,
+    pub budget: BudgetConfig,
+    pub sandbox: SandboxConfig,
+    pub proposals: ProposalConfig,
+}
+
+/// Workspace configuration for filesystem boundaries and defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// Root directory for workspace operations. Resolved to cwd at startup if None.
+    pub root: Option<PathBuf>,
+}
+
+/// Permission presets that define default agent autonomy levels.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMode {
+    /// Default: denied actions are silently blocked with structured error.
+    #[default]
+    Capability,
+    /// Opt-in: denied actions trigger interactive prompts (legacy behavior).
+    Prompt,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionPreset {
+    Power,
+    Cautious,
+    Experimental,
+    Custom,
+}
+
+impl PermissionPreset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Power => "power",
+            Self::Cautious => "cautious",
+            Self::Experimental => "experimental",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+impl FromStr for PermissionPreset {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "power" | "standard" => Ok(Self::Power),
+            "cautious" | "restricted" => Ok(Self::Cautious),
+            "experimental" | "open" => Ok(Self::Experimental),
+            "custom" => Ok(Self::Custom),
+            other => Err(format!(
+                "unknown permission preset '{other}'; expected power, cautious, experimental, custom, standard, restricted, open"
+            )),
+        }
+    }
+}
+
+/// Permission actions that can be allowed outright or gated behind proposals.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAction {
+    ReadAny,
+    WebSearch,
+    WebFetch,
+    CodeExecute,
+    FileWrite,
+    Git,
+    Shell,
+    ToolCall,
+    SelfModify,
+    CredentialChange,
+    SystemInstall,
+    NetworkListen,
+    OutboundMessage,
+    FileDelete,
+    OutsideWorkspace,
+    KernelModify,
+}
+
+impl PermissionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadAny => "read_any",
+            Self::WebSearch => "web_search",
+            Self::WebFetch => "web_fetch",
+            Self::CodeExecute => "code_execute",
+            Self::FileWrite => "file_write",
+            Self::Git => "git",
+            Self::Shell => "shell",
+            Self::ToolCall => "tool_call",
+            Self::SelfModify => "self_modify",
+            Self::CredentialChange => "credential_change",
+            Self::SystemInstall => "system_install",
+            Self::NetworkListen => "network_listen",
+            Self::OutboundMessage => "outbound_message",
+            Self::FileDelete => "file_delete",
+            Self::OutsideWorkspace => "outside_workspace",
+            Self::KernelModify => "kernel_modify",
+        }
+    }
+}
+
+/// Permissions configuration for preset-based and custom autonomy policies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    /// Selected preset that produced these permission lists.
+    pub preset: PermissionPreset,
+    /// Whether restricted actions are denied or trigger prompts.
+    #[serde(default)]
+    pub mode: CapabilityMode,
+    /// Actions Fawx can perform without asking.
+    pub unrestricted: Vec<PermissionAction>,
+    /// Actions that require human approval via proposal.
+    pub proposal_required: Vec<PermissionAction>,
+}
+
+impl PermissionsConfig {
+    /// 🔥 Power User — full workspace autonomy, proposals for external actions.
+    pub fn power() -> Self {
+        Self {
+            preset: PermissionPreset::Power,
+            mode: CapabilityMode::Capability,
+            unrestricted: actions(&[
+                PermissionAction::ReadAny,
+                PermissionAction::WebSearch,
+                PermissionAction::WebFetch,
+                PermissionAction::CodeExecute,
+                PermissionAction::FileWrite,
+                PermissionAction::Git,
+                PermissionAction::Shell,
+                PermissionAction::ToolCall,
+                PermissionAction::SelfModify,
+            ]),
+            proposal_required: actions(&[
+                PermissionAction::CredentialChange,
+                PermissionAction::SystemInstall,
+                PermissionAction::NetworkListen,
+                PermissionAction::OutboundMessage,
+                PermissionAction::FileDelete,
+                PermissionAction::OutsideWorkspace,
+                PermissionAction::KernelModify,
+            ]),
+        }
+    }
+
+    /// 🔒 Cautious — proposals for writes too.
+    pub fn cautious() -> Self {
+        Self {
+            preset: PermissionPreset::Cautious,
+            mode: CapabilityMode::Capability,
+            unrestricted: actions(&[
+                PermissionAction::ReadAny,
+                PermissionAction::WebSearch,
+                PermissionAction::WebFetch,
+                PermissionAction::ToolCall,
+            ]),
+            proposal_required: actions(&[
+                PermissionAction::CodeExecute,
+                PermissionAction::FileWrite,
+                PermissionAction::Git,
+                PermissionAction::Shell,
+                PermissionAction::SelfModify,
+                PermissionAction::CredentialChange,
+                PermissionAction::SystemInstall,
+                PermissionAction::NetworkListen,
+                PermissionAction::OutboundMessage,
+                PermissionAction::FileDelete,
+                PermissionAction::OutsideWorkspace,
+                PermissionAction::KernelModify,
+            ]),
+        }
+    }
+
+    /// 🧪 Experimental — maximum autonomy including kernel self-modification.
+    pub fn experimental() -> Self {
+        Self {
+            preset: PermissionPreset::Experimental,
+            mode: CapabilityMode::Capability,
+            unrestricted: actions(&[
+                PermissionAction::ReadAny,
+                PermissionAction::WebSearch,
+                PermissionAction::WebFetch,
+                PermissionAction::CodeExecute,
+                PermissionAction::FileWrite,
+                PermissionAction::Git,
+                PermissionAction::Shell,
+                PermissionAction::ToolCall,
+                PermissionAction::SelfModify,
+                PermissionAction::KernelModify,
+            ]),
+            proposal_required: actions(&[
+                PermissionAction::CredentialChange,
+                PermissionAction::SystemInstall,
+                PermissionAction::NetworkListen,
+                PermissionAction::OutboundMessage,
+                PermissionAction::FileDelete,
+                PermissionAction::OutsideWorkspace,
+            ]),
+        }
+    }
+
+    /// Open — everything allowed except privilege escalation.
+    pub fn open() -> Self {
+        Self {
+            preset: PermissionPreset::Experimental,
+            mode: CapabilityMode::Capability,
+            ..Self::experimental()
+        }
+    }
+
+    /// Standard — developer workflow, credential/system changes blocked.
+    pub fn standard() -> Self {
+        Self {
+            preset: PermissionPreset::Power,
+            mode: CapabilityMode::Capability,
+            ..Self::power()
+        }
+    }
+
+    /// Restricted — read-heavy, most writes blocked.
+    pub fn restricted() -> Self {
+        Self {
+            preset: PermissionPreset::Cautious,
+            mode: CapabilityMode::Capability,
+            ..Self::cautious()
+        }
+    }
+
+    pub fn from_preset_name(name: &str) -> Result<Self, String> {
+        match PermissionPreset::from_str(name)? {
+            PermissionPreset::Power => Ok(Self::power()),
+            PermissionPreset::Cautious => Ok(Self::cautious()),
+            PermissionPreset::Experimental => Ok(Self::experimental()),
+            PermissionPreset::Custom => Ok(Self {
+                preset: PermissionPreset::Custom,
+                ..Self::default()
+            }),
+        }
+    }
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+fn actions(list: &[PermissionAction]) -> Vec<PermissionAction> {
+    list.to_vec()
+}
+
+/// Budget configuration for per-session and daily cost guardrails.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Max cost in cents per session (0 = unlimited). E.g., 500 = $5.00.
+    pub max_session_cost_cents: u32,
+    /// Max cost in cents per day (0 = unlimited).
+    pub max_daily_cost_cents: u32,
+    /// Alert threshold in cents.
+    pub alert_threshold_cents: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_session_cost_cents: 500,
+            max_daily_cost_cents: 2_000,
+            alert_threshold_cents: 200,
+        }
+    }
+}
+
+/// Sandbox configuration for process and network execution limits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Allow network access from shell/skills.
+    pub allow_network: bool,
+    /// Allow subprocess spawning.
+    pub allow_subprocess: bool,
+    /// Kill processes after this many seconds (None = no limit).
+    pub max_execution_seconds: Option<u64>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            allow_network: true,
+            allow_subprocess: true,
+            max_execution_seconds: Some(300),
+        }
+    }
+}
+
+/// Proposal configuration for approval timing, channels, and expiry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProposalConfig {
+    /// Minutes before auto-approving proposals (None = never).
+    pub auto_approve_timeout_minutes: Option<u32>,
+    /// Where to send proposal notifications.
+    pub notification_channels: Vec<String>,
+    /// Hours before proposals expire unacted (None = never expires).
+    pub expiry_hours: Option<u32>,
+}
+
+impl Default for ProposalConfig {
+    fn default() -> Self {
+        Self {
+            auto_approve_timeout_minutes: None,
+            notification_channels: vec!["tui".to_string()],
+            expiry_hours: Some(24),
+        }
+    }
 }
 
 /// Fleet configuration for multi-node coordination.
@@ -222,10 +598,24 @@ pub enum ThinkingBudget {
     Adaptive,
     #[serde(rename = "high")]
     High,
+    #[serde(rename = "medium")]
+    Medium,
     #[serde(rename = "low")]
     Low,
     #[serde(rename = "off")]
     Off,
+    /// OpenAI "none" — reasoning disabled.
+    #[serde(rename = "none")]
+    None,
+    /// OpenAI GPT-5 "minimal".
+    #[serde(rename = "minimal")]
+    Minimal,
+    /// Anthropic Opus 4.6 "max".
+    #[serde(rename = "max")]
+    Max,
+    /// OpenAI GPT-5.4 "xhigh".
+    #[serde(rename = "xhigh")]
+    Xhigh,
 }
 
 impl std::fmt::Display for ThinkingBudget {
@@ -233,20 +623,26 @@ impl std::fmt::Display for ThinkingBudget {
         match self {
             Self::Adaptive => write!(f, "adaptive"),
             Self::High => write!(f, "high"),
+            Self::Medium => write!(f, "medium"),
             Self::Low => write!(f, "low"),
             Self::Off => write!(f, "off"),
+            Self::None => write!(f, "none"),
+            Self::Minimal => write!(f, "minimal"),
+            Self::Max => write!(f, "max"),
+            Self::Xhigh => write!(f, "xhigh"),
         }
     }
 }
 
 impl ThinkingBudget {
-    /// Map a budget level to its token count, or `None` for `Off`.
+    /// Map a budget level to its token count, or `None` for disabled variants.
     pub fn budget_tokens(&self) -> Option<u32> {
         match self {
+            Self::Xhigh | Self::Max => Some(32_000),
             Self::High => Some(10_000),
-            Self::Adaptive => Some(5_000),
-            Self::Low => Some(1_024),
-            Self::Off => None,
+            Self::Adaptive | Self::Medium => Some(5_000),
+            Self::Low | Self::Minimal => Some(1_024),
+            Self::Off | Self::None => Option::None,
         }
     }
 }
@@ -258,10 +654,15 @@ impl std::str::FromStr for ThinkingBudget {
         match s.to_ascii_lowercase().as_str() {
             "adaptive" => Ok(Self::Adaptive),
             "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
             "low" => Ok(Self::Low),
             "off" => Ok(Self::Off),
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "max" => Ok(Self::Max),
+            "xhigh" => Ok(Self::Xhigh),
             other => Err(format!(
-                "unknown thinking budget \'{other}\'; expected adaptive, high, low, or off"
+                "unknown thinking level '{other}'; expected off, none, minimal, low, medium, high, xhigh, max, or adaptive"
             )),
         }
     }
@@ -275,6 +676,24 @@ pub struct HttpConfig {
     pub bearer_token: Option<String>,
 }
 
+/// Scope for borrowed GitHub credentials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowScope {
+    #[default]
+    ReadOnly,
+    Contribution,
+}
+
+impl std::fmt::Display for BorrowScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadOnly => write!(f, "read_only"),
+            Self::Contribution => write!(f, "contribution"),
+        }
+    }
+}
+
 /// Security settings for WASM skill signature verification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -283,6 +702,11 @@ pub struct SecurityConfig {
     /// When false (default), unsigned skills load with a warning.
     /// Invalid signatures are ALWAYS rejected regardless of this setting.
     pub require_signatures: bool,
+    /// Maximum GitHub PAT borrow scope for subagents/workers.
+    /// Defaults to read-only for safety. Set to "contribution" to allow
+    /// subagents to push branches and create PRs.
+    #[serde(default)]
+    pub github_borrow_scope: BorrowScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +726,16 @@ pub struct ModelConfig {
     pub synthesis_instruction: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub file_logging: Option<bool>,
+    pub file_level: Option<String>,
+    pub stderr_level: Option<String>,
+    pub max_files: Option<usize>,
+    pub log_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -317,6 +751,7 @@ pub struct MemoryConfig {
     pub max_value_size: usize,
     pub max_snapshot_chars: usize,
     pub max_relevant_results: usize,
+    pub embeddings_enabled: bool,
 }
 
 impl Default for GeneralConfig {
@@ -347,6 +782,7 @@ impl Default for MemoryConfig {
             max_value_size: 10240,
             max_snapshot_chars: 2000,
             max_relevant_results: 5,
+            embeddings_enabled: true,
         }
     }
 }
@@ -455,6 +891,39 @@ fn expand_tilde_opt(path: &mut Option<PathBuf>) {
     }
 }
 
+fn expand_tilde_string_opt(path: &mut Option<String>) {
+    if let Some(path_str) = path.as_mut() {
+        let original = path_str.clone();
+        let expanded = expand_tilde(Path::new(&original));
+        let expanded_str = expanded.to_string_lossy().into_owned();
+        if expanded_str != original {
+            tracing::debug!("config path expanded: {} -> {}", original, expanded_str);
+            *path_str = expanded_str;
+        }
+    }
+}
+
+pub fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "error" => Some(LevelFilter::ERROR),
+        "warn" => Some(LevelFilter::WARN),
+        "info" => Some(LevelFilter::INFO),
+        "debug" => Some(LevelFilter::DEBUG),
+        "trace" => Some(LevelFilter::TRACE),
+        _ => None,
+    }
+}
+
+fn validate_log_level(field: &str, value: &Option<String>) -> Result<(), String> {
+    let Some(level) = value.as_ref() else {
+        return Ok(());
+    };
+    if parse_log_level(level).is_some() {
+        return Ok(());
+    }
+    Err(format!("{field} must be one of: {VALID_LOG_LEVELS}"))
+}
+
 impl FawxConfig {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
@@ -473,6 +942,7 @@ impl FawxConfig {
     /// Expand `~` to the user's home directory in all user-facing path configs.
     fn expand_paths(&mut self) {
         expand_tilde_opt(&mut self.general.data_dir);
+        expand_tilde_string_opt(&mut self.logging.log_dir);
         expand_tilde_opt(&mut self.tools.working_dir);
         expand_tilde_opt(&mut self.self_modify.proposals_dir);
     }
@@ -493,13 +963,15 @@ impl FawxConfig {
             return Err("memory.max_entries must be >= 1".to_string());
         }
         if let Some(instruction) = &self.model.synthesis_instruction {
-            if instruction.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
-                return Err(format!(
-                    "model.synthesis_instruction exceeds {} characters",
-                    MAX_SYNTHESIS_INSTRUCTION_LENGTH
-                ));
+            validate_synthesis_instruction(instruction)?;
+        }
+        if let Some(max_files) = self.logging.max_files {
+            if max_files == 0 {
+                return Err("logging.max_files must be >= 1".to_string());
             }
         }
+        validate_log_level("logging.file_level", &self.logging.file_level)?;
+        validate_log_level("logging.stderr_level", &self.logging.stderr_level)?;
         validate_glob_patterns(&self.self_modify)
     }
 
@@ -752,6 +1224,7 @@ max_entries = 200
 max_value_size = 555
 max_snapshot_chars = 777
 max_relevant_results = 9
+embeddings_enabled = false
 "#;
         write_config(&temp, content);
         let loaded = FawxConfig::load(temp.path()).expect("load config");
@@ -762,6 +1235,32 @@ max_relevant_results = 9
         assert_eq!(loaded.tools.max_read_size, 4096);
         assert_eq!(loaded.memory.max_snapshot_chars, 777);
         assert_eq!(loaded.memory.max_relevant_results, 9);
+        assert!(!loaded.memory.embeddings_enabled);
+    }
+
+    #[test]
+    fn load_parses_logging_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[logging]
+file_logging = true
+file_level = "trace"
+stderr_level = "error"
+max_files = 14
+log_dir = "~/.fawx/custom-logs"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(loaded.logging.file_logging, Some(true));
+        assert_eq!(loaded.logging.file_level.as_deref(), Some("trace"));
+        assert_eq!(loaded.logging.stderr_level.as_deref(), Some("error"));
+        assert_eq!(loaded.logging.max_files, Some(14));
+        assert_eq!(
+            loaded.logging.log_dir.as_deref(),
+            Some(home.join(".fawx/custom-logs").to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -773,6 +1272,7 @@ max_relevant_results = 9
 
         assert_eq!(loaded.general.max_iterations, 42);
         assert_eq!(loaded.general.max_history, 20);
+        assert_eq!(loaded.logging, LoggingConfig::default());
         assert_eq!(loaded.tools.max_read_size, 1024 * 1024);
         assert_eq!(loaded.memory.max_entries, 1000);
         assert_eq!(loaded.memory.max_relevant_results, 5);
@@ -804,6 +1304,20 @@ max_relevant_results = 9
     }
 
     #[test]
+    fn default_template_includes_power_user_sections() {
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[workspace]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# root = \".\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[permissions]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# preset = \"power\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[budget]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# max_session_cost_cents = 500"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[sandbox]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# allow_network = true"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[proposals]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# notification_channels = [\"tui\"]"));
+    }
+
+    #[test]
     fn write_default_refuses_overwrite() {
         let temp = TempDir::new().expect("tempdir");
         write_config(&temp, "[general]\n");
@@ -816,11 +1330,13 @@ max_relevant_results = 9
         let defaults = FawxConfig::default();
         assert_eq!(defaults.general.max_iterations, 10);
         assert_eq!(defaults.general.max_history, 20);
+        assert_eq!(defaults.logging, LoggingConfig::default());
         assert_eq!(defaults.tools.max_read_size, 1024 * 1024);
         assert_eq!(defaults.memory.max_entries, 1000);
         assert_eq!(defaults.memory.max_value_size, 10240);
         assert_eq!(defaults.memory.max_snapshot_chars, 2000);
         assert_eq!(defaults.memory.max_relevant_results, 5);
+        assert!(defaults.memory.embeddings_enabled);
     }
 
     #[test]
@@ -836,6 +1352,13 @@ max_relevant_results = 9
                 default_model: Some("claude-sonnet".to_string()),
                 synthesis_instruction: Some("short answers".to_string()),
             },
+            logging: LoggingConfig {
+                file_logging: Some(true),
+                file_level: Some("debug".to_string()),
+                stderr_level: Some("error".to_string()),
+                max_files: Some(14),
+                log_dir: Some("~/.fawx/custom-logs".to_string()),
+            },
             tools: ToolsConfig {
                 working_dir: Some(PathBuf::from("/tmp/work")),
                 search_exclude: vec!["vendor".to_string()],
@@ -846,6 +1369,7 @@ max_relevant_results = 9
                 max_value_size: 5,
                 max_snapshot_chars: 6,
                 max_relevant_results: 7,
+                embeddings_enabled: false,
             },
             self_modify: SelfModifyCliConfig {
                 enabled: true,
@@ -860,6 +1384,7 @@ max_relevant_results = 9
             },
             security: SecurityConfig {
                 require_signatures: true,
+                github_borrow_scope: BorrowScope::Contribution,
             },
             http: HttpConfig {
                 bearer_token: Some("test-token".to_string()),
@@ -908,6 +1433,30 @@ max_relevant_results = 9
                 bot_token: Some("123456:ABC-DEF".to_string()),
                 allowed_chat_ids: vec![100, 200],
                 webhook_secret: Some("test-webhook-secret".to_string()),
+            },
+            workspace: WorkspaceConfig {
+                root: Some(PathBuf::from("/tmp/workspace")),
+            },
+            permissions: PermissionsConfig {
+                preset: PermissionPreset::Custom,
+                mode: CapabilityMode::Prompt,
+                unrestricted: vec![PermissionAction::ReadAny, PermissionAction::ToolCall],
+                proposal_required: vec![PermissionAction::FileDelete],
+            },
+            budget: BudgetConfig {
+                max_session_cost_cents: 750,
+                max_daily_cost_cents: 4_200,
+                alert_threshold_cents: 350,
+            },
+            sandbox: SandboxConfig {
+                allow_network: false,
+                allow_subprocess: false,
+                max_execution_seconds: Some(45),
+            },
+            proposals: ProposalConfig {
+                auto_approve_timeout_minutes: Some(5),
+                notification_channels: vec!["tui".to_string(), "telegram".to_string()],
+                expiry_hours: Some(48),
             },
         };
 
@@ -1103,6 +1652,38 @@ default_model = "old-model"
     }
 
     #[test]
+    fn load_rejects_invalid_logging_level() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = "[logging]\nfile_level = \"verbose\"\n";
+        write_config(&temp, content);
+        let error = FawxConfig::load(temp.path()).expect_err("should reject invalid level");
+        assert!(error.contains("logging.file_level must be one of"));
+    }
+
+    #[test]
+    fn parse_log_level_accepts_supported_values_case_insensitively() {
+        assert_eq!(parse_log_level("error"), Some(LevelFilter::ERROR));
+        assert_eq!(parse_log_level(" Warn "), Some(LevelFilter::WARN));
+        assert_eq!(parse_log_level("INFO"), Some(LevelFilter::INFO));
+        assert_eq!(parse_log_level("Debug"), Some(LevelFilter::DEBUG));
+        assert_eq!(parse_log_level("trace"), Some(LevelFilter::TRACE));
+    }
+
+    #[test]
+    fn parse_log_level_rejects_unknown_values() {
+        assert_eq!(parse_log_level("verbose"), None);
+    }
+
+    #[test]
+    fn load_rejects_zero_max_log_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = "[logging]\nmax_files = 0\n";
+        write_config(&temp, content);
+        let error = FawxConfig::load(temp.path()).expect_err("should reject zero");
+        assert!(error.contains("logging.max_files must be >= 1"));
+    }
+
+    #[test]
     fn load_rejects_oversized_synthesis_instruction() {
         let temp = TempDir::new().expect("tempdir");
         let long_value = "x".repeat(501);
@@ -1110,6 +1691,14 @@ default_model = "old-model"
         write_config(&temp, &content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject long instruction");
         assert!(error.contains("synthesis_instruction exceeds 500 characters"));
+    }
+
+    #[test]
+    fn load_rejects_empty_synthesis_instruction() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[model]\nsynthesis_instruction = \"\"\n");
+        let error = FawxConfig::load(temp.path()).expect_err("should reject empty instruction");
+        assert!(error.contains("synthesis_instruction must not be empty"));
     }
 
     #[test]
@@ -1166,13 +1755,28 @@ deny = ["[invalid"]
     fn security_config_defaults_and_roundtrip() {
         let defaults = SecurityConfig::default();
         assert!(!defaults.require_signatures);
+        assert_eq!(defaults.github_borrow_scope, BorrowScope::ReadOnly);
 
         let config = SecurityConfig {
             require_signatures: true,
+            github_borrow_scope: BorrowScope::Contribution,
         };
         let encoded = toml::to_string(&config).expect("serialize");
         let decoded: SecurityConfig = toml::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn security_config_default_borrow_scope_is_read_only() {
+        let config = SecurityConfig::default();
+        assert_eq!(config.github_borrow_scope, BorrowScope::ReadOnly);
+    }
+
+    #[test]
+    fn security_config_deserializes_contribution_scope() {
+        let config: SecurityConfig = toml::from_str("github_borrow_scope = \"contribution\"")
+            .expect("deserialize security config");
+        assert_eq!(config.github_borrow_scope, BorrowScope::Contribution);
     }
 
     #[test]
@@ -1184,6 +1788,22 @@ deny = ["[invalid"]
         assert!(
             DEFAULT_CONFIG_TEMPLATE.contains("require_signatures"),
             "template should mention require_signatures"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("github_borrow_scope"),
+            "template should mention github_borrow_scope"
+        );
+    }
+
+    #[test]
+    fn config_template_includes_logging_section() {
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("[logging]"),
+            "template should contain [logging] section"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("file_level"),
+            "template should mention file_level"
         );
     }
 
@@ -1304,6 +1924,9 @@ max_iterations = 10
 [general]
 data_dir = "~/.fawx"
 
+[logging]
+log_dir = "~/.fawx/logs"
+
 [tools]
 working_dir = "~/projects"
 
@@ -1315,6 +1938,10 @@ proposals_dir = "~/.fawx/proposals"
 
         let home = dirs::home_dir().expect("home dir should exist in test");
         assert_eq!(loaded.general.data_dir, Some(home.join(".fawx")),);
+        assert_eq!(
+            loaded.logging.log_dir.as_deref(),
+            Some(home.join(".fawx/logs").to_string_lossy().as_ref())
+        );
         assert_eq!(loaded.tools.working_dir, Some(home.join("projects")),);
         assert_eq!(
             loaded.self_modify.proposals_dir,
@@ -1340,5 +1967,283 @@ working_dir = "/tmp/work"
             Some(PathBuf::from("/tmp/fawx-data")),
         );
         assert_eq!(loaded.tools.working_dir, Some(PathBuf::from("/tmp/work")),);
+    }
+
+    #[test]
+    fn power_preset_has_correct_unrestricted() {
+        let config = PermissionsConfig::power();
+        assert_eq!(config.unrestricted.len(), 9);
+        assert_eq!(
+            config.unrestricted,
+            vec![
+                PermissionAction::ReadAny,
+                PermissionAction::WebSearch,
+                PermissionAction::WebFetch,
+                PermissionAction::CodeExecute,
+                PermissionAction::FileWrite,
+                PermissionAction::Git,
+                PermissionAction::Shell,
+                PermissionAction::ToolCall,
+                PermissionAction::SelfModify,
+            ]
+        );
+    }
+
+    #[test]
+    fn power_preset_has_correct_proposals() {
+        let config = PermissionsConfig::power();
+        assert_eq!(config.proposal_required.len(), 7);
+        assert_eq!(
+            config.proposal_required,
+            vec![
+                PermissionAction::CredentialChange,
+                PermissionAction::SystemInstall,
+                PermissionAction::NetworkListen,
+                PermissionAction::OutboundMessage,
+                PermissionAction::FileDelete,
+                PermissionAction::OutsideWorkspace,
+                PermissionAction::KernelModify,
+            ]
+        );
+    }
+
+    #[test]
+    fn cautious_preset_restricts_writes() {
+        let config = PermissionsConfig::cautious();
+        assert!(!config.unrestricted.contains(&PermissionAction::FileWrite));
+        assert!(config
+            .proposal_required
+            .contains(&PermissionAction::FileWrite));
+    }
+
+    #[test]
+    fn experimental_preset_allows_kernel_modify() {
+        let config = PermissionsConfig::experimental();
+        assert!(config
+            .unrestricted
+            .contains(&PermissionAction::KernelModify));
+        assert!(!config
+            .proposal_required
+            .contains(&PermissionAction::KernelModify));
+    }
+
+    #[test]
+    fn permissions_config_serde_round_trip() {
+        let config = PermissionsConfig {
+            preset: PermissionPreset::Custom,
+            mode: CapabilityMode::Prompt,
+            unrestricted: vec![PermissionAction::ReadAny, PermissionAction::ToolCall],
+            proposal_required: vec![PermissionAction::FileDelete, PermissionAction::KernelModify],
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: PermissionsConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn permission_preset_as_str_matches_serde_name() {
+        let presets = [
+            PermissionPreset::Power,
+            PermissionPreset::Cautious,
+            PermissionPreset::Experimental,
+            PermissionPreset::Custom,
+        ];
+
+        for preset in presets {
+            let encoded = serde_json::to_string(&preset).expect("serialize preset");
+            assert_eq!(encoded, format!("\"{}\"", preset.as_str()));
+        }
+    }
+
+    #[test]
+    fn permission_action_as_str_matches_serde_name() {
+        let actions = [
+            PermissionAction::ReadAny,
+            PermissionAction::WebSearch,
+            PermissionAction::WebFetch,
+            PermissionAction::CodeExecute,
+            PermissionAction::FileWrite,
+            PermissionAction::Git,
+            PermissionAction::Shell,
+            PermissionAction::ToolCall,
+            PermissionAction::SelfModify,
+            PermissionAction::CredentialChange,
+            PermissionAction::SystemInstall,
+            PermissionAction::NetworkListen,
+            PermissionAction::OutboundMessage,
+            PermissionAction::FileDelete,
+            PermissionAction::OutsideWorkspace,
+            PermissionAction::KernelModify,
+        ];
+
+        for action in actions {
+            let encoded = serde_json::to_string(&action).expect("serialize action");
+            assert_eq!(encoded, format!("\"{}\"", action.as_str()));
+        }
+    }
+
+    #[test]
+    fn budget_config_defaults() {
+        let config = BudgetConfig::default();
+        assert_eq!(config.max_session_cost_cents, 500);
+        assert_eq!(config.max_daily_cost_cents, 2_000);
+        assert_eq!(config.alert_threshold_cents, 200);
+    }
+
+    #[test]
+    fn budget_config_serde_round_trip() {
+        let config = BudgetConfig {
+            max_session_cost_cents: 750,
+            max_daily_cost_cents: 4_200,
+            alert_threshold_cents: 350,
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: BudgetConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn sandbox_config_defaults() {
+        let config = SandboxConfig::default();
+        assert!(config.allow_network);
+        assert!(config.allow_subprocess);
+        assert_eq!(config.max_execution_seconds, Some(300));
+    }
+
+    #[test]
+    fn sandbox_config_serde_round_trip() {
+        let config = SandboxConfig {
+            allow_network: false,
+            allow_subprocess: true,
+            max_execution_seconds: Some(120),
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: SandboxConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn proposal_config_serde_round_trip() {
+        let config = ProposalConfig {
+            auto_approve_timeout_minutes: Some(15),
+            notification_channels: vec!["tui".to_string(), "telegram".to_string()],
+            expiry_hours: Some(72),
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: ProposalConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn fawx_config_with_new_sections_round_trips() {
+        let config = FawxConfig {
+            workspace: WorkspaceConfig {
+                root: Some(PathBuf::from("/tmp/workspace")),
+            },
+            permissions: PermissionsConfig::experimental(),
+            budget: BudgetConfig {
+                max_session_cost_cents: 800,
+                max_daily_cost_cents: 3_000,
+                alert_threshold_cents: 400,
+            },
+            sandbox: SandboxConfig {
+                allow_network: false,
+                allow_subprocess: true,
+                max_execution_seconds: Some(120),
+            },
+            proposals: ProposalConfig {
+                auto_approve_timeout_minutes: Some(15),
+                notification_channels: vec!["tui".to_string(), "telegram".to_string()],
+                expiry_hours: Some(72),
+            },
+            ..FawxConfig::default()
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: FawxConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn preset_from_name() {
+        assert_eq!(
+            PermissionsConfig::from_preset_name("power").expect("power preset"),
+            PermissionsConfig::power()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("cautious").expect("cautious preset"),
+            PermissionsConfig::cautious()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("experimental").expect("experimental preset"),
+            PermissionsConfig::experimental()
+        );
+    }
+
+    #[test]
+    fn preset_from_name_supports_custom() {
+        assert_eq!(
+            PermissionsConfig::from_preset_name("custom").expect("custom preset"),
+            PermissionsConfig {
+                preset: PermissionPreset::Custom,
+                mode: CapabilityMode::Capability,
+                ..PermissionsConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn permissions_default_is_standard_capability() {
+        let config = PermissionsConfig::default();
+
+        assert_eq!(config, PermissionsConfig::standard());
+        assert_eq!(config.mode, CapabilityMode::Capability);
+    }
+
+    #[test]
+    fn preset_from_name_accepts_aliases() {
+        assert_eq!(
+            PermissionsConfig::from_preset_name("standard").expect("standard preset"),
+            PermissionsConfig::power()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("restricted").expect("restricted preset"),
+            PermissionsConfig::cautious()
+        );
+        assert_eq!(
+            PermissionsConfig::from_preset_name("open").expect("open preset"),
+            PermissionsConfig::experimental()
+        );
+    }
+
+    #[test]
+    fn preset_from_name_rejects_unknown_value() {
+        let error = PermissionsConfig::from_preset_name("nope").expect_err("should fail fast");
+        assert_eq!(
+            error,
+            "unknown permission preset 'nope'; expected power, cautious, experimental, custom, standard, restricted, open"
+        );
+    }
+
+    #[test]
+    fn old_configs_deserialize_with_new_sections_defaulted() {
+        let config: FawxConfig =
+            toml::from_str("[general]\nmax_iterations = 12\n").expect("deserialize old config");
+        assert_eq!(config.workspace, WorkspaceConfig::default());
+        assert_eq!(config.budget, BudgetConfig::default());
+        assert_eq!(config.sandbox, SandboxConfig::default());
+        assert_eq!(config.proposals, ProposalConfig::default());
+    }
+
+    #[test]
+    fn permissions_without_mode_defaults_to_capability() {
+        let config: PermissionsConfig = toml::from_str(
+            r#"
+preset = "power"
+unrestricted = ["read_any"]
+proposal_required = ["shell"]
+"#,
+        )
+        .expect("deserialize permissions without mode");
+        assert_eq!(config.mode, CapabilityMode::Capability);
     }
 }

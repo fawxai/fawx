@@ -112,6 +112,40 @@ impl Storage {
         Ok(existed)
     }
 
+    /// Delete multiple keys in a single write transaction.
+    pub fn delete_many(&self, table: &str, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(table);
+        let write_txn = self.db.begin_write().map_err(|e| {
+            StorageError::Database(format!("Failed to begin write transaction: {e}"))
+        })?;
+
+        {
+            let mut table_handle = match write_txn.open_table(table_def) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => {
+                    return Err(StorageError::Database(format!(
+                        "Failed to open table '{table}': {e}"
+                    )))
+                }
+            };
+            for key in keys {
+                table_handle.remove(key.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to delete key '{key}': {e}"))
+                })?;
+            }
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| StorageError::Database(format!("Failed to commit transaction: {e}")))?;
+
+        Ok(())
+    }
+
     /// List all keys in the specified table.
     pub fn list_keys(&self, table: &str) -> Result<Vec<String>> {
         let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(table);
@@ -217,6 +251,25 @@ mod tests {
             .delete("test", "nonexistent")
             .expect("Failed to delete");
         assert!(!existed);
+    }
+
+    #[test]
+    fn test_delete_many_removes_multiple_keys() {
+        let storage = Storage::open_in_memory().expect("Failed to create storage");
+        storage.put("test", "key1", b"value1").expect("put key1");
+        storage.put("test", "key2", b"value2").expect("put key2");
+        storage.put("test", "key3", b"value3").expect("put key3");
+
+        storage
+            .delete_many("test", &["key1".to_string(), "key3".to_string()])
+            .expect("delete many");
+
+        assert_eq!(storage.get("test", "key1").expect("get key1"), None);
+        assert_eq!(
+            storage.get("test", "key2").expect("get key2"),
+            Some(b"value2".to_vec())
+        );
+        assert_eq!(storage.get("test", "key3").expect("get key3"), None);
     }
 
     #[test]

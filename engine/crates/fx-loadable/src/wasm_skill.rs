@@ -116,8 +116,20 @@ impl Skill for WasmSkill {
         &self.manifest.name
     }
 
+    fn description(&self) -> &str {
+        &self.manifest.description
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![self.build_tool_definition()]
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        self.manifest
+            .capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {

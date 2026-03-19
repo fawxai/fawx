@@ -153,6 +153,7 @@ async fn live_text_response() {
         .iter()
         .filter_map(|b| match b {
             fx_llm::ContentBlock::Text { text } => Some(text.as_str()),
+            fx_llm::ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect();
@@ -289,6 +290,7 @@ async fn live_thinking_text() {
         .iter()
         .filter_map(|b| match b {
             fx_llm::ContentBlock::Text { text } => Some(text.as_str()),
+            fx_llm::ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect();

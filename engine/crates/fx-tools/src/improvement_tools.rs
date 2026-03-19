@@ -288,7 +288,7 @@ async fn run_improvement_pipeline(
     finding: &AnalysisFinding,
     llm_provider: &dyn CompletionProvider,
     working_dir: &std::path::Path,
-) -> Result<Option<fx_improve::ExecutionResult>, String> {
+) -> Result<fx_improve::ImprovementRunResult, String> {
     let data_dir = working_dir.join(".fawx");
     let improve_config = ImprovementConfig::default();
 
@@ -297,25 +297,18 @@ async fn run_improvement_pipeline(
     let candidates = detector.detect(std::slice::from_ref(finding));
 
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(fx_improve::ImprovementRunResult::empty());
     }
 
-    let plans = ImprovementPlanner::plan(&candidates, llm_provider, working_dir)
-        .await
-        .map_err(|e| format!("planning failed: {e}"))?;
-
-    if plans.is_empty() {
-        return Ok(None);
-    }
-
+    let planning = ImprovementPlanner::plan(&candidates, llm_provider, working_dir).await;
     let proposals_dir = data_dir.join("proposals");
     let executor =
         ImprovementExecutor::new(improve_config, proposals_dir, working_dir.to_path_buf());
-    let result = executor
-        .execute(&plans, &mut detector)
+    let execution = executor
+        .execute(&planning.plans, &mut detector)
         .map_err(|e| format!("execution failed: {e}"))?;
 
-    Ok(Some(result))
+    Ok(planning.into_run_result(execution))
 }
 
 /// Create an improvement proposal from a cached finding. Returns "pending_approval".
@@ -326,30 +319,64 @@ pub(crate) async fn handle_propose_improvement(
 ) -> Result<String, String> {
     let (parsed, finding) =
         validate_proposal_request(args, &state.rate_limiter, &state.finding_cache)?;
-
     let result =
         run_improvement_pipeline(&finding, state.llm_provider.as_ref(), working_dir).await?;
 
-    let Some(result) = result else {
-        return serde_json::to_string_pretty(&serde_json::json!({
-            "status": "skipped",
-            "reason": "Finding did not produce actionable candidates or plans"
-        }))
-        .map_err(|e| e.to_string());
+    let response = if result.proposals_written.is_empty() && result.branches_created.is_empty() {
+        skipped_proposal_response(&result)
+    } else {
+        pending_proposal_response(&parsed, &result)
     };
 
-    let response = serde_json::json!({
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+fn pending_proposal_response(
+    parsed: &ProposeImprovementArgs,
+    result: &fx_improve::ImprovementRunResult,
+) -> serde_json::Value {
+    serde_json::json!({
         "status": "pending_approval",
         "proposal_id": parsed.finding_id,
         "description": parsed.description,
+        "plans_generated": result.plans_generated,
         "proposals_written": result.proposals_written.iter()
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
             .collect::<Vec<_>>(),
         "branches_created": result.branches_created,
+        "skipped_candidates": serialize_skipped_candidates(&result.skipped_candidates),
         "message": "Proposal created. Run /approve to execute the changes."
-    });
+    })
+}
 
-    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+fn skipped_proposal_response(result: &fx_improve::ImprovementRunResult) -> serde_json::Value {
+    if result.skipped_candidates.is_empty() {
+        return serde_json::json!({
+            "status": "skipped",
+            "reason": "Finding did not produce actionable candidates or plans"
+        });
+    }
+
+    serde_json::json!({
+        "status": "skipped",
+        "reason": "All actionable candidates were skipped during planning",
+        "summary": fx_improve::skipped_candidate_summary(&result.skipped_candidates),
+        "skipped_candidates": serialize_skipped_candidates(&result.skipped_candidates),
+    })
+}
+
+fn serialize_skipped_candidates(
+    skipped_candidates: &[fx_improve::SkippedCandidate],
+) -> Vec<serde_json::Value> {
+    skipped_candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "name": candidate.name,
+                "reason": candidate.reason,
+            })
+        })
+        .collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -413,40 +440,30 @@ mod tests {
         CompletionRequest, CompletionResponse, CompletionStream, ProviderCapabilities,
         ProviderError, ToolCall as LlmToolCall,
     };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     // ── Mock provider ─────────────────────────────────────────────────
 
     #[derive(Debug)]
     struct MockProvider {
-        response: Result<CompletionResponse, ProviderError>,
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
     }
 
     impl MockProvider {
         fn with_findings(findings: Vec<serde_json::Value>) -> Self {
+            Self::with_responses(vec![Ok(report_findings_response(findings))])
+        }
+
+        fn with_responses(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
             Self {
-                response: Ok(CompletionResponse {
-                    content: Vec::new(),
-                    tool_calls: vec![LlmToolCall {
-                        id: "call-1".to_string(),
-                        name: "report_findings".to_string(),
-                        arguments: serde_json::json!({ "findings": findings }),
-                    }],
-                    usage: None,
-                    stop_reason: Some("tool_use".to_string()),
-                }),
+                responses: Mutex::new(VecDeque::from(responses)),
             }
         }
 
         fn empty() -> Self {
-            Self {
-                response: Ok(CompletionResponse {
-                    content: Vec::new(),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    stop_reason: Some("end_turn".to_string()),
-                }),
-            }
+            Self::with_responses((0..64).map(|_| Ok(empty_response())).collect())
         }
     }
 
@@ -456,7 +473,11 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, ProviderError> {
-            self.response.clone()
+            self.responses
+                .lock()
+                .expect("mock provider lock")
+                .pop_front()
+                .expect("mock response")
         }
 
         async fn complete_stream(
@@ -484,17 +505,53 @@ mod tests {
 
     // ── Test helpers ──────────────────────────────────────────────────
 
+    fn report_findings_response(findings: Vec<serde_json::Value>) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![LlmToolCall {
+                id: "call-1".to_string(),
+                name: "report_findings".to_string(),
+                arguments: serde_json::json!({ "findings": findings }),
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn empty_response() -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        }
+    }
+
     fn sample_finding_json(name: &str, confidence: &str) -> serde_json::Value {
+        sample_finding_json_with_evidence(name, confidence, 1)
+    }
+
+    fn sample_finding_json_with_evidence(
+        name: &str,
+        confidence: &str,
+        evidence_count: usize,
+    ) -> serde_json::Value {
+        let evidence = (0..evidence_count)
+            .map(|index| {
+                serde_json::json!({
+                    "session_id": format!("sess-{}", index + 1),
+                    "signal_kind": "friction",
+                    "message": format!("test signal {}", index + 1),
+                    "timestamp_ms": 1000 + index as u64,
+                })
+            })
+            .collect::<Vec<_>>();
+
         serde_json::json!({
             "pattern_name": name,
             "description": format!("Description for {name}"),
             "confidence": confidence,
-            "evidence": [{
-                "session_id": "sess-1",
-                "signal_kind": "friction",
-                "message": "test signal",
-                "timestamp_ms": 1000
-            }],
+            "evidence": evidence,
             "suggested_action": "Fix the issue"
         })
     }
@@ -719,6 +776,61 @@ mod tests {
             parsed["status"], "skipped",
             "expected skipped due to insufficient evidence, got: {}",
             parsed["status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_improvement_returns_planning_skips_when_all_plans_fail() {
+        let tmp = TempDir::new().expect("tempdir");
+        let provider = MockProvider::with_responses(vec![
+            Ok(report_findings_response(vec![
+                sample_finding_json_with_evidence("Fixable issue", "high", 3),
+            ])),
+            Ok(empty_response()),
+        ]);
+        let (state, _) = build_state_with_signals(&tmp, provider);
+
+        let analysis_result = handle_analyze_signals(&state, &serde_json::json!({}))
+            .await
+            .expect("analyze should succeed");
+        let findings: Vec<serde_json::Value> =
+            serde_json::from_str(&analysis_result).expect("valid json");
+        let finding_id = findings[0]["finding_id"]
+            .as_str()
+            .expect("finding_id")
+            .to_string();
+
+        let working_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&working_dir).expect("create repo dir");
+
+        let result = handle_propose_improvement(
+            &state,
+            &serde_json::json!({
+                "finding_id": finding_id,
+                "description": "Fix the timeout issue"
+            }),
+            &working_dir,
+        )
+        .await
+        .expect("propose should return skipped details");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["status"], "skipped");
+        assert_eq!(
+            parsed["reason"],
+            "All actionable candidates were skipped during planning"
+        );
+        assert_eq!(
+            parsed["summary"],
+            "1 candidate skipped (model did not produce a plan)"
+        );
+        assert_eq!(
+            parsed["skipped_candidates"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["skipped_candidates"][0]["reason"],
+            "model did not produce a plan"
         );
     }
 
