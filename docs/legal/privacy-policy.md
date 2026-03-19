@@ -1,9 +1,9 @@
 # Privacy Policy
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 **Effective Date: March 1, 2026**
 
-This Privacy Policy describes how Fawx AI, Inc., a Delaware corporation ("Fawx AI," "we," "us," or "our") handles information when you use the Fawx application ("Software"). We believe in straightforward privacy: **Fawx collects nothing by default.**
+This Privacy Policy describes how Fawx AI LLC, a Colorado limited liability company ("Fawx AI," "we," "us," or "our") handles information when you use the Fawx application ("Software"). We believe in straightforward privacy: **Fawx collects nothing by default.**
 
 ---
 
@@ -165,7 +165,7 @@ We will not retroactively apply less protective terms to data already collected.
 
 If you have questions about this Privacy Policy or want to exercise your data rights, contact us at:
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 Email: privacy@fawx.ai
 
 ---

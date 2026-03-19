@@ -1,9 +1,9 @@
 # End User License Agreement
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 **Effective Date: March 1, 2026**
 
-This End User License Agreement ("Agreement") is a legal agreement between you ("User") and Fawx AI, Inc., a Delaware corporation ("Fawx AI," "we," "us," or "our"). By installing, copying, or using the Fawx application ("Software"), you agree to be bound by the terms of this Agreement. If you do not agree, do not install or use the Software.
+This End User License Agreement ("Agreement") is a legal agreement between you ("User") and Fawx AI LLC, a Colorado limited liability company ("Fawx AI," "we," "us," or "our"). By installing, copying, or using the Fawx application ("Software"), you agree to be bound by the terms of this Agreement. If you do not agree, do not install or use the Software.
 
 ---
 
@@ -43,7 +43,7 @@ These restrictions do **not** apply to the open-source components (Skill SDK and
 
 ### What We Own
 
-Fawx, the kernel, and all associated trademarks, logos, and documentation are the property of Fawx AI, Inc. This Agreement does not transfer any ownership rights to you.
+Fawx, the kernel, and all associated trademarks, logos, and documentation are the property of Fawx AI LLC. This Agreement does not transfer any ownership rights to you.
 
 ### What You Own
 
@@ -99,7 +99,7 @@ You acknowledge that the Software executes actions on your device and connected 
 
 ## 9. General
 
-- **Governing law:** This Agreement is governed by the laws of the State of Delaware, United States, without regard to conflict of law principles.
+- **Governing law:** This Agreement is governed by the laws of the State of Colorado, United States, without regard to conflict of law principles.
 - **Entire agreement:** This Agreement constitutes the entire agreement between you and Fawx AI regarding the Software and supersedes all prior agreements.
 - **Severability:** If any provision of this Agreement is found unenforceable, the remaining provisions remain in full effect.
 - **Updates:** We may update this Agreement from time to time. We will notify you of material changes through the Software. Continued use after notification constitutes acceptance of the updated terms.
@@ -110,7 +110,7 @@ You acknowledge that the Software executes actions on your device and connected 
 
 If you have questions about this Agreement, contact us at:
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 Email: legal@fawx.ai
 
 ---

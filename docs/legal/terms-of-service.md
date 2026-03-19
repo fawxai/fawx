@@ -1,9 +1,9 @@
 # Terms of Service
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 **Effective Date: March 1, 2026**
 
-These Terms of Service ("Terms") govern your use of the Fawx application and any related services provided by Fawx AI, Inc., a Delaware corporation ("Fawx AI," "we," "us," or "our"). By using Fawx, you agree to these Terms. If you do not agree, do not use the Software.
+These Terms of Service ("Terms") govern your use of the Fawx application and any related services provided by Fawx AI LLC, a Colorado limited liability company ("Fawx AI," "we," "us," or "our"). By using Fawx, you agree to these Terms. If you do not agree, do not use the Software.
 
 ---
 
@@ -121,11 +121,11 @@ FAWX AI SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL
 
 ### Governing Law
 
-These Terms are governed by the laws of the **State of Delaware, United States**, without regard to conflict of law principles.
+These Terms are governed by the laws of the **State of Colorado, United States**, without regard to conflict of law principles.
 
 ### Jurisdiction
 
-Any dispute arising from these Terms or your use of Fawx shall be resolved exclusively in the **state or federal courts located in the State of Delaware**. You consent to the personal jurisdiction of these courts.
+Any dispute arising from these Terms or your use of Fawx shall be resolved exclusively in the **state or federal courts located in the State of Colorado**. You consent to the personal jurisdiction of these courts.
 
 ### Informal Resolution First
 
@@ -146,7 +146,7 @@ Before filing any legal claim, you agree to attempt to resolve the dispute infor
 
 If you have questions about these Terms, contact us at:
 
-**Fawx AI, Inc.**
+**Fawx AI LLC**
 Email: legal@fawx.ai
 
 ---
