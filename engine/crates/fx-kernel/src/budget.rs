@@ -108,7 +108,7 @@ fn default_max_synthesis_tokens() -> usize {
     DEFAULT_MAX_SYNTHESIS_TOKENS
 }
 
-const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
+const DEFAULT_MAX_TOOL_RETRIES: u8 = 5;
 
 fn default_max_tool_retries() -> u8 {
     DEFAULT_MAX_TOOL_RETRIES
