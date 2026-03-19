@@ -96,6 +96,98 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.composerPhaseLabel, "Streaming in another session...")
     }
 
+    func testStreamingDisplayControllerCoalescesRapidTokensIntoOneFlush() async {
+        var flushedChunks: [String] = []
+        let sleeper = ControlledSleeper()
+        let controller = StreamingDisplayController(
+            flushInterval: .milliseconds(30),
+            sleepHandler: { duration in
+                try await sleeper.sleep(for: duration)
+            }
+        ) { chunk in
+            flushedChunks.append(chunk)
+        }
+
+        for _ in 0..<100 {
+            controller.appendToken("a")
+        }
+
+        await waitForSleepToBeScheduled(on: sleeper)
+        XCTAssertTrue(flushedChunks.isEmpty)
+        let pendingSleepCount = await sleeper.pendingSleepCount
+        XCTAssertEqual(pendingSleepCount, 1)
+
+        await sleeper.resumeNextSleep()
+        await Task.yield()
+
+        XCTAssertEqual(flushedChunks, [String(repeating: "a", count: 100)])
+    }
+
+    func testStreamingDistanceDetachesAndRepinsAutoScroll() {
+        let sut = makeSUT()
+
+        XCTAssertTrue(sut.shouldAutoScrollStreamingUpdates)
+
+        sut.updateStreamingDistanceFromBottomForTesting(StreamingDisplayController.bottomThreshold + 20)
+
+        XCTAssertFalse(sut.isPinnedToBottomForTesting)
+        XCTAssertFalse(sut.shouldAutoScrollStreamingUpdates)
+
+        sut.updateStreamingDistanceFromBottomForTesting(StreamingDisplayController.bottomThreshold - 5)
+
+        XCTAssertTrue(sut.isPinnedToBottomForTesting)
+        XCTAssertTrue(sut.shouldAutoScrollStreamingUpdates)
+    }
+
+    func testStreamEndFlushesBufferedTokensImmediately() async throws {
+        let sut = makeSUT()
+
+        sut.appendStreamingTokenForTesting("tail")
+
+        XCTAssertEqual(sut.streamingText, "")
+
+        sut.flushStreamingDisplayForTesting()
+
+        XCTAssertEqual(sut.streamingText, "tail")
+
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(sut.streamingText, "tail")
+    }
+
+    func testStreamingDisplayControllerPreservesDetachedStateWhenStreamEnds() {
+        let controller = StreamingDisplayController { _ in }
+
+        controller.userDidScroll(distanceFromBottom: StreamingDisplayController.bottomThreshold + 20)
+        controller.reset(repinToBottom: false)
+
+        XCTAssertFalse(controller.isPinnedToBottom)
+
+        controller.reset(repinToBottom: true)
+
+        XCTAssertTrue(controller.isPinnedToBottom)
+    }
+
+    func testStreamingDisplayControllerAllowsLargeScrollAwayWhilePendingAutoScroll() {
+        let controller = StreamingDisplayController { _ in }
+
+        controller.appendToken("tail")
+        controller.streamDidEnd()
+        controller.userDidScroll(distanceFromBottom: StreamingDisplayController.bottomThreshold * 3)
+
+        XCTAssertFalse(controller.isPinnedToBottom)
+    }
+
+    func testStreamingDisplayControllerKeepsPinnedStateForSmallContentGrowthJump() {
+        let controller = StreamingDisplayController { _ in }
+
+        controller.appendToken("tail")
+        controller.streamDidEnd()
+        controller.userDidScroll(distanceFromBottom: StreamingDisplayController.bottomThreshold + 5)
+
+        XCTAssertTrue(controller.isPinnedToBottom)
+    }
+
     func testShowEmptyStatePreservesBackgroundStream() {
         let sut = makeSUT()
         let message = SessionMessage(role: .assistant, content: "visible", timestamp: 1)
@@ -219,5 +311,38 @@ final class ChatViewModelTests: XCTestCase {
         let appState = AppState()
         let sessionViewModel = SessionViewModel(appState: appState)
         return ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
+    }
+
+    private func waitForSleepToBeScheduled(on sleeper: ControlledSleeper) async {
+        for _ in 0..<20 {
+            if await sleeper.pendingSleepCount > 0 {
+                return
+            }
+            await Task.yield()
+        }
+
+        XCTFail("Expected the render timer to schedule a sleep.")
+    }
+}
+
+private actor ControlledSleeper {
+    private var continuations: [CheckedContinuation<Void, Error>] = []
+
+    var pendingSleepCount: Int {
+        continuations.count
+    }
+
+    func sleep(for _: Duration) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func resumeNextSleep() {
+        guard !continuations.isEmpty else {
+            return
+        }
+
+        continuations.removeFirst().resume(returning: ())
     }
 }

@@ -10,6 +10,8 @@ struct ChatDetailView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
+    @State private var scrollViewportBottomY: CGFloat = 0
+    @State private var scrollContentBottomY: CGFloat = 0
     @State private var isShowingRipcordSheet = false
     @State private var isLoadingRipcordJournal = false
     @State private var ripcordJournalEntries: [JournalEntry] = []
@@ -45,11 +47,27 @@ struct ChatDetailView: View {
 
                     Color.clear
                         .frame(height: 1)
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: ScrollContentBottomPreferenceKey.self,
+                                    value: proxy.frame(in: .global).maxY
+                                )
+                            }
+                        )
                         .id(scrollBottomAnchorID)
                 }
                 .padding(FawxSpacing.paddingXL)
             }
             .id(sessionScrollIdentity)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ScrollViewportBottomPreferenceKey.self,
+                        value: proxy.frame(in: .global).maxY
+                    )
+                }
+            )
             .background(Color.fawxBackground)
             .accessibilityIdentifier("messageList")
             .overlay {
@@ -86,13 +104,29 @@ struct ChatDetailView: View {
             .onAppear {
                 scheduleScrollToBottom(using: proxy, animated: false)
             }
+            .onPreferenceChange(ScrollViewportBottomPreferenceKey.self) { viewportBottomY in
+                scrollViewportBottomY = viewportBottomY
+                updateStreamingDistanceFromBottomIfNeeded()
+            }
+            .onPreferenceChange(ScrollContentBottomPreferenceKey.self) { contentBottomY in
+                scrollContentBottomY = contentBottomY
+                updateStreamingDistanceFromBottomIfNeeded()
+            }
             .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
                 let animated = chatViewModel.pendingTranscriptScrollBehavior == .animated && !chatViewModel.isLoadingHistory
-                scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
+                let shouldSkipStreamingScroll =
+                    chatViewModel.isCurrentSessionStreaming && !chatViewModel.shouldAutoScrollStreamingUpdates
+                if !shouldSkipStreamingScroll {
+                    scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
+                }
                 chatViewModel.pendingTranscriptScrollBehavior = .animated
             }
             .onChange(of: chatViewModel.visibleStreamingText) { _, _ in
-                scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
+                guard chatViewModel.shouldAutoScrollStreamingUpdates else {
+                    return
+                }
+
+                scheduleScrollToBottom(using: proxy, animated: true, includeFollowUp: false)
             }
             .onChange(of: chatViewModel.isCurrentSessionStreaming) { _, isStreaming in
                 if isStreaming {
@@ -431,12 +465,21 @@ struct ChatDetailView: View {
         }
 
         if animated {
-            withAnimation(.easeOut(duration: 0.2)) {
+            withAnimation(.easeOut(duration: 0.15)) {
                 proxy.scrollTo(scrollBottomAnchorID, anchor: .bottom)
             }
         } else {
             proxy.scrollTo(scrollBottomAnchorID, anchor: .bottom)
         }
+    }
+
+    private func updateStreamingDistanceFromBottomIfNeeded() {
+        guard chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty else {
+            return
+        }
+
+        let distanceFromBottom = max(0, scrollContentBottomY - scrollViewportBottomY)
+        chatViewModel.updateStreamingDistanceFromBottom(distanceFromBottom)
     }
 
     private var composerBottomPadding: CGFloat {
@@ -536,6 +579,22 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private struct ScrollViewportBottomPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ScrollContentBottomPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
 }
 
 private enum RipcordAction {

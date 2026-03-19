@@ -1,5 +1,137 @@
+import CoreGraphics
 import Foundation
 import Observation
+
+@MainActor
+final class StreamingDisplayController {
+    static let flushInterval: Duration = .milliseconds(50)
+    static let bottomThreshold: CGFloat = 50
+    private static let contentGrowthDetachAllowanceMultiplier: CGFloat = 1.25
+
+    private let flushHandler: (String) -> Void
+    private let flushIntervalDuration: Duration
+    private let sleepHandler: @Sendable (Duration) async throws -> Void
+    private var pendingTokens = ""
+    private var renderTimer: Task<Void, Never>?
+    private var pendingAutoScroll = false
+    private var lastDistanceFromBottom: CGFloat = 0
+
+    private(set) var isPinnedToBottom = true
+
+    init(
+        flushInterval: Duration = StreamingDisplayController.flushInterval,
+        sleepHandler: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        },
+        flushHandler: @escaping (String) -> Void
+    ) {
+        self.flushHandler = flushHandler
+        self.flushIntervalDuration = flushInterval
+        self.sleepHandler = sleepHandler
+    }
+
+    func appendToken(_ token: String) {
+        guard !token.isEmpty else {
+            return
+        }
+
+        pendingTokens += token
+        startRenderTimerIfNeeded()
+    }
+
+    func streamDidEnd() {
+        flushPendingTokens()
+        stopRenderTimer()
+    }
+
+    func reset(repinToBottom: Bool = true) {
+        stopRenderTimer()
+        pendingTokens = ""
+        pendingAutoScroll = false
+        if repinToBottom {
+            isPinnedToBottom = true
+            lastDistanceFromBottom = 0
+        }
+    }
+
+    func userDidScroll(
+        distanceFromBottom: CGFloat,
+        threshold: CGFloat = StreamingDisplayController.bottomThreshold
+    ) {
+        let clampedDistance = max(0, distanceFromBottom)
+        if clampedDistance <= threshold {
+            isPinnedToBottom = true
+            pendingAutoScroll = false
+            lastDistanceFromBottom = clampedDistance
+            return
+        }
+
+        if pendingAutoScroll {
+            pendingAutoScroll = false
+
+            // Ignore one small jump caused by content growth before our scheduled
+            // scroll catches up, but still allow a real user scroll-away to detach.
+            let contentGrowthDetachAllowance = threshold * Self.contentGrowthDetachAllowanceMultiplier
+            if clampedDistance - lastDistanceFromBottom <= contentGrowthDetachAllowance {
+                lastDistanceFromBottom = clampedDistance
+                return
+            }
+        }
+
+        isPinnedToBottom = false
+        lastDistanceFromBottom = clampedDistance
+    }
+
+    private func startRenderTimerIfNeeded() {
+        guard renderTimer == nil else {
+            return
+        }
+
+        renderTimer = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else {
+                    return
+                }
+
+                do {
+                    try await self.sleepHandler(self.flushIntervalDuration)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
+                }
+
+                self.handleRenderTimerTick()
+            }
+        }
+    }
+
+    private func handleRenderTimerTick() {
+        flushPendingTokens()
+
+        if pendingTokens.isEmpty {
+            stopRenderTimer()
+        }
+    }
+
+    private func flushPendingTokens() {
+        guard !pendingTokens.isEmpty else {
+            return
+        }
+
+        let flushedTokens = pendingTokens
+        pendingTokens = ""
+        if isPinnedToBottom {
+            pendingAutoScroll = true
+        }
+        flushHandler(flushedTokens)
+    }
+
+    private func stopRenderTimer() {
+        renderTimer?.cancel()
+        renderTimer = nil
+    }
+}
 
 @MainActor
 @Observable
@@ -85,6 +217,9 @@ final class ChatViewModel {
     @ObservationIgnored private var transcriptCache: [String: [SessionMessage]] = [:]
     @ObservationIgnored private var transcriptCacheAccessOrder: [String] = []
     @ObservationIgnored private var permissionPromptTimeoutTask: Task<Void, Never>?
+    @ObservationIgnored private lazy var streamingDisplayController = StreamingDisplayController { [weak self] flushedText in
+        self?.streamingText += flushedText
+    }
     private var sessionLoadTask: Task<Void, Never>?
 
     init(appState: AppState, sessionViewModel: SessionViewModel) {
@@ -110,6 +245,10 @@ final class ChatViewModel {
 
     var visibleCurrentPhase: StreamingPhase? {
         isCurrentSessionStreaming ? currentPhase : nil
+    }
+
+    var shouldAutoScrollStreamingUpdates: Bool {
+        streamingDisplayController.isPinnedToBottom
     }
 
     var composerPhaseLabel: String? {
@@ -431,6 +570,10 @@ final class ChatViewModel {
         queuedMessage = nil
     }
 
+    func updateStreamingDistanceFromBottom(_ distanceFromBottom: CGFloat) {
+        streamingDisplayController.userDidScroll(distanceFromBottom: distanceFromBottom)
+    }
+
     private func send(_ text: String, forceSessionID: String? = nil) async {
         errorMessage = nil
         currentPhase = nil
@@ -482,6 +625,7 @@ final class ChatViewModel {
         streamingSessionID = sessionID
         streamingText = ""
         currentPhase = nil
+        streamingDisplayController.reset(repinToBottom: true)
 
         let assistantTimestamp = Int(Date().timeIntervalSince1970)
         streamTask = Task {
@@ -492,7 +636,7 @@ final class ChatViewModel {
                 for try await event in stream {
                     switch event {
                     case .textDelta(let text):
-                        streamingText += text
+                        streamingDisplayController.appendToken(text)
                     case .toolCallStart(let id, let name):
                         if currentSessionID == sessionID {
                             beginToolCall(id: id, name: name)
@@ -563,6 +707,7 @@ final class ChatViewModel {
     }
 
     private func finalizeStream(timestamp: Int, finalResponse: String?, sessionID: String) async {
+        streamingDisplayController.streamDidEnd()
         let content = finalResponse ?? streamingText
         if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let assistantMessage = SessionMessage(role: .assistant, content: content, timestamp: timestamp)
@@ -581,6 +726,7 @@ final class ChatViewModel {
     }
 
     private func finalizeCancellation(timestamp: Int, sessionID: String) async {
+        streamingDisplayController.streamDidEnd()
         if !streamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let interrupted = streamingText + "\n\n(interrupted)"
             let assistantMessage = SessionMessage(role: .assistant, content: interrupted, timestamp: timestamp)
@@ -595,6 +741,7 @@ final class ChatViewModel {
     }
 
     private func recoverInterruptedStream(sessionID: String, retryText: String) async -> Bool {
+        streamingDisplayController.streamDidEnd()
         do {
             let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
             guard
@@ -639,6 +786,7 @@ final class ChatViewModel {
 
     private func resetStreamingState() {
         clearPermissionPromptState()
+        streamingDisplayController.reset(repinToBottom: false)
         streamingText = ""
         isStreaming = false
         streamingSessionID = nil
@@ -1012,6 +1160,22 @@ extension ChatViewModel {
 
     func finishActivePermissionPromptForTesting(id: String) {
         finishActivePermissionPrompt(id: id)
+    }
+
+    func appendStreamingTokenForTesting(_ token: String) {
+        streamingDisplayController.appendToken(token)
+    }
+
+    func flushStreamingDisplayForTesting() {
+        streamingDisplayController.streamDidEnd()
+    }
+
+    func updateStreamingDistanceFromBottomForTesting(_ distanceFromBottom: CGFloat) {
+        updateStreamingDistanceFromBottom(distanceFromBottom)
+    }
+
+    var isPinnedToBottomForTesting: Bool {
+        streamingDisplayController.isPinnedToBottom
     }
 }
 #endif
