@@ -78,6 +78,9 @@ enum Commands {
         /// HTTP server port (default: 8400)
         #[arg(long, default_value = "8400")]
         port: u16,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
         /// Run as a fleet worker using the saved fleet identity
         #[arg(long)]
         fleet: bool,
@@ -940,8 +943,12 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             system_prompt,
             http,
             port,
+            data_dir,
             fleet,
         } => {
+            if let Some(ref dir) = data_dir {
+                std::env::set_var("FAWX_DATA_DIR", dir);
+            }
             let _pid_guard = restart::create_serve_pid_file_guard()?;
             if fleet {
                 commands::serve_fleet::run().await
@@ -1337,6 +1344,7 @@ mod tests {
                 system_prompt: None,
                 http: false,
                 port: 8400,
+                data_dir: None,
                 fleet: true,
             })
         ));
@@ -1606,6 +1614,7 @@ exit 0
             system_prompt: None,
             http: false,
             port: 8400,
+            data_dir: None,
             fleet: true,
         })
         .await
