@@ -155,23 +155,33 @@ pub struct AddParams {
     pub iteration: u32,
 }
 
+/// Result of adding an entry to the scratchpad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddResult {
+    /// The ID assigned to the new entry.
+    pub id: u32,
+    /// If the caller specified a parent_id that didn't exist, this holds the
+    /// original value. The entry was created as top-level instead.
+    pub parent_dropped: Option<u32>,
+}
+
 impl Scratchpad {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn add(&mut self, params: AddParams) -> Result<u32, ScratchpadError> {
+    pub fn add(&mut self, params: AddParams) -> Result<AddResult, ScratchpadError> {
         if params.label.trim().is_empty() {
             return Err(ScratchpadError::EmptyLabel);
         }
         if params.content.trim().is_empty() {
             return Err(ScratchpadError::EmptyContent);
         }
-        if let Some(pid) = params.parent_id {
-            if !self.entries.iter().any(|e| e.id == pid) {
-                return Err(ScratchpadError::ParentNotFound(pid));
-            }
-        }
+        let (resolved_parent, parent_dropped) = match params.parent_id {
+            Some(pid) if self.entries.iter().any(|e| e.id == pid) => (Some(pid), None),
+            Some(pid) => (None, Some(pid)),
+            None => (None, None),
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push(ScratchpadEntry {
@@ -181,11 +191,11 @@ impl Scratchpad {
             content: params.content,
             confidence: params.confidence,
             status: EntryStatus::Active,
-            parent_id: params.parent_id,
+            parent_id: resolved_parent,
             created_at_iteration: params.iteration,
             updated_at_iteration: params.iteration,
         });
-        Ok(id)
+        Ok(AddResult { id, parent_dropped })
     }
 
     pub fn update(
@@ -354,6 +364,7 @@ mod tests {
             iteration: 0,
         })
         .expect("add should succeed")
+        .id
     }
 
     #[test]
@@ -365,26 +376,28 @@ mod tests {
     }
 
     #[test]
-    fn add_validates_parent() {
+    fn add_with_invalid_parent_falls_back_to_top_level() {
         let mut sp = Scratchpad::new();
-        assert_eq!(
-            sp.add(AddParams {
+        let result = sp
+            .add(AddParams {
                 kind: EntryKind::Note,
                 label: "c".into(),
                 content: "o".into(),
                 confidence: Confidence::Medium,
                 parent_id: Some(99),
                 iteration: 0,
-            }),
-            Err(ScratchpadError::ParentNotFound(99))
-        );
+            })
+            .expect("should succeed with fallback");
+        assert_eq!(result.parent_dropped, Some(99));
+        let entry = sp.get(result.id).expect("entry should exist");
+        assert_eq!(entry.parent_id, None, "should be top-level after fallback");
     }
 
     #[test]
     fn add_with_valid_parent() {
         let mut sp = Scratchpad::new();
         let p = add_entry(&mut sp, EntryKind::Hypothesis, "p", "content");
-        let c = sp
+        let result = sp
             .add(AddParams {
                 kind: EntryKind::Observation,
                 label: "c".into(),
@@ -394,7 +407,8 @@ mod tests {
                 iteration: 1,
             })
             .expect("ok");
-        assert_eq!(sp.get(c).expect("exists").parent_id, Some(p));
+        assert_eq!(result.parent_dropped, None);
+        assert_eq!(sp.get(result.id).expect("exists").parent_id, Some(p));
     }
 
     #[test]
@@ -716,7 +730,8 @@ mod tests {
                 parent_id: Some(parent),
                 iteration: 0,
             })
-            .expect("add child");
+            .expect("add child")
+            .id;
         sp.remove(parent).expect("remove parent");
         let child_entry = sp.get(child).expect("child should still exist");
         assert_eq!(
