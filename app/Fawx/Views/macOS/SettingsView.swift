@@ -174,10 +174,10 @@ struct SettingsView: View {
                         }
                     )) {
                         ForEach(appState.availableThinkingLevels, id: \.self) { level in
-                            Text(level.displayName).tag(level.rawValue)
+                            Text(displayThinkingLevel(level, modelID: appState.activeModel?.modelID)).tag(level.rawValue)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     .disabled(disableServerControls || appState.availableThinkingLevels.isEmpty)
                     .accessibilityIdentifier("thinkingPicker")
 

@@ -55,4 +55,16 @@ final class FormattersTests: XCTestCase {
 
         XCTAssertEqual(name, "claude…s-4-6")
     }
+
+    func testDisplayThinkingLevelMarksAdaptiveAsDefaultForClaude46Models() {
+        let label = displayThinkingLevel(.adaptive, modelID: "anthropic/claude-opus-4-6-20260301")
+
+        XCTAssertEqual(label, "Adaptive (default)")
+    }
+
+    func testDisplayThinkingLevelLeavesAdaptiveUnchangedForNonClaude46Models() {
+        let label = displayThinkingLevel(.adaptive, modelID: "openai/gpt-5.4")
+
+        XCTAssertEqual(label, "Adaptive")
+    }
 }

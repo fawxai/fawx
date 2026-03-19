@@ -13,18 +13,24 @@ actor FawxClient {
     private let streamSession: URLSession
 
     init(baseURL: URL? = nil, bearerToken: String? = nil) {
+        self.init(
+            baseURL: baseURL,
+            bearerToken: bearerToken,
+            restSession: Self.makeRestSession(),
+            streamSession: Self.makeStreamSession()
+        )
+    }
+
+    init(
+        baseURL: URL? = nil,
+        bearerToken: String? = nil,
+        restSession: URLSession,
+        streamSession: URLSession
+    ) {
         self.baseURL = baseURL
         self.bearerToken = bearerToken
-
-        let restConfiguration = URLSessionConfiguration.default
-        restConfiguration.timeoutIntervalForRequest = 15
-        restConfiguration.timeoutIntervalForResource = 30
-        self.restSession = URLSession(configuration: restConfiguration)
-
-        let streamConfiguration = URLSessionConfiguration.default
-        streamConfiguration.timeoutIntervalForRequest = Self.streamIdleTimeout
-        streamConfiguration.timeoutIntervalForResource = Self.streamResourceTimeout
-        self.streamSession = URLSession(configuration: streamConfiguration)
+        self.restSession = restSession
+        self.streamSession = streamSession
     }
 
     func updateConfiguration(baseURL: URL?, bearerToken: String?) {
@@ -474,12 +480,21 @@ actor FawxClient {
 
     func setThinking(_ level: ThinkingLevel) async throws -> SetThinkingResponse {
         let body = try encoder.encode(SetThinkingBody(level: level.rawValue))
-        return try await performRequest(
-            path: "/v1/thinking",
-            method: "PUT",
-            bodyData: body,
-            decodeAs: SetThinkingResponse.self
-        )
+        do {
+            return try await performRequest(
+                path: "/v1/thinking",
+                method: "POST",
+                bodyData: body,
+                decodeAs: SetThinkingResponse.self
+            )
+        } catch APIError.httpStatus(let code, _) where code == 404 || code == 405 {
+            return try await performRequest(
+                path: "/v1/thinking",
+                method: "PUT",
+                bodyData: body,
+                decodeAs: SetThinkingResponse.self
+            )
+        }
     }
 
     func skills() async throws -> SkillsResponse {
@@ -568,6 +583,19 @@ actor FawxClient {
             path: "/v1/fleet/nodes/\(Self.encodedPathComponent(id))",
             method: "DELETE",
             authRequired: true
+        )
+    }
+
+    func setThinkingRequestForTesting(
+        _ level: ThinkingLevel,
+        method: String = "POST"
+    ) throws -> URLRequest {
+        let body = try encoder.encode(SetThinkingBody(level: level.rawValue))
+        return try makeRequest(
+            path: "/v1/thinking",
+            method: method,
+            authRequired: true,
+            bodyData: body
         )
     }
 #endif
@@ -850,6 +878,20 @@ actor FawxClient {
         }
 
         return statusCode != 401 && statusCode != 403
+    }
+
+    private static func makeRestSession() -> URLSession {
+        let restConfiguration = URLSessionConfiguration.default
+        restConfiguration.timeoutIntervalForRequest = 15
+        restConfiguration.timeoutIntervalForResource = 30
+        return URLSession(configuration: restConfiguration)
+    }
+
+    private static func makeStreamSession() -> URLSession {
+        let streamConfiguration = URLSessionConfiguration.default
+        streamConfiguration.timeoutIntervalForRequest = Self.streamIdleTimeout
+        streamConfiguration.timeoutIntervalForResource = Self.streamResourceTimeout
+        return URLSession(configuration: streamConfiguration)
     }
 
     private func makeRequest(

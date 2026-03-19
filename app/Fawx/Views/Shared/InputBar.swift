@@ -138,14 +138,14 @@ struct InputBar: View {
     private var thinkingMenu: some View {
         Menu {
             ForEach(availableThinkingLevels, id: \.self) { level in
-                Button(level.displayName) {
+                Button(displayThinkingLevel(level, modelID: activeModel?.modelID)) {
                     selectThinking(level)
                 }
             }
         } label: {
             ModelBadge(
-                title: displayThinkingLevel(thinkingLevel),
-                accessibilityLabel: "Thinking level \(displayThinkingLevel(thinkingLevel))"
+                title: displayThinkingLevel(thinkingLevel, modelID: activeModel?.modelID),
+                accessibilityLabel: "Thinking level \(displayThinkingLevel(thinkingLevel, modelID: activeModel?.modelID))"
             )
         }
         .disabled(thinkingMenuDisabled)

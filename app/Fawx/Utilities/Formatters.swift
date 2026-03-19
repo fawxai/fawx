@@ -64,14 +64,34 @@ func compactModelName(_ modelID: String, limit: Int? = nil) -> String {
     return String(abbreviated[..<startIndex]) + "…" + String(abbreviated[endIndex...])
 }
 
-func displayThinkingLevel(_ level: ThinkingLevel?) -> String {
-    level?.rawValue.capitalized ?? "—"
+func displayThinkingLevel(_ level: ThinkingLevel?, modelID: String? = nil) -> String {
+    guard let level else {
+        return "—"
+    }
+
+    if level == .adaptive, usesAdaptiveDefaultThinkingLabel(for: modelID) {
+        return "Adaptive (default)"
+    }
+
+    return level.displayName
 }
 
 func modelMetadataSummary(_ model: ModelInfo) -> String {
     let provider = humanReadableSettingToken(model.provider)
     let authMethod = humanReadableSettingToken(model.authMethod)
     return "\(provider) · \(authMethod)"
+}
+
+// Claude 4.6 models default to adaptive thinking today, so they get the
+// explicit label. Update this list if Anthropic adds new 4.6-style variants.
+private func usesAdaptiveDefaultThinkingLabel(for modelID: String?) -> Bool {
+    guard let modelID else {
+        return false
+    }
+
+    let normalizedModelID = abbreviateModelName(modelID).lowercased()
+    return normalizedModelID.hasPrefix("claude-opus-4-6")
+        || normalizedModelID.hasPrefix("claude-sonnet-4-6")
 }
 
 func permissionPresetLabel(_ rawValue: String?) -> String {

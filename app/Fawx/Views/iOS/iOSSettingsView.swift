@@ -275,10 +275,10 @@ private struct iOSModelThinkingSettingsView: View {
                     }
                 )) {
                     ForEach(appState.availableThinkingLevels, id: \.self) { level in
-                        Text(level.displayName).tag(level.rawValue)
+                        Text(displayThinkingLevel(level, modelID: appState.activeModel?.modelID)).tag(level.rawValue)
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .disabled(disableControls || appState.availableThinkingLevels.isEmpty)
                 .accessibilityIdentifier("thinkingPicker")
 

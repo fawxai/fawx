@@ -21,7 +21,6 @@ struct ThinkingLevel: RawRepresentable, Codable, Hashable, Sendable {
     static let low = Self(rawValue: "low")
     static let adaptive = Self(rawValue: "adaptive")
     static let high = Self(rawValue: "high")
-    static let defaultOptions: [ThinkingLevel] = [.off, .low, .adaptive, .high]
 
     var displayName: String {
         rawValue
@@ -31,14 +30,15 @@ struct ThinkingLevel: RawRepresentable, Codable, Hashable, Sendable {
     }
 }
 
-struct ThinkingConfig: Codable, Sendable, Hashable {
+struct ThinkingConfig: Decodable, Sendable, Hashable {
     let level: ThinkingLevel
     let budgetTokens: Int?
-    let available: [ThinkingLevel]
+    let validLevels: [ThinkingLevel]
 
     enum CodingKeys: String, CodingKey {
         case level
         case budgetTokens = "budget_tokens"
+        case validLevels = "valid_levels"
         case available
     }
 
@@ -46,21 +46,23 @@ struct ThinkingConfig: Codable, Sendable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         level = try container.decode(ThinkingLevel.self, forKey: .level)
         budgetTokens = try container.decodeIfPresent(Int.self, forKey: .budgetTokens)
-        available = try container.decodeIfPresent([ThinkingLevel].self, forKey: .available)
-            ?? ThinkingLevel.defaultOptions
+        validLevels = try container.decodeIfPresent([ThinkingLevel].self, forKey: .validLevels)
+            ?? container.decodeIfPresent([ThinkingLevel].self, forKey: .available)
+            ?? [level]
     }
 }
 
-struct SetThinkingResponse: Codable, Sendable, Hashable {
+struct SetThinkingResponse: Decodable, Sendable, Hashable {
     let previousLevel: ThinkingLevel
     let level: ThinkingLevel
     let budgetTokens: Int?
-    let available: [ThinkingLevel]
+    let validLevels: [ThinkingLevel]
 
     enum CodingKeys: String, CodingKey {
         case previousLevel = "previous_level"
         case level
         case budgetTokens = "budget_tokens"
+        case validLevels = "valid_levels"
         case available
     }
 
@@ -69,7 +71,8 @@ struct SetThinkingResponse: Codable, Sendable, Hashable {
         previousLevel = try container.decode(ThinkingLevel.self, forKey: .previousLevel)
         level = try container.decode(ThinkingLevel.self, forKey: .level)
         budgetTokens = try container.decodeIfPresent(Int.self, forKey: .budgetTokens)
-        available = try container.decodeIfPresent([ThinkingLevel].self, forKey: .available)
-            ?? ThinkingLevel.defaultOptions
+        validLevels = try container.decodeIfPresent([ThinkingLevel].self, forKey: .validLevels)
+            ?? container.decodeIfPresent([ThinkingLevel].self, forKey: .available)
+            ?? [level]
     }
 }
