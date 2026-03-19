@@ -1,5 +1,31 @@
 import Foundation
 
+actor LocalInstallConfigurationLoader {
+    static let shared = LocalInstallConfigurationLoader()
+
+    func loadDefault() async -> LocalInstallConfiguration? {
+#if os(macOS)
+        let dataDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".fawx", isDirectory: true)
+        return await load(from: dataDir.appendingPathComponent("config.toml", isDirectory: false))
+#else
+        nil
+#endif
+    }
+
+    func load(from configURL: URL) async -> LocalInstallConfiguration? {
+        let rawConfig = await Task.detached(priority: .utility) {
+            try? String(contentsOf: configURL)
+        }.value
+
+        guard let rawConfig else {
+            return nil
+        }
+
+        return LocalInstallConfiguration.parse(rawConfig, configURL: configURL)
+    }
+}
+
 struct LocalInstallConfiguration: Sendable, Equatable {
     let host: String
     let port: Int
@@ -24,21 +50,23 @@ struct LocalInstallConfiguration: Sendable, Equatable {
 #endif
     }
 
-    static func loadDefault() -> LocalInstallConfiguration? {
-#if os(macOS)
-        let dataDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".fawx", isDirectory: true)
-        return load(from: dataDir.appendingPathComponent("config.toml", isDirectory: false))
-#else
-        nil
-#endif
+    static func loadDefault(
+        loader: LocalInstallConfigurationLoader = .shared
+    ) async -> LocalInstallConfiguration? {
+        await loader.loadDefault()
     }
 
-    static func load(from configURL: URL) -> LocalInstallConfiguration? {
-        guard let rawConfig = try? String(contentsOf: configURL) else {
-            return nil
-        }
+    static func load(
+        from configURL: URL,
+        loader: LocalInstallConfigurationLoader = .shared
+    ) async -> LocalInstallConfiguration? {
+        await loader.load(from: configURL)
+    }
 
+    fileprivate static func parse(
+        _ rawConfig: String,
+        configURL: URL
+    ) -> LocalInstallConfiguration? {
         var currentSection = ""
         var host = "127.0.0.1"
         var port = 8400

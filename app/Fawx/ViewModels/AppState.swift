@@ -115,13 +115,101 @@ enum RefreshCadence {
 @MainActor
 @Observable
 final class AppState {
-    private enum StorageKey {
-        static let serverURL = "server_url"
-        static let pairedDeviceName = "paired_device_name"
-        static let theme = "theme"
-        static let fontSize = "font_size"
-        static let setupComplete = "setup_complete"
-        static let connectionMode = "connection_mode"
+    private struct StartupHydrationOverride: OptionSet {
+        let rawValue: Int
+
+        static let navigation = StartupHydrationOverride(rawValue: 1 << 0)
+        static let theme = StartupHydrationOverride(rawValue: 1 << 1)
+        static let fontSize = StartupHydrationOverride(rawValue: 1 << 2)
+    }
+
+    private struct LaunchState {
+        var connectionMode: AppConnectionMode
+        var rootDestination: AppRootDestination
+        var serverURLString: String
+        var pairedDeviceName: String?
+        var theme: AppTheme
+        var fontSize: AppFontSize
+        var authToken: String?
+        var localInstallConfiguration: LocalInstallConfiguration?
+        var isSetupComplete: Bool
+
+        var baseURL: URL? {
+            URL(string: serverURLString)
+        }
+
+        var isConfigured: Bool {
+            !serverURLString.isEmpty && authToken?.isEmpty == false
+        }
+
+        @MainActor
+        static func resolved(from snapshot: AppStatePersistence.LaunchSnapshot) -> LaunchState {
+            let resolvedPairing = resolvePairing(from: snapshot)
+            let isSetupComplete = snapshot.setupComplete || resolvedPairing.localInstallConfiguration != nil
+
+            return LaunchState(
+                connectionMode: resolvedPairing.connectionMode,
+                rootDestination: AppState.resolveInitialDestination(
+                    isConfigured: !resolvedPairing.serverURLString.isEmpty
+                        && resolvedPairing.authToken?.isEmpty == false,
+                    setupComplete: isSetupComplete,
+                    connectionMode: resolvedPairing.connectionMode,
+                    hasStoredServerURL: !snapshot.storedServerURL.isEmpty,
+                    hasLocalInstall: resolvedPairing.localInstallConfiguration != nil
+                ),
+                serverURLString: resolvedPairing.serverURLString,
+                pairedDeviceName: AppState.resolvedDeviceName(
+                    storedDeviceName: snapshot.pairedDeviceName,
+                    authToken: resolvedPairing.authToken
+                ),
+                theme: snapshot.theme,
+                fontSize: snapshot.fontSize,
+                authToken: resolvedPairing.authToken,
+                localInstallConfiguration: resolvedPairing.localInstallConfiguration,
+                isSetupComplete: isSetupComplete
+            )
+        }
+
+        @MainActor
+        private static func resolvePairing(
+            from snapshot: AppStatePersistence.LaunchSnapshot
+        ) -> (
+            serverURLString: String,
+            authToken: String?,
+            connectionMode: AppConnectionMode,
+            localInstallConfiguration: LocalInstallConfiguration?
+        ) {
+            let storedConnectionMode = resolveStoredConnectionMode(from: snapshot)
+            let localInstallConfiguration = snapshot.localInstallConfiguration
+            var serverURLString = UITestLaunchOptions.serverURLOverride ?? snapshot.storedServerURL
+            var authToken = UITestLaunchOptions.bearerTokenOverride ?? snapshot.authToken
+            var connectionMode = storedConnectionMode
+
+#if os(macOS)
+            if (serverURLString.isEmpty || authToken?.isEmpty != false), let localInstallConfiguration {
+                serverURLString = localInstallConfiguration.baseURLString
+                authToken = localInstallConfiguration.bearerToken
+                connectionMode = .local
+            } else if serverURLString.isEmpty && connectionMode == .local {
+                serverURLString = AppState.defaultLocalSetupServerURLString
+            }
+#endif
+
+            return (serverURLString, authToken, connectionMode, localInstallConfiguration)
+        }
+
+        @MainActor
+        private static func resolveStoredConnectionMode(
+            from snapshot: AppStatePersistence.LaunchSnapshot
+        ) -> AppConnectionMode {
+            let defaultConnectionMode = AppState.defaultConnectionMode(
+                forStoredServerURL: snapshot.storedServerURL
+            )
+
+            return AppConnectionMode(
+                rawValue: snapshot.connectionModeRawValue ?? defaultConnectionMode.rawValue
+            ) ?? defaultConnectionMode
+        }
     }
 
     private static let defaultLocalSetupServerURLString = "http://127.0.0.1:8400"
@@ -158,73 +246,38 @@ final class AppState {
     var setupActionError: String?
 
     let client: FawxClient
+    @ObservationIgnored private let persistence: AppStatePersistence
     private var authToken: String?
     private var isSetupComplete: Bool
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var hasRequestedNotificationAuthorization = false
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectAttempt = 0
+    @ObservationIgnored private var startupHydrationOverrides: StartupHydrationOverride = []
 
-    init() {
-        if UITestLaunchOptions.shouldResetState {
-            Self.resetPersistedConfiguration()
+    @ObservationIgnored private var initialPersistenceLoadTask: Task<Void, Never>?
+
+    init(
+        persistence: AppStatePersistence = AppStatePersistence.defaultStore(),
+        startLoadingPersistedState: Bool = true
+    ) {
+        let initialState = Self.initialLaunchState()
+
+        self.connectionMode = initialState.connectionMode
+        self.rootDestination = initialState.rootDestination
+        self.serverURLString = initialState.serverURLString
+        self.pairedDeviceName = initialState.pairedDeviceName
+        self.theme = initialState.theme
+        self.fontSize = initialState.fontSize
+        self.authToken = initialState.authToken
+        self.localInstallConfiguration = initialState.localInstallConfiguration
+        self.isSetupComplete = initialState.isSetupComplete
+        self.client = FawxClient(baseURL: initialState.baseURL, bearerToken: initialState.authToken)
+        self.persistence = persistence
+
+        if startLoadingPersistedState {
+            startPersistedStateLoad(resetState: UITestLaunchOptions.shouldResetState)
         }
-
-        let defaults = UserDefaults.standard
-        let storedServerURL = defaults.string(forKey: StorageKey.serverURL) ?? ""
-        let storedTheme = AppTheme(rawValue: defaults.string(forKey: StorageKey.theme) ?? AppTheme.system.rawValue) ?? .system
-        let storedFontSize = AppFontSize(rawValue: defaults.string(forKey: StorageKey.fontSize) ?? AppFontSize.medium.rawValue) ?? .medium
-        let defaultConnectionMode = Self.defaultConnectionMode(forStoredServerURL: storedServerURL)
-        let storedConnectionMode = AppConnectionMode(
-            rawValue: defaults.string(forKey: StorageKey.connectionMode) ?? defaultConnectionMode.rawValue
-        ) ?? defaultConnectionMode
-        let storedSetupComplete = defaults.bool(forKey: StorageKey.setupComplete)
-        let storedToken = try? KeychainHelper.token(forServer: storedServerURL)
-        let storedDeviceName = defaults.string(forKey: StorageKey.pairedDeviceName)
-        let detectedLocalInstall = LocalInstallConfiguration.loadDefault()
-
-        var resolvedServerURL = UITestLaunchOptions.serverURLOverride ?? storedServerURL
-        var resolvedToken = UITestLaunchOptions.bearerTokenOverride ?? storedToken
-        var resolvedConnectionMode = storedConnectionMode
-
-#if os(macOS)
-        if (resolvedServerURL.isEmpty || resolvedToken?.isEmpty != false), let detectedLocalInstall {
-            resolvedServerURL = detectedLocalInstall.baseURLString
-            resolvedToken = detectedLocalInstall.bearerToken
-            resolvedConnectionMode = .local
-        } else if resolvedServerURL.isEmpty && resolvedConnectionMode == .local {
-            resolvedServerURL = Self.defaultLocalSetupServerURLString
-        }
-#endif
-
-        let resolvedDeviceName = UITestLaunchOptions.pairedDeviceNameOverride
-            ?? storedDeviceName
-            ?? (UITestLaunchOptions.isUITesting && resolvedToken != nil ? "UI Test Device" : nil)
-
-        let resolvedSetupComplete = storedSetupComplete || detectedLocalInstall != nil
-        let resolvedBaseURL = URL(string: resolvedServerURL)
-
-        self.connectionMode = resolvedConnectionMode
-        self.rootDestination = Self.resolveInitialDestination(
-            isConfigured: !resolvedServerURL.isEmpty && resolvedToken?.isEmpty == false,
-            setupComplete: resolvedSetupComplete,
-            connectionMode: resolvedConnectionMode,
-            hasStoredServerURL: !storedServerURL.isEmpty,
-            hasLocalInstall: detectedLocalInstall != nil
-        )
-        self.serverURLString = resolvedServerURL
-        self.pairedDeviceName = resolvedDeviceName
-        self.theme = storedTheme
-        self.fontSize = storedFontSize
-        self.authToken = resolvedToken
-        self.localInstallConfiguration = detectedLocalInstall
-        self.isSetupComplete = resolvedSetupComplete
-        self.client = FawxClient(baseURL: resolvedBaseURL, bearerToken: resolvedToken)
-
-        if resolvedSetupComplete {
-            defaults.set(true, forKey: StorageKey.setupComplete)
-        }
-        defaults.set(resolvedConnectionMode.rawValue, forKey: StorageKey.connectionMode)
     }
 
     var isConfigured: Bool {
@@ -390,6 +443,8 @@ final class AppState {
     }
 
     func bootstrap() async {
+        await awaitPersistedStateLoad()
+
         guard showsMainExperience, isConfigured else {
             reconnectTask?.cancel()
             reconnectTask = nil
@@ -407,6 +462,7 @@ final class AppState {
     }
 
     func beginRemoteOnboarding() {
+        recordStartupHydrationOverride(.navigation)
         connectionMode = .remote
         rootDestination = .remoteOnboarding
         setupActionError = nil
@@ -415,6 +471,7 @@ final class AppState {
 
     func returnToLocalSetup() {
 #if os(macOS)
+        recordStartupHydrationOverride(.navigation)
         connectionMode = .local
         rootDestination = .setupWizard
         setupActionError = nil
@@ -423,12 +480,13 @@ final class AppState {
     }
 
     func completeLocalSetup() async throws {
-        reloadLocalInstallConfiguration()
+        await awaitPersistedStateLoad()
+        let currentLocalInstallConfiguration = await refreshLocalInstallConfiguration()
 
         let resolvedServerURL: String
 
-        if let localInstallConfiguration {
-            resolvedServerURL = localInstallConfiguration.baseURLString
+        if let currentLocalInstallConfiguration {
+            resolvedServerURL = currentLocalInstallConfiguration.baseURLString
         } else if !serverURLString.isEmpty {
             resolvedServerURL = serverURLString
         } else {
@@ -455,7 +513,7 @@ final class AppState {
             connectionMode: .local
         )
         isSetupComplete = true
-        UserDefaults.standard.set(true, forKey: StorageKey.setupComplete)
+        await persistence.setSetupComplete(true)
         await bootstrap()
     }
 
@@ -472,17 +530,19 @@ final class AppState {
             throw APIError.invalidURL(canonicalURLString)
         }
 
+        await awaitPersistedStateLoad()
+        try await persistence.savePairing(
+            serverURLString: canonicalURLString,
+            token: token,
+            deviceName: deviceName,
+            connectionMode: connectionMode
+        )
+
         serverURLString = canonicalURLString
         pairedDeviceName = deviceName
         authToken = token
         self.connectionMode = connectionMode
         rootDestination = .main
-
-        let defaults = UserDefaults.standard
-        defaults.set(canonicalURLString, forKey: StorageKey.serverURL)
-        defaults.set(deviceName, forKey: StorageKey.pairedDeviceName)
-        defaults.set(connectionMode.rawValue, forKey: StorageKey.connectionMode)
-        try KeychainHelper.saveToken(token, forServer: canonicalURLString)
 
         await client.updateConfiguration(baseURL: url, bearerToken: token)
         connectionError = nil
@@ -492,9 +552,8 @@ final class AppState {
     }
 
     func unpair() async throws {
-        if !serverURLString.isEmpty {
-            try? KeychainHelper.deleteToken(forServer: serverURLString)
-        }
+        await awaitPersistedStateLoad()
+        await persistence.clearPairing(serverURLString: serverURLString)
 
         let hasLocalInstall = localInstallConfiguration != nil
         let setupComplete = isSetupComplete
@@ -522,8 +581,6 @@ final class AppState {
         qrPairingResponse = nil
         clearRipcordState()
 
-        UserDefaults.standard.removeObject(forKey: StorageKey.serverURL)
-        UserDefaults.standard.removeObject(forKey: StorageKey.pairedDeviceName)
         await client.updateConfiguration(baseURL: nil, bearerToken: nil)
 
         rootDestination = Self.resolveInitialDestination(
@@ -950,14 +1007,21 @@ final class AppState {
     }
 
     func setTheme(_ theme: AppTheme) {
+        recordStartupHydrationOverride(.theme)
         self.theme = theme
-        UserDefaults.standard.set(theme.rawValue, forKey: StorageKey.theme)
+        persistTheme(theme)
     }
 
     func setFontSize(_ fontSize: AppFontSize) {
+        recordStartupHydrationOverride(.fontSize)
         self.fontSize = fontSize
-        UserDefaults.standard.set(fontSize.rawValue, forKey: StorageKey.fontSize)
+        persistFontSize(fontSize)
         FawxTypography.setScale(fontSize.scale)
+    }
+
+    func awaitPersistedStateLoad() async {
+        let loadTask = initialPersistenceLoadTask
+        await loadTask?.value
     }
 
     private func shouldNotifyForRipcordActivation(
@@ -997,6 +1061,70 @@ final class AppState {
 
     private func clearRipcordState() {
         ripcordStatus = nil
+    }
+
+    private func startPersistedStateLoad(resetState: Bool) {
+        let persistence = persistence
+
+        initialPersistenceLoadTask = Task(priority: .utility) { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            let snapshot = await persistence.loadLaunchSnapshot(resetState: resetState)
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await applyPersistedLaunchSnapshot(snapshot)
+            initialPersistenceLoadTask = nil
+        }
+    }
+
+    private func applyPersistedLaunchSnapshot(_ snapshot: AppStatePersistence.LaunchSnapshot) async {
+        var launchState = Self.resolvedLaunchState(from: snapshot)
+        let startupOverrides = startupHydrationOverrides
+        startupHydrationOverrides = []
+
+        if startupOverrides.contains(.navigation) {
+            launchState.connectionMode = connectionMode
+            launchState.rootDestination = rootDestination
+        }
+
+        if startupOverrides.contains(.theme) {
+            launchState.theme = theme
+        }
+
+        if startupOverrides.contains(.fontSize) {
+            launchState.fontSize = fontSize
+        }
+
+        applyLaunchState(launchState)
+        await client.updateConfiguration(baseURL: launchState.baseURL, bearerToken: launchState.authToken)
+        await persistence.persistResolvedLaunchState(
+            setupComplete: launchState.isSetupComplete,
+            connectionMode: launchState.connectionMode
+        )
+    }
+
+    private func recordStartupHydrationOverride(_ override: StartupHydrationOverride) {
+        guard initialPersistenceLoadTask != nil else {
+            return
+        }
+
+        startupHydrationOverrides.insert(override)
+    }
+
+    private func applyLaunchState(_ launchState: LaunchState) {
+        connectionMode = launchState.connectionMode
+        rootDestination = launchState.rootDestination
+        serverURLString = launchState.serverURLString
+        pairedDeviceName = launchState.pairedDeviceName
+        theme = launchState.theme
+        fontSize = launchState.fontSize
+        authToken = launchState.authToken
+        localInstallConfiguration = launchState.localInstallConfiguration
+        isSetupComplete = launchState.isSetupComplete
     }
 
     private var rootDestinationKey: String {
@@ -1162,16 +1290,75 @@ final class AppState {
         }
     }
 
-    private func reloadLocalInstallConfiguration() {
+    private func refreshLocalInstallConfiguration() async -> LocalInstallConfiguration? {
 #if os(macOS)
-        if let configuration = LocalInstallConfiguration.loadDefault() {
-            localInstallConfiguration = configuration
-        }
+        let configuration = await persistence.loadLocalInstallConfiguration()
+        localInstallConfiguration = configuration
+        return configuration
+#else
+        return nil
 #endif
     }
 
     private func persistConnectionMode() {
-        UserDefaults.standard.set(connectionMode.rawValue, forKey: StorageKey.connectionMode)
+        let connectionMode = connectionMode
+        let persistence = persistence
+        Task(priority: .utility) {
+            await persistence.setConnectionMode(connectionMode)
+        }
+    }
+
+    private func persistTheme(_ theme: AppTheme) {
+        let persistence = persistence
+        Task(priority: .utility) {
+            await persistence.setTheme(theme)
+        }
+    }
+
+    private func persistFontSize(_ fontSize: AppFontSize) {
+        let persistence = persistence
+        Task(priority: .utility) {
+            await persistence.setFontSize(fontSize)
+        }
+    }
+
+    private static func initialLaunchState() -> LaunchState {
+        let serverURLString = UITestLaunchOptions.serverURLOverride ?? ""
+        let authToken = UITestLaunchOptions.bearerTokenOverride
+        let connectionMode = defaultConnectionMode(forStoredServerURL: serverURLString)
+
+        return LaunchState(
+            connectionMode: connectionMode,
+            rootDestination: resolveInitialDestination(
+                isConfigured: !serverURLString.isEmpty && authToken?.isEmpty == false,
+                setupComplete: false,
+                connectionMode: connectionMode,
+                hasStoredServerURL: !serverURLString.isEmpty,
+                hasLocalInstall: false
+            ),
+            serverURLString: serverURLString,
+            pairedDeviceName: resolvedDeviceName(storedDeviceName: nil, authToken: authToken),
+            theme: .system,
+            fontSize: .medium,
+            authToken: authToken,
+            localInstallConfiguration: nil,
+            isSetupComplete: false
+        )
+    }
+
+    private static func resolvedLaunchState(
+        from snapshot: AppStatePersistence.LaunchSnapshot
+    ) -> LaunchState {
+        LaunchState.resolved(from: snapshot)
+    }
+
+    private static func resolvedDeviceName(
+        storedDeviceName: String?,
+        authToken: String?
+    ) -> String? {
+        UITestLaunchOptions.pairedDeviceNameOverride
+            ?? storedDeviceName
+            ?? (UITestLaunchOptions.isUITesting && authToken != nil ? "UI Test Device" : nil)
     }
 
     private static func resolveInitialDestination(
@@ -1212,21 +1399,5 @@ final class AppState {
         }
 #endif
         return "This Mac"
-    }
-
-    private static func resetPersistedConfiguration() {
-        let defaults = UserDefaults.standard
-        let storedServerURL = defaults.string(forKey: StorageKey.serverURL) ?? ""
-
-        if !storedServerURL.isEmpty {
-            try? KeychainHelper.deleteToken(forServer: storedServerURL)
-        }
-
-        defaults.removeObject(forKey: StorageKey.serverURL)
-        defaults.removeObject(forKey: StorageKey.pairedDeviceName)
-        defaults.removeObject(forKey: StorageKey.theme)
-        defaults.removeObject(forKey: StorageKey.fontSize)
-        defaults.removeObject(forKey: StorageKey.setupComplete)
-        defaults.removeObject(forKey: StorageKey.connectionMode)
     }
 }

@@ -114,15 +114,17 @@ private final class LocalhostOAuthCallbackBridge: @unchecked Sendable {
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let resumeIfNeeded: @Sendable (Result<Void, Error>) -> Void = { result in
-                guard resumeState.markResumedIfNeeded() else {
-                    return
-                }
+                Task {
+                    guard await resumeState.markResumedIfNeeded() else {
+                        return
+                    }
 
-                switch result {
-                case .success:
-                    continuation.resume(returning: ())
-                case .failure(let error):
-                    continuation.resume(throwing: error)
+                    switch result {
+                    case .success:
+                        continuation.resume(returning: ())
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
 
@@ -351,14 +353,10 @@ private final class LocalhostOAuthCallbackBridge: @unchecked Sendable {
     }
 }
 
-private final class ContinuationResumeState: @unchecked Sendable {
-    private let lock = NSLock()
+private actor ContinuationResumeState {
     private var hasResumed = false
 
     func markResumedIfNeeded() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard !hasResumed else {
             return false
         }

@@ -3,9 +3,10 @@ import XCTest
 
 @MainActor
 final class TelemetryViewModelTests: XCTestCase {
-    func testSetCategoryEnabledIgnoresSecondMutationWhileFirstIsPending() async {
+    func testSetCategoryEnabledIgnoresSecondMutationWhileFirstIsPending() async throws {
         let started = expectation(description: "First telemetry mutation started")
         let patchState = TelemetryPatchState()
+        let appState = try await makeConfiguredAppState()
 
         let response = makeTelemetryResponse(
             enabled: true,
@@ -16,7 +17,7 @@ final class TelemetryViewModelTests: XCTestCase {
         )
 
         let sut = TelemetryViewModel(
-            appState: AppState(),
+            appState: appState,
             fetchConsent: { response },
             patchConsent: { request in
                 let requestCount = patchState.append(request)
@@ -63,9 +64,10 @@ final class TelemetryViewModelTests: XCTestCase {
         XCTAssertFalse(sut.pendingCategories.contains("performance"))
     }
 
-    func testSetEnabledReturnsEarlyWhileCategoryMutationIsPending() async {
+    func testSetEnabledReturnsEarlyWhileCategoryMutationIsPending() async throws {
         let started = expectation(description: "Category mutation started")
         let patchState = TelemetryPatchState()
+        let appState = try await makeConfiguredAppState()
 
         let response = makeTelemetryResponse(
             enabled: true,
@@ -76,7 +78,7 @@ final class TelemetryViewModelTests: XCTestCase {
         )
 
         let sut = TelemetryViewModel(
-            appState: AppState(),
+            appState: appState,
             fetchConsent: { response },
             patchConsent: { request in
                 _ = patchState.append(request)
@@ -126,6 +128,28 @@ final class TelemetryViewModelTests: XCTestCase {
             ),
             updatedAt: "2026-03-16T00:00:00Z"
         )
+    }
+
+    private func makeConfiguredAppState() async throws -> AppState {
+        let defaultsSuiteName = "TelemetryViewModelTests.\(UUID().uuidString)"
+        let keychainService = "ai.fawx.app.tests.\(UUID().uuidString)"
+        let appState = AppState(
+            persistence: AppStatePersistence(
+                defaultsSuiteName: defaultsSuiteName,
+                keychainService: keychainService,
+                localInstallLoader: { nil }
+            ),
+            startLoadingPersistedState: false
+        )
+
+        try await appState.savePairing(
+            serverURLString: "https://telemetry.example.com:8400",
+            token: "telemetry-token",
+            deviceName: "Telemetry Test Device",
+            connectionMode: .remote
+        )
+
+        return appState
     }
 }
 
