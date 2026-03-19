@@ -111,6 +111,7 @@ actor LocalBootstrapService {
             <array>
                 <string>\(xmlEscape(binaryPath))</string>
                 <string>serve</string>
+                <string>--http</string>
                 <string>--port</string>
                 <string>\(port)</string>
                 <string>--data-dir</string>

@@ -122,6 +122,7 @@ pub fn generate_plist(config: &LaunchAgentConfig) -> String {
     <array>
         <string>{binary}</string>
         <string>serve</string>
+        <string>--http</string>
         <string>--port</string>
         <string>{port}</string>
         <string>--data-dir</string>
@@ -277,6 +278,16 @@ mod tests {
         let config = test_config();
         let plist = generate_plist(&config);
         assert!(plist.contains("<string>/usr/local/bin/fawx</string>"));
+    }
+
+    #[test]
+    fn generate_plist_contains_http_flag() {
+        let config = test_config();
+        let plist = generate_plist(&config);
+        assert!(
+            plist.contains("<string>--http</string>"),
+            "plist must include --http so the server starts in HTTP mode"
+        );
     }
 
     #[test]
