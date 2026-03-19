@@ -3360,7 +3360,7 @@ mod tests {
             process_input_with_commands(&mut app, "/auth usage-reporting show-status", None)
                 .await
                 .expect("process auth show-status command");
-        assert!(auth_status.response.contains("Status: configured"));
+        assert!(auth_status.response.contains("Status: registered"));
 
         let auth_write =
             process_input_with_commands(&mut app, "/auth github set-token ghp_test", None)
