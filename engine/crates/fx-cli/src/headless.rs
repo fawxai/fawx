@@ -290,26 +290,6 @@ fn headless_stream_callback(callback: StreamCallback) -> StreamCallback {
     })
 }
 
-#[derive(Clone)]
-pub struct HeadlessSubagentFactoryDeps {
-    pub router: Arc<ModelRouter>,
-    pub config: FawxConfig,
-    pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
-}
-
-#[derive(Clone)]
-pub struct HeadlessSubagentFactory {
-    deps: HeadlessSubagentFactoryDeps,
-    disabled_manager: Arc<SubagentManager>,
-}
-
-struct HeadlessSubagentSession {
-    app: HeadlessApp,
-}
-
-#[derive(Debug)]
-struct DisabledSubagentFactory;
-
 impl HeadlessApp {
     fn initial_bus_receiver(deps: &HeadlessAppDeps) -> Option<mpsc::Receiver<Envelope>> {
         match (deps.session_bus.as_ref(), deps.session_key.as_ref()) {
@@ -2257,93 +2237,6 @@ fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
     }
 }
 
-impl HeadlessSubagentFactory {
-    pub fn new(deps: HeadlessSubagentFactoryDeps) -> Self {
-        Self {
-            deps,
-            disabled_manager: new_disabled_subagent_manager(),
-        }
-    }
-}
-
-impl std::fmt::Debug for HeadlessSubagentFactory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeadlessSubagentFactory")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for HeadlessSubagentSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeadlessSubagentSession")
-            .field("active_model", &self.app.active_model)
-            .finish()
-    }
-}
-
-impl SubagentFactory for DisabledSubagentFactory {
-    fn create_session(
-        &self,
-        _config: &SpawnConfig,
-    ) -> Result<CreatedSubagentSession, SubagentError> {
-        Err(SubagentError::Spawn(
-            "nested subagent spawning is disabled".to_string(),
-        ))
-    }
-}
-
-impl SubagentFactory for HeadlessSubagentFactory {
-    fn create_session(
-        &self,
-        config: &SpawnConfig,
-    ) -> Result<CreatedSubagentSession, SubagentError> {
-        if config.model.is_some() {
-            return Err(SubagentError::Spawn(
-                "model overrides are not supported with a shared router".to_string(),
-            ));
-        }
-        let cancel_token = CancellationToken::new();
-        let options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token.clone());
-        let bundle = build_headless_loop_engine_bundle(
-            &self.deps.config,
-            self.deps.improvement_provider.clone(),
-            options,
-        )
-        .map_err(|error| SubagentError::Spawn(error.to_string()))?;
-        let deps = HeadlessAppDeps {
-            loop_engine: bundle.engine,
-            router: Arc::clone(&self.deps.router),
-            config: self.deps.config.clone(),
-            memory: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: config.system_prompt.clone(),
-            subagent_manager: Arc::clone(&self.disabled_manager),
-        };
-        let app =
-            HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
-        Ok(CreatedSubagentSession {
-            session: Box::new(HeadlessSubagentSession { app }),
-            cancel_token,
-        })
-    }
-}
-
-#[async_trait]
-impl SubagentSession for HeadlessSubagentSession {
-    async fn process_message(&mut self, input: &str) -> Result<SubagentTurn, SubagentError> {
-        let result = self
-            .app
-            .process_message(input)
-            .await
-            .map_err(|error| SubagentError::Execution(error.to_string()))?;
-        Ok(SubagentTurn {
-            response: result.response,
-            tokens_used: result.tokens_used,
-        })
-    }
-}
-
 // ── Free functions ──────────────────────────────────────────────────────────
 
 fn is_quit_command(input: &str) -> bool {
@@ -3326,28 +3219,6 @@ mod tests {
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
-    }
-
-    #[tokio::test]
-    async fn process_message_reports_token_counts() {
-        let mut app = HeadlessApp {
-            loop_engine: test_engine(),
-            router: test_router(),
-            config: FawxConfig::default(),
-            memory: None,
-            _subagent_manager: new_disabled_subagent_manager(),
-            active_model: "mock-model".to_string(),
-            conversation_history: Vec::new(),
-            max_history: 20,
-            custom_system_prompt: None,
-            config_manager: None,
-        };
-
-        let result = app.process_message("hello").await.expect("process message");
-
-        assert_eq!(result.model, "mock-model");
-        assert!(result.iterations > 0);
-        assert!(result.tokens_used >= mock_completion_usage_total());
     }
 
     #[test]

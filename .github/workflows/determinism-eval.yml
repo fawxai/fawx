@@ -3,10 +3,6 @@ name: Determinism Eval
 on:
   pull_request:
     branches: [ main, staging ]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
