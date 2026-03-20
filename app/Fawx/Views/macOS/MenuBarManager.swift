@@ -25,8 +25,8 @@ final class MenuBarManager: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            if let icon = NSImage(named: "MenuBarIcon") {
-                icon.isTemplate = true
+            if let icon = NSImage(named: "MenuBarIcon-stopped") {
+                icon.isTemplate = false
                 icon.size = NSSize(width: 18, height: 18)
                 button.image = icon
                 button.imagePosition = .imageLeading
@@ -65,14 +65,28 @@ final class MenuBarManager: NSObject {
         }
 
         let snapshot = snapshot()
-        if let icon = NSImage(named: "MenuBarIcon") {
-            icon.isTemplate = true
+        let iconName = menuBarIconName(for: snapshot.color)
+        if let icon = NSImage(named: iconName) {
+            icon.isTemplate = false
             icon.size = NSSize(width: 18, height: 18)
             button.image = icon
             button.imagePosition = .imageLeading
         }
         button.attributedTitle = statusItemTitle(snapshot: snapshot)
         button.toolTip = "\(snapshot.title)\n\(snapshot.detail)"
+    }
+
+    private func menuBarIconName(for color: Color) -> String {
+        switch color {
+        case .fawxSuccess:
+            return "MenuBarIcon-active"
+        case .fawxError:
+            return "MenuBarIcon-error"
+        case .fawxWarning:
+            return "MenuBarIcon-connecting"
+        default:
+            return "MenuBarIcon-stopped"
+        }
     }
 
     private func rebuildMenu() {
@@ -164,24 +178,7 @@ final class MenuBarManager: NSObject {
     }
 
     private func statusItemTitle(snapshot: MenuBarStatusSnapshot) -> NSAttributedString {
-        let title = NSMutableAttributedString(
-            string: "",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 14),
-            ]
-        )
-
-        title.append(
-            NSAttributedString(
-                string: "●",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: nsColor(from: snapshot.color),
-                ]
-            )
-        )
-
-        return title
+        NSAttributedString(string: "")
     }
 
     private func isPrimaryAppWindow(_ window: NSWindow) -> Bool {
