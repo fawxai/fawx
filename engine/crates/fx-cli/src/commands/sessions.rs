@@ -3,7 +3,8 @@ use anyhow::anyhow;
 use chrono::{TimeZone, Utc};
 use clap::Args;
 use fx_session::{
-    SessionContentBlock, SessionInfo, SessionKey, SessionKind, SessionMessage, SessionRegistry,
+    render_content_blocks_with_options, ContentRenderOptions, SessionContentBlock, SessionInfo,
+    SessionKey, SessionKind, SessionMessage, SessionRegistry,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -199,10 +200,7 @@ fn format_message_count(export: &SessionExport) -> String {
 }
 
 fn format_message_block(message: &SessionMessage) -> String {
-    let token_suffix = message
-        .token_count
-        .map(|count| format!(" | {count} tokens"))
-        .unwrap_or_default();
+    let token_suffix = format_token_suffix(message);
     format!(
         "[{}] {}{}\n{}",
         message.role,
@@ -213,25 +211,25 @@ fn format_message_block(message: &SessionMessage) -> String {
 }
 
 fn render_message_content(message: &SessionMessage) -> String {
-    message
-        .content
-        .iter()
-        .map(render_content_block)
-        .collect::<Vec<_>>()
-        .join("\n")
+    render_content_blocks_with_options(
+        &message.content,
+        ContentRenderOptions {
+            include_tool_use_id: true,
+        },
+    )
 }
 
-fn render_content_block(block: &SessionContentBlock) -> String {
-    match block {
-        SessionContentBlock::Text { text } => text.clone(),
-        SessionContentBlock::ToolUse { id, name, input } => {
-            format!("[tool_use:{name}#{id}] {input}")
+fn format_token_suffix(message: &SessionMessage) -> String {
+    match (
+        message.total_token_count(),
+        message.input_token_count,
+        message.output_token_count,
+    ) {
+        (Some(total), Some(input), Some(output)) => {
+            format!(" | {total} tokens ({input} in / {output} out)")
         }
-        SessionContentBlock::ToolResult {
-            tool_use_id,
-            content,
-        } => format!("[tool_result:{tool_use_id}] {content}"),
-        SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
+        (Some(total), _, _) => format!(" | {total} tokens"),
+        (None, _, _) => String::new(),
     }
 }
 

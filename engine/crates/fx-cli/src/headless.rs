@@ -6,6 +6,7 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use futures::Stream;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
 use fx_api::engine::{
@@ -33,7 +34,7 @@ use fx_llm::CompletionProvider;
 use fx_llm::{
     valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
     ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
-    StreamCallback as ProviderStreamCallback,
+    StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 use fx_memory::SignalStore;
 use fx_session::{
@@ -42,10 +43,12 @@ use fx_session::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -332,7 +335,11 @@ where
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, ProviderError> {
-        self.inner.complete_stream(request).await
+        let stream = self.inner.complete_stream(request).await?;
+        Ok(Box::pin(RecordingCompletionStream::new(
+            stream,
+            self.collector.clone(),
+        )))
     }
 
     async fn stream(
@@ -346,6 +353,104 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct StreamedToolCallState {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    arguments_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamedCompletionState {
+    text: String,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+    tool_calls_by_index: HashMap<usize, StreamedToolCallState>,
+    id_to_index: HashMap<String, usize>,
+}
+
+impl StreamedCompletionState {
+    fn apply_chunk(&mut self, chunk: StreamChunk) {
+        if let Some(delta) = chunk.delta_content {
+            self.text.push_str(&delta);
+        }
+        self.usage = merge_stream_usage(self.usage, chunk.usage);
+        self.stop_reason = chunk.stop_reason.or(self.stop_reason.take());
+        self.apply_tool_deltas(chunk.tool_use_deltas);
+    }
+
+    fn apply_tool_deltas(&mut self, deltas: Vec<ToolUseDelta>) {
+        for (chunk_index, delta) in deltas.into_iter().enumerate() {
+            let index = streamed_tool_index(
+                chunk_index,
+                &delta,
+                &self.tool_calls_by_index,
+                &self.id_to_index,
+            );
+            let entry = self.tool_calls_by_index.entry(index).or_default();
+            merge_streamed_tool_delta(entry, delta, &mut self.id_to_index, index);
+        }
+    }
+
+    fn into_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text { text: self.text }],
+            tool_calls: finalize_streamed_tool_calls(self.tool_calls_by_index),
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        }
+    }
+}
+
+struct RecordingCompletionStream {
+    inner: CompletionStream,
+    collector: SessionTurnCollector,
+    state: StreamedCompletionState,
+    recorded: bool,
+}
+
+impl RecordingCompletionStream {
+    fn new(inner: CompletionStream, collector: SessionTurnCollector) -> Self {
+        Self {
+            inner,
+            collector,
+            state: StreamedCompletionState::default(),
+            recorded: false,
+        }
+    }
+
+    fn record_completed_response(&mut self) {
+        if self.recorded {
+            return;
+        }
+
+        let response = std::mem::take(&mut self.state).into_response();
+        self.collector.record_response(&response);
+        self.recorded = true;
+    }
+}
+
+impl Stream for RecordingCompletionStream {
+    type Item = Result<StreamChunk, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.state.apply_chunk(chunk.clone());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => {
+                this.record_completed_response();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct SessionTurnCollector {
     responses: Arc<Mutex<Vec<CompletionResponse>>>,
@@ -353,10 +458,27 @@ struct SessionTurnCollector {
     pending_tool_results: Arc<Mutex<Vec<SessionContentBlock>>>,
 }
 
+#[derive(Debug, Default)]
+struct SessionTurnSnapshot {
+    responses: Vec<CompletionResponse>,
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+}
+
+#[derive(Debug)]
+struct RecordedAssistantTurn {
+    message: SessionMessage,
+    has_tool_use: bool,
+}
+
 impl SessionTurnCollector {
     fn record_response(&self, response: &CompletionResponse) {
-        if let Ok(mut guard) = self.responses.lock() {
-            guard.push(response.clone());
+        match self.responses.lock() {
+            Ok(mut guard) => {
+                guard.push(response.clone());
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to record session turn response");
+            }
         }
     }
 
@@ -378,77 +500,14 @@ impl SessionTurnCollector {
     ) -> Vec<SessionMessage> {
         self.flush_pending_tool_results();
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut messages = vec![SessionMessage::structured(
-            SessionRecordRole::User,
-            user_message_blocks(user_text, images),
-            timestamp,
-            None,
-        )];
+        let timestamp = current_epoch_secs();
+        let mut messages = vec![user_session_message(user_text, images, timestamp)];
+        let assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
 
-        let responses = self
-            .responses
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let rounds = self
-            .tool_result_rounds
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let mut round_iter = rounds.into_iter();
-        let mut assistant_message_count = 0usize;
-
-        for response in responses {
-            if response.content.is_empty() {
-                continue;
-            }
-
-            let blocks = response
-                .content
-                .into_iter()
-                .map(SessionContentBlock::from)
-                .collect::<Vec<_>>();
-            let has_tool_use = blocks
-                .iter()
-                .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
-            let token_count = response
-                .usage
-                .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens));
-            messages.push(SessionMessage::structured(
-                SessionRecordRole::Assistant,
-                blocks,
-                timestamp,
-                token_count,
-            ));
-            assistant_message_count = assistant_message_count.saturating_add(1);
-
-            if has_tool_use {
-                if let Some(tool_results) = round_iter.next() {
-                    if !tool_results.is_empty() {
-                        messages.push(SessionMessage::structured(
-                            SessionRecordRole::Tool,
-                            tool_results,
-                            timestamp,
-                            None,
-                        ));
-                    }
-                }
-            }
-        }
-
-        if assistant_message_count == 0 {
-            messages.push(SessionMessage::structured(
-                SessionRecordRole::Assistant,
-                vec![SessionContentBlock::Text {
-                    text: fallback_response.to_string(),
-                }],
-                timestamp,
-                None,
-            ));
+        if assistant_messages.is_empty() {
+            messages.push(fallback_assistant_message(fallback_response, timestamp));
+        } else {
+            messages.extend(assistant_messages);
         }
 
         messages
@@ -463,8 +522,8 @@ impl SessionTurnCollector {
                 id,
                 output,
                 is_error,
-            } => {
-                if let Ok(mut guard) = self.pending_tool_results.lock() {
+            } => match self.pending_tool_results.lock() {
+                Ok(mut guard) => {
                     guard.push(SessionContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: serde_json::Value::String(if *is_error {
@@ -474,7 +533,10 @@ impl SessionTurnCollector {
                         }),
                     });
                 }
-            }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to record pending tool result");
+                }
+            },
             StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
                 self.flush_pending_tool_results();
             }
@@ -485,16 +547,317 @@ impl SessionTurnCollector {
     }
 
     fn flush_pending_tool_results(&self) {
-        let Ok(mut pending) = self.pending_tool_results.lock() else {
-            return;
+        let pending_blocks = match self.pending_tool_results.lock() {
+            Ok(mut pending) => {
+                if pending.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *pending)
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to flush pending tool results");
+                return;
+            }
         };
-        if pending.is_empty() {
-            return;
-        }
-        if let Ok(mut rounds) = self.tool_result_rounds.lock() {
-            rounds.push(std::mem::take(&mut *pending));
+
+        match self.tool_result_rounds.lock() {
+            Ok(mut rounds) => {
+                rounds.push(pending_blocks);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to store flushed tool results");
+                match self.pending_tool_results.lock() {
+                    Ok(mut pending) => pending.extend(pending_blocks),
+                    Err(recover_error) => {
+                        tracing::warn!(
+                            error = %recover_error,
+                            "failed to restore pending tool results after flush failure"
+                        );
+                    }
+                }
+            }
         }
     }
+
+    fn snapshot(&self) -> SessionTurnSnapshot {
+        SessionTurnSnapshot {
+            responses: self.snapshot_responses(),
+            tool_result_rounds: self.snapshot_tool_result_rounds(),
+        }
+    }
+
+    fn snapshot_responses(&self) -> Vec<CompletionResponse> {
+        match self.responses.lock() {
+            Ok(guard) => guard.clone(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to snapshot recorded session responses");
+                Vec::new()
+            }
+        }
+    }
+
+    fn snapshot_tool_result_rounds(&self) -> Vec<Vec<SessionContentBlock>> {
+        match self.tool_result_rounds.lock() {
+            Ok(guard) => guard.clone(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to snapshot recorded tool results");
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn user_session_message(
+    user_text: &str,
+    images: &[ImageAttachment],
+    timestamp: u64,
+) -> SessionMessage {
+    SessionMessage::structured(
+        SessionRecordRole::User,
+        user_message_blocks(user_text, images),
+        timestamp,
+        None,
+    )
+}
+
+fn fallback_assistant_message(fallback_response: &str, timestamp: u64) -> SessionMessage {
+    SessionMessage::structured(
+        SessionRecordRole::Assistant,
+        vec![SessionContentBlock::Text {
+            text: fallback_response.to_string(),
+        }],
+        timestamp,
+        None,
+    )
+}
+
+fn build_assistant_turn_messages(
+    snapshot: SessionTurnSnapshot,
+    timestamp: u64,
+) -> Vec<SessionMessage> {
+    let mut messages = Vec::new();
+    let mut tool_result_rounds = snapshot.tool_result_rounds.into_iter();
+
+    for response in snapshot.responses {
+        let Some(recorded_turn) = assistant_turn_from_response(response, timestamp) else {
+            continue;
+        };
+
+        messages.push(recorded_turn.message);
+        if recorded_turn.has_tool_use {
+            append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
+        }
+    }
+
+    messages
+}
+
+fn assistant_turn_from_response(
+    response: CompletionResponse,
+    timestamp: u64,
+) -> Option<RecordedAssistantTurn> {
+    let blocks = session_blocks_from_response(response.content, response.tool_calls);
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    Some(RecordedAssistantTurn {
+        message: SessionMessage::structured_with_usage(
+            SessionRecordRole::Assistant,
+            blocks,
+            timestamp,
+            response.usage,
+        ),
+        has_tool_use,
+    })
+}
+
+fn append_tool_result_round(
+    messages: &mut Vec<SessionMessage>,
+    tool_result_rounds: &mut impl Iterator<Item = Vec<SessionContentBlock>>,
+    timestamp: u64,
+) {
+    let Some(tool_results) = tool_result_rounds.next() else {
+        return;
+    };
+    if tool_results.is_empty() {
+        return;
+    }
+
+    messages.push(SessionMessage::structured(
+        SessionRecordRole::Tool,
+        tool_results,
+        timestamp,
+        None,
+    ));
+}
+
+fn session_blocks_from_response(
+    content: Vec<fx_llm::ContentBlock>,
+    tool_calls: Vec<ToolCall>,
+) -> Vec<SessionContentBlock> {
+    let mut blocks = content
+        .into_iter()
+        .filter_map(session_block_from_content)
+        .collect::<Vec<_>>();
+    blocks.extend(
+        tool_calls
+            .into_iter()
+            .map(|call| SessionContentBlock::ToolUse {
+                id: call.id,
+                name: call.name,
+                input: call.arguments,
+            }),
+    );
+    blocks
+}
+
+fn session_block_from_content(block: fx_llm::ContentBlock) -> Option<SessionContentBlock> {
+    match block {
+        fx_llm::ContentBlock::Text { text } if text.is_empty() => None,
+        other => Some(SessionContentBlock::from(other)),
+    }
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn merge_stream_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+
+    let left_in = left.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
+    let left_out = left.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+    let right_in = right.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
+    let right_out = right.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+
+    Some(Usage {
+        input_tokens: left_in.saturating_add(right_in),
+        output_tokens: left_out.saturating_add(right_out),
+    })
+}
+
+fn streamed_tool_index(
+    chunk_index: usize,
+    delta: &ToolUseDelta,
+    tool_calls_by_index: &HashMap<usize, StreamedToolCallState>,
+    id_to_index: &HashMap<String, usize>,
+) -> usize {
+    let Some(id) = delta.id.as_deref() else {
+        return chunk_index;
+    };
+
+    if let Some(index) = id_to_index.get(id).copied() {
+        return index;
+    }
+
+    if streamed_chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+        return chunk_index;
+    }
+
+    next_streamed_tool_index(tool_calls_by_index)
+}
+
+fn streamed_chunk_index_usable_for_id(
+    chunk_index: usize,
+    id: &str,
+    tool_calls_by_index: &HashMap<usize, StreamedToolCallState>,
+) -> bool {
+    match tool_calls_by_index.get(&chunk_index) {
+        None => true,
+        Some(state) => match state.id.as_deref() {
+            None => true,
+            Some(existing_id) => existing_id == id,
+        },
+    }
+}
+
+fn next_streamed_tool_index(tool_calls_by_index: &HashMap<usize, StreamedToolCallState>) -> usize {
+    tool_calls_by_index
+        .keys()
+        .copied()
+        .max()
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn merge_streamed_tool_delta(
+    entry: &mut StreamedToolCallState,
+    delta: ToolUseDelta,
+    id_to_index: &mut HashMap<String, usize>,
+    index: usize,
+) {
+    if entry.id.is_none() {
+        entry.id = delta.id;
+    }
+    if entry.name.is_none() {
+        entry.name = delta.name;
+    }
+    if let Some(id) = entry.id.clone() {
+        id_to_index.insert(id, index);
+    }
+    if let Some(arguments_delta) = delta.arguments_delta {
+        merge_streamed_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
+    }
+    entry.arguments_done |= delta.arguments_done;
+}
+
+fn merge_streamed_arguments(arguments: &mut String, arguments_delta: &str, arguments_done: bool) {
+    if arguments_delta.is_empty() {
+        return;
+    }
+
+    let done_payload_is_complete = arguments_done
+        && !arguments.is_empty()
+        && serde_json::from_str::<serde_json::Value>(arguments_delta).is_ok();
+    if done_payload_is_complete {
+        arguments.clear();
+    }
+
+    arguments.push_str(arguments_delta);
+}
+
+fn finalize_streamed_tool_calls(by_index: HashMap<usize, StreamedToolCallState>) -> Vec<ToolCall> {
+    let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
+    indexed_calls.sort_by_key(|(index, _)| *index);
+    indexed_calls
+        .into_iter()
+        .filter_map(|(_, state)| streamed_tool_call_from_state(state))
+        .collect()
+}
+
+fn streamed_tool_call_from_state(state: StreamedToolCallState) -> Option<ToolCall> {
+    if !state.arguments_done {
+        return None;
+    }
+
+    let id = state.id?.trim().to_string();
+    let name = state.name?.trim().to_string();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    let raw_arguments = if state.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        state.arguments.trim()
+    };
+
+    serde_json::from_str(raw_arguments)
+        .ok()
+        .map(|arguments| ToolCall {
+            id,
+            name,
+            arguments,
+        })
 }
 
 #[derive(Debug)]
@@ -1264,7 +1627,7 @@ impl HeadlessApp {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
         self.finalize_cycle_with_turn_messages(input, &[], result, None)
     }
@@ -1312,13 +1675,17 @@ impl HeadlessApp {
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error> {
         self.last_session_messages.clear();
-        self.clear_startup_warnings();
         let callback = callback.map(headless_stream_callback);
+        let should_emit_startup_warnings = callback.is_some();
         let collector = SessionTurnCollector::default();
         let combined_callback = collector.callback(callback);
         // Set permission prompt callback for this cycle so SSE events fire
         self.set_permission_callback(Some(Arc::clone(&combined_callback)));
-        self.emit_startup_warnings(Some(&combined_callback));
+        if should_emit_startup_warnings {
+            self.emit_startup_warnings(Some(&combined_callback));
+        } else {
+            self.clear_startup_warnings();
+        }
         self.update_memory_context(input);
         let snapshot = if images.is_empty() {
             self.build_perception_snapshot(input, source)
@@ -1439,7 +1806,7 @@ impl HeadlessApp {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn record_turn(&mut self, user_text: &str, assistant_text: &str) {
         self.record_session_turn_messages(text_turn_messages(user_text, assistant_text));
     }
@@ -1489,10 +1856,7 @@ fn user_message_blocks(user_text: &str, images: &[ImageAttachment]) -> Vec<Sessi
 }
 
 fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessage> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = current_epoch_secs();
     vec![
         SessionMessage::structured(
             SessionRecordRole::User,
@@ -3114,7 +3478,11 @@ mod tests {
         assert_eq!(messages[2].role, SessionRecordRole::Tool);
         assert_eq!(messages[3].role, SessionRecordRole::Assistant);
         assert_eq!(messages[1].token_count, Some(15));
+        assert_eq!(messages[1].input_token_count, Some(10));
+        assert_eq!(messages[1].output_token_count, Some(5));
         assert_eq!(messages[3].token_count, Some(10));
+        assert_eq!(messages[3].input_token_count, Some(7));
+        assert_eq!(messages[3].output_token_count, Some(3));
         assert!(messages[1].content.iter().any(
             |block| matches!(block, SessionContentBlock::ToolUse { id, .. } if id == "call_1")
         ));
@@ -3124,6 +3492,46 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
         );
+    }
+
+    #[test]
+    fn session_turn_collector_uses_tool_calls_when_response_content_is_empty() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: String::new(),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_2".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "rust"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_2".to_string(),
+            output: "results".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn("search rust", &[], "fallback");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(12));
+        assert!(messages[1].content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ToolUse { id, name, .. } if id == "call_2" && name == "search"
+        )));
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert!(messages[2].content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
+        )));
     }
 
     fn test_router() -> SharedModelRouter {
@@ -4078,10 +4486,18 @@ mod tests {
         };
 
         let result = app.process_message("hello").await.expect("process message");
+        let session_messages = app.take_last_session_messages();
+        let assistant_message = session_messages
+            .iter()
+            .find(|message| message.role == SessionRecordRole::Assistant)
+            .expect("assistant session message should be recorded");
 
         assert_eq!(result.model, "mock-model");
         assert!(result.iterations > 0);
         assert!(result.tokens_used.total_tokens() >= mock_completion_usage_total());
+        assert_eq!(assistant_message.token_count, Some(5));
+        assert_eq!(assistant_message.input_token_count, Some(3));
+        assert_eq!(assistant_message.output_token_count, Some(2));
     }
 
     #[tokio::test]

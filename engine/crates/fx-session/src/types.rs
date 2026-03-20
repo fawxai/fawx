@@ -218,6 +218,46 @@ mod tests {
         assert_eq!(MessageRole::Tool.to_string(), "tool");
     }
 
+    #[test]
+    fn message_role_converts_into_llm_role() {
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::User),
+            fx_llm::MessageRole::User
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::Assistant),
+            fx_llm::MessageRole::Assistant
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::System),
+            fx_llm::MessageRole::System
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::Tool),
+            fx_llm::MessageRole::Tool
+        );
+    }
+
+    #[test]
+    fn message_role_converts_from_llm_role() {
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::User),
+            MessageRole::User
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::Assistant),
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::System),
+            MessageRole::System
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::Tool),
+            MessageRole::Tool
+        );
+    }
+
     /// Regression test: the inner field of `SessionKey` must not be
     /// directly constructible from outside the crate, which would allow
     /// bypassing `SessionKey::new()` validation (e.g., empty keys).

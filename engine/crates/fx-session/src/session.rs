@@ -3,7 +3,7 @@
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
 };
-use fx_llm::{ContentBlock, Message};
+use fx_llm::{ContentBlock, Message, Usage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,6 +78,12 @@ pub struct SessionMessage {
     /// Tokens consumed to produce this message, when known.
     #[serde(default)]
     pub token_count: Option<u32>,
+    /// Input tokens consumed by prompt/context, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_count: Option<u32>,
+    /// Output tokens produced by generation, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_count: Option<u32>,
 }
 
 impl SessionMessage {
@@ -90,6 +96,8 @@ impl SessionMessage {
             }],
             timestamp,
             token_count: None,
+            input_token_count: None,
+            output_token_count: None,
         }
     }
 
@@ -105,6 +113,25 @@ impl SessionMessage {
             content,
             timestamp,
             token_count,
+            input_token_count: None,
+            output_token_count: None,
+        }
+    }
+
+    /// Build a structured session message with split token accounting.
+    pub fn structured_with_usage(
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        timestamp: u64,
+        usage: Option<Usage>,
+    ) -> Self {
+        Self {
+            role,
+            content,
+            timestamp,
+            token_count: usage.map(total_token_count),
+            input_token_count: usage.map(|usage| usage.input_tokens),
+            output_token_count: usage.map(|usage| usage.output_tokens),
         }
     }
 
@@ -120,6 +147,22 @@ impl SessionMessage {
     pub fn render_text(&self) -> String {
         render_content_blocks(&self.content)
     }
+
+    /// Return the combined token count when available.
+    pub fn total_token_count(&self) -> Option<u32> {
+        self.token_count.or_else(|| {
+            Some(
+                self.input_token_count?
+                    .saturating_add(self.output_token_count?),
+            )
+        })
+    }
+}
+
+/// Formatting controls for rendered session content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentRenderOptions {
+    pub include_tool_use_id: bool,
 }
 
 /// Persistent session state: metadata + conversation history.
@@ -254,19 +297,34 @@ where
     }
 }
 
-fn render_content_blocks(blocks: &[SessionContentBlock]) -> String {
+pub fn render_content_blocks(blocks: &[SessionContentBlock]) -> String {
+    render_content_blocks_with_options(blocks, ContentRenderOptions::default())
+}
+
+/// Render structured content blocks into readable text with configurable formatting.
+pub fn render_content_blocks_with_options(
+    blocks: &[SessionContentBlock],
+    options: ContentRenderOptions,
+) -> String {
     blocks
         .iter()
-        .map(render_content_block)
+        .map(|block| render_content_block_with_options(block, options))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn render_content_block(block: &SessionContentBlock) -> String {
+fn render_content_block_with_options(
+    block: &SessionContentBlock,
+    options: ContentRenderOptions,
+) -> String {
     match block {
         SessionContentBlock::Text { text } => text.clone(),
-        SessionContentBlock::ToolUse { name, input, .. } => {
-            format!("[tool_use:{name}] {input}")
+        SessionContentBlock::ToolUse { id, name, input } => {
+            if options.include_tool_use_id {
+                format!("[tool_use:{name}#{id}] {input}")
+            } else {
+                format!("[tool_use:{name}] {input}")
+            }
         }
         SessionContentBlock::ToolResult {
             tool_use_id,
@@ -274,6 +332,10 @@ fn render_content_block(block: &SessionContentBlock) -> String {
         } => format!("[tool_result:{tool_use_id}] {content}"),
         SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
     }
+}
+
+fn total_token_count(usage: Usage) -> u32 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -459,7 +521,7 @@ mod tests {
 
     #[test]
     fn session_message_round_trips_mixed_structured_content() {
-        let message = SessionMessage::structured(
+        let message = SessionMessage::structured_with_usage(
             MessageRole::Assistant,
             vec![
                 SessionContentBlock::Text {
@@ -475,13 +537,86 @@ mod tests {
                 },
             ],
             123,
-            Some(42),
+            Some(Usage {
+                input_tokens: 17,
+                output_tokens: 25,
+            }),
         );
 
         let json = serde_json::to_string(&message).expect("serialize");
         let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(restored, message);
+    }
+
+    #[test]
+    fn session_message_to_llm_message_preserves_structured_content() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                },
+                SessionContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                },
+            ],
+            123,
+            Some(5),
+        );
+
+        let llm_message = message.to_llm_message();
+
+        assert_eq!(llm_message.role, MessageRole::Assistant.into());
+        assert_eq!(
+            llm_message.content,
+            vec![
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                },
+                ContentBlock::Text {
+                    text: "[image:image/png]".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extend_messages_appends_messages_and_updates_timestamp() {
+        let mut session = Session::new(
+            SessionKey::new("extend").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        session.updated_at = 0;
+
+        session.extend_messages([
+            SessionMessage::text(MessageRole::User, "first", 1),
+            SessionMessage::text(MessageRole::Assistant, "second", 2),
+        ]);
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].render_text(), "first");
+        assert_eq!(session.messages[1].render_text(), "second");
+        assert!(session.updated_at > 0);
     }
 
     #[test]
@@ -550,22 +685,29 @@ mod tests {
 
     #[test]
     fn token_count_round_trips_and_defaults_for_legacy_messages() {
-        let message = SessionMessage::structured(
+        let message = SessionMessage::structured_with_usage(
             MessageRole::Assistant,
             vec![SessionContentBlock::Text {
                 text: "usage".to_string(),
             }],
             123,
-            Some(99),
+            Some(Usage {
+                input_tokens: 44,
+                output_tokens: 55,
+            }),
         );
 
         let json = serde_json::to_string(&message).expect("serialize");
         let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.token_count, Some(99));
+        assert_eq!(restored.input_token_count, Some(44));
+        assert_eq!(restored.output_token_count, Some(55));
 
         let legacy: SessionMessage =
             serde_json::from_str(r#"{"role":"assistant","content":"old","timestamp":1}"#)
                 .expect("legacy deserialize");
         assert_eq!(legacy.token_count, None);
+        assert_eq!(legacy.input_token_count, None);
+        assert_eq!(legacy.output_token_count, None);
     }
 }
