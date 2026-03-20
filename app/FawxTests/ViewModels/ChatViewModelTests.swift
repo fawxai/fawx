@@ -54,6 +54,37 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(sut.transcriptItems.isEmpty)
     }
 
+    func testDraftMessageIsScopedPerSession() {
+        let sut = makeSUT()
+
+        sut.prepareToDisplaySession("session-a")
+        sut.draftMessage = "draft-a"
+
+        sut.prepareToDisplaySession("session-b")
+        XCTAssertEqual(sut.draftMessage, "")
+
+        sut.draftMessage = "draft-b"
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.draftMessage, "draft-a")
+
+        sut.prepareToDisplaySession("session-b")
+        XCTAssertEqual(sut.draftMessage, "draft-b")
+    }
+
+    func testDraftMessagePersistsForNilSessionSelection() {
+        let sut = makeSUT()
+
+        sut.prepareToDisplaySession(nil)
+        sut.draftMessage = "new-session-draft"
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.draftMessage, "")
+
+        sut.prepareToDisplaySession(nil)
+        XCTAssertEqual(sut.draftMessage, "new-session-draft")
+    }
+
     func testHandleStreamErrorOnlySurfacesForVisibleSession() {
         let sut = makeSUT()
 
@@ -234,6 +265,70 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(sut.transcriptItems.isEmpty)
     }
 
+    func testQueuedMessageIsOnlyVisibleForItsOriginatingSession() {
+        let sut = makeSUT(connectionStatus: .connected)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.draftMessage = "follow up"
+
+        sut.sendDraft()
+
+        XCTAssertEqual(sut.draftMessage, "")
+        XCTAssertEqual(sut.queuedMessage, "follow up")
+
+        sut.prepareToDisplaySession("session-b")
+        XCTAssertNil(sut.queuedMessage)
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.queuedMessage, "follow up")
+    }
+
+    func testQueuedMessageDeliveryTargetsFinishedStreamingSession() {
+        let sut = makeSUT(connectionStatus: .connected)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.draftMessage = "follow up"
+        sut.sendDraft()
+
+        sut.prepareToDisplaySession("session-b")
+
+        let delivery = sut.consumeQueuedMessageForTesting(finishedSessionID: "session-a")
+
+        XCTAssertEqual(delivery?.text, "follow up")
+        XCTAssertEqual(delivery?.sessionID, "session-a")
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertNil(sut.queuedMessage)
+    }
+
+    func testQueuedMessageDeliveryDiscardsOnSessionMismatch() {
+        let sut = makeSUT(connectionStatus: .connected)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.draftMessage = "follow up"
+        sut.sendDraft()
+
+        let delivery = sut.consumeQueuedMessageForTesting(finishedSessionID: "session-c")
+
+        XCTAssertNil(delivery)
+        XCTAssertNil(sut.queuedMessage)
+    }
+
     func testInvalidateSessionRemovesCacheAndClearsVisibleTranscriptForCurrentSession() {
         let sut = makeSUT()
         let message = SessionMessage(role: .assistant, content: "cached", timestamp: 1)
@@ -247,6 +342,17 @@ final class ChatViewModelTests: XCTestCase {
 
         XCTAssertNil(sut.cachedMessages(for: "session-a"))
         XCTAssertTrue(sut.transcriptItems.isEmpty)
+    }
+
+    func testInvalidateSessionClearsDraftForSession() {
+        let sut = makeSUT()
+
+        sut.prepareToDisplaySession("session-a")
+        sut.draftMessage = "stale draft"
+
+        sut.invalidateSession("session-a")
+
+        XCTAssertEqual(sut.draftMessage, "")
     }
 
     func testInvalidateSessionDoesNotAffectOtherVisibleSession() {
@@ -307,8 +413,9 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
     }
 
-    private func makeSUT() -> ChatViewModel {
-        let appState = AppState()
+    private func makeSUT(connectionStatus: ConnectionStatus = .disconnected) -> ChatViewModel {
+        let appState = AppState(startLoadingPersistedState: false)
+        appState.connectionStatus = connectionStatus
         let sessionViewModel = SessionViewModel(appState: appState)
         return ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
     }

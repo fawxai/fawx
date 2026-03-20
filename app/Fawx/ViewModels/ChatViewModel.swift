@@ -193,8 +193,8 @@ final class ChatViewModel {
     static let maxCachedSessions = 10
 
     var transcriptItems: [ChatTranscriptItem] = []
-    var draftMessage = ""
-    var queuedMessage: String?
+    private var draftsBySession: [String: String] = [:]
+    private var queuedMessageText: String?
     var isLoadingHistory = false
     var isStreaming = false
     var streamingText = ""
@@ -208,6 +208,7 @@ final class ChatViewModel {
     private let appState: AppState
     private let sessionViewModel: SessionViewModel
     private var currentSessionID: String?
+    private var queuedMessageSessionID: String?
     private var streamingSessionID: String?
     private var streamTask: Task<Void, Never>?
     private var retryRequest: RetryRequest?
@@ -225,6 +226,26 @@ final class ChatViewModel {
     init(appState: AppState, sessionViewModel: SessionViewModel) {
         self.appState = appState
         self.sessionViewModel = sessionViewModel
+    }
+
+    var draftMessage: String {
+        get { draftsBySession[draftStorageKey(for: currentSessionID)] ?? "" }
+        set {
+            let key = draftStorageKey(for: currentSessionID)
+            if newValue.isEmpty {
+                draftsBySession.removeValue(forKey: key)
+            } else {
+                draftsBySession[key] = newValue
+            }
+        }
+    }
+
+    var queuedMessage: String? {
+        guard queuedMessageSessionID == currentSessionID else {
+            return nil
+        }
+
+        return queuedMessageText
     }
 
     var activeStreamSessionID: String? {
@@ -297,6 +318,7 @@ final class ChatViewModel {
 
     func invalidateSession(_ sessionID: String) {
         removeCachedMessages(for: sessionID)
+        draftsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
 
         if currentSessionID == sessionID {
             transcriptItems = []
@@ -534,7 +556,8 @@ final class ChatViewModel {
         draftMessage = ""
 
         if isStreaming {
-            queuedMessage = trimmed
+            queuedMessageText = trimmed
+            queuedMessageSessionID = currentSessionID
             return
         }
 
@@ -555,7 +578,7 @@ final class ChatViewModel {
     }
 
     func dismissQueuedMessage() {
-        queuedMessage = nil
+        clearQueuedMessage()
     }
 
     func stopStreaming() {
@@ -567,7 +590,7 @@ final class ChatViewModel {
     func cleanup() {
         stopStreaming()
         resetStreamingState()
-        queuedMessage = nil
+        clearQueuedMessage()
     }
 
     func updateStreamingDistanceFromBottom(_ distanceFromBottom: CGFloat) {
@@ -722,7 +745,7 @@ final class ChatViewModel {
             await appState.refreshContext(for: sessionID)
         }
         await sessionViewModel.refresh()
-        await sendQueuedMessageIfNeeded()
+        await sendQueuedMessageIfNeeded(finishedSessionID: sessionID)
     }
 
     private func finalizeCancellation(timestamp: Int, sessionID: String) async {
@@ -763,7 +786,7 @@ final class ChatViewModel {
                 await appState.refreshContext(for: sessionID)
             }
             await sessionViewModel.refresh()
-            await sendQueuedMessageIfNeeded()
+            await sendQueuedMessageIfNeeded(finishedSessionID: sessionID)
             return true
         } catch {
             await appState.noteRecoverableRequestFailure(error)
@@ -771,17 +794,12 @@ final class ChatViewModel {
         }
     }
 
-    private func sendQueuedMessageIfNeeded() async {
-        guard let queued = queuedMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !queued.isEmpty else {
-            queuedMessage = nil
-            return
-        }
-        guard appState.connectionStatus == .connected else {
+    private func sendQueuedMessageIfNeeded(finishedSessionID: String) async {
+        guard let queuedDelivery = consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID) else {
             return
         }
 
-        queuedMessage = nil
-        await send(queued)
+        await send(queuedDelivery.text, forceSessionID: queuedDelivery.sessionID)
     }
 
     private func resetStreamingState() {
@@ -792,6 +810,36 @@ final class ChatViewModel {
         streamingSessionID = nil
         currentPhase = nil
         anonymousToolCallCounter = 0
+    }
+
+    private func draftStorageKey(for sessionID: String?) -> String {
+        sessionID ?? ""
+    }
+
+    private func clearQueuedMessage() {
+        queuedMessageText = nil
+        queuedMessageSessionID = nil
+    }
+
+    private func consumeQueuedMessageIfReady(
+        finishedSessionID: String
+    ) -> (text: String, sessionID: String?)? {
+        guard let queued = queuedMessageText?.trimmingCharacters(in: .whitespacesAndNewlines), !queued.isEmpty else {
+            clearQueuedMessage()
+            return nil
+        }
+        guard appState.connectionStatus == .connected else {
+            return nil
+        }
+
+        let targetSessionID = queuedMessageSessionID
+        clearQueuedMessage()
+
+        guard targetSessionID == finishedSessionID else {
+            return nil
+        }
+
+        return (queued, targetSessionID)
     }
 
     func respondToPermissionPrompt(_ decision: PermissionPromptDecision) {
@@ -1176,6 +1224,19 @@ extension ChatViewModel {
 
     var isPinnedToBottomForTesting: Bool {
         streamingDisplayController.isPinnedToBottom
+    }
+
+    func consumeQueuedMessageForTesting(
+        finishedSessionID: String,
+        connectionStatus: ConnectionStatus = .connected
+    ) -> (text: String, sessionID: String?)? {
+        let previousConnectionStatus = appState.connectionStatus
+        appState.connectionStatus = connectionStatus
+        defer {
+            appState.connectionStatus = previousConnectionStatus
+        }
+
+        return consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID)
     }
 }
 #endif
