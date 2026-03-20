@@ -110,6 +110,12 @@ enum Commands {
     /// Inspect persistent log files
     Logs(commands::logs::LogsArgs),
 
+    /// Inspect conversation sessions
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommands,
+    },
+
     /// Run Fawx-specific security checks
     SecurityAudit(commands::security_audit::SecurityAuditArgs),
 
@@ -333,6 +339,15 @@ enum SkillCommands {
         #[arg(long)]
         path: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionsCommands {
+    /// List all sessions
+    List(commands::sessions::ListArgs),
+
+    /// Export full conversation from a session
+    Export(commands::sessions::ExportArgs),
 }
 
 #[derive(Subcommand)]
@@ -929,6 +944,13 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     }
 }
 
+fn dispatch_sessions(command: SessionsCommands) -> anyhow::Result<i32> {
+    match command {
+        SessionsCommands::List(args) => commands::sessions::run_list(&args),
+        SessionsCommands::Export(args) => commands::sessions::run_export(&args),
+    }
+}
+
 fn dispatch_tailscale(command: TailscaleCommands) -> anyhow::Result<i32> {
     match command {
         TailscaleCommands::Cert { hostname } => {
@@ -974,6 +996,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Devices(args) => Ok(commands::devices::run(&args).await?),
         Commands::Version => Ok(commands::version::run()),
         Commands::Logs(args) => commands::logs::run(&args),
+        Commands::Sessions { command } => dispatch_sessions(command),
         Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
         Commands::Backup(args) => commands::backup::run(&args),
         Commands::Bootstrap {
@@ -1111,7 +1134,7 @@ mod tests {
     use super::{
         dispatch_command, ensure_headless_chat_model_available, fawx_tui_binary_name,
         find_fawx_tui_binary_from, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
-        SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        SessionsCommands, SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1431,6 +1454,30 @@ mod tests {
                 lines: 100,
                 list: false
             }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sessions_list_command() {
+        let cli = Cli::parse_from(["fawx", "sessions", "list", "--json", "--kind", "subagent"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionsCommands::List(crate::commands::sessions::ListArgs { json: true, kind })
+            }) if kind.as_deref() == Some("subagent")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sessions_export_command() {
+        let cli = Cli::parse_from([
+            "fawx", "sessions", "export", "sess-123", "--json", "--limit", "5",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionsCommands::Export(crate::commands::sessions::ExportArgs { id, json: true, limit: Some(5) })
+            }) if id == "sess-123"
         ));
     }
 
