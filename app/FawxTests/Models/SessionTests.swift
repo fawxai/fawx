@@ -111,7 +111,7 @@ final class SessionTests: XCTestCase {
     }
 }
 
-final class IOSViewSourceRegressionTests: XCTestCase {
+final class ViewSourceRegressionTests: XCTestCase {
     func testSessionListViewDoesNotDuplicateSessionRowForSplitLayout() throws {
         let source = try sourceFile(at: "app/Fawx/Views/iOS/SessionListView.swift")
         let sessionRowSource = try snippet(
@@ -149,6 +149,15 @@ final class IOSViewSourceRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.permissions)"))
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.synthesis)"))
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.usage)"))
+    }
+
+    func testMacOSContentViewPinsSidebarColumnWidthForChatLayout() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/macOS/ContentView.swift")
+
+        XCTAssertTrue(source.contains(".navigationSplitViewColumnWidth("))
+        XCTAssertTrue(source.contains("min: Layout.sidebarMinWidth"))
+        XCTAssertTrue(source.contains("ideal: Layout.sidebarIdealWidth"))
+        XCTAssertTrue(source.contains("max: Layout.sidebarMaxWidth"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {
