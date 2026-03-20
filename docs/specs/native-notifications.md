@@ -159,6 +159,26 @@ func send(title: String, body: String) async {
 
 Call `NotificationService.shared.requestPermission()` during the setup wizard's Ready step, or on first app launch after setup. One-time prompt. If denied, notifications silently no-op (no error to the agent).
 
+### 6. Kernel context (system prompt)
+
+The agent needs to know the `notify` tool exists and when to use it. Add to `REASONING_SYSTEM_PROMPT` in `engine/crates/fx-kernel/src/loop_engine.rs`:
+
+```
+You have a `notify` tool that sends native OS notifications to the user. Use it when:
+- You complete a task that took multiple steps (experiments, code generation, long analysis)
+- You have important results to share and the user may not be watching
+- You finish background work the user is waiting for
+
+Do NOT use it for:
+- Simple one-turn responses the user is actively reading
+- Trivial acknowledgements ("Got it", "Done")
+- Every tool call completion
+
+If you don't call `notify`, a generic notification fires automatically for multi-step tasks when the app isn't in focus. Prefer calling it yourself with a meaningful summary.
+```
+
+This goes after the existing system prompt text, before memory/scratchpad context is appended.
+
 ## Files to create/change
 
 | File | Change |
@@ -171,7 +191,7 @@ Call `NotificationService.shared.requestPermission()` during the setup wizard's 
 | `app/Fawx/Services/NotificationService.swift` | New: UNUserNotificationCenter wrapper |
 | `app/Fawx/Services/StreamingService.swift` | Handle `notification` SSE event |
 | `app/Fawx/Views/Shared/SetupWizard/ReadyStep.swift` | Request notification permission |
-| `engine/crates/fx-kernel/src/loop_engine.rs` | Automatic fallback after cycle completion |
+| `engine/crates/fx-kernel/src/loop_engine.rs` | Automatic fallback after cycle completion + `notify` guidance in `REASONING_SYSTEM_PROMPT` |
 
 ## Tests required
 
