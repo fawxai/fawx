@@ -65,7 +65,12 @@ final class MenuBarManager: NSObject {
         }
 
         let snapshot = snapshot()
-        button.image = nil
+        if let icon = NSImage(named: "MenuBarIcon") {
+            icon.isTemplate = true
+            icon.size = NSSize(width: 18, height: 18)
+            button.image = icon
+            button.imagePosition = .imageLeading
+        }
         button.attributedTitle = statusItemTitle(snapshot: snapshot)
         button.toolTip = "\(snapshot.title)\n\(snapshot.detail)"
     }
