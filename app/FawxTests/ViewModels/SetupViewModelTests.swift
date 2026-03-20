@@ -10,7 +10,7 @@ final class SetupViewModelTests: XCTestCase {
 
         let sut = SetupViewModel(
             appState: appState,
-            completeLocalSetupAction: { progress in
+            completeLocalSetupAction: { _, progress in
                 bootstrapCallCount += 1
                 progress("Starting Fawx server...")
                 try await appState.savePairing(
@@ -46,7 +46,7 @@ final class SetupViewModelTests: XCTestCase {
 
         let sut = SetupViewModel(
             appState: appState,
-            completeLocalSetupAction: { _ in
+            completeLocalSetupAction: { _, _ in
                 bootstrapCallCount += 1
             },
             refreshPhase4StateAction: {
@@ -76,7 +76,7 @@ final class SetupViewModelTests: XCTestCase {
 
         let sut = SetupViewModel(
             appState: appState,
-            completeLocalSetupAction: { _ in
+            completeLocalSetupAction: { _, _ in
                 throw TestError()
             },
             refreshPhase4StateAction: {
