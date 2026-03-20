@@ -3,7 +3,9 @@ import SwiftUI
 
 struct Sidebar: View {
     @Environment(\.colorScheme) private var colorScheme
+#if os(macOS)
     @Environment(\.controlActiveState) private var controlActiveState
+#endif
 
     @Bindable var sessionViewModel: SessionViewModel
     let selection: SidebarSelection?
@@ -102,7 +104,15 @@ struct Sidebar: View {
     }
 
     private var shouldUseActiveLightSessionIconColor: Bool {
-        colorScheme == .light && controlActiveState == .key && isSelectingSessions == false
+        guard colorScheme == .light, isSelectingSessions == false else {
+            return false
+        }
+
+#if os(macOS)
+        return controlActiveState == .key
+#else
+        return true
+#endif
     }
 
     @ViewBuilder
