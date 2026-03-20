@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Fawx
 
@@ -367,6 +368,90 @@ final class AppStateTests: XCTestCase {
         XCTAssertNotNil(sut.activeRipcordStatus)
     }
 
+    @MainActor
+    func testGitPanelPresentationShowRestoresSidebarSelectionToActiveSession() {
+        let context = makeGitPanelPresentationContext()
+        let session = makeSession(id: "session-a", updatedAt: 10)
+        let isShowingGitPanel = BoolBox(false)
+
+        context.sessionViewModel.upsert(session)
+        context.sessionViewModel.select(session.id)
+        context.appState.sidebarSelection = .settings
+
+        GitPanelPresentation.show(
+            showGitPanel: gitPanelBinding(for: isShowingGitPanel),
+            selectedSessionID: nil,
+            appState: context.appState,
+            sessionViewModel: context.sessionViewModel,
+            chatViewModel: context.chatViewModel
+        )
+
+        XCTAssertTrue(isShowingGitPanel.value)
+        XCTAssertEqual(context.appState.sidebarSelection, .session(session.id))
+        XCTAssertEqual(context.sessionViewModel.selectedSessionID, session.id)
+        XCTAssertTrue(context.chatViewModel.isLoadingHistory)
+    }
+
+    @MainActor
+    func testGitPanelPresentationShowClearsSelectionWhenNoSessionIsAvailable() {
+        let context = makeGitPanelPresentationContext()
+        let isShowingGitPanel = BoolBox(false)
+
+        context.appState.sidebarSelection = .skills
+        context.sessionViewModel.select(nil)
+
+        GitPanelPresentation.show(
+            showGitPanel: gitPanelBinding(for: isShowingGitPanel),
+            selectedSessionID: nil,
+            appState: context.appState,
+            sessionViewModel: context.sessionViewModel,
+            chatViewModel: context.chatViewModel
+        )
+
+        XCTAssertTrue(isShowingGitPanel.value)
+        XCTAssertNil(context.appState.sidebarSelection)
+        XCTAssertNil(context.sessionViewModel.selectedSessionID)
+        XCTAssertFalse(context.chatViewModel.isLoadingHistory)
+        XCTAssertTrue(context.chatViewModel.transcriptItems.isEmpty)
+    }
+
+    @MainActor
+    func testGitPanelPresentationToggleShowsThenHidesPanel() {
+        let context = makeGitPanelPresentationContext()
+        let session = makeSession(id: "session-a", updatedAt: 20)
+        let isShowingGitPanel = BoolBox(false)
+
+        context.sessionViewModel.upsert(session)
+        context.sessionViewModel.select(session.id)
+
+        GitPanelPresentation.toggle(
+            showGitPanel: gitPanelBinding(for: isShowingGitPanel),
+            selectedSessionID: session.id,
+            appState: context.appState,
+            sessionViewModel: context.sessionViewModel,
+            chatViewModel: context.chatViewModel
+        )
+        XCTAssertTrue(isShowingGitPanel.value)
+
+        GitPanelPresentation.toggle(
+            showGitPanel: gitPanelBinding(for: isShowingGitPanel),
+            selectedSessionID: session.id,
+            appState: context.appState,
+            sessionViewModel: context.sessionViewModel,
+            chatViewModel: context.chatViewModel
+        )
+        XCTAssertFalse(isShowingGitPanel.value)
+    }
+
+    @MainActor
+    func testGitPanelPresentationHideClearsBinding() {
+        let isShowingGitPanel = BoolBox(true)
+
+        GitPanelPresentation.hide(showGitPanel: gitPanelBinding(for: isShowingGitPanel))
+
+        XCTAssertFalse(isShowingGitPanel.value)
+    }
+
 #if os(macOS)
     func testAwaitPersistedStateLoadDoesNotOverwriteReturnToLocalSetup() async {
         let defaultsSuiteName = uniqueDefaultsSuiteName()
@@ -413,6 +498,46 @@ final class AppStateTests: XCTestCase {
 
     private func uniqueKeychainService() -> String {
         "ai.fawx.app.tests.\(UUID().uuidString)"
+    }
+
+    @MainActor
+    private func makeGitPanelPresentationContext()
+        -> (appState: AppState, sessionViewModel: SessionViewModel, chatViewModel: ChatViewModel)
+    {
+        let appState = AppState(startLoadingPersistedState: false)
+        let sessionViewModel = SessionViewModel(appState: appState)
+        let chatViewModel = ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
+        return (appState, sessionViewModel, chatViewModel)
+    }
+
+    private func makeSession(id: String, updatedAt: Int) -> Session {
+        Session(
+            key: id,
+            kind: .main,
+            status: .idle,
+            label: nil,
+            title: "Session \(id)",
+            preview: nil,
+            model: "gpt-5.4",
+            createdAt: updatedAt,
+            updatedAt: updatedAt,
+            messageCount: 0
+        )
+    }
+
+    private func gitPanelBinding(for box: BoolBox) -> Binding<Bool> {
+        Binding(
+            get: { box.value },
+            set: { box.value = $0 }
+        )
+    }
+}
+
+private final class BoolBox {
+    var value: Bool
+
+    init(_ value: Bool) {
+        self.value = value
     }
 }
 

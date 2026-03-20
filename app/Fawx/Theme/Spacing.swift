@@ -9,13 +9,16 @@ enum FawxSpacing {
     static let cornerRadiusSM: CGFloat = 4
     static let cornerRadius: CGFloat = 8
     static let sidebarWidth: CGFloat = 260
+    static let messageWidthRatio: CGFloat = 0.85
     static let ripcordNotificationMaxWidth: CGFloat = 320
+    static let ripcordReviewTrayMaxWidth: CGFloat = 520
     static let placeholderCopyMaxWidth: CGFloat = 320
     static let inputBarMinHeight: CGFloat = 48
     static let inputBarMaxHeight: CGFloat = 200
+    static let transcriptEdgeClamp: CGFloat = 48
 
     static func maxMessageWidth(for containerWidth: CGFloat) -> CGFloat {
-        let proportional = containerWidth * 0.85
+        let proportional = containerWidth * messageWidthRatio
         return min(max(proportional, 400), 1200)
     }
 

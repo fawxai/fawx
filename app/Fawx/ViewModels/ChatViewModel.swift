@@ -506,12 +506,67 @@ final class ChatViewModel {
     }
 
     private func applyFetchedMessages(_ messages: [SessionMessage], for sessionID: String) {
-        cacheMessages(messages, for: sessionID)
-        let updatedItems = makeTranscriptItems(from: messages)
+        let mergedMessages = mergedFetchedMessages(messages, for: sessionID)
+        cacheMessages(mergedMessages, for: sessionID)
+        let updatedItems = makeTranscriptItems(from: mergedMessages)
         if transcriptItems != updatedItems {
             pendingTranscriptScrollBehavior = .snap
             transcriptItems = updatedItems
         }
+    }
+
+    private func mergedFetchedMessages(
+        _ fetchedMessages: [SessionMessage],
+        for sessionID: String
+    ) -> [SessionMessage] {
+        guard let existingMessages = transcriptCache[sessionID], !existingMessages.isEmpty else {
+            return fetchedMessages
+        }
+
+        if areEquivalentMessageSequences(existingMessages, fetchedMessages) {
+            return fetchedMessages
+        }
+
+        if isEquivalentMessagePrefix(fetchedMessages, of: existingMessages) {
+            return existingMessages
+        }
+
+        if isEquivalentMessagePrefix(existingMessages, of: fetchedMessages) {
+            return fetchedMessages
+        }
+
+        return fetchedMessages
+    }
+
+    private func areEquivalentMessageSequences(
+        _ lhs: [SessionMessage],
+        _ rhs: [SessionMessage]
+    ) -> Bool {
+        lhs.count == rhs.count && isEquivalentMessagePrefix(lhs, of: rhs)
+    }
+
+    private func isEquivalentMessagePrefix(
+        _ prefix: [SessionMessage],
+        of messages: [SessionMessage]
+    ) -> Bool {
+        guard prefix.count <= messages.count else {
+            return false
+        }
+
+        for (lhs, rhs) in zip(prefix, messages) {
+            guard messagesAreEquivalentForTranscriptMerge(lhs, rhs) else {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func messagesAreEquivalentForTranscriptMerge(
+        _ lhs: SessionMessage,
+        _ rhs: SessionMessage
+    ) -> Bool {
+        lhs.role == rhs.role && lhs.content == rhs.content
     }
 
     private func handleLoadMessagesError(_ error: Error, sessionID: String, loadSequence: Int) async {
@@ -776,9 +831,10 @@ final class ChatViewModel {
                 return false
             }
 
-            cacheMessages(response.messages, for: sessionID)
+            let mergedMessages = mergedFetchedMessages(response.messages, for: sessionID)
+            cacheMessages(mergedMessages, for: sessionID)
             if currentSessionID == sessionID {
-                transcriptItems = makeTranscriptItems(from: response.messages)
+                transcriptItems = makeTranscriptItems(from: mergedMessages)
             }
             retryRequest = nil
             resetStreamingState()
@@ -1237,6 +1293,10 @@ extension ChatViewModel {
         }
 
         return consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID)
+    }
+
+    func applyFetchedMessagesForTesting(_ messages: [SessionMessage], sessionID: String) {
+        applyFetchedMessages(messages, for: sessionID)
     }
 }
 #endif

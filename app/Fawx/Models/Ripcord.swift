@@ -203,6 +203,11 @@ struct JournalAction: Codable, Sendable, Hashable {
     let type: String
     let payload: JSONValue
 
+    init(type: String, payload: JSONValue) {
+        self.type = type
+        self.payload = payload
+    }
+
     init(from decoder: Decoder) throws {
         let payload = try JSONValue(from: decoder)
         guard let object = payload.objectValue else {

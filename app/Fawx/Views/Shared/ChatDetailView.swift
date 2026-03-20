@@ -9,10 +9,10 @@ struct ChatDetailView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
-    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 200
+    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
     @State private var scrollViewportBottomY: CGFloat = 0
     @State private var scrollContentBottomY: CGFloat = 0
-    @State private var isShowingRipcordSheet = false
+    @State private var isShowingRipcordReviewTray = false
     @State private var isLoadingRipcordJournal = false
     @State private var ripcordJournalEntries: [JournalEntry] = []
     @State private var ripcordJournalErrorMessage: String?
@@ -124,10 +124,6 @@ struct ChatDetailView: View {
             .overlay(alignment: .top) {
                 refreshIndicatorOverlay
             }
-            .overlay(alignment: .topTrailing) {
-                ripcordNotificationOverlay
-            }
-            .animation(.easeInOut(duration: 0.25), value: appState.activeRipcordStatus?.notificationID)
     }
 
     @ViewBuilder
@@ -142,29 +138,6 @@ struct ChatDetailView: View {
         if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
             cachedRefreshIndicator
                 .padding(.top, FawxSpacing.paddingLG)
-        }
-    }
-
-    @ViewBuilder
-    private var ripcordNotificationOverlay: some View {
-        if let ripcordStatus = appState.activeRipcordStatus {
-            RipcordNotification(
-                status: ripcordStatus,
-                isPerformingAction: ripcordActionInFlight != nil,
-                reviewAction: presentRipcordJournal,
-                pullAction: {
-                    pendingRipcordConfirmation = .pull
-                },
-                approveAction: {
-                    pendingRipcordConfirmation = .approve
-                },
-                dismissAction: {
-                    appState.dismissRipcordNotification()
-                }
-            )
-            .padding(.top, FawxSpacing.paddingLG)
-            .padding(.trailing, FawxSpacing.paddingLG)
-            .transition(.move(edge: .trailing).combined(with: .opacity))
         }
     }
 
@@ -260,14 +233,33 @@ struct ChatDetailView: View {
     private func applyingRipcordPresentation<Content: View>(to content: Content) -> some View {
         content
             .sheet(
-                isPresented: $isShowingRipcordSheet,
+                isPresented: isShowingRipcordReportBinding,
                 onDismiss: {
                     ripcordReport = nil
                 }
             ) {
-                ripcordSheetContent
+                if let ripcordReport {
+                    RipcordReportView(report: ripcordReport, dismissAction: {
+                        self.ripcordReport = nil
+                    })
                     .fawxOpaqueModalPresentation()
+                }
             }
+            .onChange(of: appState.activeRipcordStatus?.notificationID) { oldValue, newValue in
+                guard oldValue != newValue else {
+                    return
+                }
+
+                isShowingRipcordReviewTray = false
+                ripcordJournalEntries = []
+                ripcordJournalErrorMessage = nil
+
+                if newValue == nil {
+                    ripcordJournalErrorMessage = nil
+                }
+            }
+            .animation(.easeInOut(duration: 0.22), value: isShowingRipcordReviewTray)
+            .animation(.easeInOut(duration: 0.22), value: appState.activeRipcordStatus?.notificationID)
             .confirmationDialog(
                 pendingRipcordConfirmation?.title ?? "",
                 isPresented: pendingRipcordConfirmationBinding,
@@ -279,36 +271,15 @@ struct ChatDetailView: View {
             }
     }
 
-    @ViewBuilder
-    private var ripcordSheetContent: some View {
-        if let ripcordReport {
-            RipcordReportView(report: ripcordReport, dismissAction: {
-                self.ripcordReport = nil
-                isShowingRipcordSheet = false
-            })
-        } else {
-            RipcordJournalPanel(
-                status: appState.ripcordStatus,
-                entries: ripcordJournalEntries,
-                isLoading: isLoadingRipcordJournal,
-                errorMessage: ripcordJournalErrorMessage,
-                isPerformingAction: ripcordActionInFlight != nil,
-                refreshAction: {
-                    Task {
-                        await loadRipcordJournal()
-                    }
-                },
-                pullAction: {
-                    pendingRipcordConfirmation = .pull
-                },
-                approveAction: {
-                    pendingRipcordConfirmation = .approve
-                },
-                dismissAction: {
-                    isShowingRipcordSheet = false
+    private var isShowingRipcordReportBinding: Binding<Bool> {
+        Binding(
+            get: { ripcordReport != nil },
+            set: { isPresented in
+                if !isPresented {
+                    ripcordReport = nil
                 }
-            )
-        }
+            }
+        )
     }
 
     private var pendingRipcordConfirmationBinding: Binding<Bool> {
@@ -344,7 +315,7 @@ struct ChatDetailView: View {
 
     private func presentRipcordJournal() {
         ripcordReport = nil
-        isShowingRipcordSheet = true
+        isShowingRipcordReviewTray = true
 
         Task {
             await loadRipcordJournal()
@@ -381,16 +352,16 @@ struct ChatDetailView: View {
             case .pull:
                 ripcordReport = try await appState.pullRipcord()
                 ripcordJournalEntries = []
-                isShowingRipcordSheet = true
+                isShowingRipcordReviewTray = false
             case .approve:
                 try await appState.approveRipcord()
                 ripcordReport = nil
                 ripcordJournalEntries = []
-                isShowingRipcordSheet = false
+                isShowingRipcordReviewTray = false
             }
         } catch {
             ripcordJournalErrorMessage = error.localizedDescription
-            isShowingRipcordSheet = true
+            isShowingRipcordReviewTray = true
             await appState.noteRecoverableRequestFailure(error)
         }
     }
@@ -509,6 +480,8 @@ struct ChatDetailView: View {
                 .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
             }
 
+            ripcordComposerSurface
+
             InputBar(
                 text: $chatViewModel.draftMessage,
                 queuedMessage: chatViewModel.queuedMessage,
@@ -558,6 +531,90 @@ struct ChatDetailView: View {
                         .opacity(FawxOpacity.iconSecondary)
                 }
                 .ignoresSafeArea(edges: .bottom)
+        }
+    }
+
+    @ViewBuilder
+    private var ripcordComposerSurface: some View {
+        if let ripcordStatus = appState.activeRipcordStatus {
+            ripcordComposerContent(for: ripcordStatus)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private func ripcordComposerContent(for status: RipcordStatusResponse) -> some View {
+        if isShowingRipcordReviewTray {
+            ripcordReviewTray(for: status)
+        } else {
+            ripcordNotification(for: status)
+        }
+    }
+
+    private func ripcordNotification(for status: RipcordStatusResponse) -> some View {
+        RipcordNotification(
+            snapshot: RipcordNotificationSnapshot(
+                status: status,
+                isPerformingAction: ripcordActionInFlight != nil,
+                resolutionActionKind: ripcordResolutionActionKind
+            ),
+            actions: ripcordNotificationActions
+        )
+    }
+
+    private func ripcordReviewTray(for status: RipcordStatusResponse) -> some View {
+        RipcordReviewTray(
+            snapshot: RipcordReviewTraySnapshot(
+                status: status,
+                entries: ripcordJournalEntries,
+                isLoading: isLoadingRipcordJournal,
+                errorMessage: ripcordJournalErrorMessage,
+                isPerformingAction: ripcordActionInFlight != nil,
+                resolutionActionKind: ripcordResolutionActionKind
+            ),
+            actions: ripcordReviewTrayActions
+        )
+    }
+
+    private var ripcordNotificationActions: RipcordNotificationActions {
+        RipcordNotificationActions(
+            review: presentRipcordJournal,
+            pull: {
+                pendingRipcordConfirmation = .pull
+            },
+            resolution: performRipcordResolutionAction
+        )
+    }
+
+    private var ripcordReviewTrayActions: RipcordReviewTrayActions {
+        RipcordReviewTrayActions(
+            refresh: {
+                Task {
+                    await loadRipcordJournal()
+                }
+            },
+            pull: {
+                pendingRipcordConfirmation = .pull
+            },
+            resolution: performRipcordResolutionAction,
+            close: {
+                isShowingRipcordReviewTray = false
+            }
+        )
+    }
+
+    private var ripcordResolutionActionKind: RipcordResolutionActionKind {
+        RipcordResolutionActionKind.forPermissionMode(appState.permissionMode)
+    }
+
+    private func performRipcordResolutionAction() {
+        switch ripcordResolutionActionKind {
+        case .dismiss:
+            isShowingRipcordReviewTray = false
+            appState.dismissRipcordNotification()
+        case .approve:
+            pendingRipcordConfirmation = .approve
         }
     }
 
