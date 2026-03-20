@@ -72,6 +72,9 @@ struct FawxApp: App {
     private func mainWindowScene(selectedTheme: AppTheme) -> some Scene {
         WindowGroup {
             themedRootView(selectedTheme: selectedTheme)
+#if os(macOS)
+                .frame(minWidth: 900, minHeight: 600)
+#endif
                 .task(id: appState.configurationKey) {
                     settingsViewModel.reloadStoredValues()
 #if os(macOS)
@@ -134,6 +137,8 @@ struct FawxApp: App {
                 }
         }
 #if os(macOS)
+        .defaultSize(width: 1200, height: 800)
+        .windowResizability(.contentMinSize)
         .commands {
             FawxMacCommands(
                 appState: appState,

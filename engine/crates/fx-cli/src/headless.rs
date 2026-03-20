@@ -53,9 +53,10 @@ use crate::commands::slash::{
 };
 use crate::context::load_context_files;
 use crate::helpers::{
-    available_provider_names, format_memory_for_prompt, render_model_menu_text, render_status_text,
-    resolve_model_alias, thinking_config_for_active_model, trim_history,
-    AnalysisCompletionProvider, RouterLoopLlmProvider,
+    available_provider_names, fetch_shared_available_models, format_memory_for_prompt, read_router,
+    render_model_menu_text, render_status_text, resolve_model_alias,
+    thinking_config_for_active_model, trim_history, write_router, AnalysisCompletionProvider,
+    RouterLoopLlmProvider, SharedModelRouter,
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::startup::{
@@ -130,6 +131,8 @@ pub struct ErrorRecord {
 }
 
 const MAX_ERROR_HISTORY: usize = 50;
+const NO_AI_PROVIDERS_STARTUP_WARNING: &str =
+    "no AI providers configured; HTTP API available but chat disabled until a provider is added";
 
 pub struct CycleResult {
     /// The assistant's response text.
@@ -147,7 +150,7 @@ pub struct CycleResult {
 /// Dependencies for constructing a [`HeadlessApp`]. Avoids > 5 bare params.
 pub struct HeadlessAppDeps {
     pub loop_engine: LoopEngine,
-    pub router: Arc<ModelRouter>,
+    pub router: SharedModelRouter,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub config: FawxConfig,
     pub memory: Option<SharedMemoryStore>,
@@ -171,7 +174,7 @@ pub struct HeadlessAppDeps {
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
 pub struct HeadlessApp {
     loop_engine: LoopEngine,
-    router: Arc<ModelRouter>,
+    router: SharedModelRouter,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     config: FawxConfig,
     memory: Option<SharedMemoryStore>,
@@ -208,7 +211,7 @@ pub struct HeadlessApp {
 
 #[derive(Clone)]
 pub struct HeadlessSubagentFactoryDeps {
-    pub router: Arc<ModelRouter>,
+    pub router: SharedModelRouter,
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
     pub session_bus: Option<SessionBus>,
@@ -315,9 +318,19 @@ impl HeadlessApp {
     }
 
     /// Build from the standard startup bundle + router + config.
-    pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+    pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
         // Callers must seed the router's active model before construction.
-        let active_model = resolve_active_model(&deps.router, &deps.config)?;
+        let active_model = read_router(&deps.router, |router| {
+            resolve_active_model(router, &deps.config)
+        })
+        .unwrap_or_default();
+        if active_model.is_empty() {
+            tracing::warn!("{NO_AI_PROVIDERS_STARTUP_WARNING}");
+            deps.startup_warnings.push(StartupWarning {
+                category: ErrorCategory::System,
+                message: NO_AI_PROVIDERS_STARTUP_WARNING.to_string(),
+            });
+        }
         let bus_receiver = Self::initial_bus_receiver(&deps);
         let max_history = deps.config.general.max_history;
         let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
@@ -360,11 +373,12 @@ impl HeadlessApp {
     }
 
     fn seed_runtime_info(&self) {
-        let provider = self
-            .router
-            .provider_for_model(&self.active_model)
-            .unwrap_or("")
-            .to_string();
+        let provider = read_router(&self.router, |router| {
+            router
+                .provider_for_model(&self.active_model)
+                .unwrap_or("")
+                .to_string()
+        });
         if let Ok(mut info) = self.runtime_info.write() {
             info.active_model = self.active_model.clone();
             info.provider = provider;
@@ -547,7 +561,7 @@ impl HeadlessApp {
         self.clear_startup_warnings();
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot_with_images(input, source, images);
-        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
         let result = self
             .loop_engine
             .run_cycle(snapshot, &llm)
@@ -597,7 +611,7 @@ impl HeadlessApp {
     }
 
     pub fn available_models(&self) -> Vec<ModelInfo> {
-        self.router.available_models()
+        read_router(&self.router, ModelRouter::available_models)
     }
 
     pub fn thinking_budget(&self) -> fx_config::ThinkingBudget {
@@ -662,7 +676,11 @@ impl HeadlessApp {
             thinking_adjusted: thinking_adjusted.map(|(from, to)| ThinkingAdjustedDto {
                 from: from.to_string(),
                 to: to.to_string(),
-                reason: thinking_adjustment_reason(from, to, self.active_provider_name()),
+                reason: thinking_adjustment_reason(
+                    from,
+                    to,
+                    self.active_provider_name().as_deref(),
+                ),
             }),
         })
     }
@@ -682,8 +700,12 @@ impl HeadlessApp {
     }
 
     #[cfg(feature = "http")]
-    fn active_provider_name(&self) -> Option<&str> {
-        self.router.provider_for_model(&self.active_model)
+    fn active_provider_name(&self) -> Option<String> {
+        read_router(&self.router, |router| {
+            router
+                .provider_for_model(&self.active_model)
+                .map(ToString::to_string)
+        })
     }
 
     fn current_thinking_budget(&self) -> ThinkingBudget {
@@ -746,7 +768,9 @@ impl HeadlessApp {
         &mut self,
         selector: &str,
     ) -> anyhow::Result<(String, Option<(ThinkingBudget, ThinkingBudget)>)> {
-        let active_model = resolve_headless_model_selector(&self.router, selector)?;
+        let active_model = read_router(&self.router, |router| {
+            resolve_headless_model_selector(router, selector)
+        })?;
         apply_headless_active_model(self, &active_model);
         persist_default_model(
             &mut self.config,
@@ -825,7 +849,8 @@ impl HeadlessApp {
 
     pub(crate) async fn analyze_signals_command(&mut self) -> anyhow::Result<String> {
         let signal_store = headless_signal_store(&self.config)?;
-        let provider = AnalysisCompletionProvider::new(&self.router, self.active_model.clone());
+        let provider =
+            AnalysisCompletionProvider::new(Arc::clone(&self.router), self.active_model.clone());
         let engine = AnalysisEngine::new(&signal_store);
         match engine.analyze(&provider).await {
             Ok(findings) => Ok(render_analysis_output(&findings, self.memory.as_ref())),
@@ -843,7 +868,8 @@ impl HeadlessApp {
             ));
         }
         let signal_store = headless_signal_store(&self.config)?;
-        let provider = AnalysisCompletionProvider::new(&self.router, self.active_model.clone());
+        let provider =
+            AnalysisCompletionProvider::new(Arc::clone(&self.router), self.active_model.clone());
         let (config, data_dir, repo_root, proposals_dir) =
             build_headless_improve_context(&self.config, flags);
         let paths = CyclePaths {
@@ -866,28 +892,52 @@ impl HeadlessApp {
             .as_deref()
             .unwrap_or(DEFAULT_HTTP_MODEL);
 
-        let Some(router) = Arc::get_mut(&mut self.router) else {
-            // Router is already shared (e.g. by SubagentManager). The active
-            // model was seeded before Arc wrapping, so this is harmless.
-            tracing::debug!("skipping apply_http_defaults: router already shared");
-            return;
-        };
+        let active_model = write_router(&self.router, |router| {
+            if let Err(error) = router.set_active(selector) {
+                tracing::warn!(
+                    model = selector,
+                    error = %error,
+                    "failed to set HTTP default model"
+                );
+                return None;
+            }
 
-        if let Err(error) = router.set_active(selector) {
-            tracing::warn!(
-                model = selector,
-                error = %error,
-                "failed to set HTTP default model"
-            );
-            return;
-        }
+            router.active_model().map(ToString::to_string)
+        });
 
-        if let Some(active_model) = self.router.active_model() {
-            self.active_model = active_model.to_string();
+        if let Some(active_model) = active_model {
+            self.active_model = active_model.clone();
             if self.config.model.default_model.is_none() {
-                self.config.model.default_model = Some(active_model.to_string());
+                self.config.model.default_model = Some(active_model);
             }
         }
+    }
+
+    fn apply_reloaded_router(&mut self, mut router: ModelRouter) -> anyhow::Result<()> {
+        let next_active_model = if !self.active_model.is_empty()
+            && headless_model_available(&router, &self.active_model)
+        {
+            Some(self.active_model.clone())
+        } else {
+            resolve_active_model(&router, &self.config).ok()
+        };
+
+        if let Some(active_model) = next_active_model {
+            router.set_active(&active_model)?;
+            self.active_model = active_model;
+        } else {
+            self.active_model.clear();
+        }
+
+        write_router(&self.router, |shared_router| *shared_router = router);
+        self.seed_runtime_info();
+        Ok(())
+    }
+
+    pub fn reload_providers(&mut self) -> anyhow::Result<()> {
+        let auth_manager = crate::startup::load_auth_manager()?;
+        let router = crate::startup::build_router(&auth_manager)?;
+        self.apply_reloaded_router(router)
     }
 
     // ── internal helpers ────────────────────────────────────────────────
@@ -918,7 +968,7 @@ impl HeadlessApp {
         self.clear_startup_warnings();
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
         let result = self
             .loop_engine
             .run_cycle(snapshot, &llm)
@@ -940,7 +990,7 @@ impl HeadlessApp {
         self.emit_startup_warnings(Some(&callback));
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
         let result = self
             .loop_engine
             .run_cycle_streaming(snapshot, &llm, Some(callback))
@@ -1101,19 +1151,19 @@ impl HeadlessApp {
     }
 
     async fn list_models_dynamic(&self) -> anyhow::Result<String> {
-        let models = self.dynamic_models_or_fallback().await;
+        let models = self.dynamic_models_or_fallback().await?;
         Ok(render_model_menu_text(
             Some(self.active_model.as_str()),
             &models,
         ))
     }
 
-    async fn dynamic_models_or_fallback(&self) -> Vec<ModelInfo> {
-        let models = self.router.fetch_available_models().await;
+    async fn dynamic_models_or_fallback(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        let models = fetch_shared_available_models(&self.router).await;
         if models.is_empty() {
-            return self.router.available_models();
+            return Ok(self.available_models());
         }
-        models
+        Ok(models)
     }
 }
 
@@ -1223,6 +1273,10 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::session_bus(self)
     }
 
+    fn reload_providers(&mut self) -> Result<(), anyhow::Error> {
+        HeadlessApp::reload_providers(self)
+    }
+
     fn recent_errors(&self, limit: usize) -> Vec<fx_api::ErrorRecordDto> {
         HeadlessApp::recent_errors(self, limit)
             .into_iter()
@@ -1249,10 +1303,7 @@ impl CommandHost for HeadlessApp {
     }
 
     fn list_models(&self) -> String {
-        render_model_menu_text(
-            Some(self.active_model.as_str()),
-            &self.router.available_models(),
-        )
+        render_model_menu_text(Some(self.active_model.as_str()), &self.available_models())
     }
 
     fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -1298,9 +1349,10 @@ impl CommandHost for HeadlessApp {
     }
 
     fn show_status(&self) -> String {
+        let providers = read_router(&self.router, available_provider_names);
         render_status_text(
             &self.active_model,
-            &available_provider_names(&self.router),
+            &providers,
             self.loop_engine.status(current_time_ms()),
         )
     }
@@ -1350,7 +1402,9 @@ impl CommandHost for HeadlessApp {
         value: Option<&str>,
         has_extra_args: bool,
     ) -> anyhow::Result<String> {
-        handle_headless_auth_command(&self.router, subcommand, action, value, has_extra_args)
+        read_router(&self.router, |router| {
+            handle_headless_auth_command(router, subcommand, action, value, has_extra_args)
+        })
     }
 
     fn handle_keys(
@@ -1770,18 +1824,24 @@ fn sync_headless_model_from_config(
     app: &mut HeadlessApp,
     default_model: Option<String>,
 ) -> anyhow::Result<()> {
-    let resolved = resolve_requested_model(&app.router, default_model.as_deref())?;
+    let resolved = read_router(&app.router, |router| {
+        resolve_requested_model(router, default_model.as_deref())
+    })?;
     apply_headless_active_model(app, &resolved);
     Ok(())
 }
 
 fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
-    if let Some(router) = Arc::get_mut(&mut app.router) {
+    let error_message = write_router(&app.router, |router| {
         if let Err(error) = router.set_active(model) {
-            let message = format!("Model reload failed after config change: {error}");
             tracing::warn!(error = %error, model, "failed to apply reloaded model to router");
-            app.record_error(ErrorCategory::System, message, true);
+            Some(format!("Model reload failed after config change: {error}"))
+        } else {
+            None
         }
+    });
+    if let Some(message) = error_message {
+        app.record_error(ErrorCategory::System, message, true);
     }
     app.active_model = model.to_string();
 }
@@ -2369,7 +2429,7 @@ fn headless_model_available(router: &ModelRouter, model: &str) -> bool {
         .any(|candidate| candidate.model_id == model)
 }
 
-fn no_headless_models_available() -> anyhow::Error {
+pub(crate) fn no_headless_models_available() -> anyhow::Error {
     anyhow::anyhow!(
         "no models available in router; configure a provider and authenticate it before starting headless mode"
     )
@@ -2432,7 +2492,7 @@ mod tests {
     use fx_kernel::loop_engine::LoopEngine;
     use fx_session::SessionKey;
     use fx_subagent::SpawnConfig;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use tokio::time::Duration;
 
     // ── Test helpers ────────────────────────────────────────────────────
@@ -2463,6 +2523,20 @@ mod tests {
             .expect("test engine")
     }
 
+    fn shared_router(router: ModelRouter) -> SharedModelRouter {
+        Arc::new(RwLock::new(router))
+    }
+
+    fn router_active_model(router: &SharedModelRouter) -> Option<String> {
+        read_router(router, |router| {
+            router.active_model().map(ToString::to_string)
+        })
+    }
+
+    fn router_available_models(router: &SharedModelRouter) -> Vec<ModelInfo> {
+        read_router(router, ModelRouter::available_models)
+    }
+
     fn test_app() -> HeadlessApp {
         let mut config = FawxConfig::default();
         let unique = SystemTime::now()
@@ -2475,7 +2549,7 @@ mod tests {
 
         HeadlessApp {
             loop_engine: test_engine(),
-            router: Arc::new(ModelRouter::new()),
+            router: shared_router(ModelRouter::new()),
             runtime_info: test_runtime_info(),
             config,
             memory: None,
@@ -2573,11 +2647,11 @@ mod tests {
         u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
     }
 
-    fn test_router() -> Arc<ModelRouter> {
+    fn test_router() -> SharedModelRouter {
         let mut router = ModelRouter::new();
         router.register_provider(Box::new(UsageReportingProvider));
         router.set_active("mock-model").expect("set active");
-        Arc::new(router)
+        shared_router(router)
     }
 
     #[derive(Debug)]
@@ -2741,7 +2815,7 @@ mod tests {
         seed_headless_router_active_model(&mut router, &config);
         HeadlessAppDeps {
             loop_engine: test_engine(),
-            router: Arc::new(router),
+            router: shared_router(router),
             runtime_info: test_runtime_info(),
             config,
             memory: None,
@@ -2780,7 +2854,7 @@ mod tests {
 
     fn headless_app_with_router(router: ModelRouter, active_model: &str) -> HeadlessApp {
         let mut app = test_app();
-        app.router = Arc::new(router);
+        app.router = shared_router(router);
         app.active_model = active_model.to_string();
         app
     }
@@ -2874,9 +2948,11 @@ mod tests {
         app.router = test_router();
         app.active_model = "mock-model".to_string();
 
+        let available_models = router_available_models(&app.router);
+
         assert_eq!(
             app.list_models(),
-            render_model_menu_text(Some("mock-model"), &app.router.available_models())
+            render_model_menu_text(Some("mock-model"), &available_models)
         );
     }
 
@@ -2906,7 +2982,7 @@ mod tests {
         let mut app = test_app();
         let mut router = static_model_router(&["mock-model"]);
         router.set_active("mock-model").expect("set active");
-        app.router = Arc::new(router);
+        app.router = shared_router(router);
         app.startup_warnings.push(StartupWarning {
             category: ErrorCategory::Memory,
             message: "Failed to initialize memory: broken store".to_string(),
@@ -3023,7 +3099,7 @@ mod tests {
 
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
-            router: Arc::new(router),
+            router: shared_router(router),
             runtime_info: test_runtime_info(),
             config,
             memory: None,
@@ -3060,10 +3136,66 @@ mod tests {
         let response = app.reload_config().expect("reload config");
 
         assert_eq!(app.active_model, "gpt-5.4");
-        assert_eq!(app.router.active_model(), Some("gpt-5.4"));
+        assert_eq!(router_active_model(&app.router).as_deref(), Some("gpt-5.4"));
         assert_eq!(
             response,
             crate::commands::slash::config_reload_success_message(&temp.path().join("config.toml"))
+        );
+    }
+
+    #[test]
+    fn reload_providers_adds_new_models() {
+        let mut app = headless_app_with_router(ModelRouter::new(), "");
+
+        app.apply_reloaded_router(static_model_router(&["gpt-5.4"]))
+            .expect("reload providers");
+
+        let models = router_available_models(&app.router);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "gpt-5.4");
+    }
+
+    #[test]
+    fn reload_providers_removes_deleted_provider() {
+        let mut router = static_model_router(&["gpt-5.4"]);
+        router.set_active("gpt-5.4").expect("set active");
+        let mut app = headless_app_with_router(router, "gpt-5.4");
+
+        app.apply_reloaded_router(ModelRouter::new())
+            .expect("reload providers");
+
+        assert!(router_available_models(&app.router).is_empty());
+        assert!(app.active_model.is_empty());
+        assert_eq!(router_active_model(&app.router), None);
+    }
+
+    #[test]
+    fn reload_providers_preserves_active_model() {
+        let mut router = static_model_router(&["gpt-5.4", "gpt-5.4-mini"]);
+        router.set_active("gpt-5.4-mini").expect("set active");
+        let mut app = headless_app_with_router(router, "gpt-5.4-mini");
+
+        app.apply_reloaded_router(static_model_router(&["gpt-5.4", "gpt-5.4-mini"]))
+            .expect("reload providers");
+
+        assert_eq!(app.active_model, "gpt-5.4-mini");
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("gpt-5.4-mini")
+        );
+    }
+
+    #[test]
+    fn reload_providers_auto_selects_when_empty() {
+        let mut app = headless_app_with_router(ModelRouter::new(), "");
+
+        app.apply_reloaded_router(static_model_router(&["claude-opus-4-6"]))
+            .expect("reload providers");
+
+        assert_eq!(app.active_model, "claude-opus-4-6");
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("claude-opus-4-6")
         );
     }
 
@@ -3113,7 +3245,7 @@ mod tests {
         let mut router = ModelRouter::new();
         router.register_provider(Box::new(MultiModelProvider));
         router.set_active("mock-model").expect("set active");
-        app.router = Arc::new(router);
+        app.router = shared_router(router);
 
         let status = app.show_status();
         assert!(status.contains("providers: usage-reporting"));
@@ -3404,7 +3536,7 @@ mod tests {
             .expect("set active conversation model");
 
         let mut app = test_app();
-        app.router = Arc::new(router);
+        app.router = shared_router(router);
         app.active_model = "conversation-memory".to_string();
 
         let first = AppEngine::process_message(
@@ -3663,7 +3795,10 @@ mod tests {
         let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
 
         assert_eq!(app.active_model, "config-model");
-        assert_eq!(app.router.active_model(), Some("config-model"));
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("config-model")
+        );
     }
 
     #[test]
@@ -3677,11 +3812,17 @@ mod tests {
             .set_active(&active_model)
             .expect("set active before Arc sharing");
 
-        let router = Arc::new(router);
+        let router = shared_router(router);
         let cloned_router = Arc::clone(&router);
 
-        assert_eq!(router.active_model(), Some("config-model"));
-        assert_eq!(cloned_router.active_model(), Some("config-model"));
+        assert_eq!(
+            router_active_model(&router).as_deref(),
+            Some("config-model")
+        );
+        assert_eq!(
+            router_active_model(&cloned_router).as_deref(),
+            Some("config-model")
+        );
     }
 
     #[test]
@@ -3695,7 +3836,7 @@ mod tests {
         });
 
         assert_eq!(app.active_model, "a-model");
-        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert_eq!(router_active_model(&app.router).as_deref(), Some("a-model"));
         assert!(
             logs.contains("configured default_model 'missing-model' not available, falling back")
         );
@@ -3713,7 +3854,7 @@ mod tests {
         });
 
         assert_eq!(app.active_model, "a-model");
-        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert_eq!(router_active_model(&app.router).as_deref(), Some("a-model"));
         assert!(logs.is_empty(), "unexpected warnings: {logs}");
     }
 
@@ -3726,7 +3867,10 @@ mod tests {
         sync_headless_model_from_config(&mut app, Some("new-model".to_string())).expect("sync");
 
         assert_eq!(app.active_model, "new-model");
-        assert_eq!(app.router.active_model(), Some("new-model"));
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("new-model")
+        );
     }
 
     #[test]
@@ -3741,7 +3885,10 @@ mod tests {
         });
 
         assert_eq!(app.active_model, "old-model");
-        assert_eq!(app.router.active_model(), Some("old-model"));
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("old-model")
+        );
         assert!(
             logs.contains("configured default_model 'missing-model' not available, falling back")
         );
@@ -3755,7 +3902,7 @@ mod tests {
         let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
 
         assert_eq!(app.active_model, "a-model");
-        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert_eq!(router_active_model(&app.router).as_deref(), Some("a-model"));
     }
 
     #[test]
@@ -3771,19 +3918,26 @@ mod tests {
         let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
 
         assert_eq!(app.active_model, "config-model");
-        assert_eq!(app.router.active_model(), Some("config-model"));
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("config-model")
+        );
     }
 
     #[test]
-    fn new_returns_clear_error_when_no_models_are_available() {
-        let result = HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()));
-        assert!(result.is_err(), "should fail without any models");
+    fn new_succeeds_when_no_models_are_available() {
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()))
+                .expect("should build without models")
+        });
 
-        let error = result.err().expect("missing error");
-        assert_eq!(
-            error.to_string(),
-            "no models available in router; configure a provider and authenticate it before starting headless mode"
-        );
+        assert_eq!(app.active_model(), "");
+        assert_eq!(router_active_model(&app.router).as_deref(), None);
+        assert!(logs.contains(NO_AI_PROVIDERS_STARTUP_WARNING));
+        assert!(app.recent_errors(1).iter().any(|warning| {
+            warning.category == ErrorCategory::System
+                && warning.message == NO_AI_PROVIDERS_STARTUP_WARNING
+        }));
     }
 
     #[tokio::test]
@@ -3836,7 +3990,7 @@ mod tests {
     #[test]
     fn headless_subagent_factory_new_builds_disabled_manager() {
         let deps = HeadlessSubagentFactoryDeps {
-            router: Arc::new(ModelRouter::new()),
+            router: shared_router(ModelRouter::new()),
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: None,

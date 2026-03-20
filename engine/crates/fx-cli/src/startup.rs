@@ -1424,6 +1424,9 @@ impl fx_llm::CompletionProvider for OwnedRouterProvider {
 }
 
 pub fn fawx_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("FAWX_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .map(|home| home.join(".fawx"))
         .unwrap_or_else(|| PathBuf::from(".fawx"))
@@ -1626,7 +1629,7 @@ fn register_keyed_provider(
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
             })?
             .with_supported_models(supported_models);
-        router.register_provider_with_auth(Box::new(anthropic), auth_label);
+        router.register_provider_with_auth(Arc::new(anthropic), auth_label);
         return Ok(());
     }
 
@@ -1637,7 +1640,7 @@ fn register_keyed_provider(
         .with_name(provider.to_string())
         .with_supported_models(supported_models);
 
-    router.register_provider_with_auth(Box::new(provider_client), auth_label);
+    router.register_provider_with_auth(Arc::new(provider_client), auth_label);
     Ok(())
 }
 
@@ -1658,7 +1661,7 @@ fn register_oauth_provider(
                 })?
                 .with_supported_models(supported_models);
 
-        router.register_provider_with_auth(Box::new(provider_client), "subscription");
+        router.register_provider_with_auth(Arc::new(provider_client), "subscription");
         return Ok(());
     }
 
@@ -1670,7 +1673,7 @@ fn register_oauth_provider(
             .with_name(provider.to_string())
             .with_supported_models(supported_models);
 
-    router.register_provider_with_auth(Box::new(provider_client), "subscription");
+    router.register_provider_with_auth(Arc::new(provider_client), "subscription");
     Ok(())
 }
 
@@ -2730,5 +2733,31 @@ mod tests {
             duration_millis_u64(std::time::Duration::from_secs(u64::MAX)),
             u64::MAX
         );
+    }
+
+    /// Tests env var override and fallback in a single test to avoid
+    /// parallel test races on the shared `FAWX_DATA_DIR` env var.
+    #[test]
+    fn fawx_data_dir_respects_env_var_and_falls_back() {
+        let key = "FAWX_DATA_DIR";
+        let original = std::env::var_os(key);
+
+        // With env var set: should return the override path
+        std::env::set_var(key, "/tmp/custom-fawx-data");
+        let with_env = fawx_data_dir();
+        assert_eq!(with_env, PathBuf::from("/tmp/custom-fawx-data"));
+
+        // Without env var: should fall back to ~/.fawx
+        std::env::remove_var(key);
+        let without_env = fawx_data_dir();
+        assert!(
+            without_env.ends_with(".fawx"),
+            "should fall back to ~/.fawx, got: {without_env:?}"
+        );
+
+        // Restore original value
+        if let Some(val) = original {
+            std::env::set_var(key, val);
+        }
     }
 }

@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth;
 #[allow(dead_code)]
 pub mod backup;
+pub mod bootstrap;
 #[allow(dead_code)]
 pub mod completions;
 #[allow(dead_code)]
@@ -49,6 +50,8 @@ pub(crate) mod runtime_layout;
 pub mod security_audit;
 #[allow(dead_code)]
 pub mod serve_fleet;
+#[allow(dead_code)]
+pub mod sessions;
 #[allow(dead_code)]
 pub mod setup;
 #[allow(dead_code)]

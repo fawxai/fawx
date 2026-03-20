@@ -78,6 +78,9 @@ enum Commands {
         /// HTTP server port (default: 8400)
         #[arg(long, default_value = "8400")]
         port: u16,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
         /// Run as a fleet worker using the saved fleet identity
         #[arg(long)]
         fleet: bool,
@@ -107,11 +110,30 @@ enum Commands {
     /// Inspect persistent log files
     Logs(commands::logs::LogsArgs),
 
+    /// Inspect conversation sessions
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommands,
+    },
+
     /// Run Fawx-specific security checks
     SecurityAudit(commands::security_audit::SecurityAuditArgs),
 
     /// Create a compressed backup of ~/.fawx
     Backup(commands::backup::BackupArgs),
+
+    /// Non-interactive zero-to-one local setup for GUI/embedded use
+    Bootstrap {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        /// Override default port (scans 8400-8410 if unset)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
 
     /// Import memory and context from another workspace
     Import(commands::import::ImportArgs),
@@ -320,6 +342,15 @@ enum SkillCommands {
 }
 
 #[derive(Subcommand)]
+enum SessionsCommands {
+    /// List all sessions
+    List(commands::sessions::ListArgs),
+
+    /// Export full conversation from a session
+    Export(commands::sessions::ExportArgs),
+}
+
+#[derive(Subcommand)]
 enum TailscaleCommands {
     /// Generate a TLS certificate for HTTPS
     Cert {
@@ -346,7 +377,7 @@ fn build_config_manager(
 }
 
 fn build_subagent_manager(
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     session_bus: Option<fx_bus::SessionBus>,
@@ -467,7 +498,7 @@ fn build_headless_startup(
     let auth_manager = startup::load_auth_manager()?;
     let mut router = startup::build_router(&auth_manager)?;
     headless::seed_headless_router_active_model(&mut router, &config);
-    let router = Arc::new(router);
+    let router = Arc::new(std::sync::RwLock::new(router));
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
@@ -515,7 +546,7 @@ fn build_headless_startup(
 
 #[allow(clippy::too_many_arguments)] // Pre-existing constructor shape; follow-up will bundle args into a config struct.
 fn build_headless_app(
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     system_prompt: Option<std::path::PathBuf>,
@@ -646,11 +677,19 @@ async fn run_headless(
         _logging_guard,
         ..
     } = startup;
+    ensure_headless_chat_model_available(app.active_model())?;
     if single {
         app.run_single(json).await
     } else {
         app.run(json).await
     }
+}
+
+fn ensure_headless_chat_model_available(active_model: &str) -> anyhow::Result<()> {
+    if active_model.is_empty() {
+        return Err(headless::no_headless_models_available());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]
@@ -905,6 +944,13 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     }
 }
 
+fn dispatch_sessions(command: SessionsCommands) -> anyhow::Result<i32> {
+    match command {
+        SessionsCommands::List(args) => commands::sessions::run_list(&args),
+        SessionsCommands::Export(args) => commands::sessions::run_export(&args),
+    }
+}
+
 fn dispatch_tailscale(command: TailscaleCommands) -> anyhow::Result<i32> {
     match command {
         TailscaleCommands::Cert { hostname } => {
@@ -927,8 +973,12 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             system_prompt,
             http,
             port,
+            data_dir,
             fleet,
         } => {
+            if let Some(ref dir) = data_dir {
+                std::env::set_var("FAWX_DATA_DIR", dir);
+            }
             let _pid_guard = restart::create_serve_pid_file_guard()?;
             if fleet {
                 commands::serve_fleet::run().await
@@ -946,8 +996,14 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Devices(args) => Ok(commands::devices::run(&args).await?),
         Commands::Version => Ok(commands::version::run()),
         Commands::Logs(args) => commands::logs::run(&args),
+        Commands::Sessions { command } => dispatch_sessions(command),
         Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
         Commands::Backup(args) => commands::backup::run(&args),
+        Commands::Bootstrap {
+            json,
+            port,
+            data_dir,
+        } => Ok(commands::bootstrap::run(json, port, data_dir).await?),
         Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Tailscale { command } => dispatch_tailscale(command),
@@ -1076,9 +1132,9 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SkillCommands,
-        FAWX_TUI_NOT_FOUND_MESSAGE,
+        dispatch_command, ensure_headless_chat_model_available, fawx_tui_binary_name,
+        find_fawx_tui_binary_from, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
+        SessionsCommands, SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1178,6 +1234,27 @@ mod tests {
     fn cli_parses_setup_command() {
         let cli = Cli::parse_from(["fawx", "setup", "--force"]);
         assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
+    }
+
+    #[test]
+    fn cli_parses_bootstrap_command() {
+        let cli = Cli::parse_from([
+            "fawx",
+            "bootstrap",
+            "--json",
+            "--port",
+            "9500",
+            "--data-dir",
+            "/tmp/fawx",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Bootstrap {
+                json: true,
+                port: Some(9500),
+                data_dir: Some(path),
+            }) if path == *std::path::Path::new("/tmp/fawx")
+        ));
     }
 
     #[test]
@@ -1298,6 +1375,7 @@ mod tests {
                 system_prompt: None,
                 http: false,
                 port: 8400,
+                data_dir: None,
                 fleet: true,
             })
         ));
@@ -1376,6 +1454,30 @@ mod tests {
                 lines: 100,
                 list: false
             }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sessions_list_command() {
+        let cli = Cli::parse_from(["fawx", "sessions", "list", "--json", "--kind", "subagent"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionsCommands::List(crate::commands::sessions::ListArgs { json: true, kind })
+            }) if kind.as_deref() == Some("subagent")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sessions_export_command() {
+        let cli = Cli::parse_from([
+            "fawx", "sessions", "export", "sess-123", "--json", "--limit", "5",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionsCommands::Export(crate::commands::sessions::ExportArgs { id, json: true, limit: Some(5) })
+            }) if id == "sess-123"
         ));
     }
 
@@ -1567,12 +1669,24 @@ exit 0
             system_prompt: None,
             http: false,
             port: 8400,
+            data_dir: None,
             fleet: true,
         })
         .await
         .expect("dispatch");
 
         assert_eq!(exit_code, 73);
+    }
+
+    #[test]
+    fn run_headless_guard_rejects_missing_active_model() {
+        let error =
+            ensure_headless_chat_model_available("").expect_err("empty active model should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "no models available in router; configure a provider and authenticate it before starting headless mode"
+        );
     }
 
     #[test]
