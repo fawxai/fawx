@@ -260,6 +260,18 @@ fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
     }))
 }
 
+impl From<fx_cli::headless::ResultKind> for ResultKind {
+    fn from(kind: fx_cli::headless::ResultKind) -> Self {
+        match kind {
+            fx_cli::headless::ResultKind::Complete => Self::Complete,
+            fx_cli::headless::ResultKind::Partial => Self::Partial,
+            fx_cli::headless::ResultKind::NeedsInput => Self::NeedsInput,
+            fx_cli::headless::ResultKind::Error => Self::Error,
+            fx_cli::headless::ResultKind::Empty => Self::Empty,
+        }
+    }
+}
+
 fn mock_completion_response() -> CompletionResponse {
     CompletionResponse {
         content: vec![ContentBlock::Text {
