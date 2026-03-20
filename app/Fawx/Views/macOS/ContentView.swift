@@ -122,7 +122,7 @@ struct ContentView: View {
                 appState: appState,
                 sessionViewModel: sessionViewModel,
                 chatViewModel: chatViewModel,
-                emptyStateTitle: "What are you working on?",
+                emptyStateTitle: "What are we working on?",
                 emptyStateMessage: "Create a new conversation from the sidebar, or start typing and Fawx will create one on your first message."
             )
             .navigationTitle(detailTitle)
