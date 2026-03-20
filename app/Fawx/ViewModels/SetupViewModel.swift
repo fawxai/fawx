@@ -504,7 +504,7 @@ final class SetupViewModel {
             let result = try await service.performFullBootstrap { [weak self] message in
                 self?.bootstrapProgress = message
             }
-            await appState.configureClientForBootstrap(
+            try await appState.configureClientForBootstrap(
                 serverURL: "http://\(result.host):\(result.port)",
                 bearerToken: result.bearerToken
             )
