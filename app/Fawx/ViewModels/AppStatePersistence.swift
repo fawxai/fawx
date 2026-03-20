@@ -10,6 +10,16 @@ enum AppStateStorageKey {
 }
 
 actor AppStatePersistence {
+    private struct DefaultsSnapshot: Sendable {
+        let storedServerURL: String
+        let pairedDeviceName: String?
+        let theme: AppTheme
+        let fontSize: AppFontSize
+        let setupComplete: Bool
+        let connectionModeRawValue: String?
+        let authToken: String?
+    }
+
     struct LaunchSnapshot: Sendable {
         let storedServerURL: String
         let pairedDeviceName: String?
@@ -50,25 +60,42 @@ actor AppStatePersistence {
     }
 
     func loadLaunchSnapshot(resetState: Bool) async -> LaunchSnapshot {
-        let userDefaults = defaults
+        let defaultsSuiteName = self.defaultsSuiteName
+        let keychainService = self.keychainService
+        let defaultsSnapshot = await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
 
-        if resetState {
-            resetPersistedConfiguration(userDefaults: userDefaults)
-        }
+            if resetState {
+                Self.resetPersistedConfiguration(
+                    userDefaults: userDefaults,
+                    keychainService: keychainService
+                )
+            }
 
-        let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
-        let authToken = storedServerURL.isEmpty
-            ? nil
-            : (try? KeychainHelper.token(forServer: storedServerURL, service: keychainService))
+            let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
+            let authToken = storedServerURL.isEmpty
+                ? nil
+                : (try? KeychainHelper.token(forServer: storedServerURL, service: keychainService))
+
+            return DefaultsSnapshot(
+                storedServerURL: storedServerURL,
+                pairedDeviceName: userDefaults.string(forKey: AppStateStorageKey.pairedDeviceName),
+                theme: Self.storedTheme(userDefaults: userDefaults),
+                fontSize: Self.storedFontSize(userDefaults: userDefaults),
+                setupComplete: userDefaults.bool(forKey: AppStateStorageKey.setupComplete),
+                connectionModeRawValue: userDefaults.string(forKey: AppStateStorageKey.connectionMode),
+                authToken: authToken
+            )
+        }.value
 
         return LaunchSnapshot(
-            storedServerURL: storedServerURL,
-            pairedDeviceName: userDefaults.string(forKey: AppStateStorageKey.pairedDeviceName),
-            theme: storedTheme(),
-            fontSize: storedFontSize(),
-            setupComplete: userDefaults.bool(forKey: AppStateStorageKey.setupComplete),
-            connectionModeRawValue: userDefaults.string(forKey: AppStateStorageKey.connectionMode),
-            authToken: authToken,
+            storedServerURL: defaultsSnapshot.storedServerURL,
+            pairedDeviceName: defaultsSnapshot.pairedDeviceName,
+            theme: defaultsSnapshot.theme,
+            fontSize: defaultsSnapshot.fontSize,
+            setupComplete: defaultsSnapshot.setupComplete,
+            connectionModeRawValue: defaultsSnapshot.connectionModeRawValue,
+            authToken: defaultsSnapshot.authToken,
             localInstallConfiguration: await localInstallLoader()
         )
     }
@@ -82,53 +109,87 @@ actor AppStatePersistence {
         token: String,
         deviceName: String,
         connectionMode: AppConnectionMode
-    ) throws {
-        let userDefaults = defaults
-        userDefaults.set(serverURLString, forKey: AppStateStorageKey.serverURL)
-        userDefaults.set(deviceName, forKey: AppStateStorageKey.pairedDeviceName)
-        userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
-        try KeychainHelper.saveToken(token, forServer: serverURLString, service: keychainService)
+    ) async throws {
+        let defaultsSuiteName = self.defaultsSuiteName
+        let keychainService = self.keychainService
+
+        try await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            userDefaults.set(serverURLString, forKey: AppStateStorageKey.serverURL)
+            userDefaults.set(deviceName, forKey: AppStateStorageKey.pairedDeviceName)
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+            try KeychainHelper.saveToken(token, forServer: serverURLString, service: keychainService)
+        }.value
     }
 
-    func clearPairing(serverURLString: String) {
-        let userDefaults = defaults
-        if !serverURLString.isEmpty {
-            try? KeychainHelper.deleteToken(forServer: serverURLString, service: keychainService)
-        }
+    func clearPairing(serverURLString: String) async {
+        let defaultsSuiteName = self.defaultsSuiteName
+        let keychainService = self.keychainService
 
-        userDefaults.removeObject(forKey: AppStateStorageKey.serverURL)
-        userDefaults.removeObject(forKey: AppStateStorageKey.pairedDeviceName)
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            if !serverURLString.isEmpty {
+                try? KeychainHelper.deleteToken(forServer: serverURLString, service: keychainService)
+            }
+
+            userDefaults.removeObject(forKey: AppStateStorageKey.serverURL)
+            userDefaults.removeObject(forKey: AppStateStorageKey.pairedDeviceName)
+        }.value
     }
 
     func persistResolvedLaunchState(
         setupComplete: Bool,
         connectionMode: AppConnectionMode
-    ) {
-        let userDefaults = defaults
-        if setupComplete {
-            userDefaults.set(true, forKey: AppStateStorageKey.setupComplete)
-        }
+    ) async {
+        let defaultsSuiteName = self.defaultsSuiteName
 
-        userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            if setupComplete {
+                userDefaults.set(true, forKey: AppStateStorageKey.setupComplete)
+            }
+
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+        }.value
     }
 
-    func setTheme(_ theme: AppTheme) {
-        defaults.set(theme.rawValue, forKey: AppStateStorageKey.theme)
+    func setTheme(_ theme: AppTheme) async {
+        let defaultsSuiteName = self.defaultsSuiteName
+
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            userDefaults.set(theme.rawValue, forKey: AppStateStorageKey.theme)
+        }.value
     }
 
-    func setFontSize(_ fontSize: AppFontSize) {
-        defaults.set(fontSize.rawValue, forKey: AppStateStorageKey.fontSize)
+    func setFontSize(_ fontSize: AppFontSize) async {
+        let defaultsSuiteName = self.defaultsSuiteName
+
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            userDefaults.set(fontSize.rawValue, forKey: AppStateStorageKey.fontSize)
+        }.value
     }
 
-    func setConnectionMode(_ connectionMode: AppConnectionMode) {
-        defaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+    func setConnectionMode(_ connectionMode: AppConnectionMode) async {
+        let defaultsSuiteName = self.defaultsSuiteName
+
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+        }.value
     }
 
-    func setSetupComplete(_ setupComplete: Bool) {
-        defaults.set(setupComplete, forKey: AppStateStorageKey.setupComplete)
+    func setSetupComplete(_ setupComplete: Bool) async {
+        let defaultsSuiteName = self.defaultsSuiteName
+
+        await Task.detached(priority: .utility) {
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            userDefaults.set(setupComplete, forKey: AppStateStorageKey.setupComplete)
+        }.value
     }
 
-    private var defaults: UserDefaults {
+    private static func makeDefaults(suiteName defaultsSuiteName: String?) -> UserDefaults {
         if let defaultsSuiteName, let userDefaults = UserDefaults(suiteName: defaultsSuiteName) {
             return userDefaults
         }
@@ -143,19 +204,22 @@ actor AppStatePersistence {
         return .standard
     }
 
-    private func storedTheme() -> AppTheme {
+    private static func storedTheme(userDefaults: UserDefaults) -> AppTheme {
         AppTheme(
-            rawValue: defaults.string(forKey: AppStateStorageKey.theme) ?? AppTheme.system.rawValue
+            rawValue: userDefaults.string(forKey: AppStateStorageKey.theme) ?? AppTheme.system.rawValue
         ) ?? .system
     }
 
-    private func storedFontSize() -> AppFontSize {
+    private static func storedFontSize(userDefaults: UserDefaults) -> AppFontSize {
         AppFontSize(
-            rawValue: defaults.string(forKey: AppStateStorageKey.fontSize) ?? AppFontSize.medium.rawValue
+            rawValue: userDefaults.string(forKey: AppStateStorageKey.fontSize) ?? AppFontSize.medium.rawValue
         ) ?? .medium
     }
 
-    private func resetPersistedConfiguration(userDefaults: UserDefaults) {
+    private static func resetPersistedConfiguration(
+        userDefaults: UserDefaults,
+        keychainService: String
+    ) {
         let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
 
         if !storedServerURL.isEmpty {
