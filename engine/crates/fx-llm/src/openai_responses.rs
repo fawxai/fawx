@@ -61,7 +61,7 @@ impl OpenAiResponsesProvider {
         }
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
 
@@ -931,9 +931,9 @@ async fn parse_model_response(
     Ok(filter_model_ids(parsed.data, supported_models))
 }
 
-// ============================================================================
+// =====================================================================
 // Request/Response types
-// ============================================================================
+// =====================================================================
 
 #[derive(Serialize)]
 struct ResponsesRequestBody {
@@ -1067,9 +1067,9 @@ struct SseOutputItem {
     arguments: Option<String>,
 }
 
-// ============================================================================
+// =====================================================================
 // Helpers
-// ============================================================================
+// =====================================================================
 
 fn extract_text(content: &[ContentBlock]) -> String {
     content

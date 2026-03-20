@@ -150,7 +150,7 @@ impl AnthropicProvider {
         let auth_mode = AnthropicAuthMode::detect(&api_key);
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
 
