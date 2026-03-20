@@ -11,6 +11,8 @@ struct WelcomeStep: View {
                 VStack(spacing: FawxSpacing.paddingSM) {
                     Image("FawxLogo")
                         .resizable()
+                        .interpolation(.high)
+                        .antialiased(true)
                         .aspectRatio(contentMode: .fit)
                         .frame(width: 80, height: 80)
 

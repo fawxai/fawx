@@ -25,7 +25,7 @@ final class MenuBarManager: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            if let icon = Bundle.main.image(forResource: "MenuBarIcon") {
+            if let icon = NSImage(named: "MenuBarIcon") {
                 icon.isTemplate = true
                 icon.size = NSSize(width: 18, height: 18)
                 button.image = icon
