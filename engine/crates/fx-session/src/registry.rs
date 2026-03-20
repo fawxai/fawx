@@ -1,6 +1,6 @@
 //! Session registry: tracks all active sessions and delegates persistence.
 
-use crate::session::{Session, SessionMessage};
+use crate::session::{Session, SessionContentBlock, SessionMessage};
 use crate::store::SessionStore;
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
@@ -146,12 +146,48 @@ impl SessionRegistry {
 
     /// Record a message with an explicit role in a session.
     pub fn record_message(&self, key: &SessionKey, role: MessageRole, message: &str) -> Result<()> {
+        self.record_message_blocks(
+            key,
+            role,
+            vec![SessionContentBlock::Text {
+                text: message.to_string(),
+            }],
+            None,
+        )
+    }
+
+    /// Record a structured message with an explicit role in a session.
+    pub fn record_message_blocks(
+        &self,
+        key: &SessionKey,
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        token_count: Option<u32>,
+    ) -> Result<()> {
         let snapshot = {
             let mut map = self.write()?;
             let session = map
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
-            session.add_message(role, message);
+            session.add_message_blocks(role, content, token_count);
+            session.clone()
+        };
+        self.store.save(&snapshot)?;
+        Ok(())
+    }
+
+    /// Append multiple pre-built session messages in a single save.
+    pub fn append_messages(&self, key: &SessionKey, messages: Vec<SessionMessage>) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = {
+            let mut map = self.write()?;
+            let session = map
+                .get_mut(key)
+                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+            session.extend_messages(messages);
             session.clone()
         };
         self.store.save(&snapshot)?;
@@ -320,7 +356,7 @@ mod tests {
             .history(&SessionKey::new("chat").unwrap(), 10)
             .expect("history");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[0].render_text(), "hello");
     }
 
     #[test]
@@ -359,8 +395,8 @@ mod tests {
             .history(&SessionKey::new("lim").unwrap(), 2)
             .expect("history");
         assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0].content, "msg-3");
-        assert_eq!(recent[1].content, "msg-4");
+        assert_eq!(recent[0].render_text(), "msg-3");
+        assert_eq!(recent[1].render_text(), "msg-4");
     }
 
     #[test]
@@ -422,7 +458,7 @@ mod tests {
             .history(&SessionKey::new("persist").unwrap(), 10)
             .expect("history");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "survive restart");
+        assert_eq!(history[0].render_text(), "survive restart");
     }
 
     /// Regression test: creating a duplicate key must NOT corrupt the
@@ -476,7 +512,7 @@ mod tests {
             .history(&SessionKey::new("dup-persist").unwrap(), 10)
             .expect("history");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "important data");
+        assert_eq!(history[0].render_text(), "important data");
     }
 
     #[test]

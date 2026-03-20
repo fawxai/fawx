@@ -10,7 +10,7 @@ pub mod store;
 pub mod types;
 
 pub use registry::{SessionError, SessionRegistry};
-pub use session::{Session, SessionMessage};
+pub use session::{Session, SessionContentBlock, SessionMessage};
 pub use store::SessionStore;
 pub use types::{
     InvalidSessionKey, MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind,

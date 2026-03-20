@@ -21,7 +21,7 @@ use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
-    MessageRole, SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
+    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
     SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -275,11 +275,13 @@ pub(crate) async fn handle_send_message_for_session(
         .await);
     }
 
-    let (result, response) =
+    let (result, response, session_messages) =
         process_and_route_session_message(&state, &request.message, &images, context)
             .await
             .map_err(internal_error)?;
-    record_session_turn(&registry, &key, &request.message, &response).map_err(internal_error)?;
+    registry
+        .append_messages(&key, session_messages)
+        .map_err(|error| internal_error(anyhow::Error::new(error)))?;
 
     Ok(Json(MessageResponse {
         response,
@@ -293,11 +295,7 @@ pub(crate) async fn handle_send_message_for_session(
 pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
     messages
         .iter()
-        .map(|message| match message.role {
-            MessageRole::User => Message::user(message.content.clone()),
-            MessageRole::Assistant => Message::assistant(message.content.clone()),
-            MessageRole::System => Message::system(message.content.clone()),
-        })
+        .map(SessionMessage::to_llm_message)
         .collect()
 }
 
@@ -348,14 +346,12 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
                 app.session_token_usage(),
             )
             .await;
-        r
+        r.map(|(result, _)| (result, app.take_last_session_messages()))
     };
 
     match result {
-        Ok((result, _)) => {
-            if let Err(error) =
-                record_session_turn(&task.registry, &task.key, &task.message, &result.response)
-            {
+        Ok((_result, session_messages)) => {
+            if let Err(error) = task.registry.append_messages(&task.key, session_messages) {
                 let _ = send_sse_frame(
                     &task.sender,
                     &task.disconnected,
@@ -378,8 +374,8 @@ async fn process_and_route_session_message(
     message: &str,
     images: &[EncodedImage],
     context: Vec<Message>,
-) -> Result<(CycleResult, String), anyhow::Error> {
-    let result = {
+) -> Result<(CycleResult, String, Vec<SessionMessage>), anyhow::Error> {
+    let (result, session_messages) = {
         let mut app = state.app.lock().await;
         let (result, _) = app
             .process_message_with_context(
@@ -399,7 +395,8 @@ async fn process_and_route_session_message(
                 app.session_token_usage(),
             )
             .await;
-        result
+        let session_messages = app.take_last_session_messages();
+        (result, session_messages)
     };
 
     state
@@ -416,7 +413,7 @@ async fn process_and_route_session_message(
         .http
         .take_response()
         .unwrap_or_else(|| result.response.clone());
-    Ok((result, response))
+    Ok((result, response, session_messages))
 }
 
 fn create_session(
@@ -441,17 +438,6 @@ fn create_session(
 fn generate_session_key() -> anyhow::Result<SessionKey> {
     let uuid = Uuid::new_v4().simple().to_string();
     SessionKey::new(format!("sess-{}", &uuid[..8])).map_err(anyhow::Error::new)
-}
-
-fn record_session_turn(
-    registry: &SessionRegistry,
-    key: &SessionKey,
-    user_message: &str,
-    assistant_message: &str,
-) -> anyhow::Result<()> {
-    registry.record_message(key, MessageRole::User, user_message)?;
-    registry.record_message(key, MessageRole::Assistant, assistant_message)?;
-    Ok(())
 }
 
 async fn load_session_bus(state: &HttpState) -> Result<SessionBus, (StatusCode, Json<ErrorBody>)> {

@@ -25,14 +25,20 @@ use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::cancellation::CancellationToken;
-use fx_kernel::loop_engine::{LoopEngine, LoopResult};
+use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{valid_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
+use fx_llm::{
+    valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
+    ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
+    StreamCallback as ProviderStreamCallback,
+};
 use fx_memory::SignalStore;
-use fx_session::SessionKey;
+use fx_session::{
+    MessageRole as SessionRecordRole, SessionContentBlock, SessionKey, SessionMessage,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -242,6 +248,8 @@ pub struct HeadlessApp {
     error_history: VecDeque<ErrorRecord>,
     /// Cumulative token usage across all cycles in this session.
     cumulative_tokens: TokenUsage,
+    /// Structured messages recorded for the most recent completed turn.
+    last_session_messages: Vec<SessionMessage>,
     /// Shared callback slot for permission prompt SSE events.
     permission_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
@@ -269,6 +277,224 @@ pub struct HeadlessSubagentFactory {
 
 struct HeadlessSubagentSession {
     app: HeadlessApp,
+}
+
+#[derive(Debug, Clone)]
+struct RecordingLoopLlmProvider<T> {
+    inner: T,
+    collector: SessionTurnCollector,
+}
+
+impl<T> RecordingLoopLlmProvider<T> {
+    fn new(inner: T, collector: SessionTurnCollector) -> Self {
+        Self { inner, collector }
+    }
+}
+
+#[async_trait]
+impl<T> LoopLlmProvider for RecordingLoopLlmProvider<T>
+where
+    T: LoopLlmProvider,
+{
+    async fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, fx_core::error::LlmError> {
+        self.inner.generate(prompt, max_tokens).await
+    }
+
+    async fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, fx_core::error::LlmError> {
+        self.inner
+            .generate_streaming(prompt, max_tokens, callback)
+            .await
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.inner.complete(request).await?;
+        self.collector.record_response(&response);
+        Ok(response)
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionStream, ProviderError> {
+        self.inner.complete_stream(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: ProviderStreamCallback,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.inner.stream(request, callback).await?;
+        self.collector.record_response(&response);
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SessionTurnCollector {
+    responses: Arc<Mutex<Vec<CompletionResponse>>>,
+    tool_result_rounds: Arc<Mutex<Vec<Vec<SessionContentBlock>>>>,
+    pending_tool_results: Arc<Mutex<Vec<SessionContentBlock>>>,
+}
+
+impl SessionTurnCollector {
+    fn record_response(&self, response: &CompletionResponse) {
+        if let Ok(mut guard) = self.responses.lock() {
+            guard.push(response.clone());
+        }
+    }
+
+    fn callback(&self, forward: Option<StreamCallback>) -> StreamCallback {
+        let collector = self.clone();
+        Arc::new(move |event| {
+            collector.observe(&event);
+            if let Some(callback) = forward.as_ref() {
+                callback(event);
+            }
+        })
+    }
+
+    fn session_messages_for_turn(
+        &self,
+        user_text: &str,
+        images: &[ImageAttachment],
+        fallback_response: &str,
+    ) -> Vec<SessionMessage> {
+        self.flush_pending_tool_results();
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut messages = vec![SessionMessage::structured(
+            SessionRecordRole::User,
+            user_message_blocks(user_text, images),
+            timestamp,
+            None,
+        )];
+
+        let responses = self
+            .responses
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let rounds = self
+            .tool_result_rounds
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let mut round_iter = rounds.into_iter();
+        let mut assistant_message_count = 0usize;
+
+        for response in responses {
+            if response.content.is_empty() {
+                continue;
+            }
+
+            let blocks = response
+                .content
+                .into_iter()
+                .map(SessionContentBlock::from)
+                .collect::<Vec<_>>();
+            let has_tool_use = blocks
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+            let token_count = response
+                .usage
+                .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens));
+            messages.push(SessionMessage::structured(
+                SessionRecordRole::Assistant,
+                blocks,
+                timestamp,
+                token_count,
+            ));
+            assistant_message_count = assistant_message_count.saturating_add(1);
+
+            if has_tool_use {
+                if let Some(tool_results) = round_iter.next() {
+                    if !tool_results.is_empty() {
+                        messages.push(SessionMessage::structured(
+                            SessionRecordRole::Tool,
+                            tool_results,
+                            timestamp,
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if assistant_message_count == 0 {
+            messages.push(SessionMessage::structured(
+                SessionRecordRole::Assistant,
+                vec![SessionContentBlock::Text {
+                    text: fallback_response.to_string(),
+                }],
+                timestamp,
+                None,
+            ));
+        }
+
+        messages
+    }
+
+    fn observe(&self, event: &StreamEvent) {
+        match event {
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallComplete { .. } => {
+                self.flush_pending_tool_results();
+            }
+            StreamEvent::ToolResult {
+                id,
+                output,
+                is_error,
+            } => {
+                if let Ok(mut guard) = self.pending_tool_results.lock() {
+                    guard.push(SessionContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: serde_json::Value::String(if *is_error {
+                            format!("[ERROR] {output}")
+                        } else {
+                            output.clone()
+                        }),
+                    });
+                }
+            }
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+                self.flush_pending_tool_results();
+            }
+            StreamEvent::TextDelta { .. }
+            | StreamEvent::PermissionPrompt(_)
+            | StreamEvent::PhaseChange { .. } => {}
+        }
+    }
+
+    fn flush_pending_tool_results(&self) {
+        let Ok(mut pending) = self.pending_tool_results.lock() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        if let Ok(mut rounds) = self.tool_result_rounds.lock() {
+            rounds.push(std::mem::take(&mut *pending));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -406,6 +632,7 @@ impl HeadlessApp {
             experiment_registry: deps.experiment_registry,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            last_session_messages: Vec::new(),
             permission_callback_slot: deps.permission_callback_slot,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
@@ -605,17 +832,8 @@ impl HeadlessApp {
         images: &[ImageAttachment],
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.clear_startup_warnings();
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot_with_images(input, source, images);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle(snapshot, &llm)
+        self.run_cycle_result_with_images(input, images, source, None)
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     pub async fn process_message_with_context(
@@ -690,6 +908,10 @@ impl HeadlessApp {
 
     pub fn session_bus(&self) -> Option<&SessionBus> {
         self.session_bus.as_ref()
+    }
+
+    pub fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+        std::mem::take(&mut self.last_session_messages)
     }
 
     pub fn cron_store(&self) -> Option<&fx_cron::SharedCronStore> {
@@ -1016,17 +1238,8 @@ impl HeadlessApp {
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.clear_startup_warnings();
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle(snapshot, &llm)
+        self.run_cycle_result_with_images(input, &[], source, None)
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     async fn run_cycle_result_streaming(
@@ -1035,21 +1248,8 @@ impl HeadlessApp {
         source: &InputSource,
         callback: StreamCallback,
     ) -> Result<CycleResult, anyhow::Error> {
-        let callback = headless_stream_callback(callback);
-        // Set permission prompt callback for this cycle so SSE events fire
-        self.set_permission_callback(Some(Arc::clone(&callback)));
-        self.emit_startup_warnings(Some(&callback));
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle_streaming(snapshot, &llm, Some(callback))
+        self.run_cycle_result_with_images(input, &[], source, Some(callback))
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.set_permission_callback(None); // Clear after cycle
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     fn report_stream_error(event: &StreamEvent) {
@@ -1064,7 +1264,18 @@ impl HeadlessApp {
         }
     }
 
+    #[allow(dead_code)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
+        self.finalize_cycle_with_turn_messages(input, &[], result, None)
+    }
+
+    fn finalize_cycle_with_turn_messages(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        result: &LoopResult,
+        collector: Option<&SessionTurnCollector>,
+    ) -> CycleResult {
         let response = extract_response_text(result);
         let result_kind = extract_result_kind(result);
         let iterations = extract_iterations(result);
@@ -1080,7 +1291,10 @@ impl HeadlessApp {
         self.last_signals = result.signals().to_vec();
         let signals = self.last_signals.clone();
         persist_headless_signals(self, &signals);
-        self.record_turn(input, &response);
+        let session_messages = collector
+            .map(|collector| collector.session_messages_for_turn(input, images, &response))
+            .unwrap_or_else(|| text_turn_messages(input, &response));
+        self.record_session_turn_messages(session_messages);
         CycleResult {
             response,
             model: self.active_model.clone(),
@@ -1088,6 +1302,41 @@ impl HeadlessApp {
             tokens_used,
             result_kind,
         }
+    }
+
+    async fn run_cycle_result_with_images(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.last_session_messages.clear();
+        self.clear_startup_warnings();
+        let callback = callback.map(headless_stream_callback);
+        let collector = SessionTurnCollector::default();
+        let combined_callback = collector.callback(callback);
+        // Set permission prompt callback for this cycle so SSE events fire
+        self.set_permission_callback(Some(Arc::clone(&combined_callback)));
+        self.emit_startup_warnings(Some(&combined_callback));
+        self.update_memory_context(input);
+        let snapshot = if images.is_empty() {
+            self.build_perception_snapshot(input, source)
+        } else {
+            self.build_perception_snapshot_with_images(input, source, images)
+        };
+        let llm = RecordingLoopLlmProvider::new(
+            RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone()),
+            collector.clone(),
+        );
+        let result = self
+            .loop_engine
+            .run_cycle_streaming(snapshot, &llm, Some(combined_callback))
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.set_permission_callback(None);
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle_with_turn_messages(input, images, &result, Some(&collector)))
     }
 
     fn set_permission_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
@@ -1190,11 +1439,15 @@ impl HeadlessApp {
         }
     }
 
+    #[allow(dead_code)]
     fn record_turn(&mut self, user_text: &str, assistant_text: &str) {
+        self.record_session_turn_messages(text_turn_messages(user_text, assistant_text));
+    }
+
+    fn record_session_turn_messages(&mut self, session_messages: Vec<SessionMessage>) {
+        self.last_session_messages = session_messages.clone();
         self.conversation_history
-            .push(Message::user(user_text.to_string()));
-        self.conversation_history
-            .push(Message::assistant(assistant_text.to_string()));
+            .extend(session_messages.iter().map(SessionMessage::to_llm_message));
         trim_history(&mut self.conversation_history, self.max_history);
     }
 
@@ -1218,6 +1471,44 @@ impl HeadlessApp {
         }
         Ok(models)
     }
+}
+
+fn user_message_blocks(user_text: &str, images: &[ImageAttachment]) -> Vec<SessionContentBlock> {
+    let mut blocks = images
+        .iter()
+        .map(|image| SessionContentBlock::Image {
+            media_type: image.media_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !user_text.is_empty() {
+        blocks.push(SessionContentBlock::Text {
+            text: user_text.to_string(),
+        });
+    }
+    blocks
+}
+
+fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessage> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    vec![
+        SessionMessage::structured(
+            SessionRecordRole::User,
+            user_message_blocks(user_text, &[]),
+            timestamp,
+            None,
+        ),
+        SessionMessage::structured(
+            SessionRecordRole::Assistant,
+            vec![SessionContentBlock::Text {
+                text: assistant_text.to_string(),
+            }],
+            timestamp,
+            None,
+        ),
+    ]
 }
 
 #[cfg(feature = "http")]
@@ -1358,6 +1649,10 @@ impl AppEngine for HeadlessApp {
             self.cumulative_tokens.input_tokens,
             self.cumulative_tokens.output_tokens,
         )
+    }
+
+    fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+        HeadlessApp::take_last_session_messages(self)
     }
 }
 
@@ -2323,6 +2618,7 @@ async fn process_command_input(
     app: &mut HeadlessApp,
     input: &str,
 ) -> Result<CycleResult, anyhow::Error> {
+    app.last_session_messages.clear();
     let parsed = parse_command(input);
     let response = match execute_headless_async_command(app, &parsed).await? {
         Some(response) => response,
@@ -2694,6 +2990,7 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            last_session_messages: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
@@ -2769,6 +3066,64 @@ mod tests {
             .usage
             .expect("mock response should include usage");
         u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
+    }
+
+    #[test]
+    fn session_turn_collector_builds_structured_turn_messages() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![
+                fx_llm::ContentBlock::Text {
+                    text: "Let me check.".to_string(),
+                },
+                fx_llm::ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_1".to_string(),
+            output: "file contents".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn("open the readme", &[], "fallback");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(15));
+        assert_eq!(messages[3].token_count, Some(10));
+        assert!(messages[1].content.iter().any(
+            |block| matches!(block, SessionContentBlock::ToolUse { id, .. } if id == "call_1")
+        ));
+        assert!(
+            messages[2]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
+        );
     }
 
     fn test_router() -> SharedModelRouter {
@@ -3244,6 +3599,7 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            last_session_messages: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
@@ -3713,6 +4069,7 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            last_session_messages: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
@@ -3761,6 +4118,7 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
+            last_session_messages: Vec::new(),
             permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),

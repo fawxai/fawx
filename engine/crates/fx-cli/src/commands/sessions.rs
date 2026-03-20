@@ -2,7 +2,9 @@ use crate::startup::fawx_data_dir;
 use anyhow::anyhow;
 use chrono::{TimeZone, Utc};
 use clap::Args;
-use fx_session::{SessionInfo, SessionKey, SessionKind, SessionMessage, SessionRegistry};
+use fx_session::{
+    SessionContentBlock, SessionInfo, SessionKey, SessionKind, SessionMessage, SessionRegistry,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -197,12 +199,40 @@ fn format_message_count(export: &SessionExport) -> String {
 }
 
 fn format_message_block(message: &SessionMessage) -> String {
+    let token_suffix = message
+        .token_count
+        .map(|count| format!(" | {count} tokens"))
+        .unwrap_or_default();
     format!(
-        "[{}] {}\n{}",
+        "[{}] {}{}\n{}",
         message.role,
         format_second_timestamp(message.timestamp),
-        message.content
+        token_suffix,
+        render_message_content(message)
     )
+}
+
+fn render_message_content(message: &SessionMessage) -> String {
+    message
+        .content
+        .iter()
+        .map(render_content_block)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_content_block(block: &SessionContentBlock) -> String {
+    match block {
+        SessionContentBlock::Text { text } => text.clone(),
+        SessionContentBlock::ToolUse { id, name, input } => {
+            format!("[tool_use:{name}#{id}] {input}")
+        }
+        SessionContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => format!("[tool_result:{tool_use_id}] {content}"),
+        SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
+    }
 }
 
 fn truncate_cell(text: &str, max_chars: usize) -> String {
@@ -361,10 +391,55 @@ mod tests {
         let contents = export
             .messages
             .iter()
-            .map(|message| message.content.as_str())
+            .map(render_message_content)
             .collect::<Vec<_>>();
 
         assert_eq!(contents, vec!["second", "third"]);
+    }
+
+    #[test]
+    fn export_renders_structured_tool_messages() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let registry = test_registry(&temp_dir);
+        let key = create_session(&registry, "tool-1", SessionKind::Main, Some("primary"));
+        registry
+            .record_message_blocks(
+                &key,
+                MessageRole::Assistant,
+                vec![
+                    SessionContentBlock::Text {
+                        text: "Let me check.".to_string(),
+                    },
+                    SessionContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    },
+                ],
+                Some(17),
+            )
+            .expect("record tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("file contents"),
+                }],
+                None,
+            )
+            .expect("record tool result");
+        drop(registry);
+
+        let export = load_session_export_from(&db_path(&temp_dir), "tool-1", None).expect("export");
+        let rendered = render_export_text(&export);
+
+        assert!(rendered.contains("[assistant]"));
+        assert!(rendered.contains("| 17 tokens"));
+        assert!(rendered.contains("[tool_use:read_file#call_1]"));
+        assert!(rendered.contains("[tool_result:call_1]"));
+        assert!(rendered.contains("[tool]"));
     }
 
     #[test]

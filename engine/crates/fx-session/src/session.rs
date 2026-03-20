@@ -3,8 +3,67 @@
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
 };
+use fx_llm::{ContentBlock, Message};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A structured content block stored in session history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionContentBlock {
+    /// Plain text content.
+    Text { text: String },
+    /// Tool invocation requested by the assistant.
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Tool output associated with a prior tool invocation.
+    ToolResult { tool_use_id: String, content: Value },
+    /// Marker indicating an image was part of the message.
+    Image { media_type: String },
+}
+
+impl From<ContentBlock> for SessionContentBlock {
+    fn from(block: ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => Self::Text { text },
+            ContentBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+            },
+            ContentBlock::Image { media_type, .. } => Self::Image { media_type },
+        }
+    }
+}
+
+impl From<SessionContentBlock> for ContentBlock {
+    fn from(block: SessionContentBlock) -> Self {
+        match block {
+            SessionContentBlock::Text { text } => Self::Text { text },
+            SessionContentBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            SessionContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+            },
+            // Image payloads are intentionally not persisted; replay them as
+            // a readable marker so later turns retain the fact that vision was used.
+            SessionContentBlock::Image { media_type } => Self::Text {
+                text: format!("[image:{media_type}]"),
+            },
+        }
+    }
+}
 
 /// A single conversation message within a session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -12,9 +71,55 @@ pub struct SessionMessage {
     /// Who produced this message.
     pub role: MessageRole,
     /// Message content.
-    pub content: String,
+    #[serde(deserialize_with = "deserialize_content")]
+    pub content: Vec<SessionContentBlock>,
     /// Unix epoch seconds when the message was recorded.
     pub timestamp: u64,
+    /// Tokens consumed to produce this message, when known.
+    #[serde(default)]
+    pub token_count: Option<u32>,
+}
+
+impl SessionMessage {
+    /// Build a text-only session message.
+    pub fn text(role: MessageRole, content: impl Into<String>, timestamp: u64) -> Self {
+        Self {
+            role,
+            content: vec![SessionContentBlock::Text {
+                text: content.into(),
+            }],
+            timestamp,
+            token_count: None,
+        }
+    }
+
+    /// Build a structured session message.
+    pub fn structured(
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        timestamp: u64,
+        token_count: Option<u32>,
+    ) -> Self {
+        Self {
+            role,
+            content,
+            timestamp,
+            token_count,
+        }
+    }
+
+    /// Convert the stored message into an LLM history message.
+    pub fn to_llm_message(&self) -> Message {
+        Message {
+            role: self.role.into(),
+            content: self.content.clone().into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Return a readable text representation of the structured content.
+    pub fn render_text(&self) -> String {
+        render_content_blocks(&self.content)
+    }
 }
 
 /// Persistent session state: metadata + conversation history.
@@ -56,13 +161,38 @@ impl Session {
 
     /// Append a message and update the timestamp.
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) {
-        let now = current_epoch_secs();
-        self.messages.push(SessionMessage {
+        self.add_message_blocks(
             role,
-            content: content.into(),
-            timestamp: now,
-        });
+            vec![SessionContentBlock::Text {
+                text: content.into(),
+            }],
+            None,
+        );
+    }
+
+    /// Append a structured message and update the timestamp.
+    pub fn add_message_blocks(
+        &mut self,
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        token_count: Option<u32>,
+    ) {
+        let now = current_epoch_secs();
+        self.messages
+            .push(SessionMessage::structured(role, content, now, token_count));
         self.updated_at = now;
+    }
+
+    /// Append already-constructed messages and update the timestamp once.
+    pub fn extend_messages(&mut self, messages: impl IntoIterator<Item = SessionMessage>) {
+        let mut appended_any = false;
+        for message in messages {
+            self.messages.push(message);
+            appended_any = true;
+        }
+        if appended_any {
+            self.updated_at = current_epoch_secs();
+        }
     }
 
     /// Remove all recorded messages and update the timestamp.
@@ -97,13 +227,52 @@ impl Session {
         self.messages
             .iter()
             .find(|message| message.role == MessageRole::User)
-            .map(|message| truncate_text(&message.content, 80))
+            .map(|message| truncate_text(&message.render_text(), 80))
     }
 
     fn compute_preview(&self) -> Option<String> {
         self.messages
             .last()
-            .map(|message| truncate_text(&message.content, 120))
+            .map(|message| truncate_text(&message.render_text(), 120))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContentField {
+    Blocks(Vec<SessionContentBlock>),
+    LegacyText(String),
+}
+
+fn deserialize_content<'de, D>(deserializer: D) -> Result<Vec<SessionContentBlock>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match ContentField::deserialize(deserializer)? {
+        ContentField::Blocks(blocks) => Ok(blocks),
+        ContentField::LegacyText(text) => Ok(vec![SessionContentBlock::Text { text }]),
+    }
+}
+
+fn render_content_blocks(blocks: &[SessionContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(render_content_block)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_content_block(block: &SessionContentBlock) -> String {
+    match block {
+        SessionContentBlock::Text { text } => text.clone(),
+        SessionContentBlock::ToolUse { name, input, .. } => {
+            format!("[tool_use:{name}] {input}")
+        }
+        SessionContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => format!("[tool_result:{tool_use_id}] {content}"),
+        SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
     }
 }
 
@@ -128,6 +297,7 @@ fn current_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn test_config() -> SessionConfig {
         SessionConfig {
@@ -161,7 +331,12 @@ mod tests {
         assert_eq!(session.messages.len(), 1);
         assert!(session.updated_at >= before);
         assert_eq!(session.messages[0].role, MessageRole::User);
-        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(
+            session.messages[0].content,
+            vec![SessionContentBlock::Text {
+                text: "hello".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -176,8 +351,8 @@ mod tests {
         }
         let recent = session.recent_messages(3);
         assert_eq!(recent.len(), 3);
-        assert_eq!(recent[0].content, "msg-7");
-        assert_eq!(recent[2].content, "msg-9");
+        assert_eq!(recent[0].render_text(), "msg-7");
+        assert_eq!(recent[2].render_text(), "msg-9");
     }
 
     #[test]
@@ -279,6 +454,118 @@ mod tests {
         assert_eq!(restored.key, session.key);
         assert_eq!(restored.kind, session.kind);
         assert_eq!(restored.messages.len(), 1);
-        assert_eq!(restored.messages[0].content, "init");
+        assert_eq!(restored.messages[0].render_text(), "init");
+    }
+
+    #[test]
+    fn session_message_round_trips_mixed_structured_content() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::Text {
+                    text: "Let me check.".to_string(),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "README.md"}),
+                },
+                SessionContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                },
+            ],
+            123,
+            Some(42),
+        );
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored, message);
+    }
+
+    #[test]
+    fn session_message_deserializes_legacy_string_content() {
+        let json = r#"{"role":"user","content":"hello","timestamp":123}"#;
+
+        let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(
+            restored.content,
+            vec![SessionContentBlock::Text {
+                text: "hello".to_string()
+            }]
+        );
+        assert_eq!(restored.token_count, None);
+    }
+
+    #[test]
+    fn session_content_block_converts_to_and_from_llm_content() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "hello".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: json!({"q": "weather"}),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!("sunny"),
+            },
+            ContentBlock::Image {
+                media_type: "image/jpeg".to_string(),
+                data: "ZmFrZQ==".to_string(),
+            },
+        ];
+
+        let stored = blocks
+            .clone()
+            .into_iter()
+            .map(SessionContentBlock::from)
+            .collect::<Vec<_>>();
+        let restored = stored
+            .iter()
+            .cloned()
+            .map(ContentBlock::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stored[0],
+            SessionContentBlock::Text {
+                text: "hello".to_string()
+            }
+        );
+        assert_eq!(restored[0], blocks[0]);
+        assert_eq!(restored[1], blocks[1]);
+        assert_eq!(restored[2], blocks[2]);
+        assert_eq!(
+            restored[3],
+            ContentBlock::Text {
+                text: "[image:image/jpeg]".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn token_count_round_trips_and_defaults_for_legacy_messages() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![SessionContentBlock::Text {
+                text: "usage".to_string(),
+            }],
+            123,
+            Some(99),
+        );
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.token_count, Some(99));
+
+        let legacy: SessionMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"old","timestamp":1}"#)
+                .expect("legacy deserialize");
+        assert_eq!(legacy.token_count, None);
     }
 }
