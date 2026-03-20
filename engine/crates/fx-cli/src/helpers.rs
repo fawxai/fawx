@@ -9,6 +9,7 @@ use fx_llm::{
 };
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::{Arc, RwLock};
 
 fn highest_version_model(model_ids: &[String]) -> Option<&str> {
     model_ids
@@ -124,6 +125,48 @@ pub(crate) fn available_provider_names(router: &ModelRouter) -> Vec<String> {
     providers
 }
 
+pub(crate) type SharedModelRouter = Arc<RwLock<ModelRouter>>;
+
+pub(crate) fn read_router<T>(router: &SharedModelRouter, op: impl FnOnce(&ModelRouter) -> T) -> T {
+    match router.read() {
+        Ok(guard) => op(&guard),
+        Err(error) => {
+            tracing::warn!(error = %error, "router lock poisoned");
+            let guard = error.into_inner();
+            op(&guard)
+        }
+    }
+}
+
+pub(crate) fn write_router<T>(
+    router: &SharedModelRouter,
+    op: impl FnOnce(&mut ModelRouter) -> T,
+) -> T {
+    match router.write() {
+        Ok(mut guard) => op(&mut guard),
+        Err(error) => {
+            tracing::warn!(error = %error, "router lock poisoned");
+            let mut guard = error.into_inner();
+            op(&mut guard)
+        }
+    }
+}
+
+pub(crate) async fn fetch_shared_available_models(router: &SharedModelRouter) -> Vec<ModelInfo> {
+    let catalog = read_router(router, ModelRouter::provider_catalog);
+    fx_llm::fetch_available_models_from_catalog(catalog).await
+}
+
+fn prepare_router_request(
+    router: &SharedModelRouter,
+    active_model: &str,
+    request: CompletionRequest,
+) -> Result<(Arc<dyn fx_llm::CompletionProvider>, CompletionRequest), ProviderError> {
+    read_router(router, |router| {
+        router.request_for_model(active_model, request)
+    })
+}
+
 /// Convert a thinking budget level into a provider-specific [`ThinkingConfig`].
 ///
 /// Uses the active model ID to determine the correct wire format:
@@ -165,12 +208,12 @@ pub(crate) fn format_memory_for_prompt(
 }
 
 /// Thin wrapper to expose `ModelRouter` as a `CompletionProvider` for analysis.
-pub(crate) struct AnalysisCompletionProvider<'a> {
-    router: &'a ModelRouter,
+pub(crate) struct AnalysisCompletionProvider {
+    router: SharedModelRouter,
     active_model: String,
 }
 
-impl<'a> fmt::Debug for AnalysisCompletionProvider<'a> {
+impl fmt::Debug for AnalysisCompletionProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnalysisCompletionProvider")
             .field("active_model", &self.active_model)
@@ -178,36 +221,38 @@ impl<'a> fmt::Debug for AnalysisCompletionProvider<'a> {
     }
 }
 
-impl<'a> AnalysisCompletionProvider<'a> {
-    pub(crate) fn new(router: &'a ModelRouter, active_model: String) -> Self {
+impl AnalysisCompletionProvider {
+    pub(crate) fn new(router: SharedModelRouter, active_model: String) -> Self {
         Self {
             router,
             active_model,
         }
     }
 
-    fn with_active_model(&self, mut request: CompletionRequest) -> CompletionRequest {
-        request.model = self.active_model.clone();
-        request
+    fn route_request(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<(Arc<dyn fx_llm::CompletionProvider>, CompletionRequest), ProviderError> {
+        prepare_router_request(&self.router, &self.active_model, request)
     }
 }
 
 #[async_trait]
-impl fx_llm::CompletionProvider for AnalysisCompletionProvider<'_> {
+impl fx_llm::CompletionProvider for AnalysisCompletionProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
     ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
-        self.router.complete(self.with_active_model(request)).await
+        let (provider, request) = self.route_request(request)?;
+        provider.complete(request).await
     }
 
     async fn complete_stream(
         &self,
         request: CompletionRequest,
     ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
-        self.router
-            .complete_stream(self.with_active_model(request))
-            .await
+        let (provider, request) = self.route_request(request)?;
+        provider.complete_stream(request).await
     }
 
     fn name(&self) -> &str {
@@ -226,12 +271,12 @@ impl fx_llm::CompletionProvider for AnalysisCompletionProvider<'_> {
     }
 }
 
-pub(crate) struct RouterLoopLlmProvider<'a> {
-    router: &'a ModelRouter,
+pub(crate) struct RouterLoopLlmProvider {
+    router: SharedModelRouter,
     active_model: String,
 }
 
-impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
+impl fmt::Debug for RouterLoopLlmProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RouterLoopLlmProvider")
             .field("active_model", &self.active_model)
@@ -239,17 +284,24 @@ impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
     }
 }
 
-impl<'a> RouterLoopLlmProvider<'a> {
-    pub(crate) fn new(router: &'a ModelRouter, active_model: String) -> Self {
+impl RouterLoopLlmProvider {
+    pub(crate) fn new(router: SharedModelRouter, active_model: String) -> Self {
         Self {
             router,
             active_model,
         }
     }
+
+    fn route_request(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<(Arc<dyn fx_llm::CompletionProvider>, CompletionRequest), ProviderError> {
+        prepare_router_request(&self.router, &self.active_model, request)
+    }
 }
 
 #[async_trait]
-impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
+impl LoopLlmProvider for RouterLoopLlmProvider {
     async fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, CoreLlmError> {
         let request = CompletionRequest {
             model: self.active_model.clone(),
@@ -261,8 +313,10 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             thinking: None,
         };
 
-        let mut stream = self
-            .router
+        let (provider, request) = self
+            .route_request(request)
+            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+        let mut stream = provider
             .complete_stream(request)
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
@@ -294,8 +348,10 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             thinking: None,
         };
 
-        let mut stream = self
-            .router
+        let (provider, request) = self
+            .route_request(request)
+            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+        let mut stream = provider
             .complete_stream(request)
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
@@ -314,14 +370,16 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         &self,
         request: CompletionRequest,
     ) -> Result<fx_llm::CompletionResponse, ProviderError> {
-        self.router.complete(request).await
+        let (provider, request) = self.route_request(request)?;
+        provider.complete(request).await
     }
 
     async fn complete_stream(
         &self,
         request: CompletionRequest,
     ) -> Result<fx_llm::CompletionStream, ProviderError> {
-        self.router.complete_stream(request).await
+        let (provider, request) = self.route_request(request)?;
+        provider.complete_stream(request).await
     }
 
     async fn stream(
@@ -329,7 +387,8 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         request: CompletionRequest,
         callback: StreamCallback,
     ) -> Result<fx_llm::CompletionResponse, ProviderError> {
-        self.router.stream(request, callback).await
+        let (provider, request) = self.route_request(request)?;
+        provider.stream(request, callback).await
     }
 
     fn model_name(&self) -> &str {
@@ -408,7 +467,11 @@ mod tests {
     use futures::stream;
     use fx_config::ThinkingBudget;
     use fx_llm::{CompletionProvider, CompletionResponse, CompletionStream, ProviderCapabilities};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    fn shared_router(router: ModelRouter) -> SharedModelRouter {
+        Arc::new(RwLock::new(router))
+    }
 
     #[derive(Debug)]
     struct ModelEchoProvider {
@@ -619,6 +682,41 @@ mod tests {
     }
 
     #[test]
+    fn write_router_updates_shared_router() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "OpenAI".to_string(),
+            models: vec!["gpt-5.4".to_string()],
+        }));
+        let router = shared_router(router);
+
+        write_router(&router, |router| {
+            router.set_active("gpt-5.4").expect("set active");
+        });
+
+        let active_model = read_router(&router, |router| {
+            router.active_model().map(ToString::to_string)
+        });
+        assert_eq!(active_model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[tokio::test]
+    async fn fetch_shared_available_models_reads_from_shared_router() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "Anthropic".to_string(),
+            models: vec!["claude-opus-4-6".to_string()],
+        }));
+        let router = shared_router(router);
+
+        let models = fetch_shared_available_models(&router).await;
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "claude-opus-4-6");
+        assert_eq!(models[0].provider_name, "Anthropic");
+    }
+
+    #[test]
     fn trim_history_drops_oldest_messages() {
         let mut history = vec![
             Message::user("q1"),
@@ -642,7 +740,9 @@ mod tests {
         }));
         router.set_active("claude-opus-4-6").expect("active model");
 
-        let provider = RouterLoopLlmProvider::new(&router, "claude-opus-4-6".to_string());
+        let router = shared_router(router);
+        let provider =
+            RouterLoopLlmProvider::new(Arc::clone(&router), "claude-opus-4-6".to_string());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let callback_seen = Arc::clone(&seen);
 

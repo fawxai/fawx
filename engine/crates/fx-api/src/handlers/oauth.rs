@@ -110,7 +110,7 @@ pub async fn handle_oauth_callback(
         })?;
     let expires_in = token_response.expires_in;
 
-    store_oauth_credential(&state, &provider, token_response)?;
+    store_oauth_credential(&state, &provider, token_response).await?;
     tracing::info!(provider = %provider, expires_in, "OAuth authentication successful");
 
     Ok(Json(OAuthCallbackResponse {
@@ -136,7 +136,7 @@ pub async fn handle_oauth_refresh(
             bad_gateway(error)
         })?;
     let expires_in = token_response.expires_in;
-    store_oauth_credential(&state, &provider, token_response)?;
+    store_oauth_credential(&state, &provider, token_response).await?;
     let expires_at = expires_at_ms(expires_in).map_err(internal_error)?;
     tracing::info!(provider = %provider, "OAuth token refreshed successfully");
 
@@ -239,13 +239,13 @@ async fn token_exchange_error_body(response: reqwest::Response) -> String {
     }
 }
 
-fn store_oauth_credential(
+async fn store_oauth_credential(
     state: &HttpState,
     provider: &str,
     token_response: TokenResponse,
 ) -> HandlerResult<()> {
     let auth_method = oauth_auth_method(provider, token_response).map_err(internal_error)?;
-    save_auth_method(state, provider, auth_method)
+    save_auth_method(state, provider, auth_method).await
 }
 
 fn oauth_auth_method(provider: &str, token_response: TokenResponse) -> Result<AuthMethod, String> {

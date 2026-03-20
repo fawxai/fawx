@@ -74,7 +74,7 @@ use std::{
 pub use persisted_memory::persisted_memory_entry_count;
 
 struct HeadlessAppBuildConfig {
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     system_prompt: Option<PathBuf>,
@@ -97,7 +97,7 @@ pub fn build_headless_app_with_progress(
     let config = prepare_embedded_config(startup::load_config()?);
     let mut router = startup::build_router(&auth_manager)?;
     headless::seed_headless_router_active_model(&mut router, &config);
-    let router = Arc::new(router);
+    let router = Arc::new(std::sync::RwLock::new(router));
     let build_config = HeadlessAppBuildConfig {
         data_dir: configured_data_dir(&config),
         config_manager: Some(build_config_manager(&config)),
@@ -182,7 +182,7 @@ fn build_config_manager(
 }
 
 fn build_subagent_manager(
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     session_bus: Option<fx_bus::SessionBus>,

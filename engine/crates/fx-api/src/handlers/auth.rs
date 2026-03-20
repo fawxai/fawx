@@ -28,7 +28,8 @@ pub async fn handle_setup_token(
         fx_auth::auth::AuthMethod::SetupToken {
             token: request.setup_token,
         },
-    )?;
+    )
+    .await?;
 
     Ok(Json(SetupTokenResponse {
         provider: "anthropic".to_string(),
@@ -52,7 +53,8 @@ pub async fn handle_store_api_key(
             provider: provider.clone(),
             key: request.api_key,
         },
-    )?;
+    )
+    .await?;
 
     // NEVER echo the api_key back
     Ok(Json(ApiKeyResponse {
@@ -69,7 +71,7 @@ pub async fn handle_delete_provider(
     Path(provider): Path<String>,
 ) -> HandlerResult<Json<DeleteProviderResponse>> {
     // TODO: remove from credential store
-    delete_provider_auth(&state, &provider)?;
+    delete_provider_auth(&state, &provider).await?;
 
     Ok(Json(DeleteProviderResponse {
         provider,
@@ -277,7 +279,7 @@ fn current_unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-pub(super) fn save_auth_method(
+pub(super) async fn save_auth_method(
     state: &HttpState,
     provider: &str,
     auth_method: fx_auth::auth::AuthMethod,
@@ -287,10 +289,12 @@ pub(super) fn save_auth_method(
     auth_manager.store(provider, auth_method);
     store
         .save_auth_manager(&auth_manager)
-        .map_err(internal_error)
+        .map_err(internal_error)?;
+    reload_app_providers(state).await;
+    Ok(())
 }
 
-fn delete_provider_auth(
+async fn delete_provider_auth(
     state: &HttpState,
     provider: &str,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
@@ -299,7 +303,33 @@ fn delete_provider_auth(
     auth_manager.remove(provider);
     store
         .save_auth_manager(&auth_manager)
-        .map_err(internal_error)
+        .map_err(internal_error)?;
+    reload_app_providers(state).await;
+    Ok(())
+}
+
+async fn reload_app_providers(state: &HttpState) {
+    let snapshot = {
+        let mut app = state.app.lock().await;
+        match app.reload_providers() {
+            Ok(()) => Some((
+                app.active_model().to_owned(),
+                app.thinking_level(),
+                app.available_models(),
+            )),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to reload providers after auth change");
+                None
+            }
+        }
+    };
+
+    if let Some((active_model, thinking, models)) = snapshot {
+        state
+            .shared
+            .update_model(&active_model, &thinking, models)
+            .await;
+    }
 }
 
 fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {

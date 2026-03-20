@@ -38,7 +38,10 @@ pub use model_catalog::{CatalogModel, ModelCatalog};
 pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
-pub use router::{LlmRouter, ModelInfo, ModelRouter, RouterError, RoutingStrategy};
+pub use router::{
+    fetch_available_models_from_catalog, LlmRouter, ModelInfo, ModelRouter, ProviderCatalogEntry,
+    RouterError, RoutingStrategy,
+};
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
 pub use types::{

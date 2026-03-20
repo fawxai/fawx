@@ -228,11 +228,12 @@ fn build_subagent_runner(
 ) -> anyhow::Result<ExperimentRunner> {
     let auth_manager = crate::startup::load_auth_manager()?;
     let config = crate::startup::load_config()?;
-    let (router, _) = build_active_router(&auth_manager, &config)?;
     let improvement_provider = crate::startup::build_improvement_provider(&auth_manager, &config);
+    let subagent_router = crate::startup::build_router(&auth_manager)?;
+    let locked_router = Arc::new(std::sync::RwLock::new(subagent_router));
     let factory = crate::headless::HeadlessSubagentFactory::new(
         crate::headless::HeadlessSubagentFactoryDeps {
-            router: Arc::clone(&router),
+            router: locked_router,
             config: config.clone(),
             improvement_provider,
             session_bus: None,
