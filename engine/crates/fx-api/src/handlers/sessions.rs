@@ -19,7 +19,7 @@ use axum::Json;
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
-use fx_llm::Message;
+use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
     MessageRole, SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
     SessionRegistry, SessionStatus,
@@ -253,7 +253,12 @@ pub(crate) async fn handle_send_message_for_session(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let context = session_messages_to_context(&history);
+    let mut context = session_messages_to_context(&history);
+    let max_history = {
+        let app = state.app.lock().await;
+        app.max_history()
+    };
+    trim_conversation_history(&mut context, max_history);
 
     validate_message_text(&request.message)?;
     let images = validate_and_encode_images(&request.images)?;

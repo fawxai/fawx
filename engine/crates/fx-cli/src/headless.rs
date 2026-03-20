@@ -368,6 +368,10 @@ impl HeadlessApp {
             bus_receiver,
         };
         app.seed_runtime_info();
+        if !app.active_model.is_empty() {
+            app.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
+        }
         app.record_startup_warning_history();
         Ok(app)
     }
@@ -907,6 +911,8 @@ impl HeadlessApp {
 
         if let Some(active_model) = active_model {
             self.active_model = active_model.clone();
+            self.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
             if self.config.model.default_model.is_none() {
                 self.config.model.default_model = Some(active_model);
             }
@@ -925,6 +931,8 @@ impl HeadlessApp {
         if let Some(active_model) = next_active_model {
             router.set_active(&active_model)?;
             self.active_model = active_model;
+            self.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
         } else {
             self.active_model.clear();
         }
@@ -1287,6 +1295,10 @@ impl AppEngine for HeadlessApp {
                 recoverable: record.recoverable,
             })
             .collect()
+    }
+
+    fn max_history(&self) -> usize {
+        self.max_history
     }
 
     fn session_token_usage(&self) -> (u64, u64) {
@@ -1844,6 +1856,8 @@ fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
         app.record_error(ErrorCategory::System, message, true);
     }
     app.active_model = model.to_string();
+    app.loop_engine
+        .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
 }
 
 fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {

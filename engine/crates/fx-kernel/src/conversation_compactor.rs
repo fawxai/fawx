@@ -703,7 +703,7 @@ impl CompactionConfig {
                 ));
             }
 
-            tracing::warn!(
+            tracing::info!(
                 "use_summarization=true but no llm provider available; falling back to SlidingWindowCompactor"
             );
         }
@@ -720,7 +720,7 @@ impl Default for CompactionConfig {
             model_context_limit: 128_000,
             reserved_system_tokens: 2_000,
             recompact_cooldown_turns: 2,
-            use_summarization: false,
+            use_summarization: true,
             max_summary_tokens: SummarizingCompactor::DEFAULT_MAX_SUMMARY_TOKENS,
         }
     }
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(config.model_context_limit, 128_000);
         assert_eq!(config.reserved_system_tokens, 2_000);
         assert_eq!(config.recompact_cooldown_turns, 2);
-        assert!(!config.use_summarization);
+        assert!(config.use_summarization);
         assert_eq!(config.max_summary_tokens, 1_024);
     }
 

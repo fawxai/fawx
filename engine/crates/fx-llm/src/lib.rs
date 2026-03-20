@@ -39,8 +39,8 @@ pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 pub use router::{
-    fetch_available_models_from_catalog, LlmRouter, ModelInfo, ModelRouter, ProviderCatalogEntry,
-    RouterError, RoutingStrategy,
+    context_window_for_model, fetch_available_models_from_catalog, LlmRouter, ModelInfo,
+    ModelRouter, ProviderCatalogEntry, RouterError, RoutingStrategy,
 };
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
@@ -51,7 +51,16 @@ pub use types::{
     THINKING_BUDGET_LOW,
 };
 
-/// Thinking levels supported by a provider/model family.
+/// Trim a conversation history to the most recent `max_history` messages,
+/// dropping the oldest messages first.
+pub fn trim_conversation_history(history: &mut Vec<Message>, max_history: usize) {
+    if history.len() > max_history {
+        let remove_count = history.len() - max_history;
+        history.drain(0..remove_count);
+    }
+}
+
+/// Return the supported thinking levels for a given provider.
 pub fn supported_thinking_levels(provider: &str) -> Vec<String> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => vec!["off", "low", "adaptive", "high"],
@@ -164,5 +173,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn trim_conversation_history_drops_oldest() {
+        let mut history = vec![
+            Message::user("first"),
+            Message::assistant("second"),
+            Message::user("third"),
+            Message::assistant("fourth"),
+            Message::user("fifth"),
+        ];
+        trim_conversation_history(&mut history, 3);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], Message::user("third"));
+        assert_eq!(history[2], Message::user("fifth"));
+    }
+
+    #[test]
+    fn trim_conversation_history_noop_when_under_limit() {
+        let mut history = vec![Message::user("only")];
+        trim_conversation_history(&mut history, 10);
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn trim_conversation_history_noop_when_at_limit() {
+        let mut history = vec![Message::user("a"), Message::user("b")];
+        trim_conversation_history(&mut history, 2);
+        assert_eq!(history.len(), 2);
     }
 }

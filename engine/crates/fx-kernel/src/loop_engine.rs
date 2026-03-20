@@ -1023,6 +1023,17 @@ impl LoopEngine {
         &self.conversation_budget
     }
 
+    /// Update the context limit when the active model changes.
+    /// Rebuilds the conversation budget from the updated config to prevent drift.
+    pub fn update_context_limit(&mut self, new_limit: usize) {
+        self.compaction_config.model_context_limit = new_limit;
+        self.conversation_budget = ConversationBudget::new(
+            self.compaction_config.model_context_limit,
+            self.compaction_config.compaction_threshold,
+            self.compaction_config.reserved_system_tokens,
+        );
+    }
+
     /// Synchronise the shared iteration counter and refresh scratchpad context.
     ///
     /// Called at each iteration boundary so `ScratchpadSkill` stamps entries
