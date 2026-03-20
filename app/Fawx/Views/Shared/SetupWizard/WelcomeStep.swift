@@ -13,7 +13,8 @@ struct WelcomeStep: View {
                         .resizable()
                         .interpolation(.high)
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: 120, height: 120)
+                        .frame(width: 200, height: 200)
+                        .frame(width: 200, height: 200)
 
                     Text("Welcome to Fawx")
                         .font(.system(size: 28, weight: .bold))
