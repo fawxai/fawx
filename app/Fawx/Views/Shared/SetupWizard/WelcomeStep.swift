@@ -12,9 +12,8 @@ struct WelcomeStep: View {
                     Image("FawxLogo")
                         .resizable()
                         .interpolation(.high)
-                        .antialiased(true)
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: 80, height: 80)
+                        .frame(width: 120, height: 120)
 
                     Text("Welcome to Fawx")
                         .font(.system(size: 28, weight: .bold))
