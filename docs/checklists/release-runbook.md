@@ -15,7 +15,8 @@ gh pr create --base staging --head dev --title "Release vX.Y.Z" --body "Release 
 # 2. Build + sign + notarize DMG from staging
 git checkout staging && git pull origin staging
 ./scripts/build-dmg.sh --release --identity "Developer ID Application: Tkrm Ltd. (K8HJF9QW7N)"
-# Output: build/Fawx.dmg (signed, notarized, stapled)
+# Output: build/Fawx.dmg (signed, notarized, stapled, Sparkle EdDSA-signed)
+# Output: build/appcast.xml (generated from the signed DMG)
 
 # 3. Promote staging → main (PR required)
 gh pr create --base main --head staging --title "Release vX.Y.Z" --body "Release notes here."
@@ -26,7 +27,7 @@ git checkout main && git pull origin main
 git tag vX.Y.Z
 git push origin vX.Y.Z
 
-# 5. Upload build/Fawx.dmg to fawx.ai download page
+# 5. Upload BOTH build/Fawx.dmg AND build/appcast.xml to fawx.ai
 ```
 
 ## Debug Build (No Signing)
@@ -165,6 +166,7 @@ ls -la ~/.fawx/config.toml
 | Config | `~/.fawx/config.toml` |
 | Session DB | `~/.fawx/sessions.redb` |
 | DMG output | `~/fawx/build/Fawx.dmg` |
+| Appcast output | `~/fawx/build/appcast.xml` |
 | Port range | `8400`–`8410` |
 | Health endpoint | `http://127.0.0.1:<port>/health` |
 

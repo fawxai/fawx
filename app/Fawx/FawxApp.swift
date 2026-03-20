@@ -22,6 +22,7 @@ struct FawxApp: App {
     @State private var setupViewModel: SetupViewModel
     @State private var bootstrappedConfigurationKey: String?
 #if os(macOS)
+    @State private var sparkleUpdater: SparkleUpdater
     @State private var menuBarManager: MenuBarManager
 #endif
 
@@ -54,6 +55,7 @@ struct FawxApp: App {
         _usageViewModel = State(initialValue: usageViewModel)
         _setupViewModel = State(initialValue: setupViewModel)
 #if os(macOS)
+        _sparkleUpdater = State(initialValue: SparkleUpdater())
         _menuBarManager = State(initialValue: MenuBarManager(appState: appState))
 #endif
     }
@@ -143,7 +145,8 @@ struct FawxApp: App {
             FawxMacCommands(
                 appState: appState,
                 sessionViewModel: sessionViewModel,
-                chatViewModel: chatViewModel
+                chatViewModel: chatViewModel,
+                sparkleUpdater: sparkleUpdater
             )
         }
 #endif

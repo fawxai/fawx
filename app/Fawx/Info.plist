@@ -16,6 +16,10 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
+	<key>SUFeedURL</key>
+	<string>https://fawx.ai/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>PASTE_PUBLIC_KEY_HERE</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

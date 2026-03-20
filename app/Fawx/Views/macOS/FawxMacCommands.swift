@@ -6,8 +6,16 @@ struct FawxMacCommands: Commands {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
+    @Bindable var sparkleUpdater: SparkleUpdater
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates...") {
+                sparkleUpdater.checkForUpdates()
+            }
+            .disabled(!sparkleUpdater.canCheckForUpdates)
+        }
+
         CommandGroup(replacing: .newItem) {
             Button("New Session") {
                 beginNewSession()
