@@ -502,7 +502,7 @@ final class SetupViewModel {
         do {
             let service = LocalBootstrapService()
             let result = try await service.performFullBootstrap { [weak self] message in
-                await MainActor.run { self?.bootstrapProgress = message }
+                self?.bootstrapProgress = message
             }
             await appState.configureClientForBootstrap(
                 serverURL: "http://\(result.host):\(result.port)",
