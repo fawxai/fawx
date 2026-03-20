@@ -65,7 +65,7 @@ final class MenuBarManager: NSObject {
         }
 
         let snapshot = snapshot()
-        let iconName = menuBarIconName(for: snapshot.color)
+        let iconName = menuBarIconName(for: snapshot.status)
         if let icon = NSImage(named: iconName) {
             icon.isTemplate = false
             icon.size = NSSize(width: 18, height: 18)
@@ -76,17 +76,8 @@ final class MenuBarManager: NSObject {
         button.toolTip = "\(snapshot.title)\n\(snapshot.detail)"
     }
 
-    private func menuBarIconName(for color: Color) -> String {
-        switch color {
-        case .fawxSuccess:
-            return "MenuBarIcon-active"
-        case .fawxError:
-            return "MenuBarIcon-error"
-        case .fawxWarning:
-            return "MenuBarIcon-connecting"
-        default:
-            return "MenuBarIcon-stopped"
-        }
+    private func menuBarIconName(for status: MenuBarStatus) -> String {
+        "MenuBarIcon-\(status.rawValue)"
     }
 
     private func rebuildMenu() {
@@ -119,7 +110,8 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx",
                 detail: "Status unavailable",
-                color: .fawxTextSecondary
+                color: .fawxTextSecondary,
+                status: .stopped
             )
         }
 
@@ -127,7 +119,8 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx setup required",
                 detail: "Open the app to finish setup.",
-                color: .fawxWarning
+                color: .fawxWarning,
+                status: .connecting
             )
         }
 
@@ -139,25 +132,29 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx is running",
                 detail: detail,
-                color: .fawxSuccess
+                color: .fawxSuccess,
+                status: .active
             )
         case "starting", "connecting", "reconnecting":
             return MenuBarStatusSnapshot(
                 title: "Fawx is reconnecting",
                 detail: detail,
-                color: .fawxWarning
+                color: .fawxWarning,
+                status: .connecting
             )
         case "stopped", "disconnected":
             return MenuBarStatusSnapshot(
                 title: "Fawx is stopped",
                 detail: detail,
-                color: .fawxError
+                color: .fawxError,
+                status: .error
             )
         default:
             return MenuBarStatusSnapshot(
                 title: "Fawx status unknown",
                 detail: detail,
-                color: .fawxTextSecondary
+                color: .fawxTextSecondary,
+                status: .stopped
             )
         }
     }
