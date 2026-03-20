@@ -500,9 +500,14 @@ final class SetupViewModel {
         bootstrapProgress = "Starting Fawx server..."
 
         do {
-            try await completeLocalSetupAction(false) { [weak self] message in
-                self?.bootstrapProgress = message
+            let service = LocalBootstrapService()
+            let result = try await service.performFullBootstrap { [weak self] message in
+                await MainActor.run { self?.bootstrapProgress = message }
             }
+            await appState.configureClientForBootstrap(
+                serverURL: "http://\(result.host):\(result.port)",
+                bearerToken: result.bearerToken
+            )
             bootstrapProgress = nil
             return true
         } catch {
