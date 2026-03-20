@@ -130,6 +130,8 @@ pub struct ErrorRecord {
 }
 
 const MAX_ERROR_HISTORY: usize = 50;
+const NO_AI_PROVIDERS_STARTUP_WARNING: &str =
+    "no AI providers configured; HTTP API available but chat disabled until a provider is added";
 
 pub struct CycleResult {
     /// The assistant's response text.
@@ -315,9 +317,16 @@ impl HeadlessApp {
     }
 
     /// Build from the standard startup bundle + router + config.
-    pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+    pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
         // Callers must seed the router's active model before construction.
-        let active_model = resolve_active_model(&deps.router, &deps.config)?;
+        let active_model = resolve_active_model(&deps.router, &deps.config).unwrap_or_default();
+        if active_model.is_empty() {
+            tracing::warn!("{NO_AI_PROVIDERS_STARTUP_WARNING}");
+            deps.startup_warnings.push(StartupWarning {
+                category: ErrorCategory::System,
+                message: NO_AI_PROVIDERS_STARTUP_WARNING.to_string(),
+            });
+        }
         let bus_receiver = Self::initial_bus_receiver(&deps);
         let max_history = deps.config.general.max_history;
         let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
@@ -2369,7 +2378,7 @@ fn headless_model_available(router: &ModelRouter, model: &str) -> bool {
         .any(|candidate| candidate.model_id == model)
 }
 
-fn no_headless_models_available() -> anyhow::Error {
+pub(crate) fn no_headless_models_available() -> anyhow::Error {
     anyhow::anyhow!(
         "no models available in router; configure a provider and authenticate it before starting headless mode"
     )
@@ -3775,15 +3784,19 @@ mod tests {
     }
 
     #[test]
-    fn new_returns_clear_error_when_no_models_are_available() {
-        let result = HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()));
-        assert!(result.is_err(), "should fail without any models");
+    fn new_succeeds_when_no_models_are_available() {
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()))
+                .expect("should build without models")
+        });
 
-        let error = result.err().expect("missing error");
-        assert_eq!(
-            error.to_string(),
-            "no models available in router; configure a provider and authenticate it before starting headless mode"
-        );
+        assert_eq!(app.active_model(), "");
+        assert_eq!(app.router.active_model(), None);
+        assert!(logs.contains(NO_AI_PROVIDERS_STARTUP_WARNING));
+        assert!(app.recent_errors(1).iter().any(|warning| {
+            warning.category == ErrorCategory::System
+                && warning.message == NO_AI_PROVIDERS_STARTUP_WARNING
+        }));
     }
 
     #[tokio::test]

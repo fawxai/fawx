@@ -662,11 +662,19 @@ async fn run_headless(
         _logging_guard,
         ..
     } = startup;
+    ensure_headless_chat_model_available(app.active_model())?;
     if single {
         app.run_single(json).await
     } else {
         app.run(json).await
     }
+}
+
+fn ensure_headless_chat_model_available(active_model: &str) -> anyhow::Result<()> {
+    if active_model.is_empty() {
+        return Err(headless::no_headless_models_available());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]
@@ -1101,9 +1109,9 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SkillCommands,
-        FAWX_TUI_NOT_FOUND_MESSAGE,
+        dispatch_command, ensure_headless_chat_model_available, fawx_tui_binary_name,
+        find_fawx_tui_binary_from, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
+        SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1621,6 +1629,17 @@ exit 0
         .expect("dispatch");
 
         assert_eq!(exit_code, 73);
+    }
+
+    #[test]
+    fn run_headless_guard_rejects_missing_active_model() {
+        let error =
+            ensure_headless_chat_model_available("").expect_err("empty active model should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "no models available in router; configure a provider and authenticate it before starting headless mode"
+        );
     }
 
     #[test]
