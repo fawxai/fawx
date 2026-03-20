@@ -1,6 +1,6 @@
 use crate::config_redaction;
 use crate::devices::DeviceStore;
-use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult, ResultKind};
 use crate::error::HttpError;
 use crate::experiment_registry::ExperimentRegistry;
 use crate::handlers::health::sanitize_config;
@@ -103,6 +103,7 @@ impl AppEngine for HeadlessApp {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
+            result_kind: result.result_kind.into(),
         })
     }
 
@@ -124,6 +125,7 @@ impl AppEngine for HeadlessApp {
                 response: result.response,
                 model: result.model,
                 iterations: result.iterations,
+                result_kind: result.result_kind.into(),
             },
             updated_history,
         ))
@@ -379,6 +381,7 @@ async fn mock_message(
         response: format!("echo: {}", req.message),
         model: "test-model".to_string(),
         iterations: 1,
+        result_kind: ResultKind::Complete,
     }))
 }
 
@@ -640,12 +643,14 @@ fn message_response_serializes_correctly() {
         response: "hi there".to_string(),
         model: "gpt-4".to_string(),
         iterations: 2,
+        result_kind: ResultKind::Complete,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["response"], "hi there");
     assert_eq!(json["model"], "gpt-4");
     assert_eq!(json["iterations"], 2);
+    assert_eq!(json["result_kind"], "complete");
 }
 
 #[test]
@@ -4414,6 +4419,7 @@ mod telegram_update {
         .expect("process with images");
 
         assert_eq!(result.response, "Mock response");
+        assert_eq!(result.result_kind, ResultKind::Complete);
         let requests = captured.lock().expect("capture lock");
         let last_request = requests.last().expect("captured request");
         let last_message = last_request.messages.last().expect("user message");

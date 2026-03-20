@@ -17,6 +17,17 @@ pub struct CycleResult {
     pub response: String,
     pub model: String,
     pub iterations: u32,
+    pub result_kind: ResultKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    Complete,
+    Partial,
+    NeedsInput,
+    Error,
+    Empty,
 }
 
 #[async_trait]

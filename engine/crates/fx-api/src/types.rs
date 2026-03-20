@@ -1,3 +1,4 @@
+use crate::engine::ResultKind;
 use fx_kernel::ErrorCategory;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,7 @@ pub struct MessageResponse {
     pub response: String,
     pub model: String,
     pub iterations: u32,
+    pub result_kind: ResultKind,
 }
 
 #[derive(Debug, Deserialize)]

@@ -285,6 +285,7 @@ pub(crate) async fn handle_send_message_for_session(
         response,
         model: result.model,
         iterations: result.iterations,
+        result_kind: result.result_kind,
     })
     .into_response())
 }

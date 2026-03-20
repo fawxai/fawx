@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
+pub use engine::ResultKind;
 pub use tailscale::is_tailscale_ip;
 pub use types::{
     ApiKeyRequest, ApiKeyResponse, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike,

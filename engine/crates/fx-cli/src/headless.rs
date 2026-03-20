@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
-use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+use fx_api::engine::{
+    AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult, ResultKind as ApiResultKind,
+};
 #[cfg(feature = "http")]
 use fx_api::{
     AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
@@ -130,9 +132,48 @@ pub struct ErrorRecord {
     pub recoverable: bool,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    Complete,
+    Partial,
+    NeedsInput,
+    Error,
+    Empty,
+}
+
+#[cfg(feature = "http")]
+impl From<ResultKind> for ApiResultKind {
+    fn from(value: ResultKind) -> Self {
+        match value {
+            ResultKind::Complete => Self::Complete,
+            ResultKind::Partial => Self::Partial,
+            ResultKind::NeedsInput => Self::NeedsInput,
+            ResultKind::Error => Self::Error,
+            ResultKind::Empty => Self::Empty,
+        }
+    }
+}
+
 const MAX_ERROR_HISTORY: usize = 50;
 const NO_AI_PROVIDERS_STARTUP_WARNING: &str =
     "no AI providers configured; HTTP API available but chat disabled until a provider is added";
+const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str =
+    "I ran out of processing budget before finishing. Could you try again or simplify the request?";
+const NEEDS_INPUT_FALLBACK_RESPONSE: &str =
+    "I wasn't able to produce a complete answer. Could you rephrase or provide more context?";
+const TIMEOUT_ERROR_RESPONSE: &str =
+    "The request timed out. The operation may still be running. You can try again.";
+const PERMISSION_ERROR_RESPONSE: &str =
+    "That action isn't allowed under the current permission settings.";
+const RATE_LIMIT_ERROR_RESPONSE: &str =
+    "The API rate limit was hit. Please wait a moment and try again.";
+const AUTH_ERROR_RESPONSE: &str =
+    "There was an authentication issue with the API provider. Check your credentials in settings.";
+const NETWORK_ERROR_RESPONSE: &str =
+    "A network error occurred. Check your internet connection and try again.";
+const GENERIC_ERROR_RESPONSE: &str =
+    "Something went wrong while processing your request. Please try again.";
 
 pub struct CycleResult {
     /// The assistant's response text.
@@ -143,6 +184,8 @@ pub struct CycleResult {
     pub iterations: u32,
     /// Token usage reported for the cycle.
     pub tokens_used: TokenUsage,
+    /// High-level classification used by downstream clients.
+    pub result_kind: ResultKind,
 }
 
 // ── HeadlessApp ─────────────────────────────────────────────────────────────
@@ -1023,6 +1066,7 @@ impl HeadlessApp {
 
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
         let response = extract_response_text(result);
+        let result_kind = extract_result_kind(result);
         let iterations = extract_iterations(result);
         let tokens_used = extract_token_usage(result);
         self.cumulative_tokens.input_tokens = self
@@ -1042,6 +1086,7 @@ impl HeadlessApp {
             model: self.active_model.clone(),
             iterations,
             tokens_used,
+            result_kind,
         }
     }
 
@@ -1196,10 +1241,13 @@ impl AppEngine for HeadlessApp {
         .await?;
         self.conversation_history = updated_history;
 
+        let result_kind = result.result_kind.into();
+
         Ok(ApiCycleResult {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
+            result_kind,
         })
     }
 
@@ -1217,10 +1265,14 @@ impl AppEngine for HeadlessApp {
         .await?;
 
         Ok((
-            ApiCycleResult {
-                response: result.response,
-                model: result.model,
-                iterations: result.iterations,
+            {
+                let result_kind = result.result_kind.into();
+                ApiCycleResult {
+                    response: result.response,
+                    model: result.model,
+                    iterations: result.iterations,
+                    result_kind,
+                }
             },
             updated_history,
         ))
@@ -2308,6 +2360,7 @@ fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
         model: app.active_model().to_string(),
         iterations: 0,
         tokens_used: TokenUsage::default(),
+        result_kind: ResultKind::Complete,
     }
 }
 
@@ -2464,13 +2517,70 @@ fn extract_response_text(result: &LoopResult) -> String {
         LoopResult::Complete { response, .. } => response.clone(),
         LoopResult::BudgetExhausted {
             partial_response, ..
-        } => partial_response.clone().unwrap_or_default(),
-        LoopResult::NeedsInput { prompt, .. } => prompt.clone(),
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                partial_response.clone().unwrap_or_default()
+            } else {
+                BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
+            }
+        }
+        LoopResult::NeedsInput { .. } => NEEDS_INPUT_FALLBACK_RESPONSE.to_string(),
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
-        LoopResult::Error { message, .. } => format!("error: {message}"),
+        LoopResult::Error { message, .. } => classify_error_response(message),
     }
+}
+
+fn extract_result_kind(result: &LoopResult) -> ResultKind {
+    match result {
+        LoopResult::Complete { .. } => ResultKind::Complete,
+        LoopResult::BudgetExhausted {
+            partial_response, ..
+        }
+        | LoopResult::UserStopped {
+            partial_response, ..
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                ResultKind::Partial
+            } else {
+                ResultKind::Empty
+            }
+        }
+        LoopResult::NeedsInput { .. } => ResultKind::NeedsInput,
+        LoopResult::Error { .. } => ResultKind::Error,
+    }
+}
+
+fn classify_error_response(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return TIMEOUT_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("blocked")
+        || lower.contains("denied")
+        || lower.contains("not permitted")
+        || lower.contains("forbidden")
+    {
+        return PERMISSION_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
+    {
+        return RATE_LIMIT_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("authentication") || lower.contains("unauthorized") || lower.contains("401") {
+        return AUTH_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("network") || lower.contains("connection") || lower.contains("dns") {
+        return NETWORK_ERROR_RESPONSE.to_string();
+    }
+
+    GENERIC_ERROR_RESPONSE.to_string()
+}
+
+fn has_meaningful_response(response: Option<&str>) -> bool {
+    response.is_some_and(|response| !response.trim().is_empty())
 }
 
 fn extract_iterations(result: &LoopResult) -> u32 {
@@ -3684,17 +3794,94 @@ mod tests {
         assert_eq!(extract_response_text(&result), "done");
         assert_eq!(extract_iterations(&result), 1);
         assert_eq!(extract_token_usage(&result).total_tokens(), 5);
+        assert_eq!(extract_result_kind(&result), ResultKind::Complete);
     }
 
     #[test]
-    fn extract_response_from_error() {
+    fn extract_response_from_needs_input_is_friendly() {
+        let result = LoopResult::NeedsInput {
+            prompt: "What's your question?".to_string(),
+            iterations: 2,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_response_text(&result),
+            NEEDS_INPUT_FALLBACK_RESPONSE
+        );
+        assert_ne!(extract_response_text(&result), "What's your question?");
+        assert_eq!(extract_iterations(&result), 2);
+        assert_eq!(extract_result_kind(&result), ResultKind::NeedsInput);
+    }
+
+    #[test]
+    fn extract_response_from_error_timeout_is_classified() {
+        let result = LoopResult::Error {
+            message: "request timed out after 30s".to_string(),
+            recoverable: false,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), TIMEOUT_ERROR_RESPONSE);
+        assert_eq!(extract_iterations(&result), 0);
+        assert_eq!(extract_result_kind(&result), ResultKind::Error);
+    }
+
+    #[test]
+    fn extract_response_from_error_blocked_is_classified() {
+        let result = LoopResult::Error {
+            message: "Tool 'run_command' blocked by policy".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), PERMISSION_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_auth_is_classified() {
+        let result = LoopResult::Error {
+            message: "provider returned 401 unauthorized".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), AUTH_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_rate_limit_is_classified() {
+        let result = LoopResult::Error {
+            message: "429 too many requests".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), RATE_LIMIT_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_network_is_classified() {
+        let result = LoopResult::Error {
+            message: "connection refused".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), NETWORK_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_unknown_uses_generic_fallback() {
         let result = LoopResult::Error {
             message: "boom".to_string(),
             recoverable: false,
             signals: Vec::new(),
         };
-        assert_eq!(extract_response_text(&result), "error: boom");
+
+        assert_eq!(extract_response_text(&result), GENERIC_ERROR_RESPONSE);
         assert_eq!(extract_iterations(&result), 0);
+        assert_eq!(extract_result_kind(&result), ResultKind::Error);
     }
 
     #[test]
@@ -3706,6 +3893,93 @@ mod tests {
         };
         assert_eq!(extract_response_text(&result), "partial");
         assert_eq!(extract_iterations(&result), 3);
+        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
+    }
+
+    #[test]
+    fn extract_response_from_budget_exhausted_without_content_uses_fallback() {
+        let result = LoopResult::BudgetExhausted {
+            partial_response: None,
+            iterations: 3,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_response_text(&result),
+            BUDGET_EXHAUSTED_FALLBACK_RESPONSE
+        );
+        assert_eq!(extract_result_kind(&result), ResultKind::Empty);
+    }
+
+    #[test]
+    fn extract_response_from_user_stopped_preserves_partial_response() {
+        let result = LoopResult::UserStopped {
+            partial_response: Some("partial".to_string()),
+            iterations: 1,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), "partial");
+        assert_eq!(extract_iterations(&result), 1);
+        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
+    }
+
+    #[test]
+    fn finalize_cycle_sets_result_kind_for_each_variant() {
+        let mut app = test_app();
+        let signals = Vec::new();
+
+        let complete = app.finalize_cycle(
+            "hello",
+            &LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(complete.result_kind, ResultKind::Complete);
+
+        let partial = app.finalize_cycle(
+            "hello",
+            &LoopResult::BudgetExhausted {
+                partial_response: Some("partial".to_string()),
+                iterations: 1,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(partial.result_kind, ResultKind::Partial);
+
+        let needs_input = app.finalize_cycle(
+            "hello",
+            &LoopResult::NeedsInput {
+                prompt: "clarify".to_string(),
+                iterations: 1,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(needs_input.result_kind, ResultKind::NeedsInput);
+
+        let error = app.finalize_cycle(
+            "hello",
+            &LoopResult::Error {
+                message: "network error".to_string(),
+                recoverable: true,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(error.result_kind, ResultKind::Error);
+
+        let empty = app.finalize_cycle(
+            "hello",
+            &LoopResult::UserStopped {
+                partial_response: None,
+                iterations: 1,
+                signals,
+            },
+        );
+        assert_eq!(empty.result_kind, ResultKind::Empty);
     }
 
     #[test]
