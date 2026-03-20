@@ -13,7 +13,7 @@ enum OnboardingStep: Int, Sendable {
     case pairingCode
 }
 
-private struct ScannedConnectionInfo {
+struct ScannedConnectionInfo {
     let serverURL: String
     let token: String?
 }
@@ -286,7 +286,7 @@ final class SettingsViewModel {
         return "\(stripped[..<splitIndex])-\(stripped[splitIndex...])"
     }
 
-    private static func parseScannedConnection(_ rawValue: String) -> ScannedConnectionInfo? {
+    static func parseScannedConnection(_ rawValue: String) -> ScannedConnectionInfo? {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return nil
@@ -310,12 +310,11 @@ final class SettingsViewModel {
             return nil
         }
 
-        let preferredScheme: String
-        if host.contains(".ts.net") {
-            preferredScheme = "https"
-        } else {
-            preferredScheme = "http"
-        }
+        let preferredScheme = preferredScannedConnectionScheme(
+            host: host,
+            explicitScheme: items["scheme"]?.lowercased(),
+            transport: items["transport"]?.lowercased()
+        )
 
         guard let canonicalURL = canonicalizeServerURL("\(preferredScheme)://\(host):\(port)") else {
             return nil
@@ -330,5 +329,29 @@ final class SettingsViewModel {
         }
 
         return ScannedConnectionInfo(serverURL: canonicalURL, token: resolvedToken)
+    }
+
+    private static func preferredScannedConnectionScheme(
+        host: String,
+        explicitScheme: String?,
+        transport: String?
+    ) -> String {
+        if explicitScheme == "http" || transport == "lan_http" {
+            return "http"
+        }
+
+        if explicitScheme == "https" || transport == "tailscale_https" || host.lowercased().contains(".ts.net") {
+            return "https"
+        }
+
+        let normalizedHost = host
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased()
+
+        if normalizedHost == "localhost" || normalizedHost == "127.0.0.1" || normalizedHost == "::1" {
+            return "http"
+        }
+
+        return "https"
     }
 }

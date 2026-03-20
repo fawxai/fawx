@@ -36,6 +36,7 @@ pub struct HealthResponse {
     pub model: String,
     pub uptime_seconds: u64,
     pub skills_loaded: usize,
+    pub https_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]

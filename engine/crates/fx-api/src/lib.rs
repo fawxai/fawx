@@ -29,8 +29,8 @@ mod tests;
 use crate::devices::DeviceStore;
 use crate::engine::AppEngine;
 use crate::listener::{
-    active_tailscale_ip, bind_listeners, detect_optional_tailscale_ip, listen_targets,
-    print_startup_targets, run_listeners,
+    active_tailscale_ip, bind_listeners, detect_optional_tailscale_ip, detect_tls_config,
+    listen_targets, print_startup_targets, run_listeners, ServerProtocol,
 };
 use crate::pairing::PairingState;
 use crate::router::{build_router, load_fleet_manager_if_initialized};
@@ -80,8 +80,24 @@ pub async fn run(
     let bearer_token = validate_bearer_token(&config.http_config, auth_store)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
+    let tls_config = detect_tls_config(&config.data_dir);
+    let tailscale_protocol = if tls_config.is_some() {
+        ServerProtocol::Https
+    } else {
+        ServerProtocol::Http
+    };
     let listen_plan = listen_targets(config.port, detect_optional_tailscale_ip());
-    let listeners = bind_listeners(listen_plan).await?;
+    let listeners = bind_listeners(listen_plan, tailscale_protocol).await?;
+    let tailscale_ip = active_tailscale_ip(&listeners);
+    let tailscale_https_enabled =
+        listeners.tailscale.is_some() && tailscale_protocol == ServerProtocol::Https;
+    let server_host = if tailscale_https_enabled {
+        tailscale_ip
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    } else {
+        "127.0.0.1".to_string()
+    };
     let shared_app: Arc<Mutex<dyn AppEngine>> = Arc::new(Mutex::new(app));
     let channels = build_channel_runtime(config.telegram.clone(), config.webhook_channels);
     let session_registry = init_session_registry(&config.data_dir);
@@ -96,7 +112,12 @@ pub async fn run(
     let fleet_manager = load_fleet_manager_if_initialized(&config.data_dir)?;
     let devices_path = config.data_dir.join("devices.json");
     let devices = DeviceStore::load(&devices_path);
-    let server_runtime = ServerRuntime::local(config.port);
+    let server_runtime = ServerRuntime::new(
+        server_host,
+        config.port,
+        tailscale_https_enabled,
+        crate::server_runtime::RestartController::live(),
+    );
     let (shared, config_manager, has_synthesis) = {
         let app = shared_app.lock().await;
         let config_manager = app.config_manager();
@@ -118,7 +139,7 @@ pub async fn run(
         session_registry,
         start_time: Instant::now(),
         server_runtime,
-        tailscale_ip: active_tailscale_ip(&listeners),
+        tailscale_ip: tailscale_ip.clone(),
         bearer_token,
         pairing: Arc::new(Mutex::new(PairingState::new())),
         devices: Arc::new(Mutex::new(devices)),
@@ -139,12 +160,12 @@ pub async fn run(
     };
     let router = build_router(state, fleet_manager);
 
-    print_startup_targets(&listeners);
+    print_startup_targets(&listeners, tailscale_https_enabled);
     eprintln!("Bearer token authentication: enabled");
     validate_telegram_startup(channels.telegram.as_ref()).await;
     start_telegram_polling(&channels, &shared_app, &config.data_dir);
 
-    run_listeners(router, listeners).await?;
+    run_listeners(router, listeners, tls_config).await?;
     Ok(0)
 }
 

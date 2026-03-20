@@ -5,12 +5,14 @@ struct HealthResponse: Codable, Sendable, Hashable {
     let model: String
     let uptimeSeconds: Int
     let skillsLoaded: Int
+    let httpsEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case status
         case model
         case uptimeSeconds = "uptime_seconds"
         case skillsLoaded = "skills_loaded"
+        case httpsEnabled = "https_enabled"
     }
 }
 

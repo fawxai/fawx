@@ -5,8 +5,9 @@ use crate::error::HttpError;
 use crate::experiment_registry::ExperimentRegistry;
 use crate::handlers::health::sanitize_config;
 use crate::listener::{
-    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip, run_listeners,
-    wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
+    bind_listener, detect_tls_config, listen_targets, optional_bound_listener,
+    optional_tailscale_ip, run_listeners, startup_target_lines, wait_for_server_pair,
+    BoundListener, BoundListeners, ListenTarget, ServerIdentity, ServerProtocol,
 };
 use crate::middleware::verify_token;
 use crate::pairing::PairingState;
@@ -348,6 +349,7 @@ async fn mock_health() -> Json<HealthResponse> {
         model: "test-model".to_string(),
         uptime_seconds: 42,
         skills_loaded: 2,
+        https_enabled: false,
     })
 }
 
@@ -453,13 +455,82 @@ fn optional_tailscale_ip_returns_none_when_detection_fails() {
     assert!(result.is_none());
 }
 
+#[test]
+fn detect_tls_config_returns_none_when_files_are_missing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    assert!(detect_tls_config(temp.path()).is_none());
+}
+
+#[test]
+fn detect_tls_config_returns_some_when_both_files_exist() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tls_dir = temp.path().join("tls");
+    std::fs::create_dir_all(&tls_dir).expect("create tls dir");
+    std::fs::write(tls_dir.join("cert.pem"), "cert").expect("write cert");
+    std::fs::write(tls_dir.join("key.pem"), "key").expect("write key");
+
+    let tls_config = detect_tls_config(temp.path()).expect("detect tls");
+    assert_eq!(tls_config.cert_path, tls_dir.join("cert.pem"));
+    assert_eq!(tls_config.key_path, tls_dir.join("key.pem"));
+}
+
+#[test]
+fn detect_tls_config_returns_none_when_only_one_file_exists() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tls_dir = temp.path().join("tls");
+    std::fs::create_dir_all(&tls_dir).expect("create tls dir");
+    std::fs::write(tls_dir.join("cert.pem"), "cert").expect("write cert");
+
+    assert!(detect_tls_config(temp.path()).is_none());
+}
+
+#[test]
+fn startup_target_lines_use_https_for_tailscale_when_enabled() {
+    let lines = startup_target_lines(
+        ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8400)),
+            label: "local",
+        },
+        Some(ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        }),
+        true,
+    );
+
+    assert_eq!(lines[0], "Fawx API listening on:");
+    assert_eq!(lines[1], "  http://127.0.0.1:8400 (local)");
+    assert_eq!(lines[2], "  https://100.93.251.101:8400 (Tailscale)");
+}
+
+#[test]
+fn startup_target_lines_use_http_for_tailscale_when_tls_disabled() {
+    let lines = startup_target_lines(
+        ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8400)),
+            label: "local",
+        },
+        Some(ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        }),
+        false,
+    );
+
+    assert_eq!(lines[0], "Fawx HTTP API listening on:");
+    assert_eq!(lines[2], "  http://100.93.251.101:8400 (Tailscale)");
+}
+
 #[tokio::test]
 async fn tailscale_bind_failure_falls_back_to_localhost_server() {
     let local_target = ListenTarget {
         addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         label: "local",
     };
-    let local_listener = bind_listener(local_target).await.expect("bind localhost");
+    let local_listener = bind_listener(local_target, ServerProtocol::Http)
+        .await
+        .expect("bind localhost");
     let local_addr = local_listener.local_addr().expect("local addr");
     let tailscale_target = ListenTarget {
         addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
@@ -479,6 +550,7 @@ async fn tailscale_bind_failure_falls_back_to_localhost_server() {
     let server = tokio::spawn(run_listeners(
         Router::new().route("/health", get(mock_health)),
         listeners,
+        None,
     ));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -502,9 +574,15 @@ async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
     });
 
     let result = wait_for_server_pair(
-        "local",
+        ServerIdentity {
+            label: "local",
+            protocol: ServerProtocol::Http,
+        },
         local_server,
-        "Tailscale",
+        ServerIdentity {
+            label: "Tailscale",
+            protocol: ServerProtocol::Http,
+        },
         tailscale_server,
         shutdown_tx,
     )
@@ -577,6 +655,7 @@ fn health_response_has_expected_fields() {
         model: "claude-3".to_string(),
         uptime_seconds: 60,
         skills_loaded: 3,
+        https_enabled: true,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
@@ -584,6 +663,7 @@ fn health_response_has_expected_fields() {
     assert_eq!(json["model"], "claude-3");
     assert_eq!(json["uptime_seconds"], 60);
     assert_eq!(json["skills_loaded"], 3);
+    assert_eq!(json["https_enabled"], true);
 }
 
 #[test]

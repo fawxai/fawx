@@ -23,6 +23,7 @@ pub async fn handle_health(State(state): State<HttpState>) -> Json<HealthRespons
         model: snap.active_model,
         uptime_seconds: uptime,
         skills_loaded: 0,
+        https_enabled: state.server_runtime.https_enabled,
     })
 }
 
