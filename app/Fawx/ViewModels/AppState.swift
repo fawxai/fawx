@@ -479,42 +479,37 @@ final class AppState {
 #endif
     }
 
-    func completeLocalSetup() async throws {
+    /// Configure the HTTP client for a bootstrapped server without changing
+    /// navigation state or persisting pairing. Used by the setup wizard to
+    /// enable API calls on the provider step before setup is complete.
+    func configureClientForBootstrap(serverURL: String, bearerToken: String) async throws {
+        guard let url = URL(string: serverURL) else {
+            throw APIError.invalidURL(serverURL)
+        }
+        await client.updateConfiguration(baseURL: url, bearerToken: bearerToken)
+    }
+
+    func completeLocalSetup(
+        progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
+    ) async throws {
         await awaitPersistedStateLoad()
-        let currentLocalInstallConfiguration = await refreshLocalInstallConfiguration()
 
-        let resolvedServerURL: String
-
-        if let currentLocalInstallConfiguration {
-            resolvedServerURL = currentLocalInstallConfiguration.baseURLString
-        } else if !serverURLString.isEmpty {
-            resolvedServerURL = serverURLString
-        } else {
-            resolvedServerURL = Self.defaultLocalSetupServerURLString
+        progress("Checking for an existing Fawx install...")
+        if let existingConfig = await refreshLocalInstallConfiguration(), !existingConfig.bearerToken.isEmpty {
+            try await adoptAndConnect(
+                serverURL: existingConfig.baseURLString,
+                bearerToken: existingConfig.bearerToken,
+                progress: progress
+            )
+            return
         }
 
-        guard
-            let canonicalURLString = canonicalizeServerURL(resolvedServerURL),
-            let url = URL(string: canonicalURLString)
-        else {
-            throw APIError.invalidURL(resolvedServerURL)
-        }
-
-        let setupClient = FawxClient(baseURL: url)
-        let requestedDeviceName = Self.defaultLocalDeviceName()
-        let response = try await setupClient.adoptLocalDevice(deviceName: requestedDeviceName)
-        let pairedDeviceName = response.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedDeviceName = pairedDeviceName?.nonEmpty ?? requestedDeviceName
-
-        try await savePairing(
-            serverURLString: canonicalURLString,
-            token: response.token,
-            deviceName: resolvedDeviceName,
-            connectionMode: .local
-        )
-        isSetupComplete = true
-        await persistence.setSetupComplete(true)
-        await bootstrap()
+        let bootstrapService = LocalBootstrapService()
+        let result = try await bootstrapService.performFullBootstrap(progress: progress)
+        let installedConfig = await refreshLocalInstallConfiguration()
+        let serverURL = installedConfig?.baseURLString ?? "http://\(result.host):\(result.port)"
+        let bearerToken = installedConfig?.bearerToken ?? result.bearerToken
+        try await adoptAndConnect(serverURL: serverURL, bearerToken: bearerToken, progress: progress)
     }
 
     func savePairing(
@@ -1022,6 +1017,34 @@ final class AppState {
     func awaitPersistedStateLoad() async {
         let loadTask = initialPersistenceLoadTask
         await loadTask?.value
+    }
+
+    private func adoptAndConnect(
+        serverURL: String,
+        bearerToken: String? = nil,
+        progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
+    ) async throws {
+        progress("Connecting this Mac to Fawx...")
+        guard let canonicalURLString = canonicalizeServerURL(serverURL), let url = URL(string: canonicalURLString) else {
+            throw APIError.invalidURL(serverURL)
+        }
+
+        let setupClient = FawxClient(baseURL: url, bearerToken: bearerToken)
+        let requestedDeviceName = Self.defaultLocalDeviceName()
+        let response = try await setupClient.adoptLocalDevice(deviceName: requestedDeviceName)
+        let pairedDeviceName = response.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedDeviceName = pairedDeviceName?.nonEmpty ?? requestedDeviceName
+
+        try await savePairing(
+            serverURLString: canonicalURLString,
+            token: response.token,
+            deviceName: resolvedDeviceName,
+            connectionMode: .local
+        )
+        isSetupComplete = true
+        await persistence.setSetupComplete(true)
+        progress("Opening Fawx...")
+        await bootstrap()
     }
 
     private func shouldNotifyForRipcordActivation(

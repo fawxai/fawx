@@ -59,6 +59,9 @@ enum SetupProviderAuthMethod: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 @Observable
 final class SetupViewModel {
+    typealias LocalSetupAction = (@escaping @MainActor @Sendable (String) -> Void) async throws -> Void
+    typealias Phase4StateRefreshAction = () async -> Void
+
     var step: SetupStep = .welcome
     var selectedProvider: SetupProvider = .anthropic
     var selectedAuthMethod: SetupProviderAuthMethod = .subscription
@@ -72,12 +75,26 @@ final class SetupViewModel {
     var isRefreshing = false
     var isSubmittingProvider = false
     var isTogglingAutoStart = false
+    var isBootstrapping = false
+    var bootstrapProgress: String?
 
     private let appState: AppState
+    private let completeLocalSetupAction: LocalSetupAction
+    private let refreshPhase4StateAction: Phase4StateRefreshAction
     private var attemptedCertificateHostname: String?
 
-    init(appState: AppState) {
+    init(
+        appState: AppState,
+        completeLocalSetupAction: LocalSetupAction? = nil,
+        refreshPhase4StateAction: Phase4StateRefreshAction? = nil
+    ) {
         self.appState = appState
+        self.completeLocalSetupAction = completeLocalSetupAction ?? { progress in
+            try await appState.completeLocalSetup(progress: progress)
+        }
+        self.refreshPhase4StateAction = refreshPhase4StateAction ?? {
+            await appState.refreshPhase4State()
+        }
     }
 
     var refreshKey: String {
@@ -363,8 +380,23 @@ final class SetupViewModel {
     }
 
     func finishSetup() async {
+        guard !isBootstrapping else {
+            return
+        }
+
+        isBootstrapping = true
+        bootstrapProgress = "Creating Fawx configuration..."
+        readyStatusKind = .idle
+        readyStatusMessage = nil
+        defer {
+            isBootstrapping = false
+            bootstrapProgress = nil
+        }
+
         do {
-            try await appState.completeLocalSetup()
+            try await completeLocalSetupAction { [weak self] message in
+                self?.bootstrapProgress = message
+            }
         } catch {
             readyStatusKind = .failure
             readyStatusMessage = error.localizedDescription
@@ -372,7 +404,7 @@ final class SetupViewModel {
     }
 
     private func refreshTailscaleState() async {
-        await appState.refreshPhase4State()
+        await refreshPhase4StateAction()
 
         guard let tailscale = tailscaleStatus else {
             tailscaleStatusKind = .warning
@@ -417,19 +449,26 @@ final class SetupViewModel {
     }
 
     private func refreshProviderState() async {
-        await appState.refreshPhase4State()
+        guard await ensureProviderServerIsRunning() else {
+            return
+        }
+
+        await refreshPhase4StateAction()
 
         if !configuredProviderIDs.isEmpty {
             providerStatusKind = .success
             providerStatusMessage = "Provider authentication is ready."
         } else if appState.setupStatus == nil {
             providerStatusKind = .warning
-            providerStatusMessage = "Provider status is unavailable until the local setup server reconnects."
+            providerStatusMessage = "Provider status is unavailable until the server reconnects."
+        } else {
+            providerStatusKind = .idle
+            providerStatusMessage = nil
         }
     }
 
     private func refreshReadyState() async {
-        await appState.refreshPhase4State()
+        await refreshPhase4StateAction()
 
         if appState.qrPairingResponse != nil {
             readyStatusKind = .success
@@ -447,7 +486,35 @@ final class SetupViewModel {
         if appState.isConfigured {
             await appState.refreshSettingsState()
         } else {
-            await appState.refreshPhase4State()
+            await refreshPhase4StateAction()
+        }
+    }
+
+    private func ensureProviderServerIsRunning() async -> Bool {
+        guard !appState.isConfigured else {
+            return true
+        }
+
+        providerStatusKind = .idle
+        providerStatusMessage = nil
+        bootstrapProgress = "Starting Fawx server..."
+
+        do {
+            let service = LocalBootstrapService()
+            let result = try await service.performFullBootstrap { [weak self] message in
+                self?.bootstrapProgress = message
+            }
+            try await appState.configureClientForBootstrap(
+                serverURL: "http://\(result.host):\(result.port)",
+                bearerToken: result.bearerToken
+            )
+            bootstrapProgress = nil
+            return true
+        } catch {
+            providerStatusKind = .failure
+            providerStatusMessage = "Could not start the server: \(error.localizedDescription)"
+            bootstrapProgress = nil
+            return false
         }
     }
 

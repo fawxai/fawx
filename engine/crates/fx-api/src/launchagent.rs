@@ -101,6 +101,9 @@ fn xml_escape(s: &str) -> String {
 }
 
 pub fn generate_plist(config: &LaunchAgentConfig) -> String {
+    // Keep this LaunchAgent template in sync with
+    // app/Fawx/Services/LocalBootstrapService.swift::generatePlist.
+    // Swift duplicates it during first-launch bootstrap before this API is available.
     let binary = xml_escape(&config.server_binary_path.display().to_string());
     let port = config.port;
     let data_dir = xml_escape(&config.data_dir.display().to_string());
@@ -119,6 +122,7 @@ pub fn generate_plist(config: &LaunchAgentConfig) -> String {
     <array>
         <string>{binary}</string>
         <string>serve</string>
+        <string>--http</string>
         <string>--port</string>
         <string>{port}</string>
         <string>--data-dir</string>
@@ -274,6 +278,16 @@ mod tests {
         let config = test_config();
         let plist = generate_plist(&config);
         assert!(plist.contains("<string>/usr/local/bin/fawx</string>"));
+    }
+
+    #[test]
+    fn generate_plist_contains_http_flag() {
+        let config = test_config();
+        let plist = generate_plist(&config);
+        assert!(
+            plist.contains("<string>--http</string>"),
+            "plist must include --http so the server starts in HTTP mode"
+        );
     }
 
     #[test]

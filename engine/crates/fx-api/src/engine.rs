@@ -72,6 +72,10 @@ pub trait AppEngine: Send + Sync {
         Ok(())
     }
 
+    fn reload_providers(&mut self) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
     fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto>;
 
     /// Session-level token usage (input + output tokens).
