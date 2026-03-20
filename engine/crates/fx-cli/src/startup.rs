@@ -1629,7 +1629,7 @@ fn register_keyed_provider(
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
             })?
             .with_supported_models(supported_models);
-        router.register_provider_with_auth(Box::new(anthropic), auth_label);
+        router.register_provider_with_auth(Arc::new(anthropic), auth_label);
         return Ok(());
     }
 
@@ -1640,7 +1640,7 @@ fn register_keyed_provider(
         .with_name(provider.to_string())
         .with_supported_models(supported_models);
 
-    router.register_provider_with_auth(Box::new(provider_client), auth_label);
+    router.register_provider_with_auth(Arc::new(provider_client), auth_label);
     Ok(())
 }
 
@@ -1661,7 +1661,7 @@ fn register_oauth_provider(
                 })?
                 .with_supported_models(supported_models);
 
-        router.register_provider_with_auth(Box::new(provider_client), "subscription");
+        router.register_provider_with_auth(Arc::new(provider_client), "subscription");
         return Ok(());
     }
 
@@ -1673,7 +1673,7 @@ fn register_oauth_provider(
             .with_name(provider.to_string())
             .with_supported_models(supported_models);
 
-    router.register_provider_with_auth(Box::new(provider_client), "subscription");
+    router.register_provider_with_auth(Arc::new(provider_client), "subscription");
     Ok(())
 }
 

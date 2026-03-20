@@ -377,7 +377,7 @@ fn build_config_manager(
 }
 
 fn build_subagent_manager(
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: &fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     session_bus: Option<fx_bus::SessionBus>,
@@ -498,7 +498,7 @@ fn build_headless_startup(
     let auth_manager = startup::load_auth_manager()?;
     let mut router = startup::build_router(&auth_manager)?;
     headless::seed_headless_router_active_model(&mut router, &config);
-    let router = Arc::new(router);
+    let router = Arc::new(std::sync::RwLock::new(router));
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
@@ -546,7 +546,7 @@ fn build_headless_startup(
 
 #[allow(clippy::too_many_arguments)] // Pre-existing constructor shape; follow-up will bundle args into a config struct.
 fn build_headless_app(
-    router: Arc<fx_llm::ModelRouter>,
+    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
     config: fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     system_prompt: Option<std::path::PathBuf>,

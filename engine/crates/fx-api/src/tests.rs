@@ -1195,14 +1195,14 @@ mod routing_and_status {
     fn settings_router() -> ModelRouter {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "anthropic",
                 models: vec!["claude-sonnet-4-20250514"],
             }),
             "api_key",
         );
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "openai",
                 models: vec!["gpt-4o"],
             }),
@@ -1217,14 +1217,14 @@ mod routing_and_status {
     fn thinking_test_router() -> ModelRouter {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "anthropic",
                 models: vec!["claude-sonnet-4-6", "claude-opus-4-6"],
             }),
             "api_key",
         );
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "openai",
                 models: vec!["gpt-5.4"],
             }),
@@ -1277,7 +1277,7 @@ mod routing_and_status {
 
         HeadlessApp::new(HeadlessAppDeps {
             loop_engine: test_engine(),
-            router: Arc::new(router),
+            router: Arc::new(std::sync::RwLock::new(router)),
             runtime_info,
             config,
             memory: None,
@@ -2638,7 +2638,7 @@ allowed_chat_ids = [123]
         let state = test_state_with_app(
             HeadlessApp::new(HeadlessAppDeps {
                 loop_engine: test_engine(),
-                router: Arc::new(settings_router()),
+                router: Arc::new(std::sync::RwLock::new(settings_router())),
                 runtime_info: test_runtime_info(),
                 config: fx_config::FawxConfig::default(),
                 memory: None,
@@ -3010,7 +3010,7 @@ thinking = "high"
         );
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "anthropic",
                 models: vec!["claude-sonnet-4-6", "claude-opus-4-6"],
             }),
@@ -3049,7 +3049,7 @@ thinking = "high"
     async fn get_thinking_unknown_provider_only_allows_off() {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
-            Box::new(StaticProvider {
+            Arc::new(StaticProvider {
                 name: "mystery",
                 models: vec!["mystery-model"],
             }),
@@ -4067,7 +4067,7 @@ mod telegram_update {
 
         HeadlessApp::new(HeadlessAppDeps {
             loop_engine: test_engine(),
-            router: Arc::new(router),
+            router: Arc::new(std::sync::RwLock::new(router)),
             runtime_info: test_runtime_info(),
             config: fx_config::FawxConfig::default(),
             memory: None,

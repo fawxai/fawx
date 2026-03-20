@@ -1,6 +1,7 @@
 //! LLM routing logic for both legacy fallback strategies and model-provider routing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use futures::future::join_all;
 use fx_core::error::LlmError;
@@ -15,7 +16,7 @@ use crate::LlmProvider;
 /// Routes completion requests to the currently active model provider.
 #[derive(Default)]
 pub struct ModelRouter {
-    providers: HashMap<String, Box<dyn CompletionProvider>>,
+    providers: HashMap<String, Arc<dyn CompletionProvider>>,
     active_model: Option<String>,
     model_to_provider: HashMap<String, String>,
     provider_auth_methods: HashMap<String, String>,
@@ -29,6 +30,7 @@ impl ModelRouter {
 
     /// Register a provider and infer auth method metadata from its name.
     pub fn register_provider(&mut self, provider: Box<dyn CompletionProvider>) {
+        let provider: Arc<dyn CompletionProvider> = provider.into();
         let inferred_auth_method = infer_auth_method(provider.name());
         self.register_provider_with_auth(provider, inferred_auth_method);
     }
@@ -36,7 +38,7 @@ impl ModelRouter {
     /// Register a provider with an explicit auth method descriptor.
     pub fn register_provider_with_auth(
         &mut self,
-        provider: Box<dyn CompletionProvider>,
+        provider: Arc<dyn CompletionProvider>,
         auth_method: impl Into<String>,
     ) {
         let provider_name = provider.name().to_string();
@@ -100,6 +102,22 @@ impl ModelRouter {
             .and_then(|model| self.provider_for_model(model))
     }
 
+    /// Snapshot the registered providers so callers can work without holding a router borrow.
+    pub fn provider_catalog(&self) -> Vec<ProviderCatalogEntry> {
+        self.providers
+            .iter()
+            .map(|(provider_name, provider)| ProviderCatalogEntry {
+                provider_name: provider_name.clone(),
+                auth_method: self
+                    .provider_auth_methods
+                    .get(provider_name)
+                    .cloned()
+                    .unwrap_or_else(|| infer_auth_method(provider_name)),
+                provider: Arc::clone(provider),
+            })
+            .collect()
+    }
+
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
         build_model_infos(&self.model_to_provider, &self.provider_auth_methods)
@@ -107,28 +125,36 @@ impl ModelRouter {
 
     /// Fetch available models from all registered providers dynamically.
     pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
-        let fetches = self
-            .providers
-            .iter()
-            .map(|(provider_name, provider)| async move {
-                let auth_method = self
-                    .provider_auth_methods
-                    .get(provider_name)
-                    .cloned()
-                    .unwrap_or_else(|| infer_auth_method(provider_name));
-                (
-                    provider_name.clone(),
-                    auth_method,
-                    fetch_provider_models(provider.as_ref()).await,
-                )
-            });
-        let mut model_entries = BTreeMap::new();
+        fetch_available_models_from_catalog(self.provider_catalog()).await
+    }
 
-        for (provider_name, auth_method, model_ids) in join_all(fetches).await {
-            add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
+    /// Prepare a request for a specific model without borrowing the router across await points.
+    pub fn request_for_model(
+        &self,
+        model: &str,
+        mut request: CompletionRequest,
+    ) -> Result<(Arc<dyn CompletionProvider>, CompletionRequest), ProviderLlmError> {
+        if model.trim().is_empty() {
+            return Err(ProviderLlmError::Config(
+                RouterError::EmptyModelSelector.to_string(),
+            ));
         }
 
-        model_entries.into_values().collect()
+        let resolved_model = self
+            .resolve_model(model)
+            .map_err(|error| ProviderLlmError::Config(error.to_string()))?;
+        let provider_name = self.model_to_provider.get(&resolved_model).ok_or_else(|| {
+            ProviderLlmError::Config(RouterError::ModelNotFound(resolved_model.clone()).to_string())
+        })?;
+        let provider = self.providers.get(provider_name).cloned().ok_or_else(|| {
+            ProviderLlmError::Provider(format!("provider '{provider_name}' was not registered"))
+        })?;
+
+        request.model = resolved_model;
+        if !provider.capabilities().supports_temperature {
+            request.temperature = None;
+        }
+        Ok((provider, request))
     }
 
     /// Send a completion request using the currently active model/provider pair.
@@ -161,28 +187,40 @@ impl ModelRouter {
 
     fn request_for_active_provider(
         &self,
-        mut request: CompletionRequest,
-    ) -> Result<(&dyn CompletionProvider, CompletionRequest), ProviderLlmError> {
+        request: CompletionRequest,
+    ) -> Result<(Arc<dyn CompletionProvider>, CompletionRequest), ProviderLlmError> {
         let active_model = self
             .active_model
             .clone()
             .ok_or_else(|| ProviderLlmError::Config(RouterError::NoActiveModel.to_string()))?;
-
-        let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
-            ProviderLlmError::Config(RouterError::ModelNotFound(active_model.clone()).to_string())
-        })?;
-
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
-            ProviderLlmError::Provider(format!("provider '{provider_name}' was not registered"))
-        })?;
-
-        request.model = active_model;
-        if !provider.capabilities().supports_temperature {
-            request.temperature = None;
-        }
-
-        Ok((provider.as_ref(), request))
+        self.request_for_model(&active_model, request)
     }
+}
+
+#[derive(Clone)]
+pub struct ProviderCatalogEntry {
+    pub provider_name: String,
+    pub auth_method: String,
+    pub provider: Arc<dyn CompletionProvider>,
+}
+
+pub async fn fetch_available_models_from_catalog(
+    catalog: Vec<ProviderCatalogEntry>,
+) -> Vec<ModelInfo> {
+    let fetches = catalog.into_iter().map(|entry| async move {
+        (
+            entry.provider_name,
+            entry.auth_method,
+            fetch_provider_models(entry.provider.as_ref()).await,
+        )
+    });
+    let mut model_entries = BTreeMap::new();
+
+    for (provider_name, auth_method, model_ids) in join_all(fetches).await {
+        add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
+    }
+
+    model_entries.into_values().collect()
 }
 
 async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<String> {
@@ -813,7 +851,7 @@ mod model_router_tests {
         );
 
         let mut router = ModelRouter::new();
-        router.register_provider_with_auth(Box::new(provider), "api_key");
+        router.register_provider_with_auth(Arc::new(provider), "api_key");
 
         let models = router.available_models();
         assert_eq!(models.len(), 1);
