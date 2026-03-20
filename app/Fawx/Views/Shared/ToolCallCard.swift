@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct ToolCallCard: View {
+    @Environment(\.containerWidth) private var containerWidth
+
     let toolCall: ToolCallRecord
 
     @State private var isExpanded: Bool
@@ -79,7 +81,7 @@ struct ToolCallCard: View {
             }
         }
         .padding(FawxSpacing.paddingMD)
-        .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: .leading)
+        .frame(maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth), alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(cardBackground)
         .overlay(

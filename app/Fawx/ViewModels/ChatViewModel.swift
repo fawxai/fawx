@@ -555,7 +555,7 @@ final class ChatViewModel {
 
         draftMessage = ""
 
-        if isStreaming {
+        if isCurrentSessionStreaming {
             queuedMessageText = trimmed
             queuedMessageSessionID = currentSessionID
             return

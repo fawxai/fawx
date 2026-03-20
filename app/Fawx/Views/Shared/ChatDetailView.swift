@@ -24,86 +24,165 @@ struct ChatDetailView: View {
     let emptyStateMessage: String
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: FawxSpacing.paddingLG) {
-                    if sessionViewModel.selectedSessionID == nil && chatViewModel.transcriptItems.isEmpty {
-                        emptyState
-                    } else {
-                        ForEach(chatViewModel.transcriptItems) { item in
-                            transcriptItemView(item)
-                                .id(item.id)
-                        }
-
-                        if chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty {
-                            MessageBubble(
-                                role: .assistant,
-                                content: streamingBubbleContent,
-                                isStreaming: true
-                            )
-                            .id("streaming")
-                        }
-                    }
-
-                    Color.clear
-                        .frame(height: 1)
-                        .background(
-                            GeometryReader { proxy in
-                                Color.clear.preference(
-                                    key: ScrollContentBottomPreferenceKey.self,
-                                    value: proxy.frame(in: .global).maxY
-                                )
-                            }
-                        )
-                        .id(scrollBottomAnchorID)
-                }
-                .padding(FawxSpacing.paddingXL)
-            }
-            .id(sessionScrollIdentity)
-            .background(
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: ScrollViewportBottomPreferenceKey.self,
-                        value: proxy.frame(in: .global).maxY
-                    )
-                }
-            )
+        GeometryReader(content: detailContainer)
             .background(Color.fawxBackground)
-            .accessibilityIdentifier("messageList")
+    }
+
+    private func detailContainer(_ containerProxy: GeometryProxy) -> some View {
+        ScrollViewReader { proxy in
+            applyingRipcordPresentation(
+                to: applyingPlatformScrollHandlers(
+                    to: observingTranscriptScrollView(
+                        decoratedTranscriptScrollView(
+                            baseTranscriptScrollView(for: containerProxy)
+                        ),
+                        proxy: proxy
+                    ),
+                    proxy: proxy
+                )
+            )
+        }
+    }
+
+    private func baseTranscriptScrollView(for containerProxy: GeometryProxy) -> some View {
+        ScrollView {
+            transcriptStack
+        }
+        .id(sessionScrollIdentity)
+        .background(scrollViewportReader)
+        .background(Color.fawxBackground)
+        .accessibilityIdentifier("messageList")
+        .environment(\.containerWidth, FawxSpacing.resolvedChatContainerWidth(for: containerProxy.size.width))
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            composerArea
+        }
+    }
+
+    private var transcriptStack: some View {
+        LazyVStack(spacing: FawxSpacing.paddingLG) {
+            transcriptContent
+            scrollBottomAnchor
+        }
+        .padding(FawxSpacing.paddingXL)
+    }
+
+    @ViewBuilder
+    private var transcriptContent: some View {
+        if sessionViewModel.selectedSessionID == nil && chatViewModel.transcriptItems.isEmpty {
+            emptyState
+        } else {
+            ForEach(chatViewModel.transcriptItems) { item in
+                transcriptItemView(item)
+                    .id(item.id)
+            }
+
+            if chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty {
+                streamingBubble
+            }
+        }
+    }
+
+    private var streamingBubble: some View {
+        MessageBubble(
+            role: .assistant,
+            content: streamingBubbleContent,
+            isStreaming: true
+        )
+        .id("streaming")
+    }
+
+    private var scrollBottomAnchor: some View {
+        Color.clear
+            .frame(height: 1)
+            .background(scrollContentReader)
+            .id(scrollBottomAnchorID)
+    }
+
+    private var scrollViewportReader: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(
+                key: ScrollViewportBottomPreferenceKey.self,
+                value: proxy.frame(in: .global).maxY
+            )
+        }
+    }
+
+    private var scrollContentReader: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(
+                key: ScrollContentBottomPreferenceKey.self,
+                value: proxy.frame(in: .global).maxY
+            )
+        }
+    }
+
+    private func decoratedTranscriptScrollView<Content: View>(_ content: Content) -> some View {
+        content
             .overlay {
-                if chatViewModel.isLoadingHistory && chatViewModel.transcriptItems.isEmpty {
-                    loadingOverlay
-                }
+                historyLoadingOverlay
             }
             .overlay(alignment: .top) {
-                if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
-                    cachedRefreshIndicator
-                        .padding(.top, FawxSpacing.paddingLG)
+                refreshIndicatorOverlay
+            }
+            .overlay(alignment: .topTrailing) {
+                ripcordNotificationOverlay
+            }
+            .animation(.easeInOut(duration: 0.25), value: appState.activeRipcordStatus?.notificationID)
+    }
+
+    @ViewBuilder
+    private var historyLoadingOverlay: some View {
+        if chatViewModel.isLoadingHistory && chatViewModel.transcriptItems.isEmpty {
+            loadingOverlay
+        }
+    }
+
+    @ViewBuilder
+    private var refreshIndicatorOverlay: some View {
+        if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
+            cachedRefreshIndicator
+                .padding(.top, FawxSpacing.paddingLG)
+        }
+    }
+
+    @ViewBuilder
+    private var ripcordNotificationOverlay: some View {
+        if let ripcordStatus = appState.activeRipcordStatus {
+            RipcordNotification(
+                status: ripcordStatus,
+                isPerformingAction: ripcordActionInFlight != nil,
+                reviewAction: presentRipcordJournal,
+                pullAction: {
+                    pendingRipcordConfirmation = .pull
+                },
+                approveAction: {
+                    pendingRipcordConfirmation = .approve
+                },
+                dismissAction: {
+                    appState.dismissRipcordNotification()
                 }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if let ripcordStatus = appState.activeRipcordStatus {
-                    RipcordBanner(
-                        status: ripcordStatus,
-                        isPerformingAction: ripcordActionInFlight != nil,
-                        reviewAction: presentRipcordJournal,
-                        pullAction: {
-                            pendingRipcordConfirmation = .pull
-                        },
-                        approveAction: {
-                            pendingRipcordConfirmation = .approve
-                        }
-                    )
-                    .padding(.horizontal, FawxSpacing.paddingXL)
-                    .padding(.top, FawxSpacing.paddingSM)
-                }
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                composerArea
-            }
-            .onAppear {
-                scheduleScrollToBottom(using: proxy, animated: false)
-            }
+            )
+            .padding(.top, FawxSpacing.paddingLG)
+            .padding(.trailing, FawxSpacing.paddingLG)
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+    }
+
+    private func observingTranscriptScrollView<Content: View>(
+        _ content: Content,
+        proxy: ScrollViewProxy
+    ) -> some View {
+        applyingSessionScrollHandlers(
+            to: applyingTranscriptUpdateHandlers(
+                to: applyingPreferenceHandlers(to: content),
+                proxy: proxy
+            ),
+            proxy: proxy
+        )
+    }
+
+    private func applyingPreferenceHandlers<Content: View>(to content: Content) -> some View {
+        content
             .onPreferenceChange(ScrollViewportBottomPreferenceKey.self) { viewportBottomY in
                 scrollViewportBottomY = viewportBottomY
                 updateStreamingDistanceFromBottomIfNeeded()
@@ -112,10 +191,23 @@ struct ChatDetailView: View {
                 scrollContentBottomY = contentBottomY
                 updateStreamingDistanceFromBottomIfNeeded()
             }
+    }
+
+    private func applyingTranscriptUpdateHandlers<Content: View>(
+        to content: Content,
+        proxy: ScrollViewProxy
+    ) -> some View {
+        content
+            .onAppear {
+                scheduleScrollToBottom(using: proxy, animated: false)
+            }
             .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
-                let animated = chatViewModel.pendingTranscriptScrollBehavior == .animated && !chatViewModel.isLoadingHistory
+                let animated =
+                    chatViewModel.pendingTranscriptScrollBehavior == .animated
+                    && !chatViewModel.isLoadingHistory
                 let shouldSkipStreamingScroll =
-                    chatViewModel.isCurrentSessionStreaming && !chatViewModel.shouldAutoScrollStreamingUpdates
+                    chatViewModel.isCurrentSessionStreaming
+                    && !chatViewModel.shouldAutoScrollStreamingUpdates
                 if !shouldSkipStreamingScroll {
                     scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
                 }
@@ -128,6 +220,13 @@ struct ChatDetailView: View {
 
                 scheduleScrollToBottom(using: proxy, animated: true, includeFollowUp: false)
             }
+    }
+
+    private func applyingSessionScrollHandlers<Content: View>(
+        to content: Content,
+        proxy: ScrollViewProxy
+    ) -> some View {
+        content
             .onChange(of: chatViewModel.isCurrentSessionStreaming) { _, isStreaming in
                 if isStreaming {
                     scheduleScrollToBottom(using: proxy, animated: false)
@@ -141,83 +240,106 @@ struct ChatDetailView: View {
                     scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
                 }
             }
+    }
+
+    private func applyingPlatformScrollHandlers<Content: View>(
+        to content: Content,
+        proxy: ScrollViewProxy
+    ) -> some View {
 #if os(iOS)
+        content
             .scrollDismissesKeyboard(.interactively)
             .onReceive(keyboardFrameDidChange) { _ in
                 scheduleScrollToBottom(using: proxy)
             }
+#else
+        content
 #endif
+    }
+
+    private func applyingRipcordPresentation<Content: View>(to content: Content) -> some View {
+        content
             .sheet(
                 isPresented: $isShowingRipcordSheet,
                 onDismiss: {
                     ripcordReport = nil
                 }
             ) {
-                Group {
-                    if let ripcordReport {
-                        RipcordReportView(report: ripcordReport, dismissAction: {
-                            self.ripcordReport = nil
-                            isShowingRipcordSheet = false
-                        })
-                    } else {
-                        RipcordJournalPanel(
-                            status: appState.activeRipcordStatus,
-                            entries: ripcordJournalEntries,
-                            isLoading: isLoadingRipcordJournal,
-                            errorMessage: ripcordJournalErrorMessage,
-                            isPerformingAction: ripcordActionInFlight != nil,
-                            refreshAction: {
-                                Task {
-                                    await loadRipcordJournal()
-                                }
-                            },
-                            pullAction: {
-                                pendingRipcordConfirmation = .pull
-                            },
-                            approveAction: {
-                                pendingRipcordConfirmation = .approve
-                            },
-                            dismissAction: {
-                                isShowingRipcordSheet = false
-                            }
-                        )
-                    }
-                }
-                .fawxOpaqueModalPresentation()
+                ripcordSheetContent
+                    .fawxOpaqueModalPresentation()
             }
             .confirmationDialog(
                 pendingRipcordConfirmation?.title ?? "",
-                isPresented: Binding(
-                    get: { pendingRipcordConfirmation != nil },
-                    set: { isPresented in
-                        if !isPresented {
-                            pendingRipcordConfirmation = nil
-                        }
-                    }
-                ),
+                isPresented: pendingRipcordConfirmationBinding,
                 titleVisibility: .visible
             ) {
-                Button(
-                    pendingRipcordConfirmation?.buttonTitle ?? "",
-                    role: pendingRipcordConfirmation?.buttonRole
-                ) {
-                    guard let pendingRipcordConfirmation else {
-                        return
-                    }
-
-                    Task {
-                        await performRipcordAction(pendingRipcordConfirmation)
-                    }
-                }
-
-                Button("Cancel", role: .cancel) {
-                    pendingRipcordConfirmation = nil
-                }
+                ripcordConfirmationActions
             } message: {
                 Text(pendingRipcordConfirmation?.message ?? "")
             }
+    }
+
+    @ViewBuilder
+    private var ripcordSheetContent: some View {
+        if let ripcordReport {
+            RipcordReportView(report: ripcordReport, dismissAction: {
+                self.ripcordReport = nil
+                isShowingRipcordSheet = false
+            })
+        } else {
+            RipcordJournalPanel(
+                status: appState.ripcordStatus,
+                entries: ripcordJournalEntries,
+                isLoading: isLoadingRipcordJournal,
+                errorMessage: ripcordJournalErrorMessage,
+                isPerformingAction: ripcordActionInFlight != nil,
+                refreshAction: {
+                    Task {
+                        await loadRipcordJournal()
+                    }
+                },
+                pullAction: {
+                    pendingRipcordConfirmation = .pull
+                },
+                approveAction: {
+                    pendingRipcordConfirmation = .approve
+                },
+                dismissAction: {
+                    isShowingRipcordSheet = false
+                }
+            )
         }
-        .background(Color.fawxBackground)
+    }
+
+    private var pendingRipcordConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { pendingRipcordConfirmation != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingRipcordConfirmation = nil
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var ripcordConfirmationActions: some View {
+        Button(
+            pendingRipcordConfirmation?.buttonTitle ?? "",
+            role: pendingRipcordConfirmation?.buttonRole
+        ) {
+            guard let pendingRipcordConfirmation else {
+                return
+            }
+
+            Task {
+                await performRipcordAction(pendingRipcordConfirmation)
+            }
+        }
+
+        Button("Cancel", role: .cancel) {
+            pendingRipcordConfirmation = nil
+        }
     }
 
     private func presentRipcordJournal() {

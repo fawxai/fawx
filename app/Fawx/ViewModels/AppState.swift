@@ -229,7 +229,18 @@ final class AppState {
     var currentContext: ContextInfo?
     var permissionPresetName = "Power User"
     var permissionMode: PermissionMode = .prompt
-    var ripcordStatus: RipcordStatusResponse?
+    var ripcordStatus: RipcordStatusResponse? {
+        didSet {
+            guard let ripcordStatus, ripcordStatus.active else {
+                ripcordNotificationDismissedID = nil
+                return
+            }
+
+            if oldValue?.notificationID != ripcordStatus.notificationID {
+                ripcordNotificationDismissedID = nil
+            }
+        }
+    }
     var connectionError: String?
     var theme: AppTheme
     var fontSize: AppFontSize
@@ -254,6 +265,7 @@ final class AppState {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectAttempt = 0
     @ObservationIgnored private var startupHydrationOverrides: StartupHydrationOverride = []
+    private var ripcordNotificationDismissedID: String?
 
     @ObservationIgnored private var initialPersistenceLoadTask: Task<Void, Never>?
 
@@ -439,7 +451,18 @@ final class AppState {
         guard let ripcordStatus, ripcordStatus.active else {
             return nil
         }
+        guard ripcordNotificationDismissedID != ripcordStatus.notificationID else {
+            return nil
+        }
         return ripcordStatus
+    }
+
+    func dismissRipcordNotification() {
+        guard let ripcordStatus, ripcordStatus.active else {
+            return
+        }
+
+        ripcordNotificationDismissedID = ripcordStatus.notificationID
     }
 
     func bootstrap() async {
@@ -1051,7 +1074,15 @@ final class AppState {
         from previousStatus: RipcordStatusResponse?,
         to currentStatus: RipcordStatusResponse
     ) -> Bool {
-        currentStatus.active && previousStatus?.active != true
+        guard currentStatus.active else {
+            return false
+        }
+
+        guard let previousStatus else {
+            return true
+        }
+
+        return !previousStatus.active || previousStatus.notificationID != currentStatus.notificationID
     }
 
     private func postRipcordNotification(for status: RipcordStatusResponse) {

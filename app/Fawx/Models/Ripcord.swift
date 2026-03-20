@@ -103,6 +103,18 @@ struct RipcordStatusResponse: Codable, Sendable, Hashable {
         return trimmed.isEmpty ? "Tripwire crossed" : trimmed
     }
 
+    var notificationID: String {
+        if let tripwireId, !tripwireId.isEmpty {
+            return "tripwire:\(tripwireId)"
+        }
+
+        if let activatedAt {
+            return "activated:\(activatedAt.timeIntervalSince1970)"
+        }
+
+        return "description:\(displayDescription)"
+    }
+
     var entryCountLabel: String {
         "\(entryCount) action\(entryCount == 1 ? "" : "s") journaled"
     }

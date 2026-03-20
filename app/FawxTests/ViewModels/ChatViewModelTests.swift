@@ -329,6 +329,27 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(sut.queuedMessage)
     }
 
+    func testSendDraftSendsImmediatelyWhenAnotherSessionIsStreaming() async {
+        let sut = makeSUT(connectionStatus: .connected)
+
+        sut.prepareToDisplaySession("session-b")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-b",
+            streamingSessionID: "session-a"
+        )
+        sut.draftMessage = "follow up"
+
+        sut.sendDraft()
+
+        XCTAssertEqual(sut.draftMessage, "")
+        XCTAssertNil(sut.queuedMessage)
+
+        await waitForTranscriptItems(on: sut, minimumCount: 1)
+
+        XCTAssertEqual(sut.transcriptItems.compactMap(\.sessionMessage).map(\.content), ["follow up"])
+    }
+
     func testInvalidateSessionRemovesCacheAndClearsVisibleTranscriptForCurrentSession() {
         let sut = makeSUT()
         let message = SessionMessage(role: .assistant, content: "cached", timestamp: 1)
@@ -429,6 +450,17 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTFail("Expected the render timer to schedule a sleep.")
+    }
+
+    private func waitForTranscriptItems(on sut: ChatViewModel, minimumCount: Int) async {
+        for _ in 0..<20 {
+            if sut.transcriptItems.count >= minimumCount {
+                return
+            }
+            await Task.yield()
+        }
+
+        XCTFail("Expected at least \(minimumCount) transcript item(s).")
     }
 }
 

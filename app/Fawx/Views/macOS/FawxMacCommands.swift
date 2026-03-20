@@ -7,6 +7,7 @@ struct FawxMacCommands: Commands {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @Bindable var sparkleUpdater: SparkleUpdater
+    @AppStorage("show_git_panel") private var showGitPanel = false
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
@@ -46,6 +47,13 @@ struct FawxMacCommands: Commands {
                 showSettings()
             }
             .keyboardShortcut("3", modifiers: .command)
+
+            Divider()
+
+            Button(showGitPanel ? "Hide Git Panel" : "Show Git Panel") {
+                toggleGitPanel()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
         }
     }
 
@@ -74,6 +82,16 @@ struct FawxMacCommands: Commands {
         appState.sidebarSelection = .settings
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
+    }
+
+    private func toggleGitPanel() {
+        GitPanelPresentation.toggle(
+            showGitPanel: $showGitPanel,
+            selectedSessionID: sessionViewModel.selectedSessionID,
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            chatViewModel: chatViewModel
+        )
     }
 
     private func clearSelectedSession() {

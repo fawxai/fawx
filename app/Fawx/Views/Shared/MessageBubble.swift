@@ -2,6 +2,8 @@ import MarkdownUI
 import SwiftUI
 
 struct MessageBubble: View {
+    @Environment(\.containerWidth) private var containerWidth
+
     let role: MessageRole
     let content: String
     let timestamp: Int?
@@ -55,7 +57,7 @@ struct MessageBubble: View {
                 }
             }
             .frame(
-                maxWidth: FawxSpacing.maxMessageWidth,
+                maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth),
                 alignment: role == .user ? .trailing : .leading
             )
 
@@ -74,7 +76,7 @@ struct MessageBubble: View {
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             messageContent
-                .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: .leading)
+                .frame(maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth), alignment: .leading)
         }
     }
 

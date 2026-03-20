@@ -294,6 +294,79 @@ final class AppStateTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testDismissRipcordNotificationHidesCurrentActiveStatus() {
+        let sut = AppState(startLoadingPersistedState: false)
+        let status = RipcordStatusResponse(
+            active: true,
+            tripwireId: "tripwire-1",
+            tripwireDescription: "Tracked file mutation",
+            activatedAt: Date(timeIntervalSince1970: 1_710_000_000),
+            entryCount: 3
+        )
+
+        sut.ripcordStatus = status
+        XCTAssertEqual(sut.activeRipcordStatus, status)
+
+        sut.dismissRipcordNotification()
+
+        XCTAssertNil(sut.activeRipcordStatus)
+    }
+
+    @MainActor
+    func testNewRipcordEventResetsDismissedNotification() {
+        let sut = AppState(startLoadingPersistedState: false)
+        let firstStatus = RipcordStatusResponse(
+            active: true,
+            tripwireId: "tripwire-1",
+            tripwireDescription: "Tracked file mutation",
+            activatedAt: Date(timeIntervalSince1970: 1_710_000_000),
+            entryCount: 3
+        )
+        let secondStatus = RipcordStatusResponse(
+            active: true,
+            tripwireId: "tripwire-2",
+            tripwireDescription: "New policy trigger",
+            activatedAt: Date(timeIntervalSince1970: 1_710_000_100),
+            entryCount: 1
+        )
+
+        sut.ripcordStatus = firstStatus
+        sut.dismissRipcordNotification()
+        XCTAssertNil(sut.activeRipcordStatus)
+
+        sut.ripcordStatus = secondStatus
+
+        XCTAssertEqual(sut.activeRipcordStatus, secondStatus)
+    }
+
+    @MainActor
+    func testInactiveRipcordStatusClearsDismissedNotification() {
+        let sut = AppState(startLoadingPersistedState: false)
+        sut.ripcordStatus = RipcordStatusResponse(
+            active: true,
+            tripwireId: "tripwire-1",
+            tripwireDescription: "Tracked file mutation",
+            activatedAt: Date(timeIntervalSince1970: 1_710_000_000),
+            entryCount: 3
+        )
+
+        sut.dismissRipcordNotification()
+        sut.ripcordStatus = .inactive
+
+        XCTAssertNil(sut.activeRipcordStatus)
+
+        sut.ripcordStatus = RipcordStatusResponse(
+            active: true,
+            tripwireId: "tripwire-2",
+            tripwireDescription: "New policy trigger",
+            activatedAt: Date(timeIntervalSince1970: 1_710_000_100),
+            entryCount: 1
+        )
+
+        XCTAssertNotNil(sut.activeRipcordStatus)
+    }
+
 #if os(macOS)
     func testAwaitPersistedStateLoadDoesNotOverwriteReturnToLocalSetup() async {
         let defaultsSuiteName = uniqueDefaultsSuiteName()

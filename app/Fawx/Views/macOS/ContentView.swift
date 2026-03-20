@@ -16,79 +16,62 @@ struct ContentView: View {
     @Bindable var usageViewModel: UsageViewModel
 
     @SceneStorage("sidebar_selection") private var sidebarSelectionRawValue: String?
+    @AppStorage("show_git_panel") private var showGitPanel = false
 
     var body: some View {
         VStack(spacing: 0) {
-            if let banner = appState.connectionBanner {
-                ConnectionBannerView(banner: banner) {
-                    Task {
-                        await appState.retryConnection()
-                    }
-                }
-            }
-
-            NavigationSplitView {
-                Sidebar(
-                    sessionViewModel: sessionViewModel,
-                    selection: sidebarSelection,
-                    streamingSessionID: chatViewModel.activeStreamSessionID,
-                    newSessionAction: beginNewSession,
-                    selectSessionAction: selectSession,
-                    showSkillsAction: showSkills,
-                    showFleetAction: showFleet,
-                    showExperimentsAction: showExperiments,
-                    showGitAction: showGit,
-                    openSettingsAction: showSettings,
-                    clearSessionAction: clearSession,
-                    deleteSessionAction: deleteSession,
-                    deleteSessionsAction: deleteSessions
-                )
-                .frame(minWidth: 260)
-            } detail: {
-                detailView
-            }
-            .navigationSplitViewStyle(.balanced)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .layoutPriority(1)
-
-            StatusBar(
-                connectionStatus: appState.connectionStatus,
-                permissionPreset: appState.permissionPresetName,
-                modelName: appState.activeModel?.modelID ?? appState.lastHealth?.model,
-                context: appState.currentContext,
-                selectedSessionMessageCount: sessionViewModel.selectedSession?.messageCount ?? 0
-            )
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity)
+            connectionBannerView
+            mainContent
+            statusBarView
         }
         .background(Color.fawxBackground)
         .overlay(alignment: .top) {
-            if let toast = appState.toast {
-                ToastView(toast: toast)
-                    .padding(.top, FawxSpacing.paddingLG)
-            }
+            toastOverlay
         }
         .task {
-            if appState.sidebarSelection == nil {
-                appState.sidebarSelection = sidebarSelectionRawValue.flatMap(SidebarSelection.init(rawValue:))
-            }
-            await sessionViewModel.refresh()
-            await restoreSelectionAfterRefresh()
+            await loadInitialContent()
         }
         .onChange(of: sessionViewModel.selectedSessionID) { _, newValue in
-            if let newValue {
-                if sidebarSelection != .session(newValue) {
-                    sidebarSelection = .session(newValue)
-                }
-                chatViewModel.prepareToDisplaySession(newValue)
-                chatViewModel.scheduleLoadMessages(for: newValue, force: true)
-            } else if case .session = sidebarSelection {
-                beginNewSession()
-            }
+            handleSelectedSessionChange(newValue)
         }
         .onChange(of: appState.sidebarSelection) { _, newValue in
-            sidebarSelectionRawValue = newValue?.rawValue
+            handleSidebarSelectionChange(newValue)
         }
+    }
+
+    @ViewBuilder
+    private var connectionBannerView: some View {
+        if let banner = appState.connectionBanner {
+            ConnectionBannerView(banner: banner) {
+                Task {
+                    await appState.retryConnection()
+                }
+            }
+        }
+    }
+
+    private var mainContent: some View {
+        NavigationSplitView {
+            sidebarView
+        } detail: {
+            detailView
+        }
+        .navigationSplitViewStyle(.balanced)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .layoutPriority(1)
+        .toolbar {
+            gitPanelToolbar
+        }
+    }
+
+    private var sidebarView: some View {
+        Sidebar(
+            sessionViewModel: sessionViewModel,
+            selection: sidebarSelection,
+            streamingSessionID: chatViewModel.activeStreamSessionID,
+            actions: sidebarActions
+        )
+        .frame(minWidth: FawxSpacing.sidebarWidth)
     }
 
     @ViewBuilder
@@ -118,14 +101,74 @@ struct ContentView: View {
             )
             .navigationTitle("Settings")
         case .session, .none:
-            ChatDetailView(
-                appState: appState,
-                sessionViewModel: sessionViewModel,
-                chatViewModel: chatViewModel,
-                emptyStateTitle: "What are we working on?",
-                emptyStateMessage: "Create a new conversation from the sidebar, or start typing and Fawx will create one on your first message."
-            )
-            .navigationTitle(detailTitle)
+            chatDetailContainer
+                .navigationTitle(detailTitle)
+        }
+    }
+
+    private var chatDetail: some View {
+        ChatDetailView(
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            chatViewModel: chatViewModel,
+            emptyStateTitle: "What are we working on?",
+            emptyStateMessage: "Create a new conversation from the sidebar, or start typing and Fawx will create one on your first message."
+        )
+    }
+
+    @ViewBuilder
+    private var chatDetailContainer: some View {
+#if os(macOS)
+        if shouldShowGitPanel {
+            HSplitView {
+                chatDetail
+                    .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
+
+                CompactGitPanel(
+                    viewModel: gitViewModel,
+                    openFullViewAction: openGitView,
+                    dismissAction: hideGitPanel
+                )
+                .frame(minWidth: 280, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
+            }
+        } else {
+            chatDetail
+        }
+#else
+        chatDetail
+#endif
+    }
+
+    private var statusBarView: some View {
+        StatusBar(
+            connectionStatus: appState.connectionStatus,
+            permissionPreset: appState.permissionPresetName,
+            modelName: appState.activeModel?.modelID ?? appState.lastHealth?.model,
+            context: appState.currentContext,
+            selectedSessionMessageCount: sessionViewModel.selectedSession?.messageCount ?? 0
+        )
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var toastOverlay: some View {
+        if let toast = appState.toast {
+            ToastView(toast: toast)
+                .padding(.top, FawxSpacing.paddingLG)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var gitPanelToolbar: some ToolbarContent {
+        if isChatSectionSelected {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: toggleGitPanel) {
+                    Label(gitPanelButtonTitle, systemImage: "sidebar.right")
+                }
+                .help(gitPanelButtonHelp)
+            }
         }
     }
 
@@ -149,6 +192,59 @@ struct ContentView: View {
             return sessionID
         }
         return nil
+    }
+
+    private var sidebarActions: Sidebar.ActionHandlers {
+        Sidebar.ActionHandlers(
+            newSession: beginNewSession,
+            selectSession: selectSession,
+            showSkills: showSkills,
+            showFleet: showFleet,
+            showExperiments: showExperiments,
+            showGit: showGit,
+            openGitPanel: openGitPanel,
+            openSettings: showSettings,
+            clearSession: clearSession,
+            deleteSession: deleteSession,
+            deleteSessions: deleteSessions
+        )
+    }
+
+    private var gitPanelSelectionID: String? {
+        sessionViewModel.selectedSessionID ?? selectedSessionID
+    }
+
+    private var gitPanelButtonTitle: String {
+        shouldShowGitPanel ? "Hide Git Panel" : "Show Git Panel"
+    }
+
+    private var gitPanelButtonHelp: String {
+        shouldShowGitPanel ? "Hide Git side panel" : "Show Git side panel"
+    }
+
+    private func loadInitialContent() async {
+        if appState.sidebarSelection == nil {
+            appState.sidebarSelection = sidebarSelectionRawValue.flatMap(SidebarSelection.init(rawValue:))
+        }
+
+        await sessionViewModel.refresh()
+        await restoreSelectionAfterRefresh()
+    }
+
+    private func handleSelectedSessionChange(_ newValue: String?) {
+        if let newValue {
+            if sidebarSelection != .session(newValue) {
+                sidebarSelection = .session(newValue)
+            }
+            chatViewModel.prepareToDisplaySession(newValue)
+            chatViewModel.scheduleLoadMessages(for: newValue, force: true)
+        } else if case .session = sidebarSelection {
+            beginNewSession()
+        }
+    }
+
+    private func handleSidebarSelectionChange(_ newValue: SidebarSelection?) {
+        sidebarSelectionRawValue = newValue?.rawValue
     }
 
     private func beginNewSession() {
@@ -261,9 +357,51 @@ struct ContentView: View {
 
     private func switchToNonChatSection(_ selection: SidebarSelection) {
         chatViewModel.cancelScheduledLoad()
+        GitPanelPresentation.hide(showGitPanel: $showGitPanel)
         sidebarSelection = selection
         sessionViewModel.select(nil)
         chatViewModel.showEmptyState()
+    }
+
+    private var isChatSectionSelected: Bool {
+        switch sidebarSelection {
+        case .session, .none:
+            true
+        case .skills, .fleet, .experiments, .git, .settings:
+            false
+        }
+    }
+
+    private var shouldShowGitPanel: Bool {
+        showGitPanel && isChatSectionSelected
+    }
+
+    private func toggleGitPanel() {
+        GitPanelPresentation.toggle(
+            showGitPanel: $showGitPanel,
+            selectedSessionID: gitPanelSelectionID,
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            chatViewModel: chatViewModel
+        )
+    }
+
+    private func openGitPanel() {
+        GitPanelPresentation.show(
+            showGitPanel: $showGitPanel,
+            selectedSessionID: gitPanelSelectionID,
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            chatViewModel: chatViewModel
+        )
+    }
+
+    private func hideGitPanel() {
+        GitPanelPresentation.hide(showGitPanel: $showGitPanel)
+    }
+
+    private func openGitView() {
+        switchToNonChatSection(.git)
     }
 
 }
