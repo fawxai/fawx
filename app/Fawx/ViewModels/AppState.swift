@@ -480,6 +480,7 @@ final class AppState {
     }
 
     func completeLocalSetup(
+        markSetupComplete: Bool = true,
         progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
     ) async throws {
         await awaitPersistedStateLoad()
@@ -489,6 +490,7 @@ final class AppState {
             try await adoptAndConnect(
                 serverURL: existingConfig.baseURLString,
                 bearerToken: existingConfig.bearerToken,
+                markSetupComplete: markSetupComplete,
                 progress: progress
             )
             return
@@ -499,7 +501,7 @@ final class AppState {
         let installedConfig = await refreshLocalInstallConfiguration()
         let serverURL = installedConfig?.baseURLString ?? "http://\(result.host):\(result.port)"
         let bearerToken = installedConfig?.bearerToken ?? result.bearerToken
-        try await adoptAndConnect(serverURL: serverURL, bearerToken: bearerToken, progress: progress)
+        try await adoptAndConnect(serverURL: serverURL, bearerToken: bearerToken, markSetupComplete: markSetupComplete, progress: progress)
     }
 
     func savePairing(
@@ -1012,6 +1014,7 @@ final class AppState {
     private func adoptAndConnect(
         serverURL: String,
         bearerToken: String? = nil,
+        markSetupComplete: Bool = true,
         progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
     ) async throws {
         progress("Connecting this Mac to Fawx...")
@@ -1031,8 +1034,10 @@ final class AppState {
             deviceName: resolvedDeviceName,
             connectionMode: .local
         )
-        isSetupComplete = true
-        await persistence.setSetupComplete(true)
+        if markSetupComplete {
+            isSetupComplete = true
+            await persistence.setSetupComplete(true)
+        }
         progress("Opening Fawx...")
         await bootstrap()
     }
