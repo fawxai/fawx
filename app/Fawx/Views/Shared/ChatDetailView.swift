@@ -324,11 +324,10 @@ struct ChatDetailView: View {
 
     private var emptyState: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
-            appIconImage
+            Image("FawxLogo")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: emptyStateEmojiSize, height: emptyStateEmojiSize)
-                .clipShape(RoundedRectangle(cornerRadius: emptyStateEmojiSize * 0.2))
                 .accessibilityHidden(true)
 
             Text(emptyStateTitle)
@@ -352,19 +351,7 @@ struct ChatDetailView: View {
         .frame(maxWidth: .infinity, minHeight: 320)
     }
 
-    private var appIconImage: Image {
-        #if os(macOS)
-        if let nsImage = NSImage(named: NSImage.applicationIconName) {
-            return Image(nsImage: nsImage)
-        }
-        return Image(systemName: "app.fill")
-        #else
-        if let uiImage = UIImage(named: "AppIcon") {
-            return Image(uiImage: uiImage)
-        }
-        return Image(systemName: "app.fill")
-        #endif
-    }
+
 
     private var composerArea: some View {
         VStack(spacing: FawxSpacing.paddingMD) {
