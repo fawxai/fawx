@@ -482,13 +482,14 @@ final class AppState {
     /// Configure the HTTP client for a bootstrapped server without changing
     /// navigation state or persisting pairing. Used by the setup wizard to
     /// enable API calls on the provider step before setup is complete.
-    func configureClientForBootstrap(serverURL: String, bearerToken: String) async {
-        guard let url = URL(string: serverURL) else { return }
+    func configureClientForBootstrap(serverURL: String, bearerToken: String) async throws {
+        guard let url = URL(string: serverURL) else {
+            throw APIError.invalidURL(serverURL)
+        }
         await client.updateConfiguration(baseURL: url, bearerToken: bearerToken)
     }
 
     func completeLocalSetup(
-        markSetupComplete: Bool = true,
         progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
     ) async throws {
         await awaitPersistedStateLoad()
@@ -498,7 +499,6 @@ final class AppState {
             try await adoptAndConnect(
                 serverURL: existingConfig.baseURLString,
                 bearerToken: existingConfig.bearerToken,
-                markSetupComplete: markSetupComplete,
                 progress: progress
             )
             return
@@ -509,7 +509,7 @@ final class AppState {
         let installedConfig = await refreshLocalInstallConfiguration()
         let serverURL = installedConfig?.baseURLString ?? "http://\(result.host):\(result.port)"
         let bearerToken = installedConfig?.bearerToken ?? result.bearerToken
-        try await adoptAndConnect(serverURL: serverURL, bearerToken: bearerToken, markSetupComplete: markSetupComplete, progress: progress)
+        try await adoptAndConnect(serverURL: serverURL, bearerToken: bearerToken, progress: progress)
     }
 
     func savePairing(
@@ -1022,7 +1022,6 @@ final class AppState {
     private func adoptAndConnect(
         serverURL: String,
         bearerToken: String? = nil,
-        markSetupComplete: Bool = true,
         progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
     ) async throws {
         progress("Connecting this Mac to Fawx...")
@@ -1042,10 +1041,8 @@ final class AppState {
             deviceName: resolvedDeviceName,
             connectionMode: .local
         )
-        if markSetupComplete {
-            isSetupComplete = true
-            await persistence.setSetupComplete(true)
-        }
+        isSetupComplete = true
+        await persistence.setSetupComplete(true)
         progress("Opening Fawx...")
         await bootstrap()
     }

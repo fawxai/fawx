@@ -59,7 +59,7 @@ enum SetupProviderAuthMethod: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 @Observable
 final class SetupViewModel {
-    typealias LocalSetupAction = (Bool, @escaping @MainActor @Sendable (String) -> Void) async throws -> Void
+    typealias LocalSetupAction = (@escaping @MainActor @Sendable (String) -> Void) async throws -> Void
     typealias Phase4StateRefreshAction = () async -> Void
 
     var step: SetupStep = .welcome
@@ -89,8 +89,8 @@ final class SetupViewModel {
         refreshPhase4StateAction: Phase4StateRefreshAction? = nil
     ) {
         self.appState = appState
-        self.completeLocalSetupAction = completeLocalSetupAction ?? { markSetupComplete, progress in
-            try await appState.completeLocalSetup(markSetupComplete: markSetupComplete, progress: progress)
+        self.completeLocalSetupAction = completeLocalSetupAction ?? { progress in
+            try await appState.completeLocalSetup(progress: progress)
         }
         self.refreshPhase4StateAction = refreshPhase4StateAction ?? {
             await appState.refreshPhase4State()
@@ -394,7 +394,7 @@ final class SetupViewModel {
         }
 
         do {
-            try await completeLocalSetupAction(true) { [weak self] message in
+            try await completeLocalSetupAction { [weak self] message in
                 self?.bootstrapProgress = message
             }
         } catch {
