@@ -25,7 +25,12 @@ final class MenuBarManager: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.imagePosition = .noImage
+            if let icon = NSImage(named: "MenuBarIcon") {
+                icon.isTemplate = true
+                icon.size = NSSize(width: 18, height: 18)
+                button.image = icon
+                button.imagePosition = .imageLeading
+            }
             button.toolTip = "Fawx"
         }
         refreshStatusDisplay()
@@ -155,7 +160,7 @@ final class MenuBarManager: NSObject {
 
     private func statusItemTitle(snapshot: MenuBarStatusSnapshot) -> NSAttributedString {
         let title = NSMutableAttributedString(
-            string: "🦊 ",
+            string: "",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 14),
             ]
