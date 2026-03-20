@@ -19,7 +19,7 @@
 	<key>SUFeedURL</key>
 	<string>https://fawx.ai/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>PASTE_PUBLIC_KEY_HERE</string>
+	<string>7lX/6MRtx61EUUaKxJT5nmgm5TVje6DF4t4r2Hm9Rwo=</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
