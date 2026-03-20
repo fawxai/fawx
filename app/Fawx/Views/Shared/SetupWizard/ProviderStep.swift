@@ -25,6 +25,7 @@ struct ProviderStep: View {
                     )
                 }
             }
+            .disabled(viewModel.isRefreshing)
 
             VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
                 Text("How do you want to connect?")
@@ -48,6 +49,7 @@ struct ProviderStep: View {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.fawxBorder, lineWidth: 1)
             }
+            .disabled(viewModel.isRefreshing)
 
             VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
                 if viewModel.selectedProvider == .anthropic && viewModel.selectedAuthMethod == .subscription {
@@ -115,6 +117,17 @@ struct ProviderStep: View {
                     .disabled(viewModel.isSubmittingProvider || !viewModel.selectedProviderConfigured)
                 }
             }
+            .disabled(viewModel.isRefreshing)
+
+            if viewModel.isRefreshing, let bootstrapProgress = viewModel.bootstrapProgress {
+                HStack(spacing: FawxSpacing.paddingSM) {
+                    ProgressView()
+
+                    Text(bootstrapProgress)
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+            }
 
             SetupStatusMessageView(
                 kind: viewModel.providerStatusKind,
@@ -140,6 +153,7 @@ struct ProviderStep: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.fawxAccent)
             }
+            .disabled(viewModel.isRefreshing)
         }
     }
 }
