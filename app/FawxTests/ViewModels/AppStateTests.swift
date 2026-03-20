@@ -1,6 +1,128 @@
 import XCTest
 @testable import Fawx
 
+final class AppStatePersistenceTests: XCTestCase {
+    func testLoadLaunchSnapshotReadsDefaultsOffMainThread() async {
+        let probe = OffMainExecutionProbe()
+        let persistence = AppStatePersistence(
+            defaultsSuiteName: uniqueDefaultsSuiteName(),
+            localInstallLoader: { nil },
+            offMainExecutionProbe: { probe.record() }
+        )
+
+        _ = await persistence.loadLaunchSnapshot(resetState: false)
+
+        probe.assertObservedOffMain()
+    }
+
+    func testSavePairingWritesOffMainThread() async throws {
+        let probe = OffMainExecutionProbe()
+        let keychainService = uniqueKeychainService()
+        let serverURL = "https://remote.example.com:8400"
+        defer { try? KeychainHelper.deleteToken(forServer: serverURL, service: keychainService) }
+
+        let persistence = AppStatePersistence(
+            defaultsSuiteName: uniqueDefaultsSuiteName(),
+            keychainService: keychainService,
+            localInstallLoader: { nil },
+            offMainExecutionProbe: { probe.record() }
+        )
+
+        try await persistence.savePairing(
+            serverURLString: serverURL,
+            token: "new-token",
+            deviceName: "Remote Mac",
+            connectionMode: .remote
+        )
+
+        probe.assertObservedOffMain()
+    }
+
+    func testClearPairingRemovesPersistedPairingAndToken() async throws {
+        let defaultsSuiteName = uniqueDefaultsSuiteName()
+        let defaults = makeUserDefaults(suiteName: defaultsSuiteName)
+        let keychainService = uniqueKeychainService()
+        let serverURL = "https://remote.example.com:8400"
+        defer { try? KeychainHelper.deleteToken(forServer: serverURL, service: keychainService) }
+
+        defaults.set(serverURL, forKey: AppStateStorageKey.serverURL)
+        defaults.set("Remote Mac", forKey: AppStateStorageKey.pairedDeviceName)
+        try KeychainHelper.saveToken("stored-token", forServer: serverURL, service: keychainService)
+
+        let persistence = AppStatePersistence(
+            defaultsSuiteName: defaultsSuiteName,
+            keychainService: keychainService,
+            localInstallLoader: { nil }
+        )
+
+        await persistence.clearPairing(serverURLString: serverURL)
+
+        XCTAssertNil(defaults.string(forKey: AppStateStorageKey.serverURL))
+        XCTAssertNil(defaults.string(forKey: AppStateStorageKey.pairedDeviceName))
+        XCTAssertNil(try KeychainHelper.token(forServer: serverURL, service: keychainService))
+    }
+
+    func testPersistenceSettersStillWriteExpectedDefaults() async {
+        let defaultsSuiteName = uniqueDefaultsSuiteName()
+        let defaults = makeUserDefaults(suiteName: defaultsSuiteName)
+        let persistence = AppStatePersistence(
+            defaultsSuiteName: defaultsSuiteName,
+            localInstallLoader: { nil }
+        )
+
+        await persistence.setTheme(.dark)
+        await persistence.setFontSize(.large)
+        await persistence.setConnectionMode(.local)
+        await persistence.setSetupComplete(true)
+
+        XCTAssertEqual(defaults.string(forKey: AppStateStorageKey.theme), AppTheme.dark.rawValue)
+        XCTAssertEqual(defaults.string(forKey: AppStateStorageKey.fontSize), AppFontSize.large.rawValue)
+        XCTAssertEqual(defaults.string(forKey: AppStateStorageKey.connectionMode), AppConnectionMode.local.rawValue)
+        XCTAssertTrue(defaults.bool(forKey: AppStateStorageKey.setupComplete))
+    }
+
+#if os(macOS)
+    func testLoadLaunchSnapshotStartsDefaultsAndLocalInstallLoadsConcurrently() async {
+        let defaultsReadStarted = expectation(description: "defaults read started")
+        let probe = OffMainExecutionProbe(blocking: true, startedExpectation: defaultsReadStarted)
+        let loader = BlockingLocalInstallLoader()
+        let persistence = AppStatePersistence(
+            defaultsSuiteName: uniqueDefaultsSuiteName(),
+            localInstallLoader: { await loader.load() },
+            offMainExecutionProbe: { probe.record() }
+        )
+
+        let task = Task {
+            await persistence.loadLaunchSnapshot(resetState: false)
+        }
+
+        await fulfillment(of: [defaultsReadStarted], timeout: 1)
+        await loader.waitUntilStarted()
+        probe.release()
+        await loader.release()
+
+        let snapshot = await task.value
+        XCTAssertNil(snapshot.localInstallConfiguration)
+        probe.assertObservedOffMain()
+    }
+#endif
+
+    private func makeUserDefaults(suiteName: String) -> UserDefaults {
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fatalError("Couldn't create AppStatePersistence test defaults.")
+        }
+        return defaults
+    }
+
+    private func uniqueDefaultsSuiteName() -> String {
+        "AppStatePersistenceTests.\(UUID().uuidString)"
+    }
+
+    private func uniqueKeychainService() -> String {
+        "ai.fawx.app.persistence.tests.\(UUID().uuidString)"
+    }
+}
+
 final class AppStateTests: XCTestCase {
     func testAwaitPersistedStateLoadAppliesStoredPairingAndAppearance() async throws {
         let defaultsSuiteName = uniqueDefaultsSuiteName()
@@ -446,5 +568,48 @@ private actor BlockingLocalInstallLoader {
     func release() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private final class OffMainExecutionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let startedExpectation: XCTestExpectation?
+    private let releaseSemaphore: DispatchSemaphore?
+    private var invocationCount = 0
+    private var observedMainThread = false
+
+    init(
+        blocking: Bool = false,
+        startedExpectation: XCTestExpectation? = nil
+    ) {
+        self.startedExpectation = startedExpectation
+        self.releaseSemaphore = blocking ? DispatchSemaphore(value: 0) : nil
+    }
+
+    func record() {
+        lock.lock()
+        invocationCount += 1
+        observedMainThread = observedMainThread || Thread.isMainThread
+        lock.unlock()
+
+        startedExpectation?.fulfill()
+        releaseSemaphore?.wait()
+    }
+
+    func release() {
+        releaseSemaphore?.signal()
+    }
+
+    func assertObservedOffMain(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        lock.lock()
+        let invocationCount = invocationCount
+        let observedMainThread = observedMainThread
+        lock.unlock()
+
+        XCTAssertGreaterThan(invocationCount, 0, file: file, line: line)
+        XCTAssertFalse(observedMainThread, file: file, line: line)
     }
 }
