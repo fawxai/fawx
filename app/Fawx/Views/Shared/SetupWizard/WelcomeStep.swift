@@ -9,8 +9,10 @@ struct WelcomeStep: View {
         SetupWizardCard(maxWidth: 460) {
             VStack(spacing: FawxSpacing.paddingLG) {
                 VStack(spacing: FawxSpacing.paddingSM) {
-                    Text("🦊")
-                        .font(.system(size: 64))
+                    Image("FawxLogo")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 80, height: 80)
 
                     Text("Welcome to Fawx")
                         .font(.system(size: 28, weight: .bold))
