@@ -202,13 +202,13 @@ struct ChatDetailView: View {
                 scheduleScrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
-                let animated =
-                    chatViewModel.pendingTranscriptScrollBehavior == .animated
-                    && !chatViewModel.isLoadingHistory
+                let scrollBehavior = chatViewModel.pendingTranscriptScrollBehavior
+                let animated = scrollBehavior == .animated && !chatViewModel.isLoadingHistory
+                let shouldPreserveScrollPosition = scrollBehavior == .preservePosition
                 let shouldSkipStreamingScroll =
                     chatViewModel.isCurrentSessionStreaming
                     && !chatViewModel.shouldAutoScrollStreamingUpdates
-                if !shouldSkipStreamingScroll {
+                if !shouldPreserveScrollPosition && !shouldSkipStreamingScroll {
                     scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
                 }
                 chatViewModel.pendingTranscriptScrollBehavior = .animated

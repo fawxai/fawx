@@ -219,6 +219,25 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(controller.isPinnedToBottom)
     }
 
+    func testAppendingVisibleMessageWhileDetachedMidStreamPreservesScrollPosition() {
+        let sut = makeSUT()
+        let assistantMessage = SessionMessage(role: .assistant, content: "done", timestamp: 2)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a",
+            streamingText: "partial",
+            phase: .reason
+        )
+        sut.updateStreamingDistanceFromBottomForTesting(StreamingDisplayController.bottomThreshold + 20)
+
+        sut.appendMessageForTesting(assistantMessage, sessionID: "session-a")
+
+        XCTAssertEqual(sut.pendingTranscriptScrollBehavior, .preservePosition)
+    }
+
     func testShowEmptyStatePreservesBackgroundStream() {
         let sut = makeSUT()
         let message = SessionMessage(role: .assistant, content: "visible", timestamp: 1)
