@@ -500,7 +500,7 @@ final class SetupViewModel {
         bootstrapProgress = "Starting Fawx server..."
 
         do {
-            try await completeLocalSetupAction(markSetupComplete: false) { [weak self] message in
+            try await completeLocalSetupAction(false) { [weak self] message in
                 self?.bootstrapProgress = message
             }
             bootstrapProgress = nil
