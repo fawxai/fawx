@@ -364,6 +364,10 @@ pub(crate) async fn serve_tls_listener_with_shutdown(
 async fn load_rustls_config(
     tls_config: &TlsConfig,
 ) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    // Ensure a CryptoProvider is installed before rustls attempts to use one.
+    // ring is already a dependency; this makes it the process-level default.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     axum_server::tls_rustls::RustlsConfig::from_pem_file(
         tls_config.cert_path.clone(),
         tls_config.key_path.clone(),

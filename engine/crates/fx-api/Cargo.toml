@@ -33,6 +33,7 @@ fx-tools.workspace = true
 rand = "0.8"
 reqwest.workspace = true
 ring.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
 serde_json.workspace = true
 subtle = "2"
