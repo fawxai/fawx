@@ -65,19 +65,14 @@ final class MenuBarManager: NSObject {
         }
 
         let snapshot = snapshot()
-        let iconName = menuBarIconName(for: snapshot.status)
-        if let icon = NSImage(named: iconName) {
-            icon.isTemplate = false
+        if let icon = NSImage(named: "MenuBarIcon-stopped") {
+            icon.isTemplate = true
             icon.size = NSSize(width: 18, height: 18)
             button.image = icon
             button.imagePosition = .imageLeading
         }
         button.attributedTitle = statusItemTitle(snapshot: snapshot)
         button.toolTip = "\(snapshot.title)\n\(snapshot.detail)"
-    }
-
-    private func menuBarIconName(for status: MenuBarStatus) -> String {
-        "MenuBarIcon-\(status.rawValue)"
     }
 
     private func rebuildMenu() {
@@ -175,7 +170,13 @@ final class MenuBarManager: NSObject {
     }
 
     private func statusItemTitle(snapshot: MenuBarStatusSnapshot) -> NSAttributedString {
-        NSAttributedString(string: "")
+        NSAttributedString(
+            string: "●",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 9),
+                .foregroundColor: nsColor(from: snapshot.color),
+            ]
+        )
     }
 
     private func isPrimaryAppWindow(_ window: NSWindow) -> Bool {
