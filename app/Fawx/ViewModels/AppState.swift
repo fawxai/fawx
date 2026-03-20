@@ -479,6 +479,14 @@ final class AppState {
 #endif
     }
 
+    /// Configure the HTTP client for a bootstrapped server without changing
+    /// navigation state or persisting pairing. Used by the setup wizard to
+    /// enable API calls on the provider step before setup is complete.
+    func configureClientForBootstrap(serverURL: String, bearerToken: String) async {
+        guard let url = URL(string: serverURL) else { return }
+        await client.updateConfiguration(baseURL: url, bearerToken: bearerToken)
+    }
+
     func completeLocalSetup(
         markSetupComplete: Bool = true,
         progress: @escaping @MainActor @Sendable (String) -> Void = { _ in }
