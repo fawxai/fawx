@@ -51,6 +51,8 @@ pub mod security_audit;
 #[allow(dead_code)]
 pub mod serve_fleet;
 #[allow(dead_code)]
+pub mod sessions;
+#[allow(dead_code)]
 pub mod setup;
 #[allow(dead_code)]
 pub(crate) mod skill_signatures;
