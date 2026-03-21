@@ -37,7 +37,7 @@ use fx_llm::{
     ContentBlock, Message, MessageRole, ProviderError, StreamCallback as ProviderStreamCallback,
     StreamChunk, StreamEvent as ProviderStreamEvent, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
-use fx_session::SessionMemory;
+use fx_session::{SessionMemory, SessionMemoryUpdate};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -447,6 +447,8 @@ pub struct LoopEngine {
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
     conversation_compactor: Box<dyn CompactionStrategy>,
+    /// LLM for compaction-time memory extraction.
+    compaction_llm: Option<Arc<dyn LlmProvider>>,
     memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
     compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
     /// Guards performance signal to fire only on the Normal→Low transition,
@@ -703,6 +705,7 @@ impl LoopEngineBuilder {
         let max_iterations = required_builder_field(self.max_iterations, "max_iterations")?.max(1);
         let synthesis_instruction =
             required_builder_field(self.synthesis_instruction, "synthesis_instruction")?;
+        let compaction_llm_for_extraction = self.compaction_llm.as_ref().map(Arc::clone);
         let (compaction_config, conversation_budget, conversation_compactor) =
             build_compaction_components(self.compaction_config, self.compaction_llm)?;
 
@@ -725,6 +728,7 @@ impl LoopEngineBuilder {
             compaction_config,
             conversation_budget,
             conversation_compactor,
+            compaction_llm: compaction_llm_for_extraction,
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
@@ -770,6 +774,103 @@ fn build_compaction_components(
     );
     let strategy = compaction_config.build_strategy(llm);
     Ok((compaction_config, conversation_budget, strategy))
+}
+
+fn build_extraction_prompt(messages: &[Message]) -> String {
+    format!(
+        concat!(
+            "Extract key facts from this conversation excerpt that is being removed from context.\n",
+            "Return a JSON object with these optional fields:\n",
+            "- \"project\": what the session is about (string, only if clearly identifiable)\n",
+            "- \"current_state\": current state of work (string, only if clear)\n",
+            "- \"key_decisions\": important decisions made (array of short strings)\n",
+            "- \"active_files\": files being worked on (array of paths)\n",
+            "- \"custom_context\": other important facts to remember (array of short strings)\n\n",
+            "Only include fields where the conversation clearly contains relevant information.\n",
+            "Keep each string under 100 characters. Return ONLY valid JSON, no markdown.\n\n",
+            "Conversation:\n{}"
+        ),
+        format_extraction_messages(messages)
+    )
+}
+
+fn format_extraction_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter_map(format_extraction_message)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_extraction_message(message: &Message) -> Option<String> {
+    let role = extraction_role(&message.role)?;
+    let content = message
+        .content
+        .iter()
+        .map(format_extraction_block)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("{role}: {content}"))
+}
+
+fn extraction_role(role: &MessageRole) -> Option<&'static str> {
+    match role {
+        MessageRole::User => Some("user"),
+        MessageRole::Assistant => Some("assistant"),
+        MessageRole::System => None,
+        MessageRole::Tool => Some("tool"),
+    }
+}
+
+fn format_extraction_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => text.clone(),
+        ContentBlock::ToolUse { name, .. } => format!("[tool: {name}]"),
+        ContentBlock::ToolResult { content, .. } => {
+            truncate_prompt_text(&render_tool_result(content), 200)
+        }
+        ContentBlock::Image { .. } => "[image]".to_string(),
+    }
+}
+
+fn render_tool_result(content: &serde_json::Value) -> String {
+    match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content.to_string(),
+    }
+}
+
+fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn parse_extraction_response(response: &str) -> Option<SessionMemoryUpdate> {
+    let trimmed = response.trim();
+    if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(trimmed) {
+        return Some(update);
+    }
+    if let Some(json) = extract_json_object(trimmed) {
+        if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(json) {
+            return Some(update);
+        }
+    }
+    tracing::warn!(
+        response_len = response.len(),
+        "failed to parse memory extraction response as JSON"
+    );
+    None
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    Some(&text[start..=end])
 }
 
 fn required_builder_field<T>(value: Option<T>, field: &str) -> Result<T, LoopError> {
@@ -3007,9 +3108,6 @@ impl LoopEngine {
             return;
         }
 
-        let Some(flush) = &self.memory_flush else {
-            return;
-        };
         let evicted: Vec<Message> = result
             .evicted_indices
             .iter()
@@ -3019,18 +3117,55 @@ impl LoopEngine {
             return;
         }
 
-        if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
-            tracing::warn!(
-                scope = scope.as_str(),
-                error = %err,
-                evicted_count = evicted.len(),
-                "pre-compaction memory flush failed; proceeding without flush"
-            );
-            self.emit_background_error(
-                ErrorCategory::Memory,
-                format!("Memory flush failed during compaction: {err}"),
-                true,
-            );
+        if let Some(flush) = &self.memory_flush {
+            if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    error = %err,
+                    evicted_count = evicted.len(),
+                    "pre-compaction memory flush failed; proceeding without flush"
+                );
+                self.emit_background_error(
+                    ErrorCategory::Memory,
+                    format!("Memory flush failed during compaction: {err}"),
+                    true,
+                );
+            }
+        }
+
+        self.extract_memory_from_evicted(&evicted).await;
+    }
+
+    async fn extract_memory_from_evicted(&self, evicted: &[Message]) {
+        let Some(llm) = &self.compaction_llm else {
+            return;
+        };
+        if evicted.is_empty() {
+            return;
+        }
+
+        let prompt = build_extraction_prompt(evicted);
+        match llm.generate(&prompt, 512).await {
+            Ok(response) => {
+                if let Some(update) = parse_extraction_response(&response) {
+                    let mut memory = self
+                        .session_memory
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Err(err) = memory.apply_update(update) {
+                        tracing::warn!(
+                            error = %err,
+                            "auto-extracted memory update rejected (token cap)"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "memory extraction from evicted messages failed"
+                );
+            }
         }
     }
 
@@ -12155,6 +12290,62 @@ mod context_compaction_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ExtractionLlm {
+        responses: Mutex<VecDeque<Result<String, CoreLlmError>>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl ExtractionLlm {
+        fn new(responses: Vec<Result<String, CoreLlmError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("prompts lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ExtractionLlm {
+        async fn generate(&self, prompt: &str, _: u32) -> Result<String, CoreLlmError> {
+            self.prompts
+                .lock()
+                .expect("prompts lock")
+                .push(prompt.to_string());
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok("{}".to_string()))
+        }
+
+        async fn generate_streaming(
+            &self,
+            prompt: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            let response = self.generate(prompt, 0).await?;
+            callback(response.clone());
+            Ok(response)
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-extraction"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Ok(text_response("ok"))
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct FlushCall {
         evicted: Vec<Message>,
@@ -12534,6 +12725,202 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(compacted.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_from_evicted_updates_session_memory() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(serde_json::json!({
+            "project": "Phase 5",
+            "current_state": "Adding automatic extraction",
+            "key_decisions": ["Use compaction LLM"],
+            "active_files": ["engine/crates/fx-kernel/src/loop_engine.rs"],
+            "custom_context": ["Evicted facts are auto-saved"]
+        })
+        .to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let evicted = vec![
+            Message::user("We are implementing Phase 5."),
+            Message::assistant("LoopEngine needs automatic extraction."),
+        ];
+
+        engine.extract_memory_from_evicted(&evicted).await;
+
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(memory.project.as_deref(), Some("Phase 5"));
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("Adding automatic extraction")
+        );
+        assert_eq!(memory.key_decisions, vec!["Use compaction LLM"]);
+        assert_eq!(
+            memory.active_files,
+            vec!["engine/crates/fx-kernel/src/loop_engine.rs"]
+        );
+        assert_eq!(memory.custom_context, vec!["Evicted facts are auto-saved"]);
+        assert_eq!(llm.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_memory_skipped_without_compaction_llm() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_handles_llm_failure_gracefully() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Err(CoreLlmError::ApiRequest(
+            "boom".to_string(),
+        ))]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_handles_malformed_response() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok("not json".to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_respects_token_cap() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(
+            serde_json::json!({"custom_context": [words(2_100)]}).to_string(),
+        )]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[test]
+    fn build_extraction_prompt_formats_messages() {
+        let prompt = build_extraction_prompt(&[
+            Message::system("system policy"),
+            Message::user("User fact"),
+            tool_use("call-1"),
+            tool_result("call-1", 250),
+            Message {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "abc".to_string(),
+                }],
+            },
+        ]);
+
+        assert!(prompt.contains("Return ONLY valid JSON"));
+        assert!(prompt.contains("user: User fact"));
+        assert!(prompt.contains("assistant: [tool: read]"));
+        assert!(prompt.contains("tool: "));
+        assert!(prompt.contains("[image]"));
+        assert!(prompt.contains("..."));
+        assert!(!prompt.contains("system: system policy"));
+    }
+
+    #[test]
+    fn parse_extraction_response_handles_code_block() {
+        let response = "```json\n{\"project\":\"Phase 5\"}\n```";
+
+        let update = parse_extraction_response(response).expect("parse code block");
+
+        assert_eq!(update.project.as_deref(), Some("Phase 5"));
+    }
+
+    #[test]
+    fn parse_extraction_response_returns_none_for_garbage() {
+        assert!(parse_extraction_response("definitely not json").is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_evicted_triggers_extraction() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let flush = Arc::new(RecordingMemoryFlush::default());
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(serde_json::json!({
+            "project": "Phase 5",
+            "custom_context": ["Compaction saved this fact"]
+        })
+        .to_string())]));
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .compaction_llm(Arc::clone(&llm) as Arc<dyn LlmProvider>)
+            .memory_flush(Arc::clone(&flush) as Arc<dyn CompactionMemoryFlush>)
+            .build()
+            .expect("test engine build");
+        let history = large_history(12, 60);
+
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert_eq!(flush.calls().len(), 1);
+        assert_eq!(
+            engine.session_memory_snapshot().project.as_deref(),
+            Some("Phase 5")
+        );
+        assert_eq!(
+            engine.session_memory_snapshot().custom_context,
+            vec!["Compaction saved this fact"]
+        );
+        assert_eq!(llm.prompts().len(), 1);
     }
 
     #[tokio::test]
