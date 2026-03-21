@@ -3,6 +3,22 @@ import XCTest
 @testable import Fawx
 
 final class SessionTests: XCTestCase {
+    func testContentViewLayoutWidensMinimumWindowWhenGitPanelIsVisible() {
+        let defaultMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: false)
+        let gitPanelMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: true)
+
+        XCTAssertEqual(defaultMinimumWidth, ContentView.Layout.minimumWindowWidth)
+        XCTAssertEqual(gitPanelMinimumWidth, ContentView.Layout.minimumWindowWidthWithGitPanel)
+        XCTAssertGreaterThan(gitPanelMinimumWidth, defaultMinimumWidth)
+        XCTAssertEqual(
+            gitPanelMinimumWidth,
+            ContentView.Layout.sidebarMinWidth
+                + ContentView.Layout.chatDetailMinWidth
+                + ContentView.Layout.compactGitPanelMinWidth
+                + ContentView.Layout.splitDividerWidthAllowance
+        )
+    }
+
     func testSummarizedSessionTitleStripsCommonPromptPrefix() {
         let title = summarizedSessionTitle(from: "Hey Fawx, please help me with the streaming retry bug")
 
@@ -158,6 +174,14 @@ final class ViewSourceRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains("min: Layout.sidebarMinWidth"))
         XCTAssertTrue(source.contains("ideal: Layout.sidebarIdealWidth"))
         XCTAssertTrue(source.contains("max: Layout.sidebarMaxWidth"))
+    }
+
+    func testMacOSContentViewSynchronizesWindowMinimumSizeWithGitPanelLayout() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/macOS/ContentView.swift")
+
+        XCTAssertTrue(source.contains("WindowMinimumSizeConfigurator("))
+        XCTAssertTrue(source.contains("Layout.resolvedMinimumWindowWidth(showingGitPanel: shouldShowGitPanel)"))
+        XCTAssertTrue(source.contains("window.contentMinSize = targetContentMinSize"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {

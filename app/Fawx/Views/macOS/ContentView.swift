@@ -1,8 +1,13 @@
 import Observation
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct ContentView: View {
-    private enum Layout {
+    enum Layout {
+        static let minimumWindowWidth: CGFloat = 900
+        static let minimumWindowHeight: CGFloat = 600
         static let sidebarMinWidth = FawxSpacing.sidebarWidth
         static let sidebarIdealWidth = FawxSpacing.sidebarWidth + FawxSpacing.paddingXL
         static let sidebarMaxWidth = FawxSpacing.sidebarWidth + (FawxSpacing.paddingXL * 2)
@@ -10,6 +15,13 @@ struct ContentView: View {
         static let compactGitPanelMinWidth: CGFloat = 280
         static let compactGitPanelIdealWidth: CGFloat = 340
         static let compactGitPanelMaxWidth: CGFloat = 420
+        static let splitDividerWidthAllowance = FawxSpacing.paddingSM * 2
+        static let minimumWindowWidthWithGitPanel =
+            sidebarMinWidth + chatDetailMinWidth + compactGitPanelMinWidth + splitDividerWidthAllowance
+
+        static func resolvedMinimumWindowWidth(showingGitPanel: Bool) -> CGFloat {
+            showingGitPanel ? minimumWindowWidthWithGitPanel : minimumWindowWidth
+        }
     }
 
     @Bindable var appState: AppState
@@ -35,9 +47,18 @@ struct ContentView: View {
             statusBarView
         }
         .background(Color.fawxBackground)
+        .frame(minWidth: minimumWindowWidth, minHeight: Layout.minimumWindowHeight)
         .overlay(alignment: .top) {
             toastOverlay
         }
+#if os(macOS)
+        .background(
+            WindowMinimumSizeConfigurator(
+                minWidth: minimumWindowWidth,
+                minHeight: Layout.minimumWindowHeight
+            )
+        )
+#endif
         .task {
             await loadInitialContent()
         }
@@ -241,6 +262,10 @@ struct ContentView: View {
         shouldShowGitPanel ? "Hide Git side panel" : "Show Git side panel"
     }
 
+    private var minimumWindowWidth: CGFloat {
+        Layout.resolvedMinimumWindowWidth(showingGitPanel: shouldShowGitPanel)
+    }
+
     private func loadInitialContent() async {
         if appState.sidebarSelection == nil {
             appState.sidebarSelection = sidebarSelectionRawValue.flatMap(SidebarSelection.init(rawValue:))
@@ -424,3 +449,75 @@ struct ContentView: View {
     }
 
 }
+
+#if os(macOS)
+private struct WindowMinimumSizeConfigurator: NSViewRepresentable {
+    let minWidth: CGFloat
+    let minHeight: CGFloat
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.scheduleUpdate(for: view, minWidth: minWidth, minHeight: minHeight)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.scheduleUpdate(for: nsView, minWidth: minWidth, minHeight: minHeight)
+    }
+
+    final class Coordinator {
+        private var lastAppliedContentMinSize = NSSize.zero
+
+        func scheduleUpdate(for view: NSView, minWidth: CGFloat, minHeight: CGFloat) {
+            guard view.window == nil else {
+                apply(to: view, minWidth: minWidth, minHeight: minHeight)
+                return
+            }
+
+            DispatchQueue.main.async { [weak view] in
+                guard let view else {
+                    return
+                }
+                self.apply(to: view, minWidth: minWidth, minHeight: minHeight)
+            }
+        }
+
+        private func apply(to view: NSView, minWidth: CGFloat, minHeight: CGFloat) {
+            guard let window = view.window else {
+                return
+            }
+
+            let targetContentMinSize = NSSize(width: minWidth, height: minHeight)
+            if lastAppliedContentMinSize != targetContentMinSize {
+                window.contentMinSize = targetContentMinSize
+                lastAppliedContentMinSize = targetContentMinSize
+            }
+
+            let currentContentSize = window.contentRect(forFrameRect: window.frame).size
+            guard currentContentSize.width < minWidth || currentContentSize.height < minHeight else {
+                return
+            }
+
+            let targetContentSize = NSSize(
+                width: max(currentContentSize.width, minWidth),
+                height: max(currentContentSize.height, minHeight)
+            )
+            let targetFrameSize = window.frameRect(
+                forContentRect: NSRect(origin: .zero, size: targetContentSize)
+            ).size
+            guard targetFrameSize != window.frame.size else {
+                return
+            }
+
+            var newFrame = window.frame
+            newFrame.origin.y += newFrame.size.height - targetFrameSize.height
+            newFrame.size = targetFrameSize
+            window.setFrame(newFrame, display: true, animate: true)
+        }
+    }
+}
+#endif
