@@ -86,6 +86,7 @@
 		486CBA0B4DDE46C94109D506 /* MarketplaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E4BE9EBBB93059B1E6AA12C /* MarketplaceView.swift */; };
 		49F793B1A6D275BD3AAF5C11 /* LocalBootstrapService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22141E06B709DC68209DB0D4 /* LocalBootstrapService.swift */; };
 		4F4C4849103AA933E9B0F06F /* SparkleUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0280020B44A6C0E57352B231 /* SparkleUpdater.swift */; };
+		5A97C4BA1A8C4D7001234567 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A97C4B81A8C4D7001234567 /* NotificationService.swift */; };
 		504AE4470C468B0B6673AA22 /* ChatTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1220A4A2A4B7E97E698344D0 /* ChatTranscript.swift */; };
 		507248C881040AFF9CB2DEC5 /* MenuBarManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12A4977E0D29A4297B8B99FE /* MenuBarManager.swift */; };
 		50A83AAFE0595E2AAE18109C /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5125E55F91D139DF57963A4C /* AppState.swift */; };
@@ -96,6 +97,7 @@
 		5445C7F910328E9339D9BDAF /* TelemetryViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 146B710FDA027AAAC80D674A /* TelemetryViewModelTests.swift */; };
 		5548F89BFF81AE8162E0FB1A /* SidebarSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946A14621A9A282DEB705EEC /* SidebarSelection.swift */; };
 		556679CC7366FE88065FDA15 /* SparkleUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0280020B44A6C0E57352B231 /* SparkleUpdater.swift */; };
+		5A97C4BB1A8C4D7001234567 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A97C4B81A8C4D7001234567 /* NotificationService.swift */; };
 		55DA1C3F904256BE16231AD0 /* APIError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78ACEF7490947C5BD47AF87D /* APIError.swift */; };
 		561A9EB0F2F4E07F4CB269D9 /* SandboxStatusCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA7175883B417E3BA5409E39 /* SandboxStatusCard.swift */; };
 		56C2896BCB25E4A60ECBC5D1 /* MarketplaceSkill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7293FD0C7B8C4BFD74D1D776 /* MarketplaceSkill.swift */; };
@@ -314,6 +316,7 @@
 		00F69F61AB77AEF2D9147C4A /* ThinkingLevelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkingLevelTests.swift; sourceTree = "<group>"; };
 		01991C29AD8CA22EC276F310 /* Fawx-macOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Fawx-macOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		0280020B44A6C0E57352B231 /* SparkleUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparkleUpdater.swift; sourceTree = "<group>"; };
+		5A97C4B81A8C4D7001234567 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		02AD2A9B134E41146C48162A /* FleetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FleetView.swift; sourceTree = "<group>"; };
 		02E62E5C85D4819024AE1EFE /* SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListView.swift; sourceTree = "<group>"; };
 		040A9F601AB8F38E19635FB7 /* GitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitView.swift; sourceTree = "<group>"; };
@@ -803,6 +806,7 @@
 			isa = PBXGroup;
 			children = (
 				22141E06B709DC68209DB0D4 /* LocalBootstrapService.swift */,
+				5A97C4B81A8C4D7001234567 /* NotificationService.swift */,
 				0280020B44A6C0E57352B231 /* SparkleUpdater.swift */,
 			);
 			path = Services;
@@ -1089,6 +1093,7 @@
 				1C341C2AE952A9088B4D6437 /* SkillsView.swift in Sources */,
 				AFA837F4BFC50D5D30217CF6 /* SkillsViewModel.swift in Sources */,
 				D1258D520042B6A16E6D9D74 /* Spacing.swift in Sources */,
+				5A97C4BB1A8C4D7001234567 /* NotificationService.swift in Sources */,
 				556679CC7366FE88065FDA15 /* SparkleUpdater.swift in Sources */,
 				76AB135BD1295A46E9FAD8F0 /* StatusBar.swift in Sources */,
 				764C74DBE4A19106B90384B2 /* StringNonEmpty.swift in Sources */,
@@ -1202,6 +1207,7 @@
 				932E5930B16FB1885A0B8F75 /* SkillsView.swift in Sources */,
 				0726A6DE34EB33231173E1C2 /* SkillsViewModel.swift in Sources */,
 				C03A141F74061976F1ACD06F /* Spacing.swift in Sources */,
+				5A97C4BA1A8C4D7001234567 /* NotificationService.swift in Sources */,
 				4F4C4849103AA933E9B0F06F /* SparkleUpdater.swift in Sources */,
 				E44A0D371A927C18C2BAE683 /* StatusBar.swift in Sources */,
 				9FC95EF6C5E504A542C873F8 /* StringNonEmpty.swift in Sources */,

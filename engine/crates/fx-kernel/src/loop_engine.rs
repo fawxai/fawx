@@ -208,6 +208,13 @@ impl<'a> CycleStream<'a> {
         });
     }
 
+    fn notification(self, title: impl Into<String>, body: impl Into<String>) {
+        self.emit(StreamEvent::Notification {
+            title: title.into(),
+            body: body.into(),
+        });
+    }
+
     fn done(self, response: &str) {
         self.emit(StreamEvent::Done {
             response: response.to_string(),
@@ -419,6 +426,10 @@ pub struct LoopEngine {
     /// Per-tool attempt counter for the current cycle.
     /// Key: tool name, Value: number of attempts (including first call).
     tool_attempts: HashMap<String, u8>,
+    /// Whether a successful `notify` tool call occurred during the current cycle.
+    notify_called_this_cycle: bool,
+    /// Whether this cycle currently has an active notification delivery channel.
+    notify_tool_guidance_enabled: bool,
     /// Shared iteration counter for scratchpad age tracking.
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
@@ -444,6 +455,11 @@ impl std::fmt::Debug for LoopEngine {
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("tool_attempts", &self.tool_attempts)
+            .field("notify_called_this_cycle", &self.notify_called_this_cycle)
+            .field(
+                "notify_tool_guidance_enabled",
+                &self.notify_tool_guidance_enabled,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -674,6 +690,8 @@ impl LoopEngineBuilder {
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             tool_attempts: HashMap::new(),
+            notify_called_this_cycle: false,
+            notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             error_callback: self.error_callback,
@@ -890,6 +908,8 @@ const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
+const NOTIFY_TOOL_NAME: &str = "notify";
+const NOTIFICATION_DEFAULT_TITLE: &str = "Fawx";
 const DECOMPOSE_TOOL_DESCRIPTION: &str = "Break a complex task into 2-4 high-level sub-goals. Each sub-goal should be substantial enough to justify its own execution context. Do NOT create more than 5 sub-goals. Prefer fewer, broader goals over many narrow ones. Only use this for tasks that genuinely cannot be handled with direct tool calls.";
 const MAX_SUB_GOALS: usize = 5;
 const DECOMPOSITION_DEPTH_LIMIT_RESPONSE: &str =
@@ -924,6 +944,12 @@ Treat successful tool results as the primary evidence for your next response. \
 If the existing tool results already answer the user's request, answer immediately instead of calling more tools. \
 Only call another tool when the current results are missing critical information, are contradictory, or the user explicitly asked you to refresh/re-check something. \
 Never repeat an identical successful tool call in the same cycle. Reuse the result you already have and answer from it.";
+
+const NOTIFY_TOOL_GUIDANCE: &str = "\n\nYou have a `notify` tool that sends native OS notifications to the user. \
+Use it when you complete a task that took multiple steps, have important results to share, or finish background work the user may not be watching. \
+Do not use it for simple one-turn replies, trivial acknowledgements, or every tool completion. \
+If you do not call `notify`, a generic notification may fire automatically for multi-step tasks when the app is not in focus. \
+Prefer calling `notify` yourself when you can provide a more meaningful summary.";
 
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
@@ -1160,6 +1186,7 @@ impl LoopEngine {
         stream_callback: Option<&StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
         self.prepare_cycle();
+        self.notify_tool_guidance_enabled = stream_callback.is_some();
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
@@ -1177,7 +1204,7 @@ impl LoopEngine {
                     if let Some(result) =
                         self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
                     {
-                        return Ok(self.finalize_result(result));
+                        return Ok(self.finish_streaming_result(result, stream));
                     }
 
                     // Yield between iterations if configured and requested
@@ -1211,8 +1238,23 @@ impl LoopEngine {
         result: LoopResult,
         stream: CycleStream<'_>,
     ) -> LoopResult {
+        self.maybe_emit_completion_notification(&result, stream);
         stream.done_result(&result);
         self.finalize_result(result)
+    }
+
+    fn maybe_emit_completion_notification(&self, result: &LoopResult, stream: CycleStream<'_>) {
+        let LoopResult::Complete { iterations, .. } = result else {
+            return;
+        };
+        if *iterations <= 1 || self.notify_called_this_cycle {
+            return;
+        }
+
+        stream.notification(
+            NOTIFICATION_DEFAULT_TITLE,
+            format!("Task complete ({iterations} steps)"),
+        );
     }
 
     fn safety_limit_result(&self) -> LoopResult {
@@ -1339,6 +1381,8 @@ impl LoopEngine {
         self.pending_steer = None;
         self.budget_low_signaled = false;
         self.tool_attempts.clear();
+        self.notify_called_this_cycle = false;
+        self.notify_tool_guidance_enabled = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -1478,7 +1522,7 @@ impl LoopEngine {
         learning: Learning,
         perception: &mut PerceptionSnapshot,
         state: &mut CycleState,
-        stream: CycleStream<'_>,
+        _stream: CycleStream<'_>,
     ) -> Option<LoopResult> {
         state.learnings.push(learning);
         let result = match continuation {
@@ -1499,9 +1543,6 @@ impl LoopEngine {
                 None
             }
         };
-        if let Some(result) = &result {
-            stream.done_result(result);
-        }
         result
     }
 
@@ -1572,13 +1613,14 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_reasoning_request(
+        let request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
@@ -1779,7 +1821,7 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
-        let request = build_truncation_continuation_request(
+        let request = build_truncation_continuation_request_with_notify_guidance(
             llm.model_name(),
             continuation_messages,
             self.tool_executor.tool_definitions(),
@@ -1787,6 +1829,7 @@ impl LoopEngine {
             self.scratchpad_context.as_deref(),
             step,
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let request_messages = request.messages.clone();
         let response = self
@@ -2361,7 +2404,9 @@ impl LoopEngine {
             builder = builder.event_bus(bus.clone());
         }
 
-        builder.build()
+        let mut child = builder.build()?;
+        child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
+        Ok(child)
     }
 
     fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -2711,14 +2756,17 @@ impl LoopEngine {
         });
     }
 
-    fn publish_tool_results(&self, results: &[ToolResult], stream: CycleStream<'_>) {
+    fn publish_tool_results(&mut self, results: &[ToolResult], stream: CycleStream<'_>) {
         for result in results {
             stream.tool_result(result);
             self.publish_tool_result(result);
         }
     }
 
-    fn publish_tool_result(&self, result: &ToolResult) {
+    fn publish_tool_result(&mut self, result: &ToolResult) {
+        if result.success && result.tool_name == NOTIFY_TOOL_NAME {
+            self.notify_called_this_cycle = true;
+        }
         let Some(bus) = &self.event_bus else {
             return;
         };
@@ -3403,13 +3451,14 @@ impl LoopEngine {
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_continuation_request(
+        let request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
 
         let response = self
@@ -4302,6 +4351,7 @@ fn decompose_tool_definition() -> ToolDefinition {
 }
 
 /// Build a CompletionRequest for tool result re-prompting.
+#[cfg(test)]
 fn build_continuation_request(
     context_messages: &[Message],
     model: &str,
@@ -4310,8 +4360,32 @@ fn build_continuation_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_continuation_request_with_notify_guidance(
+        context_messages,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_continuation_request_with_notify_guidance(
+    context_messages: &[Message],
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_tool_continuation_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -4323,6 +4397,7 @@ fn build_continuation_request(
     }
 }
 
+#[cfg(test)]
 fn build_truncation_continuation_request(
     model: &str,
     continuation_messages: &[Message],
@@ -4332,11 +4407,37 @@ fn build_truncation_continuation_request(
     step: LoopStep,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_truncation_continuation_request_with_notify_guidance(
+        model,
+        continuation_messages,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        step,
+        thinking,
+        false,
+    )
+}
+
+fn build_truncation_continuation_request_with_notify_guidance(
+    model: &str,
+    continuation_messages: &[Message],
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    step: LoopStep,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: continuation_messages.to_vec(),
@@ -4791,6 +4892,7 @@ fn completion_request_to_prompt(request: &CompletionRequest) -> String {
     format!("{system}{messages}")
 }
 
+#[cfg(test)]
 fn build_reasoning_request(
     perception: &ProcessedPerception,
     model: &str,
@@ -4799,10 +4901,34 @@ fn build_reasoning_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_reasoning_request_with_notify_guidance(
+        perception,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_reasoning_request_with_notify_guidance(
+    perception: &ProcessedPerception,
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
 
     CompletionRequest {
         model: model.to_string(),
@@ -4844,21 +4970,49 @@ User message:
     prompt
 }
 
+#[cfg(test)]
 fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
-    build_system_prompt(memory_context, scratchpad_context, None)
+    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
 }
 
+fn build_reasoning_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
+) -> String {
+    build_system_prompt(
+        memory_context,
+        scratchpad_context,
+        None,
+        notify_tool_guidance_enabled,
+    )
+}
+
+#[cfg(test)]
 fn build_tool_continuation_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
+) -> String {
+    build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        false,
+    )
+}
+
+fn build_tool_continuation_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         Some(TOOL_CONTINUATION_DIRECTIVE),
+        notify_tool_guidance_enabled,
     )
 }
 
@@ -4866,8 +5020,12 @@ fn build_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     extra_directive: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    if notify_tool_guidance_enabled {
+        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+    }
     if let Some(extra_directive) = extra_directive {
         prompt.push_str(extra_directive);
     }
@@ -5140,6 +5298,24 @@ mod tests {
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
+        );
+    }
+
+    #[test]
+    fn system_prompt_omits_notify_guidance_without_notification_channel() {
+        let prompt = build_reasoning_system_prompt(None, None);
+        assert!(
+            !prompt.contains("You have a `notify` tool"),
+            "system prompt should omit notify guidance when no notification channel is active"
+        );
+    }
+
+    #[test]
+    fn system_prompt_includes_notify_guidance_when_notification_channel_is_active() {
+        let prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, true);
+        assert!(
+            prompt.contains("You have a `notify` tool"),
+            "system prompt should include notify guidance when notifications are available"
         );
     }
 
@@ -8266,6 +8442,86 @@ mod cancellation_tests {
             output: "ok".to_string(),
             is_error: false,
         }));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_emits_notification_for_multi_iteration_completion_without_notify() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let result = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 2,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let response = match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
+        };
+        let events = events.lock().expect("lock").clone();
+
+        assert_eq!(response, "done");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::Notification { title, body }
+                    if title == "Fawx" && body == "Task complete (2 steps)"
+            )
+        }));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_skips_notification_when_notify_tool_already_ran() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.notify_called_this_cycle = true;
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 2,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Notification { .. })));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_skips_notification_for_single_iteration_completion() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Notification { .. })));
         assert_done_event(&events, "done");
     }
 

@@ -43,6 +43,9 @@ struct ReadyStep: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .task {
+            _ = await NotificationService.shared.requestPermission()
+        }
     }
 
     @ViewBuilder
