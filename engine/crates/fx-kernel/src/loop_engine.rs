@@ -400,6 +400,25 @@ impl std::fmt::Display for CompactionScope {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CompactionTier {
+    Prune,
+    Slide,
+    Summarize,
+    Emergency,
+}
+
+impl CompactionTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prune => "prune",
+            Self::Slide => "slide",
+            Self::Summarize => "summarize",
+            Self::Emergency => "emergency",
+        }
+    }
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but Phases 1-3
@@ -2854,7 +2873,35 @@ impl LoopEngine {
         map.insert(scope, iteration);
     }
 
-    fn should_skip_compaction(&self, scope: CompactionScope, iteration: u32, tier: &str) -> bool {
+    fn highest_compaction_tier(&self, messages: &[Message]) -> Option<CompactionTier> {
+        if self
+            .conversation_budget
+            .at_tier(messages, self.compaction_config.emergency_threshold)
+        {
+            return Some(CompactionTier::Emergency);
+        }
+        if self.compaction_config.use_summarization
+            && self
+                .conversation_budget
+                .at_tier(messages, self.compaction_config.summarize_threshold)
+        {
+            return Some(CompactionTier::Summarize);
+        }
+        if self
+            .conversation_budget
+            .at_tier(messages, self.compaction_config.slide_threshold)
+        {
+            return Some(CompactionTier::Slide);
+        }
+        None
+    }
+
+    fn should_skip_compaction(
+        &self,
+        scope: CompactionScope,
+        iteration: u32,
+        tier: CompactionTier,
+    ) -> bool {
         let cooldown_active = self.compaction_cooldown_active(
             scope,
             iteration,
@@ -2863,7 +2910,7 @@ impl LoopEngine {
         if cooldown_active {
             tracing::debug!(
                 scope = scope.as_str(),
-                tier,
+                tier = tier.as_str(),
                 iteration,
                 cooldown_turns = self.compaction_config.recompact_cooldown_turns,
                 "compaction tier skipped due to cooldown guard"
@@ -2874,7 +2921,7 @@ impl LoopEngine {
 
     fn log_tier_result(
         &self,
-        tier: &str,
+        tier: CompactionTier,
         scope: CompactionScope,
         before_messages: &[Message],
         target_tokens: usize,
@@ -2883,8 +2930,8 @@ impl LoopEngine {
         let before_tokens = ConversationBudget::estimate_tokens(before_messages);
         tracing::info!(
             scope = scope.as_str(),
-            tier,
-            strategy = if tier == "emergency" {
+            tier = tier.as_str(),
+            strategy = if matches!(tier, CompactionTier::Emergency) {
                 "emergency"
             } else if result.used_summarization {
                 "summarizing"
@@ -2941,7 +2988,7 @@ impl LoopEngine {
 
     async fn finish_tier<'a>(
         &self,
-        tier: &str,
+        tier: CompactionTier,
         current: Cow<'a, [Message]>,
         result: CompactionResult,
         scope: CompactionScope,
@@ -2980,14 +3027,6 @@ impl LoopEngine {
         scope: CompactionScope,
         iteration: u32,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        if !self
-            .conversation_budget
-            .at_tier(current.as_ref(), self.compaction_config.slide_threshold)
-            || self.should_skip_compaction(scope, iteration, "slide")
-        {
-            return Ok(current);
-        }
-
         let target_tokens = self.conversation_budget.compaction_target();
         match self
             .run_sliding_compaction(current.as_ref(), scope, target_tokens)
@@ -2995,7 +3034,7 @@ impl LoopEngine {
         {
             Ok(result) => Ok(self
                 .finish_tier(
-                    "slide",
+                    CompactionTier::Slide,
                     current,
                     result,
                     scope,
@@ -3006,7 +3045,7 @@ impl LoopEngine {
             Err(error) => {
                 tracing::warn!(
                     scope = scope.as_str(),
-                    tier = "slide",
+                    tier = CompactionTier::Slide.as_str(),
                     error = ?error,
                     "conversation compaction tier failed; continuing"
                 );
@@ -3021,15 +3060,6 @@ impl LoopEngine {
         scope: CompactionScope,
         iteration: u32,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        if !self.compaction_config.use_summarization
-            || !self
-                .conversation_budget
-                .at_tier(current.as_ref(), self.compaction_config.summarize_threshold)
-            || self.should_skip_compaction(scope, iteration, "summarize")
-        {
-            return Ok(current);
-        }
-
         let target_tokens = self.conversation_budget.summarize_target();
         match self
             .run_compaction_strategy(scope, current.as_ref(), target_tokens)
@@ -3037,7 +3067,7 @@ impl LoopEngine {
         {
             Ok(result) => Ok(self
                 .finish_tier(
-                    "summarize",
+                    CompactionTier::Summarize,
                     current,
                     result,
                     scope,
@@ -3048,7 +3078,7 @@ impl LoopEngine {
             Err(error) => {
                 tracing::warn!(
                     scope = scope.as_str(),
-                    tier = "summarize",
+                    tier = CompactionTier::Summarize.as_str(),
                     error = ?error,
                     "conversation compaction tier failed; continuing"
                 );
@@ -3062,19 +3092,12 @@ impl LoopEngine {
         current: Cow<'a, [Message]>,
         scope: CompactionScope,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        if !self
-            .conversation_budget
-            .at_tier(current.as_ref(), self.compaction_config.emergency_threshold)
-        {
-            return Ok(current);
-        }
-
         let result = emergency_compact(
             current.as_ref(),
             self.compaction_config.preserve_recent_turns,
         );
         Ok(self
-            .finish_tier("emergency", current, result, scope, None, 0)
+            .finish_tier(CompactionTier::Emergency, current, result, scope, None, 0)
             .await)
     }
 
@@ -3086,9 +3109,19 @@ impl LoopEngine {
     ) -> Result<Cow<'a, [Message]>, LoopError> {
         let current = Cow::Borrowed(messages);
         let current = self.apply_prune_tier(current, scope);
-        let current = self.apply_slide_tier(current, scope, iteration).await?;
-        let current = self.apply_summarize_tier(current, scope, iteration).await?;
-        let current = self.apply_emergency_tier(current, scope).await?;
+        let current = match self.highest_compaction_tier(current.as_ref()) {
+            Some(CompactionTier::Emergency) => self.apply_emergency_tier(current, scope).await?,
+            Some(tier @ (CompactionTier::Summarize | CompactionTier::Slide)) => {
+                if self.should_skip_compaction(scope, iteration, tier) {
+                    current
+                } else if matches!(tier, CompactionTier::Summarize) {
+                    self.apply_summarize_tier(current, scope, iteration).await?
+                } else {
+                    self.apply_slide_tier(current, scope, iteration).await?
+                }
+            }
+            Some(CompactionTier::Prune) | None => current,
+        };
         self.ensure_within_hard_limit(scope, current.as_ref())?;
         Ok(current)
     }
@@ -3120,7 +3153,7 @@ impl LoopEngine {
                 let after_tokens = ConversationBudget::estimate_tokens(&owned);
                 tracing::info!(
                     scope = scope.as_str(),
-                    tier = "prune",
+                    tier = CompactionTier::Prune.as_str(),
                     strategy = "prune",
                     before_tokens,
                     after_tokens,
@@ -4983,7 +5016,7 @@ fn finalized_stream_tool_call_from_state(
                 tool_id = %id,
                 tool_name = %name,
                 raw_arguments = %state.arguments,
-                error = ?error,
+                error = %error,
                 "dropping tool call with malformed JSON arguments"
             );
             return None;
@@ -11523,6 +11556,94 @@ mod context_compaction_tests {
             .join(" ")
     }
 
+    fn user(words_count: usize) -> Message {
+        Message::user(words(words_count))
+    }
+
+    fn assistant(words_count: usize) -> Message {
+        Message::assistant(words(words_count))
+    }
+
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id: None,
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "/tmp/a"}),
+            }],
+        }
+    }
+
+    fn tool_result(id: &str, word_count: usize) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: serde_json::json!(words(word_count)),
+            }],
+        }
+    }
+
+    fn has_tool_blocks(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                )
+            })
+        })
+    }
+
+    fn tiered_compaction_config(use_summarization: bool) -> CompactionConfig {
+        CompactionConfig {
+            slide_threshold: 0.60,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.80,
+            emergency_threshold: 0.95,
+            preserve_recent_turns: 2,
+            model_context_limit: 5_096,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 2,
+            use_summarization,
+            max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
+        }
+    }
+
+    fn tiered_budget(config: &CompactionConfig) -> ConversationBudget {
+        ConversationBudget::new(
+            config.model_context_limit,
+            config.slide_threshold,
+            config.reserved_system_tokens,
+        )
+    }
+
+    fn engine_with_compaction_llm(
+        context: ContextCompactor,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: CompactionConfig,
+        llm: Arc<dyn LlmProvider>,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(context)
+            .max_iterations(4)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .compaction_llm(llm)
+            .build()
+            .expect("test engine build")
+    }
+
     fn text_response(text: &str) -> CompletionResponse {
         CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -12281,6 +12402,140 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
+    async fn tiered_compaction_prune_only() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 432),
+            user(5),
+            assistant(5),
+        ];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.40 && usage < 0.60, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("prune-only compaction");
+
+        assert_ne!(compacted.as_ref(), messages.as_slice());
+        assert!(!has_tool_blocks(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_slide_when_prune_insufficient() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(200), assistant(200), user(125), assistant(125)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.60 && usage < 0.80, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("slide compaction");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_summarize_when_slide_insufficient() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let budget = tiered_budget(&config);
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
+                .to_string(),
+        ));
+        let engine =
+            engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
+        let messages = vec![user(250), assistant(250), user(175), assistant(175)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.80 && usage < 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("summarizing compaction");
+
+        assert!(has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_emergency_fires_at_95_percent() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(250), assistant(250), user(230), assistant(230)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cooldown_skips_slide_and_summarize() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
+                .to_string(),
+        ));
+        let engine =
+            engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
+        let slide_input = vec![user(200), assistant(200), user(125), assistant(125)];
+
+        let first = engine
+            .compact_if_needed(&slide_input, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+        assert!(has_compaction_marker(first.as_ref()));
+        assert!(engine.should_skip_compaction(
+            CompactionScope::Perceive,
+            11,
+            CompactionTier::Slide
+        ));
+        assert!(engine.should_skip_compaction(
+            CompactionScope::Perceive,
+            11,
+            CompactionTier::Summarize
+        ));
+
+        let emergency_input = vec![user(250), assistant(250), user(230), assistant(230)];
+        let second = engine
+            .compact_if_needed(&emergency_input, CompactionScope::Perceive, 11)
+            .await
+            .expect("emergency compaction during cooldown");
+
+        assert!(has_emergency_compaction_marker(second.as_ref()));
+        assert!(!has_conversation_summary_marker(second.as_ref()));
+    }
+
+    #[tokio::test]
     async fn cooldown_skips_compaction_when_within_window() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let engine = engine_with(
@@ -12378,7 +12633,7 @@ mod context_compaction_tests {
             .build()
             .expect("test engine build");
 
-        let history = large_history(12, 70);
+        let history = large_history(10, 70);
         let compacted = engine
             .compact_if_needed(&history, CompactionScope::Perceive, 1)
             .await
@@ -12386,6 +12641,7 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
     }
 
     #[tokio::test]

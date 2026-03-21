@@ -86,7 +86,7 @@ fn compaction_marker_message(compacted_count: usize) -> Message {
 
 fn emergency_compaction_marker_message(compacted_count: usize) -> Message {
     Message::assistant(format!(
-        "{COMPACTION_MARKER_PREFIX} emergency — {compacted_count} messages removed]"
+        "{COMPACTION_MARKER_PREFIX} emergency: {compacted_count} messages removed]"
     ))
 }
 
@@ -565,10 +565,14 @@ impl ConversationBudget {
         messages.iter().map(estimate_message_tokens).sum()
     }
 
+    /// Target token count for sliding window compaction (Tier 2).
+    /// Returns 50% of conversation budget for headroom below slide_threshold (60%).
     pub fn compaction_target(&self) -> usize {
-        self.conversation_budget().saturating_mul(3) / 5
+        self.conversation_budget() / 2
     }
 
+    /// Target token count for summarizing compaction (Tier 3).
+    /// Returns 40% of conversation budget for headroom below summarize_threshold (80%).
     pub fn summarize_target(&self) -> usize {
         self.conversation_budget().saturating_mul(2) / 5
     }
@@ -1442,7 +1446,7 @@ mod tests {
         let marker_text = text_blocks(marker).collect::<Vec<_>>().join("\n");
 
         assert!(message_contains_marker(marker));
-        assert!(marker_text.contains("emergency"));
+        assert!(marker_text.contains("emergency: 2 messages removed"));
     }
 
     #[test]
@@ -2071,6 +2075,7 @@ mod tests {
             config.reserved_system_tokens,
         );
         let strategy = config.build_strategy(None);
+        assert_eq!(budget.compaction_target(), budget.conversation_budget() / 2);
 
         // Build messages: a massive tool result in old window pushes tokens
         // above the trigger (~9524), but after pruning it shrinks well below.
