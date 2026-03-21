@@ -26,6 +26,7 @@ struct ContentView: View {
 
     @SceneStorage("sidebar_selection") private var sidebarSelectionRawValue: String?
     @AppStorage("show_git_panel") private var showGitPanel = false
+    @State private var presentedSessionMemory: Session?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,6 +46,12 @@ struct ContentView: View {
         }
         .onChange(of: appState.sidebarSelection) { _, newValue in
             handleSidebarSelectionChange(newValue)
+        }
+        .sheet(item: $presentedSessionMemory) { session in
+            SessionMemoryPanel(appState: appState, session: session) {
+                presentedSessionMemory = nil
+            }
+            .fawxOpaqueModalPresentation()
         }
     }
 
@@ -164,7 +171,9 @@ struct ContentView: View {
             permissionPreset: appState.permissionPresetName,
             modelName: appState.activeModel?.modelID ?? appState.lastHealth?.model,
             context: appState.currentContext,
-            selectedSessionMessageCount: sessionViewModel.selectedSession?.messageCount ?? 0
+            selectedSessionMessageCount: sessionViewModel.selectedSession?.messageCount ?? 0,
+            canShowSessionMemory: sessionViewModel.selectedSession != nil,
+            openSessionMemoryAction: presentSessionMemoryPanel
         )
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity)
@@ -308,6 +317,10 @@ struct ContentView: View {
             }
             chatViewModel.showEmptyState()
         }
+    }
+
+    private func presentSessionMemoryPanel() {
+        presentedSessionMemory = sessionViewModel.selectedSession
     }
 
     private func clearSession(_ sessionID: String) {

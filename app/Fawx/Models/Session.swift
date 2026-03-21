@@ -76,6 +76,112 @@ struct ClearSessionResponse: Codable, Sendable, Hashable {
     let key: String
 }
 
+struct SessionMemory: Codable, Sendable, Hashable {
+    static let maxItems = 20
+    static let maxTokens = 2_000
+
+    var project: String?
+    var currentState: String?
+    var keyDecisions: [String]
+    var activeFiles: [String]
+    var customContext: [String]
+    var lastUpdated: Int
+
+    init(
+        project: String? = nil,
+        currentState: String? = nil,
+        keyDecisions: [String] = [],
+        activeFiles: [String] = [],
+        customContext: [String] = [],
+        lastUpdated: Int = 0
+    ) {
+        self.project = project
+        self.currentState = currentState
+        self.keyDecisions = keyDecisions
+        self.activeFiles = activeFiles
+        self.customContext = customContext
+        self.lastUpdated = lastUpdated
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case project
+        case currentState = "current_state"
+        case keyDecisions = "key_decisions"
+        case activeFiles = "active_files"
+        case customContext = "custom_context"
+        case lastUpdated = "last_updated"
+    }
+
+    var isEmpty: Bool {
+        normalizedProject == nil
+            && normalizedCurrentState == nil
+            && normalizedKeyDecisions.isEmpty
+            && normalizedActiveFiles.isEmpty
+            && normalizedCustomContext.isEmpty
+    }
+
+    var estimatedTokens: Int {
+        let text = renderedMemory
+        guard !text.isEmpty else {
+            return 0
+        }
+
+        let whitespaceTokens = text.split(whereSeparator: \.isWhitespace).count
+        let characterTokens = (text.count + 3) / 4
+        return max(characterTokens, whitespaceTokens, 1)
+    }
+
+    var sanitizedForSaving: SessionMemory {
+        SessionMemory(
+            project: normalizedProject,
+            currentState: normalizedCurrentState,
+            keyDecisions: normalizedKeyDecisions,
+            activeFiles: normalizedActiveFiles,
+            customContext: normalizedCustomContext,
+            lastUpdated: lastUpdated
+        )
+    }
+
+    private var normalizedProject: String? {
+        normalized(project)
+    }
+
+    private var normalizedCurrentState: String? {
+        normalized(currentState)
+    }
+
+    private var normalizedKeyDecisions: [String] {
+        normalizedItems(keyDecisions)
+    }
+
+    private var normalizedActiveFiles: [String] {
+        normalizedItems(activeFiles)
+    }
+
+    private var normalizedCustomContext: [String] {
+        normalizedItems(customContext)
+    }
+
+    private var renderedMemory: String {
+        let sanitized = sanitizedForSaving
+        guard !sanitized.isEmpty else {
+            return ""
+        }
+
+        var lines = ["[Session Memory]"]
+        if let project = sanitized.project {
+            lines.append("Project: \(project)")
+        }
+        if let currentState = sanitized.currentState {
+            lines.append("Current state: \(currentState)")
+        }
+        appendRenderedItems(sanitized.keyDecisions, heading: "Key decisions:", into: &lines)
+        appendRenderedItems(sanitized.activeFiles, heading: "Active files:", into: &lines)
+        appendRenderedItems(sanitized.customContext, heading: "Context:", into: &lines)
+        return lines.joined(separator: "\n")
+    }
+}
+
 extension Session {
     static func sidebarSort(_ lhs: Session, _ rhs: Session) -> Bool {
         if lhs.updatedAt == rhs.updatedAt {
@@ -175,4 +281,29 @@ func truncateSessionTitle(_ text: String, maxLength: Int = 44) -> String {
     let truncatedSlice = cleaned[..<cutoff]
     let wordBoundary = truncatedSlice.lastIndex(of: " ") ?? cutoff
     return String(cleaned[..<wordBoundary]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+}
+
+private func normalized(_ value: String?) -> String? {
+    value?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty
+}
+
+private func normalizedItems(_ values: [String]) -> [String] {
+    values.compactMap { normalized($0) }
+}
+
+private func appendRenderedItems(
+    _ items: [String],
+    heading: String,
+    into lines: inout [String]
+) {
+    guard !items.isEmpty else {
+        return
+    }
+
+    lines.append(heading)
+    for item in items {
+        lines.append("- \(item)")
+    }
 }

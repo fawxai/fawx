@@ -18,6 +18,7 @@ struct ChatDetailView: View {
     @State private var ripcordReport: RipcordReport?
     @State private var pendingRipcordConfirmation: RipcordConfirmationAction?
     @State private var ripcordActionInFlight: RipcordAction?
+    @State private var presentedSessionMemory: Session?
 
     let emptyStateTitle: String
     let emptyStateMessage: String
@@ -25,6 +26,12 @@ struct ChatDetailView: View {
     var body: some View {
         GeometryReader(content: detailContainer)
             .background(Color.fawxBackground)
+            .sheet(item: $presentedSessionMemory) { session in
+                SessionMemoryPanel(appState: appState, session: session) {
+                    presentedSessionMemory = nil
+                }
+                .fawxOpaqueModalPresentation()
+            }
     }
 
     @ViewBuilder
@@ -762,6 +769,15 @@ struct ChatDetailView: View {
                 .accessibilityIdentifier("contextLabel")
 
             Spacer(minLength: 0)
+
+            if sessionViewModel.selectedSession != nil {
+                Button(action: presentSessionMemoryPanel) {
+                    Image(systemName: "square.text.square")
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("sessionMemoryButton")
+                .accessibilityLabel("Open session memory")
+            }
         }
         .font(FawxTypography.status)
         .foregroundStyle(Color.fawxTextSecondary)
@@ -804,6 +820,10 @@ struct ChatDetailView: View {
         case .disconnected:
             return .fawxError
         }
+    }
+
+    private func presentSessionMemoryPanel() {
+        presentedSessionMemory = sessionViewModel.selectedSession
     }
 
     private var keyboardFrameDidChange: NotificationCenter.Publisher {
