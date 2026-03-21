@@ -1004,6 +1004,19 @@ fn serialize_stream_event_serializes_typed_phase() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_notification_payload() {
+    let frame = serialize_stream_event(StreamEvent::Notification {
+        title: "Fawx".to_string(),
+        body: "Task complete".to_string(),
+    })
+    .expect("notification frame");
+
+    assert!(frame.contains("event: notification"));
+    assert!(frame.contains("\"title\":\"Fawx\""));
+    assert!(frame.contains("\"body\":\"Task complete\""));
+}
+
+#[test]
 fn serialize_stream_event_serializes_error_event_payload() {
     let frame = serialize_stream_event(StreamEvent::Error {
         category: fx_kernel::ErrorCategory::Memory,
@@ -1392,7 +1405,7 @@ mod routing_and_status {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -2815,7 +2828,7 @@ allowed_chat_ids = [123]
                 session_key: None,
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
-                permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
                 ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                     std::env::temp_dir().as_path(),
                 )),
@@ -4241,7 +4254,7 @@ mod telegram_update {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),

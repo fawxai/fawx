@@ -49,6 +49,10 @@ pub enum StreamEvent {
     TextDelta {
         text: String,
     },
+    Notification {
+        title: String,
+        body: String,
+    },
     ToolCallStart {
         id: String,
         name: String,
@@ -86,6 +90,18 @@ pub type StreamCallback = Arc<dyn Fn(StreamEvent) + Send + Sync>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_event_serializes_correctly() {
+        let event = StreamEvent::Notification {
+            title: "Fawx".to_string(),
+            body: "Task complete".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
 
     #[test]
     fn error_event_serializes_correctly() {

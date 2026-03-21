@@ -35,6 +35,10 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         StreamEvent::TextDelta { text } => {
             sse_frame("text_delta", serde_json::json!({ "text": text }))
         }
+        StreamEvent::Notification { title, body } => sse_frame(
+            "notification",
+            serde_json::json!({ "title": title, "body": body }),
+        ),
         StreamEvent::ToolCallStart { id, name } => sse_frame(
             "tool_call_start",
             serde_json::json!({ "id": id, "name": name }),

@@ -216,8 +216,7 @@ pub struct HeadlessAppDeps {
     pub session_key: Option<SessionKey>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
-    pub permission_callback_slot:
-        Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    pub stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
@@ -253,8 +252,8 @@ pub struct HeadlessApp {
     cumulative_tokens: TokenUsage,
     /// Structured messages recorded for the most recent completed turn.
     last_session_messages: Vec<SessionMessage>,
-    /// Shared callback slot for permission prompt SSE events.
-    permission_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    /// Shared callback slot for executor-triggered SSE stream events.
+    stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
@@ -541,6 +540,7 @@ impl SessionTurnCollector {
                 self.flush_pending_tool_results();
             }
             StreamEvent::TextDelta { .. }
+            | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. } => {}
         }
@@ -996,7 +996,7 @@ impl HeadlessApp {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
-            permission_callback_slot: deps.permission_callback_slot,
+            stream_callback_slot: deps.stream_callback_slot,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
         };
@@ -1679,8 +1679,7 @@ impl HeadlessApp {
         let should_emit_startup_warnings = callback.is_some();
         let collector = SessionTurnCollector::default();
         let combined_callback = collector.callback(callback);
-        // Set permission prompt callback for this cycle so SSE events fire
-        self.set_permission_callback(Some(Arc::clone(&combined_callback)));
+        self.set_stream_callback(Some(Arc::clone(&combined_callback)));
         if should_emit_startup_warnings {
             self.emit_startup_warnings(Some(&combined_callback));
         } else {
@@ -1701,13 +1700,13 @@ impl HeadlessApp {
             .run_cycle_streaming(snapshot, &llm, Some(combined_callback))
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.set_permission_callback(None);
+        self.set_stream_callback(None);
         self.evaluate_canary(&result);
         Ok(self.finalize_cycle_with_turn_messages(input, images, &result, Some(&collector)))
     }
 
-    fn set_permission_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
-        if let Ok(mut guard) = self.permission_callback_slot.lock() {
+    fn set_stream_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
+        if let Ok(mut guard) = self.stream_callback_slot.lock() {
             *guard = callback;
         }
     }
@@ -2861,7 +2860,7 @@ impl HeadlessSubagentFactory {
             session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
-            permission_callback_slot: bundle.permission_callback_slot,
+            stream_callback_slot: bundle.stream_callback_slot,
             ripcord_journal: bundle.ripcord_journal,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -3356,7 +3355,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3895,7 +3894,7 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4187,7 +4186,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4657,7 +4656,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4714,7 +4713,7 @@ mod tests {
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),

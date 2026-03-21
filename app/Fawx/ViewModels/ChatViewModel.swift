@@ -716,6 +716,8 @@ final class ChatViewModel {
                     switch event {
                     case .textDelta(let text):
                         streamingDisplayController.appendToken(text)
+                    case .notification(let title, let body):
+                        await NotificationService.shared.send(title: title, body: body)
                     case .toolCallStart(let id, let name):
                         if currentSessionID == sessionID {
                             beginToolCall(id: id, name: name)
