@@ -10,7 +10,7 @@ struct ChatDetailView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
-    @State private var scrollMetrics = ScrollMetrics()
+    @State private var transcriptScrollTracker = TranscriptScrollTracker()
     @State private var isShowingRipcordReviewTray = false
     @State private var isLoadingRipcordJournal = false
     @State private var ripcordJournalEntries: [JournalEntry] = []
@@ -27,7 +27,42 @@ struct ChatDetailView: View {
             .background(Color.fawxBackground)
     }
 
+    @ViewBuilder
     private func detailContainer(_ containerProxy: GeometryProxy) -> some View {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            modernDetailContainer(containerProxy)
+        } else {
+            legacyDetailContainer(containerProxy)
+        }
+    }
+
+    @available(iOS 18.0, macOS 15.0, *)
+    private func modernDetailContainer(_ containerProxy: GeometryProxy) -> some View {
+        applyingRipcordPresentation(
+            to: decoratedTranscriptScrollView(
+                ModernTranscriptScrollView(
+                    sessionID: sessionViewModel.selectedSessionID,
+                    lastTranscriptItemID: chatViewModel.transcriptItems.last?.id,
+                    hasVisibleTranscriptContent: hasVisibleTranscriptContent,
+                    isLoadingHistory: chatViewModel.isLoadingHistory,
+                    isCurrentSessionStreaming: chatViewModel.isCurrentSessionStreaming,
+                    visibleStreamingText: chatViewModel.visibleStreamingText,
+                    pendingTranscriptScrollBehavior: pendingTranscriptScrollBehaviorBinding,
+                    updateStreamingPinnedState: { isPinnedToBottom, distanceFromBottom in
+                        chatViewModel.updateStreamingPinnedState(
+                            isPinnedToBottom: isPinnedToBottom,
+                            distanceFromBottom: distanceFromBottom
+                        )
+                    },
+                    content: transcriptStack,
+                    composer: composerArea,
+                    containerWidth: FawxSpacing.resolvedChatContainerWidth(for: containerProxy.size.width)
+                )
+            )
+        )
+    }
+
+    private func legacyDetailContainer(_ containerProxy: GeometryProxy) -> some View {
         ScrollViewReader { proxy in
             applyingRipcordPresentation(
                 to: applyingPlatformScrollHandlers(
@@ -58,7 +93,7 @@ struct ChatDetailView: View {
     }
 
     private var transcriptStack: some View {
-        LazyVStack(spacing: FawxSpacing.paddingLG) {
+        VStack(spacing: FawxSpacing.paddingLG) {
             transcriptContent
             scrollBottomAnchor
         }
@@ -156,13 +191,10 @@ struct ChatDetailView: View {
     private func applyingPreferenceHandlers<Content: View>(to content: Content) -> some View {
         content
             .onPreferenceChange(ScrollViewportBottomPreferenceKey.self) { viewportBottomY in
-                updateScrollMetrics(viewportBottomY: viewportBottomY)
+                handleScrollMetricUpdate(viewportBottomY: viewportBottomY)
             }
             .onPreferenceChange(ScrollContentBottomPreferenceKey.self) { contentBottomY in
-                updateScrollMetrics(contentBottomY: contentBottomY)
-            }
-            .onChange(of: scrollMetrics) { _, _ in
-                updateStreamingDistanceFromBottomIfNeeded()
+                handleScrollMetricUpdate(contentBottomY: contentBottomY)
             }
     }
 
@@ -172,7 +204,7 @@ struct ChatDetailView: View {
     ) -> some View {
         content
             .onAppear {
-                scheduleScrollToBottom(using: proxy, animated: false)
+                scrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
                 let scrollBehavior = chatViewModel.pendingTranscriptScrollBehavior
@@ -182,7 +214,7 @@ struct ChatDetailView: View {
                     chatViewModel.isCurrentSessionStreaming
                     && !chatViewModel.shouldAutoScrollStreamingUpdates
                 if !shouldPreserveScrollPosition && !shouldSkipStreamingScroll {
-                    scheduleScrollToBottom(using: proxy, animated: animated, includeFollowUp: animated)
+                    scrollToBottom(using: proxy, animated: animated)
                 }
                 chatViewModel.pendingTranscriptScrollBehavior = .animated
             }
@@ -191,7 +223,7 @@ struct ChatDetailView: View {
                     return
                 }
 
-                scheduleScrollToBottom(using: proxy, animated: true, includeFollowUp: false)
+                scrollToBottom(using: proxy, animated: false)
             }
     }
 
@@ -202,16 +234,16 @@ struct ChatDetailView: View {
         content
             .onChange(of: chatViewModel.isCurrentSessionStreaming) { _, isStreaming in
                 if isStreaming {
-                    scheduleScrollToBottom(using: proxy, animated: false)
+                    scrollToBottom(using: proxy, animated: false)
                 }
             }
             .onChange(of: sessionViewModel.selectedSessionID) { _, _ in
-                scrollMetrics = ScrollMetrics()
-                scheduleScrollToBottom(using: proxy, animated: false)
+                transcriptScrollTracker.reset()
+                scrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.isLoadingHistory) { oldValue, newValue in
                 if oldValue && !newValue {
-                    scheduleScrollToBottom(using: proxy, animated: false, includeFollowUp: false)
+                    scrollToBottom(using: proxy, animated: false)
                 }
             }
     }
@@ -224,7 +256,7 @@ struct ChatDetailView: View {
         content
             .scrollDismissesKeyboard(.interactively)
             .onReceive(keyboardFrameDidChange) { _ in
-                scheduleScrollToBottom(using: proxy)
+                scrollToBottom(using: proxy)
             }
 #else
         content
@@ -619,23 +651,7 @@ struct ChatDetailView: View {
         }
     }
 
-    private func scheduleScrollToBottom(
-        using proxy: ScrollViewProxy,
-        animated: Bool = true,
-        includeFollowUp: Bool = true
-    ) {
-        scrollToBottom(using: proxy, animated: animated)
-
-        guard includeFollowUp else {
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            scrollToBottom(using: proxy, animated: animated)
-        }
-    }
-
-    private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool) {
+    private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
         let hasVisibleTranscriptContent =
             !chatViewModel.transcriptItems.isEmpty
             || chatViewModel.isCurrentSessionStreaming
@@ -654,15 +670,20 @@ struct ChatDetailView: View {
         }
     }
 
-    private func updateStreamingDistanceFromBottomIfNeeded() {
+    private func handleScrollMetricUpdate(
+        viewportBottomY: CGFloat? = nil,
+        contentBottomY: CGFloat? = nil
+    ) {
+        guard let distanceFromBottom = transcriptScrollTracker.update(
+            viewportBottomY: viewportBottomY,
+            contentBottomY: contentBottomY
+        ) else {
+            return
+        }
         guard chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty else {
             return
         }
-        guard scrollMetrics.viewportBottomY > 0, scrollMetrics.contentBottomY > 0 else {
-            return
-        }
 
-        let distanceFromBottom = max(0, scrollMetrics.contentBottomY - scrollMetrics.viewportBottomY)
         chatViewModel.updateStreamingDistanceFromBottom(distanceFromBottom)
     }
 
@@ -691,25 +712,17 @@ struct ChatDetailView: View {
         "chat-scroll-bottom"
     }
 
-    private func updateScrollMetrics(
-        viewportBottomY: CGFloat? = nil,
-        contentBottomY: CGFloat? = nil
-    ) {
-        var updatedMetrics = scrollMetrics
+    private var hasVisibleTranscriptContent: Bool {
+        !chatViewModel.transcriptItems.isEmpty
+            || chatViewModel.isCurrentSessionStreaming
+            || !chatViewModel.visibleStreamingText.isEmpty
+    }
 
-        if let viewportBottomY, viewportBottomY.isFinite, viewportBottomY >= 0 {
-            updatedMetrics.viewportBottomY = viewportBottomY
-        }
-
-        if let contentBottomY, contentBottomY.isFinite, contentBottomY >= 0 {
-            updatedMetrics.contentBottomY = contentBottomY
-        }
-
-        guard updatedMetrics != scrollMetrics else {
-            return
-        }
-
-        scrollMetrics = updatedMetrics
+    private var pendingTranscriptScrollBehaviorBinding: Binding<ChatViewModel.TranscriptScrollBehavior> {
+        Binding(
+            get: { chatViewModel.pendingTranscriptScrollBehavior },
+            set: { chatViewModel.pendingTranscriptScrollBehavior = $0 }
+        )
     }
 
 #if os(iOS)
@@ -786,9 +799,311 @@ struct ChatDetailView: View {
 #endif
 }
 
+@available(iOS 18.0, macOS 15.0, *)
+private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
+    let sessionID: String?
+    let lastTranscriptItemID: String?
+    let hasVisibleTranscriptContent: Bool
+    let isLoadingHistory: Bool
+    let isCurrentSessionStreaming: Bool
+    let visibleStreamingText: String
+    @Binding var pendingTranscriptScrollBehavior: ChatViewModel.TranscriptScrollBehavior
+    let updateStreamingPinnedState: (_ isPinnedToBottom: Bool, _ distanceFromBottom: CGFloat) -> Void
+    let content: Content
+    let composer: Composer
+    let containerWidth: CGFloat
+
+    @State private var scrollPosition = ScrollPosition(idType: String.self)
+    @State private var scrollPhase: ScrollPhase = .idle
+    @State private var scrollCoordinator = TranscriptScrollCoordinator()
+
+    var body: some View {
+        ScrollView {
+            content
+                .scrollTargetLayout()
+        }
+        .scrollPosition($scrollPosition)
+        .background(Color.fawxBackground)
+        .accessibilityIdentifier("messageList")
+        .environment(\.containerWidth, containerWidth)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            composer
+        }
+        .onAppear {
+            scrollCoordinator.activateSession(sessionID)
+            restoreScrollPositionIfNeeded()
+        }
+        .onChange(of: sessionID) { _, newValue in
+            scrollCoordinator.activateSession(newValue)
+            restoreScrollPositionIfNeeded()
+        }
+        .onChange(of: hasVisibleTranscriptContent) { _, _ in
+            restoreScrollPositionIfNeeded()
+        }
+        .onChange(of: isLoadingHistory) { _, _ in
+            restoreScrollPositionIfNeeded()
+        }
+        .onChange(of: isCurrentSessionStreaming) { _, isStreaming in
+            if isStreaming && scrollCoordinator.shouldFollowLiveOutput {
+                scrollToBottom(animated: false)
+            }
+        }
+        .onChange(of: lastTranscriptItemID) { _, _ in
+            handleTranscriptItemChange()
+        }
+        .onChange(of: visibleStreamingText) { _, _ in
+            guard scrollCoordinator.shouldFollowLiveOutput else {
+                return
+            }
+
+            scrollToBottom(animated: false)
+        }
+        .onScrollPhaseChange { _, newPhase in
+            scrollPhase = newPhase
+        }
+        .onScrollGeometryChange(
+            for: TranscriptScrollObservation.self,
+            of: { geometry in
+                TranscriptScrollObservation(
+                    contentOffsetY: max(0, geometry.contentOffset.y),
+                    distanceFromBottom: max(0, geometry.contentSize.height - geometry.visibleRect.maxY)
+                )
+            },
+            action: { _, observation in
+                handleScrollObservation(observation)
+            }
+        )
+#if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+        .onReceive(keyboardFrameDidChange) { _ in
+            if scrollCoordinator.shouldFollowLiveOutput {
+                scrollToBottom(animated: false)
+            }
+        }
+#endif
+    }
+
+    private var isUserDrivenScroll: Bool {
+        switch scrollPhase {
+        case .tracking, .interacting, .decelerating:
+            return true
+        case .idle, .animating:
+            return scrollPosition.isPositionedByUser
+        @unknown default:
+            return scrollPosition.isPositionedByUser
+        }
+    }
+
+    private func restoreScrollPositionIfNeeded() {
+        guard let intent = scrollCoordinator.restoreIntentIfNeeded(
+            hasVisibleTranscriptContent: hasVisibleTranscriptContent,
+            isLoadingHistory: isLoadingHistory
+        ) else {
+            return
+        }
+
+        applyScrollIntent(intent, animated: false)
+    }
+
+    private func handleTranscriptItemChange() {
+        let scrollBehavior = pendingTranscriptScrollBehavior
+        let shouldPreserveScrollPosition =
+            scrollBehavior == .preservePosition || !scrollCoordinator.shouldFollowLiveOutput
+        let animated = scrollBehavior == .animated && !isLoadingHistory
+
+        if !shouldPreserveScrollPosition {
+            scrollToBottom(animated: animated)
+        }
+
+        pendingTranscriptScrollBehavior = .animated
+    }
+
+    private func handleScrollObservation(_ observation: TranscriptScrollObservation) {
+        guard let update = scrollCoordinator.update(
+            observation: observation,
+            userDriven: isUserDrivenScroll
+        ) else {
+            return
+        }
+
+        updateStreamingPinnedState(update.isPinnedToBottom, update.distanceFromBottom)
+    }
+
+    private func scrollToBottom(animated: Bool) {
+        applyScrollIntent(.bottom, animated: animated)
+    }
+
+    private func applyScrollIntent(_ intent: TranscriptScrollRestoreIntent, animated: Bool) {
+        let performScroll = {
+            switch intent {
+            case .bottom:
+                scrollPosition.scrollTo(edge: .bottom)
+            case .point(let y):
+                scrollPosition.scrollTo(y: y)
+            }
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) {
+                performScroll()
+            }
+        } else {
+            performScroll()
+        }
+    }
+
+#if os(iOS)
+    private var keyboardFrameDidChange: NotificationCenter.Publisher {
+        NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
+    }
+#endif
+}
+
 private struct ScrollMetrics: Equatable {
     var viewportBottomY: CGFloat = 0
     var contentBottomY: CGFloat = 0
+}
+
+struct TranscriptScrollObservation: Equatable {
+    var contentOffsetY: CGFloat
+    var distanceFromBottom: CGFloat
+}
+
+enum TranscriptScrollRestoreIntent: Equatable {
+    case bottom
+    case point(CGFloat)
+}
+
+struct TranscriptPinnedStateUpdate: Equatable {
+    var distanceFromBottom: CGFloat
+    var isPinnedToBottom: Bool
+}
+
+@MainActor
+final class TranscriptScrollCoordinator {
+    enum Mode: Equatable {
+        case followingLive
+        case detached
+        case restoringSession
+    }
+
+    private struct SessionSnapshot: Equatable {
+        var contentOffsetY: CGFloat
+        var followsLive: Bool
+    }
+
+    private static let repinThreshold = StreamingDisplayController.bottomThreshold
+    private static let detachThreshold = StreamingDisplayController.bottomThreshold * 1.5
+
+    private(set) var mode: Mode = .followingLive
+    private var activeSessionID: String?
+    private var pendingRestoreSessionID: String?
+    private var snapshotsBySession: [String: SessionSnapshot] = [:]
+
+    var shouldFollowLiveOutput: Bool {
+        mode != .detached
+    }
+
+    func activateSession(_ sessionID: String?) {
+        activeSessionID = sessionID
+        pendingRestoreSessionID = sessionID
+        mode = .restoringSession
+    }
+
+    func restoreIntentIfNeeded(
+        hasVisibleTranscriptContent: Bool,
+        isLoadingHistory: Bool
+    ) -> TranscriptScrollRestoreIntent? {
+        guard
+            let activeSessionID,
+            pendingRestoreSessionID == activeSessionID,
+            hasVisibleTranscriptContent,
+            !isLoadingHistory
+        else {
+            return nil
+        }
+
+        pendingRestoreSessionID = nil
+
+        if let snapshot = snapshotsBySession[activeSessionID], !snapshot.followsLive {
+            mode = .detached
+            return .point(snapshot.contentOffsetY)
+        }
+
+        mode = .followingLive
+        return .bottom
+    }
+
+    func update(
+        observation: TranscriptScrollObservation,
+        userDriven: Bool
+    ) -> TranscriptPinnedStateUpdate? {
+        guard let activeSessionID else {
+            return nil
+        }
+
+        let distanceFromBottom = max(0, observation.distanceFromBottom)
+
+        if distanceFromBottom <= Self.repinThreshold {
+            mode = .followingLive
+        } else if userDriven && distanceFromBottom >= Self.detachThreshold {
+            mode = .detached
+        }
+
+        snapshotsBySession[activeSessionID] = SessionSnapshot(
+            contentOffsetY: max(0, observation.contentOffsetY),
+            followsLive: mode != .detached
+        )
+
+        return TranscriptPinnedStateUpdate(
+            distanceFromBottom: distanceFromBottom,
+            isPinnedToBottom: mode != .detached
+        )
+    }
+}
+
+@MainActor
+final class TranscriptScrollTracker {
+    private var metrics = ScrollMetrics()
+    private var lastDistanceFromBottom: CGFloat?
+
+    func update(
+        viewportBottomY: CGFloat? = nil,
+        contentBottomY: CGFloat? = nil
+    ) -> CGFloat? {
+        var updatedMetrics = metrics
+
+        if let viewportBottomY, viewportBottomY.isFinite, viewportBottomY >= 0 {
+            updatedMetrics.viewportBottomY = viewportBottomY
+        }
+
+        if let contentBottomY, contentBottomY.isFinite, contentBottomY >= 0 {
+            updatedMetrics.contentBottomY = contentBottomY
+        }
+
+        guard updatedMetrics != metrics else {
+            return nil
+        }
+
+        metrics = updatedMetrics
+
+        guard updatedMetrics.viewportBottomY > 0, updatedMetrics.contentBottomY > 0 else {
+            return nil
+        }
+
+        let distanceFromBottom = max(0, updatedMetrics.contentBottomY - updatedMetrics.viewportBottomY)
+        guard distanceFromBottom != lastDistanceFromBottom else {
+            return nil
+        }
+
+        lastDistanceFromBottom = distanceFromBottom
+        return distanceFromBottom
+    }
+
+    func reset() {
+        metrics = ScrollMetrics()
+        lastDistanceFromBottom = nil
+    }
 }
 
 private struct ScrollViewportBottomPreferenceKey: PreferenceKey {
