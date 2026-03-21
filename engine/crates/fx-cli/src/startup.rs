@@ -37,7 +37,8 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
 use fx_loadable::{
-    NotificationSender, NotifySkill, SignaturePolicy, SkillRegistry, TransactionSkill,
+    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillRegistry,
+    TransactionSkill,
 };
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
@@ -569,6 +570,7 @@ fn build_loop_engine_with_options(
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
+        .session_memory(Arc::clone(&skills.session_memory))
         .scratchpad_provider(bridge);
     if let Some(cancel_token) = options.cancel_token {
         builder = builder.cancel_token(cancel_token);
@@ -884,6 +886,7 @@ struct SkillRegistryBundle {
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    session_memory: Arc<Mutex<fx_session::SessionMemory>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
     journal: Option<Arc<Mutex<fx_journal::Journal>>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
@@ -980,6 +983,9 @@ fn build_skill_registry(
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
+    let session_memory = Arc::new(Mutex::new(fx_session::SessionMemory::default()));
+    let session_memory_skill = SessionMemorySkill::new(Arc::clone(&session_memory));
+    registry.register(Arc::new(session_memory_skill));
 
     if let Some(session_registry) = options.session_registry.clone() {
         let session_skill = SessionToolsSkill::new(session_registry);
@@ -1082,6 +1088,7 @@ fn build_skill_registry(
         memory_snapshot: snapshot_text,
         runtime_info,
         scratchpad,
+        session_memory,
         iteration_counter,
         journal: journal_arc,
         credential_provider,
@@ -2507,6 +2514,17 @@ mod tests {
             registry.is_some(),
             "session database should remain unlockable"
         );
+    }
+
+    #[test]
+    fn headless_bundle_registers_session_memory_tool() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        assert!(names.contains(&"update_session_memory".to_string()));
     }
 
     #[test]

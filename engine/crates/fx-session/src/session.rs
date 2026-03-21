@@ -195,6 +195,140 @@ pub struct ContentRenderOptions {
     pub include_tool_use_id: bool,
 }
 
+const SESSION_MEMORY_MAX_ITEMS: usize = 20;
+const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
+
+/// Persistent session memory that survives conversation compaction.
+/// Contains key facts the agent extracted about the session's purpose and state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SessionMemory {
+    /// What this session is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Current state of work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_state: Option<String>,
+    /// Key decisions made during this session (max 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_decisions: Vec<String>,
+    /// Files actively being worked on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_files: Vec<String>,
+    /// Custom context the agent wants to remember (max 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_context: Vec<String>,
+    /// Unix epoch seconds of last update.
+    #[serde(default)]
+    pub last_updated: u64,
+}
+
+impl SessionMemory {
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.current_state.is_none()
+            && self.key_decisions.is_empty()
+            && self.active_files.is_empty()
+            && self.custom_context.is_empty()
+    }
+
+    /// Estimated token count for the rendered memory block.
+    pub fn estimated_tokens(&self) -> usize {
+        let text = self.render();
+        if text.is_empty() {
+            return 0;
+        }
+        text.chars()
+            .count()
+            .div_ceil(4)
+            .max(text.split_whitespace().count())
+            .max(1)
+    }
+
+    /// Apply an update from the agent's tool call.
+    /// Returns Err if the result would exceed the token cap.
+    pub fn apply_update(&mut self, update: SessionMemoryUpdate) -> Result<(), String> {
+        let mut candidate = self.clone();
+        if let Some(project) = update.project {
+            candidate.project = Some(project);
+        }
+        if let Some(state) = update.current_state {
+            candidate.current_state = Some(state);
+        }
+        if let Some(decisions) = update.key_decisions {
+            append_capped_items(&mut candidate.key_decisions, decisions);
+        }
+        if let Some(files) = update.active_files {
+            candidate.active_files = files;
+        }
+        if let Some(context) = update.custom_context {
+            append_capped_items(&mut candidate.custom_context, context);
+        }
+        let estimated_tokens = candidate.estimated_tokens();
+        if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
+            return Err(format!(
+                "Session memory would exceed {} token cap ({} estimated). Be more concise.",
+                SESSION_MEMORY_MAX_TOKENS, estimated_tokens
+            ));
+        }
+        candidate.last_updated = current_epoch_secs();
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Render the memory as a human-readable text block.
+    pub fn render(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec!["[Session Memory]".to_string()];
+        if let Some(project) = &self.project {
+            lines.push(format!("Project: {project}"));
+        }
+        if let Some(state) = &self.current_state {
+            lines.push(format!("Current state: {state}"));
+        }
+        push_session_memory_items(&mut lines, "Key decisions:", &self.key_decisions);
+        push_session_memory_items(&mut lines, "Active files:", &self.active_files);
+        push_session_memory_items(&mut lines, "Context:", &self.custom_context);
+        lines.join(
+            "
+",
+        )
+    }
+}
+
+/// Partial update to session memory from the agent's tool call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionMemoryUpdate {
+    pub project: Option<String>,
+    pub current_state: Option<String>,
+    pub key_decisions: Option<Vec<String>>,
+    pub active_files: Option<Vec<String>>,
+    pub custom_context: Option<Vec<String>>,
+}
+
+fn append_capped_items(items: &mut Vec<String>, incoming: Vec<String>) {
+    items.extend(incoming);
+    trim_oldest_items(items);
+}
+
+fn trim_oldest_items(items: &mut Vec<String>) {
+    let excess = items.len().saturating_sub(SESSION_MEMORY_MAX_ITEMS);
+    if excess > 0 {
+        items.drain(..excess);
+    }
+}
+
+fn push_session_memory_items(lines: &mut Vec<String>, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    lines.push(heading.to_string());
+    for item in items {
+        lines.push(format!("- {item}"));
+    }
+}
+
 /// Persistent session state: metadata + conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -214,6 +348,9 @@ pub struct Session {
     pub updated_at: u64,
     /// Ordered conversation messages.
     pub messages: Vec<SessionMessage>,
+    /// Persistent memory that survives compaction.
+    #[serde(default)]
+    pub memory: SessionMemory,
 }
 
 impl Session {
@@ -229,6 +366,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            memory: SessionMemory::default(),
         }
     }
 
@@ -266,6 +404,11 @@ impl Session {
         if appended_any {
             self.updated_at = current_epoch_secs();
         }
+    }
+
+    pub fn set_memory(&mut self, memory: SessionMemory) {
+        self.memory = memory;
+        self.updated_at = current_epoch_secs();
     }
 
     /// Remove all recorded messages and update the timestamp.
@@ -453,6 +596,155 @@ mod tests {
         }
     }
 
+    fn memory_update() -> SessionMemoryUpdate {
+        SessionMemoryUpdate {
+            project: None,
+            current_state: None,
+            key_decisions: None,
+            active_files: None,
+            custom_context: None,
+        }
+    }
+
+    #[test]
+    fn session_memory_default_is_empty() {
+        assert!(SessionMemory::default().is_empty());
+    }
+
+    #[test]
+    fn session_memory_round_trip() {
+        let memory = SessionMemory {
+            project: Some("Phase 3".to_string()),
+            current_state: Some("wiring tests".to_string()),
+            key_decisions: vec!["use a shared arc".to_string()],
+            active_files: vec!["engine/crates/fx-session/src/session.rs".to_string()],
+            custom_context: vec!["keep it concise".to_string()],
+            last_updated: 123,
+        };
+
+        let json = serde_json::to_string(&memory).expect("serialize memory");
+        let restored: SessionMemory = serde_json::from_str(&json).expect("deserialize memory");
+
+        assert_eq!(restored, memory);
+    }
+
+    #[test]
+    fn session_backward_compat_defaults_memory_when_missing() {
+        let session = Session::new(
+            SessionKey::new("compat").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        let mut value = serde_json::to_value(&session).expect("serialize session");
+        let Some(object) = value.as_object_mut() else {
+            panic!("session json should be an object");
+        };
+        object.remove("memory");
+
+        let restored: Session = serde_json::from_value(value).expect("deserialize session");
+
+        assert!(restored.memory.is_empty());
+    }
+
+    #[test]
+    fn apply_update_overwrites_project_and_state() {
+        let mut memory = SessionMemory::default();
+        let mut initial = memory_update();
+        initial.project = Some("first".to_string());
+        initial.current_state = Some("planning".to_string());
+        memory.apply_update(initial).expect("initial update");
+
+        let mut replacement = memory_update();
+        replacement.project = Some("second".to_string());
+        replacement.current_state = Some("coding".to_string());
+        memory
+            .apply_update(replacement)
+            .expect("replacement update");
+
+        assert_eq!(memory.project.as_deref(), Some("second"));
+        assert_eq!(memory.current_state.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn apply_update_appends_decisions_and_context() {
+        let mut memory = SessionMemory::default();
+        let mut first = memory_update();
+        first.key_decisions = Some(vec!["decide one".to_string()]);
+        first.custom_context = Some(vec!["context one".to_string()]);
+        memory.apply_update(first).expect("first update");
+
+        let mut second = memory_update();
+        second.key_decisions = Some(vec!["decide two".to_string()]);
+        second.custom_context = Some(vec!["context two".to_string()]);
+        memory.apply_update(second).expect("second update");
+
+        assert_eq!(
+            memory.key_decisions,
+            vec!["decide one".to_string(), "decide two".to_string()]
+        );
+        assert_eq!(
+            memory.custom_context,
+            vec!["context one".to_string(), "context two".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_update_replaces_active_files() {
+        let mut memory = SessionMemory::default();
+        let mut first = memory_update();
+        first.active_files = Some(vec!["a.rs".to_string(), "b.rs".to_string()]);
+        memory.apply_update(first).expect("first files");
+
+        let mut second = memory_update();
+        second.active_files = Some(vec!["c.rs".to_string()]);
+        memory.apply_update(second).expect("second files");
+
+        assert_eq!(memory.active_files, vec!["c.rs".to_string()]);
+    }
+
+    #[test]
+    fn apply_update_caps_lists_at_twenty_items() {
+        let mut memory = SessionMemory::default();
+        let mut update = memory_update();
+        update.key_decisions = Some((0..25).map(|i| format!("decision-{i}")).collect());
+        update.custom_context = Some((0..22).map(|i| format!("context-{i}")).collect());
+        memory.apply_update(update).expect("capped update");
+
+        assert_eq!(memory.key_decisions.len(), SESSION_MEMORY_MAX_ITEMS);
+        assert_eq!(memory.custom_context.len(), SESSION_MEMORY_MAX_ITEMS);
+        assert_eq!(
+            memory.key_decisions.first().map(String::as_str),
+            Some("decision-5")
+        );
+        assert_eq!(
+            memory.custom_context.first().map(String::as_str),
+            Some("context-2")
+        );
+    }
+
+    #[test]
+    fn session_memory_estimated_tokens_is_nonzero_when_nonempty() {
+        let memory = SessionMemory {
+            project: Some("session memory".to_string()),
+            ..SessionMemory::default()
+        };
+
+        assert!(memory.estimated_tokens() > 0);
+    }
+
+    #[test]
+    fn session_memory_rejects_oversized_updates() {
+        let mut memory = SessionMemory::default();
+        let mut update = memory_update();
+        update.project = Some("x".repeat(SESSION_MEMORY_MAX_TOKENS * 8));
+
+        let error = memory
+            .apply_update(update)
+            .expect_err("oversized memory should fail");
+
+        assert!(error.contains("token cap"));
+    }
+
     #[test]
     fn new_session_starts_active_with_no_messages() {
         let session = Session::new(
@@ -462,6 +754,7 @@ mod tests {
         );
         assert_eq!(session.status, SessionStatus::Active);
         assert!(session.messages.is_empty());
+        assert!(session.memory.is_empty());
         assert_eq!(session.label.as_deref(), Some("test-session"));
         assert_eq!(session.model, "gpt-4");
     }

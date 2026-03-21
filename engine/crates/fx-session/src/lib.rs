@@ -12,7 +12,7 @@ pub mod types;
 pub use registry::{SessionError, SessionRegistry};
 pub use session::{
     render_content_blocks, render_content_blocks_with_options, ContentRenderOptions, Session,
-    SessionContentBlock, SessionMessage,
+    SessionContentBlock, SessionMemory, SessionMemoryUpdate, SessionMessage,
 };
 pub use store::SessionStore;
 pub use types::{

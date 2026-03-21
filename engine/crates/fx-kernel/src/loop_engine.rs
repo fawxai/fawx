@@ -37,6 +37,7 @@ use fx_llm::{
     ContentBlock, Message, MessageRole, ProviderError, StreamCallback as ProviderStreamCallback,
     StreamChunk, StreamEvent as ProviderStreamEvent, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
+use fx_session::SessionMemory;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -435,6 +436,7 @@ pub struct LoopEngine {
     iteration_count: u32,
     synthesis_instruction: String,
     memory_context: Option<String>,
+    session_memory: Arc<Mutex<SessionMemory>>,
     scratchpad_context: Option<String>,
     signals: SignalCollector,
     cancel_token: Option<CancellationToken>,
@@ -480,6 +482,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("max_iterations", &self.max_iterations)
             .field("iteration_count", &self.iteration_count)
             .field("memory_context", &self.memory_context)
+            .field("session_memory", &"SessionMemory")
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
@@ -543,6 +546,7 @@ pub struct LoopEngineBuilder {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     memory_context: Option<String>,
+    session_memory: Option<Arc<Mutex<SessionMemory>>>,
     scratchpad_context: Option<String>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
@@ -660,6 +664,11 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn session_memory(mut self, session_memory: Arc<Mutex<SessionMemory>>) -> Self {
+        self.session_memory = Some(session_memory);
+        self
+    }
+
     pub fn iteration_counter(mut self, counter: Arc<AtomicU32>) -> Self {
         self.iteration_counter = Some(counter);
         self
@@ -705,6 +714,7 @@ impl LoopEngineBuilder {
             iteration_count: 0,
             synthesis_instruction,
             memory_context: self.memory_context,
+            session_memory: self.session_memory.unwrap_or_else(default_session_memory),
             scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
             cancel_token: self.cancel_token,
@@ -772,6 +782,10 @@ fn normalize_memory_context(memory_context: String) -> Option<String> {
     } else {
         Some(memory_context)
     }
+}
+
+fn default_session_memory() -> Arc<Mutex<SessionMemory>> {
+    Arc::new(Mutex::new(SessionMemory::default()))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1061,6 +1075,21 @@ impl LoopEngine {
     /// Set memory context for system prompt injection.
     pub fn set_memory_context(&mut self, context: String) {
         self.memory_context = normalize_memory_context(context);
+    }
+
+    pub fn replace_session_memory(&self, memory: SessionMemory) -> SessionMemory {
+        let mut stored = match self.session_memory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::replace(&mut *stored, memory)
+    }
+
+    pub fn session_memory_snapshot(&self) -> SessionMemory {
+        match self.session_memory.lock() {
+            Ok(memory) => memory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub fn set_scratchpad_context(&mut self, context: String) {
@@ -1604,6 +1633,13 @@ impl LoopEngine {
 
         let mut context_window = snapshot_with_steer.conversation_history.clone();
         context_window.push(build_user_message(&snapshot_with_steer, &user_message));
+        if let Some(memory_message) = self.session_memory_message() {
+            let insert_pos = context_window
+                .iter()
+                .take_while(|message| matches!(message.role, MessageRole::System))
+                .count();
+            context_window.insert(insert_pos, memory_message);
+        }
 
         let compacted_context = self
             .compact_if_needed(
@@ -1681,6 +1717,17 @@ impl LoopEngine {
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    fn session_memory_message(&self) -> Option<Message> {
+        let memory_text = match self.session_memory.lock() {
+            Ok(memory) => (!memory.is_empty()).then(|| memory.render()),
+            Err(poisoned) => {
+                let memory = poisoned.into_inner();
+                (!memory.is_empty()).then(|| memory.render())
+            }
+        }?;
+        Some(Message::system(memory_text))
     }
 
     async fn request_completion(
@@ -2431,6 +2478,7 @@ impl LoopEngine {
         if let Some(memory_context) = &self.memory_context {
             builder = builder.memory_context(memory_context.clone());
         }
+        builder = builder.session_memory(Arc::clone(&self.session_memory));
         if let Some(scratchpad_context) = &self.scratchpad_context {
             builder = builder.scratchpad_context(scratchpad_context.clone());
         }
@@ -11722,6 +11770,15 @@ mod context_compaction_tests {
         })
     }
 
+    fn session_memory_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with("[Session Memory]")))
+        })
+    }
+
     fn large_history(count: usize, words_per_message: usize) -> Vec<Message> {
         (0..count)
             .map(|index| {
@@ -11908,6 +11965,25 @@ mod context_compaction_tests {
                 - defaults.reserved_system_tokens
                 - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
         );
+    }
+
+    #[test]
+    fn builder_uses_default_empty_session_memory() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert!(engine.session_memory_snapshot().is_empty());
     }
 
     #[test]
@@ -12274,6 +12350,65 @@ mod context_compaction_tests {
         let summary = summary_message_index(&processed.context_window)
             .expect("expected compacted context summary in context window");
         assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn session_memory_injected_in_context() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let memory = Arc::new(Mutex::new(SessionMemory {
+            project: Some("Phase 3".to_string()),
+            current_state: Some("testing injection".to_string()),
+            ..SessionMemory::default()
+        }));
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .session_memory(Arc::clone(&memory))
+            .build()
+            .expect("test engine build");
+        let snapshot = snapshot_with_history(
+            vec![
+                Message::system("system prefix"),
+                Message::assistant("existing"),
+            ],
+            "hello",
+        );
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+        let memory_index =
+            session_memory_message_index(&processed.context_window).expect("memory message");
+
+        assert_eq!(memory_index, 1);
+        assert!(message_to_text(&processed.context_window[memory_index]).contains("Phase 3"));
+    }
+
+    #[tokio::test]
+    async fn empty_session_memory_not_injected() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+        let snapshot = snapshot_with_history(vec![Message::assistant("existing")], "hello");
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(session_memory_message_index(&processed.context_window).is_none());
     }
 
     #[tokio::test]

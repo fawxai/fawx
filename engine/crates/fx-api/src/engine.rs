@@ -99,6 +99,20 @@ pub trait AppEngine: Send + Sync {
         (0, 0)
     }
 
+    /// Replace the active session memory, returning the previous value.
+    fn replace_session_memory(
+        &mut self,
+        memory: fx_session::SessionMemory,
+    ) -> fx_session::SessionMemory {
+        let _ = memory;
+        fx_session::SessionMemory::default()
+    }
+
+    /// Snapshot the active session memory.
+    fn session_memory(&self) -> fx_session::SessionMemory {
+        fx_session::SessionMemory::default()
+    }
+
     /// Structured session messages recorded for the most recent completed turn.
     fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
         Vec::new()
