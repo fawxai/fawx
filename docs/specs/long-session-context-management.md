@@ -296,6 +296,20 @@ impl Skill for RecallSkill {
 - Ensure journal entries from compaction are searchable
 - **Estimated effort:** 1 PR, ~150 lines
 
+### Phase 5: Automatic Memory Extraction
+- Before evicting messages during compaction, run a fast LLM call to extract key facts
+- Merge extracted facts into SessionMemory automatically (no agent involvement)
+- Wire into the finish_tier flow for summarize/emergency tiers
+- Agent never needs to think about calling update_session_memory; it just happens
+- Makes compaction truly lossless without relying on agent discipline
+- **Estimated effort:** 1 PR, ~200 lines
+
+### Phase 6: Compaction UX
+- Subtle indicator when compaction happens (e.g., "session context optimized" banner)
+- Panel to view/edit session memory (similar to journal entries viewer)
+- Context usage bar updates after compaction (currently stale post-compaction)
+- **Estimated effort:** 1-2 PRs, ~300 lines (Swift)
+
 ---
 
 ## Success Criteria
