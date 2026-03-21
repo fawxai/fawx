@@ -24,16 +24,18 @@ struct MessageBubble: View {
     }
 
     var body: some View {
-        if role == .system {
-            Text(content)
-                .font(FawxTypography.status)
-                .foregroundStyle(Color.fawxTextSecondary)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, FawxSpacing.paddingSM)
-                .textSelection(.enabled)
-        } else {
-            bubbleContent
+        Group {
+            if role == .system {
+                Text(content)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, FawxSpacing.paddingSM)
+            } else {
+                bubbleContent
+            }
         }
+        .textSelection(.enabled)
     }
 
     private var bubbleContent: some View {
@@ -49,7 +51,6 @@ struct MessageBubble: View {
                     .background(bubbleBackground)
                     .overlay(bubbleBorder)
                     .clipShape(RoundedRectangle(cornerRadius: bubbleCornerRadius))
-                    .textSelection(.enabled)
 
                 if let timestamp {
                     Text(timeString(timestamp))
@@ -102,7 +103,6 @@ struct MessageBubble: View {
             Text(content)
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxUserBubbleText)
-                .textSelection(.enabled)
         case .assistant:
             Markdown(content + (isStreaming ? "▍" : ""))
                 .markdownTextStyle {
@@ -124,12 +124,10 @@ struct MessageBubble: View {
                 .markdownBlockStyle(\.codeBlock) { configuration in
                     CodeBlock(language: configuration.language, content: configuration.content)
                 }
-                .textSelection(.enabled)
         case .tool:
             Text(verbatim: toolDisplayContent)
                 .font(FawxTypography.code)
                 .foregroundStyle(Color.fawxText)
-                .textSelection(.enabled)
         case .system:
             EmptyView()
         }
