@@ -2,24 +2,6 @@ import Foundation
 import XCTest
 @testable import Fawx
 
-final class ContentViewLayoutTests: XCTestCase {
-    func testContentViewLayoutWidensMinimumWindowWhenGitPanelIsVisible() {
-        let defaultMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: false)
-        let gitPanelMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: true)
-
-        XCTAssertEqual(defaultMinimumWidth, ContentView.Layout.minimumWindowWidth)
-        XCTAssertEqual(gitPanelMinimumWidth, ContentView.Layout.minimumWindowWidthWithGitPanel)
-        XCTAssertGreaterThan(gitPanelMinimumWidth, defaultMinimumWidth)
-        XCTAssertEqual(
-            gitPanelMinimumWidth,
-            ContentView.Layout.sidebarMinWidth
-                + ContentView.Layout.chatDetailMinWidth
-                + ContentView.Layout.compactGitPanelMinWidth
-                + ContentView.Layout.splitDividerWidthAllowance
-        )
-    }
-}
-
 final class SessionTests: XCTestCase {
     func testSummarizedSessionTitleStripsCommonPromptPrefix() {
         let title = summarizedSessionTitle(from: "Hey Fawx, please help me with the streaming retry bug")
@@ -178,12 +160,18 @@ final class ViewSourceRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains("max: Layout.sidebarMaxWidth"))
     }
 
-    func testMacOSContentViewSynchronizesWindowMinimumSizeWithGitPanelLayout() throws {
+    func testMacOSContentViewLetsChatSurfaceFlexBeforeCompressingSidePanes() throws {
         let source = try sourceFile(at: "app/Fawx/Views/macOS/ContentView.swift")
+        let containerSource = try snippet(
+            in: source,
+            startingAt: "    @ViewBuilder\n    private var chatDetailContainer: some View {",
+            endingBefore: "\n\n    private var statusBarView: some View {"
+        )
 
-        XCTAssertTrue(source.contains("WindowMinimumSizeConfigurator("))
-        XCTAssertTrue(source.contains("Layout.resolvedMinimumWindowWidth(showingGitPanel: shouldShowGitPanel)"))
-        XCTAssertTrue(source.contains("window.contentMinSize = targetContentMinSize"))
+        XCTAssertFalse(source.contains("WindowMinimumSizeConfigurator("))
+        XCTAssertFalse(source.contains("chatDetailMinWidth"))
+        XCTAssertTrue(containerSource.contains(".frame(maxWidth: .infinity, maxHeight: .infinity)"))
+        XCTAssertTrue(containerSource.contains("minWidth: Layout.compactGitPanelMinWidth"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {
