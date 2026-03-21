@@ -215,6 +215,7 @@ final class ViewSourceRegressionTests: XCTestCase {
         let source = try sourceFile(at: "app/Fawx/Views/Shared/StatusBar.swift")
 
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"sessionMemoryButton\")"))
+        XCTAssertTrue(source.contains("accessibilityLabel(\"Open session memory\")"))
         XCTAssertTrue(source.contains("Text(\"Memory\")"))
     }
 
@@ -223,6 +224,14 @@ final class ViewSourceRegressionTests: XCTestCase {
 
         XCTAssertTrue(source.contains("SessionMemoryPanel(appState: appState, session: session)"))
         XCTAssertTrue(source.contains("presentedSessionMemory"))
+    }
+
+    func testSessionMemoryPanelValidatesAndCountsActiveFiles() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/SessionMemoryPanel.swift")
+
+        XCTAssertTrue(source.contains("\\(sanitizedDraft.activeFiles.count) / \\(SessionMemory.maxItems) active files"))
+        XCTAssertTrue(source.contains("Keep active files to \\(SessionMemory.maxItems) items or fewer."))
+        XCTAssertTrue(source.contains(".disabled(isDisabled || isAtItemLimit)"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {

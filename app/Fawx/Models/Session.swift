@@ -126,6 +126,9 @@ struct SessionMemory: Codable, Sendable, Hashable {
             return 0
         }
 
+        // This is a lightweight client-side approximation, so we keep the larger
+        // of the character-based and whitespace-based heuristics to avoid
+        // undercounting before the server applies its stricter token cap.
         let whitespaceTokens = text.split(whereSeparator: \.isWhitespace).count
         let characterTokens = (text.count + 3) / 4
         return max(characterTokens, whitespaceTokens, 1)
@@ -179,6 +182,33 @@ struct SessionMemory: Codable, Sendable, Hashable {
         appendRenderedItems(sanitized.activeFiles, heading: "Active files:", into: &lines)
         appendRenderedItems(sanitized.customContext, heading: "Context:", into: &lines)
         return lines.joined(separator: "\n")
+    }
+}
+
+private extension SessionMemory {
+    func normalized(_ value: String?) -> String? {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+    }
+
+    func normalizedItems(_ values: [String]) -> [String] {
+        values.compactMap { normalized($0) }
+    }
+
+    func appendRenderedItems(
+        _ items: [String],
+        heading: String,
+        into lines: inout [String]
+    ) {
+        guard !items.isEmpty else {
+            return
+        }
+
+        lines.append(heading)
+        for item in items {
+            lines.append("- \(item)")
+        }
     }
 }
 
@@ -281,29 +311,4 @@ func truncateSessionTitle(_ text: String, maxLength: Int = 44) -> String {
     let truncatedSlice = cleaned[..<cutoff]
     let wordBoundary = truncatedSlice.lastIndex(of: " ") ?? cutoff
     return String(cleaned[..<wordBoundary]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
-}
-
-private func normalized(_ value: String?) -> String? {
-    value?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .nonEmpty
-}
-
-private func normalizedItems(_ values: [String]) -> [String] {
-    values.compactMap { normalized($0) }
-}
-
-private func appendRenderedItems(
-    _ items: [String],
-    heading: String,
-    into lines: inout [String]
-) {
-    guard !items.isEmpty else {
-        return
-    }
-
-    lines.append(heading)
-    for item in items {
-        lines.append("- \(item)")
-    }
 }

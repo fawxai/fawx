@@ -50,6 +50,7 @@ struct StatusBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("sessionMemoryButton")
+                .accessibilityLabel("Open session memory")
                 .help("View and edit session memory")
             }
 

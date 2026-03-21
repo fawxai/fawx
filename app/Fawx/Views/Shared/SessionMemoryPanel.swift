@@ -147,6 +147,7 @@ struct SessionMemoryPanel: View {
                 itemLabel: "Decision",
                 placeholder: "Capture an important decision or constraint",
                 items: $draft.keyDecisions,
+                maxItems: SessionMemory.maxItems,
                 addButtonTitle: "Add Decision",
                 isDisabled: isEditorDisabled
             )
@@ -156,13 +157,14 @@ struct SessionMemoryPanel: View {
     private var filesCard: some View {
         memoryCard(
             title: "Active Files",
-            subtitle: "Track the files this session is actively touching."
+            subtitle: "\(sanitizedDraft.activeFiles.count) / \(SessionMemory.maxItems) active files"
         ) {
             SessionMemoryListEditor(
                 title: "Active Files",
                 itemLabel: "File",
                 placeholder: "app/Fawx/Views/Shared/SessionMemoryPanel.swift",
                 items: $draft.activeFiles,
+                maxItems: SessionMemory.maxItems,
                 addButtonTitle: "Add File",
                 isDisabled: isEditorDisabled
             )
@@ -179,6 +181,7 @@ struct SessionMemoryPanel: View {
                 itemLabel: "Context",
                 placeholder: "Anything else Fawx should remember",
                 items: $draft.customContext,
+                maxItems: SessionMemory.maxItems,
                 addButtonTitle: "Add Context",
                 isDisabled: isEditorDisabled
             )
@@ -234,6 +237,10 @@ struct SessionMemoryPanel: View {
 
         if sanitizedDraft.customContext.count > SessionMemory.maxItems {
             return "Keep custom context to \(SessionMemory.maxItems) items or fewer."
+        }
+
+        if sanitizedDraft.activeFiles.count > SessionMemory.maxItems {
+            return "Keep active files to \(SessionMemory.maxItems) items or fewer."
         }
 
         if sanitizedDraft.estimatedTokens > SessionMemory.maxTokens {
@@ -416,6 +423,7 @@ private struct SessionMemoryListEditor: View {
     let itemLabel: String
     let placeholder: String
     @Binding var items: [String]
+    let maxItems: Int
     let addButtonTitle: String
     let isDisabled: Bool
 
@@ -469,7 +477,20 @@ private struct SessionMemoryListEditor: View {
                 items.append("")
             }
             .buttonStyle(.bordered)
-            .disabled(isDisabled)
+            .disabled(isDisabled || isAtItemLimit)
+        }
+    }
+
+    private var isAtItemLimit: Bool {
+        nonEmptyItemCount >= maxItems
+    }
+
+    private var nonEmptyItemCount: Int {
+        items.reduce(into: 0) { count, item in
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                count += 1
+            }
         }
     }
 }
