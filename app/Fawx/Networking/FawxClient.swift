@@ -461,6 +461,20 @@ actor FawxClient {
         try await performRequest(path: "/v1/sessions/\(id)/context", decodeAs: ContextInfo.self)
     }
 
+    func sessionMemory(id: String) async throws -> SessionMemory {
+        try await performRequest(path: "/v1/sessions/\(id)/memory", decodeAs: SessionMemory.self)
+    }
+
+    func updateSessionMemory(id: String, memory: SessionMemory) async throws -> SessionMemory {
+        let body = try encoder.encode(memory)
+        return try await performRequest(
+            path: "/v1/sessions/\(id)/memory",
+            method: "PUT",
+            bodyData: body,
+            decodeAs: SessionMemory.self
+        )
+    }
+
     func listModels() async throws -> ModelCatalogResponse {
         try await performRequest(path: "/v1/models", decodeAs: ModelCatalogResponse.self)
     }
@@ -595,6 +609,27 @@ actor FawxClient {
         return try makeRequest(
             path: "/v1/thinking",
             method: method,
+            authRequired: true,
+            bodyData: body
+        )
+    }
+
+    func sessionMemoryRequestForTesting(id: String) throws -> URLRequest {
+        try makeRequest(
+            path: "/v1/sessions/\(id)/memory",
+            method: "GET",
+            authRequired: true
+        )
+    }
+
+    func updateSessionMemoryRequestForTesting(
+        id: String,
+        memory: SessionMemory
+    ) throws -> URLRequest {
+        let body = try encoder.encode(memory)
+        return try makeRequest(
+            path: "/v1/sessions/\(id)/memory",
+            method: "PUT",
             authRequired: true,
             bodyData: body
         )
