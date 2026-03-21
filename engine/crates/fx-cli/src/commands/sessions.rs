@@ -3,8 +3,8 @@ use anyhow::anyhow;
 use chrono::{TimeZone, Utc};
 use clap::Args;
 use fx_session::{
-    render_content_blocks_with_options, ContentRenderOptions, SessionInfo, SessionKey,
-    SessionKind, SessionMessage, SessionRegistry,
+    render_content_blocks_with_options, ContentRenderOptions, SessionInfo, SessionKey, SessionKind,
+    SessionMessage, SessionRegistry,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
