@@ -1184,7 +1184,8 @@ mod routing_and_status {
     };
     use fx_session::{
         MessageRole as SessionMessageRole, SessionConfig, SessionContentBlock, SessionError,
-        SessionKey, SessionKind, SessionRegistry, SessionStatus, SessionStore,
+        SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
+        SessionStore,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
@@ -1412,6 +1413,185 @@ mod routing_and_status {
             experiment_registry: None,
         })
         .expect("test app")
+    }
+
+    #[derive(Debug, Default)]
+    struct SessionMemoryPersistingState {
+        current_memory: SessionMemory,
+        loaded_memories: Vec<SessionMemory>,
+        last_session_messages: Vec<SessionMessage>,
+    }
+
+    #[derive(Clone)]
+    struct SessionMemoryPersistingTestApp {
+        state: Arc<StdMutex<SessionMemoryPersistingState>>,
+    }
+
+    impl SessionMemoryPersistingTestApp {
+        fn new(initial_memory: SessionMemory) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(SessionMemoryPersistingState {
+                    current_memory: initial_memory,
+                    loaded_memories: Vec::new(),
+                    last_session_messages: Vec::new(),
+                })),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AppEngine for SessionMemoryPersistingTestApp {
+        async fn process_message(
+            &mut self,
+            input: &str,
+            images: Vec<ImageAttachment>,
+            source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<ApiCycleResult, anyhow::Error> {
+            let (result, _) = self
+                .process_message_with_context(input, images, Vec::new(), source, callback)
+                .await?;
+            Ok(result)
+        }
+
+        async fn process_message_with_context(
+            &mut self,
+            input: &str,
+            _images: Vec<ImageAttachment>,
+            context: Vec<Message>,
+            _source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+            let response = "Stored memory response".to_string();
+            {
+                let mut state = self.state.lock().expect("state lock");
+                let loaded_memory = state.current_memory.clone();
+                state.loaded_memories.push(loaded_memory);
+                state.current_memory.current_state = Some("updated during turn".to_string());
+                state.last_session_messages = vec![
+                    SessionMessage::text(SessionMessageRole::User, input, 2),
+                    SessionMessage::text(SessionMessageRole::Assistant, &response, 3),
+                ];
+            }
+            if let Some(callback) = callback {
+                callback(StreamEvent::PhaseChange {
+                    phase: fx_kernel::Phase::Synthesize,
+                });
+                callback(StreamEvent::TextDelta {
+                    text: response.clone(),
+                });
+                callback(StreamEvent::Done {
+                    response: response.clone(),
+                });
+            }
+            Ok((
+                ApiCycleResult {
+                    response,
+                    model: "mock-model".to_string(),
+                    iterations: 1,
+                    result_kind: ResultKind::Complete,
+                },
+                context,
+            ))
+        }
+
+        fn active_model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn available_models(&self) -> Vec<ModelInfoDto> {
+            vec![ModelInfoDto {
+                model_id: "mock-model".to_string(),
+                provider: "test".to_string(),
+                auth_method: "none".to_string(),
+            }]
+        }
+
+        fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+            Ok(ModelSwitchDto {
+                previous_model: "mock-model".to_string(),
+                active_model: selector.to_string(),
+                thinking_adjusted: None,
+            })
+        }
+
+        fn thinking_level(&self) -> ThinkingLevelDto {
+            ThinkingLevelDto {
+                level: "minimal".to_string(),
+                budget_tokens: None,
+                available: vec!["minimal".to_string()],
+            }
+        }
+
+        fn context_info(&self) -> ContextInfoDto {
+            ContextInfoDto {
+                used_tokens: 0,
+                max_tokens: 0,
+                percentage: 0.0,
+                compaction_threshold: 0.0,
+            }
+        }
+
+        fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+            self.context_info()
+        }
+
+        fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+            Ok(ThinkingLevelDto {
+                level: level.to_string(),
+                budget_tokens: None,
+                available: vec![level.to_string()],
+            })
+        }
+
+        fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+            Vec::new()
+        }
+
+        fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+            Vec::new()
+        }
+
+        fn config_manager(&self) -> Option<ConfigManagerHandle> {
+            None
+        }
+
+        fn session_bus(&self) -> Option<&SessionBus> {
+            None
+        }
+
+        fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+            Vec::new()
+        }
+
+        fn replace_session_memory(&mut self, memory: SessionMemory) -> SessionMemory {
+            let mut state = self.state.lock().expect("state lock");
+            std::mem::replace(&mut state.current_memory, memory)
+        }
+
+        fn session_memory(&self) -> SessionMemory {
+            self.state
+                .lock()
+                .expect("state lock")
+                .current_memory
+                .clone()
+        }
+
+        fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+            std::mem::take(&mut self.state.lock().expect("state lock").last_session_messages)
+        }
+    }
+
+    fn session_memory_test_router(
+        registry: SessionRegistry,
+        initial_memory: SessionMemory,
+    ) -> (Router, Arc<StdMutex<SessionMemoryPersistingState>>) {
+        let app = SessionMemoryPersistingTestApp::new(initial_memory);
+        let app_state = Arc::clone(&app.state);
+        let mut state = test_state_with_sessions(registry);
+        state.shared = Arc::new(SharedReadState::from_app(&app));
+        state.app = Arc::new(Mutex::new(app));
+        (build_router(state, None), app_state)
     }
 
     fn runtime_info_with_skills(
@@ -2778,6 +2958,99 @@ allowed_chat_ids = [123]
             .iter()
             .flat_map(|message| &message.content)
             .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_bad")));
+    }
+
+    #[tokio::test]
+    async fn session_message_persists_updated_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-persist");
+        let seeded_memory = SessionMemory {
+            project: Some("persistent project".to_string()),
+            ..SessionMemory::default()
+        };
+        let restored_memory = SessionMemory {
+            project: Some("shared app memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), restored_memory.clone());
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                r#"{"message":"hello there"}"#,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.loaded_memories, vec![seeded_memory.clone()]);
+        assert_eq!(state.current_memory, restored_memory);
+        drop(state);
+
+        let history = registry.history(&key, 10).expect("history");
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].render_text(), "Stored memory response");
+        assert_eq!(stored_memory.project, seeded_memory.project);
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("updated during turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_message_stream_persists_updated_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-stream-persist");
+        let seeded_memory = SessionMemory {
+            project: Some("persistent project".to_string()),
+            ..SessionMemory::default()
+        };
+        let restored_memory = SessionMemory {
+            project: Some("shared app memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), restored_memory.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("Stored memory response"));
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.loaded_memories, vec![seeded_memory.clone()]);
+        assert_eq!(state.current_memory, restored_memory);
+        drop(state);
+
+        let history = registry.history(&key, 10).expect("history");
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].render_text(), "Stored memory response");
+        assert_eq!(stored_memory.project, seeded_memory.project);
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("updated during turn")
+        );
     }
 
     #[tokio::test]

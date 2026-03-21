@@ -23,10 +23,6 @@ impl SessionMemorySkill {
         Self { memory }
     }
 
-    pub fn memory_arc(&self) -> &Arc<Mutex<SessionMemory>> {
-        &self.memory
-    }
-
     fn handle_update(&self, arguments: &str) -> Result<String, SkillError> {
         let update: SessionMemoryUpdate = serde_json::from_str(arguments)
             .map_err(|error| format!("invalid arguments: {error}"))?;

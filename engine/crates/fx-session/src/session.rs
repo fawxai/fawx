@@ -223,6 +223,7 @@ pub struct SessionMemory {
 }
 
 impl SessionMemory {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.project.is_none()
             && self.current_state.is_none()
@@ -232,6 +233,7 @@ impl SessionMemory {
     }
 
     /// Estimated token count for the rendered memory block.
+    #[must_use]
     pub fn estimated_tokens(&self) -> usize {
         let text = self.render();
         if text.is_empty() {
@@ -245,7 +247,8 @@ impl SessionMemory {
     }
 
     /// Apply an update from the agent's tool call.
-    /// Returns Err if the result would exceed the token cap.
+    /// Returns `Err(String)` with a user-facing message if the update
+    /// would exceed the session memory token cap.
     pub fn apply_update(&mut self, update: SessionMemoryUpdate) -> Result<(), String> {
         let mut candidate = self.clone();
         if let Some(project) = update.project {
@@ -290,10 +293,7 @@ impl SessionMemory {
         push_session_memory_items(&mut lines, "Key decisions:", &self.key_decisions);
         push_session_memory_items(&mut lines, "Active files:", &self.active_files);
         push_session_memory_items(&mut lines, "Context:", &self.custom_context);
-        lines.join(
-            "
-",
-        )
+        lines.join("\n")
     }
 }
 
