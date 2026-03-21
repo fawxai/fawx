@@ -2727,7 +2727,9 @@ allowed_chat_ids = [123]
             )
             .expect("record orphan tool use");
 
-        let captured = Arc::new(std::sync::Mutex::new(Vec::<fx_llm::CompletionRequest>::new()));
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
         let mut router = fx_llm::ModelRouter::new();
         router.register_provider(Box::new(LocalCapturingProvider {
             captured: Arc::clone(&captured),
@@ -2763,12 +2765,16 @@ allowed_chat_ids = [123]
             .cloned()
             .expect("captured request");
 
-        assert!(captured_request.messages.iter().flat_map(|message| &message.content).any(
-            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_good")
-        ));
-        assert!(!captured_request.messages.iter().flat_map(|message| &message.content).any(
-            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_bad")
-        ));
+        assert!(captured_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_good")));
+        assert!(!captured_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_bad")));
     }
 
     #[tokio::test]

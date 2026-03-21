@@ -609,17 +609,23 @@ mod tests {
         let context = session_messages_to_context(&messages);
 
         assert_eq!(context.len(), 3);
-        assert!(context.iter().flat_map(|message| &message.content).any(|block| {
-            matches!(
-                block,
-                ContentBlock::ToolUse { id, .. } if id == "call_good"
-            )
-        }));
-        assert!(!context.iter().flat_map(|message| &message.content).any(|block| {
-            matches!(
-                block,
-                ContentBlock::ToolUse { id, .. } if id == "call_bad"
-            )
-        }));
+        assert!(context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { id, .. } if id == "call_good"
+                )
+            }));
+        assert!(!context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { id, .. } if id == "call_bad"
+                )
+            }));
     }
 }

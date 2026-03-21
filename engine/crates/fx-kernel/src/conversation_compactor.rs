@@ -27,7 +27,9 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 fn estimate_content_tokens(content: &ContentBlock) -> usize {
     match content {
         ContentBlock::Text { text } => estimate_text_tokens(text),
-        ContentBlock::ToolUse { id, name, input, .. } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             estimate_text_tokens(id)
                 + estimate_text_tokens(name)
                 + estimate_text_tokens(&input.to_string())
@@ -316,6 +318,151 @@ fn sliding_compaction_result(
         used_summarization: false,
         evicted_indices,
     })
+}
+
+/// Result of tool block pruning.
+#[derive(Debug, Clone)]
+pub struct PruneResult {
+    /// Number of content blocks that were pruned.
+    pub pruned_count: usize,
+    /// Estimated tokens saved by pruning.
+    pub tokens_saved: usize,
+}
+
+/// Check whether the prunable zone contains any non-text blocks.
+pub fn has_prunable_blocks(messages: &[Message], preserve_recent_turns: usize) -> bool {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    messages[bounds.prefix_end..bounds.tail_start]
+        .iter()
+        .any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::Text { .. }))
+        })
+}
+
+/// Prune old tool_use, tool_result, and image blocks in-place.
+///
+/// Messages older than `preserve_recent_turns` from the end have their
+/// non-text content blocks replaced with compact text summaries. Active
+/// tool chains (tool_use in the recent window referencing a tool_result
+/// in the old window) are preserved. In-flight tool_use blocks (those
+/// without a matching tool_result anywhere) are also preserved.
+///
+/// Returns `None` if no blocks were pruned.
+pub fn prune_tool_blocks(
+    messages: &mut [Message],
+    preserve_recent_turns: usize,
+    summary_max_chars: usize,
+) -> Option<PruneResult> {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let tail_ids = ids_referenced_in_tail(messages, bounds.tail_start);
+    let unresolved_ids = unresolved_tool_use_ids(messages);
+
+    // Merge tail-referenced and unresolved IDs into a single protected set (owned).
+    let protected_ids: HashSet<String> = tail_ids
+        .into_iter()
+        .chain(unresolved_ids)
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut pruned_count = 0;
+    let mut tokens_saved: usize = 0;
+
+    for message in &mut messages[bounds.prefix_end..bounds.tail_start] {
+        let (count, saved) = prune_message_blocks(message, &protected_ids, summary_max_chars);
+        pruned_count += count;
+        tokens_saved += saved;
+    }
+
+    if pruned_count == 0 {
+        return None;
+    }
+
+    Some(PruneResult {
+        pruned_count,
+        tokens_saved,
+    })
+}
+
+/// Prune non-text blocks in a single message, returning (count, tokens_saved).
+fn prune_message_blocks(
+    message: &mut Message,
+    referenced_ids: &HashSet<String>,
+    summary_max_chars: usize,
+) -> (usize, usize) {
+    let mut count = 0;
+    let mut saved: usize = 0;
+
+    for block in &mut message.content {
+        let (replacement, block_saved) =
+            maybe_prune_block(block, referenced_ids, summary_max_chars);
+        if let Some(new_block) = replacement {
+            *block = new_block;
+            count += 1;
+            saved += block_saved;
+        }
+    }
+
+    (count, saved)
+}
+
+/// Return a replacement block and tokens saved, or None if the block
+/// should be preserved.
+fn maybe_prune_block(
+    block: &ContentBlock,
+    referenced_ids: &HashSet<String>,
+    summary_max_chars: usize,
+) -> (Option<ContentBlock>, usize) {
+    match block {
+        ContentBlock::ToolUse { id, name, .. } => {
+            if referenced_ids.contains(id) {
+                return (None, 0);
+            }
+            let before = estimate_content_tokens(block);
+            let summary = format!("[tool: {name}]");
+            let after = estimate_text_tokens(&summary);
+            let replacement = ContentBlock::Text { text: summary };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => {
+            if referenced_ids.contains(tool_use_id) {
+                return (None, 0);
+            }
+            let before = estimate_content_tokens(block);
+            let summary = summarize_tool_result(content, summary_max_chars);
+            let after = estimate_text_tokens(&summary);
+            let replacement = ContentBlock::Text { text: summary };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::Image { .. } => {
+            let before = estimate_content_tokens(block);
+            let summary = "[image]";
+            let after = estimate_text_tokens(summary);
+            let replacement = ContentBlock::Text {
+                text: summary.to_string(),
+            };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::Text { .. } => (None, 0),
+    }
+}
+
+/// Summarize a tool result value to at most `max_chars` characters.
+fn summarize_tool_result(content: &serde_json::Value, max_chars: usize) -> String {
+    let raw = match content.as_str() {
+        Some(s) => s.to_string(),
+        None => content.to_string(),
+    };
+    if raw.len() <= max_chars {
+        return format!("[result: {raw}]");
+    }
+    let truncated: String = raw.chars().take(max_chars).collect();
+    format!("[result: {truncated}...]")
 }
 
 /// Budget tracker for conversation-level context usage.
@@ -643,6 +790,10 @@ pub struct CompactionConfig {
     pub(crate) recompact_cooldown_turns: u32,
     pub(crate) use_summarization: bool,
     pub(crate) max_summary_tokens: usize,
+    /// When true, prune old tool_use/tool_result/image blocks before compaction.
+    pub(crate) prune_tool_blocks: bool,
+    /// Maximum characters retained in summarized tool results.
+    pub(crate) tool_block_summary_max_chars: usize,
 }
 
 impl CompactionConfig {
@@ -722,6 +873,8 @@ impl Default for CompactionConfig {
             recompact_cooldown_turns: 2,
             use_summarization: true,
             max_summary_tokens: SummarizingCompactor::DEFAULT_MAX_SUMMARY_TOKENS,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         }
     }
 }
@@ -1367,5 +1520,377 @@ mod tests {
                 )
             })
         }));
+    }
+
+    // 6. Tool block pruning tests
+
+    fn image_message() -> Message {
+        Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+        }
+    }
+
+    fn mixed_message(tool_id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "thinking".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: tool_id.to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/big_file.rs"}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn prune_old_tool_blocks_preserves_recent() {
+        let mut messages = vec![
+            tool_use("old-1"),
+            tool_result("old-1", 50),
+            user(10),
+            assistant(10),
+            tool_use("recent-1"),
+            tool_result("recent-1", 50),
+        ];
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+
+        // Old blocks (indices 0,1) should be pruned
+        assert!(result.pruned_count >= 2);
+
+        // Recent blocks (indices 4,5) should be preserved
+        assert!(messages[4]
+            .content
+            .iter()
+            .any(|b| { matches!(b, ContentBlock::ToolUse { id, .. } if id == "recent-1") }));
+        assert!(messages[5].content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "recent-1")
+        }));
+    }
+
+    #[test]
+    fn pruned_tool_use_retains_name_drops_input() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[tool: read]");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruned_tool_result_retains_first_n_chars_with_ellipsis() {
+        let long_content = "x".repeat(200);
+        let mut messages = vec![
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: serde_json::json!(long_content),
+                }],
+            },
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 50);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert!(text.starts_with("[result: "));
+                assert!(text.ends_with("...]"));
+                // The truncated content inside should be at most 50 chars
+                // (plus the [result: ] prefix and ...] suffix)
+                assert!(text.len() < 70);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruned_tool_result_short_content_no_ellipsis() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: serde_json::json!("ok"),
+                }],
+            },
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[result: ok]");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_blocks_replaced_with_placeholder() {
+        let mut messages = vec![image_message(), user(10), assistant(10)];
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+
+        assert_eq!(result.pruned_count, 1);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "[image]"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_tool_chains_never_pruned() {
+        // tool_use in recent window references tool_result in old window
+        let mut messages = vec![
+            tool_result("active-1", 50),
+            user(10),
+            assistant(10),
+            // Recent window (last 2):
+            tool_use("active-1"),
+            user(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // The tool_result at index 0 should be preserved because
+        // tool_use "active-1" is in the recent window
+        assert!(messages[0].content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "active-1")
+        }));
+    }
+
+    #[test]
+    fn token_estimate_decreases_after_pruning() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 200),
+            image_message(),
+            user(10),
+            assistant(10),
+        ];
+        let before = ConversationBudget::estimate_tokens(&messages);
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+        let after = ConversationBudget::estimate_tokens(&messages);
+
+        assert!(after < before, "after={after} should be < before={before}");
+        assert!(result.tokens_saved > 0);
+    }
+
+    #[test]
+    fn pruning_skipped_when_disabled_via_config() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 200),
+            user(10),
+            assistant(10),
+        ];
+        let original = messages.clone();
+        // Setting preserve_recent_turns >= len means no old window to prune.
+        let preserve = messages.len();
+        let result = prune_tool_blocks(&mut messages, preserve, 100);
+        assert!(result.is_none(), "should not prune when preserve >= len");
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn empty_messages_unchanged() {
+        let mut messages: Vec<Message> = vec![];
+        let result = prune_tool_blocks(&mut messages, 2, 100);
+        assert!(result.is_none(), "empty messages should return None");
+    }
+
+    #[test]
+    fn text_only_messages_unchanged() {
+        let mut messages = vec![user(20), assistant(20), user(10), assistant(10)];
+        let original = messages.clone();
+        let result = prune_tool_blocks(&mut messages, 2, 100);
+        assert!(result.is_none(), "text-only messages should return None");
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn mixed_message_prunes_tool_preserves_text() {
+        let mut messages = vec![
+            mixed_message("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // Text block should remain, tool_use should be replaced
+        assert_eq!(messages[0].content.len(), 2);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "thinking"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &messages[0].content[1] {
+            ContentBlock::Text { text } => assert_eq!(text, "[tool: read_file]"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_messages_in_prefix_not_pruned() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "sysimg".to_string(),
+                }],
+            },
+            tool_use("t1"),
+            tool_result("t1", 50),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // System message image should be preserved (in prefix zone)
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::Image { .. }
+        ));
+        // But old tool blocks in middle zone should be pruned
+        assert!(matches!(&messages[1].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn unresolved_tool_use_not_pruned() {
+        // tool_use "inflight" has no matching tool_result anywhere — it's in-flight.
+        // Pruning it would orphan a later tool_result.
+        let mut messages = vec![
+            tool_use("inflight"),
+            tool_use("resolved"),
+            tool_result("resolved", 50),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // The in-flight tool_use at index 0 must be preserved.
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|b| { matches!(b, ContentBlock::ToolUse { id, .. } if id == "inflight") }),
+            "in-flight tool_use should be preserved, got: {:?}",
+            messages[0].content
+        );
+
+        // The resolved tool_use at index 1 should be pruned (its result is also old).
+        assert!(
+            matches!(&messages[1].content[0], ContentBlock::Text { .. }),
+            "resolved old tool_use should be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_skips_compaction_when_pruning_sufficient() {
+        // Budget: model_context_limit must be large enough to leave a usable
+        // conversation_budget after subtracting DEFAULT_OUTPUT_RESERVE_TOKENS (4096).
+        // conversation_budget = 16_000 - 0 - 4096 = 11_904
+        // compaction trigger = ceil(11_904 * 0.80) = 9_524
+        let config = CompactionConfig {
+            compaction_threshold: 0.80,
+            preserve_recent_turns: 2,
+            model_context_limit: 16_000,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 1,
+            use_summarization: false,
+            max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 10,
+        };
+        let budget = ConversationBudget::new(
+            config.model_context_limit,
+            config.compaction_threshold,
+            config.reserved_system_tokens,
+        );
+        let strategy = config.build_strategy(None);
+
+        // Build messages: a massive tool result in old window pushes tokens
+        // above the trigger (~9524), but after pruning it shrinks well below.
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 9600), // ~9600 tokens, will be pruned to ~5
+            user(10),
+            assistant(10),
+        ];
+
+        let before_tokens = ConversationBudget::estimate_tokens(&messages);
+        assert!(
+            budget.needs_compaction(&messages),
+            "messages should exceed compaction threshold before pruning (tokens: {before_tokens})"
+        );
+
+        // Simulate what compact_if_needed does: prune first, then check.
+        let mut pruned = messages.clone();
+        let prune_result = prune_tool_blocks(
+            &mut pruned,
+            config.preserve_recent_turns,
+            config.tool_block_summary_max_chars,
+        );
+        assert!(prune_result.is_some(), "should have pruned tool blocks");
+
+        let after_tokens = ConversationBudget::estimate_tokens(&pruned);
+        assert!(
+            !budget.needs_compaction(&pruned),
+            "pruned messages should be below compaction threshold (tokens: {after_tokens})"
+        );
+
+        // Verify the compaction strategy is never invoked (we'd get the pruned
+        // messages back without the compaction marker).
+        let result = strategy.compact(&pruned, budget.compaction_target()).await;
+        match result {
+            Ok(r) => assert_eq!(r.compacted_count, 0, "compaction should be a no-op"),
+            Err(_) => panic!("compact should succeed on already-below-threshold messages"),
+        }
+    }
+
+    #[test]
+    fn has_prunable_blocks_detects_tool_blocks() {
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        assert!(has_prunable_blocks(&messages, 2));
+    }
+
+    #[test]
+    fn has_prunable_blocks_false_for_text_only() {
+        let messages = vec![user(10), assistant(10), user(10), assistant(10)];
+        assert!(!has_prunable_blocks(&messages, 2));
+    }
+
+    #[test]
+    fn has_prunable_blocks_false_when_all_in_recent() {
+        let messages = vec![tool_use("t1"), tool_result("t1", 10)];
+        // preserve_recent_turns=2 covers all messages; no prunable zone.
+        assert!(!has_prunable_blocks(&messages, 2));
     }
 }

@@ -11,8 +11,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
-    estimate_text_tokens, CompactionConfig, CompactionError, CompactionMemoryFlush,
-    CompactionResult, CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
+    estimate_text_tokens, has_prunable_blocks, prune_tool_blocks, CompactionConfig,
+    CompactionError, CompactionMemoryFlush, CompactionResult, CompactionStrategy,
+    ConversationBudget, SlidingWindowCompactor,
 };
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -1554,7 +1555,7 @@ impl LoopEngine {
         _stream: CycleStream<'_>,
     ) -> Option<LoopResult> {
         state.learnings.push(learning);
-        let result = match continuation {
+        match continuation {
             Continuation::Complete => Some(LoopResult::Complete {
                 response: response_text,
                 iterations: self.iteration_count,
@@ -1571,8 +1572,7 @@ impl LoopEngine {
                 *perception = next_perception_from_sub_goal(perception, &sub_goal);
                 None
             }
-        };
-        result
+        }
     }
 
     /// Perceive step.
@@ -2947,16 +2947,36 @@ impl LoopEngine {
             return Ok(Cow::Borrowed(messages));
         }
 
-        let before_tokens = ConversationBudget::estimate_tokens(messages);
-        let hard_limit_exceeded = self.conversation_budget.exceeds_hard_limit(messages);
+        // Run tool block pruning before compaction strategy.
+        let pruned_owned = self.maybe_prune_tool_blocks(messages, scope);
+        let effective_messages = pruned_owned.as_deref().unwrap_or(messages);
+
+        // If pruning was enough, skip compaction.
+        if !self
+            .conversation_budget
+            .needs_compaction(effective_messages)
+        {
+            return match pruned_owned {
+                Some(owned) => Ok(Cow::Owned(owned)),
+                None => Ok(Cow::Borrowed(messages)),
+            };
+        }
+
+        let before_tokens = ConversationBudget::estimate_tokens(effective_messages);
+        let hard_limit_exceeded = self
+            .conversation_budget
+            .exceeds_hard_limit(effective_messages);
         if self.should_skip_compaction(scope, iteration, hard_limit_exceeded) {
-            return Ok(Cow::Borrowed(messages));
+            return match pruned_owned {
+                Some(owned) => Ok(Cow::Owned(owned)),
+                None => Ok(Cow::Borrowed(messages)),
+            };
         }
 
         let target_tokens = self.conversation_budget.compaction_target();
         let context = CompactionContext {
             scope,
-            messages,
+            messages: effective_messages,
             target: target_tokens,
             hard_limit_exceeded,
             before_tokens,
@@ -2991,6 +3011,42 @@ impl LoopEngine {
         }
         self.record_compaction_iteration(scope, iteration);
         Ok(Cow::Owned(result.messages))
+    }
+
+    /// Apply tool block pruning if enabled, returning the pruned messages
+    /// or `None` if pruning was skipped or had no effect.
+    fn maybe_prune_tool_blocks(
+        &self,
+        messages: &[Message],
+        scope: CompactionScope,
+    ) -> Option<Vec<Message>> {
+        if !self.compaction_config.prune_tool_blocks {
+            return None;
+        }
+
+        // Quick scan: skip the clone if there are no non-text blocks in the prunable zone.
+        if !has_prunable_blocks(messages, self.compaction_config.preserve_recent_turns) {
+            return None;
+        }
+
+        let mut owned = messages.to_vec();
+        let result = prune_tool_blocks(
+            &mut owned,
+            self.compaction_config.preserve_recent_turns,
+            self.compaction_config.tool_block_summary_max_chars,
+        );
+        match result {
+            Some(prune_result) => {
+                tracing::info!(
+                    scope = scope.as_str(),
+                    pruned_blocks = prune_result.pruned_count,
+                    tokens_saved = prune_result.tokens_saved,
+                    "tool block pruning completed"
+                );
+                Some(owned)
+            }
+            None => None,
+        }
     }
 
     async fn run_sliding_fallback(
@@ -3183,7 +3239,8 @@ impl LoopEngine {
                 ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
-                        self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+                        self.tool_call_provider_ids =
+                            extract_tool_use_provider_ids(&response.content);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
                         self.append_deferred_tool_results(
                             &mut state,
@@ -4474,6 +4531,8 @@ fn build_truncation_continuation_request(
     )
 }
 
+// TODO: refactor into a params struct (pre-existing, out of scope for this PR)
+#[allow(clippy::too_many_arguments)]
 fn build_truncation_continuation_request_with_notify_guidance(
     model: &str,
     continuation_messages: &[Message],
@@ -8987,8 +9046,8 @@ mod cancellation_tests {
     #[tokio::test]
     async fn consume_stream_with_events_preserves_provider_ids_in_content() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
-        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(StreamChunk {
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("call-1".to_string()),
@@ -8999,8 +9058,7 @@ mod cancellation_tests {
                 }],
                 usage: None,
                 stop_reason: Some("tool_use".to_string()),
-            }),
-        ]));
+            })]));
 
         let response = engine
             .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
@@ -11506,6 +11564,8 @@ mod context_compaction_tests {
             recompact_cooldown_turns: 3,
             use_summarization: false,
             max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         }
     }
 
@@ -11638,6 +11698,8 @@ mod context_compaction_tests {
             recompact_cooldown_turns: 4,
             use_summarization: true,
             max_summary_tokens: 256,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::new(Vec::new()));
         let cancel_token = CancellationToken::new();

@@ -535,7 +535,9 @@ fn completion_from_accumulator(accumulator: StreamAccumulator) -> CompletionResp
             text: accumulator.text.clone(),
         });
     }
-    content.extend(tool_use_blocks_from_pending(&accumulator.pending_tool_calls));
+    content.extend(tool_use_blocks_from_pending(
+        &accumulator.pending_tool_calls,
+    ));
 
     CompletionResponse {
         content,
@@ -856,7 +858,9 @@ fn summarize_message(index: usize, message: &Message) -> String {
 
 fn summarize_content_block(block: &ContentBlock) -> String {
     match block {
-        ContentBlock::Text { text } => format!("text:{}", text.chars().take(24).collect::<String>()),
+        ContentBlock::Text { text } => {
+            format!("text:{}", text.chars().take(24).collect::<String>())
+        }
         ContentBlock::ToolUse {
             id,
             provider_id,
@@ -1302,10 +1306,7 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
 }
 
 fn collect_tool_use_blocks(output: &[ResponsesOutputItem]) -> Vec<ContentBlock> {
-    output
-        .iter()
-        .filter_map(tool_use_block_from_item)
-        .collect()
+    output.iter().filter_map(tool_use_block_from_item).collect()
 }
 
 fn tool_use_block_from_item(item: &ResponsesOutputItem) -> Option<ContentBlock> {
@@ -1322,8 +1323,8 @@ fn tool_use_block_from_item(item: &ResponsesOutputItem) -> Option<ContentBlock> 
     let name = item.name.as_ref()?.clone();
     let arguments = item.arguments.as_ref()?;
     let raw_args = crate::normalize_tool_arguments(arguments);
-    let input =
-        serde_json::from_str::<Value>(raw_args).unwrap_or_else(|_| Value::String(arguments.clone()));
+    let input = serde_json::from_str::<Value>(raw_args)
+        .unwrap_or_else(|_| Value::String(arguments.clone()));
 
     Some(ContentBlock::ToolUse {
         id,
@@ -1371,10 +1372,12 @@ fn identifiers_overlap(call: &PendingToolCall, delta: &ToolUseDelta) -> bool {
     let call_identifiers = [call.id.as_deref(), call.provider_id.as_deref()];
     let delta_identifiers = [delta.id.as_deref(), delta.provider_id.as_deref()];
 
-    call_identifiers
-        .into_iter()
-        .flatten()
-        .any(|left| delta_identifiers.into_iter().flatten().any(|right| left == right))
+    call_identifiers.into_iter().flatten().any(|left| {
+        delta_identifiers
+            .into_iter()
+            .flatten()
+            .any(|right| left == right)
+    })
 }
 
 fn pending_index_without_id(pending: &[PendingToolCall], delta: &ToolUseDelta) -> Option<usize> {
@@ -1495,8 +1498,7 @@ fn tool_use_blocks_from_pending(pending: &[PendingToolCall]) -> Vec<ContentBlock
                 .filter(|provider_id| *provider_id != id)
                 .map(ToString::to_string);
             let raw_args = crate::normalize_tool_arguments(&call.arguments).to_string();
-            let input =
-                serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
+            let input = serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
 
             Some(ContentBlock::ToolUse {
                 id: id.to_string(),
@@ -2395,7 +2397,10 @@ mod tests {
 
         assert_eq!(chunk.tool_use_deltas.len(), 1);
         assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_99"));
-        assert_eq!(chunk.tool_use_deltas[0].provider_id.as_deref(), Some("call_99"));
+        assert_eq!(
+            chunk.tool_use_deltas[0].provider_id.as_deref(),
+            Some("call_99")
+        );
         assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("lookup"));
     }
 
@@ -2421,7 +2426,10 @@ mod tests {
 
         assert_eq!(chunk.tool_use_deltas.len(), 1);
         assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_123"));
-        assert_eq!(chunk.tool_use_deltas[0].provider_id.as_deref(), Some("fc_123"));
+        assert_eq!(
+            chunk.tool_use_deltas[0].provider_id.as_deref(),
+            Some("fc_123")
+        );
     }
 
     #[test]
