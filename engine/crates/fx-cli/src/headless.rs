@@ -2017,6 +2017,17 @@ impl AppEngine for HeadlessApp {
         )
     }
 
+    fn replace_session_memory(
+        &mut self,
+        memory: fx_session::SessionMemory,
+    ) -> fx_session::SessionMemory {
+        self.loop_engine.replace_session_memory(memory)
+    }
+
+    fn session_memory(&self) -> fx_session::SessionMemory {
+        self.loop_engine.session_memory_snapshot()
+    }
+
     fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
         HeadlessApp::take_last_session_messages(self)
     }

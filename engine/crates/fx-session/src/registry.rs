@@ -1,6 +1,6 @@
 //! Session registry: tracks all active sessions and delegates persistence.
 
-use crate::session::{Session, SessionContentBlock, SessionMessage};
+use crate::session::{Session, SessionContentBlock, SessionMemory, SessionMessage};
 use crate::store::SessionStore;
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
@@ -188,6 +188,37 @@ impl SessionRegistry {
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
             session.extend_messages(messages);
+            session.clone()
+        };
+        self.store.save(&snapshot)?;
+        Ok(())
+    }
+
+    /// Read the persistent memory for a session.
+    pub fn memory(&self, key: &SessionKey) -> Result<SessionMemory> {
+        let map = self.read()?;
+        let session = map
+            .get(key)
+            .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        Ok(session.memory.clone())
+    }
+
+    /// Persist the latest turn messages and session memory together.
+    pub fn record_turn(
+        &self,
+        key: &SessionKey,
+        messages: Vec<SessionMessage>,
+        memory: SessionMemory,
+    ) -> Result<()> {
+        let snapshot = {
+            let mut map = self.write()?;
+            let session = map
+                .get_mut(key)
+                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+            if !messages.is_empty() {
+                session.extend_messages(messages);
+            }
+            session.set_memory(memory);
             session.clone()
         };
         self.store.save(&snapshot)?;
@@ -425,6 +456,42 @@ mod tests {
             .get_info(&SessionKey::new("nope").unwrap())
             .expect_err("should fail");
         assert!(matches!(err, SessionError::NotFound(_)));
+    }
+
+    #[test]
+    fn memory_returns_default_for_new_session() {
+        let reg = test_registry();
+        let key = SessionKey::new("memory").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+
+        let memory = reg.memory(&key).expect("memory");
+
+        assert!(memory.is_empty());
+    }
+
+    #[test]
+    fn record_turn_persists_messages_and_memory_together() {
+        let reg = test_registry();
+        let key = SessionKey::new("turn").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+
+        let messages = vec![SessionMessage::text(MessageRole::Assistant, "saved", 7)];
+        let memory = SessionMemory {
+            project: Some("session memory".to_string()),
+            current_state: Some("testing".to_string()),
+            ..SessionMemory::default()
+        };
+        reg.record_turn(&key, messages, memory.clone())
+            .expect("record turn");
+
+        let history = reg.history(&key, 10).expect("history");
+        let stored_memory = reg.memory(&key).expect("memory");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].render_text(), "saved");
+        assert_eq!(stored_memory, memory);
     }
 
     #[test]

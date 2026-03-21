@@ -19,10 +19,11 @@ use axum::Json;
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
+use fx_kernel::StreamCallback;
 use fx_llm::{trim_conversation_history, ContentBlock, Message};
 use fx_session::{
-    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
-    SessionRegistry, SessionStatus,
+    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMemory,
+    SessionMessage, SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -276,12 +277,17 @@ pub(crate) async fn handle_send_message_for_session(
         .await);
     }
 
-    let (result, response, session_messages) =
-        process_and_route_session_message(&state, &request.message, &images, context)
-            .await
-            .map_err(internal_error)?;
-    registry
-        .append_messages(&key, session_messages)
+    let (result, response, session_messages, session_memory) = process_and_route_session_message(
+        &state,
+        &registry,
+        &key,
+        &request.message,
+        &images,
+        context,
+    )
+    .await
+    .map_err(internal_error)?;
+    persist_session_turn(&registry, &key, session_messages, session_memory)
         .map_err(|error| internal_error(anyhow::Error::new(error)))?;
 
     Ok(Json(MessageResponse {
@@ -365,32 +371,22 @@ async fn stream_session_message_response(
 
 async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
     let callback = stream_callback(task.sender.clone(), Arc::clone(&task.disconnected));
-    let result = {
-        let mut app = task.state.app.lock().await;
-        let r = app
-            .process_message_with_context(
-                &task.message,
-                encoded_images_to_attachments(&task.images),
-                task.context,
-                InputSource::Http,
-                Some(callback),
-            )
-            .await;
-        // Update shared read state while we still hold the lock
-        task.state
-            .shared
-            .update_after_cycle(
-                app.active_model(),
-                &app.thinking_level(),
-                app.session_token_usage(),
-            )
-            .await;
-        r.map(|(result, _)| (result, app.take_last_session_messages()))
-    };
+    let result = execute_session_turn(
+        &task.state,
+        &task.registry,
+        &task.key,
+        &task.message,
+        &task.images,
+        task.context,
+        Some(callback),
+    )
+    .await;
 
     match result {
-        Ok((_result, session_messages)) => {
-            if let Err(error) = task.registry.append_messages(&task.key, session_messages) {
+        Ok((_result, session_messages, session_memory)) => {
+            if let Err(error) =
+                persist_session_turn(&task.registry, &task.key, session_messages, session_memory)
+            {
                 let _ = send_sse_frame(
                     &task.sender,
                     &task.disconnected,
@@ -410,33 +406,14 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
 
 async fn process_and_route_session_message(
     state: &HttpState,
+    registry: &SessionRegistry,
+    key: &SessionKey,
     message: &str,
     images: &[EncodedImage],
     context: Vec<Message>,
-) -> Result<(CycleResult, String, Vec<SessionMessage>), anyhow::Error> {
-    let (result, session_messages) = {
-        let mut app = state.app.lock().await;
-        let (result, _) = app
-            .process_message_with_context(
-                message,
-                encoded_images_to_attachments(images),
-                context,
-                InputSource::Http,
-                None,
-            )
-            .await?;
-        // Update shared read state while we still hold the lock
-        state
-            .shared
-            .update_after_cycle(
-                app.active_model(),
-                &app.thinking_level(),
-                app.session_token_usage(),
-            )
-            .await;
-        let session_messages = app.take_last_session_messages();
-        (result, session_messages)
-    };
+) -> Result<(CycleResult, String, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
+    let (result, session_messages, session_memory) =
+        execute_session_turn(state, registry, key, message, images, context, None).await?;
 
     state
         .channels
@@ -452,7 +429,57 @@ async fn process_and_route_session_message(
         .http
         .take_response()
         .unwrap_or_else(|| result.response.clone());
-    Ok((result, response, session_messages))
+    Ok((result, response, session_messages, session_memory))
+}
+
+async fn execute_session_turn(
+    state: &HttpState,
+    registry: &SessionRegistry,
+    key: &SessionKey,
+    message: &str,
+    images: &[EncodedImage],
+    context: Vec<Message>,
+    callback: Option<StreamCallback>,
+) -> Result<(CycleResult, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
+    let loaded_memory = registry.memory(key).map_err(anyhow::Error::new)?;
+    let mut app = state.app.lock().await;
+    let previous_memory = app.replace_session_memory(loaded_memory);
+    let outcome = app
+        .process_message_with_context(
+            message,
+            encoded_images_to_attachments(images),
+            context,
+            InputSource::Http,
+            callback,
+        )
+        .await;
+    state
+        .shared
+        .update_after_cycle(
+            app.active_model(),
+            &app.thinking_level(),
+            app.session_token_usage(),
+        )
+        .await;
+    let result = match outcome {
+        Ok((result, _)) => {
+            let session_messages = app.take_last_session_messages();
+            let session_memory = app.session_memory();
+            Ok((result, session_messages, session_memory))
+        }
+        Err(error) => Err(error),
+    };
+    app.replace_session_memory(previous_memory);
+    result
+}
+
+fn persist_session_turn(
+    registry: &SessionRegistry,
+    key: &SessionKey,
+    session_messages: Vec<SessionMessage>,
+    session_memory: SessionMemory,
+) -> Result<(), SessionError> {
+    registry.record_turn(key, session_messages, session_memory)
 }
 
 fn create_session(
