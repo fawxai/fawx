@@ -1,8 +1,9 @@
 //! JournalSkill — exposes reflective memory as agent tools.
 //!
-//! Two tools:
+//! Tools:
 //! - `journal_write`: record a lesson or insight for future sessions
 //! - `journal_search`: search past entries for relevant lessons
+//! - `recall_session_context`: search evicted session history
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +16,7 @@ use serde::Deserialize;
 use crate::journal::Journal;
 use fx_loadable::skill::{Skill, SkillError};
 
-/// Skill that provides journal_write and journal_search tools.
+/// Skill that provides journal-related tools.
 pub struct JournalSkill {
     journal: Arc<Mutex<Journal>>,
 }
@@ -46,6 +47,12 @@ struct WriteArgs {
 struct SearchArgs {
     query: String,
     tags: Option<Vec<String>>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RecallArgs {
+    query: String,
     limit: Option<usize>,
 }
 
@@ -115,6 +122,33 @@ fn journal_search_definition() -> ToolDefinition {
     }
 }
 
+fn recall_session_context_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "recall_session_context".to_string(),
+        description: concat!(
+            "Search evicted conversation history for details from earlier in this session. ",
+            "Use when you need to recall something specific that was discussed earlier ",
+            "but may have been compacted away. Searches only compaction-flushed entries, ",
+            "not general journal lessons.",
+        )
+        .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for in evicted history"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default 5)"
+                }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
 #[async_trait]
 impl Skill for JournalSkill {
     fn name(&self) -> &str {
@@ -122,7 +156,11 @@ impl Skill for JournalSkill {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![journal_write_definition(), journal_search_definition()]
+        vec![
+            journal_write_definition(),
+            journal_search_definition(),
+            recall_session_context_definition(),
+        ]
     }
 
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
@@ -140,6 +178,7 @@ impl Skill for JournalSkill {
         match tool_name {
             "journal_write" => Some(self.handle_write(arguments)),
             "journal_search" => Some(self.handle_search(arguments)),
+            "recall_session_context" => Some(self.handle_recall(arguments)),
             _ => None,
         }
     }
@@ -198,6 +237,40 @@ impl JournalSkill {
         }))
         .map_err(|e| format!("serialization failed: {e}"))
     }
+
+    fn handle_recall(&self, arguments: &str) -> Result<String, SkillError> {
+        let args: RecallArgs =
+            serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))?;
+
+        let journal = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let limit = args.limit.unwrap_or(5);
+        let results = journal.search(
+            &args.query,
+            Some(vec!["compaction-flush".to_string()]),
+            limit,
+        );
+
+        let entries: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "context": entry.context,
+                    "content": entry.lesson,
+                    "timestamp": format_timestamp(entry.timestamp),
+                })
+            })
+            .collect();
+
+        serde_json::to_string(&serde_json::json!({
+            "count": entries.len(),
+            "recalled": entries,
+        }))
+        .map_err(|e| format!("serialization failed: {e}"))
+    }
 }
 
 /// Format a Unix-millis timestamp as an ISO 8601 UTC string.
@@ -251,22 +324,29 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_skill(tmp: &TempDir) -> JournalSkill {
+    fn test_journal_and_skill(tmp: &TempDir) -> (Arc<Mutex<Journal>>, JournalSkill) {
         let path = tmp.path().join("journal.jsonl");
-        let journal = Journal::load(path).unwrap();
-        JournalSkill::new(Arc::new(Mutex::new(journal)))
+        let journal = Arc::new(Mutex::new(Journal::load(path).unwrap()));
+        let skill = JournalSkill::new(Arc::clone(&journal));
+        (journal, skill)
+    }
+
+    fn test_skill(tmp: &TempDir) -> JournalSkill {
+        let (_, skill) = test_journal_and_skill(tmp);
+        skill
     }
 
     #[test]
-    fn skill_provides_two_tools() {
+    fn skill_provides_three_tools() {
         let tmp = TempDir::new().unwrap();
         let skill = test_skill(&tmp);
         let defs = skill.tool_definitions();
-        assert_eq!(defs.len(), 2);
+        assert_eq!(defs.len(), 3);
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"journal_write"));
         assert!(names.contains(&"journal_search"));
+        assert!(names.contains(&"recall_session_context"));
     }
 
     #[test]
@@ -298,6 +378,97 @@ mod tests {
         .to_string();
 
         let result = skill.execute("journal_search", &search_args, None).await;
+        let output = result.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn recall_finds_compaction_flush_entries() {
+        let tmp = TempDir::new().unwrap();
+        let (journal, skill) = test_journal_and_skill(&tmp);
+
+        {
+            let mut journal = journal.lock().unwrap();
+            journal
+                .write(
+                    "user: what's the best BPB?\nassistant: 3.557 with hillclimb config"
+                        .to_string(),
+                    vec!["compaction-flush".to_string(), "auto".to_string()],
+                    "session-memory".to_string(),
+                    Some(
+                        "Auto-flushed during perceive compaction. 5 messages evicted.".to_string(),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let args = serde_json::json!({"query": "BPB"}).to_string();
+        let result = skill.execute("recall_session_context", &args, None).await;
+        let output = result.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert!(parsed["recalled"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("3.557"));
+    }
+
+    #[tokio::test]
+    async fn recall_ignores_non_flush_entries() {
+        let tmp = TempDir::new().unwrap();
+        let skill = test_skill(&tmp);
+
+        let write_args = serde_json::json!({
+            "lesson": "Small PRs get faster reviews",
+            "tags": ["review", "process"],
+            "applies_to": "orchestration"
+        })
+        .to_string();
+        let result = skill.execute("journal_write", &write_args, None).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+
+        let args = serde_json::json!({"query": "Small PRs"}).to_string();
+        let result = skill.execute("recall_session_context", &args, None).await;
+        let output = result.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn recall_returns_empty_when_no_matches() {
+        let tmp = TempDir::new().unwrap();
+        let skill = test_skill(&tmp);
+
+        let args = serde_json::json!({"query": "nonexistent topic"}).to_string();
+        let result = skill.execute("recall_session_context", &args, None).await;
+        let output = result.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn recall_respects_limit() {
+        let tmp = TempDir::new().unwrap();
+        let (journal, skill) = test_journal_and_skill(&tmp);
+
+        {
+            let mut journal = journal.lock().unwrap();
+            for i in 0..3 {
+                journal
+                    .write(
+                        format!("user: topic {i}\nassistant: response {i}"),
+                        vec!["compaction-flush".to_string(), "auto".to_string()],
+                        "session-memory".to_string(),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let args = serde_json::json!({"query": "topic", "limit": 1}).to_string();
+        let result = skill.execute("recall_session_context", &args, None).await;
         let output = result.unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["count"], 1);
