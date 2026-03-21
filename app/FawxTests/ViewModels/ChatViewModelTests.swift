@@ -79,6 +79,40 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(coordinator.shouldFollowLiveOutput)
     }
 
+    func testTranscriptScrollCoordinatorPublishesPinnedTransitionsOnce() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        XCTAssertEqual(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 20, distanceFromBottom: 10),
+                userDriven: false
+            ),
+            TranscriptPinnedStateUpdate(distanceFromBottom: 10, isPinnedToBottom: true)
+        )
+        XCTAssertNil(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 24, distanceFromBottom: 12),
+                userDriven: false
+            )
+        )
+
+        XCTAssertEqual(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 120, distanceFromBottom: 120),
+                userDriven: true
+            ),
+            TranscriptPinnedStateUpdate(distanceFromBottom: 120, isPinnedToBottom: false)
+        )
+        XCTAssertNil(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 140, distanceFromBottom: 140),
+                userDriven: true
+            )
+        )
+    }
+
     func testTranscriptScrollCoordinatorRestoresDetachedSessionAtSavedOffset() {
         let coordinator = TranscriptScrollCoordinator()
 

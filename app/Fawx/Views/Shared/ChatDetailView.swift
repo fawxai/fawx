@@ -827,8 +827,8 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
     let containerWidth: CGFloat
 
     @State private var scrollPosition = ScrollPosition(idType: String.self)
-    @State private var scrollPhase: ScrollPhase = .idle
     @State private var scrollCoordinator = TranscriptScrollCoordinator()
+    @State private var scrollInteractionTracker = TranscriptScrollInteractionTracker()
 
     var body: some View {
         ScrollView {
@@ -860,6 +860,13 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
             if isStreaming && scrollCoordinator.shouldFollowLiveOutput {
                 scrollToBottom(animated: false)
             }
+            if isStreaming {
+                let pinnedStateUpdate = scrollCoordinator.currentPinnedStateUpdate(distanceFromBottom: 0)
+                updateStreamingPinnedState(
+                    pinnedStateUpdate.isPinnedToBottom,
+                    pinnedStateUpdate.distanceFromBottom
+                )
+            }
         }
         .onChange(of: lastTranscriptItemID) { _, _ in
             handleTranscriptItemChange()
@@ -872,7 +879,7 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
             scrollToBottom(animated: false)
         }
         .onScrollPhaseChange { _, newPhase in
-            scrollPhase = newPhase
+            scrollInteractionTracker.updateScrollPhase(newPhase)
         }
         .onScrollGeometryChange(
             for: TranscriptScrollObservation.self,
@@ -897,14 +904,7 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
     }
 
     private var isUserDrivenScroll: Bool {
-        switch scrollPhase {
-        case .tracking, .interacting, .decelerating:
-            return true
-        case .idle, .animating:
-            return scrollPosition.isPositionedByUser
-        @unknown default:
-            return scrollPosition.isPositionedByUser
-        }
+        scrollInteractionTracker.isUserDrivenScroll(isPositionedByUser: scrollPosition.isPositionedByUser)
     }
 
     private func restoreScrollPositionIfNeeded() {
@@ -1009,6 +1009,7 @@ final class TranscriptScrollCoordinator {
     private var pendingRestoreSessionID: String?
     private var snapshotsBySession: [String: SessionSnapshot] = [:]
     private var snapshotAccessOrder: [String] = []
+    private var lastPublishedPinnedState: Bool?
 
     var shouldFollowLiveOutput: Bool {
         mode != .detached
@@ -1018,6 +1019,16 @@ final class TranscriptScrollCoordinator {
         activeSessionID = sessionID
         pendingRestoreSessionID = sessionID
         mode = .restoringSession
+        lastPublishedPinnedState = nil
+    }
+
+    func currentPinnedStateUpdate(distanceFromBottom: CGFloat) -> TranscriptPinnedStateUpdate {
+        let isPinnedToBottom = mode != .detached
+        lastPublishedPinnedState = isPinnedToBottom
+        return TranscriptPinnedStateUpdate(
+            distanceFromBottom: max(0, distanceFromBottom),
+            isPinnedToBottom: isPinnedToBottom
+        )
     }
 
     func restoreIntentIfNeeded(
@@ -1068,10 +1079,7 @@ final class TranscriptScrollCoordinator {
             for: activeSessionID
         )
 
-        return TranscriptPinnedStateUpdate(
-            distanceFromBottom: distanceFromBottom,
-            isPinnedToBottom: mode != .detached
-        )
+        return pinnedStateUpdateIfNeeded(distanceFromBottom: distanceFromBottom)
     }
 
     private func snapshot(for sessionID: String) -> SessionSnapshot? {
@@ -1101,6 +1109,40 @@ final class TranscriptScrollCoordinator {
             snapshotAccessOrder.removeFirst()
             snapshotsBySession.removeValue(forKey: leastRecentlyUsedSessionID)
         }
+    }
+
+    private func pinnedStateUpdateIfNeeded(distanceFromBottom: CGFloat) -> TranscriptPinnedStateUpdate? {
+        let isPinnedToBottom = mode != .detached
+        guard lastPublishedPinnedState != isPinnedToBottom else {
+            return nil
+        }
+
+        lastPublishedPinnedState = isPinnedToBottom
+        return TranscriptPinnedStateUpdate(
+            distanceFromBottom: distanceFromBottom,
+            isPinnedToBottom: isPinnedToBottom
+        )
+    }
+}
+
+@MainActor
+final class TranscriptScrollInteractionTracker {
+    private var isUserInteracting = false
+
+    @available(iOS 18.0, macOS 15.0, *)
+    func updateScrollPhase(_ scrollPhase: ScrollPhase) {
+        switch scrollPhase {
+        case .tracking, .interacting, .decelerating:
+            isUserInteracting = true
+        case .idle, .animating:
+            isUserInteracting = false
+        @unknown default:
+            isUserInteracting = false
+        }
+    }
+
+    func isUserDrivenScroll(isPositionedByUser: Bool) -> Bool {
+        isUserInteracting || isPositionedByUser
     }
 }
 
