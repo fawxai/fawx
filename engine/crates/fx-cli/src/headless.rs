@@ -3276,6 +3276,7 @@ mod tests {
     use fx_kernel::loop_engine::LoopEngine;
     use fx_session::SessionKey;
     use fx_subagent::SpawnConfig;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::time::Duration;
 
@@ -3432,6 +3433,20 @@ mod tests {
         u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
     }
 
+    fn streamed_tool_delta(
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments_delta: Option<&str>,
+        arguments_done: bool,
+    ) -> fx_llm::ToolUseDelta {
+        fx_llm::ToolUseDelta {
+            id: id.map(ToString::to_string),
+            name: name.map(ToString::to_string),
+            arguments_delta: arguments_delta.map(ToString::to_string),
+            arguments_done,
+        }
+    }
+
     #[test]
     fn session_turn_collector_builds_structured_turn_messages() {
         let collector = SessionTurnCollector::default();
@@ -3532,6 +3547,170 @@ mod tests {
             block,
             SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
         )));
+    }
+
+    #[test]
+    fn streamed_tool_index_reuses_known_ids_and_splits_reused_chunk_slots() {
+        let mut tool_calls_by_index = HashMap::new();
+        let mut id_to_index = HashMap::new();
+
+        tool_calls_by_index.insert(
+            0,
+            StreamedToolCallState {
+                id: Some("call_1".to_string()),
+                name: Some("search".to_string()),
+                arguments: String::new(),
+                arguments_done: false,
+            },
+        );
+        id_to_index.insert("call_1".to_string(), 0);
+
+        let reused_index = streamed_tool_index(
+            0,
+            &streamed_tool_delta(Some("call_1"), None, Some("{}"), true),
+            &tool_calls_by_index,
+            &id_to_index,
+        );
+        let next_index = streamed_tool_index(
+            0,
+            &streamed_tool_delta(Some("call_2"), Some("read_file"), Some("{}"), true),
+            &tool_calls_by_index,
+            &id_to_index,
+        );
+
+        assert_eq!(reused_index, 0);
+        assert_eq!(next_index, 1);
+    }
+
+    #[test]
+    fn merge_streamed_arguments_replaces_partial_buffer_with_complete_done_payload() {
+        let mut arguments = r#"{"path":"READ"#.to_string();
+
+        merge_streamed_arguments(&mut arguments, r#"{"path":"README.md"}"#, true);
+
+        assert_eq!(arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn streamed_completion_state_assembles_tool_calls_across_stream_chunks() {
+        let mut state = StreamedCompletionState::default();
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: Some("Working".to_string()),
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_1"),
+                Some("search"),
+                Some(r#"{"q":"rus"#),
+                false,
+            )],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+            }),
+            stop_reason: None,
+        });
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: Some(" on it".to_string()),
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_2"),
+                Some("list_files"),
+                None,
+                true,
+            )],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_1"),
+                None,
+                Some(r#"{"q":"rust"}"#),
+                true,
+            )],
+            usage: None,
+            stop_reason: None,
+        });
+
+        let response = state.into_response();
+
+        assert_eq!(
+            response.content,
+            vec![fx_llm::ContentBlock::Text {
+                text: "Working on it".to_string(),
+            }]
+        );
+        assert_eq!(
+            response.usage,
+            Some(fx_llm::Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+            })
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "search");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"q": "rust"})
+        );
+        assert_eq!(response.tool_calls[1].id, "call_2");
+        assert_eq!(response.tool_calls[1].name, "list_files");
+        assert_eq!(response.tool_calls[1].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn finalize_streamed_tool_calls_skips_incomplete_and_invalid_states() {
+        let tool_calls = finalize_streamed_tool_calls(HashMap::from([
+            (
+                2,
+                StreamedToolCallState {
+                    id: Some("call_3".to_string()),
+                    name: Some("noop".to_string()),
+                    arguments: String::new(),
+                    arguments_done: true,
+                },
+            ),
+            (
+                0,
+                StreamedToolCallState {
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    arguments: r#"{"q":"rust"}"#.to_string(),
+                    arguments_done: true,
+                },
+            ),
+            (
+                1,
+                StreamedToolCallState {
+                    id: Some("call_2".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments: r#"{"path":"README"#.to_string(),
+                    arguments_done: false,
+                },
+            ),
+            (
+                3,
+                StreamedToolCallState {
+                    id: Some("call_4".to_string()),
+                    name: Some("broken".to_string()),
+                    arguments: "{".to_string(),
+                    arguments_done: true,
+                },
+            ),
+        ]));
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({"q": "rust"}));
+        assert_eq!(tool_calls[1].id, "call_3");
+        assert_eq!(tool_calls[1].arguments, serde_json::json!({}));
     }
 
     fn test_router() -> SharedModelRouter {
