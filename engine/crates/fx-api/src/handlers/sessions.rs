@@ -302,24 +302,23 @@ pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Me
 }
 
 fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
-    let tool_use_ids = messages
-        .iter()
-        .flat_map(|message| {
-            message.content.iter().filter_map(|block| match block {
-                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-        })
-        .collect::<HashSet<_>>();
-    let tool_result_ids = messages
-        .iter()
-        .flat_map(|message| {
-            message.content.iter().filter_map(|block| match block {
-                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
-                _ => None,
-            })
-        })
-        .collect::<HashSet<_>>();
+    let mut tool_use_ids = HashSet::new();
+    let mut tool_result_ids = HashSet::new();
+
+    for message in &messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    tool_use_ids.insert(id.clone());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    tool_result_ids.insert(tool_use_id.clone());
+                }
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+
     let unresolved_tool_use_ids = tool_use_ids
         .iter()
         .filter(|id| !tool_result_ids.contains(*id))
