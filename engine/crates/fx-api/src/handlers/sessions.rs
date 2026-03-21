@@ -589,6 +589,7 @@ mod tests {
                 vec![SessionContentBlock::ToolResult {
                     tool_use_id: "call_good".to_string(),
                     content: serde_json::json!("ok"),
+                    is_error: Some(false),
                 }],
                 3,
                 None,

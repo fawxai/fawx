@@ -1,15 +1,15 @@
 import SwiftUI
 
-struct ToolCallCard: View {
+struct ToolActivityGroupCard: View {
     @Environment(\.containerWidth) private var containerWidth
 
-    let toolCall: ToolCallRecord
+    let group: ToolActivityGroupRecord
 
     @State private var isExpanded: Bool
 
-    init(toolCall: ToolCallRecord) {
-        self.toolCall = toolCall
-        _isExpanded = State(initialValue: toolCall.isRunning)
+    init(group: ToolActivityGroupRecord) {
+        self.group = group
+        _isExpanded = State(initialValue: group.runningCount > 0)
     }
 
     var body: some View {
@@ -28,24 +28,20 @@ struct ToolCallCard: View {
                     isExpanded.toggle()
                 }
             } label: {
-                headerButtonLabel
+                headerLabel
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(toolCallAccessibilityLabel)
-            .accessibilityHint(isExpanded ? "Collapse tool details" : "Expand tool details")
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityHint(isExpanded ? "Collapse tool activity" : "Expand tool activity")
 
             if isExpanded {
-                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
-                    if !toolCall.arguments.isEmpty {
-                        detailSection(title: "Arguments") {
-                            CodeBlock(language: "json", content: toolCall.arguments)
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+                    ForEach(Array(group.toolCalls.enumerated()), id: \.element.id) { index, toolCall in
+                        if index > 0 {
+                            Divider()
+                                .overlay(Color.fawxBorder.opacity(FawxOpacity.borderSubtle))
                         }
-                    }
-
-                    if let result = toolCall.result, !result.isEmpty {
-                        detailSection(title: toolCall.isError ? "Error Output" : "Result") {
-                            CodeBlock(language: nil, content: result)
-                        }
+                        toolRow(toolCall)
                     }
                 }
             }
@@ -58,14 +54,14 @@ struct ToolCallCard: View {
                 .stroke(cardBorderColor, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        .onChange(of: toolCall.isRunning) { _, isRunning in
-            if !isRunning {
-                isExpanded = false
+        .onChange(of: group.toolCalls) { _, toolCalls in
+            if toolCalls.contains(where: \.isRunning) {
+                isExpanded = true
             }
         }
     }
 
-    private var headerButtonLabel: some View {
+    private var headerLabel: some View {
         HStack(spacing: FawxSpacing.paddingSM) {
             Image(systemName: "wrench.and.screwdriver")
                 .foregroundStyle(statusColor)
@@ -74,12 +70,12 @@ struct ToolCallCard: View {
                 .clipShape(Circle())
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(toolCall.displayName)
+                Text("Tool Activity")
                     .font(FawxTypography.sidebarTitle)
                     .foregroundStyle(Color.fawxText)
                     .lineLimit(1)
 
-                Text(detailSummary)
+                Text(groupSummary)
                     .font(FawxTypography.status)
                     .foregroundStyle(Color.fawxTextSecondary)
                     .lineLimit(1)
@@ -87,7 +83,7 @@ struct ToolCallCard: View {
 
             Spacer(minLength: 0)
 
-            if toolCall.isRunning {
+            if group.runningCount > 0 {
                 ProgressView()
                     .controlSize(.small)
             }
@@ -108,67 +104,153 @@ struct ToolCallCard: View {
         }
     }
 
-    private var toolCallAccessibilityLabel: String {
-        if toolCall.isRunning {
-            return "\(toolCall.displayName), running"
-        }
-        if toolCall.isError {
-            return "\(toolCall.displayName), error"
-        }
-        return toolCall.displayName
-    }
+    private var groupSummary: String {
+        let countLabel = group.toolCount == 1 ? "1 tool" : "\(group.toolCount) tools"
 
-    private var detailSummary: String {
-        if toolCall.isRunning {
-            return "Working with live output"
+        if group.runningCount > 0 {
+            return "\(countLabel), \(group.runningCount) running"
         }
-        if toolCall.isError {
-            return "Finished with an error"
+
+        if group.errorCount > 0 {
+            let failedLabel = group.errorCount == 1 ? "1 failed" : "\(group.errorCount) failed"
+            return "\(countLabel), \(failedLabel)"
         }
-        if let result = toolCall.result, !result.isEmpty {
-            return "Completed with output"
+
+        if group.completedCount == group.toolCount {
+            return "\(countLabel), completed"
         }
-        return "Completed"
+
+        return countLabel
     }
 
     private var statusText: String {
-        if toolCall.isRunning {
+        if group.runningCount > 0 {
             return "Running"
         }
-        if toolCall.isError {
+
+        if group.errorCount > 0 {
             return "Error"
         }
+
         return "Complete"
     }
 
+    private var accessibilityLabel: String {
+        "Tool Activity, \(groupSummary)"
+    }
+
     private var statusColor: Color {
-        if toolCall.isRunning {
+        if group.runningCount > 0 {
             return .fawxAccent
         }
-        if toolCall.isError {
+
+        if group.errorCount > 0 {
             return .fawxError
         }
+
         return .fawxTextSecondary
     }
 
     private var cardBackground: Color {
-        if toolCall.isRunning {
+        if group.runningCount > 0 {
             return Color.fawxAccentSubtle
         }
-        if toolCall.isError {
+
+        if group.errorCount > 0 {
             return Color.fawxError.opacity(FawxOpacity.errorFill)
         }
+
         return Color.fawxSurface
     }
 
     private var cardBorderColor: Color {
-        if toolCall.isRunning {
+        if group.runningCount > 0 {
             return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
-        if toolCall.isError {
+
+        if group.errorCount > 0 {
             return Color.fawxError.opacity(FawxOpacity.errorBorder)
         }
+
         return Color.fawxBorder
+    }
+
+    private func toolRow(_ toolCall: ToolCallRecord) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+            HStack(alignment: .top, spacing: FawxSpacing.paddingSM) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(toolCall.displayName)
+                        .font(FawxTypography.chatBody.weight(.semibold))
+                        .foregroundStyle(Color.fawxText)
+
+                    Text(toolCallSummary(toolCall))
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+
+                Spacer(minLength: 0)
+
+                Text(toolCallStatusText(toolCall))
+                    .font(FawxTypography.status)
+                    .foregroundStyle(toolCallStatusColor(toolCall))
+                    .padding(.horizontal, FawxSpacing.paddingSM)
+                    .padding(.vertical, FawxSpacing.paddingXS)
+                    .background(toolCallStatusColor(toolCall).opacity(FawxOpacity.fillSubtle))
+                    .clipShape(Capsule())
+            }
+
+            if !toolCall.arguments.isEmpty {
+                detailSection(title: "Arguments") {
+                    CodeBlock(language: "json", content: toolCall.arguments)
+                }
+            }
+
+            if let result = toolCall.result, !result.isEmpty {
+                detailSection(title: toolCall.isError ? "Error Output" : "Result") {
+                    CodeBlock(language: nil, content: result)
+                }
+            }
+        }
+    }
+
+    private func toolCallSummary(_ toolCall: ToolCallRecord) -> String {
+        if toolCall.isRunning {
+            return "Working with live output"
+        }
+
+        if toolCall.isError {
+            return "Finished with an error"
+        }
+
+        if let result = toolCall.result, !result.isEmpty {
+            return "Completed with output"
+        }
+
+        return "Completed"
+    }
+
+    private func toolCallStatusText(_ toolCall: ToolCallRecord) -> String {
+        if toolCall.isRunning {
+            return "Running"
+        }
+
+        if toolCall.isError {
+            return "Error"
+        }
+
+        return "Complete"
+    }
+
+    private func toolCallStatusColor(_ toolCall: ToolCallRecord) -> Color {
+        if toolCall.isRunning {
+            return .fawxAccent
+        }
+
+        if toolCall.isError {
+            return .fawxError
+        }
+
+        return .fawxTextSecondary
     }
 
     private func detailSection<Content: View>(

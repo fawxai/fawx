@@ -471,6 +471,7 @@ private struct WindowMinimumSizeConfigurator: NSViewRepresentable {
         context.coordinator.scheduleUpdate(for: nsView, minWidth: minWidth, minHeight: minHeight)
     }
 
+    @MainActor
     final class Coordinator {
         private var lastAppliedContentMinSize = NSSize.zero
 
@@ -480,7 +481,7 @@ private struct WindowMinimumSizeConfigurator: NSViewRepresentable {
                 return
             }
 
-            DispatchQueue.main.async { [weak view] in
+            Task { @MainActor [weak view] in
                 guard let view else {
                     return
                 }

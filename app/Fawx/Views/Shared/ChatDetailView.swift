@@ -410,9 +410,13 @@ struct ChatDetailView: View {
     private func transcriptItemView(_ item: ChatTranscriptItem) -> some View {
         switch item {
         case .message(let message):
-            MessageBubble(message: message.message)
-        case .toolCall(let toolCall):
-            ToolCallCard(toolCall: toolCall)
+            MessageBubble(
+                role: message.message.role,
+                content: message.displayText,
+                timestamp: message.message.timestamp
+            )
+        case .toolActivityGroup(let group):
+            ToolActivityGroupCard(group: group)
         }
     }
 

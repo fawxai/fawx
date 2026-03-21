@@ -219,7 +219,8 @@ final class ChatViewModel {
     private var currentSessionID: String?
     private var errorMessagesBySession: [String: String] = [:]
     private var retryRequestsBySession: [String: RetryRequest] = [:]
-    private var anonymousToolCallCounter = 0
+    private var liveToolGroupsBySession: [String: ToolActivityGroupRecord] = [:]
+    private var anonymousToolCallCountersBySession: [String: Int] = [:]
     private var queuedPermissionPrompts: [PermissionPrompt] = []
     private var streamStates: [String: SessionStreamingState] = [:]
     @ObservationIgnored private var historyLoadSequence = 0
@@ -354,6 +355,8 @@ final class ChatViewModel {
 
     func invalidateSession(_ sessionID: String) {
         removeCachedMessages(for: sessionID)
+        liveToolGroupsBySession.removeValue(forKey: sessionID)
+        anonymousToolCallCountersBySession.removeValue(forKey: sessionID)
         draftsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
         queuedMessagesBySession.removeValue(forKey: sessionID)
         errorMessagesBySession.removeValue(forKey: errorStorageKey(for: sessionID))
@@ -368,7 +371,6 @@ final class ChatViewModel {
     func prepareToDisplaySession(_ sessionID: String?) {
         pendingTranscriptScrollBehavior = .snap
         currentSessionID = sessionID
-        anonymousToolCallCounter = 0
 
         guard let sessionID else {
             transcriptItems = []
@@ -378,10 +380,10 @@ final class ChatViewModel {
         }
 
         if let cachedMessages = cachedMessages(for: sessionID) {
-            transcriptItems = makeTranscriptItems(from: cachedMessages)
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
             isLoadingHistory = false
         } else {
-            transcriptItems = []
+            transcriptItems = transcriptItemsWithLiveToolActivity(for: sessionID)
             isLoadingHistory = isSessionStreaming(sessionID) ? false : true
         }
 
@@ -472,8 +474,10 @@ final class ChatViewModel {
         pendingTranscriptScrollBehavior = .snap
 
         if let sessionID, let cachedMessages = cachedTranscript(for: sessionID) {
-            transcriptItems = makeTranscriptItems(from: cachedMessages)
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
             await appState.refreshContext(for: sessionID)
+        } else if let sessionID {
+            transcriptItems = transcriptItemsWithLiveToolActivity(for: sessionID)
         }
 
         return true
@@ -512,7 +516,7 @@ final class ChatViewModel {
 
     private func applyCachedTranscript(_ cachedMessages: [SessionMessage]) {
         pendingTranscriptScrollBehavior = .snap
-        let cachedItems = makeTranscriptItems(from: cachedMessages)
+        let cachedItems = makeTranscriptItems(for: currentSessionID, messages: cachedMessages)
         if transcriptItems != cachedItems {
             transcriptItems = cachedItems
         }
@@ -550,7 +554,11 @@ final class ChatViewModel {
     private func applyFetchedMessages(_ messages: [SessionMessage], for sessionID: String) {
         let mergedMessages = mergedFetchedMessages(messages, for: sessionID)
         cacheMessages(mergedMessages, for: sessionID)
-        let updatedItems = makeTranscriptItems(from: mergedMessages)
+        reconcileLiveToolGroupWithHistory(for: sessionID, messages: mergedMessages)
+        guard currentSessionID == sessionID else {
+            return
+        }
+        let updatedItems = makeTranscriptItems(for: sessionID, messages: mergedMessages)
         if transcriptItems != updatedItems {
             pendingTranscriptScrollBehavior = .snap
             transcriptItems = updatedItems
@@ -608,7 +616,7 @@ final class ChatViewModel {
         _ lhs: SessionMessage,
         _ rhs: SessionMessage
     ) -> Bool {
-        lhs.role == rhs.role && lhs.content == rhs.content
+        lhs.role == rhs.role && lhs.contentBlocks == rhs.contentBlocks
     }
 
     private func handleLoadMessagesError(_ error: Error, sessionID: String, loadSequence: Int) async {
@@ -776,23 +784,15 @@ final class ChatViewModel {
                     case .notification(let title, let body):
                         await NotificationService.shared.send(title: title, body: body)
                     case .toolCallStart(let id, let name):
-                        if currentSessionID == sessionID {
-                            beginToolCall(id: id, name: name)
-                        }
+                        beginToolCall(sessionID: sessionID, id: id, name: name)
                     case .toolCallDelta(let id, let argumentsDelta):
-                        if currentSessionID == sessionID {
-                            updateToolCall(id: id) { toolCall in
-                                toolCall.arguments += argumentsDelta
-                            }
+                        updateToolCall(sessionID: sessionID, id: id) { toolCall in
+                            toolCall.arguments += argumentsDelta
                         }
                     case .toolCallComplete(let id, let name, let arguments):
-                        if currentSessionID == sessionID {
-                            completeToolCall(id: id, name: name, arguments: arguments)
-                        }
+                        completeToolCall(sessionID: sessionID, id: id, name: name, arguments: arguments)
                     case .toolResult(let id, let output, let isError):
-                        if currentSessionID == sessionID {
-                            finishToolCall(id: id, output: output, isError: isError)
-                        }
+                        finishToolCall(sessionID: sessionID, id: id, output: output, isError: isError)
                     case .permissionPrompt(let prompt):
                         enqueuePermissionPrompt(prompt)
                     case .phase(let phase):
@@ -858,6 +858,7 @@ final class ChatViewModel {
         retryRequestsBySession.removeValue(forKey: sessionID)
         clearErrorMessage(for: sessionID)
         resetStreamingState(for: sessionID)
+        await refreshSessionTranscriptFromServer(sessionID: sessionID)
 
         if currentSessionID == sessionID {
             await appState.refreshContext(for: sessionID)
@@ -897,8 +898,9 @@ final class ChatViewModel {
 
             let mergedMessages = mergedFetchedMessages(response.messages, for: sessionID)
             cacheMessages(mergedMessages, for: sessionID)
+            reconcileLiveToolGroupWithHistory(for: sessionID, messages: mergedMessages)
             if currentSessionID == sessionID {
-                transcriptItems = makeTranscriptItems(from: mergedMessages)
+                transcriptItems = makeTranscriptItems(for: sessionID, messages: mergedMessages)
             }
             clearErrorMessage(for: sessionID)
             retryRequestsBySession.removeValue(forKey: sessionID)
@@ -930,10 +932,6 @@ final class ChatViewModel {
         streamingDisplayControllers.removeValue(forKey: sessionID)
         if streamStates.isEmpty {
             clearPermissionPromptState()
-        }
-
-        if currentSessionID == sessionID {
-            anonymousToolCallCounter = 0
         }
     }
 
@@ -1136,7 +1134,7 @@ final class ChatViewModel {
                 isSessionStreaming(sessionID)
                 && !streamingDisplayController(for: sessionID).isPinnedToBottom
             pendingTranscriptScrollBehavior = shouldPreserveScrollPosition ? .preservePosition : .animated
-            transcriptItems = makeTranscriptItems(from: updatedMessages)
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: updatedMessages)
         }
     }
 
@@ -1180,16 +1178,67 @@ final class ChatViewModel {
         return controller
     }
 
-    func makeTranscriptItems(from messages: [SessionMessage]) -> [ChatTranscriptItem] {
+    func makeTranscriptItems(
+        for sessionID: String?,
+        messages: [SessionMessage]
+    ) -> [ChatTranscriptItem] {
         var duplicateCounts: [String: Int] = [:]
+        var items: [ChatTranscriptItem] = []
+        var pendingHistoricalGroupIndex: Int?
 
-        return messages.map { message in
-            let baseID = messageStableIDBase(for: message)
-            let occurrence = duplicateCounts[baseID, default: 0]
-            duplicateCounts[baseID] = occurrence + 1
-            let id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
-            return .message(TranscriptMessage(id: id, message: message))
+        for message in messages {
+            switch message.role {
+            case .tool:
+                let toolResults = toolResults(from: message)
+                if !toolResults.isEmpty, let pendingHistoricalGroupIndex {
+                    applyToolResults(toolResults, to: &items, groupIndex: pendingHistoricalGroupIndex)
+                    continue
+                }
+
+                let displayText = message.transcriptDisplayText
+                if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                }
+                pendingHistoricalGroupIndex = nil
+            case .user, .assistant, .system:
+                let displayText = message.transcriptDisplayText
+                if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                }
+
+                let historicalToolCalls = toolCalls(from: message)
+                if !historicalToolCalls.isEmpty {
+                    items.append(.toolActivityGroup(
+                        ToolActivityGroupRecord(
+                            id: historicalToolGroupID(for: message, toolCalls: historicalToolCalls),
+                            toolCalls: historicalToolCalls,
+                            isLive: false
+                        )
+                    ))
+                    pendingHistoricalGroupIndex = items.count - 1
+                } else {
+                    pendingHistoricalGroupIndex = nil
+                }
+            }
         }
+
+        if let sessionID, let liveToolGroup = liveToolGroupOverlay(for: sessionID, messages: messages) {
+            items.append(.toolActivityGroup(liveToolGroup))
+        }
+
+        return items
+    }
+
+    private func messageTranscriptItem(
+        _ message: SessionMessage,
+        displayText: String,
+        duplicateCounts: inout [String: Int]
+    ) -> ChatTranscriptItem {
+        let baseID = messageStableIDBase(for: message)
+        let occurrence = duplicateCounts[baseID, default: 0]
+        duplicateCounts[baseID] = occurrence + 1
+        let id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
+        return .message(TranscriptMessage(id: id, message: message, displayText: displayText))
     }
 
     private func messageStableIDBase(for message: SessionMessage) -> String {
@@ -1249,12 +1298,16 @@ final class ChatViewModel {
             }
 
             transcriptCache.removeValue(forKey: leastRecentSessionID)
+            liveToolGroupsBySession.removeValue(forKey: leastRecentSessionID)
+            anonymousToolCallCountersBySession.removeValue(forKey: leastRecentSessionID)
             scannedEntries = 0
         }
 
         while transcriptCache.count > Self.maxCachedSessions, let leastRecentSessionID = transcriptCacheAccessOrder.first {
             transcriptCacheAccessOrder.removeFirst()
             transcriptCache.removeValue(forKey: leastRecentSessionID)
+            liveToolGroupsBySession.removeValue(forKey: leastRecentSessionID)
+            anonymousToolCallCountersBySession.removeValue(forKey: leastRecentSessionID)
         }
     }
 
@@ -1267,36 +1320,81 @@ final class ChatViewModel {
         appState.clearContext()
     }
 
-    private func beginToolCall(id: String?, name: String?) {
-        let toolCallID = stableToolCallID(for: id)
+    private func transcriptItemsWithLiveToolActivity(for sessionID: String) -> [ChatTranscriptItem] {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
+            return []
+        }
 
-        if let index = transcriptItems.firstIndex(where: { item in
-            if case .toolCall(let toolCall) = item {
-                return toolCall.id == toolCallID
-            }
-            return false
-        }) {
-            updateTranscriptItem(at: index) { toolCall in
-                toolCall.name = name ?? toolCall.name
-                toolCall.isRunning = true
-            }
+        return [.toolActivityGroup(liveToolGroup)]
+    }
+
+    private func liveToolGroupOverlay(
+        for sessionID: String,
+        messages: [SessionMessage]
+    ) -> ToolActivityGroupRecord? {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
+            return nil
+        }
+
+        if isLiveToolGroupRepresentedInHistory(liveToolGroup, messages: messages) {
+            return nil
+        }
+
+        return liveToolGroup
+    }
+
+    private func reconcileLiveToolGroupWithHistory(for sessionID: String, messages: [SessionMessage]) {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
             return
         }
 
-        transcriptItems.append(.toolCall(
-            ToolCallRecord(
-                id: toolCallID,
-                name: name ?? "tool",
-                arguments: "",
-                result: nil,
-                isRunning: true,
-                isError: false
-            )
-        ))
+        if isLiveToolGroupRepresentedInHistory(liveToolGroup, messages: messages) {
+            liveToolGroupsBySession.removeValue(forKey: sessionID)
+        }
     }
 
-    private func completeToolCall(id: String?, name: String?, arguments: String) {
-        updateToolCall(id: id) { toolCall in
+    private func refreshVisibleTranscriptForToolActivity(
+        sessionID: String,
+        preferPreservePosition: Bool
+    ) {
+        guard currentSessionID == sessionID else {
+            return
+        }
+
+        let cachedMessages = transcriptCache[sessionID] ?? []
+        pendingTranscriptScrollBehavior = preferPreservePosition ? .preservePosition : .animated
+        transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
+    }
+
+    private func beginToolCall(sessionID: String, id: String?, name: String?) {
+        let toolCallID = stableToolCallID(for: sessionID, rawID: id)
+        var toolGroup = activeOrFreshLiveToolGroup(for: sessionID)
+
+        if let index = toolGroup.toolCalls.firstIndex(where: { $0.id == toolCallID }) {
+            toolGroup.toolCalls[index].name = name ?? toolGroup.toolCalls[index].name
+            toolGroup.toolCalls[index].isRunning = true
+        } else {
+            toolGroup.toolCalls.append(
+                ToolCallRecord(
+                    id: toolCallID,
+                    name: name ?? "tool",
+                    arguments: "",
+                    result: nil,
+                    isRunning: true,
+                    isError: false
+                )
+            )
+        }
+
+        liveToolGroupsBySession[sessionID] = toolGroup
+        refreshVisibleTranscriptForToolActivity(
+            sessionID: sessionID,
+            preferPreservePosition: shouldPreserveScrollPosition(for: sessionID)
+        )
+    }
+
+    private func completeToolCall(sessionID: String, id: String?, name: String?, arguments: String) {
+        updateToolCall(sessionID: sessionID, id: id) { toolCall in
             if let name {
                 toolCall.name = name
             }
@@ -1304,24 +1402,24 @@ final class ChatViewModel {
         }
     }
 
-    private func finishToolCall(id: String?, output: String, isError: Bool) {
-        updateToolCall(id: id) { toolCall in
+    private func finishToolCall(sessionID: String, id: String?, output: String, isError: Bool) {
+        updateToolCall(sessionID: sessionID, id: id) { toolCall in
             toolCall.result = output
             toolCall.isRunning = false
             toolCall.isError = isError
         }
     }
 
-    private func updateToolCall(id: String?, update: (inout ToolCallRecord) -> Void) {
-        let toolCallID = stableToolCallID(for: id)
+    private func updateToolCall(
+        sessionID: String,
+        id: String?,
+        update: (inout ToolCallRecord) -> Void
+    ) {
+        let toolCallID = stableToolCallID(for: sessionID, rawID: id)
+        var toolGroup = activeOrFreshLiveToolGroup(for: sessionID)
 
-        if let index = transcriptItems.firstIndex(where: { item in
-            if case .toolCall(let toolCall) = item {
-                return toolCall.id == toolCallID
-            }
-            return false
-        }) {
-            updateTranscriptItem(at: index, update: update)
+        if let index = toolGroup.toolCalls.firstIndex(where: { $0.id == toolCallID }) {
+            update(&toolGroup.toolCalls[index])
         } else {
             var toolCall = ToolCallRecord(
                 id: toolCallID,
@@ -1332,28 +1430,172 @@ final class ChatViewModel {
                 isError: false
             )
             update(&toolCall)
-            transcriptItems.append(.toolCall(toolCall))
+            toolGroup.toolCalls.append(toolCall)
+        }
+
+        liveToolGroupsBySession[sessionID] = toolGroup
+        refreshVisibleTranscriptForToolActivity(
+            sessionID: sessionID,
+            preferPreservePosition: shouldPreserveScrollPosition(for: sessionID)
+        )
+    }
+
+    private func activeOrFreshLiveToolGroup(for sessionID: String) -> ToolActivityGroupRecord {
+        if let existingGroup = liveToolGroupsBySession[sessionID] {
+            return existingGroup
+        }
+
+        return ToolActivityGroupRecord(
+            id: "live-\(sessionID)",
+            toolCalls: [],
+            isLive: true
+        )
+    }
+
+    private func shouldPreserveScrollPosition(for sessionID: String) -> Bool {
+        isSessionStreaming(sessionID)
+            && currentSessionID == sessionID
+            && !streamingDisplayController(for: sessionID).isPinnedToBottom
+    }
+
+    private func isLiveToolGroupRepresentedInHistory(
+        _ liveToolGroup: ToolActivityGroupRecord,
+        messages: [SessionMessage]
+    ) -> Bool {
+        guard !liveToolGroup.toolCalls.isEmpty else {
+            return false
+        }
+
+        let historicalToolUses = Set(messages.flatMap { message in
+            message.contentBlocks.compactMap { block -> String? in
+                guard case .toolUse(let id, _, _) = block else {
+                    return nil
+                }
+                return id
+            }
+        })
+        let historicalToolResults = Set(messages.flatMap { message in
+            toolResults(from: message).map(\.id)
+        })
+
+        return liveToolGroup.toolCalls.allSatisfy { toolCall in
+            guard !toolCall.isRunning, historicalToolUses.contains(toolCall.id) else {
+                return false
+            }
+
+            if toolCall.result != nil {
+                return historicalToolResults.contains(toolCall.id)
+            }
+
+            return true
         }
     }
 
-    private func updateTranscriptItem(
-        at index: Int,
-        update: (inout ToolCallRecord) -> Void
+    private func toolCalls(from message: SessionMessage) -> [ToolCallRecord] {
+        message.contentBlocks.compactMap { block in
+            guard case .toolUse(let id, let name, let input) = block else {
+                return nil
+            }
+
+            let arguments = renderedJSONValue(input)
+            return ToolCallRecord(
+                id: id,
+                name: name,
+                arguments: arguments,
+                result: nil,
+                isRunning: false,
+                isError: false
+            )
+        }
+    }
+
+    private func toolResults(from message: SessionMessage) -> [(id: String, output: String, isError: Bool)] {
+        message.contentBlocks.compactMap { block in
+            guard case .toolResult(let toolUseID, let content, let storedIsError) = block else {
+                return nil
+            }
+
+            let renderedOutput = renderedJSONValue(content)
+            let legacyPrefixedError = renderedOutput.hasPrefix("[ERROR]")
+            let isError = storedIsError ?? legacyPrefixedError
+            let cleanedOutput = legacyPrefixedError
+                ? renderedOutput.replacingOccurrences(of: "[ERROR] ", with: "")
+                : renderedOutput
+            return (toolUseID, cleanedOutput, isError)
+        }
+    }
+
+    private func applyToolResults(
+        _ toolResults: [(id: String, output: String, isError: Bool)],
+        to items: inout [ChatTranscriptItem],
+        groupIndex: Int
     ) {
-        guard case .toolCall(var toolCall) = transcriptItems[index] else {
+        guard case .toolActivityGroup(var group) = items[groupIndex] else {
             return
         }
-        update(&toolCall)
-        transcriptItems[index] = .toolCall(toolCall)
+
+        for toolResult in toolResults {
+            if let toolIndex = group.toolCalls.firstIndex(where: { $0.id == toolResult.id }) {
+                group.toolCalls[toolIndex].result = toolResult.output
+                group.toolCalls[toolIndex].isRunning = false
+                group.toolCalls[toolIndex].isError = toolResult.isError
+            } else {
+                group.toolCalls.append(
+                    ToolCallRecord(
+                        id: toolResult.id,
+                        name: "Unknown tool",
+                        arguments: "",
+                        result: toolResult.output,
+                        isRunning: false,
+                        isError: toolResult.isError
+                    )
+                )
+            }
+        }
+
+        items[groupIndex] = .toolActivityGroup(group)
     }
 
-    private func stableToolCallID(for rawID: String?) -> String {
+    private func historicalToolGroupID(
+        for message: SessionMessage,
+        toolCalls: [ToolCallRecord]
+    ) -> String {
+        let component = toolCalls
+            .map {
+                "\($0.id.utf8.count)#\($0.id)\($0.displayName.utf8.count)#\($0.displayName)"
+            }
+            .joined()
+        return "history:\(messageStableIDBase(for: message)):\(Self.stableDigest(for: component))"
+    }
+
+    private func renderedJSONValue(_ value: JSONValue) -> String {
+        switch value {
+        case .null:
+            return ""
+        default:
+            return value.description
+        }
+    }
+
+    private func refreshSessionTranscriptFromServer(sessionID: String) async {
+        do {
+            let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
+            applyFetchedMessages(response.messages, for: sessionID)
+        } catch is CancellationError {
+            return
+        } catch {
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    private func stableToolCallID(for sessionID: String, rawID: String?) -> String {
         if let rawID, !rawID.isEmpty {
             return rawID
         }
 
-        anonymousToolCallCounter += 1
-        return "tool-\(anonymousToolCallCounter)"
+        let nextIndex = anonymousToolCallCountersBySession[sessionID, default: 0] + 1
+        anonymousToolCallCountersBySession[sessionID] = nextIndex
+        return "tool-\(nextIndex)"
     }
 }
 
@@ -1364,6 +1606,10 @@ private struct RetryRequest {
 
 #if DEBUG
 extension ChatViewModel {
+    func makeTranscriptItems(from messages: [SessionMessage]) -> [ChatTranscriptItem] {
+        makeTranscriptItems(for: currentSessionID, messages: messages)
+    }
+
     func appendMessageForTesting(_ message: SessionMessage, sessionID: String) {
         appendMessage(message, for: sessionID)
     }
@@ -1476,6 +1722,18 @@ extension ChatViewModel {
 
     func applyFetchedMessagesForTesting(_ messages: [SessionMessage], sessionID: String) {
         applyFetchedMessages(messages, for: sessionID)
+    }
+
+    func beginToolCallForTesting(sessionID: String, id: String?, name: String?) {
+        beginToolCall(sessionID: sessionID, id: id, name: name)
+    }
+
+    func completeToolCallForTesting(sessionID: String, id: String?, name: String?, arguments: String) {
+        completeToolCall(sessionID: sessionID, id: id, name: name, arguments: arguments)
+    }
+
+    func finishToolCallForTesting(sessionID: String, id: String?, output: String, isError: Bool) {
+        finishToolCall(sessionID: sessionID, id: id, output: output, isError: isError)
     }
 }
 #endif

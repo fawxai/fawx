@@ -2583,6 +2583,7 @@ allowed_chat_ids = [123]
                 vec![SessionContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: serde_json::json!("file contents"),
+                    is_error: Some(false),
                 }],
                 None,
             )
@@ -2607,6 +2608,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["messages"][0]["token_count"], 12);
         assert_eq!(json["messages"][1]["role"], "tool");
         assert_eq!(json["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(json["messages"][1]["content"][0]["is_error"], false);
     }
 
     #[tokio::test]
@@ -2709,6 +2711,7 @@ allowed_chat_ids = [123]
                 vec![SessionContentBlock::ToolResult {
                     tool_use_id: "call_good".to_string(),
                     content: serde_json::json!("ok"),
+                    is_error: Some(false),
                 }],
                 None,
             )

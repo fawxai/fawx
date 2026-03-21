@@ -425,6 +425,7 @@ mod tests {
                 vec![SessionContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: serde_json::json!("file contents"),
+                    is_error: Some(false),
                 }],
                 None,
             )
