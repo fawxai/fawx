@@ -2,6 +2,16 @@ import Observation
 import SwiftUI
 
 struct ContentView: View {
+    private enum Layout {
+        static let sidebarMinWidth = FawxSpacing.sidebarWidth
+        static let sidebarIdealWidth = FawxSpacing.sidebarWidth + FawxSpacing.paddingXL
+        static let sidebarMaxWidth = FawxSpacing.sidebarWidth + (FawxSpacing.paddingXL * 2)
+        static let chatDetailMinWidth: CGFloat = 400
+        static let compactGitPanelMinWidth: CGFloat = 280
+        static let compactGitPanelIdealWidth: CGFloat = 340
+        static let compactGitPanelMaxWidth: CGFloat = 420
+    }
+
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
@@ -71,7 +81,11 @@ struct ContentView: View {
             streamingSessionID: chatViewModel.activeStreamSessionID,
             actions: sidebarActions
         )
-        .frame(minWidth: FawxSpacing.sidebarWidth)
+        .navigationSplitViewColumnWidth(
+            min: Layout.sidebarMinWidth,
+            ideal: Layout.sidebarIdealWidth,
+            max: Layout.sidebarMaxWidth
+        )
     }
 
     @ViewBuilder
@@ -122,7 +136,7 @@ struct ContentView: View {
         if shouldShowGitPanel {
             HSplitView {
                 chatDetail
-                    .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: Layout.chatDetailMinWidth, maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
 
                 CompactGitPanel(
@@ -130,7 +144,12 @@ struct ContentView: View {
                     openFullViewAction: openGitView,
                     dismissAction: hideGitPanel
                 )
-                .frame(minWidth: 280, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
+                .frame(
+                    minWidth: Layout.compactGitPanelMinWidth,
+                    idealWidth: Layout.compactGitPanelIdealWidth,
+                    maxWidth: Layout.compactGitPanelMaxWidth,
+                    maxHeight: .infinity
+                )
             }
         } else {
             chatDetail
