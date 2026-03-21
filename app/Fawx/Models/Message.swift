@@ -4,6 +4,7 @@ enum MessageRole: String, Codable, CaseIterable, Sendable, Hashable {
     case user
     case assistant
     case system
+    case tool
 }
 
 struct SessionMessage: Codable, Identifiable, Sendable, Hashable {
@@ -23,13 +24,14 @@ struct SessionMessage: Codable, Identifiable, Sendable, Hashable {
         case role
         case content
         case timestamp
+        case tokenCount = "token_count"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = UUID()
-        role = try container.decode(MessageRole.self, forKey: .role)
-        timestamp = try container.decode(Int.self, forKey: .timestamp)
+        role = (try? container.decode(MessageRole.self, forKey: .role)) ?? .system
+        timestamp = (try? container.decode(Int.self, forKey: .timestamp)) ?? 0
         content = try Self.decodeContent(from: container)
     }
 
