@@ -21,7 +21,7 @@ final class SessionMessageTests: XCTestCase {
         XCTAssertNotEqual(response.messages[0].id, response.messages[1].id)
     }
 
-    func testStructuredToolMessagesPreserveReadableContent() throws {
+    func testStructuredToolMessagesPreserveReadableContentWithoutDumpingToolPayloads() throws {
         let data = Data(
             """
             {
@@ -60,6 +60,7 @@ final class SessionMessageTests: XCTestCase {
         XCTAssertEqual(response.messages.map(\.role), [.assistant, .tool])
         XCTAssertTrue(response.messages[0].content.contains("[read_file]"))
         XCTAssertTrue(response.messages[0].content.contains("README.md"))
-        XCTAssertEqual(response.messages[1].content, "hello from the tool")
+        XCTAssertEqual(response.messages[1].content, "Tool output available.")
+        XCTAssertFalse(response.messages[1].content.contains("hello from the tool"))
     }
 }

@@ -205,7 +205,10 @@ final class ChatViewModel {
     var isStreaming: Bool {
         !streamStates.isEmpty
     }
-    var errorMessage: String?
+    var errorMessage: String? {
+        get { errorMessagesBySession[errorStorageKey(for: currentSessionID)] }
+        set { setErrorMessage(newValue, for: currentSessionID) }
+    }
     var activePermissionPrompt: PermissionPrompt?
     var isRespondingToPermissionPrompt = false
     var permissionPromptErrorMessage: String?
@@ -214,6 +217,7 @@ final class ChatViewModel {
     private let appState: AppState
     private let sessionViewModel: SessionViewModel
     private var currentSessionID: String?
+    private var errorMessagesBySession: [String: String] = [:]
     private var retryRequestsBySession: [String: RetryRequest] = [:]
     private var anonymousToolCallCounter = 0
     private var queuedPermissionPrompts: [PermissionPrompt] = []
@@ -352,6 +356,7 @@ final class ChatViewModel {
         removeCachedMessages(for: sessionID)
         draftsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
         queuedMessagesBySession.removeValue(forKey: sessionID)
+        errorMessagesBySession.removeValue(forKey: errorStorageKey(for: sessionID))
         retryRequestsBySession.removeValue(forKey: sessionID)
 
         if currentSessionID == sessionID {
@@ -361,7 +366,6 @@ final class ChatViewModel {
     }
 
     func prepareToDisplaySession(_ sessionID: String?) {
-        errorMessage = nil
         pendingTranscriptScrollBehavior = .snap
         currentSessionID = sessionID
         anonymousToolCallCounter = 0
@@ -465,7 +469,6 @@ final class ChatViewModel {
         historyLoadSequence += 1
         isLoadingHistory = false
         currentSessionID = sessionID
-        errorMessage = nil
         pendingTranscriptScrollBehavior = .snap
 
         if let sessionID, let cachedMessages = cachedTranscript(for: sessionID) {
@@ -482,12 +485,10 @@ final class ChatViewModel {
 
         if shouldPreserveBackgroundStream(for: sessionID) {
             currentSessionID = sessionID
-            errorMessage = nil
             pendingTranscriptScrollBehavior = .snap
         } else {
             cleanup()
             currentSessionID = sessionID
-            errorMessage = nil
             if let sessionID {
                 retryRequestsBySession.removeValue(forKey: sessionID)
             }
@@ -537,6 +538,7 @@ final class ChatViewModel {
                 return
             }
             applyFetchedMessages(response.messages, for: sessionID)
+            clearErrorMessage(for: sessionID)
             await appState.refreshContext(for: sessionID)
         } catch is CancellationError {
             return
@@ -621,7 +623,7 @@ final class ChatViewModel {
 
         removeCachedMessages(for: sessionID)
         transcriptItems = []
-        errorMessage = error.localizedDescription
+        setErrorMessage(error.localizedDescription, for: sessionID)
         pendingTranscriptScrollBehavior = .snap
         await appState.refreshContext(for: nil)
         await appState.noteRecoverableRequestFailure(error)
@@ -629,10 +631,11 @@ final class ChatViewModel {
 
     private func handleMissingSessionLoad(_ sessionID: String) async {
         removeCachedMessages(for: sessionID)
+        clearErrorMessage(for: sessionID)
         sessionViewModel.removeSession(sessionID)
         currentSessionID = nil
         transcriptItems = []
-        errorMessage = "Session no longer exists."
+        setErrorMessage("Session no longer exists.", for: nil)
         pendingTranscriptScrollBehavior = .snap
         await appState.refreshContext(for: nil)
     }
@@ -680,6 +683,9 @@ final class ChatViewModel {
     }
 
     func stopStreaming() {
+        // Permission prompts are still app-global, so canceling the visible stream
+        // must also tear down any visible approval state.
+        clearPermissionPromptState()
         guard let currentSessionID else {
             return
         }
@@ -692,6 +698,7 @@ final class ChatViewModel {
     }
 
     func cleanup() {
+        clearPermissionPromptState()
         for sessionID in Array(streamTasks.keys) {
             stopStreaming(sessionID: sessionID)
         }
@@ -708,8 +715,8 @@ final class ChatViewModel {
 
     private func send(_ text: String, forceSessionID: String? = nil) async {
         await appState.synchronizeLocalConnectionIfNeeded()
-        errorMessage = nil
         var targetSessionID = forceSessionID ?? currentSessionID
+        setErrorMessage(nil, for: targetSessionID)
 
         if targetSessionID == nil {
             do {
@@ -720,13 +727,13 @@ final class ChatViewModel {
                 targetSessionID = createdSession.id
             } catch {
                 draftMessage = text
-                errorMessage = "Failed to create session. \(error.localizedDescription)"
+                setErrorMessage("Failed to create session. \(error.localizedDescription)", for: nil)
                 return
             }
         }
 
         guard let sessionID = targetSessionID else {
-            errorMessage = "No session available."
+            setErrorMessage("No session available.", for: forceSessionID ?? currentSessionID)
             return
         }
 
@@ -743,7 +750,7 @@ final class ChatViewModel {
             )
             startStreaming(stream, sessionID: sessionID, retryText: text)
         } catch {
-            errorMessage = "Failed to send message. \(error.localizedDescription)"
+            setErrorMessage("Failed to send message. \(error.localizedDescription)", for: sessionID)
         }
     }
 
@@ -849,10 +856,8 @@ final class ChatViewModel {
         }
 
         retryRequestsBySession.removeValue(forKey: sessionID)
+        clearErrorMessage(for: sessionID)
         resetStreamingState(for: sessionID)
-        if currentSessionID == sessionID {
-            errorMessage = nil
-        }
 
         if currentSessionID == sessionID {
             await appState.refreshContext(for: sessionID)
@@ -894,8 +899,8 @@ final class ChatViewModel {
             cacheMessages(mergedMessages, for: sessionID)
             if currentSessionID == sessionID {
                 transcriptItems = makeTranscriptItems(from: mergedMessages)
-                errorMessage = nil
             }
+            clearErrorMessage(for: sessionID)
             retryRequestsBySession.removeValue(forKey: sessionID)
             resetStreamingState(for: sessionID)
             if currentSessionID == sessionID {
@@ -923,6 +928,9 @@ final class ChatViewModel {
         streamStates.removeValue(forKey: sessionID)
         streamingDisplayControllers[sessionID]?.reset(repinToBottom: false)
         streamingDisplayControllers.removeValue(forKey: sessionID)
+        if streamStates.isEmpty {
+            clearPermissionPromptState()
+        }
 
         if currentSessionID == sessionID {
             anonymousToolCallCounter = 0
@@ -931,6 +939,23 @@ final class ChatViewModel {
 
     private func draftStorageKey(for sessionID: String?) -> String {
         sessionID ?? ""
+    }
+
+    private func errorStorageKey(for sessionID: String?) -> String {
+        sessionID ?? ""
+    }
+
+    private func setErrorMessage(_ message: String?, for sessionID: String?) {
+        let key = errorStorageKey(for: sessionID)
+        if let message = message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty {
+            errorMessagesBySession[key] = message
+        } else {
+            errorMessagesBySession.removeValue(forKey: key)
+        }
+    }
+
+    private func clearErrorMessage(for sessionID: String?) {
+        setErrorMessage(nil, for: sessionID)
     }
 
     private func clearQueuedMessage(for sessionID: String?) {
@@ -1116,9 +1141,7 @@ final class ChatViewModel {
     }
 
     private func handleStreamError(_ message: String, sessionID: String) {
-        if currentSessionID == sessionID {
-            errorMessage = message
-        }
+        setErrorMessage(message, for: sessionID)
     }
 
     private func isSessionStreaming(_ sessionID: String) -> Bool {
@@ -1349,6 +1372,10 @@ extension ChatViewModel {
         handleStreamError(message, sessionID: sessionID)
     }
 
+    func clearErrorMessageForTesting(sessionID: String?) {
+        clearErrorMessage(for: sessionID)
+    }
+
     func setStreamingStateForTesting(
         isStreaming: Bool,
         currentSessionID: String?,
@@ -1388,6 +1415,18 @@ extension ChatViewModel {
 
     func finishActivePermissionPromptForTesting(id: String) {
         finishActivePermissionPrompt(id: id)
+    }
+
+    func stopStreamingForTesting() {
+        stopStreaming()
+    }
+
+    func cleanupForTesting() {
+        cleanup()
+    }
+
+    func resetStreamingStateForTesting(sessionID: String) {
+        resetStreamingState(for: sessionID)
     }
 
     func appendStreamingTokenForTesting(_ token: String) {

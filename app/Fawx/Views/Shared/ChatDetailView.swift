@@ -9,7 +9,7 @@ struct ChatDetailView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
-    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 200
+    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
     @State private var scrollMetrics = ScrollMetrics()
     @State private var isShowingRipcordReviewTray = false
     @State private var isLoadingRipcordJournal = false

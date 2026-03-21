@@ -2,21 +2,21 @@
 
 ## Current State
 
-- Repo: `/Users/joseph/fawx`
+- Repo: `fawx/`
 - Branch: `dev`
 - Rebase status: local `dev` is `0 ahead / 0 behind` `origin/dev`; no rebase needed before resuming.
 - Worktree: dirty, with both Swift app and Rust engine changes in progress.
 - Current LaunchAgent server process:
-  - binary: `/Users/joseph/fawx/target/release/fawx`
-  - args: `serve --http --port 8400 --data-dir /Users/joseph/.fawx`
+  - binary: `target/release/fawx`
+  - args: `serve --http --port 8400 --data-dir ~/.fawx`
   - started: `Sat Mar 21 01:52:52 2026`
 - Current LaunchAgent plist:
-  - `/Users/joseph/Library/LaunchAgents/ai.fawx.server.plist`
+  - `~/Library/LaunchAgents/ai.fawx.server.plist`
   - now correctly includes `--http`
 - Current active LaunchAgent log:
-  - `/Users/joseph/Library/Logs/Fawx/server.log`
+  - `~/Library/Logs/Fawx/server.log`
 - Older/stale runtime log from earlier manual runs:
-  - `/Users/joseph/.fawx/server.log`
+  - `~/.fawx/server.log`
   - useful historically, but not the first place to look for current LaunchAgent issues
 
 ## What We Learned
@@ -59,12 +59,12 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/app/Fawx/ViewModels/ChatViewModel.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/macOS/Sidebar.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/macOS/ContentView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/iOS/SessionListView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/macOS/FawxMacCommands.swift`
-- `/Users/joseph/fawx/app/FawxTests/ViewModels/ChatViewModelTests.swift`
+- `app/Fawx/ViewModels/ChatViewModel.swift`
+- `app/Fawx/Views/macOS/Sidebar.swift`
+- `app/Fawx/Views/macOS/ContentView.swift`
+- `app/Fawx/Views/iOS/SessionListView.swift`
+- `app/Fawx/Views/macOS/FawxMacCommands.swift`
+- `app/FawxTests/ViewModels/ChatViewModelTests.swift`
 
 Status:
 
@@ -86,15 +86,15 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/app/Fawx/ViewModels/AppState.swift`
-- `/Users/joseph/fawx/app/Fawx/FawxApp.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/iOS/TabRootView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/Shared/FleetView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/Shared/ExperimentsView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/Shared/SkillsView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/Shared/GitView.swift`
-- `/Users/joseph/fawx/app/Fawx/Views/iOS/iOSSettingsView.swift`
-- `/Users/joseph/fawx/app/FawxTests/ViewModels/AppStateTests.swift`
+- `app/Fawx/ViewModels/AppState.swift`
+- `app/Fawx/FawxApp.swift`
+- `app/Fawx/Views/iOS/TabRootView.swift`
+- `app/Fawx/Views/Shared/FleetView.swift`
+- `app/Fawx/Views/Shared/ExperimentsView.swift`
+- `app/Fawx/Views/Shared/SkillsView.swift`
+- `app/Fawx/Views/Shared/GitView.swift`
+- `app/Fawx/Views/iOS/iOSSettingsView.swift`
+- `app/FawxTests/ViewModels/AppStateTests.swift`
 
 Status:
 
@@ -112,8 +112,8 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/app/Fawx/Models/Ripcord.swift`
-- `/Users/joseph/fawx/app/Fawx/ViewModels/AppState.swift`
+- `app/Fawx/Models/Ripcord.swift`
+- `app/Fawx/ViewModels/AppState.swift`
 
 Status:
 
@@ -124,7 +124,7 @@ Status:
 Root cause:
 
 - the installed LaunchAgent on this machine was stale and launched:
-  - `fawx serve --port 8400 --data-dir /Users/joseph/.fawx`
+  - `fawx serve --port 8400 --data-dir ~/.fawx`
 - because it was missing `--http`, `launchd` started a headless server that exited and restarted every ~10 seconds
 - that produced repeated lock errors such as:
   - `Database already open. Cannot acquire lock.`
@@ -142,8 +142,8 @@ App-side support added:
 
 Key files touched:
 
-- `/Users/joseph/fawx/app/Fawx/ViewModels/AppState.swift`
-- `/Users/joseph/fawx/app/FawxTests/ViewModels/AppStateTests.swift`
+- `app/Fawx/ViewModels/AppState.swift`
+- `app/FawxTests/ViewModels/AppStateTests.swift`
 
 Status:
 
@@ -163,9 +163,9 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/engine/crates/fx-api/Cargo.toml`
-- `/Users/joseph/fawx/engine/crates/fx-cli/Cargo.toml`
-- `/Users/joseph/fawx/engine/crates/fx-cli/src/main.rs`
+- `engine/crates/fx-api/Cargo.toml`
+- `engine/crates/fx-cli/Cargo.toml`
+- `engine/crates/fx-cli/src/main.rs`
 
 Status:
 
@@ -191,11 +191,11 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/engine/crates/fx-llm/src/types.rs`
-- `/Users/joseph/fawx/engine/crates/fx-llm/src/openai_responses.rs`
-- `/Users/joseph/fawx/engine/crates/fx-kernel/src/loop_engine.rs`
-- `/Users/joseph/fawx/engine/crates/fx-cli/src/headless.rs`
-- `/Users/joseph/fawx/engine/crates/fx-session/src/session.rs`
+- `engine/crates/fx-llm/src/types.rs`
+- `engine/crates/fx-llm/src/openai_responses.rs`
+- `engine/crates/fx-kernel/src/loop_engine.rs`
+- `engine/crates/fx-cli/src/headless.rs`
+- `engine/crates/fx-session/src/session.rs`
 
 Status:
 
@@ -227,8 +227,8 @@ Fix direction taken:
 
 Key files touched:
 
-- `/Users/joseph/fawx/engine/crates/fx-api/src/handlers/sessions.rs`
-- `/Users/joseph/fawx/engine/crates/fx-api/src/tests.rs`
+- `engine/crates/fx-api/src/handlers/sessions.rs`
+- `engine/crates/fx-api/src/tests.rs`
 
 Status:
 
@@ -270,30 +270,30 @@ These were helpful containment steps while debugging, but they were not the fina
 ### Relevant logs
 
 - current LaunchAgent server log:
-  - `/Users/joseph/Library/Logs/Fawx/server.log`
+  - `~/Library/Logs/Fawx/server.log`
 - old runtime log from earlier manual runs:
-  - `/Users/joseph/.fawx/server.log`
+  - `~/.fawx/server.log`
 
 ### Useful log commands
 
 ```bash
-tail -f /Users/joseph/Library/Logs/Fawx/server.log
+tail -f ~/Library/Logs/Fawx/server.log
 ```
 
 ```bash
-tail -f /Users/joseph/.fawx/server.log
+tail -f ~/.fawx/server.log
 ```
 
 ### Current LaunchAgent shape
 
 ```text
-/Users/joseph/fawx/target/release/fawx serve --http --port 8400 --data-dir /Users/joseph/.fawx
+target/release/fawx serve --http --port 8400 --data-dir ~/.fawx
 ```
 
 ### Current server process check
 
 ```bash
-ps -axo pid,lstart,command | rg '/Users/joseph/fawx/target/release/fawx serve --http --port 8400 --data-dir /Users/joseph/.fawx'
+ps -axo pid,lstart,command | rg 'target/release/fawx serve --http --port 8400 --data-dir ~/.fawx'
 ```
 
 ## Tests and Verification Run During This Debug Pass
@@ -327,7 +327,7 @@ When resuming this work later:
 2. Start with the real session-specific repro that last failed:
    - the parameter-golf chat (`sess-b72b8ec7`)
 3. Watch only new lines in:
-   - `/Users/joseph/Library/Logs/Fawx/server.log`
+   - `~/Library/Logs/Fawx/server.log`
 4. If the parameter-golf chat still fails:
    - confirm whether the post-restart server log shows a new unresolved tool context problem
    - confirm whether the failing request still includes orphan historical `tool_use` blocks

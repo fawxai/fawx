@@ -32,19 +32,41 @@ struct SessionMessage: Codable, Identifiable, Sendable, Hashable {
         id = UUID()
         role = (try? container.decode(MessageRole.self, forKey: .role)) ?? .system
         timestamp = (try? container.decode(Int.self, forKey: .timestamp)) ?? 0
-        content = try Self.decodeContent(from: container)
+        content = try Self.decodeContent(from: container, role: role)
     }
 
-    private static func decodeContent(from container: KeyedDecodingContainer<CodingKeys>) throws -> String {
+    private static func decodeContent(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        role: MessageRole
+    ) throws -> String {
         // Try plain string first (legacy format)
         if let text = try? container.decode(String.self, forKey: .content) {
             return text
         }
         // Try structured content blocks (new format from PR #1542)
         if let blocks = try? container.decode([SessionContentBlock].self, forKey: .content) {
-            return blocks.compactMap(\.displayText).joined(separator: "\n\n")
+            return Self.renderStructuredContent(blocks, role: role)
         }
         return ""
+    }
+
+    private static func renderStructuredContent(
+        _ blocks: [SessionContentBlock],
+        role: MessageRole
+    ) -> String {
+        switch role {
+        case .tool:
+            let visibleBlocks = blocks.compactMap(\.toolTranscriptText)
+            if !visibleBlocks.isEmpty {
+                return visibleBlocks.joined(separator: "\n\n")
+            }
+            if blocks.contains(where: \.containsToolResult) {
+                return "Tool output available."
+            }
+            return ""
+        case .user, .assistant, .system:
+            return blocks.compactMap(\.displayText).joined(separator: "\n\n")
+        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -67,11 +89,28 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
         case .toolUse(_, let name, let input):
             let renderedInput = input.chatDisplayText
             return renderedInput.isEmpty ? "[\(name)]" : "[\(name)] \(renderedInput)"
-        case .toolResult(_, let content):
-            let renderedContent = content.chatDisplayText
-            return renderedContent.isEmpty ? "Tool completed without text output." : renderedContent
+        case .toolResult:
+            return nil
         case .image: return "[image]"
         }
+    }
+
+    var toolTranscriptText: String? {
+        switch self {
+        case .text(let text):
+            return text
+        case .image:
+            return "[image]"
+        case .toolUse, .toolResult:
+            return nil
+        }
+    }
+
+    var containsToolResult: Bool {
+        if case .toolResult = self {
+            return true
+        }
+        return false
     }
 
     enum CodingKeys: String, CodingKey {

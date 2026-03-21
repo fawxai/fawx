@@ -190,6 +190,6 @@ struct MessageBubble: View {
 
     private var toolDisplayContent: String {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "Tool completed without text output." : content
+        return trimmed.isEmpty ? "Tool output available." : content
     }
 }
