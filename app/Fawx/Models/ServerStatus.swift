@@ -277,4 +277,57 @@ struct ContextInfo: Codable, Sendable, Hashable {
         let derivedPercentage = (Double(usedTokens) / Double(maxTokens)) * 100
         return max(0, min(derivedPercentage, 100))
     }
+
+    func applyingCompaction(usedTokens: Int, usageRatio: Double) -> ContextInfo {
+        let resolvedMaxTokens = ContextInfo.resolvedMaxTokens(
+            currentMaxTokens: maxTokens,
+            usedTokens: usedTokens,
+            usageRatio: usageRatio
+        )
+        let resolvedRatio = ContextInfo.resolvedUsageRatio(
+            providedRatio: usageRatio,
+            usedTokens: usedTokens,
+            maxTokens: resolvedMaxTokens
+        )
+
+        return ContextInfo(
+            usedTokens: usedTokens,
+            maxTokens: resolvedMaxTokens,
+            percentage: resolvedRatio,
+            compactionThreshold: compactionThreshold
+        )
+    }
+
+    private static func resolvedMaxTokens(
+        currentMaxTokens: Int,
+        usedTokens: Int,
+        usageRatio: Double
+    ) -> Int {
+        if currentMaxTokens > 0 {
+            return currentMaxTokens
+        }
+
+        guard usageRatio.isFinite, usageRatio > 0 else {
+            return max(usedTokens, 0)
+        }
+
+        let derivedMaxTokens = Int((Double(usedTokens) / usageRatio).rounded())
+        return max(derivedMaxTokens, usedTokens, 0)
+    }
+
+    private static func resolvedUsageRatio(
+        providedRatio: Double,
+        usedTokens: Int,
+        maxTokens: Int
+    ) -> Double {
+        if providedRatio.isFinite, providedRatio >= 0 {
+            return providedRatio
+        }
+
+        guard maxTokens > 0 else {
+            return 0
+        }
+
+        return Double(usedTokens) / Double(maxTokens)
+    }
 }

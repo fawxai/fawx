@@ -211,6 +211,7 @@ final class ChatViewModel {
     private static let sessionLoadDebounceMs = 50
     static let permissionPromptTimeoutSeconds = 60
     private static let permissionPromptTimeout: Duration = .seconds(permissionPromptTimeoutSeconds)
+    private static let compactionBannerTimeout: Duration = .seconds(4)
     static let maxCachedSessions = 10
 
     var transcriptItems: [ChatTranscriptItem] = []
@@ -228,6 +229,13 @@ final class ChatViewModel {
     var isRespondingToPermissionPrompt = false
     var permissionPromptErrorMessage: String?
     var pendingTranscriptScrollBehavior: TranscriptScrollBehavior = .snap
+    var compactionBannerMessage: String? {
+        guard let currentSessionID else {
+            return nil
+        }
+
+        return compactionBannerMessagesBySession[currentSessionID]
+    }
 
     private let appState: AppState
     private let sessionViewModel: SessionViewModel
@@ -238,12 +246,14 @@ final class ChatViewModel {
     private var anonymousToolCallCountersBySession: [String: Int] = [:]
     private var queuedPermissionPrompts: [PermissionPrompt] = []
     private var streamStates: [String: SessionStreamingState] = [:]
+    private var compactionBannerMessagesBySession: [String: String] = [:]
     @ObservationIgnored private var historyLoadSequence = 0
     @ObservationIgnored private var transcriptCache: [String: [SessionMessage]] = [:]
     @ObservationIgnored private var transcriptCacheAccessOrder: [String] = []
     @ObservationIgnored private var permissionPromptTimeoutTask: Task<Void, Never>?
     @ObservationIgnored private var streamTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var streamingDisplayControllers: [String: StreamingDisplayController] = [:]
+    @ObservationIgnored private var compactionBannerDismissTasks: [String: Task<Void, Never>] = [:]
     private var sessionLoadTask: Task<Void, Never>?
 
     init(appState: AppState, sessionViewModel: SessionViewModel) {
@@ -376,6 +386,7 @@ final class ChatViewModel {
         queuedMessagesBySession.removeValue(forKey: sessionID)
         errorMessagesBySession.removeValue(forKey: errorStorageKey(for: sessionID))
         retryRequestsBySession.removeValue(forKey: sessionID)
+        clearCompactionBanner(for: sessionID)
 
         if currentSessionID == sessionID {
             transcriptItems = []
@@ -726,6 +737,7 @@ final class ChatViewModel {
             stopStreaming(sessionID: sessionID)
         }
         clearQueuedMessages()
+        clearCompactionBanners()
     }
 
     func updateStreamingDistanceFromBottom(
@@ -829,6 +841,21 @@ final class ChatViewModel {
                         enqueuePermissionPrompt(prompt)
                     case .phase(let phase):
                         setStreamingPhase(StreamingPhase(rawValue: phase), for: sessionID)
+                    case .contextCompacted(
+                        let tier,
+                        let messagesRemoved,
+                        let tokensBefore,
+                        let tokensAfter,
+                        let usageRatio
+                    ):
+                        handleContextCompacted(
+                            tier: tier,
+                            messagesRemoved: messagesRemoved,
+                            tokensBefore: tokensBefore,
+                            tokensAfter: tokensAfter,
+                            usageRatio: usageRatio,
+                            sessionID: sessionID
+                        )
                     case .done(let response):
                         finalResponse = response
                     case .engineError(_, let message, let recoverable):
@@ -998,6 +1025,107 @@ final class ChatViewModel {
 
     private func clearQueuedMessages() {
         queuedMessagesBySession.removeAll()
+    }
+
+    private func handleContextCompacted(
+        tier: String,
+        messagesRemoved: Int,
+        tokensBefore: Int,
+        tokensAfter: Int,
+        usageRatio: Double,
+        sessionID: String
+    ) {
+        guard currentSessionID == sessionID else {
+            return
+        }
+
+        let updatedContext = (
+            appState.currentContext
+                ?? ContextInfo(
+                    usedTokens: tokensAfter,
+                    maxTokens: 0,
+                    percentage: usageRatio,
+                    compactionThreshold: 0
+                )
+        ).applyingCompaction(usedTokens: tokensAfter, usageRatio: usageRatio)
+
+        let beforePercentage = appState.currentContext?.normalizedPercentage
+            ?? percentage(usedTokens: tokensBefore, maxTokens: updatedContext.maxTokens)
+        let afterPercentage = updatedContext.normalizedPercentage
+
+        appState.currentContext = updatedContext
+        showCompactionBanner(
+            makeCompactionBannerMessage(
+                tier: tier,
+                messagesRemoved: messagesRemoved,
+                beforePercentage: beforePercentage,
+                afterPercentage: afterPercentage
+            ),
+            for: sessionID
+        )
+    }
+
+    private func percentage(usedTokens: Int, maxTokens: Int) -> Double {
+        guard maxTokens > 0 else {
+            return 0
+        }
+
+        let derivedPercentage = (Double(usedTokens) / Double(maxTokens)) * 100
+        return max(0, min(derivedPercentage, 100))
+    }
+
+    private func makeCompactionBannerMessage(
+        tier: String,
+        messagesRemoved: Int,
+        beforePercentage: Double,
+        afterPercentage: Double
+    ) -> String {
+        let prefix = tier.lowercased() == "emergency"
+            ? "Context urgently optimized"
+            : "Context optimized"
+        let compactedMessageCount = messagesRemoved == 1
+            ? "1 message compacted"
+            : "\(messagesRemoved) messages compacted"
+
+        return "\(prefix): \(compactedMessageCount), \(Int(beforePercentage.rounded()))% -> \(Int(afterPercentage.rounded()))%"
+    }
+
+    private func showCompactionBanner(_ message: String, for sessionID: String) {
+        compactionBannerDismissTasks[sessionID]?.cancel()
+        compactionBannerMessagesBySession[sessionID] = message
+        compactionBannerDismissTasks[sessionID] = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.compactionBannerTimeout)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+
+            self?.dismissCompactionBannerIfNeeded(expectedMessage: message, sessionID: sessionID)
+        }
+    }
+
+    private func dismissCompactionBannerIfNeeded(expectedMessage: String, sessionID: String) {
+        guard compactionBannerMessagesBySession[sessionID] == expectedMessage else {
+            return
+        }
+
+        clearCompactionBanner(for: sessionID)
+    }
+
+    private func clearCompactionBanner(for sessionID: String) {
+        compactionBannerDismissTasks[sessionID]?.cancel()
+        compactionBannerDismissTasks.removeValue(forKey: sessionID)
+        compactionBannerMessagesBySession.removeValue(forKey: sessionID)
+    }
+
+    private func clearCompactionBanners() {
+        for task in compactionBannerDismissTasks.values {
+            task.cancel()
+        }
+        compactionBannerDismissTasks.removeAll()
+        compactionBannerMessagesBySession.removeAll()
     }
 
     private func consumeQueuedMessageIfReady(
@@ -1766,6 +1894,32 @@ extension ChatViewModel {
 
     func finishToolCallForTesting(sessionID: String, id: String?, output: String, isError: Bool) {
         finishToolCall(sessionID: sessionID, id: id, output: output, isError: isError)
+    }
+
+    func handleContextCompactedForTesting(
+        sessionID: String,
+        tier: String = "slide",
+        messagesRemoved: Int = 12,
+        tokensBefore: Int = 68,
+        tokensAfter: Int = 42,
+        usageRatio: Double = 0.42
+    ) {
+        handleContextCompacted(
+            tier: tier,
+            messagesRemoved: messagesRemoved,
+            tokensBefore: tokensBefore,
+            tokensAfter: tokensAfter,
+            usageRatio: usageRatio,
+            sessionID: sessionID
+        )
+    }
+
+    func setCurrentContextForTesting(_ context: ContextInfo?) {
+        appState.currentContext = context
+    }
+
+    var currentContextForTesting: ContextInfo? {
+        appState.currentContext
     }
 }
 #endif

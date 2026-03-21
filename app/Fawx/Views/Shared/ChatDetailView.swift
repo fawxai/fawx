@@ -172,8 +172,9 @@ struct ChatDetailView: View {
                 historyLoadingOverlay
             }
             .overlay(alignment: .top) {
-                refreshIndicatorOverlay
+                topOverlay
             }
+            .animation(.easeInOut(duration: 0.22), value: chatViewModel.compactionBannerMessage)
     }
 
     @ViewBuilder
@@ -184,11 +185,39 @@ struct ChatDetailView: View {
     }
 
     @ViewBuilder
-    private var refreshIndicatorOverlay: some View {
-        if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
-            cachedRefreshIndicator
-                .padding(.top, FawxSpacing.paddingLG)
+    private var topOverlay: some View {
+        if chatViewModel.compactionBannerMessage != nil
+            || (chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty)
+        {
+            VStack(spacing: FawxSpacing.paddingSM) {
+                if let compactionBannerMessage = chatViewModel.compactionBannerMessage {
+                    compactionBannerView(message: compactionBannerMessage)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
+                    cachedRefreshIndicator
+                }
+            }
+            .padding(.top, FawxSpacing.paddingLG)
+            .padding(.horizontal, FawxSpacing.paddingXL)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
+    }
+
+    private func compactionBannerView(message: String) -> some View {
+        Text(message)
+            .font(FawxTypography.status)
+            .foregroundStyle(Color.fawxTextSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, FawxSpacing.paddingMD)
+            .padding(.vertical, FawxSpacing.paddingSM)
+            .background(Color.fawxSurface.opacity(0.97))
+            .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous)
+                    .stroke(Color.fawxBorder, lineWidth: 1)
+            }
     }
 
     private func observingTranscriptScrollView<Content: View>(

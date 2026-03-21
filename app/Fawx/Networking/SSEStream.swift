@@ -9,6 +9,13 @@ enum SSEEvent: Sendable, Hashable {
     case toolResult(id: String?, output: String, isError: Bool)
     case permissionPrompt(PermissionPrompt)
     case phase(String)
+    case contextCompacted(
+        tier: String,
+        messagesRemoved: Int,
+        tokensBefore: Int,
+        tokensAfter: Int,
+        usageRatio: Double
+    )
     case engineError(category: String, message: String, recoverable: Bool)
     case done(response: String?)
     case error(String)
@@ -108,6 +115,15 @@ struct SSEParser {
         case "phase", "phase_change":
             let payload = try decoder.decode(PhasePayload.self, from: Data(data.utf8))
             return .phase(payload.phase)
+        case "context_compacted":
+            let payload = try decoder.decode(ContextCompactedPayload.self, from: Data(data.utf8))
+            return .contextCompacted(
+                tier: payload.tier,
+                messagesRemoved: payload.messagesRemoved,
+                tokensBefore: payload.tokensBefore,
+                tokensAfter: payload.tokensAfter,
+                usageRatio: payload.usageRatio
+            )
         case "engine_error":
             let payload = try decoder.decode(EngineErrorPayload.self, from: Data(data.utf8))
             return .engineError(
@@ -179,6 +195,22 @@ private struct ToolResultPayload: Decodable {
 
 private struct PhasePayload: Decodable {
     let phase: String
+}
+
+private struct ContextCompactedPayload: Decodable {
+    let tier: String
+    let messagesRemoved: Int
+    let tokensBefore: Int
+    let tokensAfter: Int
+    let usageRatio: Double
+
+    enum CodingKeys: String, CodingKey {
+        case tier
+        case messagesRemoved = "messages_removed"
+        case tokensBefore = "tokens_before"
+        case tokensAfter = "tokens_after"
+        case usageRatio = "usage_ratio"
+    }
 }
 
 private struct EngineErrorPayload: Decodable {

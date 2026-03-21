@@ -670,6 +670,61 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.visibleCurrentPhase, .act)
     }
 
+    func testContextCompactedUpdatesVisibleSessionContextAndBanner() {
+        let sut = makeSUT()
+        sut.prepareToDisplaySession("session-a")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 68,
+                maxTokens: 100,
+                percentage: 68,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(
+            sessionID: "session-a",
+            tier: "slide",
+            messagesRemoved: 12,
+            tokensBefore: 68,
+            tokensAfter: 42,
+            usageRatio: 0.42
+        )
+
+        XCTAssertEqual(sut.currentContextForTesting?.usedTokens, 42)
+        XCTAssertEqual(sut.currentContextForTesting?.maxTokens, 100)
+        XCTAssertEqual(sut.currentContextForTesting?.normalizedPercentage, 42)
+        XCTAssertEqual(
+            sut.compactionBannerMessage,
+            "Context optimized: 12 messages compacted, 68% -> 42%"
+        )
+    }
+
+    func testContextCompactedIgnoresBackgroundSession() {
+        let sut = makeSUT()
+        sut.prepareToDisplaySession("session-b")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 55,
+                maxTokens: 100,
+                percentage: 55,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(
+            sessionID: "session-a",
+            tier: "slide",
+            messagesRemoved: 12,
+            tokensBefore: 68,
+            tokensAfter: 42,
+            usageRatio: 0.42
+        )
+
+        XCTAssertEqual(sut.currentContextForTesting?.usedTokens, 55)
+        XCTAssertNil(sut.compactionBannerMessage)
+    }
+
     func testStreamingDisplayControllerCoalescesRapidTokensIntoOneFlush() async {
         var flushedChunks: [String] = []
         let sleeper = ControlledSleeper()
