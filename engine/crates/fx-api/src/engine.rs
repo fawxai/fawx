@@ -113,6 +113,11 @@ pub trait AppEngine: Send + Sync {
         fx_session::SessionMemory::default()
     }
 
+    /// Session key currently loaded into the in-memory loop engine, when any.
+    fn loaded_session_key(&self) -> Option<fx_session::SessionKey> {
+        None
+    }
+
     /// Structured session messages recorded for the most recent completed turn.
     fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
         Vec::new()

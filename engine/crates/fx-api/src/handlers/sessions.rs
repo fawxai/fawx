@@ -29,8 +29,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+const SESSION_MEMORY_MAX_ITEMS: usize = 20;
+const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -157,6 +161,38 @@ pub async fn handle_get_context(
     let context = session_messages_to_context(&history);
     let app = state.app.lock().await;
     Ok(Json(app.context_info_for_messages(&context)).into_response())
+}
+
+pub async fn handle_get_session_memory(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    let memory = registry
+        .memory(&key)
+        .map_err(|error| map_session_error(&id, error))?;
+    Ok(Json(memory).into_response())
+}
+
+pub async fn handle_update_session_memory(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Json(memory): Json<SessionMemory>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    let memory = validate_session_memory(memory)?;
+    registry
+        .record_turn(&key, Vec::new(), memory.clone())
+        .map_err(|error| map_session_error(&id, error))?;
+
+    let mut app = state.app.lock().await;
+    if app.loaded_session_key().as_ref() == Some(&key) {
+        let _ = app.replace_session_memory(memory.clone());
+    }
+
+    Ok(Json(memory).into_response())
 }
 
 pub async fn handle_delete_session(
@@ -535,6 +571,45 @@ fn invalid_payload(error: serde_json::Error) -> (StatusCode, Json<ErrorBody>) {
     bad_request(&format!("invalid payload: {error}"))
 }
 
+fn validate_session_memory(
+    mut memory: SessionMemory,
+) -> Result<SessionMemory, (StatusCode, Json<ErrorBody>)> {
+    if memory.key_decisions.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "key_decisions must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    if memory.custom_context.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "custom_context must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    if memory.active_files.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    let estimated_tokens = memory.estimated_tokens();
+    if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
+        return Err(bad_request(&format!(
+            "session memory exceeds the {SESSION_MEMORY_MAX_TOKENS} token cap ({estimated_tokens} estimated)"
+        )));
+    }
+
+    memory.last_updated = current_epoch_secs();
+    Ok(memory)
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::BAD_REQUEST,
@@ -655,5 +730,23 @@ mod tests {
                     ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
+    }
+
+    #[test]
+    fn validate_session_memory_rejects_too_many_active_files() {
+        let memory = SessionMemory {
+            active_files: (0..=SESSION_MEMORY_MAX_ITEMS)
+                .map(|index| format!("file-{index}.rs"))
+                .collect(),
+            ..SessionMemory::default()
+        };
+
+        let error = validate_session_memory(memory).expect_err("validation should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1 .0.error,
+            format!("active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items")
+        );
     }
 }

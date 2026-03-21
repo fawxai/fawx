@@ -44,7 +44,8 @@ pub enum Phase {
     Synthesize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally omitted because `ContextCompacted` carries `usage_ratio: f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamEvent {
     TextDelta {
         text: String,
@@ -83,6 +84,19 @@ pub enum StreamEvent {
         /// Whether the engine continues (true) or stops (false).
         recoverable: bool,
     },
+    /// Compaction completed and the conversation context was reduced.
+    ContextCompacted {
+        /// Which compaction tier fired.
+        tier: String,
+        /// Number of messages removed from the conversation window.
+        messages_removed: usize,
+        /// Token estimate before compaction.
+        tokens_before: usize,
+        /// Token estimate after compaction.
+        tokens_after: usize,
+        /// Current context usage ratio (0.0-1.0).
+        usage_ratio: f64,
+    },
 }
 
 pub type StreamCallback = Arc<dyn Fn(StreamEvent) + Send + Sync>;
@@ -109,6 +123,21 @@ mod tests {
             category: ErrorCategory::Provider,
             message: "rate limit exceeded".to_string(),
             recoverable: true,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn context_compacted_event_serializes_correctly() {
+        let event = StreamEvent::ContextCompacted {
+            tier: "slide".to_string(),
+            messages_removed: 12,
+            tokens_before: 5_100,
+            tokens_after: 2_900,
+            usage_ratio: 0.42,
         };
 
         let json = serde_json::to_string(&event).unwrap();

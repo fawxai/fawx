@@ -539,7 +539,8 @@ impl SessionTurnCollector {
             StreamEvent::TextDelta { .. }
             | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
-            | StreamEvent::PhaseChange { .. } => {}
+            | StreamEvent::PhaseChange { .. }
+            | StreamEvent::ContextCompacted { .. } => {}
         }
     }
 
@@ -2026,6 +2027,10 @@ impl AppEngine for HeadlessApp {
 
     fn session_memory(&self) -> fx_session::SessionMemory {
         self.loop_engine.session_memory_snapshot()
+    }
+
+    fn loaded_session_key(&self) -> Option<SessionKey> {
+        self.session_key.clone()
     }
 
     fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {

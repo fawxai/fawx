@@ -1420,6 +1420,7 @@ mod routing_and_status {
         current_memory: SessionMemory,
         loaded_memories: Vec<SessionMemory>,
         last_session_messages: Vec<SessionMessage>,
+        loaded_session_key: Option<SessionKey>,
     }
 
     #[derive(Clone)]
@@ -1428,12 +1429,13 @@ mod routing_and_status {
     }
 
     impl SessionMemoryPersistingTestApp {
-        fn new(initial_memory: SessionMemory) -> Self {
+        fn new(initial_memory: SessionMemory, loaded_session_key: Option<SessionKey>) -> Self {
             Self {
                 state: Arc::new(StdMutex::new(SessionMemoryPersistingState {
                     current_memory: initial_memory,
                     loaded_memories: Vec::new(),
                     last_session_messages: Vec::new(),
+                    loaded_session_key,
                 })),
             }
         }
@@ -1577,6 +1579,14 @@ mod routing_and_status {
                 .clone()
         }
 
+        fn loaded_session_key(&self) -> Option<SessionKey> {
+            self.state
+                .lock()
+                .expect("state lock")
+                .loaded_session_key
+                .clone()
+        }
+
         fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
             std::mem::take(&mut self.state.lock().expect("state lock").last_session_messages)
         }
@@ -1585,8 +1595,9 @@ mod routing_and_status {
     fn session_memory_test_router(
         registry: SessionRegistry,
         initial_memory: SessionMemory,
+        loaded_session_key: Option<SessionKey>,
     ) -> (Router, Arc<StdMutex<SessionMemoryPersistingState>>) {
-        let app = SessionMemoryPersistingTestApp::new(initial_memory);
+        let app = SessionMemoryPersistingTestApp::new(initial_memory, loaded_session_key);
         let app_state = Arc::clone(&app.state);
         let mut state = test_state_with_sessions(registry);
         state.shared = Arc::new(SharedReadState::from_app(&app));
@@ -2961,6 +2972,128 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_session_memory_returns_stored_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-get");
+        let memory = SessionMemory {
+            project: Some("Phase 6".to_string()),
+            current_state: Some("Reviewing compaction UX".to_string()),
+            key_decisions: vec!["Use a subtle banner".to_string()],
+            active_files: vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()],
+            custom_context: vec!["Keep session memory user-editable".to_string()],
+            last_updated: 1_742_000_000,
+        };
+        registry
+            .record_turn(&key, Vec::new(), memory.clone())
+            .expect("seed memory");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let resp = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/memory")))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(body, serde_json::to_value(memory).expect("memory json"));
+    }
+
+    #[tokio::test]
+    async fn put_session_memory_persists_and_updates_loaded_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-put");
+        let initial_loaded_memory = SessionMemory {
+            project: Some("Old loaded memory".to_string()),
+            ..SessionMemory::default()
+        };
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), initial_loaded_memory, Some(key.clone()));
+
+        let request_body = serde_json::json!({
+            "project": "Phase 6",
+            "current_state": "Implementing memory editing",
+            "key_decisions": ["Expose memory in the UI"],
+            "active_files": ["app/Fawx/Views/Shared/SessionMemoryPanel.swift"],
+            "custom_context": ["Keep the panel lightweight"],
+            "last_updated": 0
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/memory"),
+                &request_body,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(stored_memory.project.as_deref(), Some("Phase 6"));
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("Implementing memory editing")
+        );
+        assert_eq!(stored_memory.key_decisions, vec!["Expose memory in the UI"]);
+        assert_eq!(
+            stored_memory.active_files,
+            vec!["app/Fawx/Views/Shared/SessionMemoryPanel.swift"]
+        );
+        assert_eq!(
+            stored_memory.custom_context,
+            vec!["Keep the panel lightweight"]
+        );
+        assert!(stored_memory.last_updated > 0);
+        assert_eq!(
+            body["last_updated"].as_u64(),
+            Some(stored_memory.last_updated)
+        );
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.current_memory, stored_memory);
+    }
+
+    #[tokio::test]
+    async fn put_session_memory_rejects_payloads_that_exceed_token_cap() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-too-large");
+        let seeded_memory = SessionMemory {
+            project: Some("Existing memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let oversized_project = "memory ".repeat(2_200);
+        let request_body = serde_json::json!({
+            "project": oversized_project,
+            "last_updated": 0
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/memory"),
+                &request_body,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(resp).await;
+        assert!(body["error"]
+            .as_str()
+            .expect("error message")
+            .contains("token cap"));
+        assert_eq!(registry.memory(&key).expect("memory"), seeded_memory);
+    }
+
+    #[tokio::test]
     async fn session_message_persists_updated_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-persist");
@@ -2976,7 +3109,7 @@ allowed_chat_ids = [123]
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
         let (app, app_state) =
-            session_memory_test_router(registry.clone(), restored_memory.clone());
+            session_memory_test_router(registry.clone(), restored_memory.clone(), None);
 
         let resp = app
             .oneshot(authed_json_request(
@@ -3020,7 +3153,7 @@ allowed_chat_ids = [123]
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
         let (app, app_state) =
-            session_memory_test_router(registry.clone(), restored_memory.clone());
+            session_memory_test_router(registry.clone(), restored_memory.clone(), None);
 
         let req = Request::builder()
             .method("POST")
