@@ -695,8 +695,11 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.currentContextForTesting?.maxTokens, 100)
         XCTAssertEqual(sut.currentContextForTesting?.normalizedPercentage, 42)
         XCTAssertEqual(
-            sut.compactionBannerMessage,
-            "Context optimized: 12 messages compacted, 68% → 42%"
+            sut.compactionBannerInfo,
+            ChatViewModel.CompactionBannerInfo(
+                message: "Context optimized: 12 messages compacted, 68% → 42%",
+                isEmergency: false
+            )
         )
     }
 
@@ -722,7 +725,7 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(sut.currentContextForTesting?.usedTokens, 55)
-        XCTAssertNil(sut.compactionBannerMessage)
+        XCTAssertNil(sut.compactionBannerInfo)
     }
 
     func testContextCompactedDerivesMissingBudgetFromUsageRatio() {
@@ -749,8 +752,11 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.currentContextForTesting?.maxTokens, 100)
         XCTAssertEqual(sut.currentContextForTesting?.normalizedPercentage, 42)
         XCTAssertEqual(
-            sut.compactionBannerMessage,
-            "Context optimized: 12 messages compacted, 68% → 42%"
+            sut.compactionBannerInfo,
+            ChatViewModel.CompactionBannerInfo(
+                message: "Context optimized: 12 messages compacted, 68% → 42%",
+                isEmergency: false
+            )
         )
     }
 
@@ -776,8 +782,11 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            sut.compactionBannerMessage,
-            "Context optimized: 1 message compacted, 68% → 42%"
+            sut.compactionBannerInfo,
+            ChatViewModel.CompactionBannerInfo(
+                message: "Context optimized: 1 message compacted, 68% → 42%",
+                isEmergency: false
+            )
         )
     }
 
@@ -803,8 +812,11 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            sut.compactionBannerMessage,
-            "Context urgently optimized: 12 messages compacted, 92% → 48%"
+            sut.compactionBannerInfo,
+            ChatViewModel.CompactionBannerInfo(
+                message: "Context urgently optimized: 12 messages compacted, 92% → 48%",
+                isEmergency: true
+            )
         )
     }
 
@@ -826,12 +838,12 @@ final class ChatViewModelTests: XCTestCase {
 
         sut.handleContextCompactedForTesting(sessionID: "session-a")
 
-        XCTAssertNotNil(sut.compactionBannerMessage)
+        XCTAssertNotNil(sut.compactionBannerInfo)
         await waitForSleepToBeScheduled(on: sleeper)
         await sleeper.resumeNextSleep()
         await waitForCompactionBannerToDismiss(on: sut)
 
-        XCTAssertNil(sut.compactionBannerMessage)
+        XCTAssertNil(sut.compactionBannerInfo)
     }
 
     func testStreamingDisplayControllerCoalescesRapidTokensIntoOneFlush() async {
@@ -1329,7 +1341,7 @@ final class ChatViewModelTests: XCTestCase {
 
     private func waitForCompactionBannerToDismiss(on sut: ChatViewModel) async {
         for _ in 0..<20 {
-            if sut.compactionBannerMessage == nil {
+            if sut.compactionBannerInfo == nil {
                 return
             }
             await Task.yield()

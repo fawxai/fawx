@@ -174,7 +174,7 @@ struct ChatDetailView: View {
             .overlay(alignment: .top) {
                 topOverlay
             }
-            .animation(.easeInOut(duration: 0.22), value: chatViewModel.compactionBannerMessage)
+            .animation(.easeInOut(duration: 0.22), value: chatViewModel.compactionBannerInfo)
     }
 
     @ViewBuilder
@@ -186,12 +186,12 @@ struct ChatDetailView: View {
 
     @ViewBuilder
     private var topOverlay: some View {
-        if chatViewModel.compactionBannerMessage != nil
+        if chatViewModel.compactionBannerInfo != nil
             || (chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty)
         {
             VStack(spacing: FawxSpacing.paddingSM) {
-                if let compactionBannerMessage = chatViewModel.compactionBannerMessage {
-                    compactionBannerView(message: compactionBannerMessage)
+                if let compactionBannerInfo = chatViewModel.compactionBannerInfo {
+                    compactionBannerView(info: compactionBannerInfo)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
@@ -205,10 +205,10 @@ struct ChatDetailView: View {
         }
     }
 
-    private func compactionBannerView(message: String) -> some View {
-        let style = CompactionBannerStyle(message: message)
+    private func compactionBannerView(info: ChatViewModel.CompactionBannerInfo) -> some View {
+        let style = CompactionBannerStyle(isEmergency: info.isEmergency)
 
-        return Text(message)
+        return Text(info.message)
             .font(FawxTypography.status)
             .foregroundStyle(style.foreground)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -868,8 +868,8 @@ private struct CompactionBannerStyle {
     let border: Color
     let foreground: Color
 
-    init(message: String) {
-        if message.localizedCaseInsensitiveContains("urgently optimized") {
+    init(isEmergency: Bool) {
+        if isEmergency {
             background = Color.fawxWarning.opacity(0.12)
             border = Color.fawxWarning.opacity(0.45)
             foreground = .fawxText

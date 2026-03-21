@@ -1,7 +1,6 @@
 import XCTest
 @testable import Fawx
 
-@MainActor
 final class SettingsViewModelTests: XCTestCase {
     func testParseScannedConnectionUsesHTTPSForTailscaleTransportHint() {
         let connection = SettingsViewModel.parseScannedConnection(
