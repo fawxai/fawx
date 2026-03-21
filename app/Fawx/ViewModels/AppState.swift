@@ -1120,19 +1120,19 @@ final class AppState {
     private func startPersistedStateLoad(resetState: Bool) {
         let persistence = persistence
 
-        initialPersistenceLoadTask = Task(priority: .utility) { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
-
+        initialPersistenceLoadTask = Task(priority: .utility) { [weak self] in
             let snapshot = await persistence.loadLaunchSnapshot(resetState: resetState)
             guard !Task.isCancelled else {
                 return
             }
 
-            await applyPersistedLaunchSnapshot(snapshot)
-            initialPersistenceLoadTask = nil
+            await self?.finishPersistedStateLoad(snapshot)
         }
+    }
+
+    private func finishPersistedStateLoad(_ snapshot: AppStatePersistence.LaunchSnapshot) async {
+        await applyPersistedLaunchSnapshot(snapshot)
+        initialPersistenceLoadTask = nil
     }
 
     private func applyPersistedLaunchSnapshot(_ snapshot: AppStatePersistence.LaunchSnapshot) async {

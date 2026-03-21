@@ -14,15 +14,13 @@ actor LocalInstallConfigurationLoader {
     }
 
     func load(from configURL: URL) async -> LocalInstallConfiguration? {
-        let rawConfig = await Task.detached(priority: .utility) {
-            try? String(contentsOf: configURL)
+        await Task.detached(priority: .utility) {
+            guard let rawConfig = try? String(contentsOf: configURL) else {
+                return nil
+            }
+
+            return LocalInstallConfiguration.parse(rawConfig, configURL: configURL)
         }.value
-
-        guard let rawConfig else {
-            return nil
-        }
-
-        return LocalInstallConfiguration.parse(rawConfig, configURL: configURL)
     }
 }
 
