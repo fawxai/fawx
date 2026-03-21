@@ -13,21 +13,44 @@ struct ToolCallRecord: Identifiable, Hashable, Sendable {
     }
 }
 
+struct ToolActivityGroupRecord: Identifiable, Hashable, Sendable {
+    let id: String
+    var toolCalls: [ToolCallRecord]
+    var isLive: Bool
+
+    var runningCount: Int {
+        toolCalls.filter(\.isRunning).count
+    }
+
+    var errorCount: Int {
+        toolCalls.filter(\.isError).count
+    }
+
+    var completedCount: Int {
+        toolCalls.filter { !$0.isRunning }.count
+    }
+
+    var toolCount: Int {
+        toolCalls.count
+    }
+}
+
 struct TranscriptMessage: Identifiable, Hashable, Sendable {
     let id: String
     let message: SessionMessage
+    let displayText: String
 }
 
 enum ChatTranscriptItem: Identifiable, Hashable, Sendable {
     case message(TranscriptMessage)
-    case toolCall(ToolCallRecord)
+    case toolActivityGroup(ToolActivityGroupRecord)
 
     var id: String {
         switch self {
         case .message(let message):
             return "message:\(message.id)"
-        case .toolCall(let toolCall):
-            return "tool:\(toolCall.id)"
+        case .toolActivityGroup(let group):
+            return "tool-group:\(group.id)"
         }
     }
 

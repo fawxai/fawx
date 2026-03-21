@@ -25,7 +25,12 @@ pub enum SessionContentBlock {
         input: Value,
     },
     /// Tool output associated with a prior tool invocation.
-    ToolResult { tool_use_id: String, content: Value },
+    ToolResult {
+        tool_use_id: String,
+        content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
     /// Marker indicating an image was part of the message.
     Image { media_type: String },
 }
@@ -51,6 +56,7 @@ impl From<ContentBlock> for SessionContentBlock {
             } => Self::ToolResult {
                 tool_use_id,
                 content,
+                is_error: None,
             },
             ContentBlock::Image { media_type, .. } => Self::Image { media_type },
         }
@@ -75,6 +81,7 @@ impl From<SessionContentBlock> for ContentBlock {
             SessionContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                ..
             } => Self::ToolResult {
                 tool_use_id,
                 content,
@@ -400,7 +407,14 @@ fn render_content_block_with_options(
         SessionContentBlock::ToolResult {
             tool_use_id,
             content,
-        } => format!("[tool_result:{tool_use_id}] {content}"),
+            is_error,
+        } => {
+            if is_error == &Some(true) {
+                format!("[tool_result:{tool_use_id} error] {content}")
+            } else {
+                format!("[tool_result:{tool_use_id}] {content}")
+            }
+        }
         SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
     }
 }
@@ -638,6 +652,7 @@ mod tests {
                 SessionContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: json!("sunny"),
+                    is_error: None,
                 },
                 SessionContentBlock::Image {
                     media_type: "image/png".to_string(),
@@ -693,6 +708,7 @@ mod tests {
                 SessionContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: json!("sunny"),
+                    is_error: None,
                 },
             ],
             123,
@@ -751,6 +767,22 @@ mod tests {
             }]
         );
         assert_eq!(restored.token_count, None);
+    }
+
+    #[test]
+    fn session_message_deserializes_tool_result_without_is_error() {
+        let json = r#"{"role":"tool","content":[{"type":"tool_result","tool_use_id":"call_1","content":"hello"}],"timestamp":123}"#;
+
+        let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(
+            restored.content,
+            vec![SessionContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!("hello"),
+                is_error: None,
+            }]
+        );
     }
 
     #[test]

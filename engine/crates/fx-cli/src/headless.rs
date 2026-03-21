@@ -525,11 +525,8 @@ impl SessionTurnCollector {
                 Ok(mut guard) => {
                     guard.push(SessionContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: serde_json::Value::String(if *is_error {
-                            format!("[ERROR] {output}")
-                        } else {
-                            output.clone()
-                        }),
+                        content: serde_json::Value::String(output.clone()),
+                        is_error: Some(*is_error),
                     });
                 }
                 Err(error) => {
@@ -3512,7 +3509,40 @@ mod tests {
             messages[2]
                 .content
                 .iter()
-                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
+                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "call_1" && *is_error == Some(false)))
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_preserves_error_metadata_for_tool_results() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_err".to_string(),
+                provider_id: Some("fc_err".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "missing.txt"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_err".to_string(),
+            output: "missing".to_string(),
+            is_error: true,
+        });
+
+        let messages = collector.session_messages_for_turn("open missing", &[], "fallback");
+
+        assert!(
+            messages[2]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == "call_err" && content == &serde_json::Value::String("missing".to_string()) && *is_error == Some(true)))
         );
     }
 

@@ -99,6 +99,189 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(sut.transcriptItems.isEmpty)
     }
 
+    func testMakeTranscriptItemsGroupsStructuredToolHistoryIntoSingleItem() {
+        let sut = makeSUT()
+        let assistantToolMessage = SessionMessage(
+            role: .assistant,
+            contentBlocks: [
+                .text("Let me check."),
+                .toolUse(
+                    id: "call_1",
+                    name: "read_file",
+                    input: .object(["path": .string("README.md")])
+                ),
+            ],
+            timestamp: 2
+        )
+        let toolResultMessage = SessionMessage(
+            role: .tool,
+            contentBlocks: [
+                .toolResult(toolUseId: "call_1", content: .string("file contents"), isError: false)
+            ],
+            timestamp: 3
+        )
+        let assistantReply = SessionMessage(role: .assistant, content: "Done.", timestamp: 4)
+
+        let items = sut.makeTranscriptItems(from: [assistantToolMessage, toolResultMessage, assistantReply])
+
+        XCTAssertEqual(items.count, 3)
+
+        guard case .message(let leadingMessage) = items[0] else {
+            return XCTFail("Expected first transcript item to be a message")
+        }
+        XCTAssertEqual(leadingMessage.displayText, "Let me check.")
+
+        guard case .toolActivityGroup(let group) = items[1] else {
+            return XCTFail("Expected second transcript item to be grouped tool activity")
+        }
+        XCTAssertEqual(group.toolCount, 1)
+        XCTAssertEqual(group.toolCalls[0].name, "read_file")
+        XCTAssertTrue(group.toolCalls[0].arguments.contains("README.md"))
+        XCTAssertEqual(group.toolCalls[0].result, "file contents")
+        XCTAssertFalse(group.toolCalls[0].isError)
+
+        guard case .message(let trailingMessage) = items[2] else {
+            return XCTFail("Expected third transcript item to be a message")
+        }
+        XCTAssertEqual(trailingMessage.displayText, "Done.")
+    }
+
+    func testHiddenSessionToolActivityRemainsVisibleWhenReturning() {
+        let sut = makeSUT()
+        let cachedMessage = SessionMessage(role: .assistant, content: "Queued work", timestamp: 1)
+
+        sut.cacheMessages([cachedMessage], for: "session-a")
+        sut.setStreamingSessionsForTesting(
+            ["session-a": (text: "", phase: .act)],
+            currentSessionID: "session-b"
+        )
+        sut.prepareToDisplaySession("session-b")
+
+        sut.beginToolCallForTesting(sessionID: "session-a", id: "call_1", name: "read_file")
+        sut.completeToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_1",
+            name: "read_file",
+            arguments: "{\"path\":\"README.md\"}"
+        )
+        sut.finishToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_1",
+            output: "file contents",
+            isError: false
+        )
+
+        sut.prepareToDisplaySession("session-a")
+
+        let groups = sut.transcriptItems.compactMap { item -> ToolActivityGroupRecord? in
+            guard case .toolActivityGroup(let group) = item else {
+                return nil
+            }
+            return group
+        }
+
+        XCTAssertEqual(sut.transcriptItems.compactMap(\.sessionMessage), [cachedMessage])
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].toolCalls[0].name, "read_file")
+        XCTAssertEqual(groups[0].toolCalls[0].result, "file contents")
+    }
+
+    func testLiveToolGroupPreservesCompletedToolsAcrossMultipleRoundsInOneTurn() {
+        let sut = makeSUT()
+
+        sut.setStreamingSessionsForTesting(
+            ["session-a": (text: "", phase: .act)],
+            currentSessionID: "session-a"
+        )
+        sut.prepareToDisplaySession("session-a")
+
+        sut.beginToolCallForTesting(sessionID: "session-a", id: "call_1", name: "read_file")
+        sut.finishToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_1",
+            output: "first result",
+            isError: false
+        )
+
+        sut.beginToolCallForTesting(sessionID: "session-a", id: "call_2", name: "list_dir")
+
+        var groups = sut.transcriptItems.compactMap { item -> ToolActivityGroupRecord? in
+            guard case .toolActivityGroup(let group) = item else {
+                return nil
+            }
+            return group
+        }
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].toolCalls.map(\.id), ["call_1", "call_2"])
+        XCTAssertEqual(groups[0].toolCalls[0].result, "first result")
+        XCTAssertTrue(groups[0].toolCalls[1].isRunning)
+
+        sut.finishToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_2",
+            output: "second result",
+            isError: false
+        )
+
+        groups = sut.transcriptItems.compactMap { item -> ToolActivityGroupRecord? in
+            guard case .toolActivityGroup(let group) = item else {
+                return nil
+            }
+            return group
+        }
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].toolCalls.map(\.result), ["first result", "second result"])
+    }
+
+    func testFetchedHistoryReplacesMatchingLiveToolOverlayInsteadOfDuplicatingIt() {
+        let sut = makeSUT()
+        let optimisticAssistant = SessionMessage(role: .assistant, content: "Let me check.", timestamp: 1)
+        let historicalAssistant = SessionMessage(
+            role: .assistant,
+            contentBlocks: [
+                .text("Let me check."),
+                .toolUse(
+                    id: "call_1",
+                    name: "read_file",
+                    input: .object(["path": .string("README.md")])
+                ),
+            ],
+            timestamp: 2
+        )
+        let historicalToolResult = SessionMessage(
+            role: .tool,
+            contentBlocks: [
+                .toolResult(toolUseId: "call_1", content: .string("file contents"), isError: false)
+            ],
+            timestamp: 3
+        )
+
+        sut.cacheMessages([optimisticAssistant], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+        sut.beginToolCallForTesting(sessionID: "session-a", id: "call_1", name: "read_file")
+        sut.finishToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_1",
+            output: "file contents",
+            isError: false
+        )
+
+        sut.applyFetchedMessagesForTesting([historicalAssistant, historicalToolResult], sessionID: "session-a")
+
+        let groups = sut.transcriptItems.compactMap { item -> ToolActivityGroupRecord? in
+            guard case .toolActivityGroup(let group) = item else {
+                return nil
+            }
+            return group
+        }
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].toolCalls[0].id, "call_1")
+        XCTAssertEqual(groups[0].toolCalls[0].result, "file contents")
+    }
+
     func testDraftMessageIsScopedPerSession() {
         let sut = makeSUT()
 
