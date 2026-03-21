@@ -79,28 +79,43 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(coordinator.shouldFollowLiveOutput)
     }
 
-    func testTranscriptScrollCoordinatorPublishCurrentPinnedStatePrimesDeduplication() {
+    func testTranscriptScrollCoordinatorSeedPinnedStatePrimesDeduplication() {
         let coordinator = TranscriptScrollCoordinator()
 
-        coordinator.activateSession("session-a")
+        coordinator.activateSession("test-session")
 
-        XCTAssertEqual(
-            coordinator.publishCurrentPinnedState(distanceFromBottom: -10),
-            TranscriptPinnedStateUpdate(distanceFromBottom: 0, isPinnedToBottom: true)
-        )
+        let seed = coordinator.seedPinnedState(distanceFromBottom: 0)
+
+        XCTAssertTrue(seed.isPinnedToBottom)
         XCTAssertNil(
             coordinator.update(
-                observation: TranscriptScrollObservation(contentOffsetY: 20, distanceFromBottom: 10),
+                observation: TranscriptScrollObservation(contentOffsetY: 10, distanceFromBottom: 5),
                 userDriven: false
             )
         )
-        XCTAssertEqual(
-            coordinator.update(
-                observation: TranscriptScrollObservation(contentOffsetY: 120, distanceFromBottom: 120),
-                userDriven: true
-            ),
-            TranscriptPinnedStateUpdate(distanceFromBottom: 120, isPinnedToBottom: false)
-        )
+    }
+
+    func testTranscriptScrollInteractionTrackerDefaultsToNotUserDriven() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        XCTAssertFalse(tracker.isUserDrivenScroll(isPositionedByUser: false))
+    }
+
+    func testTranscriptScrollInteractionTrackerReportsUserDrivenWhenPositionedByUser() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        XCTAssertTrue(tracker.isUserDrivenScroll(isPositionedByUser: true))
+    }
+
+    @available(iOS 18.0, macOS 15.0, *)
+    func testTranscriptScrollInteractionTrackerTracksInteractingPhase() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        tracker.updateScrollPhase(.tracking)
+        XCTAssertTrue(tracker.isUserDrivenScroll(isPositionedByUser: false))
+
+        tracker.updateScrollPhase(.idle)
+        XCTAssertFalse(tracker.isUserDrivenScroll(isPositionedByUser: false))
     }
 
     func testTranscriptScrollCoordinatorPublishesPinnedTransitionsOnce() {

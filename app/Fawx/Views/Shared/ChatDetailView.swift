@@ -861,7 +861,7 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
                 scrollToBottom(animated: false)
             }
             if isStreaming {
-                let pinnedStateUpdate = scrollCoordinator.publishCurrentPinnedState(distanceFromBottom: 0)
+                let pinnedStateUpdate = scrollCoordinator.seedPinnedState(distanceFromBottom: 0)
                 updateStreamingPinnedState(
                     pinnedStateUpdate.isPinnedToBottom,
                     pinnedStateUpdate.distanceFromBottom
@@ -1022,7 +1022,7 @@ final class TranscriptScrollCoordinator {
         lastPublishedPinnedState = nil
     }
 
-    func publishCurrentPinnedState(distanceFromBottom: CGFloat) -> TranscriptPinnedStateUpdate {
+    func seedPinnedState(distanceFromBottom: CGFloat) -> TranscriptPinnedStateUpdate {
         let isPinnedToBottom = mode != .detached
         lastPublishedPinnedState = isPinnedToBottom
         return makePinnedStateUpdate(
