@@ -1294,12 +1294,16 @@ impl LoopEngine {
         message: impl Into<String>,
         recoverable: bool,
     ) {
+        self.emit_background_event(StreamEvent::Error {
+            category,
+            message: message.into(),
+            recoverable,
+        });
+    }
+
+    fn emit_background_event(&self, event: StreamEvent) {
         if let Some(cb) = &self.error_callback {
-            cb(StreamEvent::Error {
-                category,
-                message: message.into(),
-                recoverable,
-            });
+            cb(event);
         }
     }
 
@@ -3178,11 +3182,22 @@ impl LoopEngine {
         iteration: Option<u32>,
         target_tokens: usize,
     ) -> Cow<'a, [Message]> {
+        let before_tokens = ConversationBudget::estimate_tokens(current.as_ref());
+        let after_tokens = result.estimated_tokens;
         self.flush_evicted(current.as_ref(), &result, scope).await;
         if let Some(iteration) = iteration {
             self.record_compaction_iteration(scope, iteration);
         }
         self.log_tier_result(tier, scope, current.as_ref(), target_tokens, &result);
+        if result.compacted_count > 0 {
+            self.emit_background_event(StreamEvent::ContextCompacted {
+                tier: tier.as_str().to_string(),
+                messages_removed: result.compacted_count,
+                tokens_before: before_tokens,
+                tokens_after: after_tokens,
+                usage_ratio: f64::from(self.conversation_budget.usage_ratio(&result.messages)),
+            });
+        }
         Cow::Owned(result.messages)
     }
 
@@ -12705,6 +12720,57 @@ mod context_compaction_tests {
                 message,
                 recoverable: true,
             } if message == "Memory flush failed during compaction: memory flush failed: test failure"
+        )));
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_emits_context_compacted_event() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let events = Arc::new(Mutex::new(Vec::<StreamEvent>::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .error_callback(callback)
+            .build()
+            .expect("test engine build");
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should succeed");
+
+        let before_tokens = ConversationBudget::estimate_tokens(&messages);
+        let after_tokens = ConversationBudget::estimate_tokens(compacted.as_ref());
+        let expected_usage_ratio =
+            f64::from(engine.conversation_budget.usage_ratio(compacted.as_ref()));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContextCompacted {
+                tier,
+                messages_removed,
+                tokens_before,
+                tokens_after,
+                usage_ratio,
+            } if tier == "slide"
+                && *messages_removed > 0
+                && *tokens_before == before_tokens
+                && *tokens_after == after_tokens
+                && (usage_ratio - expected_usage_ratio).abs() < f64::EPSILON
         )));
     }
 
