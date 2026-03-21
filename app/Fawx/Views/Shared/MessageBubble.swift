@@ -30,6 +30,7 @@ struct MessageBubble: View {
                 .foregroundStyle(Color.fawxTextSecondary)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, FawxSpacing.paddingSM)
+                .textSelection(.enabled)
         } else {
             bubbleContent
         }
@@ -48,6 +49,7 @@ struct MessageBubble: View {
                     .background(bubbleBackground)
                     .overlay(bubbleBorder)
                     .clipShape(RoundedRectangle(cornerRadius: bubbleCornerRadius))
+                    .textSelection(.enabled)
 
                 if let timestamp {
                     Text(timeString(timestamp))
