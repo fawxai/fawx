@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import Fawx
 
-final class SessionTests: XCTestCase {
+final class ContentViewLayoutTests: XCTestCase {
     func testContentViewLayoutWidensMinimumWindowWhenGitPanelIsVisible() {
         let defaultMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: false)
         let gitPanelMinimumWidth = ContentView.Layout.resolvedMinimumWindowWidth(showingGitPanel: true)
@@ -18,7 +18,9 @@ final class SessionTests: XCTestCase {
                 + ContentView.Layout.splitDividerWidthAllowance
         )
     }
+}
 
+final class SessionTests: XCTestCase {
     func testSummarizedSessionTitleStripsCommonPromptPrefix() {
         let title = summarizedSessionTitle(from: "Hey Fawx, please help me with the streaming retry bug")
 

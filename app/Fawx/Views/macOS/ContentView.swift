@@ -47,7 +47,9 @@ struct ContentView: View {
             statusBarView
         }
         .background(Color.fawxBackground)
+#if os(macOS)
         .frame(minWidth: minimumWindowWidth, minHeight: Layout.minimumWindowHeight)
+#endif
         .overlay(alignment: .top) {
             toastOverlay
         }
