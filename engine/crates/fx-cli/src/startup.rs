@@ -655,19 +655,19 @@ impl StreamNotificationSender {
 #[async_trait]
 impl NotificationSender for StreamNotificationSender {
     async fn send(&self, title: &str, body: &str) -> Result<(), String> {
-        match self.callback_slot.lock() {
-            Ok(guard) => {
-                if let Some(callback) = guard.clone() {
-                    callback(StreamEvent::Notification {
-                        title: title.to_string(),
-                        body: body.to_string(),
-                    });
-                }
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "notification callback mutex poisoned");
-            }
+        let callback = self
+            .callback_slot
+            .lock()
+            .map_err(|error| format!("notification callback unavailable: {error}"))?
+            .clone();
+
+        if let Some(callback) = callback {
+            callback(StreamEvent::Notification {
+                title: title.to_string(),
+                body: body.to_string(),
+            });
         }
+
         Ok(())
     }
 }
@@ -1839,6 +1839,7 @@ mod tests {
     use fx_subagent::test_support::StubSubagentControl;
     use std::io;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
@@ -1894,6 +1895,68 @@ mod tests {
 
         assert!(policy.default_ask);
         assert_eq!(policy.mode, fx_config::CapabilityMode::Prompt);
+    }
+
+    #[tokio::test]
+    async fn stream_notification_sender_drops_lock_before_invoking_callback() {
+        let callback_slot = Arc::new(Mutex::new(None));
+        let callback_slot_for_callback = Arc::clone(&callback_slot);
+        let lock_reacquired = Arc::new(AtomicBool::new(false));
+        let lock_reacquired_for_callback = Arc::clone(&lock_reacquired);
+        let received = Arc::new(Mutex::new(None));
+        let received_for_callback = Arc::clone(&received);
+        let callback: StreamCallback = Arc::new(move |event| {
+            lock_reacquired_for_callback.store(
+                callback_slot_for_callback.try_lock().is_ok(),
+                Ordering::SeqCst,
+            );
+            *received_for_callback.lock().expect("received lock") = Some(event);
+        });
+        *callback_slot.lock().expect("callback slot lock") = Some(callback);
+
+        let sender = StreamNotificationSender::new(Arc::clone(&callback_slot));
+        sender
+            .send("Build done", "Task complete")
+            .await
+            .expect("send should succeed");
+
+        assert!(
+            lock_reacquired.load(Ordering::SeqCst),
+            "callback should run after releasing the mutex guard"
+        );
+        assert_eq!(
+            *received.lock().expect("received lock"),
+            Some(StreamEvent::Notification {
+                title: "Build done".to_string(),
+                body: "Task complete".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_notification_sender_returns_error_when_callback_mutex_is_poisoned() {
+        let callback_slot = Arc::new(Mutex::new(None));
+        let callback_slot_for_panic = Arc::clone(&callback_slot);
+        let join_result = std::thread::spawn(move || {
+            let _guard = callback_slot_for_panic
+                .lock()
+                .expect("callback slot lock should succeed");
+            panic!("poison callback slot");
+        })
+        .join();
+
+        assert!(
+            join_result.is_err(),
+            "helper thread should poison the mutex"
+        );
+
+        let sender = StreamNotificationSender::new(callback_slot);
+        let error = sender
+            .send("Build done", "Task complete")
+            .await
+            .expect_err("poisoned lock should fail");
+
+        assert!(error.contains("notification callback unavailable"));
     }
 
     fn create_embedding_model_dir(base: &Path, dimensions: usize) {

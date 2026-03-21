@@ -18,7 +18,7 @@ final class NotificationService {
         let settings = await center.notificationSettings()
 
         switch settings.authorizationStatus {
-        case .authorized, .provisional:
+        case .authorized, .provisional, .ephemeral:
             return true
         case .notDetermined:
             do {
@@ -55,7 +55,11 @@ final class NotificationService {
             trigger: nil
         )
 
-        try? await UNUserNotificationCenter.current().add(request)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            print("NotificationService: failed to deliver notification: \(error)")
+        }
     }
 
     private var shouldPresentNotification: Bool {

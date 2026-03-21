@@ -101,7 +101,7 @@ impl Skill for NotifySkill {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         match tool_name {
             "notify" => ToolCacheability::SideEffect,
-            _ => ToolCacheability::NeverCache,
+            _ => ToolCacheability::SideEffect,
         }
     }
 

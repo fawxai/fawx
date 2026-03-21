@@ -428,6 +428,8 @@ pub struct LoopEngine {
     tool_attempts: HashMap<String, u8>,
     /// Whether a successful `notify` tool call occurred during the current cycle.
     notify_called_this_cycle: bool,
+    /// Whether this cycle currently has an active notification delivery channel.
+    notify_tool_guidance_enabled: bool,
     /// Shared iteration counter for scratchpad age tracking.
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
@@ -454,6 +456,10 @@ impl std::fmt::Debug for LoopEngine {
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("tool_attempts", &self.tool_attempts)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
+            .field(
+                "notify_tool_guidance_enabled",
+                &self.notify_tool_guidance_enabled,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -685,6 +691,7 @@ impl LoopEngineBuilder {
             budget_low_signaled: false,
             tool_attempts: HashMap::new(),
             notify_called_this_cycle: false,
+            notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             error_callback: self.error_callback,
@@ -1179,6 +1186,7 @@ impl LoopEngine {
         stream_callback: Option<&StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
         self.prepare_cycle();
+        self.notify_tool_guidance_enabled = stream_callback.is_some();
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
@@ -1374,6 +1382,7 @@ impl LoopEngine {
         self.budget_low_signaled = false;
         self.tool_attempts.clear();
         self.notify_called_this_cycle = false;
+        self.notify_tool_guidance_enabled = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -1604,13 +1613,14 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_reasoning_request(
+        let request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
@@ -1811,7 +1821,7 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
-        let request = build_truncation_continuation_request(
+        let request = build_truncation_continuation_request_with_notify_guidance(
             llm.model_name(),
             continuation_messages,
             self.tool_executor.tool_definitions(),
@@ -1819,6 +1829,7 @@ impl LoopEngine {
             self.scratchpad_context.as_deref(),
             step,
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let request_messages = request.messages.clone();
         let response = self
@@ -2393,7 +2404,9 @@ impl LoopEngine {
             builder = builder.event_bus(bus.clone());
         }
 
-        builder.build()
+        let mut child = builder.build()?;
+        child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
+        Ok(child)
     }
 
     fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -3438,13 +3451,14 @@ impl LoopEngine {
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_continuation_request(
+        let request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
 
         let response = self
@@ -4337,6 +4351,7 @@ fn decompose_tool_definition() -> ToolDefinition {
 }
 
 /// Build a CompletionRequest for tool result re-prompting.
+#[cfg(test)]
 fn build_continuation_request(
     context_messages: &[Message],
     model: &str,
@@ -4345,8 +4360,32 @@ fn build_continuation_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_continuation_request_with_notify_guidance(
+        context_messages,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_continuation_request_with_notify_guidance(
+    context_messages: &[Message],
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_tool_continuation_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -4358,6 +4397,7 @@ fn build_continuation_request(
     }
 }
 
+#[cfg(test)]
 fn build_truncation_continuation_request(
     model: &str,
     continuation_messages: &[Message],
@@ -4367,11 +4407,37 @@ fn build_truncation_continuation_request(
     step: LoopStep,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_truncation_continuation_request_with_notify_guidance(
+        model,
+        continuation_messages,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        step,
+        thinking,
+        false,
+    )
+}
+
+fn build_truncation_continuation_request_with_notify_guidance(
+    model: &str,
+    continuation_messages: &[Message],
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    step: LoopStep,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: continuation_messages.to_vec(),
@@ -4826,6 +4892,7 @@ fn completion_request_to_prompt(request: &CompletionRequest) -> String {
     format!("{system}{messages}")
 }
 
+#[cfg(test)]
 fn build_reasoning_request(
     perception: &ProcessedPerception,
     model: &str,
@@ -4834,10 +4901,34 @@ fn build_reasoning_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_reasoning_request_with_notify_guidance(
+        perception,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_reasoning_request_with_notify_guidance(
+    perception: &ProcessedPerception,
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
 
     CompletionRequest {
         model: model.to_string(),
@@ -4879,21 +4970,49 @@ User message:
     prompt
 }
 
+#[cfg(test)]
 fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
-    build_system_prompt(memory_context, scratchpad_context, None)
+    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
 }
 
+fn build_reasoning_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
+) -> String {
+    build_system_prompt(
+        memory_context,
+        scratchpad_context,
+        None,
+        notify_tool_guidance_enabled,
+    )
+}
+
+#[cfg(test)]
 fn build_tool_continuation_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
+) -> String {
+    build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        false,
+    )
+}
+
+fn build_tool_continuation_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         Some(TOOL_CONTINUATION_DIRECTIVE),
+        notify_tool_guidance_enabled,
     )
 }
 
@@ -4901,9 +5020,12 @@ fn build_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     extra_directive: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
-    prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+    if notify_tool_guidance_enabled {
+        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+    }
     if let Some(extra_directive) = extra_directive {
         prompt.push_str(extra_directive);
     }
@@ -5176,6 +5298,24 @@ mod tests {
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
+        );
+    }
+
+    #[test]
+    fn system_prompt_omits_notify_guidance_without_notification_channel() {
+        let prompt = build_reasoning_system_prompt(None, None);
+        assert!(
+            !prompt.contains("You have a `notify` tool"),
+            "system prompt should omit notify guidance when no notification channel is active"
+        );
+    }
+
+    #[test]
+    fn system_prompt_includes_notify_guidance_when_notification_channel_is_active() {
+        let prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, true);
+        assert!(
+            prompt.contains("You have a `notify` tool"),
+            "system prompt should include notify guidance when notifications are available"
         );
     }
 
