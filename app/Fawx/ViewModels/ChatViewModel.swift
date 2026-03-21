@@ -56,12 +56,18 @@ final class StreamingDisplayController {
 
     func userDidScroll(
         distanceFromBottom: CGFloat,
+        isUserInitiated: Bool = true,
         threshold: CGFloat = StreamingDisplayController.bottomThreshold
     ) {
         let clampedDistance = max(0, distanceFromBottom)
         if clampedDistance <= threshold {
             isPinnedToBottom = true
             pendingAutoScroll = false
+            lastDistanceFromBottom = clampedDistance
+            return
+        }
+
+        if !isUserInitiated {
             lastDistanceFromBottom = clampedDistance
             return
         }
@@ -80,6 +86,15 @@ final class StreamingDisplayController {
 
         isPinnedToBottom = false
         lastDistanceFromBottom = clampedDistance
+    }
+
+    func setPinnedToBottom(_ pinnedToBottom: Bool, distanceFromBottom: CGFloat) {
+        let clampedDistance = max(0, distanceFromBottom)
+        isPinnedToBottom = pinnedToBottom
+        lastDistanceFromBottom = clampedDistance
+        if pinnedToBottom {
+            pendingAutoScroll = false
+        }
     }
 
     private func startRenderTimerIfNeeded() {
@@ -713,12 +728,29 @@ final class ChatViewModel {
         clearQueuedMessages()
     }
 
-    func updateStreamingDistanceFromBottom(_ distanceFromBottom: CGFloat) {
+    func updateStreamingDistanceFromBottom(
+        _ distanceFromBottom: CGFloat,
+        isUserInitiated: Bool = true
+    ) {
         guard let currentSessionID, isCurrentSessionStreaming else {
             return
         }
 
-        streamingDisplayController(for: currentSessionID).userDidScroll(distanceFromBottom: distanceFromBottom)
+        streamingDisplayController(for: currentSessionID).userDidScroll(
+            distanceFromBottom: distanceFromBottom,
+            isUserInitiated: isUserInitiated
+        )
+    }
+
+    func updateStreamingPinnedState(isPinnedToBottom: Bool, distanceFromBottom: CGFloat) {
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return
+        }
+
+        streamingDisplayController(for: currentSessionID).setPinnedToBottom(
+            isPinnedToBottom,
+            distanceFromBottom: distanceFromBottom
+        )
     }
 
     private func send(_ text: String, forceSessionID: String? = nil) async {

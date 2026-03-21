@@ -3,6 +3,170 @@ import XCTest
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testTranscriptScrollTrackerPublishesDistanceOnceMetricsBecomeValid() {
+        let tracker = TranscriptScrollTracker()
+
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+
+        XCTAssertEqual(tracker.update(contentBottomY: 180), 60)
+    }
+
+    func testTranscriptScrollTrackerDeduplicatesRepeatedDistances() {
+        let tracker = TranscriptScrollTracker()
+
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+        XCTAssertEqual(tracker.update(contentBottomY: 180), 60)
+        XCTAssertNil(tracker.update(contentBottomY: 180))
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+    }
+
+    func testTranscriptScrollTrackerIgnoresInvalidGeometryUpdates() {
+        let tracker = TranscriptScrollTracker()
+
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+        XCTAssertEqual(tracker.update(contentBottomY: 180), 60)
+        XCTAssertNil(tracker.update(contentBottomY: -10))
+
+        XCTAssertEqual(tracker.update(contentBottomY: 200), 80)
+    }
+
+    func testTranscriptScrollTrackerResetClearsCachedDistance() {
+        let tracker = TranscriptScrollTracker()
+
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+        XCTAssertEqual(tracker.update(contentBottomY: 180), 60)
+
+        tracker.reset()
+
+        XCTAssertNil(tracker.update(viewportBottomY: 120))
+        XCTAssertEqual(tracker.update(contentBottomY: 180), 60)
+    }
+
+    func testTranscriptScrollCoordinatorDefaultsToBottomRestoreForNewSession() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .bottom
+        )
+        XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorDefersRestoreUntilHistoryFinishesLoading() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        XCTAssertNil(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: true
+            )
+        )
+
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .bottom
+        )
+        XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorRestoresDetachedSessionAtSavedOffset() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+        _ = coordinator.update(
+            observation: TranscriptScrollObservation(contentOffsetY: 240, distanceFromBottom: 120),
+            userDriven: true
+        )
+
+        coordinator.activateSession("session-b")
+        coordinator.activateSession("session-a")
+
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .point(240)
+        )
+        XCTAssertFalse(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorRepinsNearBottom() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+        _ = coordinator.update(
+            observation: TranscriptScrollObservation(contentOffsetY: 200, distanceFromBottom: 120),
+            userDriven: true
+        )
+        XCTAssertFalse(coordinator.shouldFollowLiveOutput)
+
+        _ = coordinator.update(
+            observation: TranscriptScrollObservation(contentOffsetY: 280, distanceFromBottom: 10),
+            userDriven: true
+        )
+
+        XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorIgnoresProgrammaticDistanceGrowth() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        _ = coordinator.update(
+            observation: TranscriptScrollObservation(contentOffsetY: 80, distanceFromBottom: 200),
+            userDriven: false
+        )
+
+        XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorEvictsLeastRecentlyUsedSnapshots() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        for index in 0..<64 {
+            let sessionID = "session-\(index)"
+            coordinator.activateSession(sessionID)
+            _ = coordinator.update(
+                observation: TranscriptScrollObservation(
+                    contentOffsetY: CGFloat(index * 10),
+                    distanceFromBottom: 120
+                ),
+                userDriven: true
+            )
+        }
+
+        coordinator.activateSession("session-0")
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .bottom
+        )
+
+        coordinator.activateSession("session-63")
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .point(630)
+        )
+        XCTAssertFalse(coordinator.shouldFollowLiveOutput)
+    }
+
     func testStableDigestIsDeterministicForKnownInput() {
         XCTAssertEqual(ChatViewModel.stableDigest(for: "hello world"), "779a65e7023cd2e7")
         XCTAssertEqual(ChatViewModel.stableDigest(for: "hello world"), "779a65e7023cd2e7")
@@ -505,6 +669,17 @@ final class ChatViewModelTests: XCTestCase {
         controller.appendToken("tail")
         controller.streamDidEnd()
         controller.userDidScroll(distanceFromBottom: StreamingDisplayController.bottomThreshold + 5)
+
+        XCTAssertTrue(controller.isPinnedToBottom)
+    }
+
+    func testStreamingDisplayControllerIgnoresProgrammaticScrollDistanceGrowth() {
+        let controller = StreamingDisplayController { _ in }
+
+        controller.userDidScroll(
+            distanceFromBottom: StreamingDisplayController.bottomThreshold * 3,
+            isUserInitiated: false
+        )
 
         XCTAssertTrue(controller.isPinnedToBottom)
     }
