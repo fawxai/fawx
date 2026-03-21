@@ -54,7 +54,7 @@ struct ChatDetailView: View {
                             distanceFromBottom: distanceFromBottom
                         )
                     },
-                    content: transcriptStack,
+                    content: modernTranscriptStack,
                     composer: composerArea,
                     containerWidth: FawxSpacing.resolvedChatContainerWidth(for: containerProxy.size.width)
                 )
@@ -80,7 +80,7 @@ struct ChatDetailView: View {
 
     private func baseTranscriptScrollView(for containerProxy: GeometryProxy) -> some View {
         ScrollView {
-            transcriptStack
+            legacyTranscriptStack
         }
         .id(sessionScrollIdentity)
         .background(scrollViewportReader)
@@ -92,8 +92,17 @@ struct ChatDetailView: View {
         }
     }
 
-    private var transcriptStack: some View {
+    @available(iOS 18.0, macOS 15.0, *)
+    private var modernTranscriptStack: some View {
         VStack(spacing: FawxSpacing.paddingLG) {
+            transcriptContent
+            scrollBottomAnchor
+        }
+        .padding(FawxSpacing.paddingXL)
+    }
+
+    private var legacyTranscriptStack: some View {
+        LazyVStack(spacing: FawxSpacing.paddingLG) {
             transcriptContent
             scrollBottomAnchor
         }
@@ -959,11 +968,6 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
 #endif
 }
 
-private struct ScrollMetrics: Equatable {
-    var viewportBottomY: CGFloat = 0
-    var contentBottomY: CGFloat = 0
-}
-
 struct TranscriptScrollObservation: Equatable {
     var contentOffsetY: CGFloat
     var distanceFromBottom: CGFloat
@@ -994,11 +998,13 @@ final class TranscriptScrollCoordinator {
 
     private static let repinThreshold = StreamingDisplayController.bottomThreshold
     private static let detachThreshold = StreamingDisplayController.bottomThreshold * 1.5
+    private static let maxTrackedSnapshots = 32
 
     private(set) var mode: Mode = .followingLive
     private var activeSessionID: String?
     private var pendingRestoreSessionID: String?
     private var snapshotsBySession: [String: SessionSnapshot] = [:]
+    private var snapshotAccessOrder: [String] = []
 
     var shouldFollowLiveOutput: Bool {
         mode != .detached
@@ -1025,7 +1031,7 @@ final class TranscriptScrollCoordinator {
 
         pendingRestoreSessionID = nil
 
-        if let snapshot = snapshotsBySession[activeSessionID], !snapshot.followsLive {
+        if let snapshot = snapshot(for: activeSessionID), !snapshot.followsLive {
             mode = .detached
             return .point(snapshot.contentOffsetY)
         }
@@ -1050,9 +1056,12 @@ final class TranscriptScrollCoordinator {
             mode = .detached
         }
 
-        snapshotsBySession[activeSessionID] = SessionSnapshot(
-            contentOffsetY: max(0, observation.contentOffsetY),
-            followsLive: mode != .detached
+        storeSnapshot(
+            SessionSnapshot(
+                contentOffsetY: max(0, observation.contentOffsetY),
+                followsLive: mode != .detached
+            ),
+            for: activeSessionID
         )
 
         return TranscriptPinnedStateUpdate(
@@ -1060,38 +1069,72 @@ final class TranscriptScrollCoordinator {
             isPinnedToBottom: mode != .detached
         )
     }
+
+    private func snapshot(for sessionID: String) -> SessionSnapshot? {
+        guard let snapshot = snapshotsBySession[sessionID] else {
+            return nil
+        }
+
+        touchSnapshot(sessionID)
+        return snapshot
+    }
+
+    private func storeSnapshot(_ snapshot: SessionSnapshot, for sessionID: String) {
+        snapshotsBySession[sessionID] = snapshot
+        touchSnapshot(sessionID)
+        evictSnapshotsIfNeeded()
+    }
+
+    private func touchSnapshot(_ sessionID: String) {
+        snapshotAccessOrder.removeAll(where: { $0 == sessionID })
+        snapshotAccessOrder.append(sessionID)
+    }
+
+    private func evictSnapshotsIfNeeded() {
+        while snapshotsBySession.count > Self.maxTrackedSnapshots,
+              let leastRecentlyUsedSessionID = snapshotAccessOrder.first
+        {
+            snapshotAccessOrder.removeFirst()
+            snapshotsBySession.removeValue(forKey: leastRecentlyUsedSessionID)
+        }
+    }
 }
 
 @MainActor
 final class TranscriptScrollTracker {
-    private var metrics = ScrollMetrics()
+    private var viewportBottomY: CGFloat = 0
+    private var contentBottomY: CGFloat = 0
     private var lastDistanceFromBottom: CGFloat?
 
     func update(
         viewportBottomY: CGFloat? = nil,
         contentBottomY: CGFloat? = nil
     ) -> CGFloat? {
-        var updatedMetrics = metrics
+        var didUpdateMetrics = false
 
-        if let viewportBottomY, viewportBottomY.isFinite, viewportBottomY >= 0 {
-            updatedMetrics.viewportBottomY = viewportBottomY
+        if let viewportBottomY, viewportBottomY.isFinite, viewportBottomY >= 0,
+           viewportBottomY != self.viewportBottomY
+        {
+            self.viewportBottomY = viewportBottomY
+            didUpdateMetrics = true
         }
 
-        if let contentBottomY, contentBottomY.isFinite, contentBottomY >= 0 {
-            updatedMetrics.contentBottomY = contentBottomY
+        if let contentBottomY, contentBottomY.isFinite, contentBottomY >= 0,
+           contentBottomY != self.contentBottomY
+        {
+            self.contentBottomY = contentBottomY
+            didUpdateMetrics = true
         }
 
-        guard updatedMetrics != metrics else {
+        guard didUpdateMetrics else {
             return nil
         }
 
-        metrics = updatedMetrics
-
-        guard updatedMetrics.viewportBottomY > 0, updatedMetrics.contentBottomY > 0 else {
+        guard self.viewportBottomY > 0, self.contentBottomY > 0 else {
             return nil
         }
 
-        let distanceFromBottom = max(0, updatedMetrics.contentBottomY - updatedMetrics.viewportBottomY)
+        let distanceFromBottom = max(0, self.contentBottomY - self.viewportBottomY)
         guard distanceFromBottom != lastDistanceFromBottom else {
             return nil
         }
@@ -1101,7 +1144,8 @@ final class TranscriptScrollTracker {
     }
 
     func reset() {
-        metrics = ScrollMetrics()
+        viewportBottomY = 0
+        contentBottomY = 0
         lastDistanceFromBottom = nil
     }
 }

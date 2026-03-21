@@ -57,6 +57,28 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(coordinator.shouldFollowLiveOutput)
     }
 
+    func testTranscriptScrollCoordinatorDefersRestoreUntilHistoryFinishesLoading() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        XCTAssertNil(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: true
+            )
+        )
+
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .bottom
+        )
+        XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
     func testTranscriptScrollCoordinatorRestoresDetachedSessionAtSavedOffset() {
         let coordinator = TranscriptScrollCoordinator()
 
@@ -108,6 +130,41 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         XCTAssertTrue(coordinator.shouldFollowLiveOutput)
+    }
+
+    func testTranscriptScrollCoordinatorEvictsLeastRecentlyUsedSnapshots() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        for index in 0..<64 {
+            let sessionID = "session-\(index)"
+            coordinator.activateSession(sessionID)
+            _ = coordinator.update(
+                observation: TranscriptScrollObservation(
+                    contentOffsetY: CGFloat(index * 10),
+                    distanceFromBottom: 120
+                ),
+                userDriven: true
+            )
+        }
+
+        coordinator.activateSession("session-0")
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .bottom
+        )
+
+        coordinator.activateSession("session-63")
+        XCTAssertEqual(
+            coordinator.restoreIntentIfNeeded(
+                hasVisibleTranscriptContent: true,
+                isLoadingHistory: false
+            ),
+            .point(630)
+        )
+        XCTAssertFalse(coordinator.shouldFollowLiveOutput)
     }
 
     func testStableDigestIsDeterministicForKnownInput() {
