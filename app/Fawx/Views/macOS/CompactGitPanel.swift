@@ -112,7 +112,22 @@ struct CompactGitPanelSnapshot: Equatable {
         }
     }
 
-    private static let previewLineLimit = 80
+    private struct StatusDetails {
+        let branchTitle: String
+        let statusBadgeLabel: String
+        let statusTone: StatusTone
+        let statusSummary: String
+        let changedFileCount: Int
+    }
+
+    private struct DiffPreview {
+        let title: String
+        let lines: [String]
+        let lineCountLabel: String
+        let isTruncated: Bool
+    }
+
+    private static let diffPreviewLineLimit = 80
 
     let primaryState: PrimaryState
     let branchTitle: String
@@ -139,21 +154,12 @@ struct CompactGitPanelSnapshot: Equatable {
             errorMessage: viewModel.errorMessage
         )
 
-        if let status = viewModel.status {
-            branchTitle = status.branch
-            statusBadgeLabel = status.clean ? "Clean" : "Dirty"
-            statusTone = status.clean ? .success : .warning
-            statusSummary = Self.statusSummary(for: status)
-            changedFileCount = status.files.count
-        } else {
-            branchTitle = "Git"
-            statusBadgeLabel = viewModel.isLoading ? "Loading" : "Unknown"
-            statusTone = .neutral
-            statusSummary = viewModel.isLoading
-                ? "Loading working tree status..."
-                : "Inspect working tree status, commit changes, and sync with remote."
-            changedFileCount = 0
-        }
+        let statusDetails = Self.statusDetails(from: viewModel)
+        branchTitle = statusDetails.branchTitle
+        statusBadgeLabel = statusDetails.statusBadgeLabel
+        statusTone = statusDetails.statusTone
+        statusSummary = statusDetails.statusSummary
+        changedFileCount = statusDetails.changedFileCount
 
         stagedFileCount = viewModel.stagedFiles.count
         unstagedFileCount = viewModel.unstagedFiles.count
@@ -161,12 +167,14 @@ struct CompactGitPanelSnapshot: Equatable {
         canStageAll = !viewModel.unstagedFiles.isEmpty && !viewModel.isPerformingAction
         canPush = !viewModel.isPerformingAction
         canCommit = viewModel.canCommit && !viewModel.isPerformingAction
-        diffTitle = viewModel.selectedFilePath ?? "Diff Preview"
-
-        let diffLines = Self.diffLines(from: viewModel.displayedDiff)
-        previewLines = Array(diffLines.prefix(Self.previewLineLimit))
-        previewLineCountLabel = Self.previewLineCountLabel(for: diffLines.count)
-        isDiffTruncated = diffLines.count > previewLines.count
+        let diffPreview = Self.diffPreview(
+            selectedFilePath: viewModel.selectedFilePath,
+            displayedDiff: viewModel.displayedDiff
+        )
+        diffTitle = diffPreview.title
+        previewLines = diffPreview.lines
+        previewLineCountLabel = diffPreview.lineCountLabel
+        isDiffTruncated = diffPreview.isTruncated
     }
 
     private static func primaryState(
@@ -204,6 +212,43 @@ struct CompactGitPanelSnapshot: Equatable {
         return "\(count) staged \(fileLabel)"
     }
 
+    @MainActor
+    private static func statusDetails(from viewModel: GitViewModel) -> StatusDetails {
+        if let status = viewModel.status {
+            return StatusDetails(
+                branchTitle: status.branch,
+                statusBadgeLabel: status.clean ? "Clean" : "Dirty",
+                statusTone: status.clean ? .success : .warning,
+                statusSummary: statusSummary(for: status),
+                changedFileCount: status.files.count
+            )
+        }
+
+        return StatusDetails(
+            branchTitle: "Git",
+            statusBadgeLabel: viewModel.isLoading ? "Loading" : "Unknown",
+            statusTone: .neutral,
+            statusSummary: viewModel.isLoading
+                ? "Loading working tree status..."
+                : "Inspect working tree status, commit changes, and sync with remote.",
+            changedFileCount: 0
+        )
+    }
+
+    private static func diffPreview(
+        selectedFilePath: String?,
+        displayedDiff: String
+    ) -> DiffPreview {
+        let diffLines = diffLines(from: displayedDiff)
+        let previewLines = Array(diffLines.prefix(diffPreviewLineLimit))
+        return DiffPreview(
+            title: selectedFilePath ?? "Diff Preview",
+            lines: previewLines,
+            lineCountLabel: previewLineCountLabel(for: diffLines.count),
+            isTruncated: diffLines.count > previewLines.count
+        )
+    }
+
     private static func diffLines(from displayedDiff: String) -> [String] {
         guard displayedDiff.isEmpty == false else {
             return []
@@ -219,7 +264,7 @@ struct CompactGitPanelSnapshot: Equatable {
             return "0"
         }
 
-        return "\(min(totalLineCount, previewLineLimit))/\(totalLineCount)"
+        return "\(min(totalLineCount, diffPreviewLineLimit))/\(totalLineCount)"
     }
 }
 
@@ -228,7 +273,7 @@ private struct GitCompactHeaderCard: View {
     let dismissAction: () -> Void
 
     var body: some View {
-        GitCompactCard(spacing: FawxSpacing.paddingMD) {
+        FawxSurfaceCard(spacing: FawxSpacing.paddingMD) {
             HStack(alignment: .center, spacing: FawxSpacing.paddingSM) {
                 Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
                     .foregroundStyle(Color.fawxAccent)
@@ -268,7 +313,7 @@ private struct GitQuickActionsCard: View {
     let openFullViewAction: () -> Void
 
     var body: some View {
-        GitCompactCard(spacing: FawxSpacing.paddingMD) {
+        FawxSurfaceCard(spacing: FawxSpacing.paddingMD) {
             Text("Quick Actions")
                 .font(FawxTypography.heading2)
                 .foregroundStyle(Color.fawxText)
@@ -331,7 +376,7 @@ private struct GitFilesCard: View {
     @Bindable var viewModel: GitViewModel
 
     var body: some View {
-        GitCompactCard(spacing: FawxSpacing.paddingMD) {
+        FawxSurfaceCard(spacing: FawxSpacing.paddingMD) {
             HStack {
                 Text("Changed Files")
                     .font(FawxTypography.heading2)
@@ -388,7 +433,7 @@ private struct GitDiffCard: View {
     let snapshot: CompactGitPanelSnapshot
 
     var body: some View {
-        GitCompactCard(spacing: FawxSpacing.paddingMD) {
+        FawxSurfaceCard(spacing: FawxSpacing.paddingMD) {
             HStack {
                 Text(snapshot.diffTitle)
                     .font(FawxTypography.heading2)
@@ -430,32 +475,6 @@ private struct GitDiffCard: View {
             .frame(maxHeight: 220)
             .background(Color.fawxCode)
             .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        }
-    }
-}
-
-private struct GitCompactCard<Content: View>: View {
-    let spacing: CGFloat
-    let content: Content
-
-    init(
-        spacing: CGFloat = FawxSpacing.paddingMD,
-        @ViewBuilder content: () -> Content
-    ) {
-        self.spacing = spacing
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            content
-        }
-        .padding(FawxSpacing.paddingLG)
-        .background(Color.fawxSurface)
-        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        .overlay {
-            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                .stroke(Color.fawxBorder, lineWidth: 1)
         }
     }
 }

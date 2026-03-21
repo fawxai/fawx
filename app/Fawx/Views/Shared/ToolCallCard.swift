@@ -13,52 +13,22 @@ struct ToolCallCard: View {
     }
 
     var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            cardContent
+
+            Spacer(minLength: FawxSpacing.transcriptEdgeClamp)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var cardContent: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
             Button {
                 withAnimation(.easeInOut(duration: 0.18)) {
                     isExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: FawxSpacing.paddingSM) {
-                    Image(systemName: "wrench.and.screwdriver")
-                        .foregroundStyle(statusColor)
-                        .padding(8)
-                        .background(statusColor.opacity(FawxOpacity.fillSubtle))
-                        .clipShape(Circle())
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(toolCall.displayName)
-                            .font(FawxTypography.sidebarTitle)
-                            .foregroundStyle(Color.fawxText)
-                            .lineLimit(1)
-
-                        Text(detailSummary)
-                            .font(FawxTypography.status)
-                            .foregroundStyle(Color.fawxTextSecondary)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    if toolCall.isRunning {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-
-                    Text(statusText)
-                        .font(FawxTypography.status)
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, FawxSpacing.paddingSM)
-                        .padding(.vertical, FawxSpacing.paddingXS)
-                        .background(statusColor.opacity(FawxOpacity.fillSubtle))
-                        .clipShape(Capsule())
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("Status \(statusText)")
-
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Color.fawxTextSecondary)
-                }
+                headerButtonLabel
             }
             .buttonStyle(.plain)
             .accessibilityLabel(toolCallAccessibilityLabel)
@@ -82,7 +52,6 @@ struct ToolCallCard: View {
         }
         .padding(FawxSpacing.paddingMD)
         .frame(maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth), alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .background(cardBackground)
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
@@ -93,6 +62,49 @@ struct ToolCallCard: View {
             if !isRunning {
                 isExpanded = false
             }
+        }
+    }
+
+    private var headerButtonLabel: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            Image(systemName: "wrench.and.screwdriver")
+                .foregroundStyle(statusColor)
+                .padding(8)
+                .background(statusColor.opacity(FawxOpacity.fillSubtle))
+                .clipShape(Circle())
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(toolCall.displayName)
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+                    .lineLimit(1)
+
+                Text(detailSummary)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+
+            if toolCall.isRunning {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Text(statusText)
+                .font(FawxTypography.status)
+                .foregroundStyle(statusColor)
+                .padding(.horizontal, FawxSpacing.paddingSM)
+                .padding(.vertical, FawxSpacing.paddingXS)
+                .background(statusColor.opacity(FawxOpacity.fillSubtle))
+                .clipShape(Capsule())
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Status \(statusText)")
+
+            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.fawxTextSecondary)
         }
     }
 

@@ -38,7 +38,7 @@ struct MessageBubble: View {
     private var bubbleContent: some View {
         HStack {
             if role == .user {
-                Spacer(minLength: 48)
+                Spacer(minLength: FawxSpacing.transcriptEdgeClamp)
             }
 
             VStack(alignment: role == .user ? .trailing : .leading, spacing: FawxSpacing.paddingSM) {
@@ -62,7 +62,7 @@ struct MessageBubble: View {
             )
 
             if role != .user {
-                Spacer(minLength: 48)
+                Spacer(minLength: FawxSpacing.transcriptEdgeClamp)
             }
         }
         .frame(maxWidth: .infinity)

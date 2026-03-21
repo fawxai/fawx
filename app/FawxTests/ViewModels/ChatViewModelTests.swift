@@ -45,6 +45,51 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.transcriptItems.compactMap(\.sessionMessage), [cachedMessage])
     }
 
+    func testApplyFetchedMessagesPreservesOptimisticLocalTailWhenResponseIsStale() {
+        let sut = makeSUT()
+        let history = SessionMessage(role: .assistant, content: "earlier", timestamp: 10)
+        let localUserMessage = SessionMessage(role: .user, content: "send this", timestamp: 11)
+
+        sut.cacheMessages([history, localUserMessage], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting([history], sessionID: "session-a")
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            ["earlier", "send this"]
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).map(\.content),
+            ["earlier", "send this"]
+        )
+    }
+
+    func testApplyFetchedMessagesReplacesOptimisticTailWhenServerCatchesUp() {
+        let sut = makeSUT()
+        let history = SessionMessage(role: .assistant, content: "earlier", timestamp: 10)
+        let localUserMessage = SessionMessage(role: .user, content: "send this", timestamp: 11)
+        let fetchedUserMessage = SessionMessage(role: .user, content: "send this", timestamp: 22)
+        let fetchedAssistantMessage = SessionMessage(role: .assistant, content: "done", timestamp: 23)
+
+        sut.cacheMessages([history, localUserMessage], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(
+            [history, fetchedUserMessage, fetchedAssistantMessage],
+            sessionID: "session-a"
+        )
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.timestamp),
+            [10, 22, 23]
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).map(\.content),
+            ["earlier", "send this", "done"]
+        )
+    }
+
     func testPrepareToDisplaySessionShowsLoadingStateWhenCacheIsMissing() {
         let sut = makeSUT()
 

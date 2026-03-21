@@ -111,6 +111,7 @@ struct Sidebar: View {
 #if os(macOS)
         colorScheme == .light && controlActiveState == .key && isSelectingSessions == false
 #else
+        // iOS uses the default symbol tint because control focus state is a macOS-only concern.
         false
 #endif
     }
