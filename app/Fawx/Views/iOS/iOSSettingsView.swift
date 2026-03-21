@@ -10,6 +10,7 @@ private enum SettingsRoute: Hashable {
     case telemetry
     case synthesis
     case usage
+    case legal(LegalDocument)
 }
 
 struct iOSSettingsView: View {
@@ -99,6 +100,14 @@ struct iOSSettingsView: View {
                     AppearanceSettingsPanel(appState: appState)
                 }
 
+                Section("Legal") {
+                    ForEach(LegalDocument.allCases) { document in
+                        NavigationLink(value: SettingsRoute.legal(document)) {
+                            Text(document.title)
+                        }
+                    }
+                }
+
                 if let status = settingsViewModel.testStatusMessage {
                     Section("Status") {
                         Text(status)
@@ -147,6 +156,8 @@ struct iOSSettingsView: View {
                     iOSSynthesisSettingsView(synthesisViewModel: synthesisViewModel)
                 case .usage:
                     iOSUsageSettingsView(usageViewModel: usageViewModel)
+                case .legal(let document):
+                    LegalDocumentView(title: document.title, resourceName: document.resourceName)
                 }
             }
             .task {

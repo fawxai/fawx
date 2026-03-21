@@ -7,6 +7,16 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1B2C3D4E5F6012345678911 /* LegalDocumentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678901 /* LegalDocumentView.swift */; };
+		A1B2C3D4E5F6012345678912 /* LegalSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678902 /* LegalSection.swift */; };
+		A1B2C3D4E5F6012345678913 /* privacy-policy.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678905 /* privacy-policy.md */; };
+		A1B2C3D4E5F6012345678914 /* terms-of-service.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678906 /* terms-of-service.md */; };
+		A1B2C3D4E5F6012345678915 /* eula.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678907 /* eula.md */; };
+		A1B2C3D4E5F6012345678921 /* LegalDocumentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678901 /* LegalDocumentView.swift */; };
+		A1B2C3D4E5F6012345678922 /* LegalSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678902 /* LegalSection.swift */; };
+		A1B2C3D4E5F6012345678923 /* privacy-policy.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678905 /* privacy-policy.md */; };
+		A1B2C3D4E5F6012345678924 /* terms-of-service.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678906 /* terms-of-service.md */; };
+		A1B2C3D4E5F6012345678925 /* eula.md in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6012345678907 /* eula.md */; };
 		006C393D671A0BF5A1558DD3 /* FleetViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E169169568792E2446F8066 /* FleetViewModelTests.swift */; };
 		009504689DAF5953AC83F803 /* UsageSettingsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EBAC07324B5BA38831E8F87 /* UsageSettingsPanel.swift */; };
 		014AA085FD64490EA9FFADC9 /* IOSViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EBEBAEBE84A36EC81E2FC6C /* IOSViewModifiers.swift */; };
@@ -325,6 +335,8 @@
 		068E87A8E0FC1B301B9E706B /* SynthesisViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SynthesisViewModel.swift; sourceTree = "<group>"; };
 		0824368A956175BC978FD520 /* PermissionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTests.swift; sourceTree = "<group>"; };
 		087BAB7361F5CCDC27BA6864 /* InputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputBar.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6012345678901 /* LegalDocumentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegalDocumentView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6012345678902 /* LegalSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegalSection.swift; sourceTree = "<group>"; };
 		0BB6669269ABF48F358AEAE2 /* SparkleUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparkleUpdaterTests.swift; sourceTree = "<group>"; };
 		0BC1890444EF1EA2B509EA92 /* PermissionsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewModel.swift; sourceTree = "<group>"; };
 		11BFF651D03E0E963581BB73 /* Usage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Usage.swift; sourceTree = "<group>"; };
@@ -432,6 +444,9 @@
 		CFDA886EBEC15236873ABBFE /* OAuthSessionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthSessionCoordinator.swift; sourceTree = "<group>"; };
 		D041CDF267A8EE4EEC1BEE7E /* FawxClientFleetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FawxClientFleetTests.swift; sourceTree = "<group>"; };
 		D077EA1389A1D84FDB7D0DF4 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		A1B2C3D4E5F6012345678905 /* privacy-policy.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "privacy-policy.md"; sourceTree = "<group>"; };
+		A1B2C3D4E5F6012345678906 /* terms-of-service.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "terms-of-service.md"; sourceTree = "<group>"; };
+		A1B2C3D4E5F6012345678907 /* eula.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = eula.md; sourceTree = "<group>"; };
 		D08FE445D7033AAED2208E6D /* AuthProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthProvider.swift; sourceTree = "<group>"; };
 		D4567A3E8C8FEA6832E659D6 /* Sidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sidebar.swift; sourceTree = "<group>"; };
 		D4F028D9A2F45FDF68988B92 /* ReadyStep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadyStep.swift; sourceTree = "<group>"; };
@@ -597,6 +612,24 @@
 			path = Theme;
 			sourceTree = "<group>";
 		};
+		A1B2C3D4E5F6012345678903 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F6012345678904 /* Legal */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		A1B2C3D4E5F6012345678904 /* Legal */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F6012345678907 /* eula.md */,
+				A1B2C3D4E5F6012345678905 /* privacy-policy.md */,
+				A1B2C3D4E5F6012345678906 /* terms-of-service.md */,
+			);
+			path = Legal;
+			sourceTree = "<group>";
+		};
 		6AEA34E2E5AC4BCACC4A3F78 /* Views */ = {
 			isa = PBXGroup;
 			children = (
@@ -667,6 +700,8 @@
 				F20A0B1C2D3E4F5001000011 /* GitPanelPresentation.swift */,
 				040A9F601AB8F38E19635FB7 /* GitView.swift */,
 				087BAB7361F5CCDC27BA6864 /* InputBar.swift */,
+				A1B2C3D4E5F6012345678901 /* LegalDocumentView.swift */,
+				A1B2C3D4E5F6012345678902 /* LegalSection.swift */,
 				9E4BE9EBBB93059B1E6AA12C /* MarketplaceView.swift */,
 				B1AB5E3BFD623318C9101192 /* MessageBubble.swift */,
 				A34A4F474A3C63738988C4F0 /* ModelBadge.swift */,
@@ -782,6 +817,7 @@
 				713F091567660FA3AFF35B0A /* Fawx-macOS.entitlements */,
 				BF12295CE0C29C6C7ED2BD54 /* FawxApp.swift */,
 				D077EA1389A1D84FDB7D0DF4 /* LaunchScreen.storyboard */,
+				A1B2C3D4E5F6012345678903 /* Resources */,
 				C4DA1FEFE6FA49D5FE62D82A /* Models */,
 				05F41FE09EDAF85D43F2CA4A /* Networking */,
 				EADC3BE26D8393E572EDBB38 /* Services */,
@@ -971,6 +1007,9 @@
 			files = (
 				23C4B0BE9349C4A73A13AE67 /* Assets.xcassets in Resources */,
 				5295DBC82082FCA160FFBDA3 /* LaunchScreen.storyboard in Resources */,
+				A1B2C3D4E5F6012345678915 /* eula.md in Resources */,
+				A1B2C3D4E5F6012345678913 /* privacy-policy.md in Resources */,
+				A1B2C3D4E5F6012345678914 /* terms-of-service.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -987,6 +1026,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				C611442CECB052D61D6D94BA /* Assets.xcassets in Resources */,
+				A1B2C3D4E5F6012345678925 /* eula.md in Resources */,
+				A1B2C3D4E5F6012345678923 /* privacy-policy.md in Resources */,
+				A1B2C3D4E5F6012345678924 /* terms-of-service.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1050,6 +1092,8 @@
 				D73B20577E4D72839E8CF03F /* LocalInstallConfiguration.swift in Sources */,
 				56C2896BCB25E4A60ECBC5D1 /* MarketplaceSkill.swift in Sources */,
 				0E7F83F21C2A2C67928A8532 /* MarketplaceView.swift in Sources */,
+				A1B2C3D4E5F6012345678911 /* LegalDocumentView.swift in Sources */,
+				A1B2C3D4E5F6012345678912 /* LegalSection.swift in Sources */,
 				D4551B798E24F3271AE6B2A6 /* MenuBarManager.swift in Sources */,
 				F20E7D3BE2C2F6699B77BB81 /* MenuBarView.swift in Sources */,
 				9457A7C6B886EC371CBEAFD1 /* Message.swift in Sources */,
@@ -1164,6 +1208,8 @@
 				F04F056E502BC686DD9C3664 /* LocalInstallConfiguration.swift in Sources */,
 				979C00A477B8D19CDF085BD5 /* MarketplaceSkill.swift in Sources */,
 				486CBA0B4DDE46C94109D506 /* MarketplaceView.swift in Sources */,
+				A1B2C3D4E5F6012345678921 /* LegalDocumentView.swift in Sources */,
+				A1B2C3D4E5F6012345678922 /* LegalSection.swift in Sources */,
 				507248C881040AFF9CB2DEC5 /* MenuBarManager.swift in Sources */,
 				083BFB742FEB1646BADEED64 /* MenuBarView.swift in Sources */,
 				9A76360123AE9FF61DC105D3 /* Message.swift in Sources */,
