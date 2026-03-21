@@ -115,6 +115,14 @@ struct RipcordStatusResponse: Codable, Sendable, Hashable {
         return "description:\(displayDescription)"
     }
 
+    var hasJournaledActions: Bool {
+        entryCount > 0
+    }
+
+    var shouldSurfaceNotification: Bool {
+        active && hasJournaledActions
+    }
+
     var entryCountLabel: String {
         "\(entryCount) action\(entryCount == 1 ? "" : "s") journaled"
     }

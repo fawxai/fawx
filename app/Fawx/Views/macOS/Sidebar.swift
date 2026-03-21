@@ -23,7 +23,7 @@ struct Sidebar: View {
 
     @Bindable var sessionViewModel: SessionViewModel
     let selection: SidebarSelection?
-    let streamingSessionID: String?
+    let streamingSessionIDs: Set<String>
     let actions: ActionHandlers
 
     @State private var pendingClearSession: Session?
@@ -172,7 +172,7 @@ struct Sidebar: View {
             SessionRowView(
                 session: session,
                 isSelected: rowIsSelected(session.id),
-                isStreaming: session.id == streamingSessionID,
+                isStreaming: streamingSessionIDs.contains(session.id),
                 showsSelectionControl: isSelectingSessions,
                 isMarkedForBulkAction: selectedSessionIDs.contains(session.id)
             )

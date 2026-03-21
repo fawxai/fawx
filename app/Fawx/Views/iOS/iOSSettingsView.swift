@@ -26,6 +26,7 @@ struct iOSSettingsView: View {
     let openFleet: () -> Void
     let openExperiments: () -> Void
     let openGit: () -> Void
+    let isActive: Bool
 
     @State private var navigationPath: [SettingsRoute] = []
     @State private var isShowingQRScanner = false
@@ -160,7 +161,10 @@ struct iOSSettingsView: View {
                     LegalDocumentView(title: document.title, resourceName: document.resourceName)
                 }
             }
-            .task {
+            .task(id: isActive) {
+                guard isActive else {
+                    return
+                }
                 if appState.isConfigured {
                     await appState.revalidateConnection(allowReconnect: false)
                     await appState.refreshSettingsState()

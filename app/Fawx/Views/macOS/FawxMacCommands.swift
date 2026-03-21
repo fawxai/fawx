@@ -100,8 +100,8 @@ struct FawxMacCommands: Commands {
         }
 
         Task { @MainActor in
-            if chatViewModel.activeStreamSessionID == selectedSessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(selectedSessionID) {
+                chatViewModel.stopStreaming(sessionID: selectedSessionID)
             }
 
             let didClear = await sessionViewModel.clearSession(id: selectedSessionID)

@@ -703,15 +703,21 @@ fn session_blocks_from_response(
         .into_iter()
         .filter_map(session_block_from_content)
         .collect::<Vec<_>>();
-    blocks.extend(
-        tool_calls
-            .into_iter()
-            .map(|call| SessionContentBlock::ToolUse {
-                id: call.id,
-                name: call.name,
-                input: call.arguments,
-            }),
-    );
+    let has_tool_use_blocks = blocks
+        .iter()
+        .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    if !has_tool_use_blocks {
+        blocks.extend(
+            tool_calls
+                .into_iter()
+                .map(|call| SessionContentBlock::ToolUse {
+                    id: call.id,
+                    provider_id: None,
+                    name: call.name,
+                    input: call.arguments,
+                }),
+        );
+    }
     blocks
 }
 
@@ -3440,6 +3446,7 @@ mod tests {
     ) -> fx_llm::ToolUseDelta {
         fx_llm::ToolUseDelta {
             id: id.map(ToString::to_string),
+            provider_id: None,
             name: name.map(ToString::to_string),
             arguments_delta: arguments_delta.map(ToString::to_string),
             arguments_done,
@@ -3456,6 +3463,7 @@ mod tests {
                 },
                 fx_llm::ContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: None,
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "README.md"}),
                 },
@@ -3546,6 +3554,55 @@ mod tests {
             block,
             SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
         )));
+    }
+
+    #[test]
+    fn session_turn_collector_prefers_content_tool_use_blocks_over_tool_call_fallback() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_3".to_string(),
+                provider_id: Some("fc_3".to_string()),
+                name: "weather".to_string(),
+                input: serde_json::json!({"location": "Denver, CO"}),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_3".to_string(),
+                name: "weather".to_string(),
+                arguments: serde_json::json!({"location": "Denver, CO"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn("weather in denver", &[], "fallback");
+
+        assert_eq!(messages.len(), 2);
+        let tool_use_blocks = messages[1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                SessionContentBlock::ToolUse {
+                    id,
+                    provider_id,
+                    name,
+                    input,
+                } => Some((id, provider_id, name, input)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_use_blocks.len(), 1);
+        assert!(matches!(
+            tool_use_blocks.as_slice(),
+            [(id, Some(provider_id), name, input)]
+                if *id == "call_3"
+                    && *provider_id == "fc_3"
+                    && *name == "weather"
+                    && **input == serde_json::json!({"location": "Denver, CO"})
+        ));
     }
 
     #[test]

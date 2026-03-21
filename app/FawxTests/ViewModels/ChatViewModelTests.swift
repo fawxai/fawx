@@ -172,6 +172,24 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.composerPhaseLabel, "Streaming in another session...")
     }
 
+    func testMultipleConcurrentStreamingSessionsAreTrackedIndependently() {
+        let sut = makeSUT()
+
+        sut.setStreamingSessionsForTesting(
+            [
+                "session-a": (text: "alpha", phase: .reason),
+                "session-b": (text: "beta", phase: .act),
+            ],
+            currentSessionID: "session-b"
+        )
+
+        XCTAssertEqual(sut.activeStreamSessionIDs, Set(["session-a", "session-b"]))
+        XCTAssertTrue(sut.isCurrentSessionStreaming)
+        XCTAssertTrue(sut.isStreamingInAnotherSession)
+        XCTAssertEqual(sut.visibleStreamingText, "beta")
+        XCTAssertEqual(sut.visibleCurrentPhase, .act)
+    }
+
     func testStreamingDisplayControllerCoalescesRapidTokensIntoOneFlush() async {
         var flushedChunks: [String] = []
         let sleeper = ControlledSleeper()
@@ -202,6 +220,12 @@ final class ChatViewModelTests: XCTestCase {
     func testStreamingDistanceDetachesAndRepinsAutoScroll() {
         let sut = makeSUT()
 
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+
         XCTAssertTrue(sut.shouldAutoScrollStreamingUpdates)
 
         sut.updateStreamingDistanceFromBottomForTesting(StreamingDisplayController.bottomThreshold + 20)
@@ -218,17 +242,23 @@ final class ChatViewModelTests: XCTestCase {
     func testStreamEndFlushesBufferedTokensImmediately() async throws {
         let sut = makeSUT()
 
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+
         sut.appendStreamingTokenForTesting("tail")
 
-        XCTAssertEqual(sut.streamingText, "")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "")
 
         sut.flushStreamingDisplayForTesting()
 
-        XCTAssertEqual(sut.streamingText, "tail")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "tail")
 
         try await Task.sleep(for: .milliseconds(80))
 
-        XCTAssertEqual(sut.streamingText, "tail")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "tail")
     }
 
     func testStreamingDisplayControllerPreservesDetachedStateWhenStreamEnds() {
@@ -424,7 +454,7 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(sut.queuedMessage)
     }
 
-    func testQueuedMessageDeliveryDiscardsOnSessionMismatch() {
+    func testQueuedMessageDeliveryKeepsQueuedMessageWhenDifferentSessionFinishes() {
         let sut = makeSUT(connectionStatus: .connected)
 
         sut.prepareToDisplaySession("session-a")
@@ -439,7 +469,13 @@ final class ChatViewModelTests: XCTestCase {
         let delivery = sut.consumeQueuedMessageForTesting(finishedSessionID: "session-c")
 
         XCTAssertNil(delivery)
+        XCTAssertEqual(sut.queuedMessage, "follow up")
+
+        sut.prepareToDisplaySession("session-c")
         XCTAssertNil(sut.queuedMessage)
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.queuedMessage, "follow up")
     }
 
     func testSendDraftSendsImmediatelyWhenAnotherSessionIsStreaming() async {

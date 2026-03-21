@@ -19,12 +19,13 @@ use axum::Json;
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
-use fx_llm::{trim_conversation_history, Message};
+use fx_llm::{trim_conversation_history, ContentBlock, Message};
 use fx_session::{
     SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
     SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -293,9 +294,48 @@ pub(crate) async fn handle_send_message_for_session(
 }
 
 pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
-    messages
+    let context = messages
         .iter()
         .map(SessionMessage::to_llm_message)
+        .collect();
+    prune_unresolved_tool_context(context)
+}
+
+fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
+    let tool_use_ids = messages
+        .iter()
+        .flat_map(|message| {
+            message.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+        })
+        .collect::<HashSet<_>>();
+    let tool_result_ids = messages
+        .iter()
+        .flat_map(|message| {
+            message.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+        })
+        .collect::<HashSet<_>>();
+    let unresolved_tool_use_ids = tool_use_ids
+        .iter()
+        .filter(|id| !tool_result_ids.contains(*id))
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    messages
+        .into_iter()
+        .filter_map(|mut message| {
+            message.content.retain(|block| match block {
+                ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+            });
+            (!message.content.is_empty()).then_some(message)
+        })
         .collect()
 }
 
@@ -523,4 +563,64 @@ fn session_bus_unavailable() -> (StatusCode, Json<ErrorBody>) {
             error: "session bus not available".to_string(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fx_session::{MessageRole as SessionMessageRole, SessionContentBlock};
+
+    #[test]
+    fn session_messages_to_context_drops_unresolved_tool_use_messages() {
+        let messages = vec![
+            SessionMessage::text(SessionMessageRole::User, "first", 1),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                4,
+                None,
+            ),
+        ];
+
+        let context = session_messages_to_context(&messages);
+
+        assert_eq!(context.len(), 3);
+        assert!(context.iter().flat_map(|message| &message.content).any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { id, .. } if id == "call_good"
+            )
+        }));
+        assert!(!context.iter().flat_map(|message| &message.content).any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { id, .. } if id == "call_bad"
+            )
+        }));
+    }
 }

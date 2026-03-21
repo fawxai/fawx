@@ -239,11 +239,17 @@ impl OpenAiResponsesProvider {
     fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
         let response_text = collect_output_text(&body.output);
         let tool_calls = collect_tool_calls(&body.output);
+        let tool_use_blocks = collect_tool_use_blocks(&body.output);
+        let mut content = Vec::new();
+        if !response_text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: response_text,
+            });
+        }
+        content.extend(tool_use_blocks);
 
         CompletionResponse {
-            content: vec![ContentBlock::Text {
-                text: response_text,
-            }],
+            content,
             usage: body.usage.map(|u| Usage {
                 input_tokens: u.input_tokens.unwrap_or(0) as u32,
                 output_tokens: u.output_tokens.unwrap_or(0) as u32,
@@ -520,10 +526,16 @@ fn accumulate_stream_chunk(accumulator: &mut StreamAccumulator, chunk: StreamChu
 }
 
 fn completion_from_accumulator(accumulator: StreamAccumulator) -> CompletionResponse {
+    let mut content = Vec::new();
+    if !accumulator.text.is_empty() {
+        content.push(ContentBlock::Text {
+            text: accumulator.text.clone(),
+        });
+    }
+    content.extend(tool_use_blocks_from_pending(&accumulator.pending_tool_calls));
+
     CompletionResponse {
-        content: vec![ContentBlock::Text {
-            text: accumulator.text,
-        }],
+        content,
         tool_calls: finalize_tool_calls(accumulator.pending_tool_calls),
         usage: accumulator.usage,
         stop_reason: accumulator.stop_reason,
@@ -581,7 +593,8 @@ fn tool_delta_from_arguments_event(data: &str, is_done_event: bool) -> Option<To
     } else {
         parsed.delta
     };
-    let id = parsed.item_id.or(parsed.call_id);
+    let provider_id = parsed.item_id;
+    let id = parsed.call_id.or(provider_id.clone());
 
     if id.is_none() && parsed.name.is_none() && arguments_delta.is_none() {
         return None;
@@ -589,6 +602,7 @@ fn tool_delta_from_arguments_event(data: &str, is_done_event: bool) -> Option<To
 
     Some(ToolUseDelta {
         id,
+        provider_id,
         name: parsed.name,
         arguments_delta,
         arguments_done: is_done_event,
@@ -603,7 +617,8 @@ fn tool_delta_from_output_item_event(data: &str, is_done_event: bool) -> Option<
     }
 
     let arguments_delta = item.arguments.filter(|arguments| !arguments.is_empty());
-    let id = item.id.or(item.call_id).or(parsed.item_id);
+    let provider_id = item.id.or(parsed.item_id);
+    let id = item.call_id.or(provider_id.clone());
     let name = item.name;
     if id.is_none() && name.is_none() && arguments_delta.is_none() {
         return None;
@@ -611,6 +626,7 @@ fn tool_delta_from_output_item_event(data: &str, is_done_event: bool) -> Option<
 
     Some(ToolUseDelta {
         id,
+        provider_id,
         name,
         arguments_delta,
         arguments_done: is_done_event,
@@ -779,6 +795,7 @@ fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Resu
     for block in blocks {
         if let ContentBlock::ToolUse {
             id,
+            provider_id,
             name,
             input: tool_input,
         } = block
@@ -787,7 +804,7 @@ fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Resu
                 .map_err(|error| LlmError::Serialization(error.to_string()))?;
             input.push(json!({
                 "type": "function_call",
-                "id": id,
+                "id": provider_id.as_deref().unwrap_or(id),
                 "call_id": id,
                 "name": name,
                 "arguments": arguments,
@@ -987,6 +1004,8 @@ struct ResponsesOutputItem {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
@@ -1112,7 +1131,10 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
             continue;
         }
 
-        if let (Some(id), Some(name), Some(arguments)) = (&item.id, &item.name, &item.arguments) {
+        let Some(id) = item.call_id.as_ref().or(item.id.as_ref()) else {
+            continue;
+        };
+        if let (Some(name), Some(arguments)) = (&item.name, &item.arguments) {
             let raw_args = crate::normalize_tool_arguments(arguments);
             let arguments_value = match serde_json::from_str::<Value>(raw_args) {
                 Ok(value) => value,
@@ -1130,9 +1152,42 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
     tool_calls
 }
 
+fn collect_tool_use_blocks(output: &[ResponsesOutputItem]) -> Vec<ContentBlock> {
+    output
+        .iter()
+        .filter_map(tool_use_block_from_item)
+        .collect()
+}
+
+fn tool_use_block_from_item(item: &ResponsesOutputItem) -> Option<ContentBlock> {
+    if item.r#type.as_deref() != Some("function_call") {
+        return None;
+    }
+
+    let id = item.call_id.as_ref().or(item.id.as_ref())?.clone();
+    let provider_id = item
+        .id
+        .as_ref()
+        .filter(|provider_id| provider_id.as_str() != id.as_str())
+        .cloned();
+    let name = item.name.as_ref()?.clone();
+    let arguments = item.arguments.as_ref()?;
+    let raw_args = crate::normalize_tool_arguments(arguments);
+    let input =
+        serde_json::from_str::<Value>(raw_args).unwrap_or_else(|_| Value::String(arguments.clone()));
+
+    Some(ContentBlock::ToolUse {
+        id,
+        provider_id,
+        name,
+        input,
+    })
+}
+
 #[derive(Default)]
 struct PendingToolCall {
     id: Option<String>,
+    provider_id: Option<String>,
     name: Option<String>,
     arguments: String,
 }
@@ -1145,7 +1200,7 @@ fn merge_tool_use_deltas(pending: &mut Vec<PendingToolCall>, deltas: Vec<ToolUse
 }
 
 fn pending_tool_call_index(pending: &mut Vec<PendingToolCall>, delta: &ToolUseDelta) -> usize {
-    if let Some(index) = pending_index_by_id(pending, delta.id.as_deref()) {
+    if let Some(index) = pending_index_by_id(pending, delta) {
         return index;
     }
 
@@ -1157,30 +1212,43 @@ fn pending_tool_call_index(pending: &mut Vec<PendingToolCall>, delta: &ToolUseDe
     pending.len() - 1
 }
 
-fn pending_index_by_id(pending: &[PendingToolCall], id: Option<&str>) -> Option<usize> {
-    let id = id?;
+fn pending_index_by_id(pending: &[PendingToolCall], delta: &ToolUseDelta) -> Option<usize> {
     pending
         .iter()
-        .position(|call| call.id.as_deref() == Some(id))
+        .position(|call| identifiers_overlap(call, delta))
+}
+
+fn identifiers_overlap(call: &PendingToolCall, delta: &ToolUseDelta) -> bool {
+    let call_identifiers = [call.id.as_deref(), call.provider_id.as_deref()];
+    let delta_identifiers = [delta.id.as_deref(), delta.provider_id.as_deref()];
+
+    call_identifiers
+        .into_iter()
+        .flatten()
+        .any(|left| delta_identifiers.into_iter().flatten().any(|right| left == right))
 }
 
 fn pending_index_without_id(pending: &[PendingToolCall], delta: &ToolUseDelta) -> Option<usize> {
-    if delta.id.is_some() {
+    if delta.id.is_some() || delta.provider_id.is_some() {
         return pending.iter().rposition(|call| {
-            call.id.is_none() && same_or_unknown_name(call.name.as_deref(), delta.name.as_deref())
+            call.id.is_none()
+                && call.provider_id.is_none()
+                && same_or_unknown_name(call.name.as_deref(), delta.name.as_deref())
         });
     }
 
     if let Some(name) = delta.name.as_deref() {
         return pending.iter().rposition(|call| {
-            call.id.is_none() && same_or_unknown_name(call.name.as_deref(), Some(name))
+            call.id.is_none()
+                && call.provider_id.is_none()
+                && same_or_unknown_name(call.name.as_deref(), Some(name))
         });
     }
 
     pending
         .iter()
         .enumerate()
-        .filter(|(_, call)| call.id.is_none() || call.name.is_none())
+        .filter(|(_, call)| call.id.is_none() || call.provider_id.is_none() || call.name.is_none())
         .map(|(index, _)| index)
         // Use next_back() instead of last() to avoid needless full iteration
         // on this DoubleEndedIterator (clippy::double_ended_iterator_last).
@@ -1195,8 +1263,28 @@ fn same_or_unknown_name(left: Option<&str>, right: Option<&str>) -> bool {
 }
 
 fn apply_tool_use_delta(call: &mut PendingToolCall, delta: ToolUseDelta) {
-    if call.id.is_none() {
-        call.id = delta.id;
+    if let Some(incoming_id) = delta.id.clone() {
+        match call.id.as_deref() {
+            None => call.id = Some(incoming_id),
+            Some(current_id) if current_id == incoming_id => {}
+            Some(current_id)
+                if delta
+                    .provider_id
+                    .as_deref()
+                    .is_some_and(|provider_id| provider_id == current_id) =>
+            {
+                call.id = Some(incoming_id);
+            }
+            Some(_) => {
+                if call.provider_id.is_none() {
+                    call.provider_id = Some(incoming_id);
+                }
+            }
+        }
+    }
+
+    if call.provider_id.is_none() {
+        call.provider_id = delta.provider_id;
     }
 
     if call.name.is_none() {
@@ -1224,7 +1312,7 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
     pending
         .into_iter()
         .filter_map(|call| {
-            let id = call.id?.trim().to_string();
+            let id = call.id.or(call.provider_id)?.trim().to_string();
             let name = call.name?.trim().to_string();
             if id.is_empty() || name.is_empty() {
                 return None;
@@ -1237,6 +1325,35 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
                 id,
                 name,
                 arguments,
+            })
+        })
+        .collect()
+}
+
+fn tool_use_blocks_from_pending(pending: &[PendingToolCall]) -> Vec<ContentBlock> {
+    pending
+        .iter()
+        .filter_map(|call| {
+            let id = call.id.as_ref()?.trim();
+            let name = call.name.as_ref()?.trim();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+
+            let provider_id = call
+                .provider_id
+                .as_deref()
+                .filter(|provider_id| *provider_id != id)
+                .map(ToString::to_string);
+            let raw_args = crate::normalize_tool_arguments(&call.arguments).to_string();
+            let input =
+                serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
+
+            Some(ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id,
+                name: name.to_string(),
+                input,
             })
         })
         .collect()
@@ -1316,6 +1433,7 @@ mod tests {
             output: vec![ResponsesOutputItem {
                 r#type: None,
                 id: None,
+                call_id: None,
                 name: None,
                 arguments: None,
                 content: Some(vec![ResponsesContentPart {
@@ -1349,11 +1467,13 @@ mod tests {
             content: vec![
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
                     name: "lookup".to_string(),
                     input: serde_json::json!({"q": "first"}),
                 },
                 ContentBlock::ToolUse {
                     id: "call_2".to_string(),
+                    provider_id: Some("fc_2".to_string()),
                     name: "lookup".to_string(),
                     input: serde_json::json!({"q": "second"}),
                 },
@@ -1597,12 +1717,12 @@ mod tests {
             })
         );
         assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["id"], "call_1");
+        assert_eq!(input[1]["id"], "fc_1");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["name"], "lookup");
         assert_eq!(input[1]["arguments"], "{\"q\":\"first\"}");
         assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["id"], "call_2");
+        assert_eq!(input[2]["id"], "fc_2");
         assert_eq!(input[2]["call_id"], "call_2");
         assert_eq!(input[2]["name"], "lookup");
         assert_eq!(input[2]["arguments"], "{\"q\":\"second\"}");
@@ -1840,6 +1960,7 @@ mod tests {
             output: vec![ResponsesOutputItem {
                 r#type: Some("function_call".to_string()),
                 id: Some("call_123".to_string()),
+                call_id: None,
                 name: Some("emit_intent".to_string()),
                 arguments: Some("{\"intent\":\"open\"}".to_string()),
                 content: None,
@@ -2065,6 +2186,7 @@ mod tests {
 
         assert_eq!(chunk.tool_use_deltas.len(), 1);
         assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_99"));
+        assert_eq!(chunk.tool_use_deltas[0].provider_id.as_deref(), Some("call_99"));
         assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("lookup"));
     }
 
@@ -2077,7 +2199,20 @@ mod tests {
 
         assert_eq!(chunk.tool_use_deltas.len(), 1);
         assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_77"));
+        assert!(chunk.tool_use_deltas[0].provider_id.is_none());
         assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("lookup"));
+    }
+
+    #[test]
+    fn chunk_from_event_prefers_call_id_when_both_identifiers_exist() {
+        let item_done = r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":"{\"q\":\"weather\"}"}}"#;
+        let chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.output_item.done", item_done)
+                .unwrap();
+
+        assert_eq!(chunk.tool_use_deltas.len(), 1);
+        assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_123"));
+        assert_eq!(chunk.tool_use_deltas[0].provider_id.as_deref(), Some("fc_123"));
     }
 
     #[test]
@@ -2252,6 +2387,7 @@ mod tests {
             &mut pending,
             vec![ToolUseDelta {
                 id: Some("call_1".to_string()),
+                provider_id: None,
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("{\"intent\":\"op".to_string()),
                 arguments_done: false,
@@ -2261,6 +2397,7 @@ mod tests {
             &mut pending,
             vec![ToolUseDelta {
                 id: Some("call_1".to_string()),
+                provider_id: None,
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("en\"}".to_string()),
                 arguments_done: false,
@@ -2281,6 +2418,7 @@ mod tests {
             &mut pending,
             vec![ToolUseDelta {
                 id: Some("call_1".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: Some("{\"intent\":\"op".to_string()),
                 arguments_done: false,
@@ -2290,6 +2428,7 @@ mod tests {
             &mut pending,
             vec![ToolUseDelta {
                 id: Some("call_1".to_string()),
+                provider_id: None,
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("en\"}".to_string()),
                 arguments_done: false,
@@ -2330,6 +2469,7 @@ mod tests {
     fn finalize_tool_calls_normalizes_empty_arguments_to_empty_object() {
         let pending = vec![PendingToolCall {
             id: Some("call_1".to_string()),
+            provider_id: None,
             name: Some("git_status".to_string()),
             arguments: String::new(),
         }];
@@ -2347,6 +2487,7 @@ mod tests {
     fn finalize_tool_calls_normalizes_whitespace_arguments_to_empty_object() {
         let pending = vec![PendingToolCall {
             id: Some("call_1".to_string()),
+            provider_id: None,
             name: Some("current_time".to_string()),
             arguments: "  \t\n  ".to_string(),
         }];
@@ -2364,6 +2505,7 @@ mod tests {
         let output = vec![ResponsesOutputItem {
             r#type: Some("function_call".to_string()),
             id: Some("call_abc".to_string()),
+            call_id: None,
             name: Some("get_weather".to_string()),
             arguments: Some("".to_string()),
             content: None,
@@ -2384,6 +2526,7 @@ mod tests {
         let output = vec![ResponsesOutputItem {
             r#type: Some("function_call".to_string()),
             id: Some("call_def".to_string()),
+            call_id: None,
             name: Some("search".to_string()),
             arguments: Some(r#"{"query":"rust"}"#.to_string()),
             content: None,
@@ -2396,5 +2539,52 @@ mod tests {
             serde_json::json!({"query": "rust"}),
             "valid JSON arguments should be parsed as-is"
         );
+    }
+
+    #[test]
+    fn merge_tool_use_deltas_promotes_call_id_over_provider_item_id() {
+        let mut pending = Vec::new();
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("fc_123".to_string()),
+                provider_id: Some("fc_123".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments_delta: Some("{\"intent\":\"op".to_string()),
+                arguments_done: false,
+            }],
+        );
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("call_123".to_string()),
+                provider_id: Some("fc_123".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments_delta: Some("en\"}".to_string()),
+                arguments_done: false,
+            }],
+        );
+
+        let tool_calls = finalize_tool_calls(pending);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn collect_tool_calls_prefers_call_id_when_present() {
+        let output = vec![ResponsesOutputItem {
+            r#type: Some("function_call".to_string()),
+            id: Some("fc_123".to_string()),
+            call_id: Some("call_123".to_string()),
+            name: Some("search".to_string()),
+            arguments: Some(r#"{"query":"rust"}"#.to_string()),
+            content: None,
+            text: None,
+        }];
+
+        let tool_calls = collect_tool_calls(&output);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
     }
 }

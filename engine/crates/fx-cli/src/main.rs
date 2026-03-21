@@ -29,7 +29,7 @@ use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Once},
 };
 
 pub use confirmation::ConfirmationUi;
@@ -1118,8 +1118,23 @@ fn init_cli_logging(
         .map_err(anyhow::Error::from)
 }
 
+#[cfg(feature = "http")]
+fn install_rustls_crypto_provider() {
+    static INSTALL_PROVIDER: Once = Once::new();
+
+    INSTALL_PROVIDER.call_once(|| {
+        // Reqwest/websocket paths can touch rustls even without the HTTPS listener,
+        // so make the process-wide provider explicit at startup.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+#[cfg(not(feature = "http"))]
+fn install_rustls_crypto_provider() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_rustls_crypto_provider();
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Tui { args: Vec::new() });
     let _logging_guard = init_cli_logging(&command)?;

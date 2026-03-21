@@ -7,6 +7,7 @@ use fx_llm::{ContentBlock, Message, Usage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A structured content block stored in session history.
@@ -18,6 +19,8 @@ pub enum SessionContentBlock {
     /// Tool invocation requested by the assistant.
     ToolUse {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
         name: String,
         input: Value,
     },
@@ -31,7 +34,17 @@ impl From<ContentBlock> for SessionContentBlock {
     fn from(block: ContentBlock) -> Self {
         match block {
             ContentBlock::Text { text } => Self::Text { text },
-            ContentBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            ContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => Self::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            },
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -48,7 +61,17 @@ impl From<SessionContentBlock> for ContentBlock {
     fn from(block: SessionContentBlock) -> Self {
         match block {
             SessionContentBlock::Text { text } => Self::Text { text },
-            SessionContentBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            SessionContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => Self::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            },
             SessionContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -139,7 +162,7 @@ impl SessionMessage {
     pub fn to_llm_message(&self) -> Message {
         Message {
             role: self.role.into(),
-            content: self.content.clone().into_iter().map(Into::into).collect(),
+            content: normalized_llm_content(&self.content),
         }
     }
 
@@ -297,6 +320,52 @@ where
     }
 }
 
+fn normalized_llm_content(blocks: &[SessionContentBlock]) -> Vec<ContentBlock> {
+    let mut normalized = Vec::with_capacity(blocks.len());
+    let mut tool_use_indices: HashMap<String, usize> = HashMap::new();
+
+    for block in blocks.iter().cloned() {
+        match block {
+            SessionContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => {
+                if let Some(existing_index) = tool_use_indices.get(&id).copied() {
+                    let should_replace = matches!(
+                        normalized.get(existing_index),
+                        Some(ContentBlock::ToolUse {
+                            provider_id: existing_provider_id,
+                            ..
+                        }) if existing_provider_id.is_none() && provider_id.is_some()
+                    );
+                    if should_replace {
+                        normalized[existing_index] = ContentBlock::ToolUse {
+                            id,
+                            provider_id,
+                            name,
+                            input,
+                        };
+                    }
+                    continue;
+                }
+
+                tool_use_indices.insert(id.clone(), normalized.len());
+                normalized.push(ContentBlock::ToolUse {
+                    id,
+                    provider_id,
+                    name,
+                    input,
+                });
+            }
+            other => normalized.push(other.into()),
+        }
+    }
+
+    normalized
+}
+
 pub fn render_content_blocks(blocks: &[SessionContentBlock]) -> String {
     render_content_blocks_with_options(blocks, ContentRenderOptions::default())
 }
@@ -319,7 +388,9 @@ fn render_content_block_with_options(
 ) -> String {
     match block {
         SessionContentBlock::Text { text } => text.clone(),
-        SessionContentBlock::ToolUse { id, name, input } => {
+        SessionContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             if options.include_tool_use_id {
                 format!("[tool_use:{name}#{id}] {input}")
             } else {
@@ -529,6 +600,7 @@ mod tests {
                 },
                 SessionContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
                     name: "read_file".to_string(),
                     input: json!({"path": "README.md"}),
                 },
@@ -559,6 +631,7 @@ mod tests {
                 },
                 SessionContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
                     name: "search".to_string(),
                     input: json!({"q": "weather"}),
                 },
@@ -585,6 +658,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
                     name: "search".to_string(),
                     input: json!({"q": "weather"}),
                 },
@@ -594,6 +668,51 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: "[image:image/png]".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_message_to_llm_message_deduplicates_tool_use_blocks_preferring_provider_id() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                },
+            ],
+            123,
+            Some(5),
+        );
+
+        let llm_message = message.to_llm_message();
+
+        assert_eq!(
+            llm_message.content,
+            vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
                 },
             ]
         );
@@ -642,6 +761,7 @@ mod tests {
             },
             ContentBlock::ToolUse {
                 id: "call_1".to_string(),
+                provider_id: Some("fc_1".to_string()),
                 name: "search".to_string(),
                 input: json!({"q": "weather"}),
             },

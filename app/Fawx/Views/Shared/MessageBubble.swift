@@ -81,7 +81,12 @@ struct MessageBubble: View {
     }
 
     private var bubbleHorizontalPadding: CGFloat {
-        role == .assistant ? FawxSpacing.paddingXL : FawxSpacing.paddingLG
+        switch role {
+        case .assistant, .tool:
+            FawxSpacing.paddingXL
+        case .user, .system:
+            FawxSpacing.paddingLG
+        }
     }
 
     private var bubbleCornerRadius: CGFloat {
@@ -118,6 +123,11 @@ struct MessageBubble: View {
                     CodeBlock(language: configuration.language, content: configuration.content)
                 }
                 .textSelection(.enabled)
+        case .tool:
+            Text(verbatim: toolDisplayContent)
+                .font(FawxTypography.code)
+                .foregroundStyle(Color.fawxText)
+                .textSelection(.enabled)
         case .system:
             EmptyView()
         }
@@ -129,6 +139,8 @@ struct MessageBubble: View {
             return Color.fawxUserBubble
         case .assistant:
             return isStreaming ? Color.fawxSurfaceHover : Color.fawxSurface
+        case .tool:
+            return Color.fawxCode
         case .system:
             return Color.fawxAccentSubtle
         }
@@ -156,6 +168,8 @@ struct MessageBubble: View {
                 return Color.fawxBorder
             }
             return Color.fawxBorder.opacity(FawxOpacity.borderMedium)
+        case .tool:
+            return Color.fawxBorder.opacity(FawxOpacity.borderStrong)
         case .system:
             return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
@@ -167,8 +181,15 @@ struct MessageBubble: View {
             return "userMessage"
         case .assistant:
             return isStreaming ? "streamingAssistantMessage" : "assistantMessage"
+        case .tool:
+            return "toolMessage"
         case .system:
             return "systemMessage"
         }
+    }
+
+    private var toolDisplayContent: String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Tool completed without text output." : content
     }
 }

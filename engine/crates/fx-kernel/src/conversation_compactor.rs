@@ -27,7 +27,7 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 fn estimate_content_tokens(content: &ContentBlock) -> usize {
     match content {
         ContentBlock::Text { text } => estimate_text_tokens(text),
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse { id, name, input, .. } => {
             estimate_text_tokens(id)
                 + estimate_text_tokens(name)
                 + estimate_text_tokens(&input.to_string())
@@ -758,6 +758,7 @@ mod tests {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: id.to_string(),
+                provider_id: None,
                 name: "read".to_string(),
                 input: serde_json::json!({"path": "/tmp/a"}),
             }],

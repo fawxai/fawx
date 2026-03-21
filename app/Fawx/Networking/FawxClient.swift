@@ -34,6 +34,7 @@ actor FawxClient {
     }
 
     func updateConfiguration(baseURL: URL?, bearerToken: String?) {
+        debugLogConfigurationUpdate(from: self.baseURL, to: baseURL)
         self.baseURL = baseURL
         self.bearerToken = bearerToken
     }
@@ -906,6 +907,8 @@ actor FawxClient {
             throw APIError.invalidURL(path)
         }
 
+        debugLogRequest(path: path, resolvedURL: url)
+
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -933,7 +936,8 @@ actor FawxClient {
         }
 
         let basePath = components.path == "/" ? "" : components.path
-        components.path = basePath + (path.hasPrefix("/") ? path : "/" + path)
+        let resolvedPath = basePath + (path.hasPrefix("/") ? path : "/" + path)
+        components.percentEncodedPath = Self.percentEncodedPath(resolvedPath)
         components.queryItems = queryItems.isEmpty ? nil : queryItems
         return components.url
     }
@@ -971,6 +975,50 @@ actor FawxClient {
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
+
+    private static func percentEncodedPath(_ value: String) -> String {
+        let allowed = CharacterSet.urlPathAllowed.union(CharacterSet(charactersIn: "%"))
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+#if DEBUG
+    private func debugLogConfigurationUpdate(from oldValue: URL?, to newValue: URL?) {
+        let oldString = oldValue?.absoluteString ?? "<nil>"
+        let newString = newValue?.absoluteString ?? "<nil>"
+        guard oldString != newString || newString.contains(":18400") else {
+            return
+        }
+
+        NSLog(
+            """
+            [FawxDebug][FawxClient] updateConfiguration old=%@ new=%@ stack=%@
+            """,
+            oldString,
+            newString,
+            Thread.callStackSymbols.prefix(8).joined(separator: " | ")
+        )
+    }
+
+    private func debugLogRequest(path: String, resolvedURL: URL) {
+        let urlString = resolvedURL.absoluteString
+        let shouldLog = urlString.contains(":18400")
+            || path.contains("/messages")
+            || path == "/health"
+        guard shouldLog else {
+            return
+        }
+
+        NSLog(
+            "[FawxDebug][FawxClient] request path=%@ url=%@",
+            path,
+            urlString
+        )
+    }
+#else
+    private func debugLogConfigurationUpdate(from oldValue: URL?, to newValue: URL?) {}
+
+    private func debugLogRequest(path: String, resolvedURL: URL) {}
+#endif
 }
 
 private struct CreateSessionBody: Encodable {
