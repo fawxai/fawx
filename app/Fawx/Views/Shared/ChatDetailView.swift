@@ -206,17 +206,19 @@ struct ChatDetailView: View {
     }
 
     private func compactionBannerView(message: String) -> some View {
-        Text(message)
+        let style = CompactionBannerStyle(message: message)
+
+        return Text(message)
             .font(FawxTypography.status)
-            .foregroundStyle(Color.fawxTextSecondary)
+            .foregroundStyle(style.foreground)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, FawxSpacing.paddingMD)
             .padding(.vertical, FawxSpacing.paddingSM)
-            .background(Color.fawxSurface.opacity(0.97))
+            .background(style.background)
             .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous)
-                    .stroke(Color.fawxBorder, lineWidth: 1)
+                    .stroke(style.border, lineWidth: 1)
             }
     }
 
@@ -859,6 +861,24 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private struct CompactionBannerStyle {
+    let background: Color
+    let border: Color
+    let foreground: Color
+
+    init(message: String) {
+        if message.localizedCaseInsensitiveContains("urgently optimized") {
+            background = Color.fawxWarning.opacity(0.12)
+            border = Color.fawxWarning.opacity(0.45)
+            foreground = .fawxText
+        } else {
+            background = Color.fawxSurface.opacity(0.97)
+            border = .fawxBorder
+            foreground = .fawxTextSecondary
+        }
+    }
 }
 
 @available(iOS 18.0, macOS 15.0, *)

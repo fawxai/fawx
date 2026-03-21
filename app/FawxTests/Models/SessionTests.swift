@@ -234,6 +234,14 @@ final class ViewSourceRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains(".disabled(isDisabled || isAtItemLimit)"))
     }
 
+    func testChatDetailViewStylesEmergencyCompactionBanner() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/ChatDetailView.swift")
+
+        XCTAssertTrue(source.contains("isEmergency"))
+        XCTAssertTrue(source.contains("Color.fawxWarning.opacity(0.12)"))
+        XCTAssertTrue(source.contains("Color.fawxWarning.opacity(0.45)"))
+    }
+
     private func sourceFile(at relativePath: String) throws -> String {
         try String(contentsOf: repositoryRoot().appendingPathComponent(relativePath), encoding: .utf8)
     }

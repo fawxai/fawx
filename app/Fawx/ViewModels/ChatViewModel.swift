@@ -239,6 +239,7 @@ final class ChatViewModel {
 
     private let appState: AppState
     private let sessionViewModel: SessionViewModel
+    private let compactionBannerSleepHandler: @Sendable (Duration) async throws -> Void
     private var currentSessionID: String?
     private var errorMessagesBySession: [String: String] = [:]
     private var retryRequestsBySession: [String: RetryRequest] = [:]
@@ -256,9 +257,16 @@ final class ChatViewModel {
     @ObservationIgnored private var compactionBannerDismissTasks: [String: Task<Void, Never>] = [:]
     private var sessionLoadTask: Task<Void, Never>?
 
-    init(appState: AppState, sessionViewModel: SessionViewModel) {
+    init(
+        appState: AppState,
+        sessionViewModel: SessionViewModel,
+        compactionBannerSleepHandler: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
+    ) {
         self.appState = appState
         self.sessionViewModel = sessionViewModel
+        self.compactionBannerSleepHandler = compactionBannerSleepHandler
     }
 
     var draftMessage: String {
@@ -1049,8 +1057,23 @@ final class ChatViewModel {
                 )
         ).applyingCompaction(usedTokens: tokensAfter, usageRatio: usageRatio)
 
-        let beforePercentage = appState.currentContext?.normalizedPercentage
-            ?? percentage(usedTokens: tokensBefore, maxTokens: updatedContext.maxTokens)
+        let derivedBeforePercentage = ContextInfo(
+            usedTokens: tokensBefore,
+            maxTokens: updatedContext.maxTokens,
+            percentage: .nan,
+            compactionThreshold: updatedContext.compactionThreshold
+        ).normalizedPercentage
+        let beforePercentage: Double
+        if let currentContext = appState.currentContext {
+            let currentPercentage = currentContext.normalizedPercentage
+            if currentContext.maxTokens > 0 || currentPercentage > 0 || tokensBefore == 0 {
+                beforePercentage = currentPercentage
+            } else {
+                beforePercentage = derivedBeforePercentage
+            }
+        } else {
+            beforePercentage = derivedBeforePercentage
+        }
         let afterPercentage = updatedContext.normalizedPercentage
 
         appState.currentContext = updatedContext
@@ -1063,15 +1086,6 @@ final class ChatViewModel {
             ),
             for: sessionID
         )
-    }
-
-    private func percentage(usedTokens: Int, maxTokens: Int) -> Double {
-        guard maxTokens > 0 else {
-            return 0
-        }
-
-        let derivedPercentage = (Double(usedTokens) / Double(maxTokens)) * 100
-        return max(0, min(derivedPercentage, 100))
     }
 
     private func makeCompactionBannerMessage(
@@ -1087,22 +1101,26 @@ final class ChatViewModel {
             ? "1 message compacted"
             : "\(messagesRemoved) messages compacted"
 
-        return "\(prefix): \(compactedMessageCount), \(Int(beforePercentage.rounded()))% -> \(Int(afterPercentage.rounded()))%"
+        return "\(prefix): \(compactedMessageCount), \(Int(beforePercentage.rounded()))% → \(Int(afterPercentage.rounded()))%"
     }
 
     private func showCompactionBanner(_ message: String, for sessionID: String) {
         compactionBannerDismissTasks[sessionID]?.cancel()
         compactionBannerMessagesBySession[sessionID] = message
         compactionBannerDismissTasks[sessionID] = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
             do {
-                try await Task.sleep(for: Self.compactionBannerTimeout)
+                try await self.compactionBannerSleepHandler(Self.compactionBannerTimeout)
             } catch is CancellationError {
                 return
             } catch {
                 return
             }
 
-            self?.dismissCompactionBannerIfNeeded(expectedMessage: message, sessionID: sessionID)
+            self.dismissCompactionBannerIfNeeded(expectedMessage: message, sessionID: sessionID)
         }
     }
 

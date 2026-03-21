@@ -696,7 +696,7 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.currentContextForTesting?.normalizedPercentage, 42)
         XCTAssertEqual(
             sut.compactionBannerMessage,
-            "Context optimized: 12 messages compacted, 68% -> 42%"
+            "Context optimized: 12 messages compacted, 68% → 42%"
         )
     }
 
@@ -722,6 +722,115 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(sut.currentContextForTesting?.usedTokens, 55)
+        XCTAssertNil(sut.compactionBannerMessage)
+    }
+
+    func testContextCompactedDerivesMissingBudgetFromUsageRatio() {
+        let sut = makeSUT()
+        sut.prepareToDisplaySession("session-a")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 68,
+                maxTokens: 0,
+                percentage: 0,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(
+            sessionID: "session-a",
+            tier: "slide",
+            messagesRemoved: 12,
+            tokensBefore: 68,
+            tokensAfter: 42,
+            usageRatio: 0.42
+        )
+
+        XCTAssertEqual(sut.currentContextForTesting?.maxTokens, 100)
+        XCTAssertEqual(sut.currentContextForTesting?.normalizedPercentage, 42)
+        XCTAssertEqual(
+            sut.compactionBannerMessage,
+            "Context optimized: 12 messages compacted, 68% → 42%"
+        )
+    }
+
+    func testContextCompactedUsesSingularBannerCopy() {
+        let sut = makeSUT()
+        sut.prepareToDisplaySession("session-a")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 68,
+                maxTokens: 100,
+                percentage: 68,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(
+            sessionID: "session-a",
+            tier: "slide",
+            messagesRemoved: 1,
+            tokensBefore: 68,
+            tokensAfter: 42,
+            usageRatio: 0.42
+        )
+
+        XCTAssertEqual(
+            sut.compactionBannerMessage,
+            "Context optimized: 1 message compacted, 68% → 42%"
+        )
+    }
+
+    func testContextCompactedUsesEmergencyBannerCopy() {
+        let sut = makeSUT()
+        sut.prepareToDisplaySession("session-a")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 92,
+                maxTokens: 100,
+                percentage: 92,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(
+            sessionID: "session-a",
+            tier: "emergency",
+            messagesRemoved: 12,
+            tokensBefore: 92,
+            tokensAfter: 48,
+            usageRatio: 0.48
+        )
+
+        XCTAssertEqual(
+            sut.compactionBannerMessage,
+            "Context urgently optimized: 12 messages compacted, 92% → 48%"
+        )
+    }
+
+    func testCompactionBannerAutoDismissesAfterTimeout() async {
+        let sleeper = ControlledSleeper()
+        let sut = makeSUT { duration in
+            try await sleeper.sleep(for: duration)
+        }
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setCurrentContextForTesting(
+            ContextInfo(
+                usedTokens: 68,
+                maxTokens: 100,
+                percentage: 68,
+                compactionThreshold: 80
+            )
+        )
+
+        sut.handleContextCompactedForTesting(sessionID: "session-a")
+
+        XCTAssertNotNil(sut.compactionBannerMessage)
+        await waitForSleepToBeScheduled(on: sleeper)
+        await sleeper.resumeNextSleep()
+        await waitForCompactionBannerToDismiss(on: sut)
+
         XCTAssertNil(sut.compactionBannerMessage)
     }
 
@@ -1180,11 +1289,20 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
     }
 
-    private func makeSUT(connectionStatus: ConnectionStatus = .disconnected) -> ChatViewModel {
+    private func makeSUT(
+        connectionStatus: ConnectionStatus = .disconnected,
+        compactionBannerSleepHandler: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
+    ) -> ChatViewModel {
         let appState = AppState(startLoadingPersistedState: false)
         appState.connectionStatus = connectionStatus
         let sessionViewModel = SessionViewModel(appState: appState)
-        return ChatViewModel(appState: appState, sessionViewModel: sessionViewModel)
+        return ChatViewModel(
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            compactionBannerSleepHandler: compactionBannerSleepHandler
+        )
     }
 
     private func waitForSleepToBeScheduled(on sleeper: ControlledSleeper) async {
@@ -1207,6 +1325,17 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTFail("Expected at least \(minimumCount) transcript item(s).")
+    }
+
+    private func waitForCompactionBannerToDismiss(on sut: ChatViewModel) async {
+        for _ in 0..<20 {
+            if sut.compactionBannerMessage == nil {
+                return
+            }
+            await Task.yield()
+        }
+
+        XCTFail("Expected the compaction banner to dismiss.")
     }
 }
 
