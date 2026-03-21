@@ -227,6 +227,10 @@ impl AppEngine for HeadlessApp {
             })
             .collect()
     }
+
+    fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
+        HeadlessApp::take_last_session_messages(self)
+    }
 }
 
 #[test]
@@ -1166,8 +1170,8 @@ mod routing_and_status {
         ProviderCapabilities, ProviderError as LlmError,
     };
     use fx_session::{
-        MessageRole as SessionMessageRole, SessionConfig, SessionError, SessionKey, SessionKind,
-        SessionRegistry, SessionStatus, SessionStore,
+        MessageRole as SessionMessageRole, SessionConfig, SessionContentBlock, SessionError,
+        SessionKey, SessionKind, SessionRegistry, SessionStatus, SessionStore,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
@@ -2543,6 +2547,55 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_session_messages_returns_structured_blocks() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-structured");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                Some(12),
+            )
+            .expect("record tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("file contents"),
+                }],
+                None,
+            )
+            .expect("record tool result");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(json["messages"][0]["token_count"], 12);
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["content"][0]["type"], "tool_result");
+    }
+
+    #[tokio::test]
     async fn session_message_records_history() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-history");
@@ -2561,9 +2614,19 @@ allowed_chat_ids = [123]
         let history = registry.history(&key, 10).expect("history");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, SessionMessageRole::User);
-        assert_eq!(history[0].content, "hello there");
+        assert_eq!(
+            history[0].content,
+            vec![SessionContentBlock::Text {
+                text: "hello there".to_string()
+            }]
+        );
         assert_eq!(history[1].role, SessionMessageRole::Assistant);
-        assert_eq!(history[1].content, "Mock response");
+        assert_eq!(
+            history[1].content,
+            vec![SessionContentBlock::Text {
+                text: "Mock response".to_string()
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2708,8 +2771,8 @@ allowed_chat_ids = [123]
 
         let history = registry.history(&key, 10).expect("history");
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].content, "hello there");
-        assert_eq!(history[1].content, "Mock response");
+        assert_eq!(history[0].render_text(), "hello there");
+        assert_eq!(history[1].render_text(), "Mock response");
     }
 
     #[tokio::test]

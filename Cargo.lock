@@ -1965,6 +1965,7 @@ name = "fx-session"
 version = "0.1.0"
 dependencies = [
  "fx-core",
+ "fx-llm",
  "fx-storage",
  "serde",
  "serde_json",

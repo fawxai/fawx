@@ -98,4 +98,9 @@ pub trait AppEngine: Send + Sync {
     fn session_token_usage(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// Structured session messages recorded for the most recent completed turn.
+    fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
+        Vec::new()
+    }
 }

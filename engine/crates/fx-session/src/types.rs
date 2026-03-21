@@ -126,6 +126,8 @@ pub enum MessageRole {
     Assistant,
     /// System-level instruction or context.
     System,
+    /// Tool execution result associated with a prior assistant tool-use.
+    Tool,
 }
 
 impl fmt::Display for MessageRole {
@@ -134,6 +136,29 @@ impl fmt::Display for MessageRole {
             Self::User => f.write_str("user"),
             Self::Assistant => f.write_str("assistant"),
             Self::System => f.write_str("system"),
+            Self::Tool => f.write_str("tool"),
+        }
+    }
+}
+
+impl From<MessageRole> for fx_llm::MessageRole {
+    fn from(value: MessageRole) -> Self {
+        match value {
+            MessageRole::User => Self::User,
+            MessageRole::Assistant => Self::Assistant,
+            MessageRole::System => Self::System,
+            MessageRole::Tool => Self::Tool,
+        }
+    }
+}
+
+impl From<fx_llm::MessageRole> for MessageRole {
+    fn from(value: fx_llm::MessageRole) -> Self {
+        match value {
+            fx_llm::MessageRole::User => Self::User,
+            fx_llm::MessageRole::Assistant => Self::Assistant,
+            fx_llm::MessageRole::System => Self::System,
+            fx_llm::MessageRole::Tool => Self::Tool,
         }
     }
 }
@@ -190,6 +215,47 @@ mod tests {
         assert_eq!(MessageRole::User.to_string(), "user");
         assert_eq!(MessageRole::Assistant.to_string(), "assistant");
         assert_eq!(MessageRole::System.to_string(), "system");
+        assert_eq!(MessageRole::Tool.to_string(), "tool");
+    }
+
+    #[test]
+    fn message_role_converts_into_llm_role() {
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::User),
+            fx_llm::MessageRole::User
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::Assistant),
+            fx_llm::MessageRole::Assistant
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::System),
+            fx_llm::MessageRole::System
+        );
+        assert_eq!(
+            fx_llm::MessageRole::from(MessageRole::Tool),
+            fx_llm::MessageRole::Tool
+        );
+    }
+
+    #[test]
+    fn message_role_converts_from_llm_role() {
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::User),
+            MessageRole::User
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::Assistant),
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::System),
+            MessageRole::System
+        );
+        assert_eq!(
+            MessageRole::from(fx_llm::MessageRole::Tool),
+            MessageRole::Tool
+        );
     }
 
     /// Regression test: the inner field of `SessionKey` must not be
