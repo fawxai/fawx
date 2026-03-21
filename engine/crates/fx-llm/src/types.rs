@@ -150,6 +150,9 @@ pub enum ContentBlock {
     ToolUse {
         /// Tool call identifier.
         id: String,
+        /// Provider-specific output item identifier, when distinct from `id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
         /// Tool/function name.
         name: String,
         /// Structured input arguments.
@@ -221,6 +224,9 @@ pub struct StreamChunk {
 pub struct ToolUseDelta {
     /// Tool call identifier when provided.
     pub id: Option<String>,
+    /// Provider-specific output item identifier, when distinct from `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     /// Tool/function name when provided.
     pub name: Option<String>,
     /// Incremental JSON argument text, when streamed as text deltas.

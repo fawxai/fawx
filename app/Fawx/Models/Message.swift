@@ -32,19 +32,41 @@ struct SessionMessage: Codable, Identifiable, Sendable, Hashable {
         id = UUID()
         role = (try? container.decode(MessageRole.self, forKey: .role)) ?? .system
         timestamp = (try? container.decode(Int.self, forKey: .timestamp)) ?? 0
-        content = try Self.decodeContent(from: container)
+        content = try Self.decodeContent(from: container, role: role)
     }
 
-    private static func decodeContent(from container: KeyedDecodingContainer<CodingKeys>) throws -> String {
+    private static func decodeContent(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        role: MessageRole
+    ) throws -> String {
         // Try plain string first (legacy format)
         if let text = try? container.decode(String.self, forKey: .content) {
             return text
         }
         // Try structured content blocks (new format from PR #1542)
         if let blocks = try? container.decode([SessionContentBlock].self, forKey: .content) {
-            return blocks.compactMap(\.displayText).joined(separator: "\n\n")
+            return Self.renderStructuredContent(blocks, role: role)
         }
         return ""
+    }
+
+    private static func renderStructuredContent(
+        _ blocks: [SessionContentBlock],
+        role: MessageRole
+    ) -> String {
+        switch role {
+        case .tool:
+            let visibleBlocks = blocks.compactMap(\.toolTranscriptText)
+            if !visibleBlocks.isEmpty {
+                return visibleBlocks.joined(separator: "\n\n")
+            }
+            if blocks.contains(where: \.containsToolResult) {
+                return "Tool output available."
+            }
+            return ""
+        case .user, .assistant, .system:
+            return blocks.compactMap(\.displayText).joined(separator: "\n\n")
+        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -57,21 +79,42 @@ struct SessionMessage: Codable, Identifiable, Sendable, Hashable {
 
 enum SessionContentBlock: Codable, Sendable, Hashable {
     case text(String)
-    case toolUse(id: String, name: String)
-    case toolResult(toolUseId: String)
+    case toolUse(id: String, name: String, input: JSONValue)
+    case toolResult(toolUseId: String, content: JSONValue)
     case image(mediaType: String)
 
     var displayText: String? {
         switch self {
         case .text(let text): return text
-        case .toolUse(_, let name): return "[\(name)]"
-        case .toolResult: return nil
+        case .toolUse(_, let name, let input):
+            let renderedInput = input.chatDisplayText
+            return renderedInput.isEmpty ? "[\(name)]" : "[\(name)] \(renderedInput)"
+        case .toolResult:
+            return nil
         case .image: return "[image]"
         }
     }
 
+    var toolTranscriptText: String? {
+        switch self {
+        case .text(let text):
+            return text
+        case .image:
+            return "[image]"
+        case .toolUse, .toolResult:
+            return nil
+        }
+    }
+
+    var containsToolResult: Bool {
+        if case .toolResult = self {
+            return true
+        }
+        return false
+    }
+
     enum CodingKeys: String, CodingKey {
-        case type, text, id, name
+        case type, text, id, name, input, content
         case toolUseId = "tool_use_id"
         case mediaType = "media_type"
     }
@@ -86,10 +129,12 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
         case "tool_use":
             let id = try container.decode(String.self, forKey: .id)
             let name = try container.decode(String.self, forKey: .name)
-            self = .toolUse(id: id, name: name)
+            let input = (try? container.decode(JSONValue.self, forKey: .input)) ?? .null
+            self = .toolUse(id: id, name: name, input: input)
         case "tool_result":
             let toolUseId = try container.decode(String.self, forKey: .toolUseId)
-            self = .toolResult(toolUseId: toolUseId)
+            let content = (try? container.decode(JSONValue.self, forKey: .content)) ?? .null
+            self = .toolResult(toolUseId: toolUseId, content: content)
         case "image":
             let mediaType = try container.decode(String.self, forKey: .mediaType)
             self = .image(mediaType: mediaType)
@@ -104,13 +149,15 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
         case .text(let text):
             try container.encode("text", forKey: .type)
             try container.encode(text, forKey: .text)
-        case .toolUse(let id, let name):
+        case .toolUse(let id, let name, let input):
             try container.encode("tool_use", forKey: .type)
             try container.encode(id, forKey: .id)
             try container.encode(name, forKey: .name)
-        case .toolResult(let toolUseId):
+            try container.encode(input, forKey: .input)
+        case .toolResult(let toolUseId, let content):
             try container.encode("tool_result", forKey: .type)
             try container.encode(toolUseId, forKey: .toolUseId)
+            try container.encode(content, forKey: .content)
         case .image(let mediaType):
             try container.encode("image", forKey: .type)
             try container.encode(mediaType, forKey: .mediaType)
@@ -136,5 +183,18 @@ struct ImagePayload: Codable, Sendable, Hashable {
     enum CodingKeys: String, CodingKey {
         case data
         case mediaType = "media_type"
+    }
+}
+
+private extension JSONValue {
+    var chatDisplayText: String {
+        switch self {
+        case .null:
+            return ""
+        case .string(let value):
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        default:
+            return description.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 }

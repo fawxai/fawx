@@ -5,12 +5,14 @@ struct SkillsView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @Bindable var skillsViewModel: SkillsViewModel
+    let isActive: Bool
     let showsHeader: Bool
     @State private var selectedSection: SkillsSection = .installed
     @State private var searchText = ""
 
-    init(skillsViewModel: SkillsViewModel, showsHeader: Bool = true) {
+    init(skillsViewModel: SkillsViewModel, isActive: Bool = true, showsHeader: Bool = true) {
         _skillsViewModel = Bindable(skillsViewModel)
+        self.isActive = isActive
         self.showsHeader = showsHeader
     }
 
@@ -29,11 +31,14 @@ struct SkillsView: View {
             .padding(containerPadding)
         }
         .background(Color.fawxBackground)
-        .task {
+        .task(id: isActive) {
+            guard isActive else {
+                return
+            }
             await skillsViewModel.refresh()
         }
-        .task(id: selectedSection == .marketplace ? searchText : "__installed__") {
-            guard selectedSection == .marketplace else {
+        .task(id: "\(isActive)|\(selectedSection == .marketplace ? searchText : "__installed__")") {
+            guard isActive, selectedSection == .marketplace else {
                 return
             }
 

@@ -101,7 +101,7 @@ struct ContentView: View {
         Sidebar(
             sessionViewModel: sessionViewModel,
             selection: sidebarSelection,
-            streamingSessionID: chatViewModel.activeStreamSessionID,
+            streamingSessionIDs: chatViewModel.activeStreamSessionIDs,
             actions: sidebarActions
         )
         .navigationSplitViewColumnWidth(
@@ -340,8 +340,8 @@ struct ContentView: View {
 
     private func clearSession(_ sessionID: String) {
         Task {
-            if chatViewModel.activeStreamSessionID == sessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(sessionID) {
+                chatViewModel.stopStreaming(sessionID: sessionID)
             }
 
             let didClear = await sessionViewModel.clearSession(id: sessionID)
@@ -354,8 +354,8 @@ struct ContentView: View {
 
     private func deleteSession(_ sessionID: String) {
         Task {
-            if chatViewModel.activeStreamSessionID == sessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(sessionID) {
+                chatViewModel.stopStreaming(sessionID: sessionID)
             }
 
             let didDelete = await sessionViewModel.deleteSession(id: sessionID)
@@ -382,8 +382,8 @@ struct ContentView: View {
 
         Task {
             let deletedCurrentSelection = orderedSessionIDs.contains { $0 == selectedSessionID }
-            for sessionID in orderedSessionIDs where chatViewModel.activeStreamSessionID == sessionID {
-                chatViewModel.stopStreaming()
+            for sessionID in orderedSessionIDs where chatViewModel.activeStreamSessionIDs.contains(sessionID) {
+                chatViewModel.stopStreaming(sessionID: sessionID)
             }
 
             let deletedSessionIDs = await sessionViewModel.deleteSessions(ids: orderedSessionIDs)

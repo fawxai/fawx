@@ -179,6 +179,7 @@ impl OpenAiProvider {
                 let arguments = parse_json_or_string(&call.function.arguments);
                 content.push(ContentBlock::ToolUse {
                     id: call.id.clone(),
+                    provider_id: None,
                     name: call.function.name.clone(),
                     input: arguments.clone(),
                 });
@@ -354,6 +355,7 @@ impl OpenAiProvider {
 
         ToolUseDelta {
             id: state.id,
+            provider_id: None,
             name: state.name,
             arguments_delta,
             arguments_done: false,
@@ -635,7 +637,9 @@ fn extract_tool_calls(blocks: &[ContentBlock]) -> Result<Vec<OpenAiToolCall>, Ll
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id, name, input)),
             _ => None,
         })
         .map(|(id, name, input)| {
@@ -1299,11 +1303,13 @@ mod tests {
             content: vec![
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
                     name: "lookup".to_string(),
                     input: json!({"q": "first"}),
                 },
                 ContentBlock::ToolUse {
                     id: "call_2".to_string(),
+                    provider_id: Some("fc_2".to_string()),
                     name: "lookup".to_string(),
                     input: json!({"q": "second"}),
                 },

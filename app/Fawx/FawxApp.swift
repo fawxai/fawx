@@ -94,6 +94,9 @@ struct FawxApp: App {
                         guard appState.showsMainExperience, appState.isConfigured, appState.connectionStatus == .connected else {
                             continue
                         }
+                        guard !chatViewModel.isStreaming else {
+                            continue
+                        }
 
                         do {
                             _ = try await appState.client.health()
@@ -287,6 +290,12 @@ struct FawxApp: App {
         }
 
         do {
+            guard !chatViewModel.isStreaming else {
+                await sessionViewModel.refresh()
+                await chatViewModel.loadMessages(for: sessionViewModel.selectedSessionID, force: true)
+                return
+            }
+
             _ = try await appState.client.health()
             try await appState.refreshServerState()
             await appState.refreshRipcordState()

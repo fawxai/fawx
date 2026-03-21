@@ -10,8 +10,7 @@ struct ChatDetailView: View {
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
     @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
-    @State private var scrollViewportBottomY: CGFloat = 0
-    @State private var scrollContentBottomY: CGFloat = 0
+    @State private var scrollMetrics = ScrollMetrics()
     @State private var isShowingRipcordReviewTray = false
     @State private var isLoadingRipcordJournal = false
     @State private var ripcordJournalEntries: [JournalEntry] = []
@@ -157,11 +156,12 @@ struct ChatDetailView: View {
     private func applyingPreferenceHandlers<Content: View>(to content: Content) -> some View {
         content
             .onPreferenceChange(ScrollViewportBottomPreferenceKey.self) { viewportBottomY in
-                scrollViewportBottomY = viewportBottomY
-                updateStreamingDistanceFromBottomIfNeeded()
+                updateScrollMetrics(viewportBottomY: viewportBottomY)
             }
             .onPreferenceChange(ScrollContentBottomPreferenceKey.self) { contentBottomY in
-                scrollContentBottomY = contentBottomY
+                updateScrollMetrics(contentBottomY: contentBottomY)
+            }
+            .onChange(of: scrollMetrics) { _, _ in
                 updateStreamingDistanceFromBottomIfNeeded()
             }
     }
@@ -206,6 +206,7 @@ struct ChatDetailView: View {
                 }
             }
             .onChange(of: sessionViewModel.selectedSessionID) { _, _ in
+                scrollMetrics = ScrollMetrics()
                 scheduleScrollToBottom(using: proxy, animated: false)
             }
             .onChange(of: chatViewModel.isLoadingHistory) { oldValue, newValue in
@@ -657,8 +658,11 @@ struct ChatDetailView: View {
         guard chatViewModel.isCurrentSessionStreaming || !chatViewModel.visibleStreamingText.isEmpty else {
             return
         }
+        guard scrollMetrics.viewportBottomY > 0, scrollMetrics.contentBottomY > 0 else {
+            return
+        }
 
-        let distanceFromBottom = max(0, scrollContentBottomY - scrollViewportBottomY)
+        let distanceFromBottom = max(0, scrollMetrics.contentBottomY - scrollMetrics.viewportBottomY)
         chatViewModel.updateStreamingDistanceFromBottom(distanceFromBottom)
     }
 
@@ -685,6 +689,27 @@ struct ChatDetailView: View {
 
     private var scrollBottomAnchorID: String {
         "chat-scroll-bottom"
+    }
+
+    private func updateScrollMetrics(
+        viewportBottomY: CGFloat? = nil,
+        contentBottomY: CGFloat? = nil
+    ) {
+        var updatedMetrics = scrollMetrics
+
+        if let viewportBottomY, viewportBottomY.isFinite, viewportBottomY >= 0 {
+            updatedMetrics.viewportBottomY = viewportBottomY
+        }
+
+        if let contentBottomY, contentBottomY.isFinite, contentBottomY >= 0 {
+            updatedMetrics.contentBottomY = contentBottomY
+        }
+
+        guard updatedMetrics != scrollMetrics else {
+            return
+        }
+
+        scrollMetrics = updatedMetrics
     }
 
 #if os(iOS)
@@ -759,6 +784,11 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private struct ScrollMetrics: Equatable {
+    var viewportBottomY: CGFloat = 0
+    var contentBottomY: CGFloat = 0
 }
 
 private struct ScrollViewportBottomPreferenceKey: PreferenceKey {

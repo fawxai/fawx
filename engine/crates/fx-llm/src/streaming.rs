@@ -314,6 +314,7 @@ fn build_content_blocks(text: &str, tool_calls: &[ToolCall]) -> Vec<ContentBlock
 fn tool_call_content_block(tool_call: &ToolCall) -> ContentBlock {
     ContentBlock::ToolUse {
         id: tool_call.id.clone(),
+        provider_id: None,
         name: tool_call.name.clone(),
         input: tool_call.arguments.clone(),
     }
@@ -427,6 +428,7 @@ mod tests {
             response: CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: "tool_1".to_string(),
+                    provider_id: None,
                     name: "lookup".to_string(),
                     input: serde_json::json!({"q": "fawx"}),
                 }],
@@ -489,6 +491,7 @@ mod tests {
             StreamChunk {
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("tool_1".to_string()),
+                    provider_id: None,
                     name: Some("lookup".to_string()),
                     arguments_delta: None,
                     arguments_done: false,
@@ -498,6 +501,7 @@ mod tests {
             StreamChunk {
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("tool_1".to_string()),
+                    provider_id: None,
                     name: None,
                     arguments_delta: Some("{\"q\":\"fawx\"}".to_string()),
                     arguments_done: true,

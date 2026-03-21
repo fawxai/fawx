@@ -141,6 +141,38 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.errorMessage, "visible")
     }
 
+    func testErrorMessagesAreScopedPerSession() {
+        let sut = makeSUT()
+
+        sut.prepareToDisplaySession("session-a")
+        sut.handleStreamErrorForTesting("error-a", sessionID: "session-a")
+        XCTAssertEqual(sut.errorMessage, "error-a")
+
+        sut.prepareToDisplaySession("session-b")
+        XCTAssertNil(sut.errorMessage)
+
+        sut.handleStreamErrorForTesting("error-b", sessionID: "session-b")
+        XCTAssertEqual(sut.errorMessage, "error-b")
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.errorMessage, "error-a")
+    }
+
+    func testClearingOneSessionErrorPreservesOtherSessionErrors() {
+        let sut = makeSUT()
+
+        sut.handleStreamErrorForTesting("error-a", sessionID: "session-a")
+        sut.handleStreamErrorForTesting("error-b", sessionID: "session-b")
+
+        sut.clearErrorMessageForTesting(sessionID: "session-a")
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertNil(sut.errorMessage)
+
+        sut.prepareToDisplaySession("session-b")
+        XCTAssertEqual(sut.errorMessage, "error-b")
+    }
+
     func testStreamingComputedPropertiesTrackVisibleAndBackgroundSessions() {
         let sut = makeSUT()
 
@@ -170,6 +202,24 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(sut.isStreamingInAnotherSession)
         XCTAssertEqual(sut.visibleStreamingText, "")
         XCTAssertEqual(sut.composerPhaseLabel, "Streaming in another session...")
+    }
+
+    func testMultipleConcurrentStreamingSessionsAreTrackedIndependently() {
+        let sut = makeSUT()
+
+        sut.setStreamingSessionsForTesting(
+            [
+                "session-a": (text: "alpha", phase: .reason),
+                "session-b": (text: "beta", phase: .act),
+            ],
+            currentSessionID: "session-b"
+        )
+
+        XCTAssertEqual(sut.activeStreamSessionIDs, Set(["session-a", "session-b"]))
+        XCTAssertTrue(sut.isCurrentSessionStreaming)
+        XCTAssertTrue(sut.isStreamingInAnotherSession)
+        XCTAssertEqual(sut.visibleStreamingText, "beta")
+        XCTAssertEqual(sut.visibleCurrentPhase, .act)
     }
 
     func testStreamingDisplayControllerCoalescesRapidTokensIntoOneFlush() async {
@@ -202,6 +252,12 @@ final class ChatViewModelTests: XCTestCase {
     func testStreamingDistanceDetachesAndRepinsAutoScroll() {
         let sut = makeSUT()
 
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+
         XCTAssertTrue(sut.shouldAutoScrollStreamingUpdates)
 
         sut.updateStreamingDistanceFromBottomForTesting(StreamingDisplayController.bottomThreshold + 20)
@@ -218,17 +274,23 @@ final class ChatViewModelTests: XCTestCase {
     func testStreamEndFlushesBufferedTokensImmediately() async throws {
         let sut = makeSUT()
 
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+
         sut.appendStreamingTokenForTesting("tail")
 
-        XCTAssertEqual(sut.streamingText, "")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "")
 
         sut.flushStreamingDisplayForTesting()
 
-        XCTAssertEqual(sut.streamingText, "tail")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "tail")
 
         try await Task.sleep(for: .milliseconds(80))
 
-        XCTAssertEqual(sut.streamingText, "tail")
+        XCTAssertEqual(sut.streamingTextForTesting(sessionID: "session-a"), "tail")
     }
 
     func testStreamingDisplayControllerPreservesDetachedStateWhenStreamEnds() {
@@ -424,7 +486,7 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(sut.queuedMessage)
     }
 
-    func testQueuedMessageDeliveryDiscardsOnSessionMismatch() {
+    func testQueuedMessageDeliveryKeepsQueuedMessageWhenDifferentSessionFinishes() {
         let sut = makeSUT(connectionStatus: .connected)
 
         sut.prepareToDisplaySession("session-a")
@@ -439,7 +501,13 @@ final class ChatViewModelTests: XCTestCase {
         let delivery = sut.consumeQueuedMessageForTesting(finishedSessionID: "session-c")
 
         XCTAssertNil(delivery)
+        XCTAssertEqual(sut.queuedMessage, "follow up")
+
+        sut.prepareToDisplaySession("session-c")
         XCTAssertNil(sut.queuedMessage)
+
+        sut.prepareToDisplaySession("session-a")
+        XCTAssertEqual(sut.queuedMessage, "follow up")
     }
 
     func testSendDraftSendsImmediatelyWhenAnotherSessionIsStreaming() async {
@@ -544,6 +612,57 @@ final class ChatViewModelTests: XCTestCase {
         sut.finishActivePermissionPromptForTesting(id: first.id)
 
         XCTAssertEqual(sut.activePermissionPrompt, second)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
+    }
+
+    func testStopStreamingClearsPermissionPromptState() {
+        let sut = makeSUT()
+        let prompt = PermissionPrompt(id: "prompt-1", action: "write", path: "/tmp/report.md", tier: 2)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.enqueuePermissionPromptForTesting(prompt)
+
+        sut.stopStreamingForTesting()
+
+        XCTAssertNil(sut.activePermissionPrompt)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 0)
+        XCTAssertNil(sut.permissionPromptIndicatorText)
+        XCTAssertNil(sut.permissionPromptErrorMessage)
+    }
+
+    func testResetStreamingStateClearsPermissionPromptWhenLastStreamEnds() {
+        let sut = makeSUT()
+        let prompt = PermissionPrompt(id: "prompt-1", action: "write", path: "/tmp/report.md", tier: 2)
+
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.enqueuePermissionPromptForTesting(prompt)
+
+        sut.resetStreamingStateForTesting(sessionID: "session-a")
+
+        XCTAssertNil(sut.activePermissionPrompt)
+        XCTAssertEqual(sut.pendingPermissionPromptCount, 0)
+    }
+
+    func testResetStreamingStateKeepsPermissionPromptWhileAnotherStreamIsActive() {
+        let sut = makeSUT()
+        let prompt = PermissionPrompt(id: "prompt-1", action: "write", path: "/tmp/report.md", tier: 2)
+
+        sut.setStreamingSessionsForTesting(
+            [
+                "session-a": (text: "alpha", phase: .reason),
+                "session-b": (text: "beta", phase: .act),
+            ],
+            currentSessionID: "session-b"
+        )
+        sut.enqueuePermissionPromptForTesting(prompt)
+
+        sut.resetStreamingStateForTesting(sessionID: "session-a")
+
+        XCTAssertEqual(sut.activePermissionPrompt, prompt)
         XCTAssertEqual(sut.pendingPermissionPromptCount, 1)
     }
 

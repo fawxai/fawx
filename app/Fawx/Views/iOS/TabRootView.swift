@@ -63,6 +63,7 @@ struct TabRootView: View {
                     NavigationStack {
                         SkillsView(
                             skillsViewModel: skillsViewModel,
+                            isActive: selectedTab == .skills,
                             showsHeader: false
                         )
                             .navigationTitle("Skills")
@@ -95,7 +96,10 @@ struct TabRootView: View {
 
                 rootSectionContainer(isActive: selectedTab == .fleet) {
                     NavigationStack {
-                        FleetView(viewModel: fleetViewModel)
+                        FleetView(
+                            viewModel: fleetViewModel,
+                            isActive: selectedTab == .fleet
+                        )
                             .navigationTitle("Fleet")
                             .iOSInlineNavigationTitle()
                             .toolbar {
@@ -126,7 +130,10 @@ struct TabRootView: View {
 
                 rootSectionContainer(isActive: selectedTab == .experiments) {
                     NavigationStack {
-                        ExperimentsView(viewModel: experimentsViewModel)
+                        ExperimentsView(
+                            viewModel: experimentsViewModel,
+                            isActive: selectedTab == .experiments
+                        )
                             .navigationTitle("Experiments")
                             .iOSInlineNavigationTitle()
                             .toolbar {
@@ -157,7 +164,10 @@ struct TabRootView: View {
 
                 rootSectionContainer(isActive: selectedTab == .git) {
                     NavigationStack {
-                        GitView(viewModel: gitViewModel)
+                        GitView(
+                            viewModel: gitViewModel,
+                            isActive: selectedTab == .git
+                        )
                             .navigationTitle("Git")
                             .iOSInlineNavigationTitle()
                             .toolbar {
@@ -209,7 +219,8 @@ struct TabRootView: View {
                         },
                         openGit: {
                             selectedTab = .git
-                        }
+                        },
+                        isActive: selectedTab == .settings
                     )
                 }
             }

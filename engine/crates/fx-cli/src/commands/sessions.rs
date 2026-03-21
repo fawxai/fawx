@@ -3,8 +3,8 @@ use anyhow::anyhow;
 use chrono::{TimeZone, Utc};
 use clap::Args;
 use fx_session::{
-    render_content_blocks_with_options, ContentRenderOptions, SessionContentBlock, SessionInfo,
-    SessionKey, SessionKind, SessionMessage, SessionRegistry,
+    render_content_blocks_with_options, ContentRenderOptions, SessionInfo, SessionKey,
+    SessionKind, SessionMessage, SessionRegistry,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -281,7 +281,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_session::{MessageRole, SessionConfig};
+    use fx_session::{MessageRole, SessionConfig, SessionContentBlock};
     use tempfile::TempDir;
 
     fn db_path(temp_dir: &TempDir) -> PathBuf {
@@ -410,6 +410,7 @@ mod tests {
                     },
                     SessionContentBlock::ToolUse {
                         id: "call_1".to_string(),
+                        provider_id: None,
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "README.md"}),
                     },

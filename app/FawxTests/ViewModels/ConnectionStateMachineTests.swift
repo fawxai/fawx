@@ -22,6 +22,20 @@ final class ConnectionStateMachineTests: XCTestCase {
         XCTAssertFalse(shouldHandle)
     }
 
+    func testIssueKindReturnsOtherForServerErrorResponse() {
+        let kind = ConnectionStateMachine.issueKind(for: APIError.httpStatus(500, nil))
+
+        XCTAssertEqual(kind, .other)
+    }
+
+    func testShouldHandleAsConnectionIssueReturnsFalseForServerErrorResponse() {
+        let shouldHandle = ConnectionStateMachine.shouldHandleAsConnectionIssue(
+            APIError.httpStatus(500, "tool call failed")
+        )
+
+        XCTAssertFalse(shouldHandle)
+    }
+
     func testFailureStatusReconnectsOnConnectivityFailureWhenAllowed() {
         let status = ConnectionStateMachine.failureStatus(
             for: URLError(.cannotConnectToHost),

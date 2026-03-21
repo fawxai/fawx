@@ -49,6 +49,7 @@ fx-bus.workspace = true
 fx-cron.workspace = true
 fx-storage.workspace = true
 ring.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true

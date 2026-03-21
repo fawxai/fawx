@@ -2569,6 +2569,7 @@ allowed_chat_ids = [123]
                 SessionMessageRole::Assistant,
                 vec![SessionContentBlock::ToolUse {
                     id: "call_1".to_string(),
+                    provider_id: None,
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "README.md"}),
                 }],
@@ -2640,6 +2641,134 @@ allowed_chat_ids = [123]
                 text: "Mock response".to_string()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn session_message_ignores_unresolved_prior_tool_use_in_context() {
+        #[derive(Clone)]
+        struct LocalCapturingProvider {
+            captured: Arc<std::sync::Mutex<Vec<fx_llm::CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl fx_llm::CompletionProvider for LocalCapturingProvider {
+            async fn complete(
+                &self,
+                request: fx_llm::CompletionRequest,
+            ) -> Result<CompletionResponse, fx_llm::ProviderError> {
+                self.captured.lock().expect("capture lock").push(request);
+                Ok(mock_completion_response())
+            }
+
+            async fn complete_stream(
+                &self,
+                request: fx_llm::CompletionRequest,
+            ) -> Result<CompletionStream, fx_llm::ProviderError> {
+                self.captured.lock().expect("capture lock").push(request);
+                Ok(mock_completion_stream())
+            }
+
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["capturing-model".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-orphan-tool");
+        registry
+            .record_message(&key, SessionMessageRole::User, "first request")
+            .expect("record user");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                Some(10),
+            )
+            .expect("record resolved tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                }],
+                None,
+            )
+            .expect("record resolved tool result");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                Some(10),
+            )
+            .expect("record orphan tool use");
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<fx_llm::CompletionRequest>::new()));
+        let mut router = fx_llm::ModelRouter::new();
+        router.register_provider(Box::new(LocalCapturingProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("capturing-model")
+            .expect("set active capturing model");
+        let app = build_test_app(
+            router,
+            fx_config::FawxConfig::default(),
+            None,
+            test_runtime_info(),
+        );
+        let mut state = test_state_with_app(app, Vec::new());
+        state.session_registry = Some(registry);
+        let app = build_router(state, None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"continue from here"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+
+        assert!(captured_request.messages.iter().flat_map(|message| &message.content).any(
+            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_good")
+        ));
+        assert!(!captured_request.messages.iter().flat_map(|message| &message.content).any(
+            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_bad")
+        ));
     }
 
     #[tokio::test]

@@ -121,8 +121,15 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
 }
 
 fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
-    let delta_content = response
-        .content
+    let CompletionResponse {
+        content,
+        tool_calls,
+        usage,
+        stop_reason,
+    } = response;
+    let provider_item_ids = extract_tool_use_provider_ids(&content);
+
+    let delta_content = content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
@@ -132,10 +139,10 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let tool_use_deltas = response
-        .tool_calls
+    let tool_use_deltas = tool_calls
         .into_iter()
         .map(|call| ToolUseDelta {
+            provider_id: provider_item_ids.get(&call.id).cloned(),
             id: Some(call.id),
             name: Some(call.name),
             arguments_delta: Some(call.arguments.to_string()),
@@ -146,8 +153,8 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
     StreamChunk {
         delta_content: (!delta_content.is_empty()).then_some(delta_content),
         tool_use_deltas,
-        usage: response.usage,
-        stop_reason: response.stop_reason,
+        usage,
+        stop_reason,
     }
 }
 
@@ -434,6 +441,8 @@ pub struct LoopEngine {
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    /// Provider-specific tool output item identifiers keyed by stable tool call id.
+    tool_call_provider_ids: HashMap<String, String>,
     error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
@@ -694,6 +703,7 @@ impl LoopEngineBuilder {
             notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
+            tool_call_provider_ids: HashMap::new(),
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
@@ -791,9 +801,10 @@ enum ToolRoundOutcome {
     Response(CompletionResponse),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct StreamToolCallState {
     id: Option<String>,
+    provider_id: Option<String>,
     name: Option<String>,
     arguments: String,
     arguments_done: bool,
@@ -832,17 +843,35 @@ impl StreamResponseState {
     }
 
     fn into_response(self) -> CompletionResponse {
+        let finalized_tools = finalize_stream_tool_payloads(self.tool_calls_by_index);
+        let mut content = Vec::with_capacity(
+            usize::from(!self.text.is_empty()).saturating_add(finalized_tools.len()),
+        );
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text { text: self.text });
+        }
+        content.extend(finalized_tools.iter().map(|tool| ContentBlock::ToolUse {
+            id: tool.call.id.clone(),
+            provider_id: tool.provider_id.clone(),
+            name: tool.call.name.clone(),
+            input: tool.call.arguments.clone(),
+        }));
         CompletionResponse {
-            content: vec![ContentBlock::Text { text: self.text }],
-            tool_calls: finalize_stream_tool_calls(self.tool_calls_by_index),
+            content,
+            tool_calls: finalized_tools.into_iter().map(|tool| tool.call).collect(),
             usage: self.usage,
             stop_reason: self.stop_reason,
         }
     }
 
     fn into_cancelled_response(self) -> CompletionResponse {
+        let content = if self.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text { text: self.text }]
+        };
         CompletionResponse {
-            content: vec![ContentBlock::Text { text: self.text }],
+            content,
             tool_calls: Vec::new(),
             usage: self.usage,
             stop_reason: Some("cancelled".to_string()),
@@ -1876,6 +1905,7 @@ impl LoopEngine {
         // Decompose takes priority over all other tool calls in the same response.
         // Other tool calls are intentionally discarded — the sub-goals will re-invoke tools as needed.
         if let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) {
+            self.tool_call_provider_ids.clear();
             if response.tool_calls.len() > 1 {
                 self.emit_signal(
                     LoopStep::Decide,
@@ -1891,11 +1921,13 @@ impl LoopEngine {
         }
 
         if !response.tool_calls.is_empty() {
+            self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
             let decision = Decision::UseTools(response.tool_calls.clone());
             self.emit_decision_signals(&decision);
             return Ok(decision);
         }
 
+        self.tool_call_provider_ids.clear();
         let raw = extract_response_text(response);
         let text = extract_readable_text(&raw);
         let decision = Decision::Respond(ensure_non_empty_response(&text));
@@ -3151,6 +3183,7 @@ impl LoopEngine {
                 ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
+                        self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
                         self.append_deferred_tool_results(
                             &mut state,
@@ -3321,6 +3354,7 @@ impl LoopEngine {
         append_tool_round_messages(
             &mut state.continuation_messages,
             &state.current_calls,
+            &self.tool_call_provider_ids,
             &results,
         )?;
         state.all_tool_results.extend(results);
@@ -4223,9 +4257,10 @@ fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
 fn append_tool_round_messages(
     context_messages: &mut Vec<Message>,
     calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
     results: &[ToolResult],
 ) -> Result<(), LoopError> {
-    let assistant_message = build_tool_use_assistant_message(calls);
+    let assistant_message = build_tool_use_assistant_message(calls, provider_item_ids);
     let result_message = build_tool_result_message(calls, results)?;
     context_messages.push(assistant_message);
     context_messages.push(result_message);
@@ -4233,11 +4268,15 @@ fn append_tool_round_messages(
 }
 
 /// Build an assistant message containing ToolUse content blocks.
-fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
+fn build_tool_use_assistant_message(
+    calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
+) -> Message {
     let content = calls
         .iter()
         .map(|call| ContentBlock::ToolUse {
             id: call.id.clone(),
+            provider_id: provider_item_ids.get(&call.id).cloned(),
             name: call.name.clone(),
             input: call.arguments.clone(),
         })
@@ -4246,6 +4285,22 @@ fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
         role: MessageRole::Assistant,
         content,
     }
+}
+
+fn extract_tool_use_provider_ids(content: &[ContentBlock]) -> HashMap<String, String> {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                ..
+            } if !id.trim().is_empty() && !provider_id.trim().is_empty() => {
+                Some((id.clone(), provider_id.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build a tool message containing ToolResult content blocks.
@@ -4628,31 +4683,38 @@ fn stream_tool_index(
     tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
     id_to_index: &HashMap<String, usize>,
 ) -> usize {
-    let Some(id) = delta.id.as_deref() else {
+    for identifier in [delta.id.as_deref(), delta.provider_id.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(index) = id_to_index.get(identifier).copied() {
+            return index;
+        }
+    }
+
+    let Some(identifier) = delta.id.as_deref().or(delta.provider_id.as_deref()) else {
         return chunk_index;
     };
 
-    if let Some(index) = id_to_index.get(id).copied() {
-        return index;
-    }
-
-    if chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+    if chunk_index_usable_for_identifier(chunk_index, identifier, tool_calls_by_index) {
         return chunk_index;
     }
 
     next_stream_tool_index(tool_calls_by_index)
 }
 
-fn chunk_index_usable_for_id(
+fn chunk_index_usable_for_identifier(
     chunk_index: usize,
-    id: &str,
+    identifier: &str,
     tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
 ) -> bool {
     match tool_calls_by_index.get(&chunk_index) {
         None => true,
-        Some(state) => match state.id.as_deref() {
-            None => true,
-            Some(existing_id) => existing_id == id,
+        Some(state) => match (state.id.as_deref(), state.provider_id.as_deref()) {
+            (None, None) => true,
+            (Some(existing_id), _) if existing_id == identifier => true,
+            (_, Some(existing_provider_id)) if existing_provider_id == identifier => true,
+            _ => false,
         },
     }
 }
@@ -4672,14 +4734,36 @@ fn merge_stream_tool_delta(
     id_to_index: &mut HashMap<String, usize>,
     index: usize,
 ) {
-    if entry.id.is_none() {
-        entry.id = delta.id;
+    if let Some(incoming_id) = delta.id.clone() {
+        match entry.id.as_deref() {
+            None => entry.id = Some(incoming_id),
+            Some(current_id) if current_id == incoming_id => {}
+            Some(current_id)
+                if delta
+                    .provider_id
+                    .as_deref()
+                    .is_some_and(|provider_id| provider_id == current_id) =>
+            {
+                entry.id = Some(incoming_id);
+            }
+            Some(_) => {
+                if entry.provider_id.is_none() {
+                    entry.provider_id = Some(incoming_id);
+                }
+            }
+        }
+    }
+    if entry.provider_id.is_none() {
+        entry.provider_id = delta.provider_id;
     }
     if entry.name.is_none() {
         entry.name = delta.name;
     }
     if let Some(id) = entry.id.clone() {
         id_to_index.insert(id, index);
+    }
+    if let Some(provider_id) = entry.provider_id.clone() {
+        id_to_index.insert(provider_id, index);
     }
     if let Some(arguments_delta) = delta.arguments_delta {
         merge_stream_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
@@ -4702,25 +4786,56 @@ fn merge_stream_arguments(arguments: &mut String, arguments_delta: &str, argumen
     arguments.push_str(arguments_delta);
 }
 
+#[cfg(test)]
 fn finalize_stream_tool_calls(by_index: HashMap<usize, StreamToolCallState>) -> Vec<ToolCall> {
+    finalize_stream_tool_payloads(by_index)
+        .into_iter()
+        .map(|tool| tool.call)
+        .collect()
+}
+
+#[derive(Debug)]
+struct FinalizedStreamToolCall {
+    call: ToolCall,
+    provider_id: Option<String>,
+}
+
+fn finalize_stream_tool_payloads(
+    by_index: HashMap<usize, StreamToolCallState>,
+) -> Vec<FinalizedStreamToolCall> {
     let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
     indexed_calls.sort_by_key(|(index, _)| *index);
     indexed_calls
         .into_iter()
-        .filter_map(|(_, state)| stream_tool_call_from_state(state))
+        .filter_map(|(_, state)| finalized_stream_tool_call_from_state(state))
         .collect()
 }
 
+#[cfg(test)]
 fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
+    finalized_stream_tool_call_from_state(state).map(|tool| tool.call)
+}
+
+fn finalized_stream_tool_call_from_state(
+    state: StreamToolCallState,
+) -> Option<FinalizedStreamToolCall> {
     if !state.arguments_done {
         return None;
     }
 
-    let id = state.id?.trim().to_string();
+    let id = state.id.or(state.provider_id.clone())?.trim().to_string();
     let name = state.name?.trim().to_string();
     if id.is_empty() || name.is_empty() {
         return None;
     }
+
+    let provider_id = state
+        .provider_id
+        .filter(|provider_id| {
+            let trimmed = provider_id.trim();
+            !trimmed.is_empty() && trimmed != id
+        })
+        .map(|provider_id| provider_id.trim().to_string());
 
     let raw_args = if state.arguments.trim().is_empty() {
         "{}".to_string()
@@ -4740,10 +4855,13 @@ fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
             return None;
         }
     };
-    Some(ToolCall {
-        id,
-        name,
-        arguments,
+    Some(FinalizedStreamToolCall {
+        provider_id,
+        call: ToolCall {
+            id,
+            name,
+            arguments,
+        },
     })
 }
 
@@ -7144,13 +7262,19 @@ mod phase4_tests {
     #[derive(Debug)]
     struct Phase4MockLlm {
         responses: Mutex<VecDeque<CompletionResponse>>,
+        requests: Mutex<Vec<CompletionRequest>>,
     }
 
     impl Phase4MockLlm {
         fn new(responses: Vec<CompletionResponse>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("lock").clone()
         }
     }
 
@@ -7228,8 +7352,9 @@ mod phase4_tests {
 
         async fn complete(
             &self,
-            _: CompletionRequest,
+            request: CompletionRequest,
         ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("lock").push(request);
             self.responses
                 .lock()
                 .expect("lock")
@@ -7408,6 +7533,59 @@ mod phase4_tests {
     }
 
     #[tokio::test]
+    async fn act_with_tools_refreshes_provider_ids_between_rounds() {
+        let mut engine = p4_engine();
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-2".to_string(),
+                    provider_id: Some("fc-2".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "b.txt"}),
+                }],
+                tool_calls: vec![read_file_call("call-2", "b.txt")],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            text_response("done"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.response_text, "done");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolUse {
+                                id,
+                                provider_id: Some(provider_id),
+                                ..
+                            } if id == "call-2" && provider_id == "fc-2"
+                        )
+                    })
+            }),
+            "second continuation request should preserve provider item ids for the next tool round"
+        );
+    }
+
+    #[tokio::test]
     async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(
@@ -7537,12 +7715,14 @@ mod phase4_tests {
             },
         ];
 
-        let message = build_tool_use_assistant_message(&calls);
+        let message = build_tool_use_assistant_message(&calls, &HashMap::new());
 
         assert_eq!(message.role, fx_llm::MessageRole::Assistant);
         assert_eq!(message.content.len(), 2);
         match &message.content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "a.txt");
@@ -7562,7 +7742,7 @@ mod phase4_tests {
         }];
         let mut messages = vec![Message::user("prompt")];
 
-        append_tool_round_messages(&mut messages, &calls, &results)
+        append_tool_round_messages(&mut messages, &calls, &HashMap::new(), &results)
             .expect("append_tool_round_messages");
 
         assert_eq!(messages.len(), 3);
@@ -8289,6 +8469,7 @@ mod cancellation_tests {
     fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
         ToolUseDelta {
             id: Some(id.to_string()),
+            provider_id: None,
             name: name.map(ToString::to_string),
             arguments_delta: Some(arguments_delta.to_string()),
             arguments_done: done,
@@ -8767,6 +8948,7 @@ mod cancellation_tests {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("call-1".to_string()),
+                    provider_id: None,
                     name: Some("read_file".to_string()),
                     arguments_delta: Some("{\"path\":\"READ".to_string()),
                     arguments_done: false,
@@ -8778,6 +8960,7 @@ mod cancellation_tests {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("call-1".to_string()),
+                    provider_id: None,
                     name: None,
                     arguments_delta: Some("ME.md\"}".to_string()),
                     arguments_done: true,
@@ -8799,6 +8982,89 @@ mod cancellation_tests {
             response.tool_calls[0].arguments,
             serde_json::json!({"path":"README.md"})
         );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_preserves_provider_ids_in_content() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    provider_id: Some("fc-1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some(r#"{"path":"README.md"}"#.to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                name,
+                input,
+            }] if id == "call-1"
+                && provider_id == "fc-1"
+                && name == "read_file"
+                && input == &serde_json::json!({"path":"README.md"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_promotes_call_id_over_provider_id() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("fc-123".to_string()),
+                    provider_id: Some("fc-123".to_string()),
+                    name: Some("weather".to_string()),
+                    arguments_delta: Some(r#"{"location":"Denver, CO"}"#.to_string()),
+                    arguments_done: false,
+                }],
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-123".to_string()),
+                    provider_id: Some("fc-123".to_string()),
+                    name: None,
+                    arguments_delta: None,
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls[0].id, "call-123");
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                ..
+            }] if id == "call-123" && provider_id == "fc-123"
+        ));
     }
 
     #[tokio::test]
@@ -12299,6 +12565,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_drops_malformed_json_arguments() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("read_file".to_string()),
             arguments: "not valid json {{{".to_string(),
             arguments_done: true,
@@ -12314,6 +12581,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_accepts_valid_json_arguments() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: Some("fc-1".to_string()),
             name: Some("read_file".to_string()),
             arguments: r#"{"path":"README.md"}"#.to_string(),
             arguments_done: true,
@@ -12332,6 +12600,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_normalizes_empty_arguments_to_empty_object() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("git_status".to_string()),
             arguments: String::new(),
             arguments_done: true,
@@ -12351,6 +12620,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_normalizes_whitespace_arguments_to_empty_object() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("current_time".to_string()),
             arguments: "   \n\t  ".to_string(),
             arguments_done: true,
@@ -12371,6 +12641,7 @@ mod r2_streaming_review_tests {
             0,
             StreamToolCallState {
                 id: Some("call-zero".to_string()),
+                provider_id: None,
                 name: Some("memory_list".to_string()),
                 arguments: String::new(),
                 arguments_done: true,
@@ -12380,6 +12651,7 @@ mod r2_streaming_review_tests {
             1,
             StreamToolCallState {
                 id: Some("call-with-args".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments: r#"{"path":"test.rs"}"#.to_string(),
                 arguments_done: true,
@@ -12404,6 +12676,7 @@ mod r2_streaming_review_tests {
             0,
             StreamToolCallState {
                 id: Some("call-good".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
                 arguments_done: true,
@@ -12413,6 +12686,7 @@ mod r2_streaming_review_tests {
             1,
             StreamToolCallState {
                 id: Some("call-bad".to_string()),
+                provider_id: None,
                 name: Some("write_file".to_string()),
                 arguments: "truncated json {".to_string(),
                 arguments_done: true,
@@ -12584,6 +12858,7 @@ mod r2_streaming_review_tests {
                 },
                 ContentBlock::ToolUse {
                     id: "t1".to_string(),
+                    provider_id: None,
                     name: "read_file".to_string(),
                     input: serde_json::json!({}),
                 },
@@ -12602,6 +12877,40 @@ mod r2_streaming_review_tests {
             Some("before\nafter"),
             "non-text blocks should be skipped in the join"
         );
+    }
+
+    #[test]
+    fn response_to_chunk_preserves_tool_provider_ids() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                provider_id: Some("fc-1".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path":"README.md"}),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        };
+
+        let chunk = response_to_chunk(response);
+        assert!(matches!(
+            chunk.tool_use_deltas.as_slice(),
+            [ToolUseDelta {
+                id: Some(id),
+                provider_id: Some(provider_id),
+                name: Some(name),
+                arguments_delta: Some(arguments),
+                arguments_done: true,
+            }] if id == "call-1"
+                && provider_id == "fc-1"
+                && name == "read_file"
+                && arguments == r#"{"path":"README.md"}"#
+        ));
     }
 
     // -- Nice-to-have 2: empty stream edge case test --
@@ -12666,6 +12975,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments_delta: None,
                 arguments_done: false,
@@ -12677,6 +12987,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: Some(r#"{"path":"/tmp/a.txt"}"#.to_string()),
                 arguments_done: false,
@@ -12688,6 +12999,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: None,
                 arguments_done: true,
@@ -12699,6 +13011,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments_delta: None,
                 arguments_done: false,
@@ -12710,6 +13023,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: Some(r#"{"path":"/tmp/b.txt"}"#.to_string()),
                 arguments_done: false,
@@ -12721,6 +13035,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: None,
                 arguments_done: true,
