@@ -586,6 +586,12 @@ fn validate_session_memory(
         )));
     }
 
+    if memory.active_files.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
     let estimated_tokens = memory.estimated_tokens();
     if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
         return Err(bad_request(&format!(
@@ -724,5 +730,23 @@ mod tests {
                     ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
+    }
+
+    #[test]
+    fn validate_session_memory_rejects_too_many_active_files() {
+        let memory = SessionMemory {
+            active_files: (0..=SESSION_MEMORY_MAX_ITEMS)
+                .map(|index| format!("file-{index}.rs"))
+                .collect(),
+            ..SessionMemory::default()
+        };
+
+        let error = validate_session_memory(memory).expect_err("validation should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1 .0.error,
+            format!("active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items")
+        );
     }
 }

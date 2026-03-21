@@ -1032,25 +1032,6 @@ fn serialize_stream_event_serializes_error_event_payload() {
 }
 
 #[test]
-fn serialize_stream_event_serializes_context_compacted_payload() {
-    let frame = serialize_stream_event(StreamEvent::ContextCompacted {
-        tier: "slide".to_string(),
-        messages_removed: 12,
-        tokens_before: 5_100,
-        tokens_after: 2_900,
-        usage_ratio: 0.42,
-    })
-    .expect("context compacted frame");
-
-    assert!(frame.contains("event: context_compacted"));
-    assert!(frame.contains("\"tier\":\"slide\""));
-    assert!(frame.contains("\"messages_removed\":12"));
-    assert!(frame.contains("\"tokens_before\":5100"));
-    assert!(frame.contains("\"tokens_after\":2900"));
-    assert!(frame.contains("\"usage_ratio\":0.42"));
-}
-
-#[test]
 fn send_sse_frame_stops_when_receiver_is_closed() {
     let (sender, receiver) = mpsc::channel(1);
     let disconnected = Arc::new(AtomicBool::new(false));

@@ -44,6 +44,7 @@ pub enum Phase {
     Synthesize,
 }
 
+// `Eq` is intentionally omitted because `ContextCompacted` carries `usage_ratio: f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamEvent {
     TextDelta {

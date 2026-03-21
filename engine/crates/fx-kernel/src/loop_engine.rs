@@ -1294,14 +1294,14 @@ impl LoopEngine {
         message: impl Into<String>,
         recoverable: bool,
     ) {
-        self.emit_background_event(StreamEvent::Error {
+        self.emit_stream_event(StreamEvent::Error {
             category,
             message: message.into(),
             recoverable,
         });
     }
 
-    fn emit_background_event(&self, event: StreamEvent) {
+    fn emit_stream_event(&self, event: StreamEvent) {
         if let Some(cb) = &self.error_callback {
             cb(event);
         }
@@ -3190,7 +3190,7 @@ impl LoopEngine {
         }
         self.log_tier_result(tier, scope, current.as_ref(), target_tokens, &result);
         if result.compacted_count > 0 {
-            self.emit_background_event(StreamEvent::ContextCompacted {
+            self.emit_stream_event(StreamEvent::ContextCompacted {
                 tier: tier.as_str().to_string(),
                 messages_removed: result.compacted_count,
                 tokens_before: before_tokens,
