@@ -79,6 +79,30 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(coordinator.shouldFollowLiveOutput)
     }
 
+    func testTranscriptScrollCoordinatorPublishCurrentPinnedStatePrimesDeduplication() {
+        let coordinator = TranscriptScrollCoordinator()
+
+        coordinator.activateSession("session-a")
+
+        XCTAssertEqual(
+            coordinator.publishCurrentPinnedState(distanceFromBottom: -10),
+            TranscriptPinnedStateUpdate(distanceFromBottom: 0, isPinnedToBottom: true)
+        )
+        XCTAssertNil(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 20, distanceFromBottom: 10),
+                userDriven: false
+            )
+        )
+        XCTAssertEqual(
+            coordinator.update(
+                observation: TranscriptScrollObservation(contentOffsetY: 120, distanceFromBottom: 120),
+                userDriven: true
+            ),
+            TranscriptPinnedStateUpdate(distanceFromBottom: 120, isPinnedToBottom: false)
+        )
+    }
+
     func testTranscriptScrollCoordinatorPublishesPinnedTransitionsOnce() {
         let coordinator = TranscriptScrollCoordinator()
 
@@ -111,6 +135,34 @@ final class ChatViewModelTests: XCTestCase {
                 userDriven: true
             )
         )
+    }
+
+    @available(iOS 18.0, macOS 15.0, *)
+    func testTranscriptScrollInteractionTrackerMarksInteractivePhasesAsUserDriven() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        tracker.updateScrollPhase(.tracking)
+
+        XCTAssertTrue(tracker.isUserDrivenScroll(isPositionedByUser: false))
+    }
+
+    @available(iOS 18.0, macOS 15.0, *)
+    func testTranscriptScrollInteractionTrackerClearsInteractionOnIdlePhase() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        tracker.updateScrollPhase(.tracking)
+        tracker.updateScrollPhase(.idle)
+
+        XCTAssertFalse(tracker.isUserDrivenScroll(isPositionedByUser: false))
+    }
+
+    @available(iOS 18.0, macOS 15.0, *)
+    func testTranscriptScrollInteractionTrackerFallsBackToPositionedByUserWhenIdle() {
+        let tracker = TranscriptScrollInteractionTracker()
+
+        tracker.updateScrollPhase(.idle)
+
+        XCTAssertTrue(tracker.isUserDrivenScroll(isPositionedByUser: true))
     }
 
     func testTranscriptScrollCoordinatorRestoresDetachedSessionAtSavedOffset() {
