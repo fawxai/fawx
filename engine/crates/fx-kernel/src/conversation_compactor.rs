@@ -84,6 +84,12 @@ fn compaction_marker_message(compacted_count: usize) -> Message {
     ))
 }
 
+fn emergency_compaction_marker_message(compacted_count: usize) -> Message {
+    Message::assistant(format!(
+        "{COMPACTION_MARKER_PREFIX} emergency — {compacted_count} messages removed]"
+    ))
+}
+
 fn tool_ids_in_message(message: &Message) -> Vec<&str> {
     message
         .content
@@ -236,6 +242,20 @@ fn assemble_sliding_result(
     compacted
 }
 
+fn assemble_emergency_result(
+    messages: &[Message],
+    bounds: &ZoneBounds,
+    compacted_count: usize,
+) -> Vec<Message> {
+    let mut compacted = Vec::new();
+    compacted.extend_from_slice(&messages[..bounds.prefix_end]);
+    if compacted_count > 0 {
+        compacted.push(emergency_compaction_marker_message(compacted_count));
+    }
+    compacted.extend_from_slice(&messages[bounds.tail_start..]);
+    compacted
+}
+
 fn compaction_marker_tokens(compacted_count: usize) -> usize {
     estimate_message_tokens(&compaction_marker_message(compacted_count))
 }
@@ -318,6 +338,30 @@ fn sliding_compaction_result(
         used_summarization: false,
         evicted_indices,
     })
+}
+
+pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> CompactionResult {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let evicted_indices: Vec<usize> = (bounds.prefix_end..bounds.tail_start).collect();
+    let compacted_count = evicted_indices.len();
+    if compacted_count == 0 {
+        return CompactionResult {
+            messages: messages.to_vec(),
+            compacted_count: 0,
+            estimated_tokens: ConversationBudget::estimate_tokens(messages),
+            used_summarization: false,
+            evicted_indices,
+        };
+    }
+
+    let result_messages = assemble_emergency_result(messages, &bounds, compacted_count);
+    CompactionResult {
+        estimated_tokens: ConversationBudget::estimate_tokens(&result_messages),
+        messages: result_messages,
+        compacted_count,
+        used_summarization: false,
+        evicted_indices,
+    }
 }
 
 /// Result of tool block pruning.
@@ -469,7 +513,7 @@ fn summarize_tool_result(content: &serde_json::Value, max_chars: usize) -> Strin
 #[derive(Debug, Clone)]
 pub struct ConversationBudget {
     model_context_limit: usize,
-    compaction_threshold: f32,
+    slide_threshold: f32,
     reserved_tokens: usize,
     output_reserve_tokens: usize,
 }
@@ -477,14 +521,10 @@ pub struct ConversationBudget {
 impl ConversationBudget {
     pub const DEFAULT_OUTPUT_RESERVE_TOKENS: usize = 4_096;
 
-    pub fn new(
-        model_context_limit: usize,
-        compaction_threshold: f32,
-        reserved_tokens: usize,
-    ) -> Self {
+    pub fn new(model_context_limit: usize, slide_threshold: f32, reserved_tokens: usize) -> Self {
         Self {
             model_context_limit,
-            compaction_threshold,
+            slide_threshold,
             reserved_tokens,
             output_reserve_tokens: Self::DEFAULT_OUTPUT_RESERVE_TOKENS,
         }
@@ -497,13 +537,24 @@ impl ConversationBudget {
     }
 
     pub fn compaction_threshold_value(&self) -> f32 {
-        self.compaction_threshold
+        self.slide_threshold
+    }
+
+    pub fn usage_ratio(&self, messages: &[Message]) -> f32 {
+        let budget = self.conversation_budget();
+        if budget == 0 {
+            return if messages.is_empty() { 0.0 } else { 1.0 };
+        }
+
+        Self::estimate_tokens(messages) as f32 / budget as f32
+    }
+
+    pub fn at_tier(&self, messages: &[Message], threshold: f32) -> bool {
+        self.usage_ratio(messages) >= threshold
     }
 
     pub fn needs_compaction(&self, messages: &[Message]) -> bool {
-        let trigger =
-            (self.conversation_budget() as f32 * self.compaction_threshold).ceil() as usize;
-        Self::estimate_tokens(messages) >= trigger
+        self.at_tier(messages, self.slide_threshold)
     }
 
     pub fn exceeds_hard_limit(&self, messages: &[Message]) -> bool {
@@ -516,6 +567,10 @@ impl ConversationBudget {
 
     pub fn compaction_target(&self) -> usize {
         self.conversation_budget().saturating_mul(3) / 5
+    }
+
+    pub fn summarize_target(&self) -> usize {
+        self.conversation_budget().saturating_mul(2) / 5
     }
 }
 
@@ -758,8 +813,17 @@ impl CompactionStrategy for SummarizingCompactor {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CompactionConfigError {
-    #[error("compaction_threshold must be in (0.0, 1.0], got {0}")]
+    #[error("threshold must be in (0.0, 1.0], got {0}")]
     InvalidThreshold(f32),
+    #[error(
+        "thresholds must be strictly increasing: prune ({prune}) < slide ({slide}) < summarize ({summarize}) < emergency ({emergency})"
+    )]
+    ThresholdsNotMonotonic {
+        prune: f32,
+        slide: f32,
+        summarize: f32,
+        emergency: f32,
+    },
     #[error("model_context_limit must be > 0")]
     ZeroContextLimit,
     #[error("reserved_system_tokens ({reserved}) must be < model_context_limit ({limit})")]
@@ -782,8 +846,13 @@ pub enum CompactionConfigError {
 
 /// Configuration for conversation-level compaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompactionConfig {
-    pub(crate) compaction_threshold: f32,
+    #[serde(alias = "compaction_threshold")]
+    pub(crate) slide_threshold: f32,
+    pub(crate) prune_threshold: f32,
+    pub(crate) summarize_threshold: f32,
+    pub(crate) emergency_threshold: f32,
     pub(crate) preserve_recent_turns: usize,
     pub(crate) model_context_limit: usize,
     pub(crate) reserved_system_tokens: usize,
@@ -796,18 +865,46 @@ pub struct CompactionConfig {
     pub(crate) tool_block_summary_max_chars: usize,
 }
 
+fn validate_threshold(threshold: f32) -> Result<(), CompactionConfigError> {
+    if !(0.0 < threshold && threshold <= 1.0) {
+        return Err(CompactionConfigError::InvalidThreshold(threshold));
+    }
+    Ok(())
+}
+
 impl CompactionConfig {
     pub fn validate(&self) -> Result<(), CompactionConfigError> {
+        self.validate_thresholds()?;
         self.validate_ranges()?;
         self.validate_budget_floor()
     }
 
-    fn validate_ranges(&self) -> Result<(), CompactionConfigError> {
-        if !(0.0 < self.compaction_threshold && self.compaction_threshold <= 1.0) {
-            return Err(CompactionConfigError::InvalidThreshold(
-                self.compaction_threshold,
-            ));
+    fn validate_thresholds(&self) -> Result<(), CompactionConfigError> {
+        for threshold in [
+            self.prune_threshold,
+            self.slide_threshold,
+            self.summarize_threshold,
+            self.emergency_threshold,
+        ] {
+            validate_threshold(threshold)?;
         }
+
+        if self.prune_threshold < self.slide_threshold
+            && self.slide_threshold < self.summarize_threshold
+            && self.summarize_threshold < self.emergency_threshold
+        {
+            return Ok(());
+        }
+
+        Err(CompactionConfigError::ThresholdsNotMonotonic {
+            prune: self.prune_threshold,
+            slide: self.slide_threshold,
+            summarize: self.summarize_threshold,
+            emergency: self.emergency_threshold,
+        })
+    }
+
+    fn validate_ranges(&self) -> Result<(), CompactionConfigError> {
         if self.model_context_limit == 0 {
             return Err(CompactionConfigError::ZeroContextLimit);
         }
@@ -866,7 +963,10 @@ impl CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            compaction_threshold: 0.80,
+            slide_threshold: 0.60,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.80,
+            emergency_threshold: 0.95,
             preserve_recent_turns: 6,
             model_context_limit: 128_000,
             reserved_system_tokens: 2_000,
@@ -998,7 +1098,10 @@ mod tests {
     #[test]
     fn budget_with_default_config_has_expected_values() {
         let config = CompactionConfig::default();
-        assert_eq!(config.compaction_threshold, 0.80);
+        assert_eq!(config.prune_threshold, 0.40);
+        assert_eq!(config.slide_threshold, 0.60);
+        assert_eq!(config.summarize_threshold, 0.80);
+        assert_eq!(config.emergency_threshold, 0.95);
         assert_eq!(config.preserve_recent_turns, 6);
         assert_eq!(config.model_context_limit, 128_000);
         assert_eq!(config.reserved_system_tokens, 2_000);
@@ -1011,6 +1114,30 @@ mod tests {
     fn conversation_budget_subtracts_reserved_and_output_reserve() {
         let budget = ConversationBudget::new(16_384, 0.8, 2_000);
         assert_eq!(budget.conversation_budget(), 16_384 - 2_000 - 4_096);
+    }
+
+    #[test]
+    fn usage_ratio_correct() {
+        let budget = ConversationBudget::new(5_000, 0.50, 0);
+        let messages = vec![user(452)];
+        assert_eq!(budget.usage_ratio(&messages), 0.5);
+    }
+
+    #[test]
+    fn at_tier_detects_threshold_crossing() {
+        let budget = ConversationBudget::new(5_000, 0.50, 0);
+        assert!(!budget.at_tier(&[user(451)], 0.5));
+        assert!(budget.at_tier(&[user(452)], 0.5));
+        assert!(budget.at_tier(&[user(453)], 0.5));
+    }
+
+    #[test]
+    fn summarize_target_returns_two_fifths_of_budget() {
+        let budget = ConversationBudget::new(16_384, 0.8, 2_000);
+        assert_eq!(
+            budget.summarize_target(),
+            budget.conversation_budget() * 2 / 5
+        );
     }
 
     #[test]
@@ -1266,6 +1393,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn emergency_compact_drops_all_middle() {
+        let middle_user = Message::user("middle_user_unique");
+        let middle_asst = Message::assistant("middle_asst_unique");
+        let messages = vec![
+            system(5),
+            middle_user.clone(),
+            middle_asst.clone(),
+            user(20),
+            assistant(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.messages.len(), 4); // system + marker + 2 recent
+        assert!(!result.messages.contains(&middle_user));
+        assert!(!result.messages.contains(&middle_asst));
+    }
+
+    #[test]
+    fn emergency_compact_preserves_system_prefix() {
+        let messages = vec![system(5), system(5), user(20), assistant(20), user(20)];
+
+        let result = emergency_compact(&messages, 1);
+
+        assert_eq!(&result.messages[..2], &messages[..2]);
+    }
+
+    #[test]
+    fn emergency_compact_preserves_recent_turns() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(
+            &result.messages[result.messages.len() - 2..],
+            &messages[3..]
+        );
+    }
+
+    #[test]
+    fn emergency_compact_inserts_marker() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+        let marker = &result.messages[1];
+        let marker_text = text_blocks(marker).collect::<Vec<_>>().join("\n");
+
+        assert!(message_contains_marker(marker));
+        assert!(marker_text.contains("emergency"));
+    }
+
+    #[test]
+    fn emergency_compact_populates_evicted_indices() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.evicted_indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn emergency_compact_empty_middle_is_noop() {
+        let messages = vec![system(5), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.messages, messages);
+        assert_eq!(result.compacted_count, 0);
+        assert!(result.evicted_indices.is_empty());
+    }
+
     // 5.3 SummarizingCompactor tests
 
     #[tokio::test]
@@ -1396,7 +1595,7 @@ mod tests {
     #[test]
     fn config_rejects_threshold_above_one() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = 1.1;
+        config.emergency_threshold = 1.1;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
@@ -1406,7 +1605,7 @@ mod tests {
     #[test]
     fn config_rejects_threshold_at_zero() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = 0.0;
+        config.prune_threshold = 0.0;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
@@ -1416,11 +1615,50 @@ mod tests {
     #[test]
     fn config_rejects_negative_threshold() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = -0.1;
+        config.slide_threshold = -0.1;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
         ));
+    }
+
+    #[test]
+    fn config_rejects_non_monotonic_thresholds() {
+        let mut config = CompactionConfig::default();
+        config.summarize_threshold = config.slide_threshold;
+        assert!(matches!(
+            config.validate(),
+            Err(CompactionConfigError::ThresholdsNotMonotonic { .. })
+        ));
+    }
+
+    #[test]
+    fn config_accepts_valid_thresholds() {
+        CompactionConfig::default()
+            .validate()
+            .expect("valid defaults");
+    }
+
+    #[test]
+    fn backward_compat_compaction_threshold_maps_to_slide() {
+        let config: CompactionConfig = serde_json::from_value(serde_json::json!({
+            "compaction_threshold": 0.7,
+        }))
+        .expect("config should deserialize");
+
+        assert_eq!(config.slide_threshold, 0.7);
+        assert_eq!(
+            config.prune_threshold,
+            CompactionConfig::default().prune_threshold
+        );
+        assert_eq!(
+            config.summarize_threshold,
+            CompactionConfig::default().summarize_threshold
+        );
+        assert_eq!(
+            config.emergency_threshold,
+            CompactionConfig::default().emergency_threshold
+        );
     }
 
     #[test]
@@ -1814,7 +2052,10 @@ mod tests {
         // conversation_budget = 16_000 - 0 - 4096 = 11_904
         // compaction trigger = ceil(11_904 * 0.80) = 9_524
         let config = CompactionConfig {
-            compaction_threshold: 0.80,
+            slide_threshold: 0.80,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.90,
+            emergency_threshold: 0.95,
             preserve_recent_turns: 2,
             model_context_limit: 16_000,
             reserved_system_tokens: 0,
@@ -1826,7 +2067,7 @@ mod tests {
         };
         let budget = ConversationBudget::new(
             config.model_context_limit,
-            config.compaction_threshold,
+            config.slide_threshold,
             config.reserved_system_tokens,
         );
         let strategy = config.build_strategy(None);
@@ -1843,7 +2084,7 @@ mod tests {
         let before_tokens = ConversationBudget::estimate_tokens(&messages);
         assert!(
             budget.needs_compaction(&messages),
-            "messages should exceed compaction threshold before pruning (tokens: {before_tokens})"
+            "messages should exceed slide threshold before pruning (tokens: {before_tokens})"
         );
 
         // Simulate what compact_if_needed does: prune first, then check.
@@ -1858,7 +2099,7 @@ mod tests {
         let after_tokens = ConversationBudget::estimate_tokens(&pruned);
         assert!(
             !budget.needs_compaction(&pruned),
-            "pruned messages should be below compaction threshold (tokens: {after_tokens})"
+            "pruned messages should be below slide threshold (tokens: {after_tokens})"
         );
 
         // Verify the compaction strategy is never invoked (we'd get the pruned
