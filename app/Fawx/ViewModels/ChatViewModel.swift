@@ -139,6 +139,7 @@ final class ChatViewModel {
     enum TranscriptScrollBehavior {
         case animated
         case snap
+        case preservePosition
     }
 
     enum StreamingPhase: Sendable, Equatable {
@@ -985,7 +986,11 @@ final class ChatViewModel {
         let updatedMessages = existingMessages + [message]
         cacheMessages(updatedMessages, for: sessionID)
         if currentSessionID == sessionID {
-            pendingTranscriptScrollBehavior = .animated
+            let shouldPreserveScrollPosition =
+                isStreaming
+                && streamingSessionID == sessionID
+                && !streamingDisplayController.isPinnedToBottom
+            pendingTranscriptScrollBehavior = shouldPreserveScrollPosition ? .preservePosition : .animated
             transcriptItems = makeTranscriptItems(from: updatedMessages)
         }
     }
