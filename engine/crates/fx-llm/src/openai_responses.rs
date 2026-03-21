@@ -10,6 +10,7 @@ use http::{header::HeaderValue, Request};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tokio_tungstenite::tungstenite::{
     self,
     client::IntoClientRequest,
@@ -152,11 +153,13 @@ impl OpenAiResponsesProvider {
         stream: bool,
     ) -> Result<ResponsesRequestBody, LlmError> {
         self.ensure_supported_model(&request.model)?;
+        validate_tool_message_sequence(&request.messages)?;
 
         let mut input = Vec::new();
         for message in &request.messages {
             map_message_to_responses_input(&mut input, message)?;
         }
+        validate_responses_input_sequence(&input)?;
 
         let tools: Vec<ResponsesTool> = request
             .tools
@@ -753,6 +756,152 @@ fn map_message_to_responses_input(
     }
 
     Ok(())
+}
+
+fn validate_tool_message_sequence(messages: &[Message]) -> Result<(), LlmError> {
+    let mut seen_tool_calls = HashSet::new();
+
+    for (message_index, message) in messages.iter().enumerate() {
+        match message.role {
+            MessageRole::Assistant => {
+                for block in &message.content {
+                    if let ContentBlock::ToolUse { id, .. } = block {
+                        if !id.trim().is_empty() {
+                            seen_tool_calls.insert(id.clone());
+                        }
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        let trimmed = tool_use_id.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if !seen_tool_calls.contains(trimmed) {
+                            return Err(LlmError::Request(format!(
+                                "invalid tool continuation messages: tool result '{}' at message {} has no matching earlier assistant tool_use; tail={}",
+                                trimmed,
+                                message_index,
+                                summarize_message_tail(messages),
+                            )));
+                        }
+                    }
+                }
+            }
+            MessageRole::System | MessageRole::User => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_responses_input_sequence(input: &[Value]) -> Result<(), LlmError> {
+    let mut seen_tool_calls = HashSet::new();
+
+    for (item_index, item) in input.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                    let trimmed = call_id.trim();
+                    if !trimmed.is_empty() {
+                        seen_tool_calls.insert(trimmed.to_string());
+                    }
+                }
+            }
+            Some("function_call_output") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let trimmed = call_id.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !seen_tool_calls.contains(trimmed) {
+                    return Err(LlmError::Request(format!(
+                        "invalid responses input: function_call_output '{}' at item {} has no matching earlier function_call; tail={}",
+                        trimmed,
+                        item_index,
+                        summarize_input_tail(input),
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn summarize_message_tail(messages: &[Message]) -> String {
+    let start = messages.len().saturating_sub(6);
+    messages[start..]
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| summarize_message(start + offset, message))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_message(index: usize, message: &Message) -> String {
+    let blocks = message
+        .content
+        .iter()
+        .map(summarize_content_block)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{index}:{:?}[{blocks}]", message.role)
+}
+
+fn summarize_content_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => format!("text:{}", text.chars().take(24).collect::<String>()),
+        ContentBlock::ToolUse {
+            id,
+            provider_id,
+            name,
+            ..
+        } => format!(
+            "tool_use:{name}:{id}:{}",
+            provider_id.as_deref().unwrap_or("-")
+        ),
+        ContentBlock::ToolResult { tool_use_id, .. } => format!("tool_result:{tool_use_id}"),
+        ContentBlock::Image { .. } => "image".to_string(),
+    }
+}
+
+fn summarize_input_tail(input: &[Value]) -> String {
+    let start = input.len().saturating_sub(8);
+    input[start..]
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| summarize_input_item(start + offset, item))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_input_item(index: usize, item: &Value) -> String {
+    if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+        return match item_type {
+            "function_call" => format!(
+                "{index}:function_call:{}:{}",
+                item.get("call_id").and_then(Value::as_str).unwrap_or("-"),
+                item.get("id").and_then(Value::as_str).unwrap_or("-")
+            ),
+            "function_call_output" => format!(
+                "{index}:function_call_output:{}",
+                item.get("call_id").and_then(Value::as_str).unwrap_or("-")
+            ),
+            other => format!("{index}:{other}"),
+        };
+    }
+
+    if let Some(role) = item.get("role").and_then(Value::as_str) {
+        return format!("{index}:role:{role}");
+    }
+
+    format!("{index}:unknown")
 }
 
 fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
@@ -1762,6 +1911,66 @@ mod tests {
         assert_eq!(input[4]["type"], "function_call_output");
         assert_eq!(serialized["tools"][0]["name"], "lookup");
         assert!(serialized.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_request_body_rejects_tool_result_without_matching_assistant_tool_use() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Find weather"),
+                crate::types::Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: serde_json::json!("first result"),
+                    }],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let error = match provider.build_request_body(&request, false) {
+            Ok(_) => panic!("should reject orphan tool result"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid tool continuation messages"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_responses_input_sequence_rejects_orphan_function_call_output() {
+        let input = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Find weather"}]
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "first result"
+            }),
+        ];
+
+        let error = match validate_responses_input_sequence(&input) {
+            Ok(_) => panic!("should reject orphan function call output"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("invalid responses input"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
