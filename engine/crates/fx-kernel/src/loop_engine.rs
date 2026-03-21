@@ -11,9 +11,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
-    estimate_text_tokens, prune_tool_blocks, CompactionConfig, CompactionError,
-    CompactionMemoryFlush, CompactionResult, CompactionStrategy, ConversationBudget,
-    SlidingWindowCompactor,
+    estimate_text_tokens, has_prunable_blocks, prune_tool_blocks, CompactionConfig,
+    CompactionError, CompactionMemoryFlush, CompactionResult, CompactionStrategy,
+    ConversationBudget, SlidingWindowCompactor,
 };
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -3023,22 +3023,29 @@ impl LoopEngine {
         if !self.compaction_config.prune_tool_blocks {
             return None;
         }
+
+        // Quick scan: skip the clone if there are no non-text blocks in the prunable zone.
+        if !has_prunable_blocks(messages, self.compaction_config.preserve_recent_turns) {
+            return None;
+        }
+
         let mut owned = messages.to_vec();
         let result = prune_tool_blocks(
             &mut owned,
             self.compaction_config.preserve_recent_turns,
             self.compaction_config.tool_block_summary_max_chars,
         );
-        if result.pruned_count > 0 {
-            tracing::info!(
-                scope = scope.as_str(),
-                pruned_blocks = result.pruned_count,
-                tokens_saved = result.tokens_saved,
-                "tool block pruning completed"
-            );
-            Some(owned)
-        } else {
-            None
+        match result {
+            Some(prune_result) => {
+                tracing::info!(
+                    scope = scope.as_str(),
+                    pruned_blocks = prune_result.pruned_count,
+                    tokens_saved = prune_result.tokens_saved,
+                    "tool block pruning completed"
+                );
+                Some(owned)
+            }
+            None => None,
         }
     }
 
@@ -4524,7 +4531,7 @@ fn build_truncation_continuation_request(
     )
 }
 
-// Pre-existing: refactoring to a params struct is out of scope for this PR.
+// TODO: refactor into a params struct (pre-existing, out of scope for this PR)
 #[allow(clippy::too_many_arguments)]
 fn build_truncation_continuation_request_with_notify_guidance(
     model: &str,
