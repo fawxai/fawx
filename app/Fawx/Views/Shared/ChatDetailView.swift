@@ -172,8 +172,9 @@ struct ChatDetailView: View {
                 historyLoadingOverlay
             }
             .overlay(alignment: .top) {
-                refreshIndicatorOverlay
+                topOverlay
             }
+            .animation(.easeInOut(duration: 0.22), value: chatViewModel.compactionBannerInfo)
     }
 
     @ViewBuilder
@@ -184,11 +185,41 @@ struct ChatDetailView: View {
     }
 
     @ViewBuilder
-    private var refreshIndicatorOverlay: some View {
-        if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
-            cachedRefreshIndicator
-                .padding(.top, FawxSpacing.paddingLG)
+    private var topOverlay: some View {
+        if chatViewModel.compactionBannerInfo != nil
+            || (chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty)
+        {
+            VStack(spacing: FawxSpacing.paddingSM) {
+                if let compactionBannerInfo = chatViewModel.compactionBannerInfo {
+                    compactionBannerView(info: compactionBannerInfo)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if chatViewModel.isLoadingHistory && !chatViewModel.transcriptItems.isEmpty {
+                    cachedRefreshIndicator
+                }
+            }
+            .padding(.top, FawxSpacing.paddingLG)
+            .padding(.horizontal, FawxSpacing.paddingXL)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
+    }
+
+    private func compactionBannerView(info: ChatViewModel.CompactionBannerInfo) -> some View {
+        let style = CompactionBannerStyle(isEmergency: info.isEmergency)
+
+        return Text(info.message)
+            .font(FawxTypography.status)
+            .foregroundStyle(style.foreground)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, FawxSpacing.paddingMD)
+            .padding(.vertical, FawxSpacing.paddingSM)
+            .background(style.background)
+            .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius, style: .continuous)
+                    .stroke(style.border, lineWidth: 1)
+            }
     }
 
     private func observingTranscriptScrollView<Content: View>(
@@ -830,6 +861,24 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private struct CompactionBannerStyle {
+    let background: Color
+    let border: Color
+    let foreground: Color
+
+    init(isEmergency: Bool) {
+        if isEmergency {
+            background = Color.fawxWarning.opacity(0.12)
+            border = Color.fawxWarning.opacity(0.45)
+            foreground = .fawxText
+        } else {
+            background = Color.fawxSurface.opacity(0.97)
+            border = .fawxBorder
+            foreground = .fawxTextSecondary
+        }
+    }
 }
 
 @available(iOS 18.0, macOS 15.0, *)

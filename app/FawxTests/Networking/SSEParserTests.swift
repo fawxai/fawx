@@ -81,6 +81,33 @@ final class SSEParserTests: XCTestCase {
         )
     }
 
+    func testParseLineParsesContextCompactedEvent() throws {
+        var parser = SSEParser()
+
+        XCTAssertEqual(try parser.parseLine("event: context_compacted"), [])
+        XCTAssertEqual(
+            try parser.parseLine(
+                #"data: {"tier":"slide","messages_removed":12,"tokens_before":5100,"tokens_after":2900,"usage_ratio":0.42}"#
+            ),
+            []
+        )
+
+        let events = try parser.parseLine("")
+
+        XCTAssertEqual(
+            events,
+            [
+                .contextCompacted(
+                    tier: "slide",
+                    messagesRemoved: 12,
+                    tokensBefore: 5100,
+                    tokensAfter: 2900,
+                    usageRatio: 0.42
+                )
+            ]
+        )
+    }
+
     func testParseLineParsesLegacyPermissionPromptEventShape() throws {
         var parser = SSEParser()
 
