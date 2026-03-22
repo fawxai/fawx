@@ -455,6 +455,13 @@ pub struct LoopEngine {
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
     budget_low_signaled: bool,
+    /// Consecutive iterations that used tools without producing user-facing text.
+    /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
+    /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
+    consecutive_tool_only_turns: u16,
+    /// Latest reasoning input messages for graceful budget-exhausted synthesis.
+    /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
+    last_reasoning_messages: Vec<Message>,
     /// Tool retry tracker for the current cycle.
     tool_retry_tracker: ToolRetryTracker,
     /// Whether a successful `notify` tool call occurred during the current cycle.
@@ -488,6 +495,10 @@ impl std::fmt::Debug for LoopEngine {
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
+            .field(
+                "consecutive_tool_only_turns",
+                &self.consecutive_tool_only_turns,
+            )
             .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
@@ -841,6 +852,8 @@ impl LoopEngineBuilder {
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
+            consecutive_tool_only_turns: 0,
+            last_reasoning_messages: Vec::new(),
             tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
             notify_tool_guidance_enabled: false,
@@ -1226,6 +1239,14 @@ understands what present-you built. Write what you wish past-you had left behind
 const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
 Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
+const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
+const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
+const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+/// Consecutive tool-only iterations before injecting a nudge asking the model
+/// to share progress. Tuned to balance responsiveness (lower = more nudges)
+/// against autonomy (higher = fewer interruptions). 6 is ~3 tool-call rounds
+/// in a typical agentic workflow.
+const TOOL_ONLY_TURN_NUDGE_THRESHOLD: u16 = 6;
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -1482,7 +1503,28 @@ impl LoopEngine {
                 .await?
             {
                 IterationStep::Terminal(result) => {
-                    return Ok(self.finish_streaming_result(result, stream))
+                    let result = match result {
+                        LoopResult::BudgetExhausted {
+                            partial_response,
+                            iterations,
+                            signals,
+                        } => {
+                            let reasoning_messages =
+                                std::mem::take(&mut self.last_reasoning_messages);
+                            let synthesized =
+                                self.forced_synthesis_turn(llm, &reasoning_messages).await;
+                            LoopResult::BudgetExhausted {
+                                partial_response: Some(Self::resolve_budget_exhausted_response(
+                                    synthesized,
+                                    partial_response,
+                                )),
+                                iterations,
+                                signals,
+                            }
+                        }
+                        other => other,
+                    };
+                    return Ok(self.finish_streaming_result(result, stream));
                 }
                 IterationStep::Progress(outcome) => {
                     if let Some(result) =
@@ -1664,6 +1706,8 @@ impl LoopEngine {
         self.user_stop_requested = false;
         self.pending_steer = None;
         self.budget_low_signaled = false;
+        self.consecutive_tool_only_turns = 0;
+        self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
@@ -1742,6 +1786,7 @@ impl LoopEngine {
 
         state.tokens.accumulate(action.tokens_used);
         state.partial_response = Some(action.response_text.clone());
+        self.update_tool_only_turns(&action);
 
         if let Some(step) = self.check_cancellation(state.partial_response.clone()) {
             return Ok(step);
@@ -1758,6 +1803,14 @@ impl LoopEngine {
             continuation,
             learning,
         }))
+    }
+
+    fn update_tool_only_turns(&mut self, action: &ActionResult) {
+        if !action.tool_results.is_empty() && action.response_text.trim().is_empty() {
+            self.consecutive_tool_only_turns = self.consecutive_tool_only_turns.saturating_add(1);
+        } else if !action.response_text.trim().is_empty() {
+            self.consecutive_tool_only_turns = 0;
+        }
     }
 
     fn record_reasoning_cost(&mut self, reason_cost: ActionCost, state: &mut CycleState) {
@@ -1797,6 +1850,80 @@ impl LoopEngine {
             iterations: self.iteration_count,
             signals: Vec::new(),
         })
+    }
+
+    /// Make one final LLM call with tools stripped to synthesize findings.
+    async fn forced_synthesis_turn(
+        &self,
+        llm: &dyn LlmProvider,
+        messages: &[Message],
+    ) -> Option<String> {
+        let mut synthesis_messages = messages.to_vec();
+        synthesis_messages.push(Message::system(
+            BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE.to_string(),
+        ));
+
+        let request = CompletionRequest {
+            model: llm.model_name().to_string(),
+            messages: synthesis_messages,
+            tools: vec![],
+            temperature: Some(0.3),
+            max_tokens: Some(2048),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let remaining_wall_ms = self
+            .budget
+            .remaining(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            )
+            .wall_time_ms;
+        let timeout_ms = remaining_wall_ms.min(30_000).saturating_sub(2_000);
+        if timeout_ms == 0 {
+            tracing::warn!("skipping forced synthesis: insufficient wall time remaining");
+            return None;
+        }
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        match tokio::time::timeout(timeout, llm.complete(request)).await {
+            Ok(Ok(response)) => {
+                let text: String = response
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("forced synthesis turn failed: {e}");
+                None
+            }
+            Err(_elapsed) => {
+                tracing::warn!("forced synthesis turn timed out after {timeout_ms}ms");
+                None
+            }
+        }
+    }
+
+    fn resolve_budget_exhausted_response(
+        synthesized: Option<String>,
+        partial_response: Option<String>,
+    ) -> String {
+        synthesized
+            .or_else(|| partial_response.filter(|text| !text.trim().is_empty()))
+            .unwrap_or_else(|| BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string())
     }
 
     fn handle_continuation(
@@ -1882,7 +2009,11 @@ impl LoopEngine {
             context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
         }
 
-        Ok(ProcessedPerception {
+        if self.consecutive_tool_only_turns >= TOOL_ONLY_TURN_NUDGE_THRESHOLD {
+            context_window.push(Message::system(TOOL_ONLY_TURN_NUDGE.to_string()));
+        }
+
+        let processed = ProcessedPerception {
             user_message: user_message.clone(),
             images: snapshot_with_steer
                 .user_input
@@ -1893,7 +2024,10 @@ impl LoopEngine {
             active_goals: vec![format!("Help the user with: {user_message}")],
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
-        })
+        };
+        self.last_reasoning_messages = build_reasoning_messages(&processed);
+
+        Ok(processed)
     }
 
     /// Reason step.
@@ -3836,6 +3970,7 @@ impl LoopEngine {
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
+        self.last_reasoning_messages = state.continuation_messages.clone();
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
@@ -5507,8 +5642,6 @@ fn build_reasoning_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let context = perception.context_window.clone();
-    let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
         memory_context,
@@ -5518,17 +5651,22 @@ fn build_reasoning_request_with_notify_guidance(
 
     CompletionRequest {
         model: model.to_string(),
-        messages: [
-            context,
-            vec![build_processed_perception_message(perception, &user_prompt)],
-        ]
-        .concat(),
+        messages: build_reasoning_messages(perception),
         tools,
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
         thinking,
     }
+}
+
+fn build_reasoning_messages(perception: &ProcessedPerception) -> Vec<Message> {
+    let user_prompt = reasoning_user_prompt(perception);
+    [
+        perception.context_window.clone(),
+        vec![build_processed_perception_message(perception, &user_prompt)],
+    ]
+    .concat()
 }
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
@@ -9181,7 +9319,7 @@ mod cancellation_tests {
             max_tool_invocations: 0,
             max_tokens: 0,
             max_cost_cents: 0,
-            max_wall_time_ms: 0,
+            max_wall_time_ms: 60_000, // non-zero so synthesis timeout guard doesn't skip
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
             ..BudgetConfig::default()
@@ -9202,9 +9340,14 @@ mod cancellation_tests {
             .await
             .expect("run_cycle_streaming");
 
-        assert!(matches!(result, LoopResult::BudgetExhausted { .. }));
+        match result {
+            LoopResult::BudgetExhausted {
+                partial_response, ..
+            } => assert_eq!(partial_response.as_deref(), Some("hello")),
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
+        }
         let events = events.lock().expect("lock").clone();
-        assert_done_event(&events, "budget exhausted");
+        assert_done_event(&events, "hello");
     }
 
     #[tokio::test]
@@ -12350,66 +12493,8 @@ mod context_compaction_tests {
         assert!(error.reason.contains("invalid_compaction_config"));
     }
 
-    #[derive(Debug)]
-    struct RecordingLlm {
-        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
-        requests: Mutex<Vec<CompletionRequest>>,
-        generated_summary: String,
-    }
-
-    impl RecordingLlm {
-        fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
-            Self::with_generated_summary(responses, "summary".to_string())
-        }
-
-        fn with_generated_summary(
-            responses: Vec<Result<CompletionResponse, ProviderError>>,
-            generated_summary: String,
-        ) -> Self {
-            Self {
-                responses: Mutex::new(VecDeque::from(responses)),
-                requests: Mutex::new(Vec::new()),
-                generated_summary,
-            }
-        }
-
-        fn requests(&self) -> Vec<CompletionRequest> {
-            self.requests.lock().expect("requests lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for RecordingLlm {
-        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
-            Ok(self.generated_summary.clone())
-        }
-
-        async fn generate_streaming(
-            &self,
-            _: &str,
-            _: u32,
-            callback: Box<dyn Fn(String) + Send + 'static>,
-        ) -> Result<String, CoreLlmError> {
-            callback(self.generated_summary.clone());
-            Ok(self.generated_summary.clone())
-        }
-
-        fn model_name(&self) -> &str {
-            "mock"
-        }
-
-        async fn complete(
-            &self,
-            request: CompletionRequest,
-        ) -> Result<CompletionResponse, ProviderError> {
-            self.requests.lock().expect("requests lock").push(request);
-            self.responses
-                .lock()
-                .expect("response lock")
-                .pop_front()
-                .unwrap_or_else(|| Ok(text_response("ok")))
-        }
-    }
+    // RecordingLlm lives in test_fixtures (pub(super)) to avoid duplication.
+    use super::test_fixtures::RecordingLlm;
 
     #[derive(Debug)]
     struct ExtractionLlm {
@@ -12584,6 +12669,27 @@ mod context_compaction_tests {
             .expect("tool round");
 
         assert!(has_compaction_marker(&state.continuation_messages));
+    }
+
+    #[tokio::test]
+    async fn tool_round_updates_last_reasoning_messages_after_compaction() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 120 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .await
+            .expect("tool round");
+
+        assert!(has_compaction_marker(&engine.last_reasoning_messages));
+        assert_eq!(engine.last_reasoning_messages, state.continuation_messages);
     }
 
     #[tokio::test]
@@ -14618,6 +14724,71 @@ mod loop_resilience_tests {
         assert!(!has_wrap_up, "no wrap-up directive when budget normal");
     }
 
+    #[tokio::test]
+    async fn tool_only_turn_nudge_injected_at_threshold() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_only_turns = TOOL_ONLY_TURN_NUDGE_THRESHOLD;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(has_nudge, "tool-only nudge should be in context window");
+    }
+
+    #[tokio::test]
+    async fn tool_only_turn_nudge_not_injected_below_threshold() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_only_turns = TOOL_ONLY_TURN_NUDGE_THRESHOLD - 1;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(!has_nudge, "tool-only nudge should stay below threshold");
+    }
+
+    #[test]
+    fn tool_only_turn_counter_tracks_and_resets() {
+        let mut engine = high_budget_engine();
+        let tool_action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            }],
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+        };
+        engine.update_tool_only_turns(&tool_action);
+        assert_eq!(engine.consecutive_tool_only_turns, 1);
+
+        let text_action = ActionResult {
+            decision: Decision::Respond("done".to_string()),
+            tool_results: Vec::new(),
+            response_text: "done".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        engine.update_tool_only_turns(&text_action);
+        assert_eq!(engine.consecutive_tool_only_turns, 0);
+    }
+
     // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---
     #[tokio::test]
     async fn fan_out_3_calls_within_cap_all_execute() {
@@ -15147,6 +15318,73 @@ mod test_fixtures {
         }
     }
 
+    /// Mock LLM that records requests and replays scripted responses.
+    /// Consolidated from context_compaction_tests + test_fixtures to avoid duplication.
+    #[derive(Debug)]
+    pub(super) struct RecordingLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+        requests: Mutex<Vec<CompletionRequest>>,
+        generated_summary: String,
+    }
+
+    impl RecordingLlm {
+        pub(super) fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self::with_generated_summary(responses, "summary".to_string())
+        }
+
+        pub(super) fn ok(responses: Vec<CompletionResponse>) -> Self {
+            Self::new(responses.into_iter().map(Ok).collect())
+        }
+
+        pub(super) fn with_generated_summary(
+            responses: Vec<Result<CompletionResponse, ProviderError>>,
+            generated_summary: String,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
+                generated_summary,
+            }
+        }
+
+        pub(super) fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.generated_summary.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback(self.generated_summary.clone());
+            Ok(self.generated_summary.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "recording"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(text_response("ok")))
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for ScriptedLlm {
         async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
@@ -15615,6 +15853,138 @@ mod error_path_coverage_tests {
             }
             other => panic!("expected BudgetExhausted or Complete, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_before_reason_returns_synthesized_response() {
+        let config = BudgetConfig {
+            max_llm_calls: 5,
+            max_tool_invocations: 5,
+            max_tokens: 1,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), config, 0, 3);
+        let llm = ScriptedLlm::ok(vec![text_response("final synthesized answer")]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match result {
+            LoopResult::BudgetExhausted {
+                partial_response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(
+                    partial_response.as_deref(),
+                    Some("final synthesized answer")
+                );
+                assert_eq!(iterations, 1);
+            }
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_uses_partial_response_when_synthesis_fails() {
+        let config = BudgetConfig {
+            max_llm_calls: 1,
+            max_tool_invocations: 5,
+            max_tokens: 100_000,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), config, 0, 3);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("")),
+            Err(fx_llm::ProviderError::Provider(
+                "forced synthesis failed".to_string(),
+            )),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match result {
+            LoopResult::BudgetExhausted {
+                partial_response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(partial_response.as_deref(), Some(SAFE_FALLBACK_RESPONSE));
+                assert_ne!(
+                    partial_response.as_deref(),
+                    Some(BUDGET_EXHAUSTED_FALLBACK_RESPONSE)
+                );
+                assert_eq!(iterations, 2);
+            }
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_synthesis_turn_strips_tools_and_appends_directive() {
+        let engine = build_engine_with_executor(
+            Arc::new(StubToolExecutor),
+            budget_config_with_llm_calls(5, 2),
+            0,
+            3,
+        );
+        let llm = RecordingLlm::ok(vec![text_response("synthesized")]);
+        let messages = vec![Message::user("hello")];
+
+        let result = engine.forced_synthesis_turn(&llm, &messages).await;
+        let requests = llm.requests();
+
+        assert_eq!(result.as_deref(), Some("synthesized"));
+        assert_eq!(
+            requests.len(),
+            1,
+            "forced synthesis should make one LLM call"
+        );
+        assert!(
+            requests[0].tools.is_empty(),
+            "forced synthesis must strip tools"
+        );
+        assert!(
+            requests[0].messages.iter().any(|message| {
+                message.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => text.contains("Your tool budget is exhausted"),
+                    _ => false,
+                })
+            }),
+            "forced synthesis should append the budget-exhausted directive"
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_response_uses_non_empty_fallbacks() {
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(
+                Some("synthesized".to_string()),
+                Some("partial".to_string()),
+            ),
+            "synthesized"
+        );
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(None, Some("partial".to_string())),
+            "partial"
+        );
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(None, Some("   ".to_string())),
+            BUDGET_EXHAUSTED_FALLBACK_RESPONSE
+        );
     }
 
     // =========================================================================
