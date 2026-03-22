@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use fx_config::AgentConfig;
 
 const COMMON_BEHAVIORAL_RULES: &str = "\
 Use tools when you need information not in the conversation. \
@@ -6,14 +6,19 @@ When the user's request matches an available tool, prefer calling the tool over 
 After using tools, respond with the answer directly. \
 For multi-step tasks, use the decompose tool to break work into parallel sub-goals.";
 
-const CASUAL_IDENTITY_TEMPLATE: &str = "You are {name}, a personal AI agent running on this machine.\nYou're direct, helpful, and concise. Skip the formalities and filler.\nAnswer questions naturally. When you use tools, just share the results\nwithout narrating what you did or how you got them.";
-const PROFESSIONAL_IDENTITY_TEMPLATE: &str = "You are {name}, a personal AI agent running on this machine.\nProvide clear, structured responses. Be thorough but efficient.\nUse tools when needed and present results directly without narrating the process.";
-const TECHNICAL_IDENTITY_TEMPLATE: &str = "You are {name}, a personal AI agent running on this machine.\nBe precise and terse. No filler, no hedging. Use tools, report results.\nCode and data speak louder than prose.";
-const MINIMAL_IDENTITY_TEMPLATE: &str =
-    "You are {name}. Answer with minimum words. No filler. Tools: use them, report results only.";
+const CASUAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
+You're direct, helpful, and concise. Skip the formalities and filler.
+Answer questions naturally. When you use tools, just share the results
+without narrating what you did or how you got them."#;
+const PROFESSIONAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
+Provide clear, structured responses. Be thorough but efficient.
+Use tools when needed and present results directly without narrating the process."#;
+const TECHNICAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
+Be precise and terse. No filler, no hedging. Use tools, report results.
+Code and data speak louder than prose."#;
+const MINIMAL_IDENTITY_TEMPLATE: &str = r#"You are {name}. Answer with minimum words. No filler. Tools: use them, report results only."#;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Personality {
     #[default]
     Casual,
@@ -23,17 +28,7 @@ pub enum Personality {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Verbosity {
-    Terse,
-    #[default]
-    Normal,
-    Thorough,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Surface {
     NativeApp,
     #[default]
@@ -41,8 +36,7 @@ pub enum Surface {
     HeadlessApi,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityConfig {
     pub name: String,
     pub personality: Personality,
@@ -57,29 +51,43 @@ impl Default for IdentityConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BehaviorConfig {
     pub custom_instructions: Option<String>,
-    pub verbosity: Verbosity,
-    pub proactive: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityGroup {
     pub name: String,
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SecurityMode {
+    #[default]
+    Capability,
+    Prompt,
+    Open,
+}
+
+impl SecurityMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capability => "capability",
+            Self::Prompt => "prompt",
+            Self::Open => "open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityContext {
-    pub mode: String,
+    pub mode: SecurityMode,
     pub restricted: Vec<String>,
     pub working_dir: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContext {
     pub is_new: bool,
     pub message_count: usize,
@@ -120,6 +128,10 @@ impl SystemPromptBuilder {
             session: SessionContext::default(),
             directives: Vec::new(),
         }
+    }
+
+    pub fn from_config(agent: &AgentConfig) -> Self {
+        Self::new(identity_from_config(agent), behavior_from_config(agent))
     }
 
     pub fn capabilities(mut self, capabilities: Vec<CapabilityGroup>) -> Self {
@@ -170,6 +182,33 @@ impl SystemPromptBuilder {
     }
 }
 
+fn identity_from_config(agent: &AgentConfig) -> IdentityConfig {
+    IdentityConfig {
+        name: agent.name.clone(),
+        personality: personality_from_config(agent),
+    }
+}
+
+fn behavior_from_config(agent: &AgentConfig) -> BehaviorConfig {
+    BehaviorConfig {
+        custom_instructions: agent.behavior.custom_instructions.clone(),
+    }
+}
+
+fn personality_from_config(agent: &AgentConfig) -> Personality {
+    match agent.personality.trim().to_ascii_lowercase().as_str() {
+        "casual" | "" => Personality::Casual,
+        "professional" => Personality::Professional,
+        "technical" => Personality::Technical,
+        "minimal" => Personality::Minimal,
+        _ => custom_personality(agent).unwrap_or_default(),
+    }
+}
+
+fn custom_personality(agent: &AgentConfig) -> Option<Personality> {
+    non_empty(agent.custom_personality.as_deref()).map(|text| Personality::Custom(text.to_string()))
+}
+
 fn render_identity(identity: &IdentityConfig) -> String {
     let base = match &identity.personality {
         Personality::Casual => CASUAL_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
@@ -215,7 +254,9 @@ fn render_security(security: &SecurityContext) -> String {
 
     format!(
         "Security:\n- Mode: {}\n- Restricted: {}\n- Working directory: {}",
-        security.mode, restricted, security.working_dir
+        security.mode.as_str(),
+        restricted,
+        security.working_dir
     )
 }
 
@@ -274,6 +315,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_config::{AgentBehaviorConfig, AgentConfig};
 
     fn builder_with_personality(personality: Personality) -> SystemPromptBuilder {
         SystemPromptBuilder::new(
@@ -330,6 +372,38 @@ mod tests {
     }
 
     #[test]
+    fn from_config_maps_custom_personality_and_behavior() {
+        let prompt = SystemPromptBuilder::from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "custom".to_string(),
+            custom_personality: Some("Be warm, pragmatic, and slightly opinionated.".to_string()),
+            behavior: AgentBehaviorConfig {
+                custom_instructions: Some("Prefer concrete next steps.".to_string()),
+                verbosity: "thorough".to_string(),
+                proactive: true,
+            },
+        })
+        .build();
+
+        assert!(prompt.contains("You are Rivet, a personal AI agent running on this machine."));
+        assert!(prompt.contains("Be warm, pragmatic, and slightly opinionated."));
+        assert!(prompt.contains("Behavioral:\nPrefer concrete next steps."));
+    }
+
+    #[test]
+    fn from_config_falls_back_to_default_personality_when_custom_text_missing() {
+        let prompt = SystemPromptBuilder::from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "custom".to_string(),
+            custom_personality: Some("   ".to_string()),
+            behavior: AgentBehaviorConfig::default(),
+        })
+        .build();
+
+        assert!(prompt.contains("You're direct, helpful, and concise."));
+    }
+
+    #[test]
     fn build_assembles_all_layers() {
         let prompt = SystemPromptBuilder::new(
             IdentityConfig {
@@ -338,7 +412,6 @@ mod tests {
             },
             BehaviorConfig {
                 custom_instructions: Some("Keep answers grounded in evidence.".to_string()),
-                ..BehaviorConfig::default()
             },
         )
         .capabilities(vec![CapabilityGroup {
@@ -346,7 +419,7 @@ mod tests {
             description: "Fetch a web page".to_string(),
         }])
         .security(SecurityContext {
-            mode: "capability".to_string(),
+            mode: SecurityMode::Capability,
             restricted: vec!["kernel_modify".to_string()],
             working_dir: "/workspace".to_string(),
         })
@@ -381,7 +454,6 @@ mod tests {
             IdentityConfig::default(),
             BehaviorConfig {
                 custom_instructions: Some("   ".to_string()),
-                ..BehaviorConfig::default()
             },
         )
         .directive("   ")
@@ -419,7 +491,7 @@ mod tests {
     fn security_context_renders_boundaries() {
         let prompt = builder_with_personality(Personality::Casual)
             .security(SecurityContext {
-                mode: "capability".to_string(),
+                mode: SecurityMode::Capability,
                 restricted: vec!["network_listen".to_string(), "kernel_modify".to_string()],
                 working_dir: "/workspace".to_string(),
             })
@@ -429,6 +501,25 @@ mod tests {
         assert!(prompt.contains("- Mode: capability"));
         assert!(prompt.contains("- Restricted: network_listen, kernel_modify"));
         assert!(prompt.contains("- Working directory: /workspace"));
+    }
+
+    #[test]
+    fn security_mode_variants_render_lowercase_labels() {
+        for (mode, label) in [
+            (SecurityMode::Capability, "capability"),
+            (SecurityMode::Prompt, "prompt"),
+            (SecurityMode::Open, "open"),
+        ] {
+            let prompt = builder_with_personality(Personality::Casual)
+                .security(SecurityContext {
+                    mode,
+                    restricted: Vec::new(),
+                    working_dir: "/workspace".to_string(),
+                })
+                .build();
+
+            assert!(prompt.contains(&format!("- Mode: {label}")));
+        }
     }
 
     #[test]
@@ -479,7 +570,6 @@ mod tests {
             IdentityConfig::default(),
             BehaviorConfig {
                 custom_instructions: Some("Prefer concrete next steps.".to_string()),
-                ..BehaviorConfig::default()
             },
         )
         .build();
