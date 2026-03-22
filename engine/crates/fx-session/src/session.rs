@@ -3,8 +3,97 @@
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
 };
+use fx_llm::{ContentBlock, Message, Usage};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A structured content block stored in session history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionContentBlock {
+    /// Plain text content.
+    Text { text: String },
+    /// Tool invocation requested by the assistant.
+    ToolUse {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        name: String,
+        input: Value,
+    },
+    /// Tool output associated with a prior tool invocation.
+    ToolResult {
+        tool_use_id: String,
+        content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+    /// Marker indicating an image was part of the message.
+    Image { media_type: String },
+}
+
+impl From<ContentBlock> for SessionContentBlock {
+    fn from(block: ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => Self::Text { text },
+            ContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => Self::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+                is_error: None,
+            },
+            ContentBlock::Image { media_type, .. } => Self::Image { media_type },
+        }
+    }
+}
+
+impl From<SessionContentBlock> for ContentBlock {
+    fn from(block: SessionContentBlock) -> Self {
+        match block {
+            SessionContentBlock::Text { text } => Self::Text { text },
+            SessionContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => Self::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            },
+            SessionContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Self::ToolResult {
+                tool_use_id,
+                content,
+            },
+            // Image payloads are intentionally not persisted; replay them as
+            // a readable marker so later turns retain the fact that vision was used.
+            SessionContentBlock::Image { media_type } => Self::Text {
+                text: format!("[image:{media_type}]"),
+            },
+        }
+    }
+}
 
 /// A single conversation message within a session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -12,9 +101,232 @@ pub struct SessionMessage {
     /// Who produced this message.
     pub role: MessageRole,
     /// Message content.
-    pub content: String,
+    #[serde(deserialize_with = "deserialize_content")]
+    pub content: Vec<SessionContentBlock>,
     /// Unix epoch seconds when the message was recorded.
     pub timestamp: u64,
+    /// Tokens consumed to produce this message, when known.
+    #[serde(default)]
+    pub token_count: Option<u32>,
+    /// Input tokens consumed by prompt/context, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_count: Option<u32>,
+    /// Output tokens produced by generation, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_count: Option<u32>,
+}
+
+impl SessionMessage {
+    /// Build a text-only session message.
+    pub fn text(role: MessageRole, content: impl Into<String>, timestamp: u64) -> Self {
+        Self {
+            role,
+            content: vec![SessionContentBlock::Text {
+                text: content.into(),
+            }],
+            timestamp,
+            token_count: None,
+            input_token_count: None,
+            output_token_count: None,
+        }
+    }
+
+    /// Build a structured session message.
+    pub fn structured(
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        timestamp: u64,
+        token_count: Option<u32>,
+    ) -> Self {
+        Self {
+            role,
+            content,
+            timestamp,
+            token_count,
+            input_token_count: None,
+            output_token_count: None,
+        }
+    }
+
+    /// Build a structured session message with split token accounting.
+    pub fn structured_with_usage(
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        timestamp: u64,
+        usage: Option<Usage>,
+    ) -> Self {
+        Self {
+            role,
+            content,
+            timestamp,
+            token_count: usage.map(total_token_count),
+            input_token_count: usage.map(|usage| usage.input_tokens),
+            output_token_count: usage.map(|usage| usage.output_tokens),
+        }
+    }
+
+    /// Convert the stored message into an LLM history message.
+    pub fn to_llm_message(&self) -> Message {
+        Message {
+            role: self.role.into(),
+            content: normalized_llm_content(&self.content),
+        }
+    }
+
+    /// Return a readable text representation of the structured content.
+    pub fn render_text(&self) -> String {
+        render_content_blocks(&self.content)
+    }
+
+    /// Return the combined token count when available.
+    pub fn total_token_count(&self) -> Option<u32> {
+        self.token_count.or_else(|| {
+            Some(
+                self.input_token_count?
+                    .saturating_add(self.output_token_count?),
+            )
+        })
+    }
+}
+
+/// Formatting controls for rendered session content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentRenderOptions {
+    pub include_tool_use_id: bool,
+}
+
+const SESSION_MEMORY_MAX_ITEMS: usize = 20;
+const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
+
+/// Persistent session memory that survives conversation compaction.
+/// Contains key facts the agent extracted about the session's purpose and state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SessionMemory {
+    /// What this session is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Current state of work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_state: Option<String>,
+    /// Key decisions made during this session (max 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_decisions: Vec<String>,
+    /// Files actively being worked on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_files: Vec<String>,
+    /// Custom context the agent wants to remember (max 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_context: Vec<String>,
+    /// Unix epoch seconds of last update.
+    #[serde(default)]
+    pub last_updated: u64,
+}
+
+impl SessionMemory {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.current_state.is_none()
+            && self.key_decisions.is_empty()
+            && self.active_files.is_empty()
+            && self.custom_context.is_empty()
+    }
+
+    /// Estimated token count for the rendered memory block.
+    #[must_use]
+    pub fn estimated_tokens(&self) -> usize {
+        let text = self.render();
+        if text.is_empty() {
+            return 0;
+        }
+        text.chars()
+            .count()
+            .div_ceil(4)
+            .max(text.split_whitespace().count())
+            .max(1)
+    }
+
+    /// Apply an update from the agent's tool call.
+    /// Returns `Err(String)` with a user-facing message if the update
+    /// would exceed the session memory token cap.
+    pub fn apply_update(&mut self, update: SessionMemoryUpdate) -> Result<(), String> {
+        let mut candidate = self.clone();
+        if let Some(project) = update.project {
+            candidate.project = Some(project);
+        }
+        if let Some(state) = update.current_state {
+            candidate.current_state = Some(state);
+        }
+        if let Some(decisions) = update.key_decisions {
+            append_capped_items(&mut candidate.key_decisions, decisions);
+        }
+        if let Some(files) = update.active_files {
+            candidate.active_files = files;
+        }
+        if let Some(context) = update.custom_context {
+            append_capped_items(&mut candidate.custom_context, context);
+        }
+        let estimated_tokens = candidate.estimated_tokens();
+        if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
+            return Err(format!(
+                "Session memory would exceed {} token cap ({} estimated). Be more concise.",
+                SESSION_MEMORY_MAX_TOKENS, estimated_tokens
+            ));
+        }
+        candidate.last_updated = current_epoch_secs();
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Render the memory as a human-readable text block.
+    pub fn render(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec!["[Session Memory]".to_string()];
+        if let Some(project) = &self.project {
+            lines.push(format!("Project: {project}"));
+        }
+        if let Some(state) = &self.current_state {
+            lines.push(format!("Current state: {state}"));
+        }
+        push_session_memory_items(&mut lines, "Key decisions:", &self.key_decisions);
+        push_session_memory_items(&mut lines, "Active files:", &self.active_files);
+        push_session_memory_items(&mut lines, "Context:", &self.custom_context);
+        lines.join("\n")
+    }
+}
+
+/// Partial update to session memory from the agent's tool call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionMemoryUpdate {
+    pub project: Option<String>,
+    pub current_state: Option<String>,
+    pub key_decisions: Option<Vec<String>>,
+    pub active_files: Option<Vec<String>>,
+    pub custom_context: Option<Vec<String>>,
+}
+
+fn append_capped_items(items: &mut Vec<String>, incoming: Vec<String>) {
+    items.extend(incoming);
+    trim_oldest_items(items);
+}
+
+fn trim_oldest_items(items: &mut Vec<String>) {
+    let excess = items.len().saturating_sub(SESSION_MEMORY_MAX_ITEMS);
+    if excess > 0 {
+        items.drain(..excess);
+    }
+}
+
+fn push_session_memory_items(lines: &mut Vec<String>, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    lines.push(heading.to_string());
+    for item in items {
+        lines.push(format!("- {item}"));
+    }
 }
 
 /// Persistent session state: metadata + conversation history.
@@ -36,6 +348,9 @@ pub struct Session {
     pub updated_at: u64,
     /// Ordered conversation messages.
     pub messages: Vec<SessionMessage>,
+    /// Persistent memory that survives compaction.
+    #[serde(default)]
+    pub memory: SessionMemory,
 }
 
 impl Session {
@@ -51,18 +366,49 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            memory: SessionMemory::default(),
         }
     }
 
     /// Append a message and update the timestamp.
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) {
-        let now = current_epoch_secs();
-        self.messages.push(SessionMessage {
+        self.add_message_blocks(
             role,
-            content: content.into(),
-            timestamp: now,
-        });
+            vec![SessionContentBlock::Text {
+                text: content.into(),
+            }],
+            None,
+        );
+    }
+
+    /// Append a structured message and update the timestamp.
+    pub fn add_message_blocks(
+        &mut self,
+        role: MessageRole,
+        content: Vec<SessionContentBlock>,
+        token_count: Option<u32>,
+    ) {
+        let now = current_epoch_secs();
+        self.messages
+            .push(SessionMessage::structured(role, content, now, token_count));
         self.updated_at = now;
+    }
+
+    /// Append already-constructed messages and update the timestamp once.
+    pub fn extend_messages(&mut self, messages: impl IntoIterator<Item = SessionMessage>) {
+        let mut appended_any = false;
+        for message in messages {
+            self.messages.push(message);
+            appended_any = true;
+        }
+        if appended_any {
+            self.updated_at = current_epoch_secs();
+        }
+    }
+
+    pub fn set_memory(&mut self, memory: SessionMemory) {
+        self.memory = memory;
+        self.updated_at = current_epoch_secs();
     }
 
     /// Remove all recorded messages and update the timestamp.
@@ -97,14 +443,127 @@ impl Session {
         self.messages
             .iter()
             .find(|message| message.role == MessageRole::User)
-            .map(|message| truncate_text(&message.content, 80))
+            .map(|message| truncate_text(&message.render_text(), 80))
     }
 
     fn compute_preview(&self) -> Option<String> {
         self.messages
             .last()
-            .map(|message| truncate_text(&message.content, 120))
+            .map(|message| truncate_text(&message.render_text(), 120))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContentField {
+    Blocks(Vec<SessionContentBlock>),
+    LegacyText(String),
+}
+
+fn deserialize_content<'de, D>(deserializer: D) -> Result<Vec<SessionContentBlock>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match ContentField::deserialize(deserializer)? {
+        ContentField::Blocks(blocks) => Ok(blocks),
+        ContentField::LegacyText(text) => Ok(vec![SessionContentBlock::Text { text }]),
+    }
+}
+
+fn normalized_llm_content(blocks: &[SessionContentBlock]) -> Vec<ContentBlock> {
+    let mut normalized = Vec::with_capacity(blocks.len());
+    let mut tool_use_indices: HashMap<String, usize> = HashMap::new();
+
+    for block in blocks.iter().cloned() {
+        match block {
+            SessionContentBlock::ToolUse {
+                id,
+                provider_id,
+                name,
+                input,
+            } => {
+                if let Some(existing_index) = tool_use_indices.get(&id).copied() {
+                    let should_replace = matches!(
+                        normalized.get(existing_index),
+                        Some(ContentBlock::ToolUse {
+                            provider_id: existing_provider_id,
+                            ..
+                        }) if existing_provider_id.is_none() && provider_id.is_some()
+                    );
+                    if should_replace {
+                        normalized[existing_index] = ContentBlock::ToolUse {
+                            id,
+                            provider_id,
+                            name,
+                            input,
+                        };
+                    }
+                    continue;
+                }
+
+                tool_use_indices.insert(id.clone(), normalized.len());
+                normalized.push(ContentBlock::ToolUse {
+                    id,
+                    provider_id,
+                    name,
+                    input,
+                });
+            }
+            other => normalized.push(other.into()),
+        }
+    }
+
+    normalized
+}
+
+pub fn render_content_blocks(blocks: &[SessionContentBlock]) -> String {
+    render_content_blocks_with_options(blocks, ContentRenderOptions::default())
+}
+
+/// Render structured content blocks into readable text with configurable formatting.
+pub fn render_content_blocks_with_options(
+    blocks: &[SessionContentBlock],
+    options: ContentRenderOptions,
+) -> String {
+    blocks
+        .iter()
+        .map(|block| render_content_block_with_options(block, options))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_content_block_with_options(
+    block: &SessionContentBlock,
+    options: ContentRenderOptions,
+) -> String {
+    match block {
+        SessionContentBlock::Text { text } => text.clone(),
+        SessionContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
+            if options.include_tool_use_id {
+                format!("[tool_use:{name}#{id}] {input}")
+            } else {
+                format!("[tool_use:{name}] {input}")
+            }
+        }
+        SessionContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            if is_error == &Some(true) {
+                format!("[tool_result:{tool_use_id} error] {content}")
+            } else {
+                format!("[tool_result:{tool_use_id}] {content}")
+            }
+        }
+        SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
+    }
+}
+
+fn total_token_count(usage: Usage) -> u32 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -128,12 +587,162 @@ fn current_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn test_config() -> SessionConfig {
         SessionConfig {
             label: Some("test-session".to_string()),
             model: "gpt-4".to_string(),
         }
+    }
+
+    fn memory_update() -> SessionMemoryUpdate {
+        SessionMemoryUpdate {
+            project: None,
+            current_state: None,
+            key_decisions: None,
+            active_files: None,
+            custom_context: None,
+        }
+    }
+
+    #[test]
+    fn session_memory_default_is_empty() {
+        assert!(SessionMemory::default().is_empty());
+    }
+
+    #[test]
+    fn session_memory_round_trip() {
+        let memory = SessionMemory {
+            project: Some("Phase 3".to_string()),
+            current_state: Some("wiring tests".to_string()),
+            key_decisions: vec!["use a shared arc".to_string()],
+            active_files: vec!["engine/crates/fx-session/src/session.rs".to_string()],
+            custom_context: vec!["keep it concise".to_string()],
+            last_updated: 123,
+        };
+
+        let json = serde_json::to_string(&memory).expect("serialize memory");
+        let restored: SessionMemory = serde_json::from_str(&json).expect("deserialize memory");
+
+        assert_eq!(restored, memory);
+    }
+
+    #[test]
+    fn session_backward_compat_defaults_memory_when_missing() {
+        let session = Session::new(
+            SessionKey::new("compat").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        let mut value = serde_json::to_value(&session).expect("serialize session");
+        let Some(object) = value.as_object_mut() else {
+            panic!("session json should be an object");
+        };
+        object.remove("memory");
+
+        let restored: Session = serde_json::from_value(value).expect("deserialize session");
+
+        assert!(restored.memory.is_empty());
+    }
+
+    #[test]
+    fn apply_update_overwrites_project_and_state() {
+        let mut memory = SessionMemory::default();
+        let mut initial = memory_update();
+        initial.project = Some("first".to_string());
+        initial.current_state = Some("planning".to_string());
+        memory.apply_update(initial).expect("initial update");
+
+        let mut replacement = memory_update();
+        replacement.project = Some("second".to_string());
+        replacement.current_state = Some("coding".to_string());
+        memory
+            .apply_update(replacement)
+            .expect("replacement update");
+
+        assert_eq!(memory.project.as_deref(), Some("second"));
+        assert_eq!(memory.current_state.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn apply_update_appends_decisions_and_context() {
+        let mut memory = SessionMemory::default();
+        let mut first = memory_update();
+        first.key_decisions = Some(vec!["decide one".to_string()]);
+        first.custom_context = Some(vec!["context one".to_string()]);
+        memory.apply_update(first).expect("first update");
+
+        let mut second = memory_update();
+        second.key_decisions = Some(vec!["decide two".to_string()]);
+        second.custom_context = Some(vec!["context two".to_string()]);
+        memory.apply_update(second).expect("second update");
+
+        assert_eq!(
+            memory.key_decisions,
+            vec!["decide one".to_string(), "decide two".to_string()]
+        );
+        assert_eq!(
+            memory.custom_context,
+            vec!["context one".to_string(), "context two".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_update_replaces_active_files() {
+        let mut memory = SessionMemory::default();
+        let mut first = memory_update();
+        first.active_files = Some(vec!["a.rs".to_string(), "b.rs".to_string()]);
+        memory.apply_update(first).expect("first files");
+
+        let mut second = memory_update();
+        second.active_files = Some(vec!["c.rs".to_string()]);
+        memory.apply_update(second).expect("second files");
+
+        assert_eq!(memory.active_files, vec!["c.rs".to_string()]);
+    }
+
+    #[test]
+    fn apply_update_caps_lists_at_twenty_items() {
+        let mut memory = SessionMemory::default();
+        let mut update = memory_update();
+        update.key_decisions = Some((0..25).map(|i| format!("decision-{i}")).collect());
+        update.custom_context = Some((0..22).map(|i| format!("context-{i}")).collect());
+        memory.apply_update(update).expect("capped update");
+
+        assert_eq!(memory.key_decisions.len(), SESSION_MEMORY_MAX_ITEMS);
+        assert_eq!(memory.custom_context.len(), SESSION_MEMORY_MAX_ITEMS);
+        assert_eq!(
+            memory.key_decisions.first().map(String::as_str),
+            Some("decision-5")
+        );
+        assert_eq!(
+            memory.custom_context.first().map(String::as_str),
+            Some("context-2")
+        );
+    }
+
+    #[test]
+    fn session_memory_estimated_tokens_is_nonzero_when_nonempty() {
+        let memory = SessionMemory {
+            project: Some("session memory".to_string()),
+            ..SessionMemory::default()
+        };
+
+        assert!(memory.estimated_tokens() > 0);
+    }
+
+    #[test]
+    fn session_memory_rejects_oversized_updates() {
+        let mut memory = SessionMemory::default();
+        let mut update = memory_update();
+        update.project = Some("x".repeat(SESSION_MEMORY_MAX_TOKENS * 8));
+
+        let error = memory
+            .apply_update(update)
+            .expect_err("oversized memory should fail");
+
+        assert!(error.contains("token cap"));
     }
 
     #[test]
@@ -145,6 +754,7 @@ mod tests {
         );
         assert_eq!(session.status, SessionStatus::Active);
         assert!(session.messages.is_empty());
+        assert!(session.memory.is_empty());
         assert_eq!(session.label.as_deref(), Some("test-session"));
         assert_eq!(session.model, "gpt-4");
     }
@@ -161,7 +771,12 @@ mod tests {
         assert_eq!(session.messages.len(), 1);
         assert!(session.updated_at >= before);
         assert_eq!(session.messages[0].role, MessageRole::User);
-        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(
+            session.messages[0].content,
+            vec![SessionContentBlock::Text {
+                text: "hello".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -176,8 +791,8 @@ mod tests {
         }
         let recent = session.recent_messages(3);
         assert_eq!(recent.len(), 3);
-        assert_eq!(recent[0].content, "msg-7");
-        assert_eq!(recent[2].content, "msg-9");
+        assert_eq!(recent[0].render_text(), "msg-7");
+        assert_eq!(recent[2].render_text(), "msg-9");
     }
 
     #[test]
@@ -279,6 +894,265 @@ mod tests {
         assert_eq!(restored.key, session.key);
         assert_eq!(restored.kind, session.kind);
         assert_eq!(restored.messages.len(), 1);
-        assert_eq!(restored.messages[0].content, "init");
+        assert_eq!(restored.messages[0].render_text(), "init");
+    }
+
+    #[test]
+    fn session_message_round_trips_mixed_structured_content() {
+        let message = SessionMessage::structured_with_usage(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::Text {
+                    text: "Let me check.".to_string(),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "README.md"}),
+                },
+                SessionContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                },
+            ],
+            123,
+            Some(Usage {
+                input_tokens: 17,
+                output_tokens: 25,
+            }),
+        );
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored, message);
+    }
+
+    #[test]
+    fn session_message_to_llm_message_preserves_structured_content() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                    is_error: None,
+                },
+                SessionContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                },
+            ],
+            123,
+            Some(5),
+        );
+
+        let llm_message = message.to_llm_message();
+
+        assert_eq!(llm_message.role, MessageRole::Assistant.into());
+        assert_eq!(
+            llm_message.content,
+            vec![
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                },
+                ContentBlock::Text {
+                    text: "[image:image/png]".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_message_to_llm_message_deduplicates_tool_use_blocks_preferring_provider_id() {
+        let message = SessionMessage::structured(
+            MessageRole::Assistant,
+            vec![
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                    is_error: None,
+                },
+            ],
+            123,
+            Some(5),
+        );
+
+        let llm_message = message.to_llm_message();
+
+        assert_eq!(
+            llm_message.content,
+            vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "search".to_string(),
+                    input: json!({"q": "weather"}),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("sunny"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extend_messages_appends_messages_and_updates_timestamp() {
+        let mut session = Session::new(
+            SessionKey::new("extend").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        session.updated_at = 0;
+
+        session.extend_messages([
+            SessionMessage::text(MessageRole::User, "first", 1),
+            SessionMessage::text(MessageRole::Assistant, "second", 2),
+        ]);
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].render_text(), "first");
+        assert_eq!(session.messages[1].render_text(), "second");
+        assert!(session.updated_at > 0);
+    }
+
+    #[test]
+    fn session_message_deserializes_legacy_string_content() {
+        let json = r#"{"role":"user","content":"hello","timestamp":123}"#;
+
+        let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(
+            restored.content,
+            vec![SessionContentBlock::Text {
+                text: "hello".to_string()
+            }]
+        );
+        assert_eq!(restored.token_count, None);
+    }
+
+    #[test]
+    fn session_message_deserializes_tool_result_without_is_error() {
+        let json = r#"{"role":"tool","content":[{"type":"tool_result","tool_use_id":"call_1","content":"hello"}],"timestamp":123}"#;
+
+        let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(
+            restored.content,
+            vec![SessionContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!("hello"),
+                is_error: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn session_content_block_converts_to_and_from_llm_content() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "hello".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                provider_id: Some("fc_1".to_string()),
+                name: "search".to_string(),
+                input: json!({"q": "weather"}),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!("sunny"),
+            },
+            ContentBlock::Image {
+                media_type: "image/jpeg".to_string(),
+                data: "ZmFrZQ==".to_string(),
+            },
+        ];
+
+        let stored = blocks
+            .clone()
+            .into_iter()
+            .map(SessionContentBlock::from)
+            .collect::<Vec<_>>();
+        let restored = stored
+            .iter()
+            .cloned()
+            .map(ContentBlock::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stored[0],
+            SessionContentBlock::Text {
+                text: "hello".to_string()
+            }
+        );
+        assert_eq!(restored[0], blocks[0]);
+        assert_eq!(restored[1], blocks[1]);
+        assert_eq!(restored[2], blocks[2]);
+        assert_eq!(
+            restored[3],
+            ContentBlock::Text {
+                text: "[image:image/jpeg]".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn token_count_round_trips_and_defaults_for_legacy_messages() {
+        let message = SessionMessage::structured_with_usage(
+            MessageRole::Assistant,
+            vec![SessionContentBlock::Text {
+                text: "usage".to_string(),
+            }],
+            123,
+            Some(Usage {
+                input_tokens: 44,
+                output_tokens: 55,
+            }),
+        );
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        let restored: SessionMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.token_count, Some(99));
+        assert_eq!(restored.input_token_count, Some(44));
+        assert_eq!(restored.output_token_count, Some(55));
+
+        let legacy: SessionMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"old","timestamp":1}"#)
+                .expect("legacy deserialize");
+        assert_eq!(legacy.token_count, None);
+        assert_eq!(legacy.input_token_count, None);
+        assert_eq!(legacy.output_token_count, None);
     }
 }

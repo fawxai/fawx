@@ -35,6 +35,7 @@ SIGNING_IDENTITY="${FAWX_SIGNING_IDENTITY:-}"
 NOTARIZE_PROFILE="${FAWX_NOTARIZE_PROFILE:-fawx-notarize}"
 DMG_BACKGROUND_IMAGE="${FAWX_DMG_BACKGROUND_IMAGE:-}"
 DEFAULT_DMG_BACKGROUND="$REPO_ROOT/assets/dmg-background.png"
+SPARKLE_PUBLIC_KEY_PLACEHOLDER="PASTE_PUBLIC_KEY_HERE"
 
 if [[ -z "$DMG_BACKGROUND_IMAGE" && -f "$DEFAULT_DMG_BACKGROUND" ]]; then
     DMG_BACKGROUND_IMAGE="$DEFAULT_DMG_BACKGROUND"
@@ -63,6 +64,82 @@ fi
 echo "🦊 Fawx DMG Build Pipeline"
 echo "   Mode: $(if $RELEASE; then echo 'Release (signed + notarized)'; else echo 'Debug'; fi)"
 echo ""
+
+plist_value() {
+    local key="$1"
+    /usr/libexec/PlistBuddy -c "Print :$key" "$APP_DIR/Fawx/Info.plist" 2>/dev/null || true
+}
+
+sparkle_updates_configured() {
+    local feed_url public_key
+    feed_url="$(plist_value SUFeedURL)"
+    public_key="$(plist_value SUPublicEDKey)"
+
+    [[ -n "$feed_url" && -n "$public_key" && "$public_key" != "$SPARKLE_PUBLIC_KEY_PLACEHOLDER" ]]
+}
+
+find_sparkle_tool() {
+    local tool_name="$1"
+    local search_root tool_path
+
+    if [[ -n "${FAWX_SPARKLE_TOOLS_DIR:-}" && -x "${FAWX_SPARKLE_TOOLS_DIR%/}/$tool_name" ]]; then
+        echo "${FAWX_SPARKLE_TOOLS_DIR%/}/$tool_name"
+        return 0
+    fi
+
+    for search_root in \
+        "$BUILD_DIR/derived/SourcePackages" \
+        "$HOME/Library/Developer/Xcode/DerivedData"
+    do
+        [[ -d "$search_root" ]] || continue
+        tool_path="$(find "$search_root" -path "*/artifacts/sparkle/Sparkle/bin/$tool_name" -print -quit 2>/dev/null)"
+        if [[ -n "$tool_path" ]]; then
+            echo "$tool_path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+sign_dmg_for_sparkle() {
+    local dmg_path="$1"
+    local sign_tool
+    local sign_output
+    sign_tool="$(find_sparkle_tool sign_update || true)"
+
+    if [[ -z "$sign_tool" ]]; then
+        echo "   ⚠ Sparkle sign_update tool not found; skipping EdDSA signing"
+        return 0
+    fi
+
+    echo "   Signing DMG for Sparkle..."
+    if ! sign_output="$("$sign_tool" "$dmg_path" 2>&1)"; then
+        printf '%s\n' "$sign_output" >&2
+        return 1
+    fi
+
+    if [[ -n "$sign_output" ]]; then
+        while IFS= read -r line; do
+            echo "     $line"
+        done <<< "$sign_output"
+    fi
+}
+
+generate_sparkle_appcast() {
+    local output_dir="$1"
+    local appcast_tool
+    appcast_tool="$(find_sparkle_tool generate_appcast || true)"
+
+    if [[ -z "$appcast_tool" ]]; then
+        echo "   ⚠ Sparkle generate_appcast tool not found; skipping appcast generation"
+        return 0
+    fi
+
+    echo "   Generating Sparkle appcast..."
+    "$appcast_tool" "$output_dir"
+    echo "   ✅ Appcast: $output_dir/appcast.xml"
+}
 
 # Step 1: Build engine binary
 step_engine() {
@@ -270,6 +347,13 @@ step_dmg() {
             xcrun stapler staple "$dmg_path"
             echo "   ✅ Notarized + stapled"
         fi
+    fi
+
+    if sparkle_updates_configured; then
+        sign_dmg_for_sparkle "$dmg_path"
+        generate_sparkle_appcast "$BUILD_DIR"
+    else
+        echo "   ℹ Sparkle signing skipped until SUFeedURL and SUPublicEDKey are fully configured"
     fi
 
     echo ""

@@ -6,6 +6,8 @@ struct StatusBar: View {
     let modelName: String?
     let context: ContextInfo?
     let selectedSessionMessageCount: Int
+    let canShowSessionMemory: Bool
+    let openSessionMemoryAction: () -> Void
 
     var body: some View {
         HStack(spacing: FawxSpacing.paddingMD) {
@@ -36,6 +38,21 @@ struct StatusBar: View {
                 .help(modelName.map { abbreviateModelName($0) } ?? "Server model unavailable")
 
             Spacer()
+
+            if canShowSessionMemory {
+                Button(action: openSessionMemoryAction) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.text.square")
+                        Text("Memory")
+                    }
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("sessionMemoryButton")
+                .accessibilityLabel("Open session memory")
+                .help("View and edit session memory")
+            }
 
             if let displayContext = displayContext {
                 HStack(spacing: FawxSpacing.paddingSM) {

@@ -1,10 +1,18 @@
 #if os(macOS)
 import SwiftUI
 
+enum MenuBarStatus: String {
+    case active
+    case connecting
+    case error
+    case stopped
+}
+
 struct MenuBarStatusSnapshot: Equatable {
     let title: String
     let detail: String
     let color: Color
+    let status: MenuBarStatus
 }
 
 struct MenuBarView: View {

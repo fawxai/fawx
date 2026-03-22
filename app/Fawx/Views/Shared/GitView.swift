@@ -3,6 +3,12 @@ import SwiftUI
 
 struct GitView: View {
     @Bindable var viewModel: GitViewModel
+    let isActive: Bool
+
+    init(viewModel: GitViewModel, isActive: Bool = true) {
+        _viewModel = Bindable(viewModel)
+        self.isActive = isActive
+    }
 
     var body: some View {
         Group {
@@ -13,7 +19,10 @@ struct GitView: View {
 #endif
         }
         .background(Color.fawxBackground)
-        .task { @MainActor in
+        .task(id: isActive) { @MainActor in
+            guard isActive else {
+                return
+            }
             await viewModel.refresh()
         }
         .alert(

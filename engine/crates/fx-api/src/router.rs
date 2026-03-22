@@ -16,8 +16,8 @@ use crate::handlers::phase4::{
 };
 use crate::handlers::sessions::{
     handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
-    handle_get_messages, handle_get_session, handle_list_sessions, handle_send_message,
-    handle_send_to_session,
+    handle_get_messages, handle_get_session, handle_get_session_memory, handle_list_sessions,
+    handle_send_message, handle_send_to_session, handle_update_session_memory,
 };
 use crate::handlers::settings::{
     handle_get_thinking, handle_list_auth, handle_list_models, handle_list_skills,
@@ -54,6 +54,10 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         )
         .route("/sessions/{id}/send", post(handle_send_to_session))
         .route("/sessions/{id}/context", get(handle_get_context))
+        .route(
+            "/sessions/{id}/memory",
+            get(handle_get_session_memory).put(handle_update_session_memory),
+        )
         .route(
             "/proposals/pending",
             get(handlers::proposals::handle_list_pending),

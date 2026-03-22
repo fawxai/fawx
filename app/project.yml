@@ -13,6 +13,9 @@ packages:
   MarkdownUI:
     url: https://github.com/gonzalezreal/swift-markdown-ui.git
     from: 2.4.1
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.5.0
 targets:
   Fawx-macOS:
     type: application
@@ -26,6 +29,7 @@ targets:
           - LaunchScreen.storyboard
     dependencies:
       - package: MarkdownUI
+      - package: Sparkle
     settings:
       base:
         PRODUCT_NAME: Fawx

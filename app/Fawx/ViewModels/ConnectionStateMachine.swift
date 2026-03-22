@@ -30,7 +30,7 @@ enum ConnectionStateMachine {
             return .connectivity
         }
 
-        if case APIError.httpStatus(let code, _) = error, code == 408 || (500 ... 599).contains(code) {
+        if case APIError.httpStatus(let code, _) = error, code == 408 {
             return .connectivity
         }
 

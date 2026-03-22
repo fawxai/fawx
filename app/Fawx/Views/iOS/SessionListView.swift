@@ -322,8 +322,8 @@ struct SessionListView: View {
 
     private func clearSession(_ sessionID: String) {
         Task { @MainActor in
-            if chatViewModel.activeStreamSessionID == sessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(sessionID) {
+                chatViewModel.stopStreaming(sessionID: sessionID)
             }
 
             let didClear = await sessionViewModel.clearSession(id: sessionID)
@@ -337,8 +337,8 @@ struct SessionListView: View {
 
     private func deleteSession(_ sessionID: String) {
         Task { @MainActor in
-            if chatViewModel.activeStreamSessionID == sessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(sessionID) {
+                chatViewModel.stopStreaming(sessionID: sessionID)
             }
 
             let didDelete = await sessionViewModel.deleteSession(id: sessionID)
@@ -460,7 +460,7 @@ struct SessionListView: View {
         let rowContent = SessionRowView(
             session: session,
             isSelected: session.id == sessionViewModel.selectedSessionID,
-            isStreaming: session.id == chatViewModel.activeStreamSessionID
+            isStreaming: chatViewModel.activeStreamSessionIDs.contains(session.id)
         )
 
         Button {

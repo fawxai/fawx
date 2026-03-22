@@ -44,6 +44,12 @@ final class FormattersTests: XCTestCase {
         XCTAssertNil(url)
     }
 
+    func testCanonicalizeServerURLPreservesExplicitHTTPS() {
+        let url = canonicalizeServerURL("https://Example.com:8400/path")
+
+        XCTAssertEqual(url, "https://example.com:8400")
+    }
+
     func testAbbreviateModelNameDropsProviderPrefix() {
         let name = abbreviateModelName("anthropic/claude-opus-4-6")
 

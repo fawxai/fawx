@@ -27,7 +27,9 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 fn estimate_content_tokens(content: &ContentBlock) -> usize {
     match content {
         ContentBlock::Text { text } => estimate_text_tokens(text),
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             estimate_text_tokens(id)
                 + estimate_text_tokens(name)
                 + estimate_text_tokens(&input.to_string())
@@ -79,6 +81,12 @@ fn summary_message(summary: &str) -> Message {
 fn compaction_marker_message(compacted_count: usize) -> Message {
     Message::assistant(format!(
         "{COMPACTION_MARKER_PREFIX} {compacted_count} older messages removed]"
+    ))
+}
+
+fn emergency_compaction_marker_message(compacted_count: usize) -> Message {
+    Message::assistant(format!(
+        "{COMPACTION_MARKER_PREFIX} emergency: {compacted_count} messages removed]"
     ))
 }
 
@@ -234,6 +242,20 @@ fn assemble_sliding_result(
     compacted
 }
 
+fn assemble_emergency_result(
+    messages: &[Message],
+    bounds: &ZoneBounds,
+    compacted_count: usize,
+) -> Vec<Message> {
+    let mut compacted = Vec::new();
+    compacted.extend_from_slice(&messages[..bounds.prefix_end]);
+    if compacted_count > 0 {
+        compacted.push(emergency_compaction_marker_message(compacted_count));
+    }
+    compacted.extend_from_slice(&messages[bounds.tail_start..]);
+    compacted
+}
+
 fn compaction_marker_tokens(compacted_count: usize) -> usize {
     estimate_message_tokens(&compaction_marker_message(compacted_count))
 }
@@ -318,11 +340,180 @@ fn sliding_compaction_result(
     })
 }
 
+pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> CompactionResult {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let evicted_indices: Vec<usize> = (bounds.prefix_end..bounds.tail_start).collect();
+    let compacted_count = evicted_indices.len();
+    if compacted_count == 0 {
+        return CompactionResult {
+            messages: messages.to_vec(),
+            compacted_count: 0,
+            estimated_tokens: ConversationBudget::estimate_tokens(messages),
+            used_summarization: false,
+            evicted_indices,
+        };
+    }
+
+    let result_messages = assemble_emergency_result(messages, &bounds, compacted_count);
+    CompactionResult {
+        estimated_tokens: ConversationBudget::estimate_tokens(&result_messages),
+        messages: result_messages,
+        compacted_count,
+        used_summarization: false,
+        evicted_indices,
+    }
+}
+
+/// Result of tool block pruning.
+#[derive(Debug, Clone)]
+pub struct PruneResult {
+    /// Number of content blocks that were pruned.
+    pub pruned_count: usize,
+    /// Estimated tokens saved by pruning.
+    pub tokens_saved: usize,
+}
+
+/// Check whether the prunable zone contains any non-text blocks.
+pub fn has_prunable_blocks(messages: &[Message], preserve_recent_turns: usize) -> bool {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    messages[bounds.prefix_end..bounds.tail_start]
+        .iter()
+        .any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::Text { .. }))
+        })
+}
+
+/// Prune old tool_use, tool_result, and image blocks in-place.
+///
+/// Messages older than `preserve_recent_turns` from the end have their
+/// non-text content blocks replaced with compact text summaries. Active
+/// tool chains (tool_use in the recent window referencing a tool_result
+/// in the old window) are preserved. In-flight tool_use blocks (those
+/// without a matching tool_result anywhere) are also preserved.
+///
+/// Returns `None` if no blocks were pruned.
+pub fn prune_tool_blocks(
+    messages: &mut [Message],
+    preserve_recent_turns: usize,
+    summary_max_chars: usize,
+) -> Option<PruneResult> {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let tail_ids = ids_referenced_in_tail(messages, bounds.tail_start);
+    let unresolved_ids = unresolved_tool_use_ids(messages);
+
+    // Merge tail-referenced and unresolved IDs into a single protected set (owned).
+    let protected_ids: HashSet<String> = tail_ids
+        .into_iter()
+        .chain(unresolved_ids)
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut pruned_count = 0;
+    let mut tokens_saved: usize = 0;
+
+    for message in &mut messages[bounds.prefix_end..bounds.tail_start] {
+        let (count, saved) = prune_message_blocks(message, &protected_ids, summary_max_chars);
+        pruned_count += count;
+        tokens_saved += saved;
+    }
+
+    if pruned_count == 0 {
+        return None;
+    }
+
+    Some(PruneResult {
+        pruned_count,
+        tokens_saved,
+    })
+}
+
+/// Prune non-text blocks in a single message, returning (count, tokens_saved).
+fn prune_message_blocks(
+    message: &mut Message,
+    referenced_ids: &HashSet<String>,
+    summary_max_chars: usize,
+) -> (usize, usize) {
+    let mut count = 0;
+    let mut saved: usize = 0;
+
+    for block in &mut message.content {
+        let (replacement, block_saved) =
+            maybe_prune_block(block, referenced_ids, summary_max_chars);
+        if let Some(new_block) = replacement {
+            *block = new_block;
+            count += 1;
+            saved += block_saved;
+        }
+    }
+
+    (count, saved)
+}
+
+/// Return a replacement block and tokens saved, or None if the block
+/// should be preserved.
+fn maybe_prune_block(
+    block: &ContentBlock,
+    referenced_ids: &HashSet<String>,
+    summary_max_chars: usize,
+) -> (Option<ContentBlock>, usize) {
+    match block {
+        ContentBlock::ToolUse { id, name, .. } => {
+            if referenced_ids.contains(id) {
+                return (None, 0);
+            }
+            let before = estimate_content_tokens(block);
+            let summary = format!("[tool: {name}]");
+            let after = estimate_text_tokens(&summary);
+            let replacement = ContentBlock::Text { text: summary };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => {
+            if referenced_ids.contains(tool_use_id) {
+                return (None, 0);
+            }
+            let before = estimate_content_tokens(block);
+            let summary = summarize_tool_result(content, summary_max_chars);
+            let after = estimate_text_tokens(&summary);
+            let replacement = ContentBlock::Text { text: summary };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::Image { .. } => {
+            let before = estimate_content_tokens(block);
+            let summary = "[image]";
+            let after = estimate_text_tokens(summary);
+            let replacement = ContentBlock::Text {
+                text: summary.to_string(),
+            };
+            (Some(replacement), before.saturating_sub(after))
+        }
+        ContentBlock::Text { .. } => (None, 0),
+    }
+}
+
+/// Summarize a tool result value to at most `max_chars` characters.
+fn summarize_tool_result(content: &serde_json::Value, max_chars: usize) -> String {
+    let raw = match content.as_str() {
+        Some(s) => s.to_string(),
+        None => content.to_string(),
+    };
+    if raw.len() <= max_chars {
+        return format!("[result: {raw}]");
+    }
+    let truncated: String = raw.chars().take(max_chars).collect();
+    format!("[result: {truncated}...]")
+}
+
 /// Budget tracker for conversation-level context usage.
 #[derive(Debug, Clone)]
 pub struct ConversationBudget {
     model_context_limit: usize,
-    compaction_threshold: f32,
+    slide_threshold: f32,
     reserved_tokens: usize,
     output_reserve_tokens: usize,
 }
@@ -330,14 +521,10 @@ pub struct ConversationBudget {
 impl ConversationBudget {
     pub const DEFAULT_OUTPUT_RESERVE_TOKENS: usize = 4_096;
 
-    pub fn new(
-        model_context_limit: usize,
-        compaction_threshold: f32,
-        reserved_tokens: usize,
-    ) -> Self {
+    pub fn new(model_context_limit: usize, slide_threshold: f32, reserved_tokens: usize) -> Self {
         Self {
             model_context_limit,
-            compaction_threshold,
+            slide_threshold,
             reserved_tokens,
             output_reserve_tokens: Self::DEFAULT_OUTPUT_RESERVE_TOKENS,
         }
@@ -350,13 +537,24 @@ impl ConversationBudget {
     }
 
     pub fn compaction_threshold_value(&self) -> f32 {
-        self.compaction_threshold
+        self.slide_threshold
+    }
+
+    pub fn usage_ratio(&self, messages: &[Message]) -> f32 {
+        let budget = self.conversation_budget();
+        if budget == 0 {
+            return if messages.is_empty() { 0.0 } else { 1.0 };
+        }
+
+        Self::estimate_tokens(messages) as f32 / budget as f32
+    }
+
+    pub fn at_tier(&self, messages: &[Message], threshold: f32) -> bool {
+        self.usage_ratio(messages) >= threshold
     }
 
     pub fn needs_compaction(&self, messages: &[Message]) -> bool {
-        let trigger =
-            (self.conversation_budget() as f32 * self.compaction_threshold).ceil() as usize;
-        Self::estimate_tokens(messages) >= trigger
+        self.at_tier(messages, self.slide_threshold)
     }
 
     pub fn exceeds_hard_limit(&self, messages: &[Message]) -> bool {
@@ -367,8 +565,16 @@ impl ConversationBudget {
         messages.iter().map(estimate_message_tokens).sum()
     }
 
+    /// Target token count for sliding window compaction (Tier 2).
+    /// Returns 50% of conversation budget for headroom below slide_threshold (60%).
     pub fn compaction_target(&self) -> usize {
-        self.conversation_budget().saturating_mul(3) / 5
+        self.conversation_budget() / 2
+    }
+
+    /// Target token count for summarizing compaction (Tier 3).
+    /// Returns 40% of conversation budget for headroom below summarize_threshold (80%).
+    pub fn summarize_target(&self) -> usize {
+        self.conversation_budget().saturating_mul(2) / 5
     }
 }
 
@@ -611,8 +817,17 @@ impl CompactionStrategy for SummarizingCompactor {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CompactionConfigError {
-    #[error("compaction_threshold must be in (0.0, 1.0], got {0}")]
+    #[error("threshold must be in (0.0, 1.0], got {0}")]
     InvalidThreshold(f32),
+    #[error(
+        "thresholds must be strictly increasing: prune ({prune}) < slide ({slide}) < summarize ({summarize}) < emergency ({emergency})"
+    )]
+    ThresholdsNotMonotonic {
+        prune: f32,
+        slide: f32,
+        summarize: f32,
+        emergency: f32,
+    },
     #[error("model_context_limit must be > 0")]
     ZeroContextLimit,
     #[error("reserved_system_tokens ({reserved}) must be < model_context_limit ({limit})")]
@@ -635,28 +850,65 @@ pub enum CompactionConfigError {
 
 /// Configuration for conversation-level compaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompactionConfig {
-    pub(crate) compaction_threshold: f32,
+    #[serde(alias = "compaction_threshold")]
+    pub(crate) slide_threshold: f32,
+    pub(crate) prune_threshold: f32,
+    pub(crate) summarize_threshold: f32,
+    pub(crate) emergency_threshold: f32,
     pub(crate) preserve_recent_turns: usize,
     pub(crate) model_context_limit: usize,
     pub(crate) reserved_system_tokens: usize,
     pub(crate) recompact_cooldown_turns: u32,
     pub(crate) use_summarization: bool,
     pub(crate) max_summary_tokens: usize,
+    /// When true, prune old tool_use/tool_result/image blocks before compaction.
+    pub(crate) prune_tool_blocks: bool,
+    /// Maximum characters retained in summarized tool results.
+    pub(crate) tool_block_summary_max_chars: usize,
+}
+
+fn validate_threshold(threshold: f32) -> Result<(), CompactionConfigError> {
+    if !(0.0 < threshold && threshold <= 1.0) {
+        return Err(CompactionConfigError::InvalidThreshold(threshold));
+    }
+    Ok(())
 }
 
 impl CompactionConfig {
     pub fn validate(&self) -> Result<(), CompactionConfigError> {
+        self.validate_thresholds()?;
         self.validate_ranges()?;
         self.validate_budget_floor()
     }
 
-    fn validate_ranges(&self) -> Result<(), CompactionConfigError> {
-        if !(0.0 < self.compaction_threshold && self.compaction_threshold <= 1.0) {
-            return Err(CompactionConfigError::InvalidThreshold(
-                self.compaction_threshold,
-            ));
+    fn validate_thresholds(&self) -> Result<(), CompactionConfigError> {
+        for threshold in [
+            self.prune_threshold,
+            self.slide_threshold,
+            self.summarize_threshold,
+            self.emergency_threshold,
+        ] {
+            validate_threshold(threshold)?;
         }
+
+        if self.prune_threshold < self.slide_threshold
+            && self.slide_threshold < self.summarize_threshold
+            && self.summarize_threshold < self.emergency_threshold
+        {
+            return Ok(());
+        }
+
+        Err(CompactionConfigError::ThresholdsNotMonotonic {
+            prune: self.prune_threshold,
+            slide: self.slide_threshold,
+            summarize: self.summarize_threshold,
+            emergency: self.emergency_threshold,
+        })
+    }
+
+    fn validate_ranges(&self) -> Result<(), CompactionConfigError> {
         if self.model_context_limit == 0 {
             return Err(CompactionConfigError::ZeroContextLimit);
         }
@@ -703,7 +955,7 @@ impl CompactionConfig {
                 ));
             }
 
-            tracing::warn!(
+            tracing::info!(
                 "use_summarization=true but no llm provider available; falling back to SlidingWindowCompactor"
             );
         }
@@ -715,13 +967,18 @@ impl CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            compaction_threshold: 0.80,
+            slide_threshold: 0.60,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.80,
+            emergency_threshold: 0.95,
             preserve_recent_turns: 6,
             model_context_limit: 128_000,
             reserved_system_tokens: 2_000,
             recompact_cooldown_turns: 2,
-            use_summarization: false,
+            use_summarization: true,
             max_summary_tokens: SummarizingCompactor::DEFAULT_MAX_SUMMARY_TOKENS,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         }
     }
 }
@@ -758,6 +1015,7 @@ mod tests {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: id.to_string(),
+                provider_id: None,
                 name: "read".to_string(),
                 input: serde_json::json!({"path": "/tmp/a"}),
             }],
@@ -844,12 +1102,15 @@ mod tests {
     #[test]
     fn budget_with_default_config_has_expected_values() {
         let config = CompactionConfig::default();
-        assert_eq!(config.compaction_threshold, 0.80);
+        assert_eq!(config.prune_threshold, 0.40);
+        assert_eq!(config.slide_threshold, 0.60);
+        assert_eq!(config.summarize_threshold, 0.80);
+        assert_eq!(config.emergency_threshold, 0.95);
         assert_eq!(config.preserve_recent_turns, 6);
         assert_eq!(config.model_context_limit, 128_000);
         assert_eq!(config.reserved_system_tokens, 2_000);
         assert_eq!(config.recompact_cooldown_turns, 2);
-        assert!(!config.use_summarization);
+        assert!(config.use_summarization);
         assert_eq!(config.max_summary_tokens, 1_024);
     }
 
@@ -857,6 +1118,30 @@ mod tests {
     fn conversation_budget_subtracts_reserved_and_output_reserve() {
         let budget = ConversationBudget::new(16_384, 0.8, 2_000);
         assert_eq!(budget.conversation_budget(), 16_384 - 2_000 - 4_096);
+    }
+
+    #[test]
+    fn usage_ratio_correct() {
+        let budget = ConversationBudget::new(5_000, 0.50, 0);
+        let messages = vec![user(452)];
+        assert_eq!(budget.usage_ratio(&messages), 0.5);
+    }
+
+    #[test]
+    fn at_tier_detects_threshold_crossing() {
+        let budget = ConversationBudget::new(5_000, 0.50, 0);
+        assert!(!budget.at_tier(&[user(451)], 0.5));
+        assert!(budget.at_tier(&[user(452)], 0.5));
+        assert!(budget.at_tier(&[user(453)], 0.5));
+    }
+
+    #[test]
+    fn summarize_target_returns_two_fifths_of_budget() {
+        let budget = ConversationBudget::new(16_384, 0.8, 2_000);
+        assert_eq!(
+            budget.summarize_target(),
+            budget.conversation_budget() * 2 / 5
+        );
     }
 
     #[test]
@@ -1112,6 +1397,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn emergency_compact_drops_all_middle() {
+        let middle_user = Message::user("middle_user_unique");
+        let middle_asst = Message::assistant("middle_asst_unique");
+        let messages = vec![
+            system(5),
+            middle_user.clone(),
+            middle_asst.clone(),
+            user(20),
+            assistant(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.messages.len(), 4); // system + marker + 2 recent
+        assert!(!result.messages.contains(&middle_user));
+        assert!(!result.messages.contains(&middle_asst));
+    }
+
+    #[test]
+    fn emergency_compact_preserves_system_prefix() {
+        let messages = vec![system(5), system(5), user(20), assistant(20), user(20)];
+
+        let result = emergency_compact(&messages, 1);
+
+        assert_eq!(&result.messages[..2], &messages[..2]);
+    }
+
+    #[test]
+    fn emergency_compact_preserves_recent_turns() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(
+            &result.messages[result.messages.len() - 2..],
+            &messages[3..]
+        );
+    }
+
+    #[test]
+    fn emergency_compact_inserts_marker() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+        let marker = &result.messages[1];
+        let marker_text = text_blocks(marker).collect::<Vec<_>>().join("\n");
+
+        assert!(message_contains_marker(marker));
+        assert!(marker_text.contains("emergency: 2 messages removed"));
+    }
+
+    #[test]
+    fn emergency_compact_populates_evicted_indices() {
+        let messages = vec![system(5), user(20), assistant(20), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.evicted_indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn emergency_compact_empty_middle_is_noop() {
+        let messages = vec![system(5), user(20), assistant(20)];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert_eq!(result.messages, messages);
+        assert_eq!(result.compacted_count, 0);
+        assert!(result.evicted_indices.is_empty());
+    }
+
     // 5.3 SummarizingCompactor tests
 
     #[tokio::test]
@@ -1242,7 +1599,7 @@ mod tests {
     #[test]
     fn config_rejects_threshold_above_one() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = 1.1;
+        config.emergency_threshold = 1.1;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
@@ -1252,7 +1609,7 @@ mod tests {
     #[test]
     fn config_rejects_threshold_at_zero() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = 0.0;
+        config.prune_threshold = 0.0;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
@@ -1262,11 +1619,50 @@ mod tests {
     #[test]
     fn config_rejects_negative_threshold() {
         let mut config = CompactionConfig::default();
-        config.compaction_threshold = -0.1;
+        config.slide_threshold = -0.1;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::InvalidThreshold(_))
         ));
+    }
+
+    #[test]
+    fn config_rejects_non_monotonic_thresholds() {
+        let mut config = CompactionConfig::default();
+        config.summarize_threshold = config.slide_threshold;
+        assert!(matches!(
+            config.validate(),
+            Err(CompactionConfigError::ThresholdsNotMonotonic { .. })
+        ));
+    }
+
+    #[test]
+    fn config_accepts_valid_thresholds() {
+        CompactionConfig::default()
+            .validate()
+            .expect("valid defaults");
+    }
+
+    #[test]
+    fn backward_compat_compaction_threshold_maps_to_slide() {
+        let config: CompactionConfig = serde_json::from_value(serde_json::json!({
+            "compaction_threshold": 0.7,
+        }))
+        .expect("config should deserialize");
+
+        assert_eq!(config.slide_threshold, 0.7);
+        assert_eq!(
+            config.prune_threshold,
+            CompactionConfig::default().prune_threshold
+        );
+        assert_eq!(
+            config.summarize_threshold,
+            CompactionConfig::default().summarize_threshold
+        );
+        assert_eq!(
+            config.emergency_threshold,
+            CompactionConfig::default().emergency_threshold
+        );
     }
 
     #[test]
@@ -1366,5 +1762,381 @@ mod tests {
                 )
             })
         }));
+    }
+
+    // 6. Tool block pruning tests
+
+    fn image_message() -> Message {
+        Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+        }
+    }
+
+    fn mixed_message(tool_id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "thinking".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: tool_id.to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/big_file.rs"}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn prune_old_tool_blocks_preserves_recent() {
+        let mut messages = vec![
+            tool_use("old-1"),
+            tool_result("old-1", 50),
+            user(10),
+            assistant(10),
+            tool_use("recent-1"),
+            tool_result("recent-1", 50),
+        ];
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+
+        // Old blocks (indices 0,1) should be pruned
+        assert!(result.pruned_count >= 2);
+
+        // Recent blocks (indices 4,5) should be preserved
+        assert!(messages[4]
+            .content
+            .iter()
+            .any(|b| { matches!(b, ContentBlock::ToolUse { id, .. } if id == "recent-1") }));
+        assert!(messages[5].content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "recent-1")
+        }));
+    }
+
+    #[test]
+    fn pruned_tool_use_retains_name_drops_input() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[tool: read]");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruned_tool_result_retains_first_n_chars_with_ellipsis() {
+        let long_content = "x".repeat(200);
+        let mut messages = vec![
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: serde_json::json!(long_content),
+                }],
+            },
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 50);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert!(text.starts_with("[result: "));
+                assert!(text.ends_with("...]"));
+                // The truncated content inside should be at most 50 chars
+                // (plus the [result: ] prefix and ...] suffix)
+                assert!(text.len() < 70);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruned_tool_result_short_content_no_ellipsis() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: serde_json::json!("ok"),
+                }],
+            },
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        let block = &messages[0].content[0];
+        match block {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[result: ok]");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_blocks_replaced_with_placeholder() {
+        let mut messages = vec![image_message(), user(10), assistant(10)];
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+
+        assert_eq!(result.pruned_count, 1);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "[image]"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_tool_chains_never_pruned() {
+        // tool_use in recent window references tool_result in old window
+        let mut messages = vec![
+            tool_result("active-1", 50),
+            user(10),
+            assistant(10),
+            // Recent window (last 2):
+            tool_use("active-1"),
+            user(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // The tool_result at index 0 should be preserved because
+        // tool_use "active-1" is in the recent window
+        assert!(messages[0].content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "active-1")
+        }));
+    }
+
+    #[test]
+    fn token_estimate_decreases_after_pruning() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 200),
+            image_message(),
+            user(10),
+            assistant(10),
+        ];
+        let before = ConversationBudget::estimate_tokens(&messages);
+        let result = prune_tool_blocks(&mut messages, 2, 100).expect("should prune");
+        let after = ConversationBudget::estimate_tokens(&messages);
+
+        assert!(after < before, "after={after} should be < before={before}");
+        assert!(result.tokens_saved > 0);
+    }
+
+    #[test]
+    fn pruning_skipped_when_disabled_via_config() {
+        let mut messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 200),
+            user(10),
+            assistant(10),
+        ];
+        let original = messages.clone();
+        // Setting preserve_recent_turns >= len means no old window to prune.
+        let preserve = messages.len();
+        let result = prune_tool_blocks(&mut messages, preserve, 100);
+        assert!(result.is_none(), "should not prune when preserve >= len");
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn empty_messages_unchanged() {
+        let mut messages: Vec<Message> = vec![];
+        let result = prune_tool_blocks(&mut messages, 2, 100);
+        assert!(result.is_none(), "empty messages should return None");
+    }
+
+    #[test]
+    fn text_only_messages_unchanged() {
+        let mut messages = vec![user(20), assistant(20), user(10), assistant(10)];
+        let original = messages.clone();
+        let result = prune_tool_blocks(&mut messages, 2, 100);
+        assert!(result.is_none(), "text-only messages should return None");
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn mixed_message_prunes_tool_preserves_text() {
+        let mut messages = vec![
+            mixed_message("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // Text block should remain, tool_use should be replaced
+        assert_eq!(messages[0].content.len(), 2);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "thinking"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &messages[0].content[1] {
+            ContentBlock::Text { text } => assert_eq!(text, "[tool: read_file]"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_messages_in_prefix_not_pruned() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "sysimg".to_string(),
+                }],
+            },
+            tool_use("t1"),
+            tool_result("t1", 50),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // System message image should be preserved (in prefix zone)
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::Image { .. }
+        ));
+        // But old tool blocks in middle zone should be pruned
+        assert!(matches!(&messages[1].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn unresolved_tool_use_not_pruned() {
+        // tool_use "inflight" has no matching tool_result anywhere — it's in-flight.
+        // Pruning it would orphan a later tool_result.
+        let mut messages = vec![
+            tool_use("inflight"),
+            tool_use("resolved"),
+            tool_result("resolved", 50),
+            user(10),
+            assistant(10),
+        ];
+        prune_tool_blocks(&mut messages, 2, 100);
+
+        // The in-flight tool_use at index 0 must be preserved.
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|b| { matches!(b, ContentBlock::ToolUse { id, .. } if id == "inflight") }),
+            "in-flight tool_use should be preserved, got: {:?}",
+            messages[0].content
+        );
+
+        // The resolved tool_use at index 1 should be pruned (its result is also old).
+        assert!(
+            matches!(&messages[1].content[0], ContentBlock::Text { .. }),
+            "resolved old tool_use should be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_skips_compaction_when_pruning_sufficient() {
+        // Budget: model_context_limit must be large enough to leave a usable
+        // conversation_budget after subtracting DEFAULT_OUTPUT_RESERVE_TOKENS (4096).
+        // conversation_budget = 16_000 - 0 - 4096 = 11_904
+        // compaction trigger = ceil(11_904 * 0.80) = 9_524
+        let config = CompactionConfig {
+            slide_threshold: 0.80,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.90,
+            emergency_threshold: 0.95,
+            preserve_recent_turns: 2,
+            model_context_limit: 16_000,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 1,
+            use_summarization: false,
+            max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 10,
+        };
+        let budget = ConversationBudget::new(
+            config.model_context_limit,
+            config.slide_threshold,
+            config.reserved_system_tokens,
+        );
+        let strategy = config.build_strategy(None);
+        assert_eq!(budget.compaction_target(), budget.conversation_budget() / 2);
+
+        // Build messages: a massive tool result in old window pushes tokens
+        // above the trigger (~9524), but after pruning it shrinks well below.
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 9600), // ~9600 tokens, will be pruned to ~5
+            user(10),
+            assistant(10),
+        ];
+
+        let before_tokens = ConversationBudget::estimate_tokens(&messages);
+        assert!(
+            budget.needs_compaction(&messages),
+            "messages should exceed slide threshold before pruning (tokens: {before_tokens})"
+        );
+
+        // Simulate what compact_if_needed does: prune first, then check.
+        let mut pruned = messages.clone();
+        let prune_result = prune_tool_blocks(
+            &mut pruned,
+            config.preserve_recent_turns,
+            config.tool_block_summary_max_chars,
+        );
+        assert!(prune_result.is_some(), "should have pruned tool blocks");
+
+        let after_tokens = ConversationBudget::estimate_tokens(&pruned);
+        assert!(
+            !budget.needs_compaction(&pruned),
+            "pruned messages should be below slide threshold (tokens: {after_tokens})"
+        );
+
+        // Verify the compaction strategy is never invoked (we'd get the pruned
+        // messages back without the compaction marker).
+        let result = strategy.compact(&pruned, budget.compaction_target()).await;
+        match result {
+            Ok(r) => assert_eq!(r.compacted_count, 0, "compaction should be a no-op"),
+            Err(_) => panic!("compact should succeed on already-below-threshold messages"),
+        }
+    }
+
+    #[test]
+    fn has_prunable_blocks_detects_tool_blocks() {
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 10),
+            user(10),
+            assistant(10),
+        ];
+        assert!(has_prunable_blocks(&messages, 2));
+    }
+
+    #[test]
+    fn has_prunable_blocks_false_for_text_only() {
+        let messages = vec![user(10), assistant(10), user(10), assistant(10)];
+        assert!(!has_prunable_blocks(&messages, 2));
+    }
+
+    #[test]
+    fn has_prunable_blocks_false_when_all_in_recent() {
+        let messages = vec![tool_use("t1"), tool_result("t1", 10)];
+        // preserve_recent_turns=2 covers all messages; no prunable zone.
+        assert!(!has_prunable_blocks(&messages, 2));
     }
 }

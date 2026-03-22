@@ -150,7 +150,7 @@ impl AnthropicProvider {
         let auth_mode = AnthropicAuthMode::detect(&api_key);
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
 
@@ -368,6 +368,7 @@ impl AnthropicProvider {
                 AnthropicContentBlock::ToolUse { id, name, input } => {
                     content.push(ContentBlock::ToolUse {
                         id: id.clone(),
+                        provider_id: None,
                         name: name.clone(),
                         input: input.clone(),
                     });
@@ -447,6 +448,7 @@ impl AnthropicProvider {
             delta_content: None,
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some(id),
+                provider_id: None,
                 name: Some(name),
                 arguments_delta: None,
                 arguments_done: false,
@@ -483,6 +485,7 @@ impl AnthropicProvider {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: tool_id,
+                    provider_id: None,
                     name: None,
                     arguments_delta: Some(partial_json),
                     arguments_done: false,
@@ -508,6 +511,7 @@ impl AnthropicProvider {
             delta_content: None,
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some(tool_id),
+                provider_id: None,
                 name: None,
                 arguments_delta: None,
                 arguments_done: true,
@@ -823,7 +827,9 @@ fn filter_model_ids(models: Vec<AnthropicModel>) -> Vec<String> {
 fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBlock, LlmError> {
     match block {
         ContentBlock::Text { text } => Ok(AnthropicContentBlock::Text { text: text.clone() }),
-        ContentBlock::ToolUse { id, name, input } => Ok(AnthropicContentBlock::ToolUse {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Ok(AnthropicContentBlock::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),

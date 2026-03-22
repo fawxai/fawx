@@ -2,6 +2,8 @@ import MarkdownUI
 import SwiftUI
 
 struct MessageBubble: View {
+    @Environment(\.containerWidth) private var containerWidth
+
     let role: MessageRole
     let content: String
     let timestamp: Int?
@@ -22,21 +24,24 @@ struct MessageBubble: View {
     }
 
     var body: some View {
-        if role == .system {
-            Text(content)
-                .font(FawxTypography.status)
-                .foregroundStyle(Color.fawxTextSecondary)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, FawxSpacing.paddingSM)
-        } else {
-            bubbleContent
+        Group {
+            if role == .system {
+                Text(content)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, FawxSpacing.paddingSM)
+            } else {
+                bubbleContent
+            }
         }
+        .textSelection(.enabled)
     }
 
     private var bubbleContent: some View {
         HStack {
             if role == .user {
-                Spacer(minLength: 48)
+                Spacer(minLength: FawxSpacing.transcriptEdgeClamp)
             }
 
             VStack(alignment: role == .user ? .trailing : .leading, spacing: FawxSpacing.paddingSM) {
@@ -55,12 +60,12 @@ struct MessageBubble: View {
                 }
             }
             .frame(
-                maxWidth: FawxSpacing.maxMessageWidth,
+                maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth),
                 alignment: role == .user ? .trailing : .leading
             )
 
             if role != .user {
-                Spacer(minLength: 48)
+                Spacer(minLength: FawxSpacing.transcriptEdgeClamp)
             }
         }
         .frame(maxWidth: .infinity)
@@ -74,12 +79,17 @@ struct MessageBubble: View {
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             messageContent
-                .frame(maxWidth: FawxSpacing.maxMessageWidth, alignment: .leading)
+                .frame(maxWidth: FawxSpacing.maxMessageWidth(for: containerWidth), alignment: .leading)
         }
     }
 
     private var bubbleHorizontalPadding: CGFloat {
-        role == .assistant ? FawxSpacing.paddingXL : FawxSpacing.paddingLG
+        switch role {
+        case .assistant, .tool:
+            FawxSpacing.paddingXL
+        case .user, .system:
+            FawxSpacing.paddingLG
+        }
     }
 
     private var bubbleCornerRadius: CGFloat {
@@ -93,7 +103,6 @@ struct MessageBubble: View {
             Text(content)
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxUserBubbleText)
-                .textSelection(.enabled)
         case .assistant:
             Markdown(content + (isStreaming ? "▍" : ""))
                 .markdownTextStyle {
@@ -115,7 +124,10 @@ struct MessageBubble: View {
                 .markdownBlockStyle(\.codeBlock) { configuration in
                     CodeBlock(language: configuration.language, content: configuration.content)
                 }
-                .textSelection(.enabled)
+        case .tool:
+            Text(verbatim: toolDisplayContent)
+                .font(FawxTypography.code)
+                .foregroundStyle(Color.fawxText)
         case .system:
             EmptyView()
         }
@@ -127,6 +139,8 @@ struct MessageBubble: View {
             return Color.fawxUserBubble
         case .assistant:
             return isStreaming ? Color.fawxSurfaceHover : Color.fawxSurface
+        case .tool:
+            return Color.fawxCode
         case .system:
             return Color.fawxAccentSubtle
         }
@@ -154,6 +168,8 @@ struct MessageBubble: View {
                 return Color.fawxBorder
             }
             return Color.fawxBorder.opacity(FawxOpacity.borderMedium)
+        case .tool:
+            return Color.fawxBorder.opacity(FawxOpacity.borderStrong)
         case .system:
             return Color.fawxAccent.opacity(FawxOpacity.accentBorder)
         }
@@ -165,8 +181,15 @@ struct MessageBubble: View {
             return "userMessage"
         case .assistant:
             return isStreaming ? "streamingAssistantMessage" : "assistantMessage"
+        case .tool:
+            return "toolMessage"
         case .system:
             return "systemMessage"
         }
+    }
+
+    private var toolDisplayContent: String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Tool output available." : content
     }
 }

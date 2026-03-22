@@ -3,6 +3,12 @@ import SwiftUI
 
 struct ExperimentsView: View {
     @Bindable var viewModel: ExperimentsViewModel
+    let isActive: Bool
+
+    init(viewModel: ExperimentsViewModel, isActive: Bool = true) {
+        _viewModel = Bindable(viewModel)
+        self.isActive = isActive
+    }
 
     var body: some View {
         ScrollView {
@@ -24,13 +30,23 @@ struct ExperimentsView: View {
         .refreshable {
             await viewModel.refresh()
         }
-        .task {
+        .task(id: isActive) {
+            guard isActive else {
+                return
+            }
             await viewModel.refresh()
         }
-        .task {
+        .task(id: "poll:\(isActive)") {
+            guard isActive else {
+                return
+            }
+
             while !Task.isCancelled {
                 try? await Task.sleep(for: RefreshCadence.dashboardPanels)
                 guard !Task.isCancelled else {
+                    break
+                }
+                guard isActive else {
                     break
                 }
                 await viewModel.refresh()

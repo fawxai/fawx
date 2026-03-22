@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx Roadmap — Path to #1</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --orange: #f0883e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    color: var(--text-muted);
+    font-size: 1.1rem;
+    margin-bottom: 2.5rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1.5rem;
+  }
+  h2 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin: 2.5rem 0 1rem;
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin: 1.5rem 0 0.75rem;
+    color: var(--text);
+  }
+  p, li { color: var(--text); font-size: 0.95rem; }
+  p { margin-bottom: 0.75rem; }
+  ul { padding-left: 1.5rem; margin-bottom: 1rem; }
+  li { margin-bottom: 0.35rem; }
+
+  .strategy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+    margin: 1.5rem 0;
+  }
+  @media (max-width: 700px) { .strategy-grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem;
+  }
+  .card h3 { margin-top: 0; font-size: 1.05rem; }
+  .card p { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.5rem; }
+
+  .moat { border-left: 3px solid var(--green); }
+  .gap { border-left: 3px solid var(--red); }
+  .wip { border-left: 3px solid var(--yellow); }
+  .future { border-left: 3px solid var(--purple); }
+
+  .tag {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 4px;
+  }
+  .tag-engine { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag-gui { background: rgba(188,140,255,0.15); color: var(--purple); }
+  .tag-ax { background: rgba(63,185,80,0.15); color: var(--green); }
+  .tag-infra { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .tag-ship { background: rgba(248,81,73,0.15); color: var(--red); }
+
+  .sprint {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .sprint-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+  .sprint-header h3 { margin: 0; font-size: 1.2rem; }
+  .sprint-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 4px 12px;
+    border-radius: 16px;
+  }
+  .sprint-now { background: rgba(63,185,80,0.2); color: var(--green); }
+  .sprint-next { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .sprint-later { background: rgba(210,153,34,0.2); color: var(--yellow); }
+  .sprint-future { background: rgba(188,140,255,0.2); color: var(--purple); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  .status {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .status-done { background: var(--green); }
+  .status-wip { background: var(--yellow); }
+  .status-todo { background: var(--text-muted); }
+  .status-blocked { background: var(--red); }
+
+  .comp-grid {
+    display: grid;
+    grid-template-columns: 1fr repeat(5, 80px);
+    gap: 0;
+    font-size: 0.85rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 1.5rem 0;
+  }
+  .comp-grid > div {
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    display: flex;
+    align-items: center;
+  }
+  .comp-grid > div:nth-child(6n+1) { font-weight: 600; }
+  .comp-header {
+    background: rgba(48,54,61,0.3);
+    font-weight: 600 !important;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .comp-grid .yes { color: var(--green); }
+  .comp-grid .no { color: var(--text-muted); }
+  .comp-grid .partial { color: var(--yellow); }
+  .comp-grid .fawx-col { background: rgba(88,166,255,0.05); }
+
+  .callout {
+    background: rgba(88,166,255,0.08);
+    border: 1px solid rgba(88,166,255,0.2);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+    font-size: 0.9rem;
+  }
+  .callout strong { color: var(--accent); }
+
+  .dep-arrow { color: var(--text-muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>Fawx Roadmap</h1>
+<p class="subtitle">Path to #1 — beating every SOTA harness on every dimension that matters.<br>
+Updated 2026-03-20 &middot; Living document</p>
+
+<!-- ───────────────── STRATEGIC VISION ───────────────── -->
+
+<h2>Strategic Vision</h2>
+
+<p>Every existing agentic harness (Codex CLI, Claude Code, OpenClaw, Hermes Agent) has the same fundamental limitation: they're terminal-first tools bolted onto chat interfaces. None of them have a native GUI, a real security kernel, or a self-improvement loop.</p>
+
+<p>Fawx wins by being the first harness that is simultaneously:</p>
+
+<div class="strategy-grid">
+  <div class="card moat">
+    <h3>🖥 Native GUI</h3>
+    <p>macOS + iOS Swift app. No terminal required. Session management, streaming visualization, tool approval, memory browsing. Zero competitors have this.</p>
+  </div>
+  <div class="card moat">
+    <h3>🔒 AX-First Security</h3>
+    <p>Capability gates (not consent prompts), tripwire/ripcord invisible enforcement, OS-level sandboxing. The agent runs free inside boundaries; the human sets policy, not individual approvals.</p>
+  </div>
+  <div class="card moat">
+    <h3>🧠 Self-Improving</h3>
+    <p>fx-forge: experiment → evaluate → fine-tune loop. Signal flywheel from tripwire data. The agent gets better from its own mistakes, automatically.</p>
+  </div>
+  <div class="card moat">
+    <h3>⚡ Fleet Architecture</h3>
+    <p>Multi-node orchestration over Tailscale. Subagent spawning, task routing, distributed tool execution. One brain, many hands.</p>
+  </div>
+</div>
+
+<!-- ───────────────── COMPETITIVE MAP ───────────────── -->
+
+<h2>Competitive Map</h2>
+
+<div class="comp-grid">
+  <div class="comp-header">Capability</div>
+  <div class="comp-header fawx-col">Fawx</div>
+  <div class="comp-header">Codex</div>
+  <div class="comp-header">Claude Code</div>
+  <div class="comp-header">OpenClaw</div>
+  <div class="comp-header">Hermes</div>
+
+  <div>Native GUI (macOS/iOS)</div>
+  <div class="fawx-col partial">WIP</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>TUI / CLI</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="no">✗</div>
+  <div class="yes">✓</div>
+
+  <div>Multi-provider (BYO key)</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+
+  <div>HTTP API</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="yes">✓</div>
+
+  <div>Security kernel (not just prompts)</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="partial">sandbox</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>Capability mode (no consent spam)</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>Tripwire / Ripcord</div>
+  <div class="fawx-col partial">backend</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>OS-level enforcement</div>
+  <div class="fawx-col no">planned</div>
+  <div class="partial">sandbox</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>WASM skill plugins</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="partial">npm</div>
+  <div class="no">✗</div>
+
+  <div>Experiment / self-improve</div>
+  <div class="fawx-col partial">WIP</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>Fleet (multi-node)</div>
+  <div class="fawx-col partial">WIP</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="partial">nodes</div>
+  <div class="no">✗</div>
+
+  <div>Reflective memory</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="no">✗</div>
+  <div class="partial">CLAUDE.md</div>
+  <div class="yes">✓</div>
+  <div class="no">✗</div>
+
+  <div>Subagent orchestration</div>
+  <div class="fawx-col partial">WIP</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+  <div class="yes">✓</div>
+  <div class="no">✗</div>
+
+  <div>OAuth (use existing subs)</div>
+  <div class="fawx-col yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="no">✗</div>
+  <div class="no">✗</div>
+
+  <div>Conversation persistence</div>
+  <div class="fawx-col partial">flat</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+  <div class="yes">✓</div>
+</div>
+
+<div class="callout">
+  <strong>Key insight:</strong> No competitor is even attempting native GUI + security kernel + self-improvement. Most compete on only one axis (CLI UX or model access). Fawx competes on all four moats simultaneously.
+</div>
+
+<!-- ───────────────── 5 CONTROL PLANE GAPS ───────────────── -->
+
+<h2>5 Critical Gaps to Close</h2>
+
+<div class="strategy-grid">
+  <div class="card gap">
+    <h3>1. Structured Session Storage</h3>
+    <p>Tool calls are flattened to text. The model can't see what tools it ran or what they returned. Context compaction loses critical information. This is why long sessions degrade.</p>
+    <p><strong>Fix:</strong> PR C — structured message types in redb, tool call/result pairs preserved through compaction.</p>
+    <span class="tag tag-engine">engine</span>
+  </div>
+  <div class="card gap">
+    <h3>2. Response Quality Gate</h3>
+    <p>Tool errors surface as user-facing text. Model parrots error messages instead of synthesizing a real response. Users see raw stack traces and git errors.</p>
+    <p><strong>Fix:</strong> PR B — <code>extract_response_text</code> classifies outputs, routes errors back through synthesis.</p>
+    <span class="tag tag-engine">engine</span>
+  </div>
+  <div class="card gap">
+    <h3>3. Memory Continuity</h3>
+    <p>fx-journal exists but isn't wired like OpenClaw's MEMORY.md system. No soul import path. No cross-session memory search. No memory decay or curation.</p>
+    <p><strong>Fix:</strong> Memory format compatible with import, semantic search over journal entries, auto-curation.</p>
+    <span class="tag tag-engine">engine</span> <span class="tag tag-ax">ax</span>
+  </div>
+  <div class="card gap">
+    <h3>4. Multi-Turn Autonomy</h3>
+    <p>Agent should run 50+ tool calls without user intervention. Currently limited by timeout, context window, and lack of checkpoint/resume.</p>
+    <p><strong>Fix:</strong> Longer timeouts (done: 30 min), checkpoint-based context management, graceful degradation on compaction.</p>
+    <span class="tag tag-engine">engine</span> <span class="tag tag-ax">ax</span>
+  </div>
+  <div class="card gap">
+    <h3>5. Self-Improvement Loop</h3>
+    <p>fx-forge experiment pipeline works but isn't connected to the signal flywheel. No automatic skill refinement from tripwire data. No earned autonomy.</p>
+    <p><strong>Fix:</strong> Wire tripwire signals → experiment generation → evaluation → skill update. Forge Phase 2.</p>
+    <span class="tag tag-ax">ax</span>
+  </div>
+</div>
+
+<!-- ───────────────── GUI BUG BACKLOG ───────────────── -->
+
+<h2>GUI / UX Debt</h2>
+
+<table>
+  <tr>
+    <th>Issue</th>
+    <th>Layer</th>
+    <th>Status</th>
+    <th>Severity</th>
+  </tr>
+  <tr>
+    <td><span class="status status-done"></span>Session draft/queue bleed — PR #1534</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Merged</td>
+    <td>High</td>
+  </tr>
+  <tr>
+    <td><span class="status status-done"></span>HTTPS for iOS — PR #1533</td>
+    <td><span class="tag tag-gui">gui</span> <span class="tag tag-engine">engine</span></td>
+    <td>Merged</td>
+    <td>Blocker</td>
+  </tr>
+  <tr>
+    <td><span class="status status-done"></span>Sparkle auto-update — PR #1532</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Merged</td>
+    <td>High</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Main thread I/O audit (RW lock deadlock)</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Spec written</td>
+    <td>High</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Streaming scroll smoothing</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Spec written</td>
+    <td>Medium</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Permissions UI: capability mode toggle</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Todo</td>
+    <td>Medium</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Menu bar: "Open Fawx" broken</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Todo</td>
+    <td>Low</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Usage / model display issues</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Todo</td>
+    <td>Low</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Ripcord UI: banner, journal panel, report view</td>
+    <td><span class="tag tag-gui">gui</span> <span class="tag tag-ax">ax</span></td>
+    <td>Spec written</td>
+    <td>Medium</td>
+  </tr>
+  <tr>
+    <td><span class="status status-todo"></span>Git UI pane (Joe request)</td>
+    <td><span class="tag tag-gui">gui</span></td>
+    <td>Todo</td>
+    <td>Low</td>
+  </tr>
+  <tr>
+    <td><span class="status status-blocked"></span>CLI <code>fawx sessions</code> fails (redb lock)</td>
+    <td><span class="tag tag-engine">engine</span></td>
+    <td>Blocked: needs HTTP routing</td>
+    <td>High</td>
+  </tr>
+</table>
+
+<!-- ───────────────── AX LAYER ───────────────── -->
+
+<h2>AX Layer — Agent Experience</h2>
+
+<table>
+  <tr>
+    <th>Component</th>
+    <th>Current State</th>
+    <th>Target</th>
+  </tr>
+  <tr>
+    <td><strong>Skills System</strong></td>
+    <td>13 tools (10 builtin + 3 git), WASM loading + hot-reload + signing. 3 marketplace skills published.</td>
+    <td>Skill discovery, auto-install from marketplace, skill composition (chain skills), skill-level permissions, community SDK.</td>
+  </tr>
+  <tr>
+    <td><strong>Experiment Tool</strong></td>
+    <td>Pipeline works: generate → evaluate → chain-forward. Cargo scoping, canonical hashing. First non-zero score achieved (1.00).</td>
+    <td>Multi-turn subagent (build verification), auto-chain with <code>--max-rounds</code>, integration with forge signal flywheel, experiment results → skill patches.</td>
+  </tr>
+  <tr>
+    <td><strong>Fleet Tools</strong></td>
+    <td>Channel trait, webhook, fx-fleet crate, task router, orchestrator, SSH transport, 5 dashboard endpoints.</td>
+    <td>Multi-node task distribution, node health monitoring, automatic failover, distributed tool execution, fleet-wide tripwire cascade.</td>
+  </tr>
+  <tr>
+    <td><strong>Capability Gate</strong></td>
+    <td>Shipped (PR #1471). Default mode. Restricted actions get immediate structured denial.</td>
+    <td>Dynamic capability expansion via <code>request_capability</code> tool, earned autonomy from signal data.</td>
+  </tr>
+  <tr>
+    <td><strong>Tripwire / Ripcord</strong></td>
+    <td>Backend complete (Phase 2). Tripwire boundaries, journaled monitoring, atomic rollback.</td>
+    <td>Swift UI (banner + journal + report), fleet cascade, signal generation for forge.</td>
+  </tr>
+  <tr>
+    <td><strong>OS Enforcement</strong></td>
+    <td>Phase 3 designed. Landlock + seccomp-bpf + network namespaces.</td>
+    <td>Capability config → kernel rules at session start. Shell commands physically can't bypass boundaries.</td>
+  </tr>
+</table>
+
+<!-- ───────────────── SPRINTS ───────────────── -->
+
+<h2>Sprints</h2>
+
+<!-- SPRINT 1 -->
+<div class="sprint">
+  <div class="sprint-header">
+    <h3>Sprint 1: Stabilize &amp; Ship</h3>
+    <span class="sprint-label sprint-now">NOW</span>
+  </div>
+  <p style="color: var(--text-muted); margin-bottom: 1rem;">
+    Fix the bugs that make daily use painful. Get iOS on Joe's phone. Get Bart onboarded.
+    <br><strong>Goal:</strong> Fawx is usable for 8+ hour sessions without degradation.
+  </p>
+  <table>
+    <tr><th>Task</th><th>Tags</th><th>Status</th><th>Depends On</th></tr>
+    <tr>
+      <td>PR B: Response quality gate</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Spec needed</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>PR C: Structured session storage + redb migration</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Spec needed</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Main thread I/O audit (deadlock fix)</td>
+      <td><span class="tag tag-gui">gui</span></td>
+      <td><span class="status status-todo"></span>Spec written</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Streaming scroll smoothing</td>
+      <td><span class="tag tag-gui">gui</span></td>
+      <td><span class="status status-todo"></span>Spec written</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>iOS app on Joe's iPhone (test over HTTPS)</td>
+      <td><span class="tag tag-gui">gui</span> <span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-wip"></span>HTTPS merged</td>
+      <td>Rebuild + TLS certs</td>
+    </tr>
+    <tr>
+      <td>CLI <code>fawx sessions</code>: route through HTTP API</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>CI VM on Mac Mini: Rust + repo + OpenClaw node</td>
+      <td><span class="tag tag-infra">infra</span></td>
+      <td><span class="status status-wip"></span>In progress</td>
+      <td>Joe: CLI tools install</td>
+    </tr>
+    <tr>
+      <td>Pre-existing fx-api test failures (10 tests)</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+  </table>
+</div>
+
+<!-- SPRINT 2 -->
+<div class="sprint">
+  <div class="sprint-header">
+    <h3>Sprint 2: Polish &amp; Publish</h3>
+    <span class="sprint-label sprint-next">NEXT</span>
+  </div>
+  <p style="color: var(--text-muted); margin-bottom: 1rem;">
+    Ship to App Store. First external user (Bart). Public download page.
+    <br><strong>Goal:</strong> Anyone can download Fawx and use it with their own API keys.
+  </p>
+  <table>
+    <tr><th>Task</th><th>Tags</th><th>Status</th><th>Depends On</th></tr>
+    <tr>
+      <td>App icon + branding finalization</td>
+      <td><span class="tag tag-gui">gui</span> <span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Notarized DMG build + Sparkle appcast</td>
+      <td><span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>EdDSA keys, fawx.ai hosting</td>
+    </tr>
+    <tr>
+      <td>iOS App Store submission</td>
+      <td><span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Sprint 1 bugs, VPS test instance</td>
+    </tr>
+    <tr>
+      <td>Temp Fawx instance on VPS for Apple review</td>
+      <td><span class="tag tag-infra">infra</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>HTTPS working</td>
+    </tr>
+    <tr>
+      <td>fawx.ai download page + marketing copy</td>
+      <td><span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>DMG built</td>
+    </tr>
+    <tr>
+      <td>Permissions UI: capability/prompt mode toggle</td>
+      <td><span class="tag tag-gui">gui</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Delaware incorporation + legal docs in app</td>
+      <td><span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Onboard Bart: first external user test</td>
+      <td><span class="tag tag-ship">ship</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>DMG + Sparkle working</td>
+    </tr>
+  </table>
+</div>
+
+<!-- SPRINT 3 -->
+<div class="sprint">
+  <div class="sprint-header">
+    <h3>Sprint 3: Memory &amp; Autonomy</h3>
+    <span class="sprint-label sprint-later">LATER</span>
+  </div>
+  <p style="color: var(--text-muted); margin-bottom: 1rem;">
+    Make Fawx remember everything and run unsupervised. Close the gap with OpenClaw's memory system. Enable Clawdio soul import.
+    <br><strong>Goal:</strong> Agent maintains context across sessions and handles complex multi-tool chains autonomously.
+  </p>
+  <table>
+    <tr><th>Task</th><th>Tags</th><th>Status</th><th>Depends On</th></tr>
+    <tr>
+      <td>Memory format: MEMORY.md + daily logs compatible</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Semantic search over journal entries</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Memory format</td>
+    </tr>
+    <tr>
+      <td>Soul import: OpenClaw → Fawx migration tool</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Memory format + structured storage</td>
+    </tr>
+    <tr>
+      <td>Checkpoint / resume for long tool chains</td>
+      <td><span class="tag tag-engine">engine</span> <span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Structured storage</td>
+    </tr>
+    <tr>
+      <td>Memory decay + auto-curation</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Semantic search</td>
+    </tr>
+    <tr>
+      <td>Ripcord Swift UI: banner, journal, report</td>
+      <td><span class="tag tag-gui">gui</span> <span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Spec written</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td><code>request_capability</code> tool (~150 lines Rust)</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Capability gate</td>
+    </tr>
+  </table>
+</div>
+
+<!-- SPRINT 4 -->
+<div class="sprint">
+  <div class="sprint-header">
+    <h3>Sprint 4: AX Kernel &amp; Self-Improvement</h3>
+    <span class="sprint-label sprint-future">FUTURE</span>
+  </div>
+  <p style="color: var(--text-muted); margin-bottom: 1rem;">
+    OS-level enforcement. Signal flywheel. Earned autonomy. This is where Fawx becomes something no other harness can replicate.
+    <br><strong>Goal:</strong> Agent improves itself from its own operational data. Security boundaries are physically unbreakable.
+  </p>
+  <table>
+    <tr><th>Task</th><th>Tags</th><th>Status</th><th>Depends On</th></tr>
+    <tr>
+      <td>fx-sandbox: Landlock + seccomp-bpf + network namespaces</td>
+      <td><span class="tag tag-ax">ax</span> <span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Designed</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Capability config → OS kernel rules at session start</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>fx-sandbox</td>
+    </tr>
+    <tr>
+      <td>Signal flywheel: tripwire → labeled signals → forge input</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Tripwire + forge</td>
+    </tr>
+    <tr>
+      <td>fx-forge Phase 2: LocalBackend (Unsloth) + LlamaCppConverter</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Experiment pipeline stable</td>
+    </tr>
+    <tr>
+      <td>Earned autonomy: auto-expand capabilities from signal data</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Signal flywheel + forge</td>
+    </tr>
+    <tr>
+      <td>Fleet: multi-node task distribution + failover</td>
+      <td><span class="tag tag-engine">engine</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Fleet dashboard</td>
+    </tr>
+    <tr>
+      <td>Skill composition: chain skills, skill-level permissions</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Todo</td>
+      <td>Skills system + capability gate</td>
+    </tr>
+    <tr>
+      <td>FawxShell: dedicated sandbox runtime</td>
+      <td><span class="tag tag-ax">ax</span></td>
+      <td><span class="status status-todo"></span>Evaluated after Phase 3</td>
+      <td>fx-sandbox validated</td>
+    </tr>
+  </table>
+</div>
+
+<!-- ───────────────── DEPENDENCY GRAPH ───────────────── -->
+
+<h2>Dependency Graph</h2>
+
+<div class="card" style="font-family: monospace; font-size: 0.85rem; line-height: 2; padding: 1.5rem;">
+  <span style="color: var(--green);">Sprint 1 (NOW)</span><br>
+  &nbsp;&nbsp;PR B (response gate) ─────────────────────┐<br>
+  &nbsp;&nbsp;PR C (structured storage) ──┬──────────────┤<br>
+  &nbsp;&nbsp;Main thread I/O audit ──────┤&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;Streaming scroll ───────────┤&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;CLI HTTP routing ───────────┘&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+  <span style="color: var(--accent);">Sprint 2 (NEXT)</span><br>
+  &nbsp;&nbsp;DMG + Sparkle ──────────────┬──────────────┐<br>
+  &nbsp;&nbsp;iOS App Store ──────────────┤&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;fawx.ai website ────────────┤&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;Bart onboarding ────────────┘&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+  <span style="color: var(--yellow);">Sprint 3 (LATER)</span><br>
+  &nbsp;&nbsp;Memory format ──→ Semantic search ──→ Soul import<br>
+  &nbsp;&nbsp;Structured storage ──→ Checkpoint/resume<br>
+  &nbsp;&nbsp;Ripcord UI + request_capability<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+  <span style="color: var(--purple);">Sprint 4 (FUTURE)</span><br>
+  &nbsp;&nbsp;fx-sandbox ──→ OS enforcement ──→ FawxShell<br>
+  &nbsp;&nbsp;Tripwire signals ──→ Signal flywheel ──→ Earned autonomy<br>
+  &nbsp;&nbsp;fx-forge Phase 2 ──→ Self-improvement loop<br>
+  &nbsp;&nbsp;Fleet distribution + failover<br>
+</div>
+
+<!-- ───────────────── NORTH STAR ───────────────── -->
+
+<h2>North Star</h2>
+
+<div class="callout">
+  <strong>The endgame:</strong> Clawdio runs inside Fawx. Soul, memory, preferences, workflow — all imported. The agent harness is self-built, self-improving, and self-securing. No dependency on OpenClaw, Telegram, or any external platform. A native app on every Apple device, with a security kernel no other harness has attempted, and a self-improvement loop that makes the agent better every day it runs.
+</div>
+
+<p style="color: var(--text-muted); text-align: center; margin-top: 3rem; font-size: 0.85rem;">
+  Last updated: 2026-03-20 16:14 UTC &middot; Fawx v1.0 &middot; 1,100+ tests, 453 CLI tests, 13 tools, 7-step agentic loop
+</p>
+
+</body>
+</html>

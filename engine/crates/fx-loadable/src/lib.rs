@@ -21,7 +21,9 @@
 
 pub mod builtin;
 pub mod loader;
+pub mod notify_skill;
 pub mod registry;
+pub mod session_memory_skill;
 pub mod skill;
 pub mod transaction_skill;
 pub mod wasm_host;
@@ -36,7 +38,9 @@ pub(crate) mod templates;
 
 pub use builtin::BuiltinSkill;
 pub use loader::{SkillLoader, SkillManifest};
+pub use notify_skill::{NotificationSender, NotifySkill};
 pub use registry::SkillRegistry;
+pub use session_memory_skill::SessionMemorySkill;
 pub use skill::{Skill, SkillError};
 pub use transaction_skill::TransactionSkill;
 pub use wasm_skill::SignaturePolicy;

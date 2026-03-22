@@ -25,7 +25,12 @@ final class MenuBarManager: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.imagePosition = .noImage
+            if let icon = NSImage(named: "MenuBarIcon-stopped") {
+                icon.isTemplate = false
+                icon.size = NSSize(width: 18, height: 18)
+                button.image = icon
+                button.imagePosition = .imageLeading
+            }
             button.toolTip = "Fawx"
         }
         refreshStatusDisplay()
@@ -60,7 +65,12 @@ final class MenuBarManager: NSObject {
         }
 
         let snapshot = snapshot()
-        button.image = nil
+        if let icon = NSImage(named: "MenuBarIcon-stopped") {
+            icon.isTemplate = true
+            icon.size = NSSize(width: 18, height: 18)
+            button.image = icon
+            button.imagePosition = .imageLeading
+        }
         button.attributedTitle = statusItemTitle(snapshot: snapshot)
         button.toolTip = "\(snapshot.title)\n\(snapshot.detail)"
     }
@@ -95,7 +105,8 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx",
                 detail: "Status unavailable",
-                color: .fawxTextSecondary
+                color: .fawxTextSecondary,
+                status: .stopped
             )
         }
 
@@ -103,7 +114,8 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx setup required",
                 detail: "Open the app to finish setup.",
-                color: .fawxWarning
+                color: .fawxWarning,
+                status: .connecting
             )
         }
 
@@ -115,25 +127,29 @@ final class MenuBarManager: NSObject {
             return MenuBarStatusSnapshot(
                 title: "Fawx is running",
                 detail: detail,
-                color: .fawxSuccess
+                color: .fawxSuccess,
+                status: .active
             )
         case "starting", "connecting", "reconnecting":
             return MenuBarStatusSnapshot(
                 title: "Fawx is reconnecting",
                 detail: detail,
-                color: .fawxWarning
+                color: .fawxWarning,
+                status: .connecting
             )
         case "stopped", "disconnected":
             return MenuBarStatusSnapshot(
                 title: "Fawx is stopped",
                 detail: detail,
-                color: .fawxError
+                color: .fawxError,
+                status: .error
             )
         default:
             return MenuBarStatusSnapshot(
                 title: "Fawx status unknown",
                 detail: detail,
-                color: .fawxTextSecondary
+                color: .fawxTextSecondary,
+                status: .stopped
             )
         }
     }
@@ -154,24 +170,13 @@ final class MenuBarManager: NSObject {
     }
 
     private func statusItemTitle(snapshot: MenuBarStatusSnapshot) -> NSAttributedString {
-        let title = NSMutableAttributedString(
-            string: "🦊 ",
+        NSAttributedString(
+            string: "●",
             attributes: [
-                .font: NSFont.systemFont(ofSize: 14),
+                .font: NSFont.systemFont(ofSize: 9),
+                .foregroundColor: nsColor(from: snapshot.color),
             ]
         )
-
-        title.append(
-            NSAttributedString(
-                string: "●",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: nsColor(from: snapshot.color),
-                ]
-            )
-        )
-
-        return title
     }
 
     private func isPrimaryAppWindow(_ window: NSWindow) -> Bool {

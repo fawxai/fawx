@@ -76,12 +76,9 @@ actor LocalBootstrapService {
         let binaryURL = try bundledServerBinaryURL()
         let result = try await runBootstrapCommand(binaryURL: binaryURL)
 
-        guard result.created else {
-            await progress("Using your existing Fawx configuration...")
-            return result
-        }
-
-        await progress("Installing Fawx to start automatically...")
+        await progress(result.created
+            ? "Installing Fawx to start automatically..."
+            : "Updating Fawx launch configuration...")
         try await installAndLoadLaunchAgent(binaryURL: binaryURL, result: result)
         await progress("Starting the local Fawx server...")
         try await waitForServerHealth(host: result.host, port: result.port)

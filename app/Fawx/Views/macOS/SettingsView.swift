@@ -25,6 +25,7 @@ struct SettingsView: View {
                 synthesisSection
                 usageSection
                 appearanceSection
+                legalSection
             }
             .frame(maxWidth: 760, alignment: .leading)
             .padding(.horizontal, FawxSpacing.paddingXL)
@@ -218,6 +219,12 @@ struct SettingsView: View {
     private var appearanceSection: some View {
         settingsSection("Appearance") {
             AppearanceSettingsPanel(appState: appState)
+        }
+    }
+
+    private var legalSection: some View {
+        settingsSection("Legal") {
+            LegalSection()
         }
     }
 

@@ -2,23 +2,29 @@ import Observation
 import SwiftUI
 
 struct Sidebar: View {
+    struct ActionHandlers {
+        let newSession: () -> Void
+        let selectSession: (String) -> Void
+        let showSkills: () -> Void
+        let showFleet: () -> Void
+        let showExperiments: () -> Void
+        let showGit: () -> Void
+        let openGitPanel: () -> Void
+        let openSettings: () -> Void
+        let clearSession: (String) -> Void
+        let deleteSession: (String) -> Void
+        let deleteSessions: ([String]) -> Void
+    }
+
     @Environment(\.colorScheme) private var colorScheme
+#if os(macOS)
     @Environment(\.controlActiveState) private var controlActiveState
+#endif
 
     @Bindable var sessionViewModel: SessionViewModel
     let selection: SidebarSelection?
-
-    let streamingSessionID: String?
-    let newSessionAction: () -> Void
-    let selectSessionAction: (String) -> Void
-    let showSkillsAction: () -> Void
-    let showFleetAction: () -> Void
-    let showExperimentsAction: () -> Void
-    let showGitAction: () -> Void
-    let openSettingsAction: () -> Void
-    let clearSessionAction: (String) -> Void
-    let deleteSessionAction: (String) -> Void
-    let deleteSessionsAction: ([String]) -> Void
+    let streamingSessionIDs: Set<String>
+    let actions: ActionHandlers
 
     @State private var pendingClearSession: Session?
     @State private var pendingDeleteSessions: [Session] = []
@@ -39,7 +45,7 @@ struct Sidebar: View {
 
             Button("Clear", role: .destructive) {
                 if let session = pendingClearSession {
-                    clearSessionAction(session.id)
+                    actions.clearSession(session.id)
                 }
                 pendingClearSession = nil
             }
@@ -55,10 +61,10 @@ struct Sidebar: View {
                 let sessionIDs = pendingDeleteSessions.map(\.id)
                 if sessionIDs.isEmpty == false {
                     if isSelectingSessions {
-                        deleteSessionsAction(sessionIDs)
+                        actions.deleteSessions(sessionIDs)
                         cancelSelectionMode()
                     } else if let sessionID = sessionIDs.first {
-                        deleteSessionAction(sessionID)
+                        actions.deleteSession(sessionID)
                     }
                 }
                 pendingDeleteSessions = []
@@ -80,7 +86,7 @@ struct Sidebar: View {
     }
 
     private var newSessionButton: some View {
-        Button(action: newSessionAction) {
+        Button(action: actions.newSession) {
             Label {
                 Text("New Session")
             } icon: {
@@ -102,7 +108,12 @@ struct Sidebar: View {
     }
 
     private var shouldUseActiveLightSessionIconColor: Bool {
+#if os(macOS)
         colorScheme == .light && controlActiveState == .key && isSelectingSessions == false
+#else
+        // iOS uses the default symbol tint because control focus state is a macOS-only concern.
+        false
+#endif
     }
 
     @ViewBuilder
@@ -127,7 +138,7 @@ struct Sidebar: View {
                 title: "No conversations yet",
                 message: "Start a new one!",
                 actionTitle: "New Session",
-                action: newSessionAction
+                action: actions.newSession
             )
             .listRowBackground(Color.clear)
         } else if filteredGroupedSections.isEmpty {
@@ -161,7 +172,7 @@ struct Sidebar: View {
             SessionRowView(
                 session: session,
                 isSelected: rowIsSelected(session.id),
-                isStreaming: session.id == streamingSessionID,
+                isStreaming: streamingSessionIDs.contains(session.id),
                 showsSelectionControl: isSelectingSessions,
                 isMarkedForBulkAction: selectedSessionIDs.contains(session.id)
             )
@@ -226,31 +237,36 @@ struct Sidebar: View {
                 title: "Skills",
                 systemImage: "puzzlepiece.extension",
                 isSelected: selection == .skills,
-                action: showSkillsAction
+                action: actions.showSkills
             )
             sidebarButton(
                 title: "Fleet",
                 systemImage: "point.3.connected.trianglepath.dotted",
                 isSelected: selection == .fleet,
-                action: showFleetAction
+                action: actions.showFleet
             )
             sidebarButton(
                 title: "Experiments",
                 systemImage: "waveform.path.ecg.rectangle",
                 isSelected: selection == .experiments,
-                action: showExperimentsAction
+                action: actions.showExperiments
             )
             sidebarButton(
                 title: "Git",
                 systemImage: "arrow.trianglehead.branch",
                 isSelected: selection == .git,
-                action: showGitAction
+                action: actions.showGit
             )
+            .contextMenu {
+                Button("Open as Side Panel") {
+                    actions.openGitPanel()
+                }
+            }
             sidebarButton(
                 title: "Settings",
                 systemImage: "gearshape",
                 isSelected: selection == .settings,
-                action: openSettingsAction
+                action: actions.openSettings
             )
         }
         .frame(maxWidth: .infinity)
@@ -405,7 +421,7 @@ struct Sidebar: View {
         if isSelectingSessions {
             toggleSelection(for: sessionID)
         } else {
-            selectSessionAction(sessionID)
+            actions.selectSession(sessionID)
         }
     }
 

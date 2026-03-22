@@ -87,6 +87,43 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(SessionRowView.subtitleText(for: multiMessageSession), "4 messages")
     }
 
+    func testSessionMemorySanitizedForSavingTrimsBlankValues() {
+        let memory = SessionMemory(
+            project: "  Compaction UX  ",
+            currentState: "   ",
+            keyDecisions: ["Keep the banner subtle", "   "],
+            activeFiles: [" app/Fawx/Views/Shared/SessionMemoryPanel.swift "],
+            customContext: ["Support older servers gracefully", ""],
+            lastUpdated: 42
+        )
+
+        let sanitized = memory.sanitizedForSaving
+
+        XCTAssertEqual(sanitized.project, "Compaction UX")
+        XCTAssertNil(sanitized.currentState)
+        XCTAssertEqual(sanitized.keyDecisions, ["Keep the banner subtle"])
+        XCTAssertEqual(sanitized.activeFiles, ["app/Fawx/Views/Shared/SessionMemoryPanel.swift"])
+        XCTAssertEqual(sanitized.customContext, ["Support older servers gracefully"])
+        XCTAssertEqual(sanitized.lastUpdated, 42)
+    }
+
+    func testSessionMemoryEstimatedTokensIsZeroForEmptyMemory() {
+        XCTAssertEqual(SessionMemory().estimatedTokens, 0)
+    }
+
+    func testSessionMemoryEstimatedTokensReflectRenderedMemory() {
+        let memory = SessionMemory(
+            project: "Compaction UX",
+            currentState: "Add a memory editor",
+            keyDecisions: ["Use a sheet"],
+            activeFiles: ["app/Fawx/Views/Shared/SessionMemoryPanel.swift"],
+            customContext: ["Keep the copy concise"]
+        )
+
+        XCTAssertGreaterThan(memory.estimatedTokens, 0)
+        XCTAssertGreaterThan(memory.estimatedTokens, memory.keyDecisions.count)
+    }
+
     private func makeSession(
         key: String,
         label: String? = nil,
@@ -111,7 +148,7 @@ final class SessionTests: XCTestCase {
     }
 }
 
-final class IOSViewSourceRegressionTests: XCTestCase {
+final class ViewSourceRegressionTests: XCTestCase {
     func testSessionListViewDoesNotDuplicateSessionRowForSplitLayout() throws {
         let source = try sourceFile(at: "app/Fawx/Views/iOS/SessionListView.swift")
         let sessionRowSource = try snippet(
@@ -149,6 +186,62 @@ final class IOSViewSourceRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.permissions)"))
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.synthesis)"))
         XCTAssertTrue(source.contains("NavigationLink(value: SettingsRoute.usage)"))
+    }
+
+    func testMacOSContentViewPinsSidebarColumnWidthForChatLayout() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/macOS/ContentView.swift")
+
+        XCTAssertTrue(source.contains(".navigationSplitViewColumnWidth("))
+        XCTAssertTrue(source.contains("min: Layout.sidebarMinWidth"))
+        XCTAssertTrue(source.contains("ideal: Layout.sidebarIdealWidth"))
+        XCTAssertTrue(source.contains("max: Layout.sidebarMaxWidth"))
+    }
+
+    func testMacOSContentViewLetsChatSurfaceFlexBeforeCompressingSidePanes() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/macOS/ContentView.swift")
+        let containerSource = try snippet(
+            in: source,
+            startingAt: "    @ViewBuilder\n    private var chatDetailContainer: some View {",
+            endingBefore: "\n\n    private var statusBarView: some View {"
+        )
+
+        XCTAssertFalse(source.contains("WindowMinimumSizeConfigurator("))
+        XCTAssertFalse(source.contains("chatDetailMinWidth"))
+        XCTAssertTrue(containerSource.contains(".frame(maxWidth: .infinity, maxHeight: .infinity)"))
+        XCTAssertTrue(containerSource.contains("minWidth: Layout.compactGitPanelMinWidth"))
+    }
+
+    func testStatusBarIncludesSessionMemoryButton() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/StatusBar.swift")
+
+        XCTAssertTrue(source.contains("accessibilityIdentifier(\"sessionMemoryButton\")"))
+        XCTAssertTrue(source.contains("accessibilityLabel(\"Open session memory\")"))
+        XCTAssertTrue(source.contains("Text(\"Memory\")"))
+    }
+
+    func testChatDetailViewPresentsSessionMemoryPanel() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/ChatDetailView.swift")
+
+        XCTAssertTrue(source.contains("SessionMemoryPanel(appState: appState, session: session)"))
+        XCTAssertTrue(source.contains("presentedSessionMemory"))
+    }
+
+    func testSessionMemoryPanelValidatesAndCountsActiveFiles() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/SessionMemoryPanel.swift")
+
+        XCTAssertTrue(source.contains("\\(sanitizedDraft.activeFiles.count) / \\(SessionMemory.maxItems) active files"))
+        XCTAssertTrue(source.contains("Keep active files to \\(SessionMemory.maxItems) items or fewer."))
+        XCTAssertTrue(source.contains(".disabled(isDisabled || isAtItemLimit)"))
+    }
+
+    func testChatDetailViewStylesEmergencyCompactionBanner() throws {
+        let source = try sourceFile(at: "app/Fawx/Views/Shared/ChatDetailView.swift")
+
+        XCTAssertTrue(source.contains("CompactionBannerStyle(isEmergency: info.isEmergency)"))
+        XCTAssertTrue(source.contains("init(isEmergency: Bool)"))
+        XCTAssertFalse(source.contains("message.localizedCaseInsensitiveContains(\"urgently optimized\")"))
+        XCTAssertTrue(source.contains("Color.fawxWarning.opacity(0.12)"))
+        XCTAssertTrue(source.contains("Color.fawxWarning.opacity(0.45)"))
     }
 
     private func sourceFile(at relativePath: String) throws -> String {

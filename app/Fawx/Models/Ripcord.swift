@@ -103,6 +103,26 @@ struct RipcordStatusResponse: Codable, Sendable, Hashable {
         return trimmed.isEmpty ? "Tripwire crossed" : trimmed
     }
 
+    var notificationID: String {
+        if let tripwireId, !tripwireId.isEmpty {
+            return "tripwire:\(tripwireId)"
+        }
+
+        if let activatedAt {
+            return "activated:\(activatedAt.timeIntervalSince1970)"
+        }
+
+        return "description:\(displayDescription)"
+    }
+
+    var hasJournaledActions: Bool {
+        entryCount > 0
+    }
+
+    var shouldSurfaceNotification: Bool {
+        active && hasJournaledActions
+    }
+
     var entryCountLabel: String {
         "\(entryCount) action\(entryCount == 1 ? "" : "s") journaled"
     }
@@ -190,6 +210,11 @@ struct JournalEntry: Codable, Sendable, Hashable, Identifiable {
 struct JournalAction: Codable, Sendable, Hashable {
     let type: String
     let payload: JSONValue
+
+    init(type: String, payload: JSONValue) {
+        self.type = type
+        self.payload = payload
+    }
 
     init(from decoder: Decoder) throws {
         let payload = try JSONValue(from: decoder)

@@ -102,7 +102,7 @@ mod tests {
             .expect("should exist");
         assert_eq!(loaded.key, session.key);
         assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].content, "hello");
+        assert_eq!(loaded.messages[0].render_text(), "hello");
     }
 
     #[test]
@@ -179,6 +179,6 @@ mod tests {
             .expect("load")
             .expect("should exist");
         assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].content, "new message");
+        assert_eq!(loaded.messages[0].render_text(), "new message");
     }
 }

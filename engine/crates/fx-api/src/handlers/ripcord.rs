@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use crate::build_router;
     use crate::devices::DeviceStore;
-    use crate::engine::{AppEngine, CycleResult};
+    use crate::engine::{AppEngine, CycleResult, ResultKind};
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
     use crate::state::{build_channel_runtime, default_telemetry, SharedReadState};
@@ -119,6 +119,7 @@ mod tests {
                 response: "ok".to_string(),
                 model: self.active_model().to_string(),
                 iterations: 0,
+                result_kind: ResultKind::Complete,
             })
         }
 
@@ -135,6 +136,7 @@ mod tests {
                     response: "ok".to_string(),
                     model: self.active_model().to_string(),
                     iterations: 0,
+                    result_kind: ResultKind::Complete,
                 },
                 context,
             ))

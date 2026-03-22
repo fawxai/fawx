@@ -6,8 +6,17 @@ struct FawxMacCommands: Commands {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
+    @Bindable var sparkleUpdater: SparkleUpdater
+    @AppStorage("show_git_panel") private var showGitPanel = false
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates...") {
+                sparkleUpdater.checkForUpdates()
+            }
+            .disabled(!sparkleUpdater.canCheckForUpdates)
+        }
+
         CommandGroup(replacing: .newItem) {
             Button("New Session") {
                 beginNewSession()
@@ -38,6 +47,13 @@ struct FawxMacCommands: Commands {
                 showSettings()
             }
             .keyboardShortcut("3", modifiers: .command)
+
+            Divider()
+
+            Button(showGitPanel ? "Hide Git Panel" : "Show Git Panel") {
+                toggleGitPanel()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
         }
     }
 
@@ -68,14 +84,24 @@ struct FawxMacCommands: Commands {
         chatViewModel.showEmptyState()
     }
 
+    private func toggleGitPanel() {
+        GitPanelPresentation.toggle(
+            showGitPanel: $showGitPanel,
+            selectedSessionID: sessionViewModel.selectedSessionID,
+            appState: appState,
+            sessionViewModel: sessionViewModel,
+            chatViewModel: chatViewModel
+        )
+    }
+
     private func clearSelectedSession() {
         guard let selectedSessionID = sessionViewModel.selectedSessionID else {
             return
         }
 
         Task { @MainActor in
-            if chatViewModel.activeStreamSessionID == selectedSessionID {
-                chatViewModel.stopStreaming()
+            if chatViewModel.activeStreamSessionIDs.contains(selectedSessionID) {
+                chatViewModel.stopStreaming(sessionID: selectedSessionID)
             }
 
             let didClear = await sessionViewModel.clearSession(id: selectedSessionID)
