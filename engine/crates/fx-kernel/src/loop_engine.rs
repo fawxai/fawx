@@ -4062,10 +4062,35 @@ impl LoopEngine {
             return Ok(Vec::new());
         }
 
+        // Pre-flight: detect malformed tool arguments from parse-failure fallback.
+        let mut malformed_results: Vec<ToolResult> = Vec::new();
+        let valid: Vec<ToolCall> = allowed
+            .iter()
+            .filter(|call| {
+                if call.arguments.get("__fawx_raw_args").is_some() {
+                    tracing::warn!(
+                        tool = %call.name,
+                        "skipping tool call with malformed arguments"
+                    );
+                    malformed_results.push(ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: false,
+                        output: "Tool call failed: arguments could not be parsed as valid JSON"
+                            .into(),
+                    });
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
         let max_bytes = self.budget.config().max_tool_result_bytes;
         let executed = self
             .tool_executor
-            .execute_tools(allowed, self.cancel_token.as_ref())
+            .execute_tools(&valid, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
                 stream.emit_error(
@@ -4079,7 +4104,9 @@ impl LoopEngine {
                     error.recoverable,
                 )
             })?;
-        Ok(truncate_tool_results(executed, max_bytes))
+        let mut results = truncate_tool_results(executed, max_bytes);
+        results.append(&mut malformed_results);
+        Ok(results)
     }
 
     async fn request_tool_continuation(
@@ -14722,6 +14749,43 @@ mod loop_resilience_tests {
             })
         });
         assert!(!has_wrap_up, "no wrap-up directive when budget normal");
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_args_skipped_with_error_result() {
+        let mut engine = high_budget_engine();
+        let calls = vec![
+            ToolCall {
+                id: "valid-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "/tmp/test.md"}),
+            },
+            ToolCall {
+                id: "malformed-1".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"__fawx_raw_args": "{broken json"}),
+            },
+        ];
+        let results = engine
+            .execute_allowed_tool_calls(&calls, CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        // Valid call should produce a result from the executor
+        let valid_result = results.iter().find(|r| r.tool_call_id == "valid-1");
+        assert!(valid_result.is_some(), "valid call should have a result");
+
+        // Malformed call should produce an error result without hitting the executor
+        let malformed_result = results
+            .iter()
+            .find(|r| r.tool_call_id == "malformed-1")
+            .expect("malformed call should have a result");
+        assert!(!malformed_result.success);
+        assert!(
+            malformed_result.output.contains("could not be parsed"),
+            "should explain the failure: {}",
+            malformed_result.output
+        );
     }
 
     #[tokio::test]

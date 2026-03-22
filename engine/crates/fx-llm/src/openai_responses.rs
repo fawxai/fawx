@@ -1232,11 +1232,7 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
             continue;
         };
         if let (Some(name), Some(arguments)) = (&item.name, &item.arguments) {
-            let raw_args = crate::normalize_tool_arguments(arguments);
-            let arguments_value = match serde_json::from_str::<Value>(raw_args) {
-                Ok(value) => value,
-                Err(_) => Value::String(arguments.clone()),
-            };
+            let arguments_value = crate::parse_tool_arguments_object(arguments);
 
             tool_calls.push(ToolCall {
                 id: id.clone(),
@@ -1266,9 +1262,7 @@ fn tool_use_block_from_item(item: &ResponsesOutputItem) -> Option<ContentBlock> 
         .cloned();
     let name = item.name.as_ref()?.clone();
     let arguments = item.arguments.as_ref()?;
-    let raw_args = crate::normalize_tool_arguments(arguments);
-    let input = serde_json::from_str::<Value>(raw_args)
-        .unwrap_or_else(|_| Value::String(arguments.clone()));
+    let input = crate::parse_tool_arguments_object(arguments);
 
     Some(ContentBlock::ToolUse {
         id,
@@ -1413,9 +1407,7 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
             if id.is_empty() || name.is_empty() {
                 return None;
             }
-            let raw_args = crate::normalize_tool_arguments(&call.arguments).to_string();
-            let arguments =
-                serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
+            let arguments = crate::parse_tool_arguments_object(&call.arguments);
 
             Some(ToolCall {
                 id,
@@ -1441,8 +1433,7 @@ fn tool_use_blocks_from_pending(pending: &[PendingToolCall]) -> Vec<ContentBlock
                 .as_deref()
                 .filter(|provider_id| *provider_id != id)
                 .map(ToString::to_string);
-            let raw_args = crate::normalize_tool_arguments(&call.arguments).to_string();
-            let input = serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
+            let input = crate::parse_tool_arguments_object(&call.arguments);
 
             Some(ContentBlock::ToolUse {
                 id: id.to_string(),

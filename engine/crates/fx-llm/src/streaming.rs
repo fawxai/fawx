@@ -321,8 +321,7 @@ fn tool_call_content_block(tool_call: &ToolCall) -> ContentBlock {
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
-    let normalized = crate::normalize_tool_arguments(arguments);
-    serde_json::from_str(normalized).unwrap_or_else(|_| Value::String(arguments.to_string()))
+    crate::parse_tool_arguments_object(arguments)
 }
 
 fn emit_events(callback: &StreamCallback, events: Vec<StreamEvent>) {
@@ -543,5 +542,50 @@ mod tests {
                 }
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_tool_arguments_tests {
+    use super::parse_tool_arguments;
+    use serde_json::Value;
+
+    #[test]
+    fn valid_json_object_parses_normally() {
+        let result = parse_tool_arguments(r#"{"path": "/tmp/test.md"}"#);
+        assert!(result.is_object());
+        assert_eq!(result["path"], "/tmp/test.md");
+    }
+
+    #[test]
+    fn malformed_json_wraps_as_raw_object_not_string() {
+        let result = parse_tool_arguments(r#"{"path": "/tmp/test.md"#);
+        assert!(
+            result.is_object(),
+            "fallback must be an object, got: {result:?}"
+        );
+        assert!(
+            !matches!(result, Value::String(_)),
+            "must not be Value::String"
+        );
+        assert!(
+            result.get("__fawx_raw_args").is_some(),
+            "must contain __fawx_raw_args key"
+        );
+        assert_eq!(result["__fawx_raw_args"], r#"{"path": "/tmp/test.md"#);
+    }
+
+    #[test]
+    fn empty_string_normalizes_to_empty_object() {
+        let result = parse_tool_arguments("");
+        assert!(result.is_object());
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn whitespace_only_normalizes_to_empty_object() {
+        let result = parse_tool_arguments("   ");
+        assert!(result.is_object());
+        assert_eq!(result, serde_json::json!({}));
     }
 }
