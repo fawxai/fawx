@@ -9,7 +9,7 @@ struct ChatDetailView: View {
     @Bindable var appState: AppState
     @Bindable var sessionViewModel: SessionViewModel
     @Bindable var chatViewModel: ChatViewModel
-    @ScaledMetric(relativeTo: .title2) private var emptyStateEmojiSize = 30
+    private let emptyStateLogoSize: CGFloat = 200
     @State private var transcriptScrollTracker = TranscriptScrollTracker()
     @State private var isShowingRipcordReviewTray = false
     @State private var isLoadingRipcordJournal = false
@@ -504,7 +504,7 @@ struct ChatDetailView: View {
             Image("FawxLogo")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: emptyStateEmojiSize, height: emptyStateEmojiSize)
+                .frame(width: emptyStateLogoSize, height: emptyStateLogoSize)
                 .accessibilityHidden(true)
 
             Text(emptyStateTitle)
