@@ -1951,19 +1951,19 @@ mod tests {
         );
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["id"], "fc_1");
-        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["call_id"], "fc_1");
         assert_eq!(input[1]["name"], "lookup");
         assert_eq!(input[1]["arguments"], "{\"q\":\"first\"}");
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[2]["id"], "fc_2");
-        assert_eq!(input[2]["call_id"], "call_2");
+        assert_eq!(input[2]["call_id"], "fc_2");
         assert_eq!(input[2]["name"], "lookup");
         assert_eq!(input[2]["arguments"], "{\"q\":\"second\"}");
         assert_eq!(
             input[3],
             serde_json::json!({
                 "type": "function_call_output",
-                "call_id": "call_1",
+                "call_id": "fc_1",
                 "output": "first result"
             })
         );
@@ -1971,7 +1971,7 @@ mod tests {
             input[4],
             serde_json::json!({
                 "type": "function_call_output",
-                "call_id": "call_2",
+                "call_id": "fc_2",
                 "output": "second result"
             })
         );
