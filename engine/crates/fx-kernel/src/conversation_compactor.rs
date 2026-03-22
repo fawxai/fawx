@@ -1542,23 +1542,6 @@ mod tests {
         let messages = vec![
             user(10),
             tool_use("call-1"),
-            tool_result("call-1", 20),
-            user(20),
-            assistant(20),
-        ];
-
-        let result = emergency_compact(&messages, 2);
-        let has_use = has_tool_use(&result.messages, "call-1");
-        let has_result = has_tool_result(&result.messages, "call-1");
-
-        assert_eq!(has_use, has_result);
-    }
-
-    #[test]
-    fn emergency_compact_keeps_tool_use_when_result_in_tail() {
-        let messages = vec![
-            user(10),
-            tool_use("call-1"),
             user(20),
             assistant(20),
             tool_result("call-1", 20),
@@ -1567,8 +1550,14 @@ mod tests {
 
         let result = emergency_compact(&messages, 2);
 
-        assert!(has_tool_use(&result.messages, "call-1"));
-        assert!(has_tool_result(&result.messages, "call-1"));
+        assert!(
+            has_tool_use(&result.messages, "call-1"),
+            "tool_use must be preserved when its result is in tail"
+        );
+        assert!(
+            has_tool_result(&result.messages, "call-1"),
+            "tool_result in tail must be preserved"
+        );
     }
 
     #[test]

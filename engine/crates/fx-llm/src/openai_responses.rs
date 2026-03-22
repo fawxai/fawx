@@ -1587,6 +1587,35 @@ mod tests {
         }
     }
 
+    fn single_tool_continuation_request(tool_output: Value) -> CompletionRequest {
+        CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        provider_id: None,
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({"q": "weather"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: tool_output,
+                    }],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        }
+    }
+
     #[test]
     fn build_request_body_maps_messages() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
@@ -1901,59 +1930,35 @@ mod tests {
     #[test]
     fn test_build_request_body_maps_tool_result_string_content() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
-        let request = CompletionRequest {
-            model: "gpt-4.1".to_string(),
-            messages: vec![crate::types::Message {
-                role: MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: Value::String("tool output".to_string()),
-                }],
-            }],
-            system_prompt: None,
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            thinking: None,
-        };
+        let request = single_tool_continuation_request(Value::String("tool output".to_string()));
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
         let input = serialized["input"].as_array().unwrap();
 
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"], "tool output");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "tool output");
     }
 
     #[test]
     fn test_build_request_body_maps_tool_result_error_prefix() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
-        let request = CompletionRequest {
-            model: "gpt-4.1".to_string(),
-            messages: vec![crate::types::Message {
-                role: MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: Value::String("[ERROR] permission denied".to_string()),
-                }],
-            }],
-            system_prompt: None,
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            thinking: None,
-        };
+        let request = single_tool_continuation_request(Value::String(
+            "[ERROR] permission denied".to_string(),
+        ));
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
         let input = serialized["input"].as_array().unwrap();
 
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"], "[ERROR] permission denied");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "[ERROR] permission denied");
     }
 
     #[test]

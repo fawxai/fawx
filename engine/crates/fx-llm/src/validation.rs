@@ -97,3 +97,76 @@ fn summarize_content_block(block: &ContentBlock) -> String {
         ContentBlock::Image { .. } => "image".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_tool_message_sequence;
+    use crate::types::{ContentBlock, LlmError, Message, MessageRole};
+
+    fn user_message() -> Message {
+        Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }
+    }
+
+    fn assistant_tool_use(id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id: None,
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "/tmp/a"}),
+            }],
+        }
+    }
+
+    fn tool_message(tool_use_id: &str) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: serde_json::json!("ok"),
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_tool_sequence() {
+        let messages = vec![
+            user_message(),
+            assistant_tool_use("call-1"),
+            tool_message("call-1"),
+        ];
+
+        assert!(validate_tool_message_sequence(&messages).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_orphaned_tool_result() {
+        let messages = vec![user_message(), tool_message("call-1")];
+
+        let message = match validate_tool_message_sequence(&messages) {
+            Err(LlmError::Request(message)) => message,
+            Err(other) => panic!("expected request error, got {other:?}"),
+            Ok(()) => panic!("expected orphaned tool result to fail"),
+        };
+
+        assert!(message.contains("invalid tool continuation"));
+    }
+
+    #[test]
+    fn validate_accepts_empty_messages() {
+        assert!(validate_tool_message_sequence(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_empty_tool_use_ids() {
+        let messages = vec![user_message(), assistant_tool_use(""), tool_message("")];
+
+        assert!(validate_tool_message_sequence(&messages).is_ok());
+    }
+}
