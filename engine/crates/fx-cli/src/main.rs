@@ -961,6 +961,43 @@ fn dispatch_tailscale(command: TailscaleCommands) -> anyhow::Result<i32> {
     }
 }
 
+/// Best-effort stale PID cleanup for `fawx serve`.
+///
+/// This uses OS process-liveness checks, so the end-to-end behavior is best
+/// covered with an integration-style dead-child regression test rather than a
+/// pure unit test.
+fn cleanup_stale_pid_file() {
+    cleanup_stale_pid_file_at(&restart::pid_file_path());
+}
+
+fn cleanup_stale_pid_file_at(pid_path: &Path) {
+    #[cfg(not(unix))]
+    let _ = pid_path;
+
+    #[cfg(unix)]
+    {
+        let Ok(Some(pid)) = restart::read_pid_file(pid_path) else {
+            return;
+        };
+        use nix::sys::signal;
+
+        let is_alive = i32::try_from(pid)
+            .ok()
+            .map(nix::unistd::Pid::from_raw)
+            .map(|process| {
+                matches!(
+                    signal::kill(process, None),
+                    Ok(()) | Err(nix::errno::Errno::EPERM)
+                )
+            })
+            .unwrap_or(false);
+        if !is_alive {
+            let _ = std::fs::remove_file(pid_path);
+            eprintln!("Removed stale PID file (process {pid} is dead)");
+        }
+    }
+}
+
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
         Commands::Tui { args } => launch_fawx_tui(&args),
@@ -979,6 +1016,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             if let Some(ref dir) = data_dir {
                 std::env::set_var("FAWX_DATA_DIR", dir);
             }
+            cleanup_stale_pid_file();
             let _pid_guard = restart::create_serve_pid_file_guard()?;
             if fleet {
                 commands::serve_fleet::run().await
@@ -1147,9 +1185,10 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        dispatch_command, ensure_headless_chat_model_available, fawx_tui_binary_name,
-        find_fawx_tui_binary_from, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
-        SessionsCommands, SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        cleanup_stale_pid_file_at, dispatch_command, ensure_headless_chat_model_available,
+        fawx_tui_binary_name, find_fawx_tui_binary_from, resolve_ripcord_path_with,
+        ripcord_binary_name, Cli, Commands, SessionsCommands, SkillCommands,
+        FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1702,6 +1741,47 @@ exit 0
             error.to_string(),
             "no models available in router; configure a provider and authenticate it before starting headless mode"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_pid_file_removes_dead_process_pid() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let pid_path = temp_dir.path().join("fawx.pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(":")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        child.wait().expect("wait for child");
+        fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
+
+        cleanup_stale_pid_file_at(&pid_path);
+
+        assert!(!pid_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_pid_file_keeps_live_process_pid() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let pid_path = temp_dir.path().join("fawx.pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
+
+        cleanup_stale_pid_file_at(&pid_path);
+
+        let preserved_pid = restart::read_pid_file(&pid_path).expect("read pid file");
+        let _ = child.kill();
+        child.wait().expect("wait for child");
+
+        assert_eq!(preserved_pid, Some(pid));
     }
 
     #[test]

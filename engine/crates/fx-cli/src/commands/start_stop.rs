@@ -10,6 +10,9 @@ use std::{
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Give the OS a moment to release redb's file lock after the daemon exits.
+/// Without this small delay, a rapid stop/start can race the lock cleanup.
+const POST_STOP_DELAY: Duration = Duration::from_millis(200);
 const DAEMON_LOG_FILE: &str = "fawx-daemon.log";
 
 pub(crate) fn run_start() -> anyhow::Result<i32> {
@@ -138,6 +141,8 @@ fn execute_stop(system: &impl ProcessControl, pid_file: &Path) -> anyhow::Result
         return Ok(StopOutcome::StalePidRemoved);
     }
     terminate_process(system, pid)?;
+    // Allow OS to fully release file handles before returning.
+    system.sleep(POST_STOP_DELAY);
     restart::remove_pid_file(pid_file)?;
     Ok(StopOutcome::Stopped)
 }
@@ -223,6 +228,7 @@ mod tests {
     struct MockProcessControl {
         process_exists: RefCell<VecDeque<bool>>,
         sent_signals: RefCell<Vec<(u32, RestartSignal)>>,
+        slept: RefCell<Vec<Duration>>,
         spawn_requests: RefCell<Vec<SpawnRequest>>,
         pid_written_on_spawn: Option<(PathBuf, u32)>,
     }
@@ -232,6 +238,7 @@ mod tests {
             Self {
                 process_exists: RefCell::new(process_exists.into()),
                 sent_signals: RefCell::new(Vec::new()),
+                slept: RefCell::new(Vec::new()),
                 spawn_requests: RefCell::new(Vec::new()),
                 pid_written_on_spawn: None,
             }
@@ -265,7 +272,9 @@ mod tests {
             Ok(())
         }
 
-        fn sleep(&self, _duration: Duration) {}
+        fn sleep(&self, duration: Duration) {
+            self.slept.borrow_mut().push(duration);
+        }
     }
 
     fn write_pid_file(temp: &TempDir, pid: u32) -> PathBuf {
@@ -346,6 +355,22 @@ mod tests {
         );
         assert!(control.process_exists.borrow().is_empty());
         assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn stop_includes_post_termination_delay() {
+        let temp = TempDir::new().expect("tempdir");
+        let pid_file = write_pid_file(&temp, 4321);
+        let control = MockProcessControl::new(vec![true, false]);
+
+        let outcome = execute_stop(&control, &pid_file).expect("stop outcome");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert_eq!(
+            *control.sent_signals.borrow(),
+            vec![(4321, RestartSignal::Terminate)]
+        );
+        assert_eq!(*control.slept.borrow(), vec![POST_STOP_DELAY]);
     }
 
     #[test]
