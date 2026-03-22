@@ -4,7 +4,8 @@ use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{
     build_skip_mask, effective_max_depth, estimate_complexity, truncate_tool_result, ActionCost,
     AllocationMode, AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState,
-    BudgetTracker, DepthMode, DEFAULT_LLM_CALL_COST_CENTS, DEFAULT_TOOL_INVOCATION_COST_CENTS,
+    BudgetTracker, DepthMode, RetryPolicyConfig, DEFAULT_LLM_CALL_COST_CENTS,
+    DEFAULT_TOOL_INVOCATION_COST_CENTS,
 };
 use crate::cancellation::CancellationToken;
 use crate::channels::ChannelRegistry;
@@ -454,9 +455,8 @@ pub struct LoopEngine {
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
     budget_low_signaled: bool,
-    /// Per-tool attempt counter for the current cycle.
-    /// Key: tool name, Value: number of attempts (including first call).
-    tool_attempts: HashMap<String, u8>,
+    /// Tool retry tracker for the current cycle.
+    tool_retry_tracker: ToolRetryTracker,
     /// Whether a successful `notify` tool call occurred during the current cycle.
     notify_called_this_cycle: bool,
     /// Whether this cycle currently has an active notification delivery channel.
@@ -488,7 +488,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
-            .field("tool_attempts", &self.tool_attempts)
+            .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
                 "notify_tool_guidance_enabled",
@@ -531,6 +531,115 @@ impl Drop for ErrorCallbackGuard<'_> {
     fn drop(&mut self) {
         self.engine.error_callback = self.original.take();
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ToolRetryTracker {
+    signature_failures: HashMap<CallSignature, u16>,
+    cycle_total_failures: u16,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CallSignature {
+    tool_name: String,
+    args_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryVerdict {
+    Allow,
+    Block { reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct BlockedToolCall {
+    call: ToolCall,
+    reason: String,
+}
+
+impl ToolRetryTracker {
+    fn should_allow(&self, call: &ToolCall, config: &RetryPolicyConfig) -> RetryVerdict {
+        if self.cycle_total_failures >= config.max_cycle_failures {
+            return RetryVerdict::Block {
+                reason: cycle_failure_limit_reason(),
+            };
+        }
+
+        let failures = self.consecutive_failures_for(call);
+        if failures >= config.max_consecutive_failures {
+            return RetryVerdict::Block {
+                reason: same_call_failure_reason(failures),
+            };
+        }
+
+        RetryVerdict::Allow
+    }
+
+    fn record_results(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let result_successes = result_successes_by_id(results);
+        for call in calls {
+            if let Some(success) = result_successes.get(call.id.as_str()) {
+                self.record_result(call, *success);
+            }
+        }
+    }
+
+    fn record_result(&mut self, call: &ToolCall, success: bool) {
+        let signature = CallSignature::from_call(call);
+        if success {
+            self.signature_failures.insert(signature, 0);
+            return;
+        }
+
+        let failures = self.signature_failures.entry(signature).or_insert(0);
+        *failures = failures.saturating_add(1);
+        self.cycle_total_failures = self.cycle_total_failures.saturating_add(1);
+    }
+
+    fn consecutive_failures_for(&self, call: &ToolCall) -> u16 {
+        self.signature_failures
+            .get(&CallSignature::from_call(call))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn clear(&mut self) {
+        self.signature_failures.clear();
+        self.cycle_total_failures = 0;
+    }
+}
+
+impl CallSignature {
+    fn from_call(call: &ToolCall) -> Self {
+        Self {
+            tool_name: call.name.clone(),
+            args_hash: hash_tool_arguments(&call.arguments),
+        }
+    }
+}
+
+fn hash_tool_arguments(arguments: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let canonical = serde_json::to_string(arguments).unwrap_or_default();
+    canonical.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn result_successes_by_id(results: &[ToolResult]) -> HashMap<&str, bool> {
+    results
+        .iter()
+        .map(|result| (result.tool_call_id.as_str(), result.success))
+        .collect()
+}
+
+fn cycle_failure_limit_reason() -> String {
+    "too many total failures this cycle".to_string()
+}
+
+fn same_call_failure_reason(failures: u16) -> String {
+    format!("same call failed {failures} times consecutively")
 }
 
 #[derive(Default)]
@@ -732,7 +841,7 @@ impl LoopEngineBuilder {
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
-            tool_attempts: HashMap::new(),
+            tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
             notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
@@ -1555,7 +1664,7 @@ impl LoopEngine {
         self.user_stop_requested = false;
         self.pending_steer = None;
         self.budget_low_signaled = false;
-        self.tool_attempts.clear();
+        self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
         if let Some(token) = &self.cancel_token {
@@ -2640,6 +2749,8 @@ impl LoopEngine {
             max_tool_result_bytes: template.max_tool_result_bytes,
             max_aggregate_result_bytes: template.max_aggregate_result_bytes,
             max_synthesis_tokens: template.max_synthesis_tokens,
+            max_consecutive_failures: template.max_consecutive_failures,
+            max_cycle_failures: template.max_cycle_failures,
             max_tool_retries: template.max_tool_retries,
         }
     }
@@ -3773,41 +3884,35 @@ impl LoopEngine {
         calls: &[ToolCall],
         stream: CycleStream<'_>,
     ) -> Result<Vec<ToolResult>, LoopError> {
-        let max_retries = self.budget.config().max_tool_retries;
-        let max_attempts = u16::from(max_retries).saturating_add(1);
+        let retry_policy = self.budget.config().retry_policy();
         let (allowed, blocked) =
-            partition_by_retry_budget(calls, &mut self.tool_attempts, max_attempts);
+            partition_by_retry_policy(calls, &self.tool_retry_tracker, &retry_policy);
 
-        self.emit_blocked_tool_errors(&blocked, max_retries, stream);
+        self.emit_blocked_tool_errors(&blocked, stream);
         let mut results = self.execute_allowed_tool_calls(&allowed, stream).await?;
-        results.extend(build_blocked_tool_results(&blocked, max_retries));
+        self.tool_retry_tracker.record_results(&allowed, &results);
+        results.extend(build_blocked_tool_results(&blocked));
         Ok(reorder_results_by_calls(calls, results))
     }
 
-    fn emit_blocked_tool_errors(
-        &mut self,
-        blocked: &[ToolCall],
-        max_retries: u8,
-        stream: CycleStream<'_>,
-    ) {
-        for call in blocked {
-            let attempts = self.tool_attempts.get(&call.name).copied().unwrap_or(0);
+    fn emit_blocked_tool_errors(&mut self, blocked: &[BlockedToolCall], stream: CycleStream<'_>) {
+        for blocked_call in blocked {
+            let call = &blocked_call.call;
+            let signature_failures = self.tool_retry_tracker.consecutive_failures_for(call);
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Blocked,
-                format!(
-                    "tool '{}' blocked: exceeded {} retries this cycle",
-                    call.name, max_retries
-                ),
+                format!("tool '{}' blocked: {}", call.name, blocked_call.reason),
                 serde_json::json!({
                     "tool": call.name,
-                    "attempts": attempts,
-                    "max_retries": max_retries,
+                    "reason": blocked_call.reason,
+                    "signature_failures": signature_failures,
+                    "cycle_total_failures": self.tool_retry_tracker.cycle_total_failures,
                 }),
             );
             stream.emit_error(
                 ErrorCategory::ToolExecution,
-                blocked_tool_message(&call.name, max_retries),
+                blocked_tool_message(&call.name, &blocked_call.reason),
                 true,
             );
         }
@@ -4461,33 +4566,30 @@ fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usiz
     }
 }
 
-/// Partition tool calls into allowed and blocked based on per-tool retry budget.
-///
-/// Increments `tool_attempts` for each allowed call. Calls whose tool name
-/// has already reached `max_attempts` are placed in the blocked list.
-fn partition_by_retry_budget(
+/// Partition tool calls into allowed and blocked based on the smart retry policy.
+fn partition_by_retry_policy(
     calls: &[ToolCall],
-    tool_attempts: &mut HashMap<String, u8>,
-    max_attempts: u16,
-) -> (Vec<ToolCall>, Vec<ToolCall>) {
+    tracker: &ToolRetryTracker,
+    config: &RetryPolicyConfig,
+) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
     let mut allowed = Vec::new();
     let mut blocked = Vec::new();
     for call in calls {
-        let count = tool_attempts.entry(call.name.clone()).or_insert(0);
-        if u16::from(*count) < max_attempts {
-            *count = count.saturating_add(1);
-            allowed.push(call.clone());
-        } else {
-            blocked.push(call.clone());
+        match tracker.should_allow(call, config) {
+            RetryVerdict::Allow => allowed.push(call.clone()),
+            RetryVerdict::Block { reason } => blocked.push(BlockedToolCall {
+                call: call.clone(),
+                reason,
+            }),
         }
     }
     (allowed, blocked)
 }
 
-fn blocked_tool_message(tool_name: &str, max_retries: u8) -> String {
+fn blocked_tool_message(tool_name: &str, reason: &str) -> String {
     format!(
-        "Tool '{}' blocked: exceeded {} retries this cycle. Try a different approach.",
-        tool_name, max_retries
+        "Tool '{}' blocked: {}. Try a different approach.",
+        tool_name, reason
     )
 }
 
@@ -4506,14 +4608,14 @@ fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> St
 }
 
 /// Build synthetic failure results for blocked tool calls.
-fn build_blocked_tool_results(blocked: &[ToolCall], max_retries: u8) -> Vec<ToolResult> {
+fn build_blocked_tool_results(blocked: &[BlockedToolCall]) -> Vec<ToolResult> {
     blocked
         .iter()
-        .map(|call| ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
+        .map(|blocked_call| ToolResult {
+            tool_call_id: blocked_call.call.id.clone(),
+            tool_name: blocked_call.call.name.clone(),
             success: false,
-            output: blocked_tool_message(&call.name, max_retries),
+            output: blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
         })
         .collect()
 }
@@ -9678,13 +9780,16 @@ mod cancellation_tests {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         engine.budget = BudgetTracker::new(
             crate::budget::BudgetConfig {
+                max_consecutive_failures: 1,
                 max_tool_retries: 0,
                 ..crate::budget::BudgetConfig::default()
             },
             0,
             0,
         );
-        engine.tool_attempts.insert("read_file".to_string(), 1);
+        engine
+            .tool_retry_tracker
+            .record_result(&read_file_call("seed"), false);
         let (callback, events) = stream_recorder();
         let calls = vec![read_file_call("call-1")];
 
@@ -9700,7 +9805,7 @@ mod cancellation_tests {
                 message,
                 recoverable: true,
             } if message
-                == "Tool 'read_file' blocked: exceeded 0 retries this cycle. Try a different approach."
+                == &blocked_tool_message("read_file", &same_call_failure_reason(1))
         )));
     }
 
@@ -15965,18 +16070,18 @@ mod error_path_coverage_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tool retry budget tests (#1101)
+// Per-tool retry policy tests (#1101)
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod per_tool_retry_budget_tests {
+mod per_tool_retry_policy_tests {
     use super::*;
     use crate::act::{ToolExecutorError, ToolResult};
-    use crate::budget::{BudgetConfig, BudgetTracker};
+    use crate::budget::{BudgetConfig, BudgetTracker, RetryPolicyConfig};
     use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
     use fx_llm::ToolCall;
     use std::sync::Arc;
 
-    /// Stub executor that always succeeds.
     #[derive(Debug)]
     struct AlwaysSucceedExecutor;
 
@@ -15989,305 +16094,418 @@ mod per_tool_retry_budget_tests {
         ) -> Result<Vec<ToolResult>, ToolExecutorError> {
             Ok(calls
                 .iter()
-                .map(|c| ToolResult {
-                    tool_call_id: c.id.clone(),
-                    tool_name: c.name.clone(),
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
                     success: true,
-                    output: format!("ok: {}", c.name),
+                    output: format!("ok: {}", call.name),
                 })
                 .collect())
         }
+
         fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
             Vec::new()
         }
+
+        fn clear_cache(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for AlwaysFailExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: format!("err: {}", call.name),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            Vec::new()
+        }
+
         fn clear_cache(&self) {}
     }
 
     fn make_call(id: &str, name: &str) -> ToolCall {
+        make_call_with_args(id, name, serde_json::json!({}))
+    }
+
+    fn make_call_with_args(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: id.to_string(),
             name: name.to_string(),
-            arguments: serde_json::json!({}),
+            arguments,
         }
     }
 
-    fn retry_engine(max_tool_retries: u8) -> LoopEngine {
-        let config = BudgetConfig {
+    fn retry_config(max_tool_retries: u8) -> BudgetConfig {
+        let max_consecutive_failures = u16::from(max_tool_retries).saturating_add(1);
+        BudgetConfig {
+            max_consecutive_failures,
             max_tool_retries,
             ..BudgetConfig::default()
-        };
+        }
+    }
+
+    fn retry_engine_with_executor(
+        config: BudgetConfig,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(config, 0, 0))
             .context(ContextCompactor::new(2048, 256))
             .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
+            .tool_executor(executor)
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build")
     }
 
-    // -----------------------------------------------------------------------
-    // Basic counting (tests 1–4)
-    // -----------------------------------------------------------------------
-
-    /// Test 1: Tool called once → tool_attempts == 1, execution proceeds.
-    #[tokio::test]
-    async fn single_call_increments_attempts_and_executes() {
-        let mut engine = retry_engine(2);
-        let calls = vec![make_call("1", "read_file")];
-
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert_eq!(results.len(), 1);
-        assert!(results[0].success);
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(1));
+    fn retry_engine(max_tool_retries: u8) -> LoopEngine {
+        retry_engine_with_executor(
+            retry_config(max_tool_retries),
+            Arc::new(AlwaysSucceedExecutor),
+        )
     }
 
-    /// Test 2: Tool called 3 times (default cap=2 retries) → all 3 execute.
-    #[tokio::test]
-    async fn three_calls_within_budget_all_execute() {
-        let mut engine = retry_engine(2);
+    fn failure_engine(max_tool_retries: u8) -> LoopEngine {
+        retry_engine_with_executor(retry_config(max_tool_retries), Arc::new(AlwaysFailExecutor))
+    }
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success, "call {i} should succeed");
+    fn block_message(tool_name: &str, failures: u16) -> String {
+        blocked_tool_message(tool_name, &same_call_failure_reason(failures))
+    }
+
+    fn block_signature(engine: &mut LoopEngine, call: &ToolCall) {
+        let failures = engine
+            .budget
+            .config()
+            .retry_policy()
+            .max_consecutive_failures;
+        seed_failures(engine, call, failures);
+    }
+
+    fn seed_failures(engine: &mut LoopEngine, call: &ToolCall, failures: u16) {
+        for _ in 0..failures {
+            engine.tool_retry_tracker.record_result(call, false);
         }
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(3));
     }
 
-    /// Test 3: Tool called 4th time → blocked, synthetic failure result.
+    fn is_signature_tracked(engine: &LoopEngine, call: &ToolCall) -> bool {
+        engine
+            .tool_retry_tracker
+            .signature_failures
+            .contains_key(&CallSignature::from_call(call))
+    }
+
     #[tokio::test]
-    async fn fourth_call_blocked_with_synthetic_failure() {
+    async fn successful_calls_keep_failure_counts_at_zero() {
         let mut engine = retry_engine(2);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success);
+        for id in 1..=3 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine
+                .execute_tool_calls(std::slice::from_ref(&call))
+                .await
+                .expect("execute");
+            assert!(results[0].success, "call {id} should succeed");
+            assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 0);
         }
 
-        let calls = vec![make_call("4", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("blocked"));
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 4: Different tools each called 3 times → all execute (independent).
     #[tokio::test]
-    async fn independent_counters_per_tool() {
-        let mut engine = retry_engine(2);
+    async fn consecutive_failures_block_specific_signature() {
+        let mut engine = failure_engine(2);
 
-        for i in 1..=3 {
-            let calls = vec![
-                make_call(&format!("r{i}"), "read_file"),
-                make_call(&format!("w{i}"), "write_file"),
-            ];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        for id in 1..=3 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine.execute_tool_calls(&[call]).await.expect("execute");
             assert!(
-                results.iter().all(|r| r.success),
-                "round {i} should all succeed"
+                !results[0].success,
+                "call {id} should fail but not be blocked"
             );
+            assert!(!results[0].output.contains("blocked"));
         }
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(3));
-        assert_eq!(engine.tool_attempts.get("write_file").copied(), Some(3));
+
+        let call = make_call("4", "read_file");
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute blocked call");
+        assert!(!results[0].success);
+        assert_eq!(results[0].output, block_message("read_file", 3));
+        assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 3);
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 3);
     }
 
-    // -----------------------------------------------------------------------
-    // Blocked behavior (tests 5–8)
-    // -----------------------------------------------------------------------
-
-    /// Test 5: Blocked tool returns success: false with message mentioning tool name.
     #[tokio::test]
-    async fn blocked_result_contains_tool_name_and_retry_count() {
+    async fn blocked_result_contains_tool_name_and_failure_reason() {
         let mut engine = retry_engine(2);
+        let call = make_call("blocked", "network_fetch");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "network_fetch")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        let calls = vec![make_call("4", "network_fetch")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        let results = engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
+        let reason = same_call_failure_reason(3);
         assert!(!results[0].success);
         assert!(results[0].output.contains("network_fetch"));
-        assert!(results[0].output.contains("2 retries"));
+        assert!(results[0].output.contains(&reason));
     }
 
-    /// Test 6: Blocked tool emits SignalKind::Blocked with tool name in metadata.
     #[tokio::test]
     async fn blocked_tool_emits_blocked_signal() {
         let mut engine = retry_engine(2);
+        let call = make_call("4", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        let calls = vec![make_call("4", "read_file")];
-        engine.execute_tool_calls(&calls).await.expect("execute");
+        engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
 
         let signals = engine.signals.drain_all();
         let blocked_signals: Vec<_> = signals
             .iter()
-            .filter(|s| s.kind == SignalKind::Blocked)
+            .filter(|signal| signal.kind == SignalKind::Blocked)
             .collect();
-        assert!(
-            !blocked_signals.is_empty(),
-            "should have emitted a Blocked signal"
+        let reason = same_call_failure_reason(3);
+
+        assert_eq!(blocked_signals.len(), 1);
+        assert_eq!(
+            blocked_signals[0].metadata["tool"],
+            serde_json::json!("read_file")
         );
-        let signal = &blocked_signals[0];
-        assert_eq!(signal.metadata["tool"], "read_file");
-        assert_eq!(signal.metadata["max_retries"], 2);
+        assert_eq!(
+            blocked_signals[0].metadata["reason"],
+            serde_json::json!(reason)
+        );
+        assert_eq!(
+            blocked_signals[0].metadata["signature_failures"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            blocked_signals[0].metadata["cycle_total_failures"],
+            serde_json::json!(3)
+        );
     }
 
-    /// Test 7: Tool blocked on 4th attempt remains blocked on 5th, 6th.
     #[tokio::test]
     async fn blocked_stays_blocked_within_cycle() {
         let mut engine = retry_engine(2);
+        let call = make_call("seed", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        for i in 4..=6 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(!results[0].success, "call {i} should be blocked");
+        for id in 4..=6 {
+            let blocked_call = make_call(&id.to_string(), "read_file");
+            let results = engine
+                .execute_tool_calls(&[blocked_call])
+                .await
+                .expect("execute blocked call");
+            assert_eq!(results[0].output, block_message("read_file", 3));
         }
     }
 
-    /// Test 8: Mixed batch: 1 blocked tool + 2 fresh → blocked gets synthetic, others execute.
     #[tokio::test]
     async fn mixed_batch_blocked_and_fresh() {
         let mut engine = retry_engine(2);
-
-        // Exhaust read_file
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
+        let blocked_call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &blocked_call);
 
         let calls = vec![
-            make_call("b1", "read_file"),
-            make_call("f1", "write_file"),
-            make_call("f2", "list_dir"),
+            blocked_call,
+            make_call("fresh-1", "write_file"),
+            make_call("fresh-2", "list_dir"),
         ];
         let results = engine.execute_tool_calls(&calls).await.expect("execute");
+
         assert_eq!(results.len(), 3);
-
-        // Results should be in original call order
-        assert!(!results[0].success, "read_file should be blocked");
-        assert!(results[0].output.contains("blocked"));
-        assert!(results[1].success, "write_file should succeed");
-        assert!(results[2].success, "list_dir should succeed");
+        assert_eq!(results[0].output, block_message("read_file", 3));
+        assert!(results[1].success);
+        assert!(results[2].success);
     }
 
-    // -----------------------------------------------------------------------
-    // Reset (tests 9–10)
-    // -----------------------------------------------------------------------
-
-    /// Test 9: After prepare_cycle(), a previously-blocked tool can be called again.
     #[tokio::test]
-    async fn prepare_cycle_resets_allows_blocked_tool() {
+    async fn prepare_cycle_allows_previously_blocked_signature() {
         let mut engine = retry_engine(2);
+        let call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
+        let blocked = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute blocked call");
+        assert_eq!(blocked[0].output, block_message("read_file", 3));
 
-        // Verify blocked
-        let calls = vec![make_call("4", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!results[0].success);
-
-        // Reset
         engine.prepare_cycle();
 
-        // Should work again
-        let calls = vec![make_call("5", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute");
         assert!(results[0].success);
+        assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 0);
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 10: tool_attempts is empty after prepare_cycle().
     #[tokio::test]
-    async fn tool_attempts_empty_after_prepare_cycle() {
+    async fn prepare_cycle_clears_retry_tracker() {
         let mut engine = retry_engine(2);
+        let call = make_call("1", "read_file");
+        seed_failures(&mut engine, &call, 1);
 
-        let calls = vec![make_call("1", "read_file")];
-        engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!engine.tool_attempts.is_empty());
+        assert!(!engine.tool_retry_tracker.signature_failures.is_empty());
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 1);
 
         engine.prepare_cycle();
-        assert!(engine.tool_attempts.is_empty());
+
+        assert!(engine.tool_retry_tracker.signature_failures.is_empty());
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Configuration (tests 11–13)
-    // -----------------------------------------------------------------------
+    #[test]
+    fn success_resets_failure_count() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
 
-    /// Test 11: max_tool_retries: 0 → tool blocked on 2nd attempt (1 attempt allowed).
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 1);
+
+        tracker.record_result(&call, true);
+        assert_eq!(tracker.consecutive_failures_for(&call), 0);
+
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 1);
+        assert_eq!(tracker.cycle_total_failures, 2);
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn different_args_tracked_independently() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+        };
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let mut tracker = ToolRetryTracker::default();
+
+        tracker.record_result(&call_a, false);
+        tracker.record_result(&call_a, false);
+
+        assert_eq!(tracker.consecutive_failures_for(&call_a), 2);
+        assert_eq!(tracker.consecutive_failures_for(&call_b), 0);
+        assert!(matches!(
+            tracker.should_allow(&call_a, &config),
+            RetryVerdict::Block { ref reason } if reason == &same_call_failure_reason(2)
+        ));
+        assert!(matches!(
+            tracker.should_allow(&call_b, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_all_tools() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 10,
+            max_cycle_failures: 2,
+        };
+        let mut tracker = ToolRetryTracker::default();
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let fresh_call = make_call("3", "write_file");
+
+        tracker.record_result(&call_a, false);
+        tracker.record_result(&call_b, false);
+
+        assert_eq!(tracker.cycle_total_failures, 2);
+        assert!(matches!(
+            tracker.should_allow(&fresh_call, &config),
+            RetryVerdict::Block { ref reason } if reason == &cycle_failure_limit_reason()
+        ));
+    }
+
+    #[test]
+    fn backward_compat_max_tool_retries() {
+        let mut value = serde_json::to_value(BudgetConfig::default()).expect("serialize");
+        value["max_tool_retries"] = serde_json::json!(0);
+
+        let config: BudgetConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(config.max_tool_retries, 0);
+        assert_eq!(config.max_consecutive_failures, 1);
+        assert_eq!(config.retry_policy().max_consecutive_failures, 1);
+    }
+
     #[tokio::test]
-    async fn zero_retries_blocks_on_second_attempt() {
+    async fn zero_retries_blocks_after_one_failure() {
         let mut engine = retry_engine(0);
+        let call = make_call("1", "read_file");
+        seed_failures(&mut engine, &call, 1);
 
-        let calls = vec![make_call("1", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(results[0].success);
-
-        let calls = vec![make_call("2", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!results[0].success);
+        let results = engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
+        assert_eq!(results[0].output, block_message("read_file", 1));
     }
 
-    /// Test 12: max_tool_retries: u8::MAX → effectively unlimited retries.
     #[tokio::test]
     async fn max_retries_effectively_unlimited() {
-        let mut engine = retry_engine(u8::MAX);
+        let config = BudgetConfig {
+            max_consecutive_failures: u16::from(u8::MAX).saturating_add(1),
+            max_cycle_failures: u16::MAX,
+            max_tool_retries: u8::MAX,
+            ..BudgetConfig::default()
+        };
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysFailExecutor));
 
-        // Call the same tool 255 times — all should succeed
-        for i in 1..=255_u16 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(
-                results[0].success,
-                "call {i} should succeed with u8::MAX retries"
-            );
+        for id in 1..=255_u16 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine.execute_tool_calls(&[call]).await.expect("execute");
+            assert!(!results[0].success, "call {id} should not be blocked");
+            assert!(!results[0].output.contains("blocked"));
         }
+
+        let call = make_call("255", "read_file");
+        assert_eq!(
+            engine.tool_retry_tracker.consecutive_failures_for(&call),
+            255
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 255);
     }
 
-    /// Test 13: BudgetConfig::conservative() has max_tool_retries: 1 (2 total attempts).
-    #[test]
-    fn conservative_config_has_one_retry() {
-        let config = BudgetConfig::conservative();
-        assert_eq!(config.max_tool_retries, 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration with fan-out / budget (tests 14–16)
-    // -----------------------------------------------------------------------
-
-    /// Test 14: Fan-out deferred tools don't count toward tool_attempts.
     #[tokio::test]
-    async fn deferred_tools_do_not_count_toward_attempts() {
+    async fn deferred_tools_do_not_count_toward_failures() {
         let config = BudgetConfig {
             max_fan_out: 2,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
-
-        // 4 calls, fan-out cap 2 → first 2 execute, last 2 deferred
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
         let calls = vec![
             make_call("1", "tool_a"),
             make_call("2", "tool_b"),
@@ -16296,56 +16514,46 @@ mod per_tool_retry_budget_tests {
         ];
 
         let (execute, deferred) = engine.apply_fan_out_cap(&calls);
-        assert_eq!(execute.len(), 2);
-        assert_eq!(deferred.len(), 2);
-
-        // Only execute the allowed calls through execute_tool_calls
         let results = engine.execute_tool_calls(&execute).await.expect("execute");
-        assert_eq!(results.len(), 2);
 
-        // Deferred tools should NOT be in tool_attempts
-        assert!(!engine.tool_attempts.contains_key("tool_c"));
-        assert!(!engine.tool_attempts.contains_key("tool_d"));
-        // Executed tools should be counted
-        assert_eq!(engine.tool_attempts.get("tool_a").copied(), Some(1));
-        assert_eq!(engine.tool_attempts.get("tool_b").copied(), Some(1));
+        assert_eq!(results.len(), 2);
+        assert!(is_signature_tracked(&engine, &calls[0]));
+        assert!(is_signature_tracked(&engine, &calls[1]));
+        assert!(!is_signature_tracked(&engine, &deferred[0]));
+        assert!(!is_signature_tracked(&engine, &deferred[1]));
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 15: Deferred tools re-requested in next round start fresh counts.
     #[tokio::test]
     async fn deferred_tools_start_fresh_when_executed() {
         let config = BudgetConfig {
             max_fan_out: 1,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
+        let tool_a = make_call("1", "tool_a");
+        let tool_b = make_call("2", "tool_b");
 
-        // Round 1: tool_a executes, tool_b deferred
-        let calls = vec![make_call("1", "tool_a"), make_call("2", "tool_b")];
-        let (execute, _deferred) = engine.apply_fan_out_cap(&calls);
+        let (execute, _) = engine.apply_fan_out_cap(&[tool_a.clone(), tool_b.clone()]);
         engine.execute_tool_calls(&execute).await.expect("execute");
-        assert_eq!(engine.tool_attempts.get("tool_a").copied(), Some(1));
-        assert!(!engine.tool_attempts.contains_key("tool_b"));
+        assert!(is_signature_tracked(&engine, &tool_a));
+        assert!(!is_signature_tracked(&engine, &tool_b));
 
-        // Round 2: tool_b now executed
-        let calls = vec![make_call("3", "tool_b")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&tool_b))
+            .await
+            .expect("execute deferred tool");
         assert!(results[0].success);
-        assert_eq!(engine.tool_attempts.get("tool_b").copied(), Some(1));
+        assert!(is_signature_tracked(&engine, &tool_b));
+        assert_eq!(
+            engine.tool_retry_tracker.consecutive_failures_for(&tool_b),
+            0
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 16: Tool retry blocked AND budget is Low → budget-low takes precedence.
-    /// Budget-low is checked at the top of act_with_tools() before tool dispatch,
-    /// so tools never reach execute_tool_calls when budget is Low.
-    /// This test exercises act_with_tools() directly to verify the precedence.
     #[tokio::test]
     async fn budget_low_takes_precedence_over_retry_cap() {
         use crate::budget::ActionCost;
@@ -16354,7 +16562,6 @@ mod per_tool_retry_budget_tests {
         use std::collections::VecDeque;
         use std::sync::Mutex;
 
-        /// Mock LLM that returns canned responses (same pattern as Phase4MockLlm).
         #[derive(Debug)]
         struct MockLlm {
             responses: Mutex<VecDeque<CompletionResponse>>,
@@ -16402,45 +16609,21 @@ mod per_tool_retry_budget_tests {
 
         let config = BudgetConfig {
             max_cost_cents: 100,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
-
-        // Exhaust read_file retry budget (3 attempts = initial + 2 retries)
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success);
-        }
-        // Confirm read_file is blocked at execute_tool_calls level
-        let calls = vec![make_call("blocked", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(
-            !results[0].success,
-            "read_file should be blocked by retry cap"
-        );
-
-        // Drain signals from the retry-cap blocking above
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
+        let blocked_call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &blocked_call);
         engine.signals.drain_all();
 
-        // Now push budget to Low state
         engine.budget.record(&ActionCost {
             cost_cents: 81,
             ..ActionCost::default()
         });
         assert_eq!(engine.budget.state(), BudgetState::Low);
 
-        // Call act_with_tools with the blocked tool — budget-low should
-        // short-circuit before any tool dispatch, returning a budget-blocked
-        // result rather than a retry-cap-blocked result.
         let decision = Decision::UseTools(vec![make_call("5", "read_file")]);
         let tool_calls = match &decision {
             Decision::UseTools(calls) => calls.as_slice(),
@@ -16460,33 +16643,21 @@ mod per_tool_retry_budget_tests {
             .await
             .expect("act_with_tools should succeed with budget-low path");
 
-        // Budget-low path returns immediately — no tools executed at all
-        assert!(
-            action.tool_results.is_empty(),
-            "budget-low should prevent any tool execution, got {} results",
-            action.tool_results.len()
-        );
-        // Response text should mention budget/soft-ceiling, not retry cap
+        assert!(action.tool_results.is_empty());
         assert!(
             action.response_text.contains("budget")
-                || action.response_text.contains("soft-ceiling"),
-            "response should mention budget, got: {}",
-            action.response_text
+                || action.response_text.contains("soft-ceiling")
         );
 
-        // Verify the Blocked signal is for budget, not retry cap
         let signals = engine.signals.drain_all();
         let blocked_signals: Vec<_> = signals
             .iter()
-            .filter(|s| s.kind == SignalKind::Blocked)
+            .filter(|signal| signal.kind == SignalKind::Blocked)
             .collect();
-        assert!(
-            !blocked_signals.is_empty(),
-            "should have emitted a Blocked signal"
-        );
+        assert!(!blocked_signals.is_empty());
         assert_eq!(
-            blocked_signals[0].metadata["reason"], "budget_soft_ceiling",
-            "blocked signal should be budget-based, not retry-cap-based"
+            blocked_signals[0].metadata["reason"],
+            serde_json::json!("budget_soft_ceiling")
         );
     }
 }

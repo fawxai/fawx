@@ -26,6 +26,10 @@ const DEFAULT_MAX_SYNTHESIS_TOKENS: usize = 50_000;
 const DEFAULT_LLM_CALL_TOKENS: u64 = 1_000;
 pub(crate) const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 pub(crate) const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
+const DEFAULT_MAX_CONSECUTIVE_FAILURES: u16 = 3;
+const DEFAULT_MAX_CYCLE_FAILURES: u16 = 15;
+#[cfg(test)]
+const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
 const COMPLEXITY_KEYWORDS: [&str; 6] = [
     "analyze",
     "refactor",
@@ -42,8 +46,52 @@ pub enum DepthMode {
     Adaptive,
 }
 
+/// Retry policy configuration for tool execution within a single cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryPolicyConfig {
+    /// Max consecutive failures on the same (tool, args) before blocking.
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u16,
+    /// Max total failures across all tools before circuit-breaking the cycle.
+    #[serde(default = "default_max_cycle_failures")]
+    pub max_cycle_failures: u16,
+}
+
+impl RetryPolicyConfig {
+    pub fn conservative() -> Self {
+        Self {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 8,
+        }
+    }
+
+    pub fn permissive() -> Self {
+        Self {
+            max_consecutive_failures: 10,
+            max_cycle_failures: 50,
+        }
+    }
+
+    pub fn unlimited() -> Self {
+        Self {
+            max_consecutive_failures: u16::MAX,
+            max_cycle_failures: u16::MAX,
+        }
+    }
+}
+
+impl Default for RetryPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+        }
+    }
+}
+
 /// Budget configuration for a single loop invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "BudgetConfigSerde")]
 pub struct BudgetConfig {
     /// Maximum number of LLM calls allowed.
     pub max_llm_calls: u32,
@@ -82,10 +130,83 @@ pub struct BudgetConfig {
     /// Maximum tokens to include in the synthesis prompt (Layer 2 eviction limit).
     #[serde(default = "default_max_synthesis_tokens")]
     pub max_synthesis_tokens: usize,
-    /// Maximum retries per tool name per cycle (0 = no retries, only initial attempt).
-    /// Total attempts = max_tool_retries + 1.
+    /// Max consecutive failures on the same (tool, args) before blocking.
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u16,
+    /// Max total failures across all tools before circuit-breaking the cycle.
+    #[serde(default = "default_max_cycle_failures")]
+    pub max_cycle_failures: u16,
+    /// Legacy compatibility field for configs that still set `max_tool_retries`.
+    /// Total attempts in the old model = `max_tool_retries + 1`.
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BudgetConfigSerde {
+    max_llm_calls: u32,
+    max_tool_invocations: u32,
+    max_tokens: u64,
+    max_cost_cents: u64,
+    max_wall_time_ms: u64,
+    max_recursion_depth: u32,
+    #[serde(default)]
+    decompose_depth_mode: DepthMode,
+    #[serde(default = "default_soft_ceiling_percent")]
+    soft_ceiling_percent: u8,
+    #[serde(default = "default_max_fan_out")]
+    max_fan_out: usize,
+    #[serde(default = "default_max_tool_result_bytes")]
+    max_tool_result_bytes: usize,
+    #[serde(default = "default_max_aggregate_result_bytes")]
+    max_aggregate_result_bytes: usize,
+    #[serde(default = "default_max_synthesis_tokens")]
+    max_synthesis_tokens: usize,
+    #[serde(default = "default_max_consecutive_failures")]
+    max_consecutive_failures: u16,
+    #[serde(default = "default_max_cycle_failures")]
+    max_cycle_failures: u16,
+    #[serde(default)]
+    max_tool_retries: Option<u8>,
+}
+
+impl From<BudgetConfigSerde> for BudgetConfig {
+    fn from(value: BudgetConfigSerde) -> Self {
+        let max_consecutive_failures = value
+            .max_tool_retries
+            .map(max_consecutive_failures_from_legacy_retries)
+            .unwrap_or(value.max_consecutive_failures);
+        let max_tool_retries = value
+            .max_tool_retries
+            .unwrap_or_else(|| legacy_retries_from_consecutive_failures(max_consecutive_failures));
+
+        Self {
+            max_llm_calls: value.max_llm_calls,
+            max_tool_invocations: value.max_tool_invocations,
+            max_tokens: value.max_tokens,
+            max_cost_cents: value.max_cost_cents,
+            max_wall_time_ms: value.max_wall_time_ms,
+            max_recursion_depth: value.max_recursion_depth,
+            decompose_depth_mode: value.decompose_depth_mode,
+            soft_ceiling_percent: value.soft_ceiling_percent,
+            max_fan_out: value.max_fan_out,
+            max_tool_result_bytes: value.max_tool_result_bytes,
+            max_aggregate_result_bytes: value.max_aggregate_result_bytes,
+            max_synthesis_tokens: value.max_synthesis_tokens,
+            max_consecutive_failures,
+            max_cycle_failures: value.max_cycle_failures,
+            max_tool_retries,
+        }
+    }
+}
+
+impl From<&BudgetConfig> for RetryPolicyConfig {
+    fn from(value: &BudgetConfig) -> Self {
+        Self {
+            max_consecutive_failures: value.max_consecutive_failures,
+            max_cycle_failures: value.max_cycle_failures,
+        }
+    }
 }
 
 fn default_soft_ceiling_percent() -> u8 {
@@ -108,15 +229,32 @@ fn default_max_synthesis_tokens() -> usize {
     DEFAULT_MAX_SYNTHESIS_TOKENS
 }
 
-const DEFAULT_MAX_TOOL_RETRIES: u8 = 5;
+fn default_max_consecutive_failures() -> u16 {
+    DEFAULT_MAX_CONSECUTIVE_FAILURES
+}
+
+fn default_max_cycle_failures() -> u16 {
+    DEFAULT_MAX_CYCLE_FAILURES
+}
 
 fn default_max_tool_retries() -> u8 {
-    DEFAULT_MAX_TOOL_RETRIES
+    legacy_retries_from_consecutive_failures(DEFAULT_MAX_CONSECUTIVE_FAILURES)
+}
+
+fn max_consecutive_failures_from_legacy_retries(max_tool_retries: u8) -> u16 {
+    u16::from(max_tool_retries).saturating_add(1)
+}
+
+fn legacy_retries_from_consecutive_failures(max_consecutive_failures: u16) -> u8 {
+    max_consecutive_failures
+        .saturating_sub(1)
+        .min(u16::from(u8::MAX)) as u8
 }
 
 impl BudgetConfig {
     /// Return a conservative configuration for background/proactive actions.
     pub fn conservative() -> Self {
+        let retry_policy = RetryPolicyConfig::conservative();
         Self {
             max_llm_calls: 8,
             max_tool_invocations: 16,
@@ -130,7 +268,24 @@ impl BudgetConfig {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
-            max_tool_retries: 1,
+            max_consecutive_failures: retry_policy.max_consecutive_failures,
+            max_cycle_failures: retry_policy.max_cycle_failures,
+            max_tool_retries: legacy_retries_from_consecutive_failures(
+                retry_policy.max_consecutive_failures,
+            ),
+        }
+    }
+
+    /// Return a more permissive retry policy for exploratory loops.
+    pub fn permissive() -> Self {
+        let retry_policy = RetryPolicyConfig::permissive();
+        Self {
+            max_consecutive_failures: retry_policy.max_consecutive_failures,
+            max_cycle_failures: retry_policy.max_cycle_failures,
+            max_tool_retries: legacy_retries_from_consecutive_failures(
+                retry_policy.max_consecutive_failures,
+            ),
+            ..Self::default()
         }
     }
 
@@ -138,6 +293,7 @@ impl BudgetConfig {
     ///
     /// This should not be used in production runtime paths.
     pub fn unlimited() -> Self {
+        let retry_policy = RetryPolicyConfig::unlimited();
         Self {
             max_llm_calls: u32::MAX,
             max_tool_invocations: u32::MAX,
@@ -151,14 +307,26 @@ impl BudgetConfig {
             max_tool_result_bytes: usize::MAX,
             max_aggregate_result_bytes: usize::MAX,
             max_synthesis_tokens: usize::MAX,
-            max_tool_retries: u8::MAX,
+            max_consecutive_failures: retry_policy.max_consecutive_failures,
+            max_cycle_failures: retry_policy.max_cycle_failures,
+            max_tool_retries: legacy_retries_from_consecutive_failures(
+                retry_policy.max_consecutive_failures,
+            ),
         }
+    }
+
+    pub fn retry_policy(&self) -> RetryPolicyConfig {
+        RetryPolicyConfig::from(self)
     }
 }
 
 impl Default for BudgetConfig {
     /// Return a generous default for normal user-initiated loops.
     fn default() -> Self {
+        let retry_policy = RetryPolicyConfig::default();
+        let max_tool_retries =
+            legacy_retries_from_consecutive_failures(DEFAULT_MAX_CONSECUTIVE_FAILURES);
+        debug_assert_eq!(max_tool_retries, default_max_tool_retries());
         Self {
             max_llm_calls: 64,
             max_tool_invocations: 128,
@@ -172,7 +340,9 @@ impl Default for BudgetConfig {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
-            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            max_consecutive_failures: retry_policy.max_consecutive_failures,
+            max_cycle_failures: retry_policy.max_cycle_failures,
+            max_tool_retries,
         }
     }
 }
@@ -321,6 +491,8 @@ impl BudgetAllocator {
                 max_tool_result_bytes: template.max_tool_result_bytes,
                 max_aggregate_result_bytes: template.max_aggregate_result_bytes,
                 max_synthesis_tokens: template.max_synthesis_tokens,
+                max_consecutive_failures: template.max_consecutive_failures,
+                max_cycle_failures: template.max_cycle_failures,
                 max_tool_retries: template.max_tool_retries,
             });
         }
@@ -955,6 +1127,8 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_tool_result_bytes: template.max_tool_result_bytes,
         max_aggregate_result_bytes: template.max_aggregate_result_bytes,
         max_synthesis_tokens: template.max_synthesis_tokens,
+        max_consecutive_failures: template.max_consecutive_failures,
+        max_cycle_failures: template.max_cycle_failures,
         max_tool_retries: template.max_tool_retries,
     }
 }
@@ -973,6 +1147,8 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_tool_result_bytes: template.max_tool_result_bytes,
         max_aggregate_result_bytes: template.max_aggregate_result_bytes,
         max_synthesis_tokens: template.max_synthesis_tokens,
+        max_consecutive_failures: template.max_consecutive_failures,
+        max_cycle_failures: template.max_cycle_failures,
         max_tool_retries: template.max_tool_retries,
     }
 }
@@ -1042,6 +1218,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         }
     }
@@ -1070,6 +1248,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         }
     }
@@ -1495,6 +1675,10 @@ mod tests {
         assert_eq!(default.decompose_depth_mode, DepthMode::Adaptive);
         assert_eq!(conservative.decompose_depth_mode, DepthMode::Adaptive);
         assert_eq!(unlimited.decompose_depth_mode, DepthMode::Adaptive);
+        assert_eq!(
+            default.max_tool_retries,
+            legacy_retries_from_consecutive_failures(default.max_consecutive_failures)
+        );
 
         assert_eq!(unlimited.max_llm_calls, u32::MAX);
         assert_eq!(unlimited.max_tool_invocations, u32::MAX);
@@ -1502,6 +1686,49 @@ mod tests {
         assert_eq!(unlimited.max_cost_cents, u64::MAX);
         assert_eq!(unlimited.max_wall_time_ms, u64::MAX);
         assert_eq!(unlimited.max_recursion_depth, u32::MAX);
+    }
+
+    #[test]
+    fn budget_config_permissive_uses_default_limits_with_permissive_retry_policy() {
+        let retry_policy = RetryPolicyConfig::permissive();
+        let expected = BudgetConfig {
+            max_consecutive_failures: retry_policy.max_consecutive_failures,
+            max_cycle_failures: retry_policy.max_cycle_failures,
+            max_tool_retries: legacy_retries_from_consecutive_failures(
+                retry_policy.max_consecutive_failures,
+            ),
+            ..BudgetConfig::default()
+        };
+
+        assert_eq!(BudgetConfig::permissive(), expected);
+    }
+
+    #[test]
+    fn budget_config_deserialization_prefers_max_tool_retries_over_consecutive_failures() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "max_consecutive_failures": 99,
+            "max_tool_retries": 4
+        }"#;
+        let config: BudgetConfig = serde_json::from_str(json).unwrap();
+        let expected = BudgetConfig {
+            max_llm_calls: 7,
+            max_tool_invocations: 9,
+            max_tokens: 1_234,
+            max_cost_cents: 55,
+            max_wall_time_ms: 123_456,
+            max_recursion_depth: 6,
+            max_consecutive_failures: max_consecutive_failures_from_legacy_retries(4),
+            max_tool_retries: 4,
+            ..BudgetConfig::default()
+        };
+
+        assert_eq!(config, expected);
     }
 
     #[test]
@@ -1617,6 +1844,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
@@ -1661,6 +1890,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1715,6 +1946,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1747,6 +1980,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1798,6 +2033,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1858,6 +2095,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1886,6 +2125,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -1918,6 +2159,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2055,6 +2298,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
@@ -2077,6 +2322,8 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
