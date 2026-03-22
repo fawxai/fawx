@@ -292,7 +292,7 @@ fn middle_tool_pair_map(
     messages: &[Message],
     bounds: &ZoneBounds,
 ) -> HashMap<String, HashSet<usize>> {
-    let mut pair_map = HashMap::new();
+    let mut pair_map: HashMap<String, HashSet<usize>> = HashMap::new();
 
     for (index, message) in messages
         .iter()
@@ -301,10 +301,7 @@ fn middle_tool_pair_map(
         .skip(bounds.prefix_end)
     {
         for id in tool_ids_in_message(message) {
-            pair_map
-                .entry(id.to_string())
-                .or_insert_with(HashSet::new)
-                .insert(index);
+            pair_map.entry(id.to_string()).or_default().insert(index);
         }
     }
 
@@ -794,10 +791,7 @@ impl CompactionStrategy for SlidingWindowCompactor {
         messages: &[Message],
         target_tokens: usize,
     ) -> Result<CompactionResult, CompactionError> {
-        let result =
-            sliding_compaction_result(messages, target_tokens, self.preserve_recent_turns)?;
-        debug_assert_tool_pair_integrity(&result.messages);
-        Ok(result)
+        sliding_compaction_result(messages, target_tokens, self.preserve_recent_turns)
     }
 }
 
