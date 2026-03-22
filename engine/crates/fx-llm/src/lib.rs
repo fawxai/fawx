@@ -29,6 +29,7 @@ pub use thinking::{default_thinking_level, thinking_config_for_model, valid_thin
 mod test_helpers;
 pub mod thinking;
 mod types;
+mod validation;
 
 pub use anthropic::AnthropicAuthMode;
 pub use anthropic::AnthropicProvider;

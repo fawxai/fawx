@@ -11,9 +11,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
-    emergency_compact, estimate_text_tokens, has_prunable_blocks, prune_tool_blocks,
-    CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult, CompactionStrategy,
-    ConversationBudget, SlidingWindowCompactor,
+    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, has_prunable_blocks,
+    prune_tool_blocks, CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult,
+    CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
 };
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -3320,6 +3320,7 @@ impl LoopEngine {
             }
             Some(CompactionTier::Prune) | None => current,
         };
+        debug_assert_tool_pair_integrity(current.as_ref());
         self.ensure_within_hard_limit(scope, current.as_ref())?;
         Ok(current)
     }
@@ -13082,6 +13083,46 @@ mod context_compaction_tests {
 
         assert!(has_emergency_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_emergency_tier_preserves_tool_pairs() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![
+            tool_use("call-1"),
+            user(250),
+            assistant(250),
+            tool_result("call-1", 230),
+            user(230),
+        ];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(compacted.as_ref().iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call-1"))
+        }));
+        assert!(compacted.as_ref().iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1"
+                )
+            })
+        }));
+        debug_assert_tool_pair_integrity(compacted.as_ref());
     }
 
     #[tokio::test]

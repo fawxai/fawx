@@ -25,6 +25,7 @@ use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
+use crate::validation::validate_tool_message_sequence;
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
@@ -760,45 +761,6 @@ fn map_message_to_responses_input(
     Ok(())
 }
 
-fn validate_tool_message_sequence(messages: &[Message]) -> Result<(), LlmError> {
-    let mut seen_tool_calls = HashSet::new();
-
-    for (message_index, message) in messages.iter().enumerate() {
-        match message.role {
-            MessageRole::Assistant => {
-                for block in &message.content {
-                    if let ContentBlock::ToolUse { id, .. } = block {
-                        if !id.trim().is_empty() {
-                            seen_tool_calls.insert(id.clone());
-                        }
-                    }
-                }
-            }
-            MessageRole::Tool => {
-                for block in &message.content {
-                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                        let trimmed = tool_use_id.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if !seen_tool_calls.contains(trimmed) {
-                            return Err(LlmError::Request(format!(
-                                "invalid tool continuation messages: tool result '{}' at message {} has no matching earlier assistant tool_use; tail={}",
-                                trimmed,
-                                message_index,
-                                summarize_message_tail(messages),
-                            )));
-                        }
-                    }
-                }
-            }
-            MessageRole::System | MessageRole::User => {}
-        }
-    }
-
-    Ok(())
-}
-
 fn validate_responses_input_sequence(input: &[Value]) -> Result<(), LlmError> {
     let mut seen_tool_calls = HashSet::new();
 
@@ -834,45 +796,6 @@ fn validate_responses_input_sequence(input: &[Value]) -> Result<(), LlmError> {
     }
 
     Ok(())
-}
-
-fn summarize_message_tail(messages: &[Message]) -> String {
-    let start = messages.len().saturating_sub(6);
-    messages[start..]
-        .iter()
-        .enumerate()
-        .map(|(offset, message)| summarize_message(start + offset, message))
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-fn summarize_message(index: usize, message: &Message) -> String {
-    let blocks = message
-        .content
-        .iter()
-        .map(summarize_content_block)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{index}:{:?}[{blocks}]", message.role)
-}
-
-fn summarize_content_block(block: &ContentBlock) -> String {
-    match block {
-        ContentBlock::Text { text } => {
-            format!("text:{}", text.chars().take(24).collect::<String>())
-        }
-        ContentBlock::ToolUse {
-            id,
-            provider_id,
-            name,
-            ..
-        } => format!(
-            "tool_use:{name}:{id}:{}",
-            provider_id.as_deref().unwrap_or("-")
-        ),
-        ContentBlock::ToolResult { tool_use_id, .. } => format!("tool_result:{tool_use_id}"),
-        ContentBlock::Image { .. } => "image".to_string(),
-    }
 }
 
 fn summarize_input_tail(input: &[Value]) -> String {
@@ -1664,6 +1587,35 @@ mod tests {
         }
     }
 
+    fn single_tool_continuation_request(tool_output: Value) -> CompletionRequest {
+        CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        provider_id: None,
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({"q": "weather"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: tool_output,
+                    }],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        }
+    }
+
     #[test]
     fn build_request_body_maps_messages() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
@@ -1978,59 +1930,35 @@ mod tests {
     #[test]
     fn test_build_request_body_maps_tool_result_string_content() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
-        let request = CompletionRequest {
-            model: "gpt-4.1".to_string(),
-            messages: vec![crate::types::Message {
-                role: MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: Value::String("tool output".to_string()),
-                }],
-            }],
-            system_prompt: None,
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            thinking: None,
-        };
+        let request = single_tool_continuation_request(Value::String("tool output".to_string()));
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
         let input = serialized["input"].as_array().unwrap();
 
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"], "tool output");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "tool output");
     }
 
     #[test]
     fn test_build_request_body_maps_tool_result_error_prefix() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
-        let request = CompletionRequest {
-            model: "gpt-4.1".to_string(),
-            messages: vec![crate::types::Message {
-                role: MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: Value::String("[ERROR] permission denied".to_string()),
-                }],
-            }],
-            system_prompt: None,
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            thinking: None,
-        };
+        let request = single_tool_continuation_request(Value::String(
+            "[ERROR] permission denied".to_string(),
+        ));
 
         let body = provider.build_request_body(&request, false).unwrap();
         let serialized = serde_json::to_value(&body).unwrap();
         let input = serialized["input"].as_array().unwrap();
 
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"], "[ERROR] permission denied");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "[ERROR] permission denied");
     }
 
     #[test]
