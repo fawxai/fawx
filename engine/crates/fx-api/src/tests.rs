@@ -1,12 +1,13 @@
 use crate::config_redaction;
 use crate::devices::DeviceStore;
-use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult, ResultKind};
 use crate::error::HttpError;
 use crate::experiment_registry::ExperimentRegistry;
 use crate::handlers::health::sanitize_config;
 use crate::listener::{
-    bind_listener, listen_targets, optional_bound_listener, optional_tailscale_ip, run_listeners,
-    wait_for_server_pair, BoundListener, BoundListeners, ListenTarget,
+    bind_listener, detect_tls_config, listen_targets, optional_bound_listener,
+    optional_tailscale_ip, run_listeners, startup_target_lines, wait_for_server_pair,
+    BoundListener, BoundListeners, ListenTarget, ServerIdentity, ServerProtocol,
 };
 use crate::middleware::verify_token;
 use crate::pairing::PairingState;
@@ -102,6 +103,7 @@ impl AppEngine for HeadlessApp {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
+            result_kind: result.result_kind.into(),
         })
     }
 
@@ -123,6 +125,7 @@ impl AppEngine for HeadlessApp {
                 response: result.response,
                 model: result.model,
                 iterations: result.iterations,
+                result_kind: result.result_kind.into(),
             },
             updated_history,
         ))
@@ -224,6 +227,10 @@ impl AppEngine for HeadlessApp {
             })
             .collect()
     }
+
+    fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
+        HeadlessApp::take_last_session_messages(self)
+    }
 }
 
 #[test]
@@ -255,6 +262,18 @@ fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
         },
         version: "test".to_string(),
     }))
+}
+
+impl From<fx_cli::headless::ResultKind> for ResultKind {
+    fn from(kind: fx_cli::headless::ResultKind) -> Self {
+        match kind {
+            fx_cli::headless::ResultKind::Complete => Self::Complete,
+            fx_cli::headless::ResultKind::Partial => Self::Partial,
+            fx_cli::headless::ResultKind::NeedsInput => Self::NeedsInput,
+            fx_cli::headless::ResultKind::Error => Self::Error,
+            fx_cli::headless::ResultKind::Empty => Self::Empty,
+        }
+    }
 }
 
 fn mock_completion_response() -> CompletionResponse {
@@ -348,6 +367,7 @@ async fn mock_health() -> Json<HealthResponse> {
         model: "test-model".to_string(),
         uptime_seconds: 42,
         skills_loaded: 2,
+        https_enabled: false,
     })
 }
 
@@ -377,6 +397,7 @@ async fn mock_message(
         response: format!("echo: {}", req.message),
         model: "test-model".to_string(),
         iterations: 1,
+        result_kind: ResultKind::Complete,
     }))
 }
 
@@ -453,13 +474,82 @@ fn optional_tailscale_ip_returns_none_when_detection_fails() {
     assert!(result.is_none());
 }
 
+#[test]
+fn detect_tls_config_returns_none_when_files_are_missing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    assert!(detect_tls_config(temp.path()).is_none());
+}
+
+#[test]
+fn detect_tls_config_returns_some_when_both_files_exist() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tls_dir = temp.path().join("tls");
+    std::fs::create_dir_all(&tls_dir).expect("create tls dir");
+    std::fs::write(tls_dir.join("cert.pem"), "cert").expect("write cert");
+    std::fs::write(tls_dir.join("key.pem"), "key").expect("write key");
+
+    let tls_config = detect_tls_config(temp.path()).expect("detect tls");
+    assert_eq!(tls_config.cert_path, tls_dir.join("cert.pem"));
+    assert_eq!(tls_config.key_path, tls_dir.join("key.pem"));
+}
+
+#[test]
+fn detect_tls_config_returns_none_when_only_one_file_exists() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tls_dir = temp.path().join("tls");
+    std::fs::create_dir_all(&tls_dir).expect("create tls dir");
+    std::fs::write(tls_dir.join("cert.pem"), "cert").expect("write cert");
+
+    assert!(detect_tls_config(temp.path()).is_none());
+}
+
+#[test]
+fn startup_target_lines_use_https_for_tailscale_when_enabled() {
+    let lines = startup_target_lines(
+        ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8400)),
+            label: "local",
+        },
+        Some(ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        }),
+        true,
+    );
+
+    assert_eq!(lines[0], "Fawx API listening on:");
+    assert_eq!(lines[1], "  http://127.0.0.1:8400 (local)");
+    assert_eq!(lines[2], "  https://100.93.251.101:8400 (Tailscale)");
+}
+
+#[test]
+fn startup_target_lines_use_http_for_tailscale_when_tls_disabled() {
+    let lines = startup_target_lines(
+        ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8400)),
+            label: "local",
+        },
+        Some(ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        }),
+        false,
+    );
+
+    assert_eq!(lines[0], "Fawx HTTP API listening on:");
+    assert_eq!(lines[2], "  http://100.93.251.101:8400 (Tailscale)");
+}
+
 #[tokio::test]
 async fn tailscale_bind_failure_falls_back_to_localhost_server() {
     let local_target = ListenTarget {
         addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         label: "local",
     };
-    let local_listener = bind_listener(local_target).await.expect("bind localhost");
+    let local_listener = bind_listener(local_target, ServerProtocol::Http)
+        .await
+        .expect("bind localhost");
     let local_addr = local_listener.local_addr().expect("local addr");
     let tailscale_target = ListenTarget {
         addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
@@ -479,6 +569,7 @@ async fn tailscale_bind_failure_falls_back_to_localhost_server() {
     let server = tokio::spawn(run_listeners(
         Router::new().route("/health", get(mock_health)),
         listeners,
+        None,
     ));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -502,9 +593,15 @@ async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
     });
 
     let result = wait_for_server_pair(
-        "local",
+        ServerIdentity {
+            label: "local",
+            protocol: ServerProtocol::Http,
+        },
         local_server,
-        "Tailscale",
+        ServerIdentity {
+            label: "Tailscale",
+            protocol: ServerProtocol::Http,
+        },
         tailscale_server,
         shutdown_tx,
     )
@@ -562,12 +659,14 @@ fn message_response_serializes_correctly() {
         response: "hi there".to_string(),
         model: "gpt-4".to_string(),
         iterations: 2,
+        result_kind: ResultKind::Complete,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["response"], "hi there");
     assert_eq!(json["model"], "gpt-4");
     assert_eq!(json["iterations"], 2);
+    assert_eq!(json["result_kind"], "complete");
 }
 
 #[test]
@@ -577,6 +676,7 @@ fn health_response_has_expected_fields() {
         model: "claude-3".to_string(),
         uptime_seconds: 60,
         skills_loaded: 3,
+        https_enabled: true,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
@@ -584,6 +684,7 @@ fn health_response_has_expected_fields() {
     assert_eq!(json["model"], "claude-3");
     assert_eq!(json["uptime_seconds"], 60);
     assert_eq!(json["skills_loaded"], 3);
+    assert_eq!(json["https_enabled"], true);
 }
 
 #[test]
@@ -903,6 +1004,19 @@ fn serialize_stream_event_serializes_typed_phase() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_notification_payload() {
+    let frame = serialize_stream_event(StreamEvent::Notification {
+        title: "Fawx".to_string(),
+        body: "Task complete".to_string(),
+    })
+    .expect("notification frame");
+
+    assert!(frame.contains("event: notification"));
+    assert!(frame.contains("\"title\":\"Fawx\""));
+    assert!(frame.contains("\"body\":\"Task complete\""));
+}
+
+#[test]
 fn serialize_stream_event_serializes_error_event_payload() {
     let frame = serialize_stream_event(StreamEvent::Error {
         category: fx_kernel::ErrorCategory::Memory,
@@ -1069,8 +1183,9 @@ mod routing_and_status {
         ProviderCapabilities, ProviderError as LlmError,
     };
     use fx_session::{
-        MessageRole as SessionMessageRole, SessionConfig, SessionError, SessionKey, SessionKind,
-        SessionRegistry, SessionStatus, SessionStore,
+        MessageRole as SessionMessageRole, SessionConfig, SessionContentBlock, SessionError,
+        SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
+        SessionStore,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
@@ -1291,13 +1406,203 @@ mod routing_and_status {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
             experiment_registry: None,
         })
         .expect("test app")
+    }
+
+    #[derive(Debug, Default)]
+    struct SessionMemoryPersistingState {
+        current_memory: SessionMemory,
+        loaded_memories: Vec<SessionMemory>,
+        last_session_messages: Vec<SessionMessage>,
+        loaded_session_key: Option<SessionKey>,
+    }
+
+    #[derive(Clone)]
+    struct SessionMemoryPersistingTestApp {
+        state: Arc<StdMutex<SessionMemoryPersistingState>>,
+    }
+
+    impl SessionMemoryPersistingTestApp {
+        fn new(initial_memory: SessionMemory, loaded_session_key: Option<SessionKey>) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(SessionMemoryPersistingState {
+                    current_memory: initial_memory,
+                    loaded_memories: Vec::new(),
+                    last_session_messages: Vec::new(),
+                    loaded_session_key,
+                })),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AppEngine for SessionMemoryPersistingTestApp {
+        async fn process_message(
+            &mut self,
+            input: &str,
+            images: Vec<ImageAttachment>,
+            source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<ApiCycleResult, anyhow::Error> {
+            let (result, _) = self
+                .process_message_with_context(input, images, Vec::new(), source, callback)
+                .await?;
+            Ok(result)
+        }
+
+        async fn process_message_with_context(
+            &mut self,
+            input: &str,
+            _images: Vec<ImageAttachment>,
+            context: Vec<Message>,
+            _source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+            let response = "Stored memory response".to_string();
+            {
+                let mut state = self.state.lock().expect("state lock");
+                let loaded_memory = state.current_memory.clone();
+                state.loaded_memories.push(loaded_memory);
+                state.current_memory.current_state = Some("updated during turn".to_string());
+                state.last_session_messages = vec![
+                    SessionMessage::text(SessionMessageRole::User, input, 2),
+                    SessionMessage::text(SessionMessageRole::Assistant, &response, 3),
+                ];
+            }
+            if let Some(callback) = callback {
+                callback(StreamEvent::PhaseChange {
+                    phase: fx_kernel::Phase::Synthesize,
+                });
+                callback(StreamEvent::TextDelta {
+                    text: response.clone(),
+                });
+                callback(StreamEvent::Done {
+                    response: response.clone(),
+                });
+            }
+            Ok((
+                ApiCycleResult {
+                    response,
+                    model: "mock-model".to_string(),
+                    iterations: 1,
+                    result_kind: ResultKind::Complete,
+                },
+                context,
+            ))
+        }
+
+        fn active_model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn available_models(&self) -> Vec<ModelInfoDto> {
+            vec![ModelInfoDto {
+                model_id: "mock-model".to_string(),
+                provider: "test".to_string(),
+                auth_method: "none".to_string(),
+            }]
+        }
+
+        fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+            Ok(ModelSwitchDto {
+                previous_model: "mock-model".to_string(),
+                active_model: selector.to_string(),
+                thinking_adjusted: None,
+            })
+        }
+
+        fn thinking_level(&self) -> ThinkingLevelDto {
+            ThinkingLevelDto {
+                level: "minimal".to_string(),
+                budget_tokens: None,
+                available: vec!["minimal".to_string()],
+            }
+        }
+
+        fn context_info(&self) -> ContextInfoDto {
+            ContextInfoDto {
+                used_tokens: 0,
+                max_tokens: 0,
+                percentage: 0.0,
+                compaction_threshold: 0.0,
+            }
+        }
+
+        fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+            self.context_info()
+        }
+
+        fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+            Ok(ThinkingLevelDto {
+                level: level.to_string(),
+                budget_tokens: None,
+                available: vec![level.to_string()],
+            })
+        }
+
+        fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+            Vec::new()
+        }
+
+        fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+            Vec::new()
+        }
+
+        fn config_manager(&self) -> Option<ConfigManagerHandle> {
+            None
+        }
+
+        fn session_bus(&self) -> Option<&SessionBus> {
+            None
+        }
+
+        fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+            Vec::new()
+        }
+
+        fn replace_session_memory(&mut self, memory: SessionMemory) -> SessionMemory {
+            let mut state = self.state.lock().expect("state lock");
+            std::mem::replace(&mut state.current_memory, memory)
+        }
+
+        fn session_memory(&self) -> SessionMemory {
+            self.state
+                .lock()
+                .expect("state lock")
+                .current_memory
+                .clone()
+        }
+
+        fn loaded_session_key(&self) -> Option<SessionKey> {
+            self.state
+                .lock()
+                .expect("state lock")
+                .loaded_session_key
+                .clone()
+        }
+
+        fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+            std::mem::take(&mut self.state.lock().expect("state lock").last_session_messages)
+        }
+    }
+
+    fn session_memory_test_router(
+        registry: SessionRegistry,
+        initial_memory: SessionMemory,
+        loaded_session_key: Option<SessionKey>,
+    ) -> (Router, Arc<StdMutex<SessionMemoryPersistingState>>) {
+        let app = SessionMemoryPersistingTestApp::new(initial_memory, loaded_session_key);
+        let app_state = Arc::clone(&app.state);
+        let mut state = test_state_with_sessions(registry);
+        state.shared = Arc::new(SharedReadState::from_app(&app));
+        state.app = Arc::new(Mutex::new(app));
+        (build_router(state, None), app_state)
     }
 
     fn runtime_info_with_skills(
@@ -2446,6 +2751,58 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_session_messages_returns_structured_blocks() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-structured");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                Some(12),
+            )
+            .expect("record tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("file contents"),
+                    is_error: Some(false),
+                }],
+                None,
+            )
+            .expect("record tool result");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(json["messages"][0]["token_count"], 12);
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(json["messages"][1]["content"][0]["is_error"], false);
+    }
+
+    #[tokio::test]
     async fn session_message_records_history() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-history");
@@ -2464,9 +2821,369 @@ allowed_chat_ids = [123]
         let history = registry.history(&key, 10).expect("history");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, SessionMessageRole::User);
-        assert_eq!(history[0].content, "hello there");
+        assert_eq!(
+            history[0].content,
+            vec![SessionContentBlock::Text {
+                text: "hello there".to_string()
+            }]
+        );
         assert_eq!(history[1].role, SessionMessageRole::Assistant);
-        assert_eq!(history[1].content, "Mock response");
+        assert_eq!(
+            history[1].content,
+            vec![SessionContentBlock::Text {
+                text: "Mock response".to_string()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_message_ignores_unresolved_prior_tool_use_in_context() {
+        #[derive(Clone)]
+        struct LocalCapturingProvider {
+            captured: Arc<std::sync::Mutex<Vec<fx_llm::CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl fx_llm::CompletionProvider for LocalCapturingProvider {
+            async fn complete(
+                &self,
+                request: fx_llm::CompletionRequest,
+            ) -> Result<CompletionResponse, fx_llm::ProviderError> {
+                self.captured.lock().expect("capture lock").push(request);
+                Ok(mock_completion_response())
+            }
+
+            async fn complete_stream(
+                &self,
+                request: fx_llm::CompletionRequest,
+            ) -> Result<CompletionStream, fx_llm::ProviderError> {
+                self.captured.lock().expect("capture lock").push(request);
+                Ok(mock_completion_stream())
+            }
+
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["capturing-model".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-orphan-tool");
+        registry
+            .record_message(&key, SessionMessageRole::User, "first request")
+            .expect("record user");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                Some(10),
+            )
+            .expect("record resolved tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                    is_error: Some(false),
+                }],
+                None,
+            )
+            .expect("record resolved tool result");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                Some(10),
+            )
+            .expect("record orphan tool use");
+
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = fx_llm::ModelRouter::new();
+        router.register_provider(Box::new(LocalCapturingProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("capturing-model")
+            .expect("set active capturing model");
+        let app = build_test_app(
+            router,
+            fx_config::FawxConfig::default(),
+            None,
+            test_runtime_info(),
+        );
+        let mut state = test_state_with_app(app, Vec::new());
+        state.session_registry = Some(registry);
+        let app = build_router(state, None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"continue from here"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+
+        assert!(captured_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_good")));
+        assert!(!captured_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_bad")));
+    }
+
+    #[tokio::test]
+    async fn get_session_memory_returns_stored_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-get");
+        let memory = SessionMemory {
+            project: Some("Phase 6".to_string()),
+            current_state: Some("Reviewing compaction UX".to_string()),
+            key_decisions: vec!["Use a subtle banner".to_string()],
+            active_files: vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()],
+            custom_context: vec!["Keep session memory user-editable".to_string()],
+            last_updated: 1_742_000_000,
+        };
+        registry
+            .record_turn(&key, Vec::new(), memory.clone())
+            .expect("seed memory");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let resp = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/memory")))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(body, serde_json::to_value(memory).expect("memory json"));
+    }
+
+    #[tokio::test]
+    async fn put_session_memory_persists_and_updates_loaded_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-put");
+        let initial_loaded_memory = SessionMemory {
+            project: Some("Old loaded memory".to_string()),
+            ..SessionMemory::default()
+        };
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), initial_loaded_memory, Some(key.clone()));
+
+        let request_body = serde_json::json!({
+            "project": "Phase 6",
+            "current_state": "Implementing memory editing",
+            "key_decisions": ["Expose memory in the UI"],
+            "active_files": ["app/Fawx/Views/Shared/SessionMemoryPanel.swift"],
+            "custom_context": ["Keep the panel lightweight"],
+            "last_updated": 0
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/memory"),
+                &request_body,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(stored_memory.project.as_deref(), Some("Phase 6"));
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("Implementing memory editing")
+        );
+        assert_eq!(stored_memory.key_decisions, vec!["Expose memory in the UI"]);
+        assert_eq!(
+            stored_memory.active_files,
+            vec!["app/Fawx/Views/Shared/SessionMemoryPanel.swift"]
+        );
+        assert_eq!(
+            stored_memory.custom_context,
+            vec!["Keep the panel lightweight"]
+        );
+        assert!(stored_memory.last_updated > 0);
+        assert_eq!(
+            body["last_updated"].as_u64(),
+            Some(stored_memory.last_updated)
+        );
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.current_memory, stored_memory);
+    }
+
+    #[tokio::test]
+    async fn put_session_memory_rejects_payloads_that_exceed_token_cap() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-too-large");
+        let seeded_memory = SessionMemory {
+            project: Some("Existing memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let oversized_project = "memory ".repeat(2_200);
+        let request_body = serde_json::json!({
+            "project": oversized_project,
+            "last_updated": 0
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/memory"),
+                &request_body,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(resp).await;
+        assert!(body["error"]
+            .as_str()
+            .expect("error message")
+            .contains("token cap"));
+        assert_eq!(registry.memory(&key).expect("memory"), seeded_memory);
+    }
+
+    #[tokio::test]
+    async fn session_message_persists_updated_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-persist");
+        let seeded_memory = SessionMemory {
+            project: Some("persistent project".to_string()),
+            ..SessionMemory::default()
+        };
+        let restored_memory = SessionMemory {
+            project: Some("shared app memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), restored_memory.clone(), None);
+
+        let resp = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                r#"{"message":"hello there"}"#,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.loaded_memories, vec![seeded_memory.clone()]);
+        assert_eq!(state.current_memory, restored_memory);
+        drop(state);
+
+        let history = registry.history(&key, 10).expect("history");
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].render_text(), "Stored memory response");
+        assert_eq!(stored_memory.project, seeded_memory.project);
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("updated during turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_message_stream_persists_updated_session_memory() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-stream-persist");
+        let seeded_memory = SessionMemory {
+            project: Some("persistent project".to_string()),
+            ..SessionMemory::default()
+        };
+        let restored_memory = SessionMemory {
+            project: Some("shared app memory".to_string()),
+            ..SessionMemory::default()
+        };
+        registry
+            .record_turn(&key, Vec::new(), seeded_memory.clone())
+            .expect("seed memory");
+        let (app, app_state) =
+            session_memory_test_router(registry.clone(), restored_memory.clone(), None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("Stored memory response"));
+
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.loaded_memories, vec![seeded_memory.clone()]);
+        assert_eq!(state.current_memory, restored_memory);
+        drop(state);
+
+        let history = registry.history(&key, 10).expect("history");
+        let stored_memory = registry.memory(&key).expect("memory");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].render_text(), "Stored memory response");
+        assert_eq!(stored_memory.project, seeded_memory.project);
+        assert_eq!(
+            stored_memory.current_state.as_deref(),
+            Some("updated during turn")
+        );
     }
 
     #[tokio::test]
@@ -2611,8 +3328,8 @@ allowed_chat_ids = [123]
 
         let history = registry.history(&key, 10).expect("history");
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].content, "hello there");
-        assert_eq!(history[1].content, "Mock response");
+        assert_eq!(history[0].render_text(), "hello there");
+        assert_eq!(history[1].render_text(), "Mock response");
     }
 
     #[tokio::test]
@@ -2655,7 +3372,7 @@ allowed_chat_ids = [123]
                 session_key: None,
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
-                permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
                 ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                     std::env::temp_dir().as_path(),
                 )),
@@ -4081,7 +4798,7 @@ mod telegram_update {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4334,6 +5051,7 @@ mod telegram_update {
         .expect("process with images");
 
         assert_eq!(result.response, "Mock response");
+        assert_eq!(result.result_kind, ResultKind::Complete);
         let requests = captured.lock().expect("capture lock");
         let last_request = requests.last().expect("captured request");
         let last_message = last_request.messages.last().expect("user message");

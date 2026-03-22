@@ -102,12 +102,14 @@ fn qr_pairing_response(
     let target = qr_target(runtime, tailscale);
     let host = target.host;
     let port = runtime.port;
-    let scheme_url = format!("fawx://connect?host={host}&port={port}&token=REDACTED");
+    let transport = target.transport;
+    let scheme_url =
+        format!("fawx://connect?host={host}&port={port}&transport={transport}&token=REDACTED");
     QrPairingResponse {
         scheme_url,
         display_host: host,
         port,
-        transport: target.transport.to_string(),
+        transport: transport.to_string(),
         same_network_only: target.same_network_only,
     }
 }
@@ -361,7 +363,8 @@ mod phase4_tests {
     #[test]
     fn qr_response_serializes() {
         let r = QrPairingResponse {
-            scheme_url: "fawx://connect?host=test&port=8400&token=REDACTED".into(),
+            scheme_url:
+                "fawx://connect?host=test&port=8400&transport=tailscale_https&token=REDACTED".into(),
             display_host: "test.ts.net".into(),
             port: 8400,
             transport: "tailscale_https".into(),
@@ -377,6 +380,7 @@ mod phase4_tests {
         let response = qr_pairing_response(&test_runtime(true), &QrTailscaleStatus::default());
         assert_eq!(response.transport, "tailscale_https");
         assert!(!response.same_network_only);
+        assert!(response.scheme_url.contains("transport=tailscale_https"));
     }
 
     #[test]
@@ -384,6 +388,7 @@ mod phase4_tests {
         let response = qr_pairing_response(&test_runtime(false), &QrTailscaleStatus::default());
         assert_eq!(response.transport, "lan_http");
         assert!(response.same_network_only);
+        assert!(response.scheme_url.contains("transport=lan_http"));
     }
 
     #[test]

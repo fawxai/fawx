@@ -35,6 +35,10 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         StreamEvent::TextDelta { text } => {
             sse_frame("text_delta", serde_json::json!({ "text": text }))
         }
+        StreamEvent::Notification { title, body } => sse_frame(
+            "notification",
+            serde_json::json!({ "title": title, "body": body }),
+        ),
         StreamEvent::ToolCallStart { id, name } => sse_frame(
             "tool_call_start",
             serde_json::json!({ "id": id, "name": name }),
@@ -91,6 +95,22 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
                 "category": category,
                 "message": message,
                 "recoverable": recoverable,
+            }),
+        ),
+        StreamEvent::ContextCompacted {
+            tier,
+            messages_removed,
+            tokens_before,
+            tokens_after,
+            usage_ratio,
+        } => sse_frame(
+            "context_compacted",
+            serde_json::json!({
+                "tier": tier,
+                "messages_removed": messages_removed,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "usage_ratio": usage_ratio,
             }),
         ),
     }
@@ -265,6 +285,23 @@ mod tests {
         assert_eq!(
             frame,
             "event: permission_prompt\ndata: {\"expires_at\":1742000000,\"id\":\"prompt-1\",\"reason\":\"Needed to inspect the repo\",\"request_summary\":\"git status --short --branch\",\"session_scoped_allow_available\":true,\"title\":\"Allow shell command\",\"tool\":\"shell\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn context_compacted_event_serializes() {
+        let frame = serialize_stream_event(StreamEvent::ContextCompacted {
+            tier: "slide".to_string(),
+            messages_removed: 12,
+            tokens_before: 5_100,
+            tokens_after: 2_900,
+            usage_ratio: 0.42,
+        })
+        .expect("context compacted frame");
+
+        assert_eq!(
+            frame,
+            "event: context_compacted\ndata: {\"messages_removed\":12,\"tier\":\"slide\",\"tokens_after\":2900,\"tokens_before\":5100,\"usage_ratio\":0.42}\n\n"
         );
     }
 }

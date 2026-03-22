@@ -56,12 +56,18 @@ final class StreamingDisplayController {
 
     func userDidScroll(
         distanceFromBottom: CGFloat,
+        isUserInitiated: Bool = true,
         threshold: CGFloat = StreamingDisplayController.bottomThreshold
     ) {
         let clampedDistance = max(0, distanceFromBottom)
         if clampedDistance <= threshold {
             isPinnedToBottom = true
             pendingAutoScroll = false
+            lastDistanceFromBottom = clampedDistance
+            return
+        }
+
+        if !isUserInitiated {
             lastDistanceFromBottom = clampedDistance
             return
         }
@@ -80,6 +86,15 @@ final class StreamingDisplayController {
 
         isPinnedToBottom = false
         lastDistanceFromBottom = clampedDistance
+    }
+
+    func setPinnedToBottom(_ pinnedToBottom: Bool, distanceFromBottom: CGFloat) {
+        let clampedDistance = max(0, distanceFromBottom)
+        isPinnedToBottom = pinnedToBottom
+        lastDistanceFromBottom = clampedDistance
+        if pinnedToBottom {
+            pendingAutoScroll = false
+        }
     }
 
     private func startRenderTimerIfNeeded() {
@@ -139,6 +154,7 @@ final class ChatViewModel {
     enum TranscriptScrollBehavior {
         case animated
         case snap
+        case preservePosition
     }
 
     enum StreamingPhase: Sendable, Equatable {
@@ -187,68 +203,144 @@ final class ChatViewModel {
         }
     }
 
+    struct CompactionBannerInfo: Equatable {
+        let message: String
+        let isEmergency: Bool
+    }
+
+    private struct SessionStreamingState {
+        var text = ""
+        var phase: StreamingPhase?
+    }
+
     private static let sessionLoadDebounceMs = 50
     static let permissionPromptTimeoutSeconds = 60
     private static let permissionPromptTimeout: Duration = .seconds(permissionPromptTimeoutSeconds)
+    private static let compactionBannerTimeout: Duration = .seconds(4)
     static let maxCachedSessions = 10
 
     var transcriptItems: [ChatTranscriptItem] = []
-    var draftMessage = ""
-    var queuedMessage: String?
+    private var draftsBySession: [String: String] = [:]
+    private var queuedMessagesBySession: [String: String] = [:]
     var isLoadingHistory = false
-    var isStreaming = false
-    var streamingText = ""
-    var currentPhase: StreamingPhase?
-    var errorMessage: String?
+    var isStreaming: Bool {
+        !streamStates.isEmpty
+    }
+    var errorMessage: String? {
+        get { errorMessagesBySession[errorStorageKey(for: currentSessionID)] }
+        set { setErrorMessage(newValue, for: currentSessionID) }
+    }
     var activePermissionPrompt: PermissionPrompt?
     var isRespondingToPermissionPrompt = false
     var permissionPromptErrorMessage: String?
     var pendingTranscriptScrollBehavior: TranscriptScrollBehavior = .snap
+    var compactionBannerInfo: CompactionBannerInfo? {
+        guard let currentSessionID else {
+            return nil
+        }
+
+        return compactionBannerInfosBySession[currentSessionID]
+    }
 
     private let appState: AppState
     private let sessionViewModel: SessionViewModel
+    private let compactionBannerSleepHandler: @Sendable (Duration) async throws -> Void
     private var currentSessionID: String?
-    private var streamingSessionID: String?
-    private var streamTask: Task<Void, Never>?
-    private var retryRequest: RetryRequest?
-    private var anonymousToolCallCounter = 0
+    private var errorMessagesBySession: [String: String] = [:]
+    private var retryRequestsBySession: [String: RetryRequest] = [:]
+    private var liveToolGroupsBySession: [String: ToolActivityGroupRecord] = [:]
+    private var anonymousToolCallCountersBySession: [String: Int] = [:]
     private var queuedPermissionPrompts: [PermissionPrompt] = []
+    private var streamStates: [String: SessionStreamingState] = [:]
+    private var compactionBannerInfosBySession: [String: CompactionBannerInfo] = [:]
     @ObservationIgnored private var historyLoadSequence = 0
     @ObservationIgnored private var transcriptCache: [String: [SessionMessage]] = [:]
     @ObservationIgnored private var transcriptCacheAccessOrder: [String] = []
     @ObservationIgnored private var permissionPromptTimeoutTask: Task<Void, Never>?
-    @ObservationIgnored private lazy var streamingDisplayController = StreamingDisplayController { [weak self] flushedText in
-        self?.streamingText += flushedText
-    }
+    @ObservationIgnored private var streamTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var streamingDisplayControllers: [String: StreamingDisplayController] = [:]
+    @ObservationIgnored private var compactionBannerDismissTasks: [String: Task<Void, Never>] = [:]
     private var sessionLoadTask: Task<Void, Never>?
 
-    init(appState: AppState, sessionViewModel: SessionViewModel) {
+    init(
+        appState: AppState,
+        sessionViewModel: SessionViewModel,
+        compactionBannerSleepHandler: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
+    ) {
         self.appState = appState
         self.sessionViewModel = sessionViewModel
+        self.compactionBannerSleepHandler = compactionBannerSleepHandler
+    }
+
+    var draftMessage: String {
+        get { draftsBySession[draftStorageKey(for: currentSessionID)] ?? "" }
+        set {
+            let key = draftStorageKey(for: currentSessionID)
+            if newValue.isEmpty {
+                draftsBySession.removeValue(forKey: key)
+            } else {
+                draftsBySession[key] = newValue
+            }
+        }
+    }
+
+    var queuedMessage: String? {
+        guard let currentSessionID else {
+            return nil
+        }
+        return queuedMessagesBySession[currentSessionID]
+    }
+
+    var activeStreamSessionIDs: Set<String> {
+        Set(streamStates.keys)
     }
 
     var activeStreamSessionID: String? {
-        isStreaming ? streamingSessionID : nil
+        if let currentSessionID, activeStreamSessionIDs.contains(currentSessionID) {
+            return currentSessionID
+        }
+
+        return activeStreamSessionIDs.sorted().first
     }
 
     var isCurrentSessionStreaming: Bool {
-        isStreaming && currentSessionID == streamingSessionID
+        guard let currentSessionID else {
+            return false
+        }
+        return activeStreamSessionIDs.contains(currentSessionID)
     }
 
     var isStreamingInAnotherSession: Bool {
-        isStreaming && currentSessionID != nil && currentSessionID != streamingSessionID
+        guard let currentSessionID else {
+            return false
+        }
+        return activeStreamSessionIDs.contains { $0 != currentSessionID }
     }
 
     var visibleStreamingText: String {
-        isCurrentSessionStreaming ? streamingText : ""
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return ""
+        }
+
+        return streamStates[currentSessionID]?.text ?? ""
     }
 
     var visibleCurrentPhase: StreamingPhase? {
-        isCurrentSessionStreaming ? currentPhase : nil
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return nil
+        }
+
+        return streamStates[currentSessionID]?.phase
     }
 
     var shouldAutoScrollStreamingUpdates: Bool {
-        streamingDisplayController.isPinnedToBottom
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return true
+        }
+
+        return streamingDisplayController(for: currentSessionID).isPinnedToBottom
     }
 
     var composerPhaseLabel: String? {
@@ -268,7 +360,11 @@ final class ChatViewModel {
     }
 
     var canRetryLastMessage: Bool {
-        retryRequest != nil && !isStreaming
+        guard let currentSessionID else {
+            return false
+        }
+
+        return retryRequestsBySession[currentSessionID] != nil && !isCurrentSessionStreaming
     }
 
     var pendingPermissionPromptCount: Int {
@@ -297,6 +393,13 @@ final class ChatViewModel {
 
     func invalidateSession(_ sessionID: String) {
         removeCachedMessages(for: sessionID)
+        liveToolGroupsBySession.removeValue(forKey: sessionID)
+        anonymousToolCallCountersBySession.removeValue(forKey: sessionID)
+        draftsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
+        queuedMessagesBySession.removeValue(forKey: sessionID)
+        errorMessagesBySession.removeValue(forKey: errorStorageKey(for: sessionID))
+        retryRequestsBySession.removeValue(forKey: sessionID)
+        clearCompactionBanner(for: sessionID)
 
         if currentSessionID == sessionID {
             transcriptItems = []
@@ -305,10 +408,8 @@ final class ChatViewModel {
     }
 
     func prepareToDisplaySession(_ sessionID: String?) {
-        errorMessage = nil
         pendingTranscriptScrollBehavior = .snap
         currentSessionID = sessionID
-        anonymousToolCallCounter = 0
 
         guard let sessionID else {
             transcriptItems = []
@@ -318,11 +419,11 @@ final class ChatViewModel {
         }
 
         if let cachedMessages = cachedMessages(for: sessionID) {
-            transcriptItems = makeTranscriptItems(from: cachedMessages)
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
             isLoadingHistory = false
         } else {
-            transcriptItems = []
-            isLoadingHistory = isStreaming && streamingSessionID == sessionID ? false : true
+            transcriptItems = transcriptItemsWithLiveToolActivity(for: sessionID)
+            isLoadingHistory = isSessionStreaming(sessionID) ? false : true
         }
 
         appState.clearContext()
@@ -336,7 +437,7 @@ final class ChatViewModel {
         }
 
         cleanup()
-        retryRequest = nil
+        retryRequestsBySession.removeAll()
         resetVisibleState()
     }
 
@@ -394,7 +495,11 @@ final class ChatViewModel {
     }
 
     private func isActiveStreamingSession(_ sessionID: String?) -> Bool {
-        isStreaming && streamingSessionID == sessionID
+        guard let sessionID else {
+            return false
+        }
+
+        return isSessionStreaming(sessionID)
     }
 
     private func handleActiveStreamingSessionIfNeeded(for sessionID: String?) async -> Bool {
@@ -405,12 +510,13 @@ final class ChatViewModel {
         historyLoadSequence += 1
         isLoadingHistory = false
         currentSessionID = sessionID
-        errorMessage = nil
         pendingTranscriptScrollBehavior = .snap
 
         if let sessionID, let cachedMessages = cachedTranscript(for: sessionID) {
-            transcriptItems = makeTranscriptItems(from: cachedMessages)
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
             await appState.refreshContext(for: sessionID)
+        } else if let sessionID {
+            transcriptItems = transcriptItemsWithLiveToolActivity(for: sessionID)
         }
 
         return true
@@ -422,20 +528,20 @@ final class ChatViewModel {
 
         if shouldPreserveBackgroundStream(for: sessionID) {
             currentSessionID = sessionID
-            errorMessage = nil
             pendingTranscriptScrollBehavior = .snap
         } else {
             cleanup()
             currentSessionID = sessionID
-            errorMessage = nil
-            retryRequest = nil
+            if let sessionID {
+                retryRequestsBySession.removeValue(forKey: sessionID)
+            }
         }
 
         return loadSequence
     }
 
     private func shouldPreserveBackgroundStream(for sessionID: String?) -> Bool {
-        isStreaming && streamingSessionID != nil && streamingSessionID != sessionID
+        activeStreamSessionIDs.contains { $0 != sessionID }
     }
 
     private func clearLoadedSession() {
@@ -449,7 +555,7 @@ final class ChatViewModel {
 
     private func applyCachedTranscript(_ cachedMessages: [SessionMessage]) {
         pendingTranscriptScrollBehavior = .snap
-        let cachedItems = makeTranscriptItems(from: cachedMessages)
+        let cachedItems = makeTranscriptItems(for: currentSessionID, messages: cachedMessages)
         if transcriptItems != cachedItems {
             transcriptItems = cachedItems
         }
@@ -475,6 +581,7 @@ final class ChatViewModel {
                 return
             }
             applyFetchedMessages(response.messages, for: sessionID)
+            clearErrorMessage(for: sessionID)
             await appState.refreshContext(for: sessionID)
         } catch is CancellationError {
             return
@@ -484,12 +591,71 @@ final class ChatViewModel {
     }
 
     private func applyFetchedMessages(_ messages: [SessionMessage], for sessionID: String) {
-        cacheMessages(messages, for: sessionID)
-        let updatedItems = makeTranscriptItems(from: messages)
+        let mergedMessages = mergedFetchedMessages(messages, for: sessionID)
+        cacheMessages(mergedMessages, for: sessionID)
+        reconcileLiveToolGroupWithHistory(for: sessionID, messages: mergedMessages)
+        guard currentSessionID == sessionID else {
+            return
+        }
+        let updatedItems = makeTranscriptItems(for: sessionID, messages: mergedMessages)
         if transcriptItems != updatedItems {
             pendingTranscriptScrollBehavior = .snap
             transcriptItems = updatedItems
         }
+    }
+
+    private func mergedFetchedMessages(
+        _ fetchedMessages: [SessionMessage],
+        for sessionID: String
+    ) -> [SessionMessage] {
+        guard let existingMessages = transcriptCache[sessionID], !existingMessages.isEmpty else {
+            return fetchedMessages
+        }
+
+        if areEquivalentMessageSequences(existingMessages, fetchedMessages) {
+            return fetchedMessages
+        }
+
+        if isEquivalentMessagePrefix(fetchedMessages, of: existingMessages) {
+            return existingMessages
+        }
+
+        if isEquivalentMessagePrefix(existingMessages, of: fetchedMessages) {
+            return fetchedMessages
+        }
+
+        return fetchedMessages
+    }
+
+    private func areEquivalentMessageSequences(
+        _ lhs: [SessionMessage],
+        _ rhs: [SessionMessage]
+    ) -> Bool {
+        lhs.count == rhs.count && isEquivalentMessagePrefix(lhs, of: rhs)
+    }
+
+    private func isEquivalentMessagePrefix(
+        _ prefix: [SessionMessage],
+        of messages: [SessionMessage]
+    ) -> Bool {
+        guard prefix.count <= messages.count else {
+            return false
+        }
+
+        for (lhs, rhs) in zip(prefix, messages) {
+            guard messagesAreEquivalentForTranscriptMerge(lhs, rhs) else {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func messagesAreEquivalentForTranscriptMerge(
+        _ lhs: SessionMessage,
+        _ rhs: SessionMessage
+    ) -> Bool {
+        lhs.role == rhs.role && lhs.contentBlocks == rhs.contentBlocks
     }
 
     private func handleLoadMessagesError(_ error: Error, sessionID: String, loadSequence: Int) async {
@@ -504,7 +670,7 @@ final class ChatViewModel {
 
         removeCachedMessages(for: sessionID)
         transcriptItems = []
-        errorMessage = error.localizedDescription
+        setErrorMessage(error.localizedDescription, for: sessionID)
         pendingTranscriptScrollBehavior = .snap
         await appState.refreshContext(for: nil)
         await appState.noteRecoverableRequestFailure(error)
@@ -512,10 +678,11 @@ final class ChatViewModel {
 
     private func handleMissingSessionLoad(_ sessionID: String) async {
         removeCachedMessages(for: sessionID)
+        clearErrorMessage(for: sessionID)
         sessionViewModel.removeSession(sessionID)
         currentSessionID = nil
         transcriptItems = []
-        errorMessage = "Session no longer exists."
+        setErrorMessage("Session no longer exists.", for: nil)
         pendingTranscriptScrollBehavior = .snap
         await appState.refreshContext(for: nil)
     }
@@ -533,8 +700,8 @@ final class ChatViewModel {
 
         draftMessage = ""
 
-        if isStreaming {
-            queuedMessage = trimmed
+        if isCurrentSessionStreaming, let currentSessionID {
+            queuedMessagesBySession[currentSessionID] = trimmed
             return
         }
 
@@ -544,40 +711,77 @@ final class ChatViewModel {
     }
 
     func retryLastMessage() {
-        guard let retryRequest, !isStreaming else {
+        guard
+            let currentSessionID,
+            let retryRequest = retryRequestsBySession[currentSessionID],
+            !isCurrentSessionStreaming
+        else {
             return
         }
 
-        self.retryRequest = nil
+        retryRequestsBySession.removeValue(forKey: currentSessionID)
         Task {
             await send(retryRequest.text, forceSessionID: retryRequest.sessionID)
         }
     }
 
     func dismissQueuedMessage() {
-        queuedMessage = nil
+        clearQueuedMessage(for: currentSessionID)
     }
 
     func stopStreaming() {
+        // Permission prompts are still app-global, so canceling the visible stream
+        // must also tear down any visible approval state.
         clearPermissionPromptState()
-        streamTask?.cancel()
-        streamTask = nil
+        guard let currentSessionID else {
+            return
+        }
+
+        stopStreaming(sessionID: currentSessionID)
+    }
+
+    func stopStreaming(sessionID: String) {
+        streamTasks[sessionID]?.cancel()
     }
 
     func cleanup() {
-        stopStreaming()
-        resetStreamingState()
-        queuedMessage = nil
+        clearPermissionPromptState()
+        for sessionID in Array(streamTasks.keys) {
+            stopStreaming(sessionID: sessionID)
+        }
+        clearQueuedMessages()
+        clearCompactionBanners()
     }
 
-    func updateStreamingDistanceFromBottom(_ distanceFromBottom: CGFloat) {
-        streamingDisplayController.userDidScroll(distanceFromBottom: distanceFromBottom)
+    func updateStreamingDistanceFromBottom(
+        _ distanceFromBottom: CGFloat,
+        isUserInitiated: Bool = true
+    ) {
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return
+        }
+
+        streamingDisplayController(for: currentSessionID).userDidScroll(
+            distanceFromBottom: distanceFromBottom,
+            isUserInitiated: isUserInitiated
+        )
+    }
+
+    func updateStreamingPinnedState(isPinnedToBottom: Bool, distanceFromBottom: CGFloat) {
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return
+        }
+
+        streamingDisplayController(for: currentSessionID).setPinnedToBottom(
+            isPinnedToBottom,
+            distanceFromBottom: distanceFromBottom
+        )
     }
 
     private func send(_ text: String, forceSessionID: String? = nil) async {
-        errorMessage = nil
-        currentPhase = nil
+        await appState.synchronizeLocalConnectionIfNeeded()
         var targetSessionID = forceSessionID ?? currentSessionID
+        setErrorMessage(nil, for: targetSessionID)
 
         if targetSessionID == nil {
             do {
@@ -588,13 +792,13 @@ final class ChatViewModel {
                 targetSessionID = createdSession.id
             } catch {
                 draftMessage = text
-                errorMessage = "Failed to create session. \(error.localizedDescription)"
+                setErrorMessage("Failed to create session. \(error.localizedDescription)", for: nil)
                 return
             }
         }
 
         guard let sessionID = targetSessionID else {
-            errorMessage = "No session available."
+            setErrorMessage("No session available.", for: forceSessionID ?? currentSessionID)
             return
         }
 
@@ -602,7 +806,7 @@ final class ChatViewModel {
         let userMessage = SessionMessage(role: .user, content: text, timestamp: timestamp)
         appendMessage(userMessage, for: sessionID)
         sessionViewModel.updatePreview(for: sessionID, text: text, model: appState.activeModel?.modelID)
-        retryRequest = RetryRequest(text: text, sessionID: sessionID)
+        retryRequestsBySession[sessionID] = RetryRequest(text: text, sessionID: sessionID)
 
         do {
             let stream = try await appState.client.sendMessageStream(
@@ -611,7 +815,7 @@ final class ChatViewModel {
             )
             startStreaming(stream, sessionID: sessionID, retryText: text)
         } catch {
-            errorMessage = "Failed to send message. \(error.localizedDescription)"
+            setErrorMessage("Failed to send message. \(error.localizedDescription)", for: sessionID)
         }
     }
 
@@ -620,55 +824,63 @@ final class ChatViewModel {
         sessionID: String,
         retryText: String
     ) {
-        stopStreaming()
-        isStreaming = true
-        streamingSessionID = sessionID
-        streamingText = ""
-        currentPhase = nil
-        streamingDisplayController.reset(repinToBottom: true)
+        stopStreaming(sessionID: sessionID)
+        streamStates[sessionID] = SessionStreamingState(text: "", phase: nil)
+        streamingDisplayController(for: sessionID).reset(repinToBottom: true)
 
         let assistantTimestamp = Int(Date().timeIntervalSince1970)
-        streamTask = Task {
+        let task = Task {
             var finalResponse: String?
             var streamFailed = false
 
             do {
-                for try await event in stream {
+                streamLoop: for try await event in stream {
                     switch event {
                     case .textDelta(let text):
-                        streamingDisplayController.appendToken(text)
+                        streamingDisplayController(for: sessionID).appendToken(text)
+                    case .notification(let title, let body):
+                        await NotificationService.shared.send(title: title, body: body)
                     case .toolCallStart(let id, let name):
-                        if currentSessionID == sessionID {
-                            beginToolCall(id: id, name: name)
-                        }
+                        beginToolCall(sessionID: sessionID, id: id, name: name)
                     case .toolCallDelta(let id, let argumentsDelta):
-                        if currentSessionID == sessionID {
-                            updateToolCall(id: id) { toolCall in
-                                toolCall.arguments += argumentsDelta
-                            }
+                        updateToolCall(sessionID: sessionID, id: id) { toolCall in
+                            toolCall.arguments += argumentsDelta
                         }
                     case .toolCallComplete(let id, let name, let arguments):
-                        if currentSessionID == sessionID {
-                            completeToolCall(id: id, name: name, arguments: arguments)
-                        }
+                        completeToolCall(sessionID: sessionID, id: id, name: name, arguments: arguments)
                     case .toolResult(let id, let output, let isError):
-                        if currentSessionID == sessionID {
-                            finishToolCall(id: id, output: output, isError: isError)
-                        }
+                        finishToolCall(sessionID: sessionID, id: id, output: output, isError: isError)
                     case .permissionPrompt(let prompt):
                         enqueuePermissionPrompt(prompt)
                     case .phase(let phase):
-                        currentPhase = StreamingPhase(rawValue: phase)
+                        setStreamingPhase(StreamingPhase(rawValue: phase), for: sessionID)
+                    case .contextCompacted(
+                        let tier,
+                        let messagesRemoved,
+                        let tokensBefore,
+                        let tokensAfter,
+                        let usageRatio
+                    ):
+                        handleContextCompacted(
+                            tier: tier,
+                            messagesRemoved: messagesRemoved,
+                            tokensBefore: tokensBefore,
+                            tokensAfter: tokensAfter,
+                            usageRatio: usageRatio,
+                            sessionID: sessionID
+                        )
                     case .done(let response):
                         finalResponse = response
                     case .engineError(_, let message, let recoverable):
                         if !recoverable {
                             handleStreamError(message, sessionID: sessionID)
                             streamFailed = true
+                            break streamLoop
                         }
                     case .error(let message):
                         handleStreamError(message, sessionID: sessionID)
                         streamFailed = true
+                        break streamLoop
                     }
                 }
 
@@ -678,7 +890,7 @@ final class ChatViewModel {
                         retryText: retryText
                     )
                     if !recovered {
-                        retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
+                        retryRequestsBySession[sessionID] = RetryRequest(text: retryText, sessionID: sessionID)
                         await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
                     }
                 } else {
@@ -697,51 +909,54 @@ final class ChatViewModel {
                     retryText: retryText
                 )
                 if !recovered {
-                    retryRequest = RetryRequest(text: retryText, sessionID: sessionID)
+                    retryRequestsBySession[sessionID] = RetryRequest(text: retryText, sessionID: sessionID)
                     await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
                 }
             }
-
-            streamTask = nil
         }
+
+        streamTasks[sessionID] = task
     }
 
     private func finalizeStream(timestamp: Int, finalResponse: String?, sessionID: String) async {
-        streamingDisplayController.streamDidEnd()
-        let content = finalResponse ?? streamingText
+        streamingDisplayController(for: sessionID).streamDidEnd()
+        let content = finalResponse ?? streamingText(for: sessionID)
         if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let assistantMessage = SessionMessage(role: .assistant, content: content, timestamp: timestamp)
             appendMessage(assistantMessage, for: sessionID)
             sessionViewModel.updatePreview(for: sessionID, text: content, model: appState.activeModel?.modelID)
         }
 
-        retryRequest = nil
-        resetStreamingState()
+        retryRequestsBySession.removeValue(forKey: sessionID)
+        clearErrorMessage(for: sessionID)
+        resetStreamingState(for: sessionID)
+        await refreshSessionTranscriptFromServer(sessionID: sessionID)
 
         if currentSessionID == sessionID {
             await appState.refreshContext(for: sessionID)
         }
         await sessionViewModel.refresh()
-        await sendQueuedMessageIfNeeded()
+        await sendQueuedMessageIfNeeded(finishedSessionID: sessionID)
     }
 
     private func finalizeCancellation(timestamp: Int, sessionID: String) async {
-        streamingDisplayController.streamDidEnd()
-        if !streamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let interrupted = streamingText + "\n\n(interrupted)"
+        streamingDisplayController(for: sessionID).streamDidEnd()
+        let currentStreamingText = streamingText(for: sessionID)
+        if !currentStreamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let interrupted = currentStreamingText + "\n\n(interrupted)"
             let assistantMessage = SessionMessage(role: .assistant, content: interrupted, timestamp: timestamp)
             appendMessage(assistantMessage, for: sessionID)
             sessionViewModel.updatePreview(for: sessionID, text: interrupted, model: appState.activeModel?.modelID)
         }
 
-        resetStreamingState()
+        resetStreamingState(for: sessionID)
         if currentSessionID == sessionID {
             await appState.refreshContext(for: sessionID)
         }
     }
 
     private func recoverInterruptedStream(sessionID: String, retryText: String) async -> Bool {
-        streamingDisplayController.streamDidEnd()
+        streamingDisplayController(for: sessionID).streamDidEnd()
         do {
             let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
             guard
@@ -753,17 +968,20 @@ final class ChatViewModel {
                 return false
             }
 
-            cacheMessages(response.messages, for: sessionID)
+            let mergedMessages = mergedFetchedMessages(response.messages, for: sessionID)
+            cacheMessages(mergedMessages, for: sessionID)
+            reconcileLiveToolGroupWithHistory(for: sessionID, messages: mergedMessages)
             if currentSessionID == sessionID {
-                transcriptItems = makeTranscriptItems(from: response.messages)
+                transcriptItems = makeTranscriptItems(for: sessionID, messages: mergedMessages)
             }
-            retryRequest = nil
-            resetStreamingState()
+            clearErrorMessage(for: sessionID)
+            retryRequestsBySession.removeValue(forKey: sessionID)
+            resetStreamingState(for: sessionID)
             if currentSessionID == sessionID {
                 await appState.refreshContext(for: sessionID)
             }
             await sessionViewModel.refresh()
-            await sendQueuedMessageIfNeeded()
+            await sendQueuedMessageIfNeeded(finishedSessionID: sessionID)
             return true
         } catch {
             await appState.noteRecoverableRequestFailure(error)
@@ -771,27 +989,187 @@ final class ChatViewModel {
         }
     }
 
-    private func sendQueuedMessageIfNeeded() async {
-        guard let queued = queuedMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !queued.isEmpty else {
-            queuedMessage = nil
-            return
-        }
-        guard appState.connectionStatus == .connected else {
+    private func sendQueuedMessageIfNeeded(finishedSessionID: String) async {
+        guard let queuedDelivery = consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID) else {
             return
         }
 
-        queuedMessage = nil
-        await send(queued)
+        await send(queuedDelivery.text, forceSessionID: queuedDelivery.sessionID)
     }
 
-    private func resetStreamingState() {
-        clearPermissionPromptState()
-        streamingDisplayController.reset(repinToBottom: false)
-        streamingText = ""
-        isStreaming = false
-        streamingSessionID = nil
-        currentPhase = nil
-        anonymousToolCallCounter = 0
+    private func resetStreamingState(for sessionID: String) {
+        streamTasks.removeValue(forKey: sessionID)
+        streamStates.removeValue(forKey: sessionID)
+        streamingDisplayControllers[sessionID]?.reset(repinToBottom: false)
+        streamingDisplayControllers.removeValue(forKey: sessionID)
+        if streamStates.isEmpty {
+            clearPermissionPromptState()
+        }
+    }
+
+    private func draftStorageKey(for sessionID: String?) -> String {
+        sessionID ?? ""
+    }
+
+    private func errorStorageKey(for sessionID: String?) -> String {
+        sessionID ?? ""
+    }
+
+    private func setErrorMessage(_ message: String?, for sessionID: String?) {
+        let key = errorStorageKey(for: sessionID)
+        if let message = message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty {
+            errorMessagesBySession[key] = message
+        } else {
+            errorMessagesBySession.removeValue(forKey: key)
+        }
+    }
+
+    private func clearErrorMessage(for sessionID: String?) {
+        setErrorMessage(nil, for: sessionID)
+    }
+
+    private func clearQueuedMessage(for sessionID: String?) {
+        guard let sessionID else {
+            return
+        }
+
+        queuedMessagesBySession.removeValue(forKey: sessionID)
+    }
+
+    private func clearQueuedMessages() {
+        queuedMessagesBySession.removeAll()
+    }
+
+    private func handleContextCompacted(
+        tier: String,
+        messagesRemoved: Int,
+        tokensBefore: Int,
+        tokensAfter: Int,
+        usageRatio: Double,
+        sessionID: String
+    ) {
+        guard currentSessionID == sessionID else {
+            return
+        }
+
+        let updatedContext = (
+            appState.currentContext
+                ?? ContextInfo(
+                    usedTokens: tokensAfter,
+                    maxTokens: 0,
+                    percentage: usageRatio,
+                    compactionThreshold: 0
+                )
+        ).applyingCompaction(usedTokens: tokensAfter, usageRatio: usageRatio)
+
+        let derivedBeforePercentage = ContextInfo(
+            usedTokens: tokensBefore,
+            maxTokens: updatedContext.maxTokens,
+            percentage: .nan,
+            compactionThreshold: updatedContext.compactionThreshold
+        ).normalizedPercentage
+        let beforePercentage: Double
+        if let currentContext = appState.currentContext {
+            let currentPercentage = currentContext.normalizedPercentage
+            if currentContext.maxTokens > 0 || currentPercentage > 0 || tokensBefore == 0 {
+                beforePercentage = currentPercentage
+            } else {
+                beforePercentage = derivedBeforePercentage
+            }
+        } else {
+            beforePercentage = derivedBeforePercentage
+        }
+        let afterPercentage = updatedContext.normalizedPercentage
+
+        appState.currentContext = updatedContext
+        showCompactionBanner(
+            makeCompactionBannerInfo(
+                tier: tier,
+                messagesRemoved: messagesRemoved,
+                beforePercentage: beforePercentage,
+                afterPercentage: afterPercentage
+            ),
+            for: sessionID
+        )
+    }
+
+    private func makeCompactionBannerInfo(
+        tier: String,
+        messagesRemoved: Int,
+        beforePercentage: Double,
+        afterPercentage: Double
+    ) -> CompactionBannerInfo {
+        let isEmergency = tier.lowercased() == "emergency"
+        let prefix = isEmergency ? "Context urgently optimized" : "Context optimized"
+        let compactedMessageCount = messagesRemoved == 1
+            ? "1 message compacted"
+            : "\(messagesRemoved) messages compacted"
+
+        return CompactionBannerInfo(
+            message: "\(prefix): \(compactedMessageCount), \(Int(beforePercentage.rounded()))% → \(Int(afterPercentage.rounded()))%",
+            isEmergency: isEmergency
+        )
+    }
+
+    private func showCompactionBanner(_ info: CompactionBannerInfo, for sessionID: String) {
+        compactionBannerDismissTasks[sessionID]?.cancel()
+        compactionBannerInfosBySession[sessionID] = info
+        compactionBannerDismissTasks[sessionID] = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                try await self.compactionBannerSleepHandler(Self.compactionBannerTimeout)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+
+            self.dismissCompactionBannerIfNeeded(expectedInfo: info, sessionID: sessionID)
+        }
+    }
+
+    private func dismissCompactionBannerIfNeeded(expectedInfo: CompactionBannerInfo, sessionID: String) {
+        guard compactionBannerInfosBySession[sessionID] == expectedInfo else {
+            return
+        }
+
+        clearCompactionBanner(for: sessionID)
+    }
+
+    private func clearCompactionBanner(for sessionID: String) {
+        compactionBannerDismissTasks[sessionID]?.cancel()
+        compactionBannerDismissTasks.removeValue(forKey: sessionID)
+        compactionBannerInfosBySession.removeValue(forKey: sessionID)
+    }
+
+    private func clearCompactionBanners() {
+        for task in compactionBannerDismissTasks.values {
+            task.cancel()
+        }
+        compactionBannerDismissTasks.removeAll()
+        compactionBannerInfosBySession.removeAll()
+    }
+
+    private func consumeQueuedMessageIfReady(
+        finishedSessionID: String
+    ) -> (text: String, sessionID: String?)? {
+        guard
+            let queued = queuedMessagesBySession[finishedSessionID]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !queued.isEmpty
+        else {
+            queuedMessagesBySession.removeValue(forKey: finishedSessionID)
+            return nil
+        }
+        guard appState.connectionStatus == .connected else {
+            return nil
+        }
+
+        queuedMessagesBySession.removeValue(forKey: finishedSessionID)
+        return (queued, finishedSessionID)
     }
 
     func respondToPermissionPrompt(_ decision: PermissionPromptDecision) {
@@ -937,27 +1315,115 @@ final class ChatViewModel {
         let updatedMessages = existingMessages + [message]
         cacheMessages(updatedMessages, for: sessionID)
         if currentSessionID == sessionID {
-            pendingTranscriptScrollBehavior = .animated
-            transcriptItems = makeTranscriptItems(from: updatedMessages)
+            let shouldPreserveScrollPosition =
+                isSessionStreaming(sessionID)
+                && !streamingDisplayController(for: sessionID).isPinnedToBottom
+            pendingTranscriptScrollBehavior = shouldPreserveScrollPosition ? .preservePosition : .animated
+            transcriptItems = makeTranscriptItems(for: sessionID, messages: updatedMessages)
         }
     }
 
     private func handleStreamError(_ message: String, sessionID: String) {
-        if currentSessionID == sessionID {
-            errorMessage = message
-        }
+        setErrorMessage(message, for: sessionID)
     }
 
-    func makeTranscriptItems(from messages: [SessionMessage]) -> [ChatTranscriptItem] {
-        var duplicateCounts: [String: Int] = [:]
+    private func isSessionStreaming(_ sessionID: String) -> Bool {
+        streamStates[sessionID] != nil
+    }
 
-        return messages.map { message in
-            let baseID = messageStableIDBase(for: message)
-            let occurrence = duplicateCounts[baseID, default: 0]
-            duplicateCounts[baseID] = occurrence + 1
-            let id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
-            return .message(TranscriptMessage(id: id, message: message))
+    private func streamingText(for sessionID: String) -> String {
+        streamStates[sessionID]?.text ?? ""
+    }
+
+    private func setStreamingPhase(_ phase: StreamingPhase?, for sessionID: String) {
+        guard streamStates[sessionID] != nil else {
+            return
         }
+
+        streamStates[sessionID]?.phase = phase
+    }
+
+    private func appendStreamingText(_ text: String, for sessionID: String) {
+        guard !text.isEmpty, streamStates[sessionID] != nil else {
+            return
+        }
+
+        streamStates[sessionID]?.text += text
+    }
+
+    private func streamingDisplayController(for sessionID: String) -> StreamingDisplayController {
+        if let controller = streamingDisplayControllers[sessionID] {
+            return controller
+        }
+
+        let controller = StreamingDisplayController { [weak self] flushedText in
+            self?.appendStreamingText(flushedText, for: sessionID)
+        }
+        streamingDisplayControllers[sessionID] = controller
+        return controller
+    }
+
+    func makeTranscriptItems(
+        for sessionID: String?,
+        messages: [SessionMessage]
+    ) -> [ChatTranscriptItem] {
+        var duplicateCounts: [String: Int] = [:]
+        var items: [ChatTranscriptItem] = []
+        var pendingHistoricalGroupIndex: Int?
+
+        for message in messages {
+            switch message.role {
+            case .tool:
+                let toolResults = toolResults(from: message)
+                if !toolResults.isEmpty, let pendingHistoricalGroupIndex {
+                    applyToolResults(toolResults, to: &items, groupIndex: pendingHistoricalGroupIndex)
+                    continue
+                }
+
+                let displayText = message.transcriptDisplayText
+                if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                }
+                pendingHistoricalGroupIndex = nil
+            case .user, .assistant, .system:
+                let displayText = message.transcriptDisplayText
+                if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                }
+
+                let historicalToolCalls = toolCalls(from: message)
+                if !historicalToolCalls.isEmpty {
+                    items.append(.toolActivityGroup(
+                        ToolActivityGroupRecord(
+                            id: historicalToolGroupID(for: message, toolCalls: historicalToolCalls),
+                            toolCalls: historicalToolCalls,
+                            isLive: false
+                        )
+                    ))
+                    pendingHistoricalGroupIndex = items.count - 1
+                } else {
+                    pendingHistoricalGroupIndex = nil
+                }
+            }
+        }
+
+        if let sessionID, let liveToolGroup = liveToolGroupOverlay(for: sessionID, messages: messages) {
+            items.append(.toolActivityGroup(liveToolGroup))
+        }
+
+        return items
+    }
+
+    private func messageTranscriptItem(
+        _ message: SessionMessage,
+        displayText: String,
+        duplicateCounts: inout [String: Int]
+    ) -> ChatTranscriptItem {
+        let baseID = messageStableIDBase(for: message)
+        let occurrence = duplicateCounts[baseID, default: 0]
+        duplicateCounts[baseID] = occurrence + 1
+        let id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
+        return .message(TranscriptMessage(id: id, message: message, displayText: displayText))
     }
 
     private func messageStableIDBase(for message: SessionMessage) -> String {
@@ -1005,7 +1471,7 @@ final class ChatViewModel {
     }
 
     private func trimTranscriptCacheIfNeeded() {
-        let protectedSessions = Set([currentSessionID, streamingSessionID].compactMap { $0 })
+        let protectedSessions = activeStreamSessionIDs.union(Set([currentSessionID].compactMap { $0 }))
         var scannedEntries = 0
 
         while transcriptCache.count > Self.maxCachedSessions, scannedEntries < transcriptCacheAccessOrder.count {
@@ -1017,12 +1483,16 @@ final class ChatViewModel {
             }
 
             transcriptCache.removeValue(forKey: leastRecentSessionID)
+            liveToolGroupsBySession.removeValue(forKey: leastRecentSessionID)
+            anonymousToolCallCountersBySession.removeValue(forKey: leastRecentSessionID)
             scannedEntries = 0
         }
 
         while transcriptCache.count > Self.maxCachedSessions, let leastRecentSessionID = transcriptCacheAccessOrder.first {
             transcriptCacheAccessOrder.removeFirst()
             transcriptCache.removeValue(forKey: leastRecentSessionID)
+            liveToolGroupsBySession.removeValue(forKey: leastRecentSessionID)
+            anonymousToolCallCountersBySession.removeValue(forKey: leastRecentSessionID)
         }
     }
 
@@ -1035,36 +1505,81 @@ final class ChatViewModel {
         appState.clearContext()
     }
 
-    private func beginToolCall(id: String?, name: String?) {
-        let toolCallID = stableToolCallID(for: id)
+    private func transcriptItemsWithLiveToolActivity(for sessionID: String) -> [ChatTranscriptItem] {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
+            return []
+        }
 
-        if let index = transcriptItems.firstIndex(where: { item in
-            if case .toolCall(let toolCall) = item {
-                return toolCall.id == toolCallID
-            }
-            return false
-        }) {
-            updateTranscriptItem(at: index) { toolCall in
-                toolCall.name = name ?? toolCall.name
-                toolCall.isRunning = true
-            }
+        return [.toolActivityGroup(liveToolGroup)]
+    }
+
+    private func liveToolGroupOverlay(
+        for sessionID: String,
+        messages: [SessionMessage]
+    ) -> ToolActivityGroupRecord? {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
+            return nil
+        }
+
+        if isLiveToolGroupRepresentedInHistory(liveToolGroup, messages: messages) {
+            return nil
+        }
+
+        return liveToolGroup
+    }
+
+    private func reconcileLiveToolGroupWithHistory(for sessionID: String, messages: [SessionMessage]) {
+        guard let liveToolGroup = liveToolGroupsBySession[sessionID] else {
             return
         }
 
-        transcriptItems.append(.toolCall(
-            ToolCallRecord(
-                id: toolCallID,
-                name: name ?? "tool",
-                arguments: "",
-                result: nil,
-                isRunning: true,
-                isError: false
-            )
-        ))
+        if isLiveToolGroupRepresentedInHistory(liveToolGroup, messages: messages) {
+            liveToolGroupsBySession.removeValue(forKey: sessionID)
+        }
     }
 
-    private func completeToolCall(id: String?, name: String?, arguments: String) {
-        updateToolCall(id: id) { toolCall in
+    private func refreshVisibleTranscriptForToolActivity(
+        sessionID: String,
+        preferPreservePosition: Bool
+    ) {
+        guard currentSessionID == sessionID else {
+            return
+        }
+
+        let cachedMessages = transcriptCache[sessionID] ?? []
+        pendingTranscriptScrollBehavior = preferPreservePosition ? .preservePosition : .animated
+        transcriptItems = makeTranscriptItems(for: sessionID, messages: cachedMessages)
+    }
+
+    private func beginToolCall(sessionID: String, id: String?, name: String?) {
+        let toolCallID = stableToolCallID(for: sessionID, rawID: id)
+        var toolGroup = activeOrFreshLiveToolGroup(for: sessionID)
+
+        if let index = toolGroup.toolCalls.firstIndex(where: { $0.id == toolCallID }) {
+            toolGroup.toolCalls[index].name = name ?? toolGroup.toolCalls[index].name
+            toolGroup.toolCalls[index].isRunning = true
+        } else {
+            toolGroup.toolCalls.append(
+                ToolCallRecord(
+                    id: toolCallID,
+                    name: name ?? "tool",
+                    arguments: "",
+                    result: nil,
+                    isRunning: true,
+                    isError: false
+                )
+            )
+        }
+
+        liveToolGroupsBySession[sessionID] = toolGroup
+        refreshVisibleTranscriptForToolActivity(
+            sessionID: sessionID,
+            preferPreservePosition: shouldPreserveScrollPosition(for: sessionID)
+        )
+    }
+
+    private func completeToolCall(sessionID: String, id: String?, name: String?, arguments: String) {
+        updateToolCall(sessionID: sessionID, id: id) { toolCall in
             if let name {
                 toolCall.name = name
             }
@@ -1072,24 +1587,24 @@ final class ChatViewModel {
         }
     }
 
-    private func finishToolCall(id: String?, output: String, isError: Bool) {
-        updateToolCall(id: id) { toolCall in
+    private func finishToolCall(sessionID: String, id: String?, output: String, isError: Bool) {
+        updateToolCall(sessionID: sessionID, id: id) { toolCall in
             toolCall.result = output
             toolCall.isRunning = false
             toolCall.isError = isError
         }
     }
 
-    private func updateToolCall(id: String?, update: (inout ToolCallRecord) -> Void) {
-        let toolCallID = stableToolCallID(for: id)
+    private func updateToolCall(
+        sessionID: String,
+        id: String?,
+        update: (inout ToolCallRecord) -> Void
+    ) {
+        let toolCallID = stableToolCallID(for: sessionID, rawID: id)
+        var toolGroup = activeOrFreshLiveToolGroup(for: sessionID)
 
-        if let index = transcriptItems.firstIndex(where: { item in
-            if case .toolCall(let toolCall) = item {
-                return toolCall.id == toolCallID
-            }
-            return false
-        }) {
-            updateTranscriptItem(at: index, update: update)
+        if let index = toolGroup.toolCalls.firstIndex(where: { $0.id == toolCallID }) {
+            update(&toolGroup.toolCalls[index])
         } else {
             var toolCall = ToolCallRecord(
                 id: toolCallID,
@@ -1100,28 +1615,172 @@ final class ChatViewModel {
                 isError: false
             )
             update(&toolCall)
-            transcriptItems.append(.toolCall(toolCall))
+            toolGroup.toolCalls.append(toolCall)
+        }
+
+        liveToolGroupsBySession[sessionID] = toolGroup
+        refreshVisibleTranscriptForToolActivity(
+            sessionID: sessionID,
+            preferPreservePosition: shouldPreserveScrollPosition(for: sessionID)
+        )
+    }
+
+    private func activeOrFreshLiveToolGroup(for sessionID: String) -> ToolActivityGroupRecord {
+        if let existingGroup = liveToolGroupsBySession[sessionID] {
+            return existingGroup
+        }
+
+        return ToolActivityGroupRecord(
+            id: "live-\(sessionID)",
+            toolCalls: [],
+            isLive: true
+        )
+    }
+
+    private func shouldPreserveScrollPosition(for sessionID: String) -> Bool {
+        isSessionStreaming(sessionID)
+            && currentSessionID == sessionID
+            && !streamingDisplayController(for: sessionID).isPinnedToBottom
+    }
+
+    private func isLiveToolGroupRepresentedInHistory(
+        _ liveToolGroup: ToolActivityGroupRecord,
+        messages: [SessionMessage]
+    ) -> Bool {
+        guard !liveToolGroup.toolCalls.isEmpty else {
+            return false
+        }
+
+        let historicalToolUses = Set(messages.flatMap { message in
+            message.contentBlocks.compactMap { block -> String? in
+                guard case .toolUse(let id, _, _) = block else {
+                    return nil
+                }
+                return id
+            }
+        })
+        let historicalToolResults = Set(messages.flatMap { message in
+            toolResults(from: message).map(\.id)
+        })
+
+        return liveToolGroup.toolCalls.allSatisfy { toolCall in
+            guard !toolCall.isRunning, historicalToolUses.contains(toolCall.id) else {
+                return false
+            }
+
+            if toolCall.result != nil {
+                return historicalToolResults.contains(toolCall.id)
+            }
+
+            return true
         }
     }
 
-    private func updateTranscriptItem(
-        at index: Int,
-        update: (inout ToolCallRecord) -> Void
+    private func toolCalls(from message: SessionMessage) -> [ToolCallRecord] {
+        message.contentBlocks.compactMap { block in
+            guard case .toolUse(let id, let name, let input) = block else {
+                return nil
+            }
+
+            let arguments = renderedJSONValue(input)
+            return ToolCallRecord(
+                id: id,
+                name: name,
+                arguments: arguments,
+                result: nil,
+                isRunning: false,
+                isError: false
+            )
+        }
+    }
+
+    private func toolResults(from message: SessionMessage) -> [(id: String, output: String, isError: Bool)] {
+        message.contentBlocks.compactMap { block in
+            guard case .toolResult(let toolUseID, let content, let storedIsError) = block else {
+                return nil
+            }
+
+            let renderedOutput = renderedJSONValue(content)
+            let legacyPrefixedError = renderedOutput.hasPrefix("[ERROR]")
+            let isError = storedIsError ?? legacyPrefixedError
+            let cleanedOutput = legacyPrefixedError
+                ? renderedOutput.replacingOccurrences(of: "[ERROR] ", with: "")
+                : renderedOutput
+            return (toolUseID, cleanedOutput, isError)
+        }
+    }
+
+    private func applyToolResults(
+        _ toolResults: [(id: String, output: String, isError: Bool)],
+        to items: inout [ChatTranscriptItem],
+        groupIndex: Int
     ) {
-        guard case .toolCall(var toolCall) = transcriptItems[index] else {
+        guard case .toolActivityGroup(var group) = items[groupIndex] else {
             return
         }
-        update(&toolCall)
-        transcriptItems[index] = .toolCall(toolCall)
+
+        for toolResult in toolResults {
+            if let toolIndex = group.toolCalls.firstIndex(where: { $0.id == toolResult.id }) {
+                group.toolCalls[toolIndex].result = toolResult.output
+                group.toolCalls[toolIndex].isRunning = false
+                group.toolCalls[toolIndex].isError = toolResult.isError
+            } else {
+                group.toolCalls.append(
+                    ToolCallRecord(
+                        id: toolResult.id,
+                        name: "Unknown tool",
+                        arguments: "",
+                        result: toolResult.output,
+                        isRunning: false,
+                        isError: toolResult.isError
+                    )
+                )
+            }
+        }
+
+        items[groupIndex] = .toolActivityGroup(group)
     }
 
-    private func stableToolCallID(for rawID: String?) -> String {
+    private func historicalToolGroupID(
+        for message: SessionMessage,
+        toolCalls: [ToolCallRecord]
+    ) -> String {
+        let component = toolCalls
+            .map {
+                "\($0.id.utf8.count)#\($0.id)\($0.displayName.utf8.count)#\($0.displayName)"
+            }
+            .joined()
+        return "history:\(messageStableIDBase(for: message)):\(Self.stableDigest(for: component))"
+    }
+
+    private func renderedJSONValue(_ value: JSONValue) -> String {
+        switch value {
+        case .null:
+            return ""
+        default:
+            return value.description
+        }
+    }
+
+    private func refreshSessionTranscriptFromServer(sessionID: String) async {
+        do {
+            let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
+            applyFetchedMessages(response.messages, for: sessionID)
+        } catch is CancellationError {
+            return
+        } catch {
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    private func stableToolCallID(for sessionID: String, rawID: String?) -> String {
         if let rawID, !rawID.isEmpty {
             return rawID
         }
 
-        anonymousToolCallCounter += 1
-        return "tool-\(anonymousToolCallCounter)"
+        let nextIndex = anonymousToolCallCountersBySession[sessionID, default: 0] + 1
+        anonymousToolCallCountersBySession[sessionID] = nextIndex
+        return "tool-\(nextIndex)"
     }
 }
 
@@ -1132,12 +1791,20 @@ private struct RetryRequest {
 
 #if DEBUG
 extension ChatViewModel {
+    func makeTranscriptItems(from messages: [SessionMessage]) -> [ChatTranscriptItem] {
+        makeTranscriptItems(for: currentSessionID, messages: messages)
+    }
+
     func appendMessageForTesting(_ message: SessionMessage, sessionID: String) {
         appendMessage(message, for: sessionID)
     }
 
     func handleStreamErrorForTesting(_ message: String, sessionID: String) {
         handleStreamError(message, sessionID: sessionID)
+    }
+
+    func clearErrorMessageForTesting(sessionID: String?) {
+        clearErrorMessage(for: sessionID)
     }
 
     func setStreamingStateForTesting(
@@ -1147,11 +1814,30 @@ extension ChatViewModel {
         streamingText: String = "",
         phase: StreamingPhase? = nil
     ) {
-        self.isStreaming = isStreaming
         self.currentSessionID = currentSessionID
-        self.streamingSessionID = streamingSessionID
-        self.streamingText = streamingText
-        self.currentPhase = phase
+        streamStates.removeAll()
+        streamTasks.removeAll()
+        streamingDisplayControllers.removeAll()
+
+        if isStreaming, let streamingSessionID {
+            streamStates[streamingSessionID] = SessionStreamingState(text: streamingText, phase: phase)
+            _ = streamingDisplayController(for: streamingSessionID)
+        }
+    }
+
+    func setStreamingSessionsForTesting(
+        _ sessions: [String: (text: String, phase: StreamingPhase?)],
+        currentSessionID: String?
+    ) {
+        self.currentSessionID = currentSessionID
+        streamStates = sessions.reduce(into: [:]) { partialResult, entry in
+            partialResult[entry.key] = SessionStreamingState(text: entry.value.text, phase: entry.value.phase)
+        }
+        streamTasks.removeAll()
+        streamingDisplayControllers.removeAll()
+        for sessionID in sessions.keys {
+            _ = streamingDisplayController(for: sessionID)
+        }
     }
 
     func enqueuePermissionPromptForTesting(_ prompt: PermissionPrompt) {
@@ -1162,12 +1848,32 @@ extension ChatViewModel {
         finishActivePermissionPrompt(id: id)
     }
 
+    func stopStreamingForTesting() {
+        stopStreaming()
+    }
+
+    func cleanupForTesting() {
+        cleanup()
+    }
+
+    func resetStreamingStateForTesting(sessionID: String) {
+        resetStreamingState(for: sessionID)
+    }
+
     func appendStreamingTokenForTesting(_ token: String) {
-        streamingDisplayController.appendToken(token)
+        guard let currentSessionID else {
+            return
+        }
+
+        streamingDisplayController(for: currentSessionID).appendToken(token)
     }
 
     func flushStreamingDisplayForTesting() {
-        streamingDisplayController.streamDidEnd()
+        guard let currentSessionID else {
+            return
+        }
+
+        streamingDisplayController(for: currentSessionID).streamDidEnd()
     }
 
     func updateStreamingDistanceFromBottomForTesting(_ distanceFromBottom: CGFloat) {
@@ -1175,7 +1881,70 @@ extension ChatViewModel {
     }
 
     var isPinnedToBottomForTesting: Bool {
-        streamingDisplayController.isPinnedToBottom
+        guard let currentSessionID else {
+            return true
+        }
+
+        return streamingDisplayController(for: currentSessionID).isPinnedToBottom
+    }
+
+    func streamingTextForTesting(sessionID: String) -> String {
+        streamingText(for: sessionID)
+    }
+
+    func consumeQueuedMessageForTesting(
+        finishedSessionID: String,
+        connectionStatus: ConnectionStatus = .connected
+    ) -> (text: String, sessionID: String?)? {
+        let previousConnectionStatus = appState.connectionStatus
+        appState.connectionStatus = connectionStatus
+        defer {
+            appState.connectionStatus = previousConnectionStatus
+        }
+
+        return consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID)
+    }
+
+    func applyFetchedMessagesForTesting(_ messages: [SessionMessage], sessionID: String) {
+        applyFetchedMessages(messages, for: sessionID)
+    }
+
+    func beginToolCallForTesting(sessionID: String, id: String?, name: String?) {
+        beginToolCall(sessionID: sessionID, id: id, name: name)
+    }
+
+    func completeToolCallForTesting(sessionID: String, id: String?, name: String?, arguments: String) {
+        completeToolCall(sessionID: sessionID, id: id, name: name, arguments: arguments)
+    }
+
+    func finishToolCallForTesting(sessionID: String, id: String?, output: String, isError: Bool) {
+        finishToolCall(sessionID: sessionID, id: id, output: output, isError: isError)
+    }
+
+    func handleContextCompactedForTesting(
+        sessionID: String,
+        tier: String = "slide",
+        messagesRemoved: Int = 12,
+        tokensBefore: Int = 68,
+        tokensAfter: Int = 42,
+        usageRatio: Double = 0.42
+    ) {
+        handleContextCompacted(
+            tier: tier,
+            messagesRemoved: messagesRemoved,
+            tokensBefore: tokensBefore,
+            tokensAfter: tokensAfter,
+            usageRatio: usageRatio,
+            sessionID: sessionID
+        )
+    }
+
+    func setCurrentContextForTesting(_ context: ContextInfo?) {
+        appState.currentContext = context
+    }
+
+    var currentContextForTesting: ContextInfo? {
+        appState.currentContext
     }
 }
 #endif

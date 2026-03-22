@@ -10,6 +10,7 @@ private enum SettingsRoute: Hashable {
     case telemetry
     case synthesis
     case usage
+    case legal(LegalDocument)
 }
 
 struct iOSSettingsView: View {
@@ -25,6 +26,7 @@ struct iOSSettingsView: View {
     let openFleet: () -> Void
     let openExperiments: () -> Void
     let openGit: () -> Void
+    let isActive: Bool
 
     @State private var navigationPath: [SettingsRoute] = []
     @State private var isShowingQRScanner = false
@@ -99,6 +101,14 @@ struct iOSSettingsView: View {
                     AppearanceSettingsPanel(appState: appState)
                 }
 
+                Section("Legal") {
+                    ForEach(LegalDocument.allCases) { document in
+                        NavigationLink(value: SettingsRoute.legal(document)) {
+                            Text(document.title)
+                        }
+                    }
+                }
+
                 if let status = settingsViewModel.testStatusMessage {
                     Section("Status") {
                         Text(status)
@@ -147,9 +157,14 @@ struct iOSSettingsView: View {
                     iOSSynthesisSettingsView(synthesisViewModel: synthesisViewModel)
                 case .usage:
                     iOSUsageSettingsView(usageViewModel: usageViewModel)
+                case .legal(let document):
+                    LegalDocumentView(title: document.title, resourceName: document.resourceName)
                 }
             }
-            .task {
+            .task(id: isActive) {
+                guard isActive else {
+                    return
+                }
                 if appState.isConfigured {
                     await appState.revalidateConnection(allowReconnect: false)
                     await appState.refreshSettingsState()

@@ -43,6 +43,49 @@ struct ReadyStep: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .task {
+            _ = await NotificationService.shared.requestPermission()
+        }
+    }
+
+    @ViewBuilder
+    private var headline: some View {
+        if viewModel.isBootstrapping {
+            VStack(spacing: FawxSpacing.paddingSM) {
+                ProgressView()
+                    .controlSize(.large)
+
+                Text(viewModel.bootstrapProgress ?? "Setting up Fawx...")
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .multilineTextAlignment(.center)
+            }
+        } else {
+            Text("Ready to start")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(Color.fawxText)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    @ViewBuilder
+    private var headline: some View {
+        if viewModel.isBootstrapping {
+            VStack(spacing: FawxSpacing.paddingSM) {
+                ProgressView()
+                    .controlSize(.large)
+
+                Text(viewModel.bootstrapProgress ?? "Setting up Fawx...")
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .multilineTextAlignment(.center)
+            }
+        } else {
+            Text("Ready to start")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(Color.fawxText)
+                .multilineTextAlignment(.center)
+        }
     }
 
     @ViewBuilder

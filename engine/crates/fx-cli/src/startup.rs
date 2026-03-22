@@ -27,7 +27,7 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
-use fx_kernel::streaming::StreamCallback;
+use fx_kernel::streaming::{StreamCallback, StreamEvent};
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
     CachingExecutor, PermissionGateExecutor, PermissionPolicy, PermissionPromptState,
@@ -36,7 +36,10 @@ use fx_kernel::{
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
-use fx_loadable::{SignaturePolicy, SkillRegistry, TransactionSkill};
+use fx_loadable::{
+    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillRegistry,
+    TransactionSkill,
+};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_ripcord::{resolve_tripwires, RipcordJournal, TripwireEvaluator};
@@ -371,8 +374,8 @@ pub struct LoopEngineBundle {
     pub signature_policy: SignaturePolicy,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
-    /// Shared callback slot for permission prompts SSE.
-    pub permission_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    /// Shared callback slot for SSE stream events that need executor-side access.
+    pub stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
     pub ripcord_journal: Arc<RipcordJournal>,
     /// LLM provider for experiment/improvement pipelines.
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
@@ -446,6 +449,7 @@ struct SkillRegistryBuildOptions {
     session_registry: Option<fx_session::SessionRegistry>,
     session_bus: Option<SessionBus>,
     kernel_budget: BudgetConfig,
+    stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
     credential_store: Option<SharedCredentialStore>,
     token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
@@ -508,10 +512,16 @@ fn build_loop_engine_with_options(
     options: HeadlessLoopBuildOptions,
 ) -> Result<LoopEngineBundle, StartupError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
+    let stream_callback_slot = Arc::new(std::sync::Mutex::new(None));
     let kernel_budget = BudgetConfig::default();
     let budget = BudgetTracker::new(kernel_budget.clone(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    let registry_options = build_skill_registry_options(&config, &options, &kernel_budget);
+    let registry_options = build_skill_registry_options(
+        &config,
+        &options,
+        &kernel_budget,
+        Arc::clone(&stream_callback_slot),
+    );
     let working_dir = registry_options.working_dir.clone();
     let improvement_provider_for_bundle = improvement_provider.clone();
     let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
@@ -539,8 +549,8 @@ fn build_loop_engine_with_options(
         .permission_prompt_state
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
     let permission_gate =
-        PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state);
-    let permission_callback_slot = permission_gate.stream_callback_slot();
+        PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state)
+            .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
     let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
         let snapshot_dir = data_dir.join("ripcord").join("snapshots");
         Arc::new(RipcordJournal::new(&snapshot_dir))
@@ -560,6 +570,7 @@ fn build_loop_engine_with_options(
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
+        .session_memory(Arc::clone(&skills.session_memory))
         .scratchpad_provider(bridge);
     if let Some(cancel_token) = options.cancel_token {
         builder = builder.cancel_token(cancel_token);
@@ -595,7 +606,7 @@ fn build_loop_engine_with_options(
         signature_policy: skills.signature_policy,
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
-        permission_callback_slot,
+        stream_callback_slot,
         improvement_provider: improvement_provider_for_bundle,
         ripcord_journal,
     })
@@ -605,6 +616,7 @@ fn build_skill_registry_options(
     config: &FawxConfig,
     options: &HeadlessLoopBuildOptions,
     kernel_budget: &BudgetConfig,
+    stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
 ) -> SkillRegistryBuildOptions {
     SkillRegistryBuildOptions {
         working_dir: options
@@ -618,10 +630,47 @@ fn build_skill_registry_options(
         session_registry: options.session_registry.clone(),
         session_bus: options.session_bus.clone(),
         kernel_budget: kernel_budget.clone(),
+        stream_callback_slot,
         credential_store: options.credential_store.clone(),
         token_broker: options.token_broker.clone(),
         #[cfg(feature = "http")]
         experiment_registry: options.experiment_registry.clone(),
+    }
+}
+
+struct StreamNotificationSender {
+    callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+}
+
+impl fmt::Debug for StreamNotificationSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamNotificationSender").finish()
+    }
+}
+
+impl StreamNotificationSender {
+    fn new(callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>) -> Self {
+        Self { callback_slot }
+    }
+}
+
+#[async_trait]
+impl NotificationSender for StreamNotificationSender {
+    async fn send(&self, title: &str, body: &str) -> Result<(), String> {
+        let callback = self
+            .callback_slot
+            .lock()
+            .map_err(|error| format!("notification callback unavailable: {error}"))?
+            .clone();
+
+        if let Some(callback) = callback {
+            callback(StreamEvent::Notification {
+                title: title.to_string(),
+                body: body.to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -837,6 +886,7 @@ struct SkillRegistryBundle {
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    session_memory: Arc<Mutex<fx_session::SessionMemory>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
     journal: Option<Arc<Mutex<fx_journal::Journal>>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
@@ -921,6 +971,11 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
+    let notify_sender = Arc::new(StreamNotificationSender::new(Arc::clone(
+        &options.stream_callback_slot,
+    )));
+    let notify_skill = NotifySkill::new(notify_sender);
+    registry.register(Arc::new(notify_skill));
     let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm.clone());
     registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
@@ -928,6 +983,9 @@ fn build_skill_registry(
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
+    let session_memory = Arc::new(Mutex::new(fx_session::SessionMemory::default()));
+    let session_memory_skill = SessionMemorySkill::new(Arc::clone(&session_memory));
+    registry.register(Arc::new(session_memory_skill));
 
     if let Some(session_registry) = options.session_registry.clone() {
         let session_skill = SessionToolsSkill::new(session_registry);
@@ -1030,6 +1088,7 @@ fn build_skill_registry(
         memory_snapshot: snapshot_text,
         runtime_info,
         scratchpad,
+        session_memory,
         iteration_counter,
         journal: journal_arc,
         credential_provider,
@@ -1787,6 +1846,7 @@ mod tests {
     use fx_subagent::test_support::StubSubagentControl;
     use std::io;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
@@ -1842,6 +1902,68 @@ mod tests {
 
         assert!(policy.default_ask);
         assert_eq!(policy.mode, fx_config::CapabilityMode::Prompt);
+    }
+
+    #[tokio::test]
+    async fn stream_notification_sender_drops_lock_before_invoking_callback() {
+        let callback_slot = Arc::new(Mutex::new(None));
+        let callback_slot_for_callback = Arc::clone(&callback_slot);
+        let lock_reacquired = Arc::new(AtomicBool::new(false));
+        let lock_reacquired_for_callback = Arc::clone(&lock_reacquired);
+        let received = Arc::new(Mutex::new(None));
+        let received_for_callback = Arc::clone(&received);
+        let callback: StreamCallback = Arc::new(move |event| {
+            lock_reacquired_for_callback.store(
+                callback_slot_for_callback.try_lock().is_ok(),
+                Ordering::SeqCst,
+            );
+            *received_for_callback.lock().expect("received lock") = Some(event);
+        });
+        *callback_slot.lock().expect("callback slot lock") = Some(callback);
+
+        let sender = StreamNotificationSender::new(Arc::clone(&callback_slot));
+        sender
+            .send("Build done", "Task complete")
+            .await
+            .expect("send should succeed");
+
+        assert!(
+            lock_reacquired.load(Ordering::SeqCst),
+            "callback should run after releasing the mutex guard"
+        );
+        assert_eq!(
+            *received.lock().expect("received lock"),
+            Some(StreamEvent::Notification {
+                title: "Build done".to_string(),
+                body: "Task complete".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_notification_sender_returns_error_when_callback_mutex_is_poisoned() {
+        let callback_slot = Arc::new(Mutex::new(None));
+        let callback_slot_for_panic = Arc::clone(&callback_slot);
+        let join_result = std::thread::spawn(move || {
+            let _guard = callback_slot_for_panic
+                .lock()
+                .expect("callback slot lock should succeed");
+            panic!("poison callback slot");
+        })
+        .join();
+
+        assert!(
+            join_result.is_err(),
+            "helper thread should poison the mutex"
+        );
+
+        let sender = StreamNotificationSender::new(callback_slot);
+        let error = sender
+            .send("Build done", "Task complete")
+            .await
+            .expect_err("poisoned lock should fail");
+
+        assert!(error.contains("notification callback unavailable"));
     }
 
     fn create_embedding_model_dir(base: &Path, dimensions: usize) {
@@ -2347,6 +2469,7 @@ mod tests {
             session_registry: None,
             session_bus: None,
             kernel_budget: BudgetConfig::default(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             credential_store: None,
             token_broker: None,
             experiment_registry: Some(
@@ -2391,6 +2514,17 @@ mod tests {
             registry.is_some(),
             "session database should remain unlockable"
         );
+    }
+
+    #[test]
+    fn headless_bundle_registers_session_memory_tool() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        assert!(names.contains(&"update_session_memory".to_string()));
     }
 
     #[test]

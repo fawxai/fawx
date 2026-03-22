@@ -117,6 +117,15 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
         }
     }
 
+    /// Replace the shared callback slot used for SSE stream events.
+    pub fn with_stream_callback_slot(
+        mut self,
+        callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    ) -> Self {
+        self.stream_callback = callback_slot;
+        self
+    }
+
     /// Set the stream callback for emitting permission prompt SSE events.
     pub fn with_stream_callback(self, callback: StreamCallback) -> Self {
         match self.stream_callback.lock() {

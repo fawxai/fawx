@@ -175,6 +175,7 @@ pub async fn handle_message(
         response,
         model: result.model,
         iterations: result.iterations,
+        result_kind: result.result_kind,
     })
     .into_response())
 }

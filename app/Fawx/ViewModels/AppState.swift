@@ -186,7 +186,9 @@ final class AppState {
             var connectionMode = storedConnectionMode
 
 #if os(macOS)
-            if (serverURLString.isEmpty || authToken?.isEmpty != false), let localInstallConfiguration {
+            if let localInstallConfiguration,
+               connectionMode == .local || serverURLString.isEmpty || authToken?.isEmpty != false
+            {
                 serverURLString = localInstallConfiguration.baseURLString
                 authToken = localInstallConfiguration.bearerToken
                 connectionMode = .local
@@ -217,7 +219,11 @@ final class AppState {
     var connectionStatus: ConnectionStatus = .disconnected
     var connectionMode: AppConnectionMode
     var rootDestination: AppRootDestination
-    var serverURLString: String
+    var serverURLString: String {
+        didSet {
+            debugLogServerURLMutation(from: oldValue, to: serverURLString)
+        }
+    }
     var pairedDeviceName: String?
     var activeModel: ModelInfo?
     var thinkingLevel: ThinkingLevel?
@@ -229,7 +235,18 @@ final class AppState {
     var currentContext: ContextInfo?
     var permissionPresetName = "Power User"
     var permissionMode: PermissionMode = .prompt
-    var ripcordStatus: RipcordStatusResponse?
+    var ripcordStatus: RipcordStatusResponse? {
+        didSet {
+            guard let ripcordStatus, ripcordStatus.shouldSurfaceNotification else {
+                ripcordNotificationDismissedID = nil
+                return
+            }
+
+            if oldValue?.shouldSurfaceNotification != true || oldValue?.notificationID != ripcordStatus.notificationID {
+                ripcordNotificationDismissedID = nil
+            }
+        }
+    }
     var connectionError: String?
     var theme: AppTheme
     var fontSize: AppFontSize
@@ -254,11 +271,17 @@ final class AppState {
     @ObservationIgnored private var toastDismissTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectAttempt = 0
     @ObservationIgnored private var startupHydrationOverrides: StartupHydrationOverride = []
+    @ObservationIgnored private var refreshServerStateTask: Task<Void, Error>?
+    @ObservationIgnored private var refreshPhase4StateTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshRipcordStateTask: Task<Void, Never>?
+    @ObservationIgnored private var hasAttemptedLaunchAgentRepair = false
+    private var ripcordNotificationDismissedID: String?
 
     @ObservationIgnored private var initialPersistenceLoadTask: Task<Void, Never>?
 
     init(
         persistence: AppStatePersistence = AppStatePersistence.defaultStore(),
+        client: FawxClient? = nil,
         startLoadingPersistedState: Bool = true
     ) {
         let initialState = Self.initialLaunchState()
@@ -272,7 +295,7 @@ final class AppState {
         self.authToken = initialState.authToken
         self.localInstallConfiguration = initialState.localInstallConfiguration
         self.isSetupComplete = initialState.isSetupComplete
-        self.client = FawxClient(baseURL: initialState.baseURL, bearerToken: initialState.authToken)
+        self.client = client ?? FawxClient(baseURL: initialState.baseURL, bearerToken: initialState.authToken)
         self.persistence = persistence
 
         if startLoadingPersistedState {
@@ -436,14 +459,26 @@ final class AppState {
     }
 
     var activeRipcordStatus: RipcordStatusResponse? {
-        guard let ripcordStatus, ripcordStatus.active else {
+        guard let ripcordStatus, ripcordStatus.shouldSurfaceNotification else {
+            return nil
+        }
+        guard ripcordNotificationDismissedID != ripcordStatus.notificationID else {
             return nil
         }
         return ripcordStatus
     }
 
+    func dismissRipcordNotification() {
+        guard let ripcordStatus, ripcordStatus.shouldSurfaceNotification else {
+            return
+        }
+
+        ripcordNotificationDismissedID = ripcordStatus.notificationID
+    }
+
     func bootstrap() async {
         await awaitPersistedStateLoad()
+        await synchronizeLocalConnectionIfNeeded()
 
         guard showsMainExperience, isConfigured else {
             reconnectTask?.cancel()
@@ -588,48 +623,50 @@ final class AppState {
     }
 
     func refreshServerState() async throws {
-        async let modelsTask = client.listModels()
-        async let legacyStatusTask = client.serverStatus()
-        async let permissionsTask = client.getPermissions()
+        try await coalesceThrowingTask(\.refreshServerStateTask) { [self] in
+            async let modelsTask = self.client.listModels()
+            async let legacyStatusTask = self.client.serverStatus()
+            async let permissionsTask = self.client.getPermissions()
 
-        let models = try await modelsTask
-        let legacyStatus: ServerStatusResponse?
-        do {
-            legacyStatus = try await legacyStatusTask
-            serverStatusError = nil
-        } catch {
-            legacyStatus = nil
-            serverStatusError = error.localizedDescription
+            let models = try await modelsTask
+            let legacyStatus: ServerStatusResponse?
+            do {
+                legacyStatus = try await legacyStatusTask
+                self.serverStatusError = nil
+            } catch {
+                legacyStatus = nil
+                self.serverStatusError = error.localizedDescription
+            }
+
+            let permissionsResponse: PermissionsResponse?
+            do {
+                permissionsResponse = try await permissionsTask
+            } catch {
+                permissionsResponse = nil
+            }
+
+            do {
+                let thinking = try await self.client.thinking()
+                self.thinkingLevel = thinking.level
+                self.availableThinkingLevels = thinking.validLevels
+            } catch {
+                self.thinkingLevel = nil
+                self.availableThinkingLevels = []
+            }
+
+            await self.refreshAuthProviders()
+
+            self.availableModels = models.models
+            let activeModelID = legacyStatus?.model ?? models.activeModel
+            self.activeModel = models.models.first(where: { $0.modelID == activeModelID }) ?? models.models.first
+            if let permissionsResponse {
+                self.permissionPresetName = permissionPresetLabel(permissionsResponse.preset)
+                self.permissionMode = permissionsResponse.mode
+            } else {
+                self.permissionPresetName = self.resolvePermissionPreset(from: legacyStatus?.config)
+            }
+            await self.refreshPhase4State()
         }
-
-        let permissionsResponse: PermissionsResponse?
-        do {
-            permissionsResponse = try await permissionsTask
-        } catch {
-            permissionsResponse = nil
-        }
-
-        do {
-            let thinking = try await client.thinking()
-            thinkingLevel = thinking.level
-            availableThinkingLevels = thinking.validLevels
-        } catch {
-            thinkingLevel = nil
-            availableThinkingLevels = []
-        }
-
-        await refreshAuthProviders()
-
-        availableModels = models.models
-        let activeModelID = legacyStatus?.model ?? models.activeModel
-        activeModel = models.models.first(where: { $0.modelID == activeModelID }) ?? models.models.first
-        if let permissionsResponse {
-            permissionPresetName = permissionPresetLabel(permissionsResponse.preset)
-            permissionMode = permissionsResponse.mode
-        } else {
-            permissionPresetName = resolvePermissionPreset(from: legacyStatus?.config)
-        }
-        await refreshPhase4State()
     }
 
     func refreshAuthProviders() async {
@@ -662,24 +699,26 @@ final class AppState {
     }
 
     func refreshRipcordState() async {
-        guard isConfigured else {
-            clearRipcordState()
-            return
-        }
-
-        do {
-            let status = try await client.ripcordStatus()
-            let previousStatus = ripcordStatus
-            ripcordStatus = status
-
-            if shouldNotifyForRipcordActivation(from: previousStatus, to: status) {
-                postRipcordNotification(for: status)
+        await coalesceTask(\.refreshRipcordStateTask) { [self] in
+            guard self.isConfigured else {
+                self.clearRipcordState()
+                return
             }
-        } catch let error as APIError where error.statusCode == 503 {
-            clearRipcordState()
-        } catch {
-            if ConnectionStateMachine.shouldHandleAsConnectionIssue(error) {
-                await noteRecoverableRequestFailure(error)
+
+            do {
+                let status = try await self.client.ripcordStatus()
+                let previousStatus = self.ripcordStatus
+                self.ripcordStatus = status
+
+                if self.shouldNotifyForRipcordActivation(from: previousStatus, to: status) {
+                    self.postRipcordNotification(for: status)
+                }
+            } catch let error as APIError where error.statusCode == 503 {
+                self.clearRipcordState()
+            } catch {
+                if ConnectionStateMachine.shouldHandleAsConnectionIssue(error) {
+                    await self.noteRecoverableRequestFailure(error)
+                }
             }
         }
     }
@@ -703,48 +742,52 @@ final class AppState {
     }
 
     func refreshPhase4State() async {
-        let canQueryLocalSetupServer: Bool
+        await coalesceTask(\.refreshPhase4StateTask) { [self] in
+            let canQueryLocalSetupServer: Bool
 #if os(macOS)
-        canQueryLocalSetupServer = rootDestination == .setupWizard
-            && connectionMode == .local
-            && !serverURLString.isEmpty
+            canQueryLocalSetupServer = self.rootDestination == .setupWizard
+                && self.connectionMode == .local
+                && !self.serverURLString.isEmpty
 #else
-        canQueryLocalSetupServer = false
+            canQueryLocalSetupServer = false
 #endif
 
-        guard isConfigured || canQueryLocalSetupServer else {
-            setupStatus = nil
-            localServerStatus = nil
-            launchAgentStatus = nil
-            qrPairingResponse = nil
-            return
-        }
-
-        do {
-            setupStatus = try await client.setupStatus()
-            setupActionError = nil
-        } catch {
-            setupStatus = nil
-        }
-
-        do {
-            localServerStatus = try await client.runtimeStatus()
-        } catch {
-            if localServerStatus?.status != "stopped" {
-                localServerStatus = nil
+            guard self.isConfigured || canQueryLocalSetupServer else {
+                self.setupStatus = nil
+                self.localServerStatus = nil
+                self.launchAgentStatus = nil
+                self.qrPairingResponse = nil
+                return
             }
-        }
 
-        do {
-            launchAgentStatus = try await client.launchAgentStatus()
-        } catch {
-            launchAgentStatus = nil
-        }
+            do {
+                self.setupStatus = try await self.client.setupStatus()
+                self.setupActionError = nil
+            } catch {
+                self.setupStatus = nil
+            }
 
-        do {
-            qrPairingResponse = try await client.qrPairing()
-        } catch {
-            qrPairingResponse = nil
+            do {
+                self.localServerStatus = try await self.client.runtimeStatus()
+            } catch {
+                if self.localServerStatus?.status != "stopped" {
+                    self.localServerStatus = nil
+                }
+            }
+
+            do {
+                self.launchAgentStatus = try await self.client.launchAgentStatus()
+            } catch {
+                self.launchAgentStatus = nil
+            }
+
+            do {
+                self.qrPairingResponse = try await self.client.qrPairing()
+            } catch {
+                self.qrPairingResponse = nil
+            }
+
+            await self.repairLaunchAgentIfNeeded()
         }
     }
 
@@ -973,6 +1016,42 @@ final class AppState {
         currentContext = nil
     }
 
+    private func coalesceTask(
+        _ keyPath: ReferenceWritableKeyPath<AppState, Task<Void, Never>?>,
+        operation: @escaping @MainActor () async -> Void
+    ) async {
+        if let task = self[keyPath: keyPath] {
+            await task.value
+            return
+        }
+
+        let task = Task { @MainActor [self] in
+            defer { self[keyPath: keyPath] = nil }
+            await operation()
+        }
+
+        self[keyPath: keyPath] = task
+        await task.value
+    }
+
+    private func coalesceThrowingTask(
+        _ keyPath: ReferenceWritableKeyPath<AppState, Task<Void, Error>?>,
+        operation: @escaping @MainActor () async throws -> Void
+    ) async throws {
+        if let task = self[keyPath: keyPath] {
+            try await task.value
+            return
+        }
+
+        let task = Task { @MainActor [self] in
+            defer { self[keyPath: keyPath] = nil }
+            try await operation()
+        }
+
+        self[keyPath: keyPath] = task
+        try await task.value
+    }
+
     func setModel(_ modelID: String) async throws {
         isUpdatingServerSettings = true
         defer { isUpdatingServerSettings = false }
@@ -1051,7 +1130,15 @@ final class AppState {
         from previousStatus: RipcordStatusResponse?,
         to currentStatus: RipcordStatusResponse
     ) -> Bool {
-        currentStatus.active && previousStatus?.active != true
+        guard currentStatus.shouldSurfaceNotification else {
+            return false
+        }
+
+        guard let previousStatus, previousStatus.shouldSurfaceNotification else {
+            return true
+        }
+
+        return previousStatus.notificationID != currentStatus.notificationID
     }
 
     private func postRipcordNotification(for status: RipcordStatusResponse) {
@@ -1089,19 +1176,19 @@ final class AppState {
     private func startPersistedStateLoad(resetState: Bool) {
         let persistence = persistence
 
-        initialPersistenceLoadTask = Task(priority: .utility) { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
-
+        initialPersistenceLoadTask = Task(priority: .utility) { [weak self] in
             let snapshot = await persistence.loadLaunchSnapshot(resetState: resetState)
             guard !Task.isCancelled else {
                 return
             }
 
-            await applyPersistedLaunchSnapshot(snapshot)
-            initialPersistenceLoadTask = nil
+            await self?.finishPersistedStateLoad(snapshot)
         }
+    }
+
+    private func finishPersistedStateLoad(_ snapshot: AppStatePersistence.LaunchSnapshot) async {
+        await applyPersistedLaunchSnapshot(snapshot)
+        initialPersistenceLoadTask = nil
     }
 
     private func applyPersistedLaunchSnapshot(_ snapshot: AppStatePersistence.LaunchSnapshot) async {
@@ -1323,12 +1410,128 @@ final class AppState {
 #endif
     }
 
+    func synchronizeLocalConnectionIfNeeded() async {
+#if os(macOS)
+        guard connectionMode == .local else {
+            return
+        }
+
+        let configuration: LocalInstallConfiguration?
+        if let localInstallConfiguration {
+            configuration = localInstallConfiguration
+        } else {
+            configuration = await refreshLocalInstallConfiguration()
+        }
+        guard let configuration else {
+            debugLogLocalConnectionSync("no local install configuration available")
+            return
+        }
+
+        let resolvedServerURL = configuration.baseURLString
+        let resolvedBearerToken = configuration.bearerToken
+
+        guard serverURLString != resolvedServerURL || authToken != resolvedBearerToken else {
+            debugLogLocalConnectionSync("already synchronized to \(resolvedServerURL)")
+            return
+        }
+
+        debugLogLocalConnectionSync(
+            "resyncing local connection from \(serverURLString.nonEmpty ?? "<empty>") to \(resolvedServerURL)"
+        )
+        serverURLString = resolvedServerURL
+        authToken = resolvedBearerToken
+        await client.updateConfiguration(
+            baseURL: URL(string: resolvedServerURL),
+            bearerToken: resolvedBearerToken
+        )
+#endif
+    }
+
+#if DEBUG
+    private func debugLogServerURLMutation(from oldValue: String, to newValue: String) {
+        guard oldValue != newValue || newValue.contains(":18400") else {
+            return
+        }
+
+        NSLog(
+            """
+            [FawxDebug][AppState] serverURLString changed old=%@ new=%@ mode=%@ root=%@ stack=%@
+            """,
+            oldValue.nonEmpty ?? "<empty>",
+            newValue.nonEmpty ?? "<empty>",
+            connectionMode.rawValue,
+            rootDestinationKey,
+            Thread.callStackSymbols.prefix(8).joined(separator: " | ")
+        )
+    }
+
+    private func debugLogLocalConnectionSync(_ message: String) {
+        NSLog("[FawxDebug][AppState] local connection sync: %@", message)
+    }
+#else
+    private func debugLogServerURLMutation(from oldValue: String, to newValue: String) {}
+
+    private func debugLogLocalConnectionSync(_ message: String) {}
+#endif
+
     private func persistConnectionMode() {
         let connectionMode = connectionMode
         let persistence = persistence
         Task(priority: .utility) {
             await persistence.setConnectionMode(connectionMode)
         }
+    }
+
+    private func repairLaunchAgentIfNeeded() async {
+#if os(macOS)
+        guard !hasAttemptedLaunchAgentRepair else {
+            return
+        }
+        guard connectionMode == .local else {
+            return
+        }
+        guard launchAgentStatus?.installed == true else {
+            return
+        }
+        guard let plistURL = Self.launchAgentPlistURL() else {
+            return
+        }
+        guard
+            let plistContents = try? String(contentsOf: plistURL, encoding: .utf8),
+            Self.launchAgentNeedsRepair(plistContents: plistContents)
+        else {
+            return
+        }
+
+        hasAttemptedLaunchAgentRepair = true
+
+        do {
+            _ = try await client.installLaunchAgent(autoStart: true)
+            launchAgentStatus = try await client.launchAgentStatus()
+            showToast(message: "Repaired local server auto-start configuration.", style: .info)
+        } catch {
+            setupActionError = error.localizedDescription
+        }
+#endif
+    }
+
+    nonisolated static func launchAgentNeedsRepair(plistContents: String) -> Bool {
+        guard plistContents.contains("<string>serve</string>") else {
+            return false
+        }
+
+        return !plistContents.contains("<string>--http</string>")
+    }
+
+    private nonisolated static func launchAgentPlistURL() -> URL? {
+#if os(macOS)
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+            .appendingPathComponent("ai.fawx.server.plist", isDirectory: false)
+#else
+        nil
+#endif
     }
 
     private func persistTheme(_ theme: AppTheme) {

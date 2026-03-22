@@ -452,12 +452,7 @@ fn write_stream_delta(writer: &mut impl Write, delta: &str) -> Result<(), CoreLl
 }
 
 pub(crate) fn trim_history(history: &mut Vec<Message>, max_history: usize) {
-    if history.len() <= max_history {
-        return;
-    }
-
-    let remove_count = history.len() - max_history;
-    history.drain(0..remove_count);
+    fx_llm::trim_conversation_history(history, max_history);
 }
 
 #[cfg(test)]

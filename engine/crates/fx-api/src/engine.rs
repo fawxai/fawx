@@ -17,6 +17,17 @@ pub struct CycleResult {
     pub response: String,
     pub model: String,
     pub iterations: u32,
+    pub result_kind: ResultKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    Complete,
+    Partial,
+    NeedsInput,
+    Error,
+    Empty,
 }
 
 #[async_trait]
@@ -78,8 +89,37 @@ pub trait AppEngine: Send + Sync {
 
     fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto>;
 
+    /// Maximum number of conversation history messages to retain per session.
+    fn max_history(&self) -> usize {
+        20
+    }
+
     /// Session-level token usage (input + output tokens).
     fn session_token_usage(&self) -> (u64, u64) {
         (0, 0)
+    }
+
+    /// Replace the active session memory, returning the previous value.
+    fn replace_session_memory(
+        &mut self,
+        memory: fx_session::SessionMemory,
+    ) -> fx_session::SessionMemory {
+        let _ = memory;
+        fx_session::SessionMemory::default()
+    }
+
+    /// Snapshot the active session memory.
+    fn session_memory(&self) -> fx_session::SessionMemory {
+        fx_session::SessionMemory::default()
+    }
+
+    /// Session key currently loaded into the in-memory loop engine, when any.
+    fn loaded_session_key(&self) -> Option<fx_session::SessionKey> {
+        None
+    }
+
+    /// Structured session messages recorded for the most recent completed turn.
+    fn take_last_session_messages(&mut self) -> Vec<fx_session::SessionMessage> {
+        Vec::new()
     }
 }

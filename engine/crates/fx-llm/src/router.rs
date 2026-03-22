@@ -479,6 +479,28 @@ impl LlmRouter {
     }
 }
 
+/// Hardcoded context window lookup for known model families.
+///
+/// Returns the context window size in tokens. This is a stopgap until
+/// `ModelInfo` carries provider-reported context window sizes.
+pub fn context_window_for_model(model_id: &str) -> usize {
+    let id = model_id.to_lowercase();
+    if id.contains("claude-opus") || id.contains("claude-sonnet") || id.contains("claude-haiku") {
+        return 200_000;
+    }
+    if id.contains("gpt-5") || id.contains("gpt-4") {
+        return 128_000;
+    }
+    if id.contains("deepseek") {
+        return 64_000;
+    }
+    if id.contains("gemini") {
+        return 1_000_000;
+    }
+    // Conservative default for unknown models.
+    128_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +1317,40 @@ mod thinking_level_tests {
             supported_thinking_levels("mystery"),
             vec!["off".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_for_model;
+
+    #[test]
+    fn returns_200k_for_claude_models() {
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_for_model("claude-haiku-4-5"), 200_000);
+    }
+
+    #[test]
+    fn returns_128k_for_gpt_models() {
+        assert_eq!(context_window_for_model("gpt-5.4"), 128_000);
+        assert_eq!(context_window_for_model("gpt-4o"), 128_000);
+    }
+
+    #[test]
+    fn returns_64k_for_deepseek_models() {
+        assert_eq!(context_window_for_model("deepseek-chat"), 64_000);
+        assert_eq!(context_window_for_model("deepseek-reasoner"), 64_000);
+    }
+
+    #[test]
+    fn returns_1m_for_gemini_models() {
+        assert_eq!(context_window_for_model("gemini-2.5-pro"), 1_000_000);
+        assert_eq!(context_window_for_model("gemini-2.5-flash"), 1_000_000);
+    }
+
+    #[test]
+    fn returns_default_for_unknown_models() {
+        assert_eq!(context_window_for_model("some-unknown-model"), 128_000);
     }
 }

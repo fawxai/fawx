@@ -19,16 +19,22 @@ use axum::Json;
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
-use fx_llm::Message;
+use fx_kernel::StreamCallback;
+use fx_llm::{trim_conversation_history, ContentBlock, Message};
 use fx_session::{
-    MessageRole, SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMessage,
-    SessionRegistry, SessionStatus,
+    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMemory,
+    SessionMessage, SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+const SESSION_MEMORY_MAX_ITEMS: usize = 20;
+const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -157,6 +163,38 @@ pub async fn handle_get_context(
     Ok(Json(app.context_info_for_messages(&context)).into_response())
 }
 
+pub async fn handle_get_session_memory(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    let memory = registry
+        .memory(&key)
+        .map_err(|error| map_session_error(&id, error))?;
+    Ok(Json(memory).into_response())
+}
+
+pub async fn handle_update_session_memory(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Json(memory): Json<SessionMemory>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    let memory = validate_session_memory(memory)?;
+    registry
+        .record_turn(&key, Vec::new(), memory.clone())
+        .map_err(|error| map_session_error(&id, error))?;
+
+    let mut app = state.app.lock().await;
+    if app.loaded_session_key().as_ref() == Some(&key) {
+        let _ = app.replace_session_memory(memory.clone());
+    }
+
+    Ok(Json(memory).into_response())
+}
+
 pub async fn handle_delete_session(
     State(state): State<HttpState>,
     Path(id): Path<String>,
@@ -253,7 +291,12 @@ pub(crate) async fn handle_send_message_for_session(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let context = session_messages_to_context(&history);
+    let mut context = session_messages_to_context(&history);
+    let max_history = {
+        let app = state.app.lock().await;
+        app.max_history()
+    };
+    trim_conversation_history(&mut context, max_history);
 
     validate_message_text(&request.message)?;
     let images = validate_and_encode_images(&request.images)?;
@@ -270,27 +313,69 @@ pub(crate) async fn handle_send_message_for_session(
         .await);
     }
 
-    let (result, response) =
-        process_and_route_session_message(&state, &request.message, &images, context)
-            .await
-            .map_err(internal_error)?;
-    record_session_turn(&registry, &key, &request.message, &response).map_err(internal_error)?;
+    let (result, response, session_messages, session_memory) = process_and_route_session_message(
+        &state,
+        &registry,
+        &key,
+        &request.message,
+        &images,
+        context,
+    )
+    .await
+    .map_err(internal_error)?;
+    persist_session_turn(&registry, &key, session_messages, session_memory)
+        .map_err(|error| internal_error(anyhow::Error::new(error)))?;
 
     Ok(Json(MessageResponse {
         response,
         model: result.model,
         iterations: result.iterations,
+        result_kind: result.result_kind,
     })
     .into_response())
 }
 
 pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
-    messages
+    let context = messages
         .iter()
-        .map(|message| match message.role {
-            MessageRole::User => Message::user(message.content.clone()),
-            MessageRole::Assistant => Message::assistant(message.content.clone()),
-            MessageRole::System => Message::system(message.content.clone()),
+        .map(SessionMessage::to_llm_message)
+        .collect();
+    prune_unresolved_tool_context(context)
+}
+
+fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
+    let mut tool_use_ids = HashSet::new();
+    let mut tool_result_ids = HashSet::new();
+
+    for message in &messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    tool_use_ids.insert(id.clone());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    tool_result_ids.insert(tool_use_id.clone());
+                }
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+
+    let unresolved_tool_use_ids = tool_use_ids
+        .iter()
+        .filter(|id| !tool_result_ids.contains(*id))
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    messages
+        .into_iter()
+        .filter_map(|mut message| {
+            message.content.retain(|block| match block {
+                ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+            });
+            (!message.content.is_empty()).then_some(message)
         })
         .collect()
 }
@@ -322,33 +407,21 @@ async fn stream_session_message_response(
 
 async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
     let callback = stream_callback(task.sender.clone(), Arc::clone(&task.disconnected));
-    let result = {
-        let mut app = task.state.app.lock().await;
-        let r = app
-            .process_message_with_context(
-                &task.message,
-                encoded_images_to_attachments(&task.images),
-                task.context,
-                InputSource::Http,
-                Some(callback),
-            )
-            .await;
-        // Update shared read state while we still hold the lock
-        task.state
-            .shared
-            .update_after_cycle(
-                app.active_model(),
-                &app.thinking_level(),
-                app.session_token_usage(),
-            )
-            .await;
-        r
-    };
+    let result = execute_session_turn(
+        &task.state,
+        &task.registry,
+        &task.key,
+        &task.message,
+        &task.images,
+        task.context,
+        Some(callback),
+    )
+    .await;
 
     match result {
-        Ok((result, _)) => {
+        Ok((_result, session_messages, session_memory)) => {
             if let Err(error) =
-                record_session_turn(&task.registry, &task.key, &task.message, &result.response)
+                persist_session_turn(&task.registry, &task.key, session_messages, session_memory)
             {
                 let _ = send_sse_frame(
                     &task.sender,
@@ -369,32 +442,14 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
 
 async fn process_and_route_session_message(
     state: &HttpState,
+    registry: &SessionRegistry,
+    key: &SessionKey,
     message: &str,
     images: &[EncodedImage],
     context: Vec<Message>,
-) -> Result<(CycleResult, String), anyhow::Error> {
-    let result = {
-        let mut app = state.app.lock().await;
-        let (result, _) = app
-            .process_message_with_context(
-                message,
-                encoded_images_to_attachments(images),
-                context,
-                InputSource::Http,
-                None,
-            )
-            .await?;
-        // Update shared read state while we still hold the lock
-        state
-            .shared
-            .update_after_cycle(
-                app.active_model(),
-                &app.thinking_level(),
-                app.session_token_usage(),
-            )
-            .await;
-        result
-    };
+) -> Result<(CycleResult, String, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
+    let (result, session_messages, session_memory) =
+        execute_session_turn(state, registry, key, message, images, context, None).await?;
 
     state
         .channels
@@ -410,7 +465,57 @@ async fn process_and_route_session_message(
         .http
         .take_response()
         .unwrap_or_else(|| result.response.clone());
-    Ok((result, response))
+    Ok((result, response, session_messages, session_memory))
+}
+
+async fn execute_session_turn(
+    state: &HttpState,
+    registry: &SessionRegistry,
+    key: &SessionKey,
+    message: &str,
+    images: &[EncodedImage],
+    context: Vec<Message>,
+    callback: Option<StreamCallback>,
+) -> Result<(CycleResult, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
+    let loaded_memory = registry.memory(key).map_err(anyhow::Error::new)?;
+    let mut app = state.app.lock().await;
+    let previous_memory = app.replace_session_memory(loaded_memory);
+    let outcome = app
+        .process_message_with_context(
+            message,
+            encoded_images_to_attachments(images),
+            context,
+            InputSource::Http,
+            callback,
+        )
+        .await;
+    state
+        .shared
+        .update_after_cycle(
+            app.active_model(),
+            &app.thinking_level(),
+            app.session_token_usage(),
+        )
+        .await;
+    let result = match outcome {
+        Ok((result, _)) => {
+            let session_messages = app.take_last_session_messages();
+            let session_memory = app.session_memory();
+            Ok((result, session_messages, session_memory))
+        }
+        Err(error) => Err(error),
+    };
+    app.replace_session_memory(previous_memory);
+    result
+}
+
+fn persist_session_turn(
+    registry: &SessionRegistry,
+    key: &SessionKey,
+    session_messages: Vec<SessionMessage>,
+    session_memory: SessionMemory,
+) -> Result<(), SessionError> {
+    registry.record_turn(key, session_messages, session_memory)
 }
 
 fn create_session(
@@ -435,17 +540,6 @@ fn create_session(
 fn generate_session_key() -> anyhow::Result<SessionKey> {
     let uuid = Uuid::new_v4().simple().to_string();
     SessionKey::new(format!("sess-{}", &uuid[..8])).map_err(anyhow::Error::new)
-}
-
-fn record_session_turn(
-    registry: &SessionRegistry,
-    key: &SessionKey,
-    user_message: &str,
-    assistant_message: &str,
-) -> anyhow::Result<()> {
-    registry.record_message(key, MessageRole::User, user_message)?;
-    registry.record_message(key, MessageRole::Assistant, assistant_message)?;
-    Ok(())
 }
 
 async fn load_session_bus(state: &HttpState) -> Result<SessionBus, (StatusCode, Json<ErrorBody>)> {
@@ -475,6 +569,45 @@ fn target_session_key(id: &str) -> Result<SessionKey, (StatusCode, Json<ErrorBod
 
 fn invalid_payload(error: serde_json::Error) -> (StatusCode, Json<ErrorBody>) {
     bad_request(&format!("invalid payload: {error}"))
+}
+
+fn validate_session_memory(
+    mut memory: SessionMemory,
+) -> Result<SessionMemory, (StatusCode, Json<ErrorBody>)> {
+    if memory.key_decisions.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "key_decisions must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    if memory.custom_context.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "custom_context must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    if memory.active_files.len() > SESSION_MEMORY_MAX_ITEMS {
+        return Err(bad_request(&format!(
+            "active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items"
+        )));
+    }
+
+    let estimated_tokens = memory.estimated_tokens();
+    if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
+        return Err(bad_request(&format!(
+            "session memory exceeds the {SESSION_MEMORY_MAX_TOKENS} token cap ({estimated_tokens} estimated)"
+        )));
+    }
+
+    memory.last_updated = current_epoch_secs();
+    Ok(memory)
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
@@ -531,4 +664,89 @@ fn session_bus_unavailable() -> (StatusCode, Json<ErrorBody>) {
             error: "session bus not available".to_string(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fx_session::{MessageRole as SessionMessageRole, SessionContentBlock};
+
+    #[test]
+    fn session_messages_to_context_drops_unresolved_tool_use_messages() {
+        let messages = vec![
+            SessionMessage::text(SessionMessageRole::User, "first", 1),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                    is_error: Some(false),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                4,
+                None,
+            ),
+        ];
+
+        let context = session_messages_to_context(&messages);
+
+        assert_eq!(context.len(), 3);
+        assert!(context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { id, .. } if id == "call_good"
+                )
+            }));
+        assert!(!context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { id, .. } if id == "call_bad"
+                )
+            }));
+    }
+
+    #[test]
+    fn validate_session_memory_rejects_too_many_active_files() {
+        let memory = SessionMemory {
+            active_files: (0..=SESSION_MEMORY_MAX_ITEMS)
+                .map(|index| format!("file-{index}.rs"))
+                .collect(),
+            ..SessionMemory::default()
+        };
+
+        let error = validate_session_memory(memory).expect_err("validation should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1 .0.error,
+            format!("active_files must contain at most {SESSION_MEMORY_MAX_ITEMS} items")
+        );
+    }
 }

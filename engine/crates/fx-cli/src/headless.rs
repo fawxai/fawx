@@ -6,9 +6,12 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use futures::Stream;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 #[cfg(feature = "http")]
-use fx_api::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+use fx_api::engine::{
+    AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult, ResultKind as ApiResultKind,
+};
 #[cfg(feature = "http")]
 use fx_api::{
     AuthProviderDto, ContextInfoDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto,
@@ -23,21 +26,29 @@ use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::cancellation::CancellationToken;
-use fx_kernel::loop_engine::{LoopEngine, LoopResult};
+use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
-use fx_llm::{valid_thinking_levels, ImageAttachment, Message, ModelInfo, ModelRouter};
+use fx_llm::{
+    valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
+    ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
+    StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall, ToolUseDelta, Usage,
+};
 use fx_memory::SignalStore;
-use fx_session::SessionKey;
+use fx_session::{
+    MessageRole as SessionRecordRole, SessionContentBlock, SessionKey, SessionMessage,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -130,9 +141,48 @@ pub struct ErrorRecord {
     pub recoverable: bool,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    Complete,
+    Partial,
+    NeedsInput,
+    Error,
+    Empty,
+}
+
+#[cfg(feature = "http")]
+impl From<ResultKind> for ApiResultKind {
+    fn from(value: ResultKind) -> Self {
+        match value {
+            ResultKind::Complete => Self::Complete,
+            ResultKind::Partial => Self::Partial,
+            ResultKind::NeedsInput => Self::NeedsInput,
+            ResultKind::Error => Self::Error,
+            ResultKind::Empty => Self::Empty,
+        }
+    }
+}
+
 const MAX_ERROR_HISTORY: usize = 50;
 const NO_AI_PROVIDERS_STARTUP_WARNING: &str =
     "no AI providers configured; HTTP API available but chat disabled until a provider is added";
+const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str =
+    "I ran out of processing budget before finishing. Could you try again or simplify the request?";
+const NEEDS_INPUT_FALLBACK_RESPONSE: &str =
+    "I wasn't able to produce a complete answer. Could you rephrase or provide more context?";
+const TIMEOUT_ERROR_RESPONSE: &str =
+    "The request timed out. The operation may still be running. You can try again.";
+const PERMISSION_ERROR_RESPONSE: &str =
+    "That action isn't allowed under the current permission settings.";
+const RATE_LIMIT_ERROR_RESPONSE: &str =
+    "The API rate limit was hit. Please wait a moment and try again.";
+const AUTH_ERROR_RESPONSE: &str =
+    "There was an authentication issue with the API provider. Check your credentials in settings.";
+const NETWORK_ERROR_RESPONSE: &str =
+    "A network error occurred. Check your internet connection and try again.";
+const GENERIC_ERROR_RESPONSE: &str =
+    "Something went wrong while processing your request. Please try again.";
 
 pub struct CycleResult {
     /// The assistant's response text.
@@ -143,6 +193,8 @@ pub struct CycleResult {
     pub iterations: u32,
     /// Token usage reported for the cycle.
     pub tokens_used: TokenUsage,
+    /// High-level classification used by downstream clients.
+    pub result_kind: ResultKind,
 }
 
 // ── HeadlessApp ─────────────────────────────────────────────────────────────
@@ -164,8 +216,7 @@ pub struct HeadlessAppDeps {
     pub session_key: Option<SessionKey>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
-    pub permission_callback_slot:
-        Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    pub stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
@@ -199,8 +250,10 @@ pub struct HeadlessApp {
     error_history: VecDeque<ErrorRecord>,
     /// Cumulative token usage across all cycles in this session.
     cumulative_tokens: TokenUsage,
-    /// Shared callback slot for permission prompt SSE events.
-    permission_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    /// Structured messages recorded for the most recent completed turn.
+    last_session_messages: Vec<SessionMessage>,
+    /// Shared callback slot for executor-triggered SSE stream events.
+    stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
@@ -226,6 +279,589 @@ pub struct HeadlessSubagentFactory {
 
 struct HeadlessSubagentSession {
     app: HeadlessApp,
+}
+
+#[derive(Debug, Clone)]
+struct RecordingLoopLlmProvider<T> {
+    inner: T,
+    collector: SessionTurnCollector,
+}
+
+impl<T> RecordingLoopLlmProvider<T> {
+    fn new(inner: T, collector: SessionTurnCollector) -> Self {
+        Self { inner, collector }
+    }
+}
+
+#[async_trait]
+impl<T> LoopLlmProvider for RecordingLoopLlmProvider<T>
+where
+    T: LoopLlmProvider,
+{
+    async fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, fx_core::error::LlmError> {
+        self.inner.generate(prompt, max_tokens).await
+    }
+
+    async fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, fx_core::error::LlmError> {
+        self.inner
+            .generate_streaming(prompt, max_tokens, callback)
+            .await
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.inner.complete(request).await?;
+        self.collector.record_response(&response);
+        Ok(response)
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionStream, ProviderError> {
+        let stream = self.inner.complete_stream(request).await?;
+        Ok(Box::pin(RecordingCompletionStream::new(
+            stream,
+            self.collector.clone(),
+        )))
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: ProviderStreamCallback,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.inner.stream(request, callback).await?;
+        self.collector.record_response(&response);
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamedToolCallState {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    arguments_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamedCompletionState {
+    text: String,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+    tool_calls_by_index: HashMap<usize, StreamedToolCallState>,
+    id_to_index: HashMap<String, usize>,
+}
+
+impl StreamedCompletionState {
+    fn apply_chunk(&mut self, chunk: StreamChunk) {
+        if let Some(delta) = chunk.delta_content {
+            self.text.push_str(&delta);
+        }
+        self.usage = merge_stream_usage(self.usage, chunk.usage);
+        self.stop_reason = chunk.stop_reason.or(self.stop_reason.take());
+        self.apply_tool_deltas(chunk.tool_use_deltas);
+    }
+
+    fn apply_tool_deltas(&mut self, deltas: Vec<ToolUseDelta>) {
+        for (chunk_index, delta) in deltas.into_iter().enumerate() {
+            let index = streamed_tool_index(
+                chunk_index,
+                &delta,
+                &self.tool_calls_by_index,
+                &self.id_to_index,
+            );
+            let entry = self.tool_calls_by_index.entry(index).or_default();
+            merge_streamed_tool_delta(entry, delta, &mut self.id_to_index, index);
+        }
+    }
+
+    fn into_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text { text: self.text }],
+            tool_calls: finalize_streamed_tool_calls(self.tool_calls_by_index),
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        }
+    }
+}
+
+struct RecordingCompletionStream {
+    inner: CompletionStream,
+    collector: SessionTurnCollector,
+    state: StreamedCompletionState,
+    recorded: bool,
+}
+
+impl RecordingCompletionStream {
+    fn new(inner: CompletionStream, collector: SessionTurnCollector) -> Self {
+        Self {
+            inner,
+            collector,
+            state: StreamedCompletionState::default(),
+            recorded: false,
+        }
+    }
+
+    fn record_completed_response(&mut self) {
+        if self.recorded {
+            return;
+        }
+
+        let response = std::mem::take(&mut self.state).into_response();
+        self.collector.record_response(&response);
+        self.recorded = true;
+    }
+}
+
+impl Stream for RecordingCompletionStream {
+    type Item = Result<StreamChunk, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.state.apply_chunk(chunk.clone());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => {
+                this.record_completed_response();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SessionTurnCollector {
+    responses: Arc<Mutex<Vec<CompletionResponse>>>,
+    tool_result_rounds: Arc<Mutex<Vec<Vec<SessionContentBlock>>>>,
+    pending_tool_results: Arc<Mutex<Vec<SessionContentBlock>>>,
+}
+
+#[derive(Debug, Default)]
+struct SessionTurnSnapshot {
+    responses: Vec<CompletionResponse>,
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+}
+
+#[derive(Debug)]
+struct RecordedAssistantTurn {
+    message: SessionMessage,
+    has_tool_use: bool,
+}
+
+impl SessionTurnCollector {
+    fn record_response(&self, response: &CompletionResponse) {
+        match self.responses.lock() {
+            Ok(mut guard) => {
+                guard.push(response.clone());
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to record session turn response");
+            }
+        }
+    }
+
+    fn callback(&self, forward: Option<StreamCallback>) -> StreamCallback {
+        let collector = self.clone();
+        Arc::new(move |event| {
+            collector.observe(&event);
+            if let Some(callback) = forward.as_ref() {
+                callback(event);
+            }
+        })
+    }
+
+    fn session_messages_for_turn(
+        &self,
+        user_text: &str,
+        images: &[ImageAttachment],
+        fallback_response: &str,
+    ) -> Vec<SessionMessage> {
+        self.flush_pending_tool_results();
+
+        let timestamp = current_epoch_secs();
+        let mut messages = vec![user_session_message(user_text, images, timestamp)];
+        let assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
+
+        if assistant_messages.is_empty() {
+            messages.push(fallback_assistant_message(fallback_response, timestamp));
+        } else {
+            messages.extend(assistant_messages);
+        }
+
+        messages
+    }
+
+    fn observe(&self, event: &StreamEvent) {
+        match event {
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallComplete { .. } => {
+                self.flush_pending_tool_results();
+            }
+            StreamEvent::ToolResult {
+                id,
+                output,
+                is_error,
+            } => match self.pending_tool_results.lock() {
+                Ok(mut guard) => {
+                    guard.push(SessionContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: serde_json::Value::String(output.clone()),
+                        is_error: Some(*is_error),
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to record pending tool result");
+                }
+            },
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+                self.flush_pending_tool_results();
+            }
+            StreamEvent::TextDelta { .. }
+            | StreamEvent::Notification { .. }
+            | StreamEvent::PermissionPrompt(_)
+            | StreamEvent::PhaseChange { .. }
+            | StreamEvent::ContextCompacted { .. } => {}
+        }
+    }
+
+    fn flush_pending_tool_results(&self) {
+        let pending_blocks = match self.pending_tool_results.lock() {
+            Ok(mut pending) => {
+                if pending.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *pending)
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to flush pending tool results");
+                return;
+            }
+        };
+
+        match self.tool_result_rounds.lock() {
+            Ok(mut rounds) => {
+                rounds.push(pending_blocks);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to store flushed tool results");
+                match self.pending_tool_results.lock() {
+                    Ok(mut pending) => pending.extend(pending_blocks),
+                    Err(recover_error) => {
+                        tracing::warn!(
+                            error = %recover_error,
+                            "failed to restore pending tool results after flush failure"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SessionTurnSnapshot {
+        SessionTurnSnapshot {
+            responses: self.snapshot_responses(),
+            tool_result_rounds: self.snapshot_tool_result_rounds(),
+        }
+    }
+
+    fn snapshot_responses(&self) -> Vec<CompletionResponse> {
+        match self.responses.lock() {
+            Ok(guard) => guard.clone(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to snapshot recorded session responses");
+                Vec::new()
+            }
+        }
+    }
+
+    fn snapshot_tool_result_rounds(&self) -> Vec<Vec<SessionContentBlock>> {
+        match self.tool_result_rounds.lock() {
+            Ok(guard) => guard.clone(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to snapshot recorded tool results");
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn user_session_message(
+    user_text: &str,
+    images: &[ImageAttachment],
+    timestamp: u64,
+) -> SessionMessage {
+    SessionMessage::structured(
+        SessionRecordRole::User,
+        user_message_blocks(user_text, images),
+        timestamp,
+        None,
+    )
+}
+
+fn fallback_assistant_message(fallback_response: &str, timestamp: u64) -> SessionMessage {
+    SessionMessage::structured(
+        SessionRecordRole::Assistant,
+        vec![SessionContentBlock::Text {
+            text: fallback_response.to_string(),
+        }],
+        timestamp,
+        None,
+    )
+}
+
+fn build_assistant_turn_messages(
+    snapshot: SessionTurnSnapshot,
+    timestamp: u64,
+) -> Vec<SessionMessage> {
+    let mut messages = Vec::new();
+    let mut tool_result_rounds = snapshot.tool_result_rounds.into_iter();
+
+    for response in snapshot.responses {
+        let Some(recorded_turn) = assistant_turn_from_response(response, timestamp) else {
+            continue;
+        };
+
+        messages.push(recorded_turn.message);
+        if recorded_turn.has_tool_use {
+            append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
+        }
+    }
+
+    messages
+}
+
+fn assistant_turn_from_response(
+    response: CompletionResponse,
+    timestamp: u64,
+) -> Option<RecordedAssistantTurn> {
+    let blocks = session_blocks_from_response(response.content, response.tool_calls);
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    Some(RecordedAssistantTurn {
+        message: SessionMessage::structured_with_usage(
+            SessionRecordRole::Assistant,
+            blocks,
+            timestamp,
+            response.usage,
+        ),
+        has_tool_use,
+    })
+}
+
+fn append_tool_result_round(
+    messages: &mut Vec<SessionMessage>,
+    tool_result_rounds: &mut impl Iterator<Item = Vec<SessionContentBlock>>,
+    timestamp: u64,
+) {
+    let Some(tool_results) = tool_result_rounds.next() else {
+        return;
+    };
+    if tool_results.is_empty() {
+        return;
+    }
+
+    messages.push(SessionMessage::structured(
+        SessionRecordRole::Tool,
+        tool_results,
+        timestamp,
+        None,
+    ));
+}
+
+fn session_blocks_from_response(
+    content: Vec<fx_llm::ContentBlock>,
+    tool_calls: Vec<ToolCall>,
+) -> Vec<SessionContentBlock> {
+    let mut blocks = content
+        .into_iter()
+        .filter_map(session_block_from_content)
+        .collect::<Vec<_>>();
+    let has_tool_use_blocks = blocks
+        .iter()
+        .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    if !has_tool_use_blocks {
+        blocks.extend(
+            tool_calls
+                .into_iter()
+                .map(|call| SessionContentBlock::ToolUse {
+                    id: call.id,
+                    provider_id: None,
+                    name: call.name,
+                    input: call.arguments,
+                }),
+        );
+    }
+    blocks
+}
+
+fn session_block_from_content(block: fx_llm::ContentBlock) -> Option<SessionContentBlock> {
+    match block {
+        fx_llm::ContentBlock::Text { text } if text.is_empty() => None,
+        other => Some(SessionContentBlock::from(other)),
+    }
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn merge_stream_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+
+    let left_in = left.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
+    let left_out = left.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+    let right_in = right.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
+    let right_out = right.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+
+    Some(Usage {
+        input_tokens: left_in.saturating_add(right_in),
+        output_tokens: left_out.saturating_add(right_out),
+    })
+}
+
+fn streamed_tool_index(
+    chunk_index: usize,
+    delta: &ToolUseDelta,
+    tool_calls_by_index: &HashMap<usize, StreamedToolCallState>,
+    id_to_index: &HashMap<String, usize>,
+) -> usize {
+    let Some(id) = delta.id.as_deref() else {
+        return chunk_index;
+    };
+
+    if let Some(index) = id_to_index.get(id).copied() {
+        return index;
+    }
+
+    if streamed_chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+        return chunk_index;
+    }
+
+    next_streamed_tool_index(tool_calls_by_index)
+}
+
+fn streamed_chunk_index_usable_for_id(
+    chunk_index: usize,
+    id: &str,
+    tool_calls_by_index: &HashMap<usize, StreamedToolCallState>,
+) -> bool {
+    match tool_calls_by_index.get(&chunk_index) {
+        None => true,
+        Some(state) => match state.id.as_deref() {
+            None => true,
+            Some(existing_id) => existing_id == id,
+        },
+    }
+}
+
+fn next_streamed_tool_index(tool_calls_by_index: &HashMap<usize, StreamedToolCallState>) -> usize {
+    tool_calls_by_index
+        .keys()
+        .copied()
+        .max()
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn merge_streamed_tool_delta(
+    entry: &mut StreamedToolCallState,
+    delta: ToolUseDelta,
+    id_to_index: &mut HashMap<String, usize>,
+    index: usize,
+) {
+    if entry.id.is_none() {
+        entry.id = delta.id;
+    }
+    if entry.name.is_none() {
+        entry.name = delta.name;
+    }
+    if let Some(id) = entry.id.clone() {
+        id_to_index.insert(id, index);
+    }
+    if let Some(arguments_delta) = delta.arguments_delta {
+        merge_streamed_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
+    }
+    entry.arguments_done |= delta.arguments_done;
+}
+
+fn merge_streamed_arguments(arguments: &mut String, arguments_delta: &str, arguments_done: bool) {
+    if arguments_delta.is_empty() {
+        return;
+    }
+
+    let done_payload_is_complete = arguments_done
+        && !arguments.is_empty()
+        && serde_json::from_str::<serde_json::Value>(arguments_delta).is_ok();
+    if done_payload_is_complete {
+        arguments.clear();
+    }
+
+    arguments.push_str(arguments_delta);
+}
+
+fn finalize_streamed_tool_calls(by_index: HashMap<usize, StreamedToolCallState>) -> Vec<ToolCall> {
+    let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
+    indexed_calls.sort_by_key(|(index, _)| *index);
+    indexed_calls
+        .into_iter()
+        .filter_map(|(_, state)| streamed_tool_call_from_state(state))
+        .collect()
+}
+
+fn streamed_tool_call_from_state(state: StreamedToolCallState) -> Option<ToolCall> {
+    if !state.arguments_done {
+        return None;
+    }
+
+    let id = state.id?.trim().to_string();
+    let name = state.name?.trim().to_string();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    let raw_arguments = if state.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        state.arguments.trim()
+    };
+
+    serde_json::from_str(raw_arguments)
+        .ok()
+        .map(|arguments| ToolCall {
+            id,
+            name,
+            arguments,
+        })
 }
 
 #[derive(Debug)]
@@ -363,11 +999,16 @@ impl HeadlessApp {
             experiment_registry: deps.experiment_registry,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
-            permission_callback_slot: deps.permission_callback_slot,
+            last_session_messages: Vec::new(),
+            stream_callback_slot: deps.stream_callback_slot,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
         };
         app.seed_runtime_info();
+        if !app.active_model.is_empty() {
+            app.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
+        }
         app.record_startup_warning_history();
         Ok(app)
     }
@@ -558,17 +1199,8 @@ impl HeadlessApp {
         images: &[ImageAttachment],
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.clear_startup_warnings();
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot_with_images(input, source, images);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle(snapshot, &llm)
+        self.run_cycle_result_with_images(input, images, source, None)
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     pub async fn process_message_with_context(
@@ -643,6 +1275,10 @@ impl HeadlessApp {
 
     pub fn session_bus(&self) -> Option<&SessionBus> {
         self.session_bus.as_ref()
+    }
+
+    pub fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+        std::mem::take(&mut self.last_session_messages)
     }
 
     pub fn cron_store(&self) -> Option<&fx_cron::SharedCronStore> {
@@ -907,6 +1543,8 @@ impl HeadlessApp {
 
         if let Some(active_model) = active_model {
             self.active_model = active_model.clone();
+            self.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
             if self.config.model.default_model.is_none() {
                 self.config.model.default_model = Some(active_model);
             }
@@ -925,6 +1563,8 @@ impl HeadlessApp {
         if let Some(active_model) = next_active_model {
             router.set_active(&active_model)?;
             self.active_model = active_model;
+            self.loop_engine
+                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
         } else {
             self.active_model.clear();
         }
@@ -965,17 +1605,8 @@ impl HeadlessApp {
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.clear_startup_warnings();
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle(snapshot, &llm)
+        self.run_cycle_result_with_images(input, &[], source, None)
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     async fn run_cycle_result_streaming(
@@ -984,21 +1615,8 @@ impl HeadlessApp {
         source: &InputSource,
         callback: StreamCallback,
     ) -> Result<CycleResult, anyhow::Error> {
-        let callback = headless_stream_callback(callback);
-        // Set permission prompt callback for this cycle so SSE events fire
-        self.set_permission_callback(Some(Arc::clone(&callback)));
-        self.emit_startup_warnings(Some(&callback));
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input, source);
-        let llm = RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle_streaming(snapshot, &llm, Some(callback))
+        self.run_cycle_result_with_images(input, &[], source, Some(callback))
             .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.set_permission_callback(None); // Clear after cycle
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle(input, &result))
     }
 
     fn report_stream_error(event: &StreamEvent) {
@@ -1013,8 +1631,20 @@ impl HeadlessApp {
         }
     }
 
+    #[cfg(test)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
+        self.finalize_cycle_with_turn_messages(input, &[], result, None)
+    }
+
+    fn finalize_cycle_with_turn_messages(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        result: &LoopResult,
+        collector: Option<&SessionTurnCollector>,
+    ) -> CycleResult {
         let response = extract_response_text(result);
+        let result_kind = extract_result_kind(result);
         let iterations = extract_iterations(result);
         let tokens_used = extract_token_usage(result);
         self.cumulative_tokens.input_tokens = self
@@ -1028,17 +1658,59 @@ impl HeadlessApp {
         self.last_signals = result.signals().to_vec();
         let signals = self.last_signals.clone();
         persist_headless_signals(self, &signals);
-        self.record_turn(input, &response);
+        let session_messages = collector
+            .map(|collector| collector.session_messages_for_turn(input, images, &response))
+            .unwrap_or_else(|| text_turn_messages(input, &response));
+        self.record_session_turn_messages(session_messages);
         CycleResult {
             response,
             model: self.active_model.clone(),
             iterations,
             tokens_used,
+            result_kind,
         }
     }
 
-    fn set_permission_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
-        if let Ok(mut guard) = self.permission_callback_slot.lock() {
+    async fn run_cycle_result_with_images(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.last_session_messages.clear();
+        let callback = callback.map(headless_stream_callback);
+        let should_emit_startup_warnings = callback.is_some();
+        let collector = SessionTurnCollector::default();
+        let combined_callback = collector.callback(callback);
+        self.set_stream_callback(Some(Arc::clone(&combined_callback)));
+        if should_emit_startup_warnings {
+            self.emit_startup_warnings(Some(&combined_callback));
+        } else {
+            self.clear_startup_warnings();
+        }
+        self.update_memory_context(input);
+        let snapshot = if images.is_empty() {
+            self.build_perception_snapshot(input, source)
+        } else {
+            self.build_perception_snapshot_with_images(input, source, images)
+        };
+        let llm = RecordingLoopLlmProvider::new(
+            RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone()),
+            collector.clone(),
+        );
+        let result = self
+            .loop_engine
+            .run_cycle_streaming(snapshot, &llm, Some(combined_callback))
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.set_stream_callback(None);
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle_with_turn_messages(input, images, &result, Some(&collector)))
+    }
+
+    fn set_stream_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
+        if let Ok(mut guard) = self.stream_callback_slot.lock() {
             *guard = callback;
         }
     }
@@ -1137,11 +1809,15 @@ impl HeadlessApp {
         }
     }
 
+    #[cfg(test)]
     fn record_turn(&mut self, user_text: &str, assistant_text: &str) {
+        self.record_session_turn_messages(text_turn_messages(user_text, assistant_text));
+    }
+
+    fn record_session_turn_messages(&mut self, session_messages: Vec<SessionMessage>) {
+        self.last_session_messages = session_messages.clone();
         self.conversation_history
-            .push(Message::user(user_text.to_string()));
-        self.conversation_history
-            .push(Message::assistant(assistant_text.to_string()));
+            .extend(session_messages.iter().map(SessionMessage::to_llm_message));
         trim_history(&mut self.conversation_history, self.max_history);
     }
 
@@ -1167,6 +1843,41 @@ impl HeadlessApp {
     }
 }
 
+fn user_message_blocks(user_text: &str, images: &[ImageAttachment]) -> Vec<SessionContentBlock> {
+    let mut blocks = images
+        .iter()
+        .map(|image| SessionContentBlock::Image {
+            media_type: image.media_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !user_text.is_empty() {
+        blocks.push(SessionContentBlock::Text {
+            text: user_text.to_string(),
+        });
+    }
+    blocks
+}
+
+fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessage> {
+    let timestamp = current_epoch_secs();
+    vec![
+        SessionMessage::structured(
+            SessionRecordRole::User,
+            user_message_blocks(user_text, &[]),
+            timestamp,
+            None,
+        ),
+        SessionMessage::structured(
+            SessionRecordRole::Assistant,
+            vec![SessionContentBlock::Text {
+                text: assistant_text.to_string(),
+            }],
+            timestamp,
+            None,
+        ),
+    ]
+}
+
 #[cfg(feature = "http")]
 #[async_trait]
 impl AppEngine for HeadlessApp {
@@ -1188,10 +1899,13 @@ impl AppEngine for HeadlessApp {
         .await?;
         self.conversation_history = updated_history;
 
+        let result_kind = result.result_kind.into();
+
         Ok(ApiCycleResult {
             response: result.response,
             model: result.model,
             iterations: result.iterations,
+            result_kind,
         })
     }
 
@@ -1209,10 +1923,14 @@ impl AppEngine for HeadlessApp {
         .await?;
 
         Ok((
-            ApiCycleResult {
-                response: result.response,
-                model: result.model,
-                iterations: result.iterations,
+            {
+                let result_kind = result.result_kind.into();
+                ApiCycleResult {
+                    response: result.response,
+                    model: result.model,
+                    iterations: result.iterations,
+                    result_kind,
+                }
             },
             updated_history,
         ))
@@ -1289,11 +2007,34 @@ impl AppEngine for HeadlessApp {
             .collect()
     }
 
+    fn max_history(&self) -> usize {
+        self.max_history
+    }
+
     fn session_token_usage(&self) -> (u64, u64) {
         (
             self.cumulative_tokens.input_tokens,
             self.cumulative_tokens.output_tokens,
         )
+    }
+
+    fn replace_session_memory(
+        &mut self,
+        memory: fx_session::SessionMemory,
+    ) -> fx_session::SessionMemory {
+        self.loop_engine.replace_session_memory(memory)
+    }
+
+    fn session_memory(&self) -> fx_session::SessionMemory {
+        self.loop_engine.session_memory_snapshot()
+    }
+
+    fn loaded_session_key(&self) -> Option<SessionKey> {
+        self.session_key.clone()
+    }
+
+    fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+        HeadlessApp::take_last_session_messages(self)
     }
 }
 
@@ -1844,6 +2585,8 @@ fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
         app.record_error(ErrorCategory::System, message, true);
     }
     app.active_model = model.to_string();
+    app.loop_engine
+        .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
 }
 
 fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
@@ -2136,7 +2879,7 @@ impl HeadlessSubagentFactory {
             session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
-            permission_callback_slot: bundle.permission_callback_slot,
+            stream_callback_slot: bundle.stream_callback_slot,
             ripcord_journal: bundle.ripcord_journal,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -2257,6 +3000,7 @@ async fn process_command_input(
     app: &mut HeadlessApp,
     input: &str,
 ) -> Result<CycleResult, anyhow::Error> {
+    app.last_session_messages.clear();
     let parsed = parse_command(input);
     let response = match execute_headless_async_command(app, &parsed).await? {
         Some(response) => response,
@@ -2294,6 +3038,7 @@ fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
         model: app.active_model().to_string(),
         iterations: 0,
         tokens_used: TokenUsage::default(),
+        result_kind: ResultKind::Complete,
     }
 }
 
@@ -2450,13 +3195,70 @@ fn extract_response_text(result: &LoopResult) -> String {
         LoopResult::Complete { response, .. } => response.clone(),
         LoopResult::BudgetExhausted {
             partial_response, ..
-        } => partial_response.clone().unwrap_or_default(),
-        LoopResult::NeedsInput { prompt, .. } => prompt.clone(),
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                partial_response.clone().unwrap_or_default()
+            } else {
+                BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
+            }
+        }
+        LoopResult::NeedsInput { .. } => NEEDS_INPUT_FALLBACK_RESPONSE.to_string(),
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
-        LoopResult::Error { message, .. } => format!("error: {message}"),
+        LoopResult::Error { message, .. } => classify_error_response(message),
     }
+}
+
+fn extract_result_kind(result: &LoopResult) -> ResultKind {
+    match result {
+        LoopResult::Complete { .. } => ResultKind::Complete,
+        LoopResult::BudgetExhausted {
+            partial_response, ..
+        }
+        | LoopResult::UserStopped {
+            partial_response, ..
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                ResultKind::Partial
+            } else {
+                ResultKind::Empty
+            }
+        }
+        LoopResult::NeedsInput { .. } => ResultKind::NeedsInput,
+        LoopResult::Error { .. } => ResultKind::Error,
+    }
+}
+
+fn classify_error_response(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return TIMEOUT_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("blocked")
+        || lower.contains("denied")
+        || lower.contains("not permitted")
+        || lower.contains("forbidden")
+    {
+        return PERMISSION_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
+    {
+        return RATE_LIMIT_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("authentication") || lower.contains("unauthorized") || lower.contains("401") {
+        return AUTH_ERROR_RESPONSE.to_string();
+    }
+    if lower.contains("network") || lower.contains("connection") || lower.contains("dns") {
+        return NETWORK_ERROR_RESPONSE.to_string();
+    }
+
+    GENERIC_ERROR_RESPONSE.to_string()
+}
+
+fn has_meaningful_response(response: Option<&str>) -> bool {
+    response.is_some_and(|response| !response.trim().is_empty())
 }
 
 fn extract_iterations(result: &LoopResult) -> u32 {
@@ -2492,6 +3294,7 @@ mod tests {
     use fx_kernel::loop_engine::LoopEngine;
     use fx_session::SessionKey;
     use fx_subagent::SpawnConfig;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::time::Duration;
 
@@ -2570,7 +3373,8 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            last_session_messages: Vec::new(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -2645,6 +3449,370 @@ mod tests {
             .usage
             .expect("mock response should include usage");
         u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
+    }
+
+    fn streamed_tool_delta(
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments_delta: Option<&str>,
+        arguments_done: bool,
+    ) -> fx_llm::ToolUseDelta {
+        fx_llm::ToolUseDelta {
+            id: id.map(ToString::to_string),
+            provider_id: None,
+            name: name.map(ToString::to_string),
+            arguments_delta: arguments_delta.map(ToString::to_string),
+            arguments_done,
+        }
+    }
+
+    #[test]
+    fn session_turn_collector_builds_structured_turn_messages() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![
+                fx_llm::ContentBlock::Text {
+                    text: "Let me check.".to_string(),
+                },
+                fx_llm::ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_1".to_string(),
+            output: "file contents".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn("open the readme", &[], "fallback");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(15));
+        assert_eq!(messages[1].input_token_count, Some(10));
+        assert_eq!(messages[1].output_token_count, Some(5));
+        assert_eq!(messages[3].token_count, Some(10));
+        assert_eq!(messages[3].input_token_count, Some(7));
+        assert_eq!(messages[3].output_token_count, Some(3));
+        assert!(messages[1].content.iter().any(
+            |block| matches!(block, SessionContentBlock::ToolUse { id, .. } if id == "call_1")
+        ));
+        assert!(
+            messages[2]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "call_1" && *is_error == Some(false)))
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_preserves_error_metadata_for_tool_results() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_err".to_string(),
+                provider_id: Some("fc_err".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "missing.txt"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_err".to_string(),
+            output: "missing".to_string(),
+            is_error: true,
+        });
+
+        let messages = collector.session_messages_for_turn("open missing", &[], "fallback");
+
+        assert!(
+            messages[2]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == "call_err" && content == &serde_json::Value::String("missing".to_string()) && *is_error == Some(true)))
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_uses_tool_calls_when_response_content_is_empty() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: String::new(),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_2".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "rust"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_2".to_string(),
+            output: "results".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn("search rust", &[], "fallback");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(12));
+        assert!(messages[1].content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ToolUse { id, name, .. } if id == "call_2" && name == "search"
+        )));
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert!(messages[2].content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
+        )));
+    }
+
+    #[test]
+    fn session_turn_collector_prefers_content_tool_use_blocks_over_tool_call_fallback() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_3".to_string(),
+                provider_id: Some("fc_3".to_string()),
+                name: "weather".to_string(),
+                input: serde_json::json!({"location": "Denver, CO"}),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_3".to_string(),
+                name: "weather".to_string(),
+                arguments: serde_json::json!({"location": "Denver, CO"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn("weather in denver", &[], "fallback");
+
+        assert_eq!(messages.len(), 2);
+        let tool_use_blocks = messages[1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                SessionContentBlock::ToolUse {
+                    id,
+                    provider_id,
+                    name,
+                    input,
+                } => Some((id, provider_id, name, input)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_use_blocks.len(), 1);
+        assert!(matches!(
+            tool_use_blocks.as_slice(),
+            [(id, Some(provider_id), name, input)]
+                if *id == "call_3"
+                    && *provider_id == "fc_3"
+                    && *name == "weather"
+                    && **input == serde_json::json!({"location": "Denver, CO"})
+        ));
+    }
+
+    #[test]
+    fn streamed_tool_index_reuses_known_ids_and_splits_reused_chunk_slots() {
+        let mut tool_calls_by_index = HashMap::new();
+        let mut id_to_index = HashMap::new();
+
+        tool_calls_by_index.insert(
+            0,
+            StreamedToolCallState {
+                id: Some("call_1".to_string()),
+                name: Some("search".to_string()),
+                arguments: String::new(),
+                arguments_done: false,
+            },
+        );
+        id_to_index.insert("call_1".to_string(), 0);
+
+        let reused_index = streamed_tool_index(
+            0,
+            &streamed_tool_delta(Some("call_1"), None, Some("{}"), true),
+            &tool_calls_by_index,
+            &id_to_index,
+        );
+        let next_index = streamed_tool_index(
+            0,
+            &streamed_tool_delta(Some("call_2"), Some("read_file"), Some("{}"), true),
+            &tool_calls_by_index,
+            &id_to_index,
+        );
+
+        assert_eq!(reused_index, 0);
+        assert_eq!(next_index, 1);
+    }
+
+    #[test]
+    fn merge_streamed_arguments_replaces_partial_buffer_with_complete_done_payload() {
+        let mut arguments = r#"{"path":"READ"#.to_string();
+
+        merge_streamed_arguments(&mut arguments, r#"{"path":"README.md"}"#, true);
+
+        assert_eq!(arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn streamed_completion_state_assembles_tool_calls_across_stream_chunks() {
+        let mut state = StreamedCompletionState::default();
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: Some("Working".to_string()),
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_1"),
+                Some("search"),
+                Some(r#"{"q":"rus"#),
+                false,
+            )],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+            }),
+            stop_reason: None,
+        });
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: Some(" on it".to_string()),
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_2"),
+                Some("list_files"),
+                None,
+                true,
+            )],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        state.apply_chunk(fx_llm::StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![streamed_tool_delta(
+                Some("call_1"),
+                None,
+                Some(r#"{"q":"rust"}"#),
+                true,
+            )],
+            usage: None,
+            stop_reason: None,
+        });
+
+        let response = state.into_response();
+
+        assert_eq!(
+            response.content,
+            vec![fx_llm::ContentBlock::Text {
+                text: "Working on it".to_string(),
+            }]
+        );
+        assert_eq!(
+            response.usage,
+            Some(fx_llm::Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+            })
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "search");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"q": "rust"})
+        );
+        assert_eq!(response.tool_calls[1].id, "call_2");
+        assert_eq!(response.tool_calls[1].name, "list_files");
+        assert_eq!(response.tool_calls[1].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn finalize_streamed_tool_calls_skips_incomplete_and_invalid_states() {
+        let tool_calls = finalize_streamed_tool_calls(HashMap::from([
+            (
+                2,
+                StreamedToolCallState {
+                    id: Some("call_3".to_string()),
+                    name: Some("noop".to_string()),
+                    arguments: String::new(),
+                    arguments_done: true,
+                },
+            ),
+            (
+                0,
+                StreamedToolCallState {
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    arguments: r#"{"q":"rust"}"#.to_string(),
+                    arguments_done: true,
+                },
+            ),
+            (
+                1,
+                StreamedToolCallState {
+                    id: Some("call_2".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments: r#"{"path":"README"#.to_string(),
+                    arguments_done: false,
+                },
+            ),
+            (
+                3,
+                StreamedToolCallState {
+                    id: Some("call_4".to_string()),
+                    name: Some("broken".to_string()),
+                    arguments: "{".to_string(),
+                    arguments_done: true,
+                },
+            ),
+        ]));
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({"q": "rust"}));
+        assert_eq!(tool_calls[1].id, "call_3");
+        assert_eq!(tool_calls[1].arguments, serde_json::json!({}));
     }
 
     fn test_router() -> SharedModelRouter {
@@ -2829,7 +3997,7 @@ mod tests {
             session_key: None,
             cron_store: None,
             startup_warnings: Vec::new(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3120,7 +4288,8 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            last_session_messages: Vec::new(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3589,7 +4758,8 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            last_session_messages: Vec::new(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3597,10 +4767,18 @@ mod tests {
         };
 
         let result = app.process_message("hello").await.expect("process message");
+        let session_messages = app.take_last_session_messages();
+        let assistant_message = session_messages
+            .iter()
+            .find(|message| message.role == SessionRecordRole::Assistant)
+            .expect("assistant session message should be recorded");
 
         assert_eq!(result.model, "mock-model");
         assert!(result.iterations > 0);
         assert!(result.tokens_used.total_tokens() >= mock_completion_usage_total());
+        assert_eq!(assistant_message.token_count, Some(5));
+        assert_eq!(assistant_message.input_token_count, Some(3));
+        assert_eq!(assistant_message.output_token_count, Some(2));
     }
 
     #[tokio::test]
@@ -3637,7 +4815,8 @@ mod tests {
             experiment_registry: None,
             error_history: VecDeque::new(),
             cumulative_tokens: TokenUsage::default(),
-            permission_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            last_session_messages: Vec::new(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3670,17 +4849,94 @@ mod tests {
         assert_eq!(extract_response_text(&result), "done");
         assert_eq!(extract_iterations(&result), 1);
         assert_eq!(extract_token_usage(&result).total_tokens(), 5);
+        assert_eq!(extract_result_kind(&result), ResultKind::Complete);
     }
 
     #[test]
-    fn extract_response_from_error() {
+    fn extract_response_from_needs_input_is_friendly() {
+        let result = LoopResult::NeedsInput {
+            prompt: "What's your question?".to_string(),
+            iterations: 2,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_response_text(&result),
+            NEEDS_INPUT_FALLBACK_RESPONSE
+        );
+        assert_ne!(extract_response_text(&result), "What's your question?");
+        assert_eq!(extract_iterations(&result), 2);
+        assert_eq!(extract_result_kind(&result), ResultKind::NeedsInput);
+    }
+
+    #[test]
+    fn extract_response_from_error_timeout_is_classified() {
+        let result = LoopResult::Error {
+            message: "request timed out after 30s".to_string(),
+            recoverable: false,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), TIMEOUT_ERROR_RESPONSE);
+        assert_eq!(extract_iterations(&result), 0);
+        assert_eq!(extract_result_kind(&result), ResultKind::Error);
+    }
+
+    #[test]
+    fn extract_response_from_error_blocked_is_classified() {
+        let result = LoopResult::Error {
+            message: "Tool 'run_command' blocked by policy".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), PERMISSION_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_auth_is_classified() {
+        let result = LoopResult::Error {
+            message: "provider returned 401 unauthorized".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), AUTH_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_rate_limit_is_classified() {
+        let result = LoopResult::Error {
+            message: "429 too many requests".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), RATE_LIMIT_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_network_is_classified() {
+        let result = LoopResult::Error {
+            message: "connection refused".to_string(),
+            recoverable: true,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), NETWORK_ERROR_RESPONSE);
+    }
+
+    #[test]
+    fn extract_response_from_error_unknown_uses_generic_fallback() {
         let result = LoopResult::Error {
             message: "boom".to_string(),
             recoverable: false,
             signals: Vec::new(),
         };
-        assert_eq!(extract_response_text(&result), "error: boom");
+
+        assert_eq!(extract_response_text(&result), GENERIC_ERROR_RESPONSE);
         assert_eq!(extract_iterations(&result), 0);
+        assert_eq!(extract_result_kind(&result), ResultKind::Error);
     }
 
     #[test]
@@ -3692,6 +4948,93 @@ mod tests {
         };
         assert_eq!(extract_response_text(&result), "partial");
         assert_eq!(extract_iterations(&result), 3);
+        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
+    }
+
+    #[test]
+    fn extract_response_from_budget_exhausted_without_content_uses_fallback() {
+        let result = LoopResult::BudgetExhausted {
+            partial_response: None,
+            iterations: 3,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_response_text(&result),
+            BUDGET_EXHAUSTED_FALLBACK_RESPONSE
+        );
+        assert_eq!(extract_result_kind(&result), ResultKind::Empty);
+    }
+
+    #[test]
+    fn extract_response_from_user_stopped_preserves_partial_response() {
+        let result = LoopResult::UserStopped {
+            partial_response: Some("partial".to_string()),
+            iterations: 1,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), "partial");
+        assert_eq!(extract_iterations(&result), 1);
+        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
+    }
+
+    #[test]
+    fn finalize_cycle_sets_result_kind_for_each_variant() {
+        let mut app = test_app();
+        let signals = Vec::new();
+
+        let complete = app.finalize_cycle(
+            "hello",
+            &LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(complete.result_kind, ResultKind::Complete);
+
+        let partial = app.finalize_cycle(
+            "hello",
+            &LoopResult::BudgetExhausted {
+                partial_response: Some("partial".to_string()),
+                iterations: 1,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(partial.result_kind, ResultKind::Partial);
+
+        let needs_input = app.finalize_cycle(
+            "hello",
+            &LoopResult::NeedsInput {
+                prompt: "clarify".to_string(),
+                iterations: 1,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(needs_input.result_kind, ResultKind::NeedsInput);
+
+        let error = app.finalize_cycle(
+            "hello",
+            &LoopResult::Error {
+                message: "network error".to_string(),
+                recoverable: true,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(error.result_kind, ResultKind::Error);
+
+        let empty = app.finalize_cycle(
+            "hello",
+            &LoopResult::UserStopped {
+                partial_response: None,
+                iterations: 1,
+                signals,
+            },
+        );
+        assert_eq!(empty.result_kind, ResultKind::Empty);
     }
 
     #[test]

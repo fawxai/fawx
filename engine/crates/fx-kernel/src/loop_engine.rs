@@ -11,8 +11,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
-    estimate_text_tokens, CompactionConfig, CompactionError, CompactionMemoryFlush,
-    CompactionResult, CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
+    emergency_compact, estimate_text_tokens, has_prunable_blocks, prune_tool_blocks,
+    CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult, CompactionStrategy,
+    ConversationBudget, SlidingWindowCompactor,
 };
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -36,6 +37,7 @@ use fx_llm::{
     ContentBlock, Message, MessageRole, ProviderError, StreamCallback as ProviderStreamCallback,
     StreamChunk, StreamEvent as ProviderStreamEvent, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
+use fx_session::{SessionMemory, SessionMemoryUpdate};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -121,8 +123,15 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
 }
 
 fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
-    let delta_content = response
-        .content
+    let CompletionResponse {
+        content,
+        tool_calls,
+        usage,
+        stop_reason,
+    } = response;
+    let provider_item_ids = extract_tool_use_provider_ids(&content);
+
+    let delta_content = content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
@@ -132,10 +141,10 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let tool_use_deltas = response
-        .tool_calls
+    let tool_use_deltas = tool_calls
         .into_iter()
         .map(|call| ToolUseDelta {
+            provider_id: provider_item_ids.get(&call.id).cloned(),
             id: Some(call.id),
             name: Some(call.name),
             arguments_delta: Some(call.arguments.to_string()),
@@ -146,8 +155,8 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
     StreamChunk {
         delta_content: (!delta_content.is_empty()).then_some(delta_content),
         tool_use_deltas,
-        usage: response.usage,
-        stop_reason: response.stop_reason,
+        usage,
+        stop_reason,
     }
 }
 
@@ -205,6 +214,13 @@ impl<'a> CycleStream<'a> {
             id: result.tool_call_id.clone(),
             output: result.output.clone(),
             is_error: !result.success,
+        });
+    }
+
+    fn notification(self, title: impl Into<String>, body: impl Into<String>) {
+        self.emit(StreamEvent::Notification {
+            title: title.into(),
+            body: body.into(),
         });
     }
 
@@ -385,6 +401,25 @@ impl std::fmt::Display for CompactionScope {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CompactionTier {
+    Prune,
+    Slide,
+    Summarize,
+    Emergency,
+}
+
+impl CompactionTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prune => "prune",
+            Self::Slide => "slide",
+            Self::Summarize => "summarize",
+            Self::Emergency => "emergency",
+        }
+    }
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but Phases 1-3
@@ -401,6 +436,7 @@ pub struct LoopEngine {
     iteration_count: u32,
     synthesis_instruction: String,
     memory_context: Option<String>,
+    session_memory: Arc<Mutex<SessionMemory>>,
     scratchpad_context: Option<String>,
     signals: SignalCollector,
     cancel_token: Option<CancellationToken>,
@@ -411,6 +447,8 @@ pub struct LoopEngine {
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
     conversation_compactor: Box<dyn CompactionStrategy>,
+    /// LLM for compaction-time memory extraction.
+    compaction_llm: Option<Arc<dyn LlmProvider>>,
     memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
     compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
     /// Guards performance signal to fire only on the Normal→Low transition,
@@ -419,10 +457,16 @@ pub struct LoopEngine {
     /// Per-tool attempt counter for the current cycle.
     /// Key: tool name, Value: number of attempts (including first call).
     tool_attempts: HashMap<String, u8>,
+    /// Whether a successful `notify` tool call occurred during the current cycle.
+    notify_called_this_cycle: bool,
+    /// Whether this cycle currently has an active notification delivery channel.
+    notify_tool_guidance_enabled: bool,
     /// Shared iteration counter for scratchpad age tracking.
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    /// Provider-specific tool output item identifiers keyed by stable tool call id.
+    tool_call_provider_ids: HashMap<String, String>,
     error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
@@ -440,10 +484,16 @@ impl std::fmt::Debug for LoopEngine {
             .field("max_iterations", &self.max_iterations)
             .field("iteration_count", &self.iteration_count)
             .field("memory_context", &self.memory_context)
+            .field("session_memory", &"SessionMemory")
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("tool_attempts", &self.tool_attempts)
+            .field("notify_called_this_cycle", &self.notify_called_this_cycle)
+            .field(
+                "notify_tool_guidance_enabled",
+                &self.notify_tool_guidance_enabled,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -498,6 +548,7 @@ pub struct LoopEngineBuilder {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     memory_context: Option<String>,
+    session_memory: Option<Arc<Mutex<SessionMemory>>>,
     scratchpad_context: Option<String>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
@@ -615,6 +666,11 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn session_memory(mut self, session_memory: Arc<Mutex<SessionMemory>>) -> Self {
+        self.session_memory = Some(session_memory);
+        self
+    }
+
     pub fn iteration_counter(mut self, counter: Arc<AtomicU32>) -> Self {
         self.iteration_counter = Some(counter);
         self
@@ -649,6 +705,7 @@ impl LoopEngineBuilder {
         let max_iterations = required_builder_field(self.max_iterations, "max_iterations")?.max(1);
         let synthesis_instruction =
             required_builder_field(self.synthesis_instruction, "synthesis_instruction")?;
+        let compaction_llm_for_extraction = self.compaction_llm.as_ref().map(Arc::clone);
         let (compaction_config, conversation_budget, conversation_compactor) =
             build_compaction_components(self.compaction_config, self.compaction_llm)?;
 
@@ -660,6 +717,7 @@ impl LoopEngineBuilder {
             iteration_count: 0,
             synthesis_instruction,
             memory_context: self.memory_context,
+            session_memory: self.session_memory.unwrap_or_else(default_session_memory),
             scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
             cancel_token: self.cancel_token,
@@ -670,12 +728,16 @@ impl LoopEngineBuilder {
             compaction_config,
             conversation_budget,
             conversation_compactor,
+            compaction_llm: compaction_llm_for_extraction,
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             tool_attempts: HashMap::new(),
+            notify_called_this_cycle: false,
+            notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
+            tool_call_provider_ids: HashMap::new(),
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
@@ -707,11 +769,108 @@ fn build_compaction_components(
 
     let conversation_budget = ConversationBudget::new(
         compaction_config.model_context_limit,
-        compaction_config.compaction_threshold,
+        compaction_config.slide_threshold,
         compaction_config.reserved_system_tokens,
     );
     let strategy = compaction_config.build_strategy(llm);
     Ok((compaction_config, conversation_budget, strategy))
+}
+
+fn build_extraction_prompt(messages: &[Message]) -> String {
+    format!(
+        concat!(
+            "Extract key facts from this conversation excerpt that is being removed from context.\n",
+            "Return a JSON object with these optional fields:\n",
+            "- \"project\": what the session is about (string, only if clearly identifiable)\n",
+            "- \"current_state\": current state of work (string, only if clear)\n",
+            "- \"key_decisions\": important decisions made (array of short strings)\n",
+            "- \"active_files\": files being worked on (array of paths)\n",
+            "- \"custom_context\": other important facts to remember (array of short strings)\n\n",
+            "Only include fields where the conversation clearly contains relevant information.\n",
+            "Keep each string under 100 characters. Return ONLY valid JSON, no markdown.\n\n",
+            "Conversation:\n{}"
+        ),
+        format_extraction_messages(messages)
+    )
+}
+
+fn format_extraction_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter_map(format_extraction_message)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_extraction_message(message: &Message) -> Option<String> {
+    let role = extraction_role(&message.role)?;
+    let content = message
+        .content
+        .iter()
+        .map(format_extraction_block)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("{role}: {content}"))
+}
+
+fn extraction_role(role: &MessageRole) -> Option<&'static str> {
+    match role {
+        MessageRole::User => Some("user"),
+        MessageRole::Assistant => Some("assistant"),
+        MessageRole::System => None,
+        MessageRole::Tool => Some("tool"),
+    }
+}
+
+fn format_extraction_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => text.clone(),
+        ContentBlock::ToolUse { name, .. } => format!("[tool: {name}]"),
+        ContentBlock::ToolResult { content, .. } => {
+            truncate_prompt_text(&render_tool_result(content), 200)
+        }
+        ContentBlock::Image { .. } => "[image]".to_string(),
+    }
+}
+
+fn render_tool_result(content: &serde_json::Value) -> String {
+    match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content.to_string(),
+    }
+}
+
+fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn parse_extraction_response(response: &str) -> Option<SessionMemoryUpdate> {
+    let trimmed = response.trim();
+    if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(trimmed) {
+        return Some(update);
+    }
+    if let Some(json) = extract_json_object(trimmed) {
+        if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(json) {
+            return Some(update);
+        }
+    }
+    tracing::warn!(
+        response_len = response.len(),
+        "failed to parse memory extraction response as JSON"
+    );
+    None
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    Some(&text[start..=end])
 }
 
 fn required_builder_field<T>(value: Option<T>, field: &str) -> Result<T, LoopError> {
@@ -724,6 +883,10 @@ fn normalize_memory_context(memory_context: String) -> Option<String> {
     } else {
         Some(memory_context)
     }
+}
+
+fn default_session_memory() -> Arc<Mutex<SessionMemory>> {
+    Arc::new(Mutex::new(SessionMemory::default()))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -773,9 +936,10 @@ enum ToolRoundOutcome {
     Response(CompletionResponse),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct StreamToolCallState {
     id: Option<String>,
+    provider_id: Option<String>,
     name: Option<String>,
     arguments: String,
     arguments_done: bool,
@@ -814,17 +978,35 @@ impl StreamResponseState {
     }
 
     fn into_response(self) -> CompletionResponse {
+        let finalized_tools = finalize_stream_tool_payloads(self.tool_calls_by_index);
+        let mut content = Vec::with_capacity(
+            usize::from(!self.text.is_empty()).saturating_add(finalized_tools.len()),
+        );
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text { text: self.text });
+        }
+        content.extend(finalized_tools.iter().map(|tool| ContentBlock::ToolUse {
+            id: tool.call.id.clone(),
+            provider_id: tool.provider_id.clone(),
+            name: tool.call.name.clone(),
+            input: tool.call.arguments.clone(),
+        }));
         CompletionResponse {
-            content: vec![ContentBlock::Text { text: self.text }],
-            tool_calls: finalize_stream_tool_calls(self.tool_calls_by_index),
+            content,
+            tool_calls: finalized_tools.into_iter().map(|tool| tool.call).collect(),
             usage: self.usage,
             stop_reason: self.stop_reason,
         }
     }
 
     fn into_cancelled_response(self) -> CompletionResponse {
+        let content = if self.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text { text: self.text }]
+        };
         CompletionResponse {
-            content: vec![ContentBlock::Text { text: self.text }],
+            content,
             tool_calls: Vec::new(),
             usage: self.usage,
             stop_reason: Some("cancelled".to_string()),
@@ -836,14 +1018,6 @@ impl StreamResponseState {
 struct SubGoalExecution {
     result: SubGoalResult,
     budget: BudgetTracker,
-}
-
-struct CompactionContext<'a> {
-    scope: CompactionScope,
-    messages: &'a [Message],
-    target: usize,
-    hard_limit_exceeded: bool,
-    before_tokens: usize,
 }
 
 #[derive(Debug)]
@@ -890,6 +1064,8 @@ const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
+const NOTIFY_TOOL_NAME: &str = "notify";
+const NOTIFICATION_DEFAULT_TITLE: &str = "Fawx";
 const DECOMPOSE_TOOL_DESCRIPTION: &str = "Break a complex task into 2-4 high-level sub-goals. Each sub-goal should be substantial enough to justify its own execution context. Do NOT create more than 5 sub-goals. Prefer fewer, broader goals over many narrow ones. Only use this for tasks that genuinely cannot be handled with direct tool calls.";
 const MAX_SUB_GOALS: usize = 5;
 const DECOMPOSITION_DEPTH_LIMIT_RESPONSE: &str =
@@ -924,6 +1100,12 @@ Treat successful tool results as the primary evidence for your next response. \
 If the existing tool results already answer the user's request, answer immediately instead of calling more tools. \
 Only call another tool when the current results are missing critical information, are contradictory, or the user explicitly asked you to refresh/re-check something. \
 Never repeat an identical successful tool call in the same cycle. Reuse the result you already have and answer from it.";
+
+const NOTIFY_TOOL_GUIDANCE: &str = "\n\nYou have a `notify` tool that sends native OS notifications to the user. \
+Use it when you complete a task that took multiple steps, have important results to share, or finish background work the user may not be watching. \
+Do not use it for simple one-turn replies, trivial acknowledgements, or every tool completion. \
+If you do not call `notify`, a generic notification may fire automatically for multi-step tasks when the app is not in focus. \
+Prefer calling `notify` yourself when you can provide a more meaningful summary.";
 
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
@@ -996,6 +1178,21 @@ impl LoopEngine {
         self.memory_context = normalize_memory_context(context);
     }
 
+    pub fn replace_session_memory(&self, memory: SessionMemory) -> SessionMemory {
+        let mut stored = match self.session_memory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::replace(&mut *stored, memory)
+    }
+
+    pub fn session_memory_snapshot(&self) -> SessionMemory {
+        match self.session_memory.lock() {
+            Ok(memory) => memory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     pub fn set_scratchpad_context(&mut self, context: String) {
         self.scratchpad_context = if context.trim().is_empty() {
             None
@@ -1021,6 +1218,17 @@ impl LoopEngine {
 
     pub fn conversation_budget_ref(&self) -> &ConversationBudget {
         &self.conversation_budget
+    }
+
+    /// Update the context limit when the active model changes.
+    /// Rebuilds the conversation budget from the updated config to prevent drift.
+    pub fn update_context_limit(&mut self, new_limit: usize) {
+        self.compaction_config.model_context_limit = new_limit;
+        self.conversation_budget = ConversationBudget::new(
+            self.compaction_config.model_context_limit,
+            self.compaction_config.slide_threshold,
+            self.compaction_config.reserved_system_tokens,
+        );
     }
 
     /// Synchronise the shared iteration counter and refresh scratchpad context.
@@ -1086,12 +1294,16 @@ impl LoopEngine {
         message: impl Into<String>,
         recoverable: bool,
     ) {
+        self.emit_stream_event(StreamEvent::Error {
+            category,
+            message: message.into(),
+            recoverable,
+        });
+    }
+
+    fn emit_stream_event(&self, event: StreamEvent) {
         if let Some(cb) = &self.error_callback {
-            cb(StreamEvent::Error {
-                category,
-                message: message.into(),
-                recoverable,
-            });
+            cb(event);
         }
     }
 
@@ -1149,6 +1361,7 @@ impl LoopEngine {
         stream_callback: Option<&StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
         self.prepare_cycle();
+        self.notify_tool_guidance_enabled = stream_callback.is_some();
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
@@ -1166,7 +1379,7 @@ impl LoopEngine {
                     if let Some(result) =
                         self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
                     {
-                        return Ok(self.finalize_result(result));
+                        return Ok(self.finish_streaming_result(result, stream));
                     }
 
                     // Yield between iterations if configured and requested
@@ -1200,8 +1413,23 @@ impl LoopEngine {
         result: LoopResult,
         stream: CycleStream<'_>,
     ) -> LoopResult {
+        self.maybe_emit_completion_notification(&result, stream);
         stream.done_result(&result);
         self.finalize_result(result)
+    }
+
+    fn maybe_emit_completion_notification(&self, result: &LoopResult, stream: CycleStream<'_>) {
+        let LoopResult::Complete { iterations, .. } = result else {
+            return;
+        };
+        if *iterations <= 1 || self.notify_called_this_cycle {
+            return;
+        }
+
+        stream.notification(
+            NOTIFICATION_DEFAULT_TITLE,
+            format!("Task complete ({iterations} steps)"),
+        );
     }
 
     fn safety_limit_result(&self) -> LoopResult {
@@ -1328,6 +1556,8 @@ impl LoopEngine {
         self.pending_steer = None;
         self.budget_low_signaled = false;
         self.tool_attempts.clear();
+        self.notify_called_this_cycle = false;
+        self.notify_tool_guidance_enabled = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -1467,10 +1697,10 @@ impl LoopEngine {
         learning: Learning,
         perception: &mut PerceptionSnapshot,
         state: &mut CycleState,
-        stream: CycleStream<'_>,
+        _stream: CycleStream<'_>,
     ) -> Option<LoopResult> {
         state.learnings.push(learning);
-        let result = match continuation {
+        match continuation {
             Continuation::Complete => Some(LoopResult::Complete {
                 response: response_text,
                 iterations: self.iteration_count,
@@ -1487,11 +1717,7 @@ impl LoopEngine {
                 *perception = next_perception_from_sub_goal(perception, &sub_goal);
                 None
             }
-        };
-        if let Some(result) = &result {
-            stream.done_result(result);
         }
-        result
     }
 
     /// Perceive step.
@@ -1512,6 +1738,13 @@ impl LoopEngine {
 
         let mut context_window = snapshot_with_steer.conversation_history.clone();
         context_window.push(build_user_message(&snapshot_with_steer, &user_message));
+        if let Some(memory_message) = self.session_memory_message() {
+            let insert_pos = context_window
+                .iter()
+                .take_while(|message| matches!(message.role, MessageRole::System))
+                .count();
+            context_window.insert(insert_pos, memory_message);
+        }
 
         let compacted_context = self
             .compact_if_needed(
@@ -1561,13 +1794,14 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_reasoning_request(
+        let request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
@@ -1588,6 +1822,17 @@ impl LoopEngine {
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    fn session_memory_message(&self) -> Option<Message> {
+        let memory_text = match self.session_memory.lock() {
+            Ok(memory) => (!memory.is_empty()).then(|| memory.render()),
+            Err(poisoned) => {
+                let memory = poisoned.into_inner();
+                (!memory.is_empty()).then(|| memory.render())
+            }
+        }?;
+        Some(Message::system(memory_text))
     }
 
     async fn request_completion(
@@ -1768,7 +2013,7 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
-        let request = build_truncation_continuation_request(
+        let request = build_truncation_continuation_request_with_notify_guidance(
             llm.model_name(),
             continuation_messages,
             self.tool_executor.tool_definitions(),
@@ -1776,6 +2021,7 @@ impl LoopEngine {
             self.scratchpad_context.as_deref(),
             step,
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
         let request_messages = request.messages.clone();
         let response = self
@@ -1822,6 +2068,7 @@ impl LoopEngine {
         // Decompose takes priority over all other tool calls in the same response.
         // Other tool calls are intentionally discarded — the sub-goals will re-invoke tools as needed.
         if let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) {
+            self.tool_call_provider_ids.clear();
             if response.tool_calls.len() > 1 {
                 self.emit_signal(
                     LoopStep::Decide,
@@ -1837,11 +2084,13 @@ impl LoopEngine {
         }
 
         if !response.tool_calls.is_empty() {
+            self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
             let decision = Decision::UseTools(response.tool_calls.clone());
             self.emit_decision_signals(&decision);
             return Ok(decision);
         }
 
+        self.tool_call_provider_ids.clear();
         let raw = extract_response_text(response);
         let text = extract_readable_text(&raw);
         let decision = Decision::Respond(ensure_non_empty_response(&text));
@@ -2334,6 +2583,7 @@ impl LoopEngine {
         if let Some(memory_context) = &self.memory_context {
             builder = builder.memory_context(memory_context.clone());
         }
+        builder = builder.session_memory(Arc::clone(&self.session_memory));
         if let Some(scratchpad_context) = &self.scratchpad_context {
             builder = builder.scratchpad_context(scratchpad_context.clone());
         }
@@ -2350,7 +2600,9 @@ impl LoopEngine {
             builder = builder.event_bus(bus.clone());
         }
 
-        builder.build()
+        let mut child = builder.build()?;
+        child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
+        Ok(child)
     }
 
     fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -2700,14 +2952,17 @@ impl LoopEngine {
         });
     }
 
-    fn publish_tool_results(&self, results: &[ToolResult], stream: CycleStream<'_>) {
+    fn publish_tool_results(&mut self, results: &[ToolResult], stream: CycleStream<'_>) {
         for result in results {
             stream.tool_result(result);
             self.publish_tool_result(result);
         }
     }
 
-    fn publish_tool_result(&self, result: &ToolResult) {
+    fn publish_tool_result(&mut self, result: &ToolResult) {
+        if result.success && result.tool_name == NOTIFY_TOOL_NAME {
+            self.notify_called_this_cycle = true;
+        }
         let Some(bus) = &self.event_bus else {
             return;
         };
@@ -2771,68 +3026,67 @@ impl LoopEngine {
         map.insert(scope, iteration);
     }
 
+    fn highest_compaction_tier(&self, messages: &[Message]) -> Option<CompactionTier> {
+        if self
+            .conversation_budget
+            .at_tier(messages, self.compaction_config.emergency_threshold)
+        {
+            return Some(CompactionTier::Emergency);
+        }
+        if self.compaction_config.use_summarization
+            && self
+                .conversation_budget
+                .at_tier(messages, self.compaction_config.summarize_threshold)
+        {
+            return Some(CompactionTier::Summarize);
+        }
+        if self
+            .conversation_budget
+            .at_tier(messages, self.compaction_config.slide_threshold)
+        {
+            return Some(CompactionTier::Slide);
+        }
+        None
+    }
+
     fn should_skip_compaction(
         &self,
         scope: CompactionScope,
         iteration: u32,
-        hard_limit_exceeded: bool,
+        tier: CompactionTier,
     ) -> bool {
         let cooldown_active = self.compaction_cooldown_active(
             scope,
             iteration,
             self.compaction_config.recompact_cooldown_turns,
         );
-
-        if cooldown_active && !hard_limit_exceeded {
+        if cooldown_active {
             tracing::debug!(
                 scope = scope.as_str(),
+                tier = tier.as_str(),
                 iteration,
                 cooldown_turns = self.compaction_config.recompact_cooldown_turns,
-                "compaction skipped due to cooldown guard"
-            );
-            return true;
-        }
-
-        if cooldown_active && hard_limit_exceeded {
-            tracing::warn!(
-                scope = scope.as_str(),
-                iteration,
-                cooldown_turns = self.compaction_config.recompact_cooldown_turns,
-                "cooldown bypassed because conversation is above hard limit"
+                "compaction tier skipped due to cooldown guard"
             );
         }
-
-        false
+        cooldown_active
     }
 
-    fn ensure_compacted_within_hard_limit(
+    fn log_tier_result(
         &self,
+        tier: CompactionTier,
         scope: CompactionScope,
-        result: &CompactionResult,
-    ) -> Result<(), LoopError> {
-        if self
-            .conversation_budget
-            .exceeds_hard_limit(&result.messages)
-        {
-            return Err(context_exceeded_after_compaction_error(
-                scope,
-                result.estimated_tokens,
-                self.conversation_budget.conversation_budget(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn log_compaction_result(
-        &self,
-        scope: CompactionScope,
-        before_tokens: usize,
+        before_messages: &[Message],
         target_tokens: usize,
         result: &CompactionResult,
     ) {
+        let before_tokens = ConversationBudget::estimate_tokens(before_messages);
         tracing::info!(
             scope = scope.as_str(),
-            strategy = if result.used_summarization {
+            tier = tier.as_str(),
+            strategy = if matches!(tier, CompactionTier::Emergency) {
+                "emergency"
+            } else if result.used_summarization {
                 "summarizing"
             } else {
                 "sliding_window"
@@ -2840,10 +3094,209 @@ impl LoopEngine {
             before_tokens,
             after_tokens = result.estimated_tokens,
             target_tokens,
+            usage_ratio_before = self.conversation_budget.usage_ratio(before_messages),
+            usage_ratio_after = self.conversation_budget.usage_ratio(&result.messages),
             messages_removed = result.compacted_count,
             tokens_saved = before_tokens.saturating_sub(result.estimated_tokens),
-            "conversation compaction triggered"
+            "conversation compaction tier completed"
         );
+    }
+
+    async fn flush_evicted(
+        &self,
+        messages: &[Message],
+        result: &CompactionResult,
+        scope: CompactionScope,
+    ) {
+        if result.compacted_count == 0 {
+            return;
+        }
+
+        let evicted: Vec<Message> = result
+            .evicted_indices
+            .iter()
+            .filter_map(|&index| messages.get(index).cloned())
+            .collect();
+        if evicted.is_empty() {
+            return;
+        }
+
+        if let Some(flush) = &self.memory_flush {
+            if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    error = %err,
+                    evicted_count = evicted.len(),
+                    "pre-compaction memory flush failed; proceeding without flush"
+                );
+                self.emit_background_error(
+                    ErrorCategory::Memory,
+                    format!("Memory flush failed during compaction: {err}"),
+                    true,
+                );
+            }
+        }
+
+        self.extract_memory_from_evicted(&evicted).await;
+    }
+
+    async fn extract_memory_from_evicted(&self, evicted: &[Message]) {
+        let Some(llm) = &self.compaction_llm else {
+            return;
+        };
+        if evicted.is_empty() {
+            return;
+        }
+
+        let prompt = build_extraction_prompt(evicted);
+        match llm.generate(&prompt, 512).await {
+            Ok(response) => {
+                if let Some(update) = parse_extraction_response(&response) {
+                    let mut memory = self
+                        .session_memory
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Err(err) = memory.apply_update(update) {
+                        tracing::warn!(
+                            error = %err,
+                            "auto-extracted memory update rejected (token cap)"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "memory extraction from evicted messages failed"
+                );
+            }
+        }
+    }
+
+    async fn finish_tier<'a>(
+        &self,
+        tier: CompactionTier,
+        current: Cow<'a, [Message]>,
+        result: CompactionResult,
+        scope: CompactionScope,
+        iteration: Option<u32>,
+        target_tokens: usize,
+    ) -> Cow<'a, [Message]> {
+        let before_tokens = ConversationBudget::estimate_tokens(current.as_ref());
+        let after_tokens = result.estimated_tokens;
+        self.flush_evicted(current.as_ref(), &result, scope).await;
+        if let Some(iteration) = iteration {
+            self.record_compaction_iteration(scope, iteration);
+        }
+        self.log_tier_result(tier, scope, current.as_ref(), target_tokens, &result);
+        if result.compacted_count > 0 {
+            self.emit_stream_event(StreamEvent::ContextCompacted {
+                tier: tier.as_str().to_string(),
+                messages_removed: result.compacted_count,
+                tokens_before: before_tokens,
+                tokens_after: after_tokens,
+                usage_ratio: f64::from(self.conversation_budget.usage_ratio(&result.messages)),
+            });
+        }
+        Cow::Owned(result.messages)
+    }
+
+    fn apply_prune_tier<'a>(
+        &self,
+        current: Cow<'a, [Message]>,
+        scope: CompactionScope,
+    ) -> Cow<'a, [Message]> {
+        if !self
+            .conversation_budget
+            .at_tier(current.as_ref(), self.compaction_config.prune_threshold)
+        {
+            return current;
+        }
+
+        if let Some(pruned) = self.maybe_prune_tool_blocks(current.as_ref(), scope) {
+            return Cow::Owned(pruned);
+        }
+        current
+    }
+
+    async fn apply_slide_tier<'a>(
+        &self,
+        current: Cow<'a, [Message]>,
+        scope: CompactionScope,
+        iteration: u32,
+    ) -> Result<Cow<'a, [Message]>, LoopError> {
+        let target_tokens = self.conversation_budget.compaction_target();
+        match self
+            .run_sliding_compaction(current.as_ref(), scope, target_tokens)
+            .await
+        {
+            Ok(result) => Ok(self
+                .finish_tier(
+                    CompactionTier::Slide,
+                    current,
+                    result,
+                    scope,
+                    Some(iteration),
+                    target_tokens,
+                )
+                .await),
+            Err(error) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Slide.as_str(),
+                    error = ?error,
+                    "conversation compaction tier failed; continuing"
+                );
+                Ok(current)
+            }
+        }
+    }
+
+    async fn apply_summarize_tier<'a>(
+        &self,
+        current: Cow<'a, [Message]>,
+        scope: CompactionScope,
+        iteration: u32,
+    ) -> Result<Cow<'a, [Message]>, LoopError> {
+        let target_tokens = self.conversation_budget.summarize_target();
+        match self
+            .run_compaction_strategy(scope, current.as_ref(), target_tokens)
+            .await
+        {
+            Ok(result) => Ok(self
+                .finish_tier(
+                    CompactionTier::Summarize,
+                    current,
+                    result,
+                    scope,
+                    Some(iteration),
+                    target_tokens,
+                )
+                .await),
+            Err(error) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Summarize.as_str(),
+                    error = ?error,
+                    "conversation compaction tier failed; continuing"
+                );
+                Ok(current)
+            }
+        }
+    }
+
+    async fn apply_emergency_tier<'a>(
+        &self,
+        current: Cow<'a, [Message]>,
+        scope: CompactionScope,
+    ) -> Result<Cow<'a, [Message]>, LoopError> {
+        let result = emergency_compact(
+            current.as_ref(),
+            self.compaction_config.preserve_recent_turns,
+        );
+        Ok(self
+            .finish_tier(CompactionTier::Emergency, current, result, scope, None, 0)
+            .await)
     }
 
     async fn compact_if_needed<'a>(
@@ -2852,112 +3305,112 @@ impl LoopEngine {
         scope: CompactionScope,
         iteration: u32,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        if !self.conversation_budget.needs_compaction(messages) {
-            return Ok(Cow::Borrowed(messages));
+        let current = Cow::Borrowed(messages);
+        let current = self.apply_prune_tier(current, scope);
+        let current = match self.highest_compaction_tier(current.as_ref()) {
+            Some(CompactionTier::Emergency) => self.apply_emergency_tier(current, scope).await?,
+            Some(tier @ (CompactionTier::Summarize | CompactionTier::Slide)) => {
+                if self.should_skip_compaction(scope, iteration, tier) {
+                    current
+                } else if matches!(tier, CompactionTier::Summarize) {
+                    self.apply_summarize_tier(current, scope, iteration).await?
+                } else {
+                    self.apply_slide_tier(current, scope, iteration).await?
+                }
+            }
+            Some(CompactionTier::Prune) | None => current,
+        };
+        self.ensure_within_hard_limit(scope, current.as_ref())?;
+        Ok(current)
+    }
+
+    /// Apply tool block pruning if enabled, returning the pruned messages
+    /// or `None` if pruning was skipped or had no effect.
+    fn maybe_prune_tool_blocks(
+        &self,
+        messages: &[Message],
+        scope: CompactionScope,
+    ) -> Option<Vec<Message>> {
+        if !self.compaction_config.prune_tool_blocks {
+            return None;
+        }
+
+        if !has_prunable_blocks(messages, self.compaction_config.preserve_recent_turns) {
+            return None;
         }
 
         let before_tokens = ConversationBudget::estimate_tokens(messages);
-        let hard_limit_exceeded = self.conversation_budget.exceeds_hard_limit(messages);
-        if self.should_skip_compaction(scope, iteration, hard_limit_exceeded) {
-            return Ok(Cow::Borrowed(messages));
-        }
-
-        let target_tokens = self.conversation_budget.compaction_target();
-        let context = CompactionContext {
-            scope,
-            messages,
-            target: target_tokens,
-            hard_limit_exceeded,
-            before_tokens,
-        };
-        let result = self.run_compaction_strategy(context).await?;
-
-        self.ensure_compacted_within_hard_limit(scope, &result)?;
-        self.log_compaction_result(scope, before_tokens, target_tokens, &result);
-        if result.compacted_count > 0 {
-            if let Some(flush) = &self.memory_flush {
-                let evicted: Vec<Message> = result
-                    .evicted_indices
-                    .iter()
-                    .filter_map(|&i| messages.get(i).cloned())
-                    .collect();
-                if !evicted.is_empty() {
-                    if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
-                        tracing::warn!(
-                            scope = scope.as_str(),
-                            error = %err,
-                            evicted_count = evicted.len(),
-                            "pre-compaction memory flush failed; proceeding without flush"
-                        );
-                        self.emit_background_error(
-                            ErrorCategory::Memory,
-                            format!("Memory flush failed during compaction: {err}"),
-                            true,
-                        );
-                    }
-                }
+        let mut owned = messages.to_vec();
+        let result = prune_tool_blocks(
+            &mut owned,
+            self.compaction_config.preserve_recent_turns,
+            self.compaction_config.tool_block_summary_max_chars,
+        );
+        match result {
+            Some(prune_result) => {
+                let after_tokens = ConversationBudget::estimate_tokens(&owned);
+                tracing::info!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Prune.as_str(),
+                    strategy = "prune",
+                    before_tokens,
+                    after_tokens,
+                    target_tokens = 0,
+                    usage_ratio_before = self.conversation_budget.usage_ratio(messages),
+                    usage_ratio_after = self.conversation_budget.usage_ratio(&owned),
+                    pruned_blocks = prune_result.pruned_count,
+                    messages_removed = 0,
+                    tokens_saved = prune_result.tokens_saved,
+                    "conversation compaction tier completed"
+                );
+                Some(owned)
             }
+            None => None,
         }
-        self.record_compaction_iteration(scope, iteration);
-        Ok(Cow::Owned(result.messages))
     }
 
-    async fn run_sliding_fallback(
+    async fn run_sliding_compaction(
         &self,
-        scope: CompactionScope,
         messages: &[Message],
-        target: usize,
+        scope: CompactionScope,
+        target_tokens: usize,
     ) -> Result<CompactionResult, LoopError> {
-        let fallback = SlidingWindowCompactor::new(self.compaction_config.preserve_recent_turns);
-        fallback
-            .compact(messages, target)
+        SlidingWindowCompactor::new(self.compaction_config.preserve_recent_turns)
+            .compact(messages, target_tokens)
             .await
             .map_err(|error| compaction_failed_error(scope, error))
     }
 
     async fn run_compaction_strategy(
         &self,
-        context: CompactionContext<'_>,
+        scope: CompactionScope,
+        messages: &[Message],
+        target_tokens: usize,
     ) -> Result<CompactionResult, LoopError> {
         match self
             .conversation_compactor
-            .compact(context.messages, context.target)
+            .compact(messages, target_tokens)
             .await
         {
             Ok(result) => Ok(result),
             Err(CompactionError::SummarizationFailed { source }) => {
                 tracing::warn!(
                     error = %source,
-                    scope = context.scope.as_str(),
+                    scope = scope.as_str(),
                     "summarization compaction failed; trying sliding fallback"
                 );
-                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                self.run_sliding_compaction(messages, scope, target_tokens)
                     .await
             }
             Err(CompactionError::SummaryExceededTarget) => {
                 tracing::warn!(
-                    scope = context.scope.as_str(),
+                    scope = scope.as_str(),
                     "summary exceeded compaction target; trying sliding fallback"
                 );
-                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                self.run_sliding_compaction(messages, scope, target_tokens)
                     .await
             }
-            Err(CompactionError::AllMessagesProtected) => {
-                if context.hard_limit_exceeded {
-                    return Err(context_exceeded_after_compaction_error(
-                        context.scope,
-                        context.before_tokens,
-                        self.conversation_budget.conversation_budget(),
-                    ));
-                }
-                Ok(CompactionResult {
-                    messages: context.messages.to_vec(),
-                    compacted_count: 0,
-                    estimated_tokens: context.before_tokens,
-                    used_summarization: false,
-                    evicted_indices: Vec::new(),
-                })
-            }
+            Err(error) => Err(compaction_failed_error(scope, error)),
         }
     }
 
@@ -3092,6 +3545,8 @@ impl LoopEngine {
                 ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
+                        self.tool_call_provider_ids =
+                            extract_tool_use_provider_ids(&response.content);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
                         self.append_deferred_tool_results(
                             &mut state,
@@ -3262,6 +3717,7 @@ impl LoopEngine {
         append_tool_round_messages(
             &mut state.continuation_messages,
             &state.current_calls,
+            &self.tool_call_provider_ids,
             &results,
         )?;
         state.all_tool_results.extend(results);
@@ -3392,13 +3848,14 @@ impl LoopEngine {
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_continuation_request(
+        let request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
         );
 
         let response = self
@@ -4163,9 +4620,10 @@ fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
 fn append_tool_round_messages(
     context_messages: &mut Vec<Message>,
     calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
     results: &[ToolResult],
 ) -> Result<(), LoopError> {
-    let assistant_message = build_tool_use_assistant_message(calls);
+    let assistant_message = build_tool_use_assistant_message(calls, provider_item_ids);
     let result_message = build_tool_result_message(calls, results)?;
     context_messages.push(assistant_message);
     context_messages.push(result_message);
@@ -4173,11 +4631,15 @@ fn append_tool_round_messages(
 }
 
 /// Build an assistant message containing ToolUse content blocks.
-fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
+fn build_tool_use_assistant_message(
+    calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
+) -> Message {
     let content = calls
         .iter()
         .map(|call| ContentBlock::ToolUse {
             id: call.id.clone(),
+            provider_id: provider_item_ids.get(&call.id).cloned(),
             name: call.name.clone(),
             input: call.arguments.clone(),
         })
@@ -4186,6 +4648,22 @@ fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
         role: MessageRole::Assistant,
         content,
     }
+}
+
+fn extract_tool_use_provider_ids(content: &[ContentBlock]) -> HashMap<String, String> {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                ..
+            } if !id.trim().is_empty() && !provider_id.trim().is_empty() => {
+                Some((id.clone(), provider_id.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build a tool message containing ToolResult content blocks.
@@ -4291,6 +4769,7 @@ fn decompose_tool_definition() -> ToolDefinition {
 }
 
 /// Build a CompletionRequest for tool result re-prompting.
+#[cfg(test)]
 fn build_continuation_request(
     context_messages: &[Message],
     model: &str,
@@ -4299,8 +4778,32 @@ fn build_continuation_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_continuation_request_with_notify_guidance(
+        context_messages,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_continuation_request_with_notify_guidance(
+    context_messages: &[Message],
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_tool_continuation_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -4312,6 +4815,7 @@ fn build_continuation_request(
     }
 }
 
+#[cfg(test)]
 fn build_truncation_continuation_request(
     model: &str,
     continuation_messages: &[Message],
@@ -4321,11 +4825,39 @@ fn build_truncation_continuation_request(
     step: LoopStep,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_truncation_continuation_request_with_notify_guidance(
+        model,
+        continuation_messages,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        step,
+        thinking,
+        false,
+    )
+}
+
+// TODO: refactor into a params struct (pre-existing, out of scope for this PR)
+#[allow(clippy::too_many_arguments)]
+fn build_truncation_continuation_request_with_notify_guidance(
+    model: &str,
+    continuation_messages: &[Message],
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    step: LoopStep,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
     CompletionRequest {
         model: model.to_string(),
         messages: continuation_messages.to_vec(),
@@ -4516,31 +5048,38 @@ fn stream_tool_index(
     tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
     id_to_index: &HashMap<String, usize>,
 ) -> usize {
-    let Some(id) = delta.id.as_deref() else {
+    for identifier in [delta.id.as_deref(), delta.provider_id.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(index) = id_to_index.get(identifier).copied() {
+            return index;
+        }
+    }
+
+    let Some(identifier) = delta.id.as_deref().or(delta.provider_id.as_deref()) else {
         return chunk_index;
     };
 
-    if let Some(index) = id_to_index.get(id).copied() {
-        return index;
-    }
-
-    if chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+    if chunk_index_usable_for_identifier(chunk_index, identifier, tool_calls_by_index) {
         return chunk_index;
     }
 
     next_stream_tool_index(tool_calls_by_index)
 }
 
-fn chunk_index_usable_for_id(
+fn chunk_index_usable_for_identifier(
     chunk_index: usize,
-    id: &str,
+    identifier: &str,
     tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
 ) -> bool {
     match tool_calls_by_index.get(&chunk_index) {
         None => true,
-        Some(state) => match state.id.as_deref() {
-            None => true,
-            Some(existing_id) => existing_id == id,
+        Some(state) => match (state.id.as_deref(), state.provider_id.as_deref()) {
+            (None, None) => true,
+            (Some(existing_id), _) if existing_id == identifier => true,
+            (_, Some(existing_provider_id)) if existing_provider_id == identifier => true,
+            _ => false,
         },
     }
 }
@@ -4560,14 +5099,36 @@ fn merge_stream_tool_delta(
     id_to_index: &mut HashMap<String, usize>,
     index: usize,
 ) {
-    if entry.id.is_none() {
-        entry.id = delta.id;
+    if let Some(incoming_id) = delta.id.clone() {
+        match entry.id.as_deref() {
+            None => entry.id = Some(incoming_id),
+            Some(current_id) if current_id == incoming_id => {}
+            Some(current_id)
+                if delta
+                    .provider_id
+                    .as_deref()
+                    .is_some_and(|provider_id| provider_id == current_id) =>
+            {
+                entry.id = Some(incoming_id);
+            }
+            Some(_) => {
+                if entry.provider_id.is_none() {
+                    entry.provider_id = Some(incoming_id);
+                }
+            }
+        }
+    }
+    if entry.provider_id.is_none() {
+        entry.provider_id = delta.provider_id;
     }
     if entry.name.is_none() {
         entry.name = delta.name;
     }
     if let Some(id) = entry.id.clone() {
         id_to_index.insert(id, index);
+    }
+    if let Some(provider_id) = entry.provider_id.clone() {
+        id_to_index.insert(provider_id, index);
     }
     if let Some(arguments_delta) = delta.arguments_delta {
         merge_stream_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
@@ -4590,25 +5151,56 @@ fn merge_stream_arguments(arguments: &mut String, arguments_delta: &str, argumen
     arguments.push_str(arguments_delta);
 }
 
+#[cfg(test)]
 fn finalize_stream_tool_calls(by_index: HashMap<usize, StreamToolCallState>) -> Vec<ToolCall> {
+    finalize_stream_tool_payloads(by_index)
+        .into_iter()
+        .map(|tool| tool.call)
+        .collect()
+}
+
+#[derive(Debug)]
+struct FinalizedStreamToolCall {
+    call: ToolCall,
+    provider_id: Option<String>,
+}
+
+fn finalize_stream_tool_payloads(
+    by_index: HashMap<usize, StreamToolCallState>,
+) -> Vec<FinalizedStreamToolCall> {
     let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
     indexed_calls.sort_by_key(|(index, _)| *index);
     indexed_calls
         .into_iter()
-        .filter_map(|(_, state)| stream_tool_call_from_state(state))
+        .filter_map(|(_, state)| finalized_stream_tool_call_from_state(state))
         .collect()
 }
 
+#[cfg(test)]
 fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
+    finalized_stream_tool_call_from_state(state).map(|tool| tool.call)
+}
+
+fn finalized_stream_tool_call_from_state(
+    state: StreamToolCallState,
+) -> Option<FinalizedStreamToolCall> {
     if !state.arguments_done {
         return None;
     }
 
-    let id = state.id?.trim().to_string();
+    let id = state.id.or(state.provider_id.clone())?.trim().to_string();
     let name = state.name?.trim().to_string();
     if id.is_empty() || name.is_empty() {
         return None;
     }
+
+    let provider_id = state
+        .provider_id
+        .filter(|provider_id| {
+            let trimmed = provider_id.trim();
+            !trimmed.is_empty() && trimmed != id
+        })
+        .map(|provider_id| provider_id.trim().to_string());
 
     let raw_args = if state.arguments.trim().is_empty() {
         "{}".to_string()
@@ -4628,10 +5220,13 @@ fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
             return None;
         }
     };
-    Some(ToolCall {
-        id,
-        name,
-        arguments,
+    Some(FinalizedStreamToolCall {
+        provider_id,
+        call: ToolCall {
+            id,
+            name,
+            arguments,
+        },
     })
 }
 
@@ -4780,6 +5375,7 @@ fn completion_request_to_prompt(request: &CompletionRequest) -> String {
     format!("{system}{messages}")
 }
 
+#[cfg(test)]
 fn build_reasoning_request(
     perception: &ProcessedPerception,
     model: &str,
@@ -4788,10 +5384,34 @@ fn build_reasoning_request(
     scratchpad_context: Option<&str>,
     thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
+    build_reasoning_request_with_notify_guidance(
+        perception,
+        model,
+        tool_definitions,
+        memory_context,
+        scratchpad_context,
+        thinking,
+        false,
+    )
+}
+
+fn build_reasoning_request_with_notify_guidance(
+    perception: &ProcessedPerception,
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
+    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
 
     CompletionRequest {
         model: model.to_string(),
@@ -4833,21 +5453,49 @@ User message:
     prompt
 }
 
+#[cfg(test)]
 fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
-    build_system_prompt(memory_context, scratchpad_context, None)
+    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
 }
 
+fn build_reasoning_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
+) -> String {
+    build_system_prompt(
+        memory_context,
+        scratchpad_context,
+        None,
+        notify_tool_guidance_enabled,
+    )
+}
+
+#[cfg(test)]
 fn build_tool_continuation_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
+) -> String {
+    build_tool_continuation_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        false,
+    )
+}
+
+fn build_tool_continuation_system_prompt_with_notify_guidance(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         Some(TOOL_CONTINUATION_DIRECTIVE),
+        notify_tool_guidance_enabled,
     )
 }
 
@@ -4855,8 +5503,12 @@ fn build_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     extra_directive: Option<&str>,
+    notify_tool_guidance_enabled: bool,
 ) -> String {
     let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    if notify_tool_guidance_enabled {
+        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+    }
     if let Some(extra_directive) = extra_directive {
         prompt.push_str(extra_directive);
     }
@@ -5129,6 +5781,24 @@ mod tests {
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
+        );
+    }
+
+    #[test]
+    fn system_prompt_omits_notify_guidance_without_notification_channel() {
+        let prompt = build_reasoning_system_prompt(None, None);
+        assert!(
+            !prompt.contains("You have a `notify` tool"),
+            "system prompt should omit notify guidance when no notification channel is active"
+        );
+    }
+
+    #[test]
+    fn system_prompt_includes_notify_guidance_when_notification_channel_is_active() {
+        let prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, true);
+        assert!(
+            prompt.contains("You have a `notify` tool"),
+            "system prompt should include notify guidance when notifications are available"
         );
     }
 
@@ -6957,13 +7627,19 @@ mod phase4_tests {
     #[derive(Debug)]
     struct Phase4MockLlm {
         responses: Mutex<VecDeque<CompletionResponse>>,
+        requests: Mutex<Vec<CompletionRequest>>,
     }
 
     impl Phase4MockLlm {
         fn new(responses: Vec<CompletionResponse>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("lock").clone()
         }
     }
 
@@ -7041,8 +7717,9 @@ mod phase4_tests {
 
         async fn complete(
             &self,
-            _: CompletionRequest,
+            request: CompletionRequest,
         ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("lock").push(request);
             self.responses
                 .lock()
                 .expect("lock")
@@ -7221,6 +7898,59 @@ mod phase4_tests {
     }
 
     #[tokio::test]
+    async fn act_with_tools_refreshes_provider_ids_between_rounds() {
+        let mut engine = p4_engine();
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-2".to_string(),
+                    provider_id: Some("fc-2".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "b.txt"}),
+                }],
+                tool_calls: vec![read_file_call("call-2", "b.txt")],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            text_response("done"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.response_text, "done");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolUse {
+                                id,
+                                provider_id: Some(provider_id),
+                                ..
+                            } if id == "call-2" && provider_id == "fc-2"
+                        )
+                    })
+            }),
+            "second continuation request should preserve provider item ids for the next tool round"
+        );
+    }
+
+    #[tokio::test]
     async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(
@@ -7350,12 +8080,14 @@ mod phase4_tests {
             },
         ];
 
-        let message = build_tool_use_assistant_message(&calls);
+        let message = build_tool_use_assistant_message(&calls, &HashMap::new());
 
         assert_eq!(message.role, fx_llm::MessageRole::Assistant);
         assert_eq!(message.content.len(), 2);
         match &message.content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "a.txt");
@@ -7375,7 +8107,7 @@ mod phase4_tests {
         }];
         let mut messages = vec![Message::user("prompt")];
 
-        append_tool_round_messages(&mut messages, &calls, &results)
+        append_tool_round_messages(&mut messages, &calls, &HashMap::new(), &results)
             .expect("append_tool_round_messages");
 
         assert_eq!(messages.len(), 3);
@@ -8102,6 +8834,7 @@ mod cancellation_tests {
     fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
         ToolUseDelta {
             id: Some(id.to_string()),
+            provider_id: None,
             name: name.map(ToString::to_string),
             arguments_delta: Some(arguments_delta.to_string()),
             arguments_done: done,
@@ -8255,6 +8988,86 @@ mod cancellation_tests {
             output: "ok".to_string(),
             is_error: false,
         }));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_emits_notification_for_multi_iteration_completion_without_notify() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let result = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 2,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let response = match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
+        };
+        let events = events.lock().expect("lock").clone();
+
+        assert_eq!(response, "done");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::Notification { title, body }
+                    if title == "Fawx" && body == "Task complete (2 steps)"
+            )
+        }));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_skips_notification_when_notify_tool_already_ran() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.notify_called_this_cycle = true;
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 2,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Notification { .. })));
+        assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_skips_notification_for_single_iteration_completion() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Notification { .. })));
         assert_done_event(&events, "done");
     }
 
@@ -8500,6 +9313,7 @@ mod cancellation_tests {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("call-1".to_string()),
+                    provider_id: None,
                     name: Some("read_file".to_string()),
                     arguments_delta: Some("{\"path\":\"READ".to_string()),
                     arguments_done: false,
@@ -8511,6 +9325,7 @@ mod cancellation_tests {
                 delta_content: None,
                 tool_use_deltas: vec![ToolUseDelta {
                     id: Some("call-1".to_string()),
+                    provider_id: None,
                     name: None,
                     arguments_delta: Some("ME.md\"}".to_string()),
                     arguments_done: true,
@@ -8532,6 +9347,88 @@ mod cancellation_tests {
             response.tool_calls[0].arguments,
             serde_json::json!({"path":"README.md"})
         );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_preserves_provider_ids_in_content() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    provider_id: Some("fc-1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some(r#"{"path":"README.md"}"#.to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            })]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                name,
+                input,
+            }] if id == "call-1"
+                && provider_id == "fc-1"
+                && name == "read_file"
+                && input == &serde_json::json!({"path":"README.md"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_promotes_call_id_over_provider_id() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("fc-123".to_string()),
+                    provider_id: Some("fc-123".to_string()),
+                    name: Some("weather".to_string()),
+                    arguments_delta: Some(r#"{"location":"Denver, CO"}"#.to_string()),
+                    arguments_done: false,
+                }],
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-123".to_string()),
+                    provider_id: Some("fc-123".to_string()),
+                    name: None,
+                    arguments_delta: None,
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls[0].id, "call-123");
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::ToolUse {
+                id,
+                provider_id: Some(provider_id),
+                ..
+            }] if id == "call-123" && provider_id == "fc-123"
+        ));
     }
 
     #[tokio::test]
@@ -10857,6 +11754,94 @@ mod context_compaction_tests {
             .join(" ")
     }
 
+    fn user(words_count: usize) -> Message {
+        Message::user(words(words_count))
+    }
+
+    fn assistant(words_count: usize) -> Message {
+        Message::assistant(words(words_count))
+    }
+
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id: None,
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "/tmp/a"}),
+            }],
+        }
+    }
+
+    fn tool_result(id: &str, word_count: usize) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: serde_json::json!(words(word_count)),
+            }],
+        }
+    }
+
+    fn has_tool_blocks(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                )
+            })
+        })
+    }
+
+    fn tiered_compaction_config(use_summarization: bool) -> CompactionConfig {
+        CompactionConfig {
+            slide_threshold: 0.60,
+            prune_threshold: 0.40,
+            summarize_threshold: 0.80,
+            emergency_threshold: 0.95,
+            preserve_recent_turns: 2,
+            model_context_limit: 5_096,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 2,
+            use_summarization,
+            max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
+        }
+    }
+
+    fn tiered_budget(config: &CompactionConfig) -> ConversationBudget {
+        ConversationBudget::new(
+            config.model_context_limit,
+            config.slide_threshold,
+            config.reserved_system_tokens,
+        )
+    }
+
+    fn engine_with_compaction_llm(
+        context: ContextCompactor,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: CompactionConfig,
+        llm: Arc<dyn LlmProvider>,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(context)
+            .max_iterations(4)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .compaction_llm(llm)
+            .build()
+            .expect("test engine build")
+    }
+
     fn text_response(text: &str) -> CompletionResponse {
         CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -10884,6 +11869,18 @@ mod context_compaction_tests {
                 matches!(
                     block,
                     ContentBlock::Text { text } if text.starts_with("[context compacted:")
+                )
+            })
+        })
+    }
+
+    fn has_emergency_compaction_marker(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text }
+                        if text.starts_with("[context compacted:") && text.contains("emergency")
                 )
             })
         })
@@ -10920,6 +11917,15 @@ mod context_compaction_tests {
                     ContentBlock::Text { text } if text.starts_with("[context compacted:")
                 )
             })
+        })
+    }
+
+    fn session_memory_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with("[Session Memory]")))
         })
     }
 
@@ -10966,13 +11972,18 @@ mod context_compaction_tests {
 
     fn compaction_config() -> CompactionConfig {
         CompactionConfig {
-            compaction_threshold: 0.2,
+            slide_threshold: 0.2,
+            prune_threshold: 0.1,
+            summarize_threshold: 0.8,
+            emergency_threshold: 0.95,
             preserve_recent_turns: 2,
             model_context_limit: 5_000,
             reserved_system_tokens: 0,
             recompact_cooldown_turns: 3,
             use_summarization: false,
             max_summary_tokens: 512,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         }
     }
 
@@ -11079,8 +12090,20 @@ mod context_compaction_tests {
         assert!(engine.input_channel.is_none());
         assert!(engine.event_bus.is_none());
         assert_eq!(
-            engine.compaction_config.compaction_threshold,
-            defaults.compaction_threshold
+            engine.compaction_config.slide_threshold,
+            defaults.slide_threshold
+        );
+        assert_eq!(
+            engine.compaction_config.prune_threshold,
+            defaults.prune_threshold
+        );
+        assert_eq!(
+            engine.compaction_config.summarize_threshold,
+            defaults.summarize_threshold
+        );
+        assert_eq!(
+            engine.compaction_config.emergency_threshold,
+            defaults.emergency_threshold
         );
         assert_eq!(
             engine.compaction_config.preserve_recent_turns,
@@ -11095,16 +12118,40 @@ mod context_compaction_tests {
     }
 
     #[test]
+    fn builder_uses_default_empty_session_memory() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[test]
     fn builder_full_config() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let config = CompactionConfig {
-            compaction_threshold: 0.3,
+            slide_threshold: 0.3,
+            prune_threshold: 0.2,
+            summarize_threshold: 0.4,
+            emergency_threshold: 0.9,
             preserve_recent_turns: 3,
             model_context_limit: 5_200,
             reserved_system_tokens: 100,
             recompact_cooldown_turns: 4,
             use_summarization: true,
             max_summary_tokens: 256,
+            prune_tool_blocks: true,
+            tool_block_summary_max_chars: 100,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::new(Vec::new()));
         let cancel_token = CancellationToken::new();
@@ -11173,7 +12220,10 @@ mod context_compaction_tests {
             build_compaction_components(None, None).expect("components should build");
         let defaults = CompactionConfig::default();
 
-        assert_eq!(config.compaction_threshold, defaults.compaction_threshold);
+        assert_eq!(config.slide_threshold, defaults.slide_threshold);
+        assert_eq!(config.prune_threshold, defaults.prune_threshold);
+        assert_eq!(config.summarize_threshold, defaults.summarize_threshold);
+        assert_eq!(config.emergency_threshold, defaults.emergency_threshold);
         assert_eq!(config.preserve_recent_turns, defaults.preserve_recent_turns);
         assert_eq!(
             budget.conversation_budget(),
@@ -11252,6 +12302,62 @@ mod context_compaction_tests {
                 .expect("response lock")
                 .pop_front()
                 .unwrap_or_else(|| Ok(text_response("ok")))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExtractionLlm {
+        responses: Mutex<VecDeque<Result<String, CoreLlmError>>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl ExtractionLlm {
+        fn new(responses: Vec<Result<String, CoreLlmError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("prompts lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ExtractionLlm {
+        async fn generate(&self, prompt: &str, _: u32) -> Result<String, CoreLlmError> {
+            self.prompts
+                .lock()
+                .expect("prompts lock")
+                .push(prompt.to_string());
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok("{}".to_string()))
+        }
+
+        async fn generate_streaming(
+            &self,
+            prompt: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            let response = self.generate(prompt, 0).await?;
+            callback(response.clone());
+            Ok(response)
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-extraction"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Ok(text_response("ok"))
         }
     }
 
@@ -11453,6 +12559,65 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
+    async fn session_memory_injected_in_context() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let memory = Arc::new(Mutex::new(SessionMemory {
+            project: Some("Phase 3".to_string()),
+            current_state: Some("testing injection".to_string()),
+            ..SessionMemory::default()
+        }));
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .session_memory(Arc::clone(&memory))
+            .build()
+            .expect("test engine build");
+        let snapshot = snapshot_with_history(
+            vec![
+                Message::system("system prefix"),
+                Message::assistant("existing"),
+            ],
+            "hello",
+        );
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+        let memory_index =
+            session_memory_message_index(&processed.context_window).expect("memory message");
+
+        assert_eq!(memory_index, 1);
+        assert!(message_to_text(&processed.context_window[memory_index]).contains("Phase 3"));
+    }
+
+    #[tokio::test]
+    async fn empty_session_memory_not_injected() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+        let snapshot = snapshot_with_history(vec![Message::assistant("existing")], "hello");
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(session_memory_message_index(&processed.context_window).is_none());
+    }
+
+    #[tokio::test]
     async fn compaction_flushes_evicted_messages_before_returning_history() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let flush = Arc::new(RecordingMemoryFlush::default());
@@ -11559,6 +12724,57 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
+    async fn compact_if_needed_emits_context_compacted_event() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let events = Arc::new(Mutex::new(Vec::<StreamEvent>::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .error_callback(callback)
+            .build()
+            .expect("test engine build");
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should succeed");
+
+        let before_tokens = ConversationBudget::estimate_tokens(&messages);
+        let after_tokens = ConversationBudget::estimate_tokens(compacted.as_ref());
+        let expected_usage_ratio =
+            f64::from(engine.conversation_budget.usage_ratio(compacted.as_ref()));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContextCompacted {
+                tier,
+                messages_removed,
+                tokens_before,
+                tokens_after,
+                usage_ratio,
+            } if tier == "slide"
+                && *messages_removed > 0
+                && *tokens_before == before_tokens
+                && *tokens_after == after_tokens
+                && (usage_ratio - expected_usage_ratio).abs() < f64::EPSILON
+        )));
+    }
+
+    #[tokio::test]
     async fn compact_if_needed_skips_flush_when_none() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let engine = engine_with(
@@ -11575,6 +12791,336 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(compacted.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_from_evicted_updates_session_memory() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(serde_json::json!({
+            "project": "Phase 5",
+            "current_state": "Adding automatic extraction",
+            "key_decisions": ["Use compaction LLM"],
+            "active_files": ["engine/crates/fx-kernel/src/loop_engine.rs"],
+            "custom_context": ["Evicted facts are auto-saved"]
+        })
+        .to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let evicted = vec![
+            Message::user("We are implementing Phase 5."),
+            Message::assistant("LoopEngine needs automatic extraction."),
+        ];
+
+        engine.extract_memory_from_evicted(&evicted).await;
+
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(memory.project.as_deref(), Some("Phase 5"));
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("Adding automatic extraction")
+        );
+        assert_eq!(memory.key_decisions, vec!["Use compaction LLM"]);
+        assert_eq!(
+            memory.active_files,
+            vec!["engine/crates/fx-kernel/src/loop_engine.rs"]
+        );
+        assert_eq!(memory.custom_context, vec!["Evicted facts are auto-saved"]);
+        assert_eq!(llm.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_memory_skipped_without_compaction_llm() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_handles_llm_failure_gracefully() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Err(CoreLlmError::ApiRequest(
+            "boom".to_string(),
+        ))]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_handles_malformed_response() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok("not json".to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_respects_token_cap() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(
+            serde_json::json!({"custom_context": [words(2_100)]}).to_string(),
+        )]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            llm,
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .await;
+
+        assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[test]
+    fn build_extraction_prompt_formats_messages() {
+        let prompt = build_extraction_prompt(&[
+            Message::system("system policy"),
+            Message::user("User fact"),
+            tool_use("call-1"),
+            tool_result("call-1", 250),
+            Message {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "abc".to_string(),
+                }],
+            },
+        ]);
+
+        assert!(prompt.contains("Return ONLY valid JSON"));
+        assert!(prompt.contains("user: User fact"));
+        assert!(prompt.contains("assistant: [tool: read]"));
+        assert!(prompt.contains("tool: "));
+        assert!(prompt.contains("[image]"));
+        assert!(prompt.contains("..."));
+        assert!(!prompt.contains("system: system policy"));
+    }
+
+    #[test]
+    fn parse_extraction_response_handles_code_block() {
+        let response = "```json\n{\"project\":\"Phase 5\"}\n```";
+
+        let update = parse_extraction_response(response).expect("parse code block");
+
+        assert_eq!(update.project.as_deref(), Some("Phase 5"));
+    }
+
+    #[test]
+    fn parse_extraction_response_returns_none_for_garbage() {
+        assert!(parse_extraction_response("definitely not json").is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_evicted_triggers_extraction() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let flush = Arc::new(RecordingMemoryFlush::default());
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(serde_json::json!({
+            "project": "Phase 5",
+            "custom_context": ["Compaction saved this fact"]
+        })
+        .to_string())]));
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .compaction_llm(Arc::clone(&llm) as Arc<dyn LlmProvider>)
+            .memory_flush(Arc::clone(&flush) as Arc<dyn CompactionMemoryFlush>)
+            .build()
+            .expect("test engine build");
+        let history = large_history(12, 60);
+
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert_eq!(flush.calls().len(), 1);
+        assert_eq!(
+            engine.session_memory_snapshot().project.as_deref(),
+            Some("Phase 5")
+        );
+        assert_eq!(
+            engine.session_memory_snapshot().custom_context,
+            vec!["Compaction saved this fact"]
+        );
+        assert_eq!(llm.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_prune_only() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![
+            tool_use("t1"),
+            tool_result("t1", 432),
+            user(5),
+            assistant(5),
+        ];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.40 && usage < 0.60, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("prune-only compaction");
+
+        assert_ne!(compacted.as_ref(), messages.as_slice());
+        assert!(!has_tool_blocks(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_slide_when_prune_insufficient() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(200), assistant(200), user(125), assistant(125)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.60 && usage < 0.80, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("slide compaction");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_summarize_when_slide_insufficient() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let budget = tiered_budget(&config);
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
+                .to_string(),
+        ));
+        let engine =
+            engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
+        let messages = vec![user(250), assistant(250), user(175), assistant(175)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.80 && usage < 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("summarizing compaction");
+
+        assert!(has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_emergency_fires_at_95_percent() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(250), assistant(250), user(230), assistant(230)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cooldown_skips_slide_and_summarize() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
+                .to_string(),
+        ));
+        let engine =
+            engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
+        let slide_input = vec![user(200), assistant(200), user(125), assistant(125)];
+
+        let first = engine
+            .compact_if_needed(&slide_input, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+        assert!(has_compaction_marker(first.as_ref()));
+        assert!(engine.should_skip_compaction(
+            CompactionScope::Perceive,
+            11,
+            CompactionTier::Slide
+        ));
+        assert!(engine.should_skip_compaction(
+            CompactionScope::Perceive,
+            11,
+            CompactionTier::Summarize
+        ));
+
+        let emergency_input = vec![user(250), assistant(250), user(230), assistant(230)];
+        let second = engine
+            .compact_if_needed(&emergency_input, CompactionScope::Perceive, 11)
+            .await
+            .expect("emergency compaction during cooldown");
+
+        assert!(has_emergency_compaction_marker(second.as_ref()));
+        assert!(!has_conversation_summary_marker(second.as_ref()));
     }
 
     #[tokio::test]
@@ -11626,7 +13172,7 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
-    async fn cooldown_bypasses_when_hard_limit_exceeded() {
+    async fn emergency_bypasses_cooldown() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let engine = engine_with(
             ContextCompactor::new(2_048, 256),
@@ -11643,8 +13189,9 @@ mod context_compaction_tests {
         let second = engine
             .compact_if_needed(&oversized, CompactionScope::Perceive, 11)
             .await
-            .expect("bypass compaction");
+            .expect("emergency compaction");
 
+        assert!(has_emergency_compaction_marker(second.as_ref()));
         assert_ne!(second.as_ref(), oversized.as_slice());
     }
 
@@ -11653,6 +13200,7 @@ mod context_compaction_tests {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let mut config = compaction_config();
         config.use_summarization = true;
+        config.summarize_threshold = 0.3;
         let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
             Vec::new(),
             words(2_000),
@@ -11673,7 +13221,7 @@ mod context_compaction_tests {
             .build()
             .expect("test engine build");
 
-        let history = large_history(12, 70);
+        let history = large_history(10, 70);
         let compacted = engine
             .compact_if_needed(&history, CompactionScope::Perceive, 1)
             .await
@@ -11681,6 +13229,7 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
     }
 
     #[tokio::test]
@@ -11941,10 +13490,13 @@ mod context_compaction_tests {
             .unwrap_or_else(|| panic!("compaction info event missing; captured={captured:?}"));
         for key in [
             "scope",
+            "tier",
             "strategy",
             "before_tokens",
             "after_tokens",
             "target_tokens",
+            "usage_ratio_before",
+            "usage_ratio_after",
             "tokens_saved",
             "messages_removed",
         ] {
@@ -12032,6 +13584,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_drops_malformed_json_arguments() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("read_file".to_string()),
             arguments: "not valid json {{{".to_string(),
             arguments_done: true,
@@ -12047,6 +13600,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_accepts_valid_json_arguments() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: Some("fc-1".to_string()),
             name: Some("read_file".to_string()),
             arguments: r#"{"path":"README.md"}"#.to_string(),
             arguments_done: true,
@@ -12065,6 +13619,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_normalizes_empty_arguments_to_empty_object() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("git_status".to_string()),
             arguments: String::new(),
             arguments_done: true,
@@ -12084,6 +13639,7 @@ mod r2_streaming_review_tests {
     fn stream_tool_call_from_state_normalizes_whitespace_arguments_to_empty_object() {
         let state = StreamToolCallState {
             id: Some("call-1".to_string()),
+            provider_id: None,
             name: Some("current_time".to_string()),
             arguments: "   \n\t  ".to_string(),
             arguments_done: true,
@@ -12104,6 +13660,7 @@ mod r2_streaming_review_tests {
             0,
             StreamToolCallState {
                 id: Some("call-zero".to_string()),
+                provider_id: None,
                 name: Some("memory_list".to_string()),
                 arguments: String::new(),
                 arguments_done: true,
@@ -12113,6 +13670,7 @@ mod r2_streaming_review_tests {
             1,
             StreamToolCallState {
                 id: Some("call-with-args".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments: r#"{"path":"test.rs"}"#.to_string(),
                 arguments_done: true,
@@ -12137,6 +13695,7 @@ mod r2_streaming_review_tests {
             0,
             StreamToolCallState {
                 id: Some("call-good".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
                 arguments_done: true,
@@ -12146,6 +13705,7 @@ mod r2_streaming_review_tests {
             1,
             StreamToolCallState {
                 id: Some("call-bad".to_string()),
+                provider_id: None,
                 name: Some("write_file".to_string()),
                 arguments: "truncated json {".to_string(),
                 arguments_done: true,
@@ -12317,6 +13877,7 @@ mod r2_streaming_review_tests {
                 },
                 ContentBlock::ToolUse {
                     id: "t1".to_string(),
+                    provider_id: None,
                     name: "read_file".to_string(),
                     input: serde_json::json!({}),
                 },
@@ -12335,6 +13896,40 @@ mod r2_streaming_review_tests {
             Some("before\nafter"),
             "non-text blocks should be skipped in the join"
         );
+    }
+
+    #[test]
+    fn response_to_chunk_preserves_tool_provider_ids() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                provider_id: Some("fc-1".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path":"README.md"}),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        };
+
+        let chunk = response_to_chunk(response);
+        assert!(matches!(
+            chunk.tool_use_deltas.as_slice(),
+            [ToolUseDelta {
+                id: Some(id),
+                provider_id: Some(provider_id),
+                name: Some(name),
+                arguments_delta: Some(arguments),
+                arguments_done: true,
+            }] if id == "call-1"
+                && provider_id == "fc-1"
+                && name == "read_file"
+                && arguments == r#"{"path":"README.md"}"#
+        ));
     }
 
     // -- Nice-to-have 2: empty stream edge case test --
@@ -12399,6 +13994,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments_delta: None,
                 arguments_done: false,
@@ -12410,6 +14006,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: Some(r#"{"path":"/tmp/a.txt"}"#.to_string()),
                 arguments_done: false,
@@ -12421,6 +14018,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_01".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: None,
                 arguments_done: true,
@@ -12432,6 +14030,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: Some("read_file".to_string()),
                 arguments_delta: None,
                 arguments_done: false,
@@ -12443,6 +14042,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: Some(r#"{"path":"/tmp/b.txt"}"#.to_string()),
                 arguments_done: false,
@@ -12454,6 +14054,7 @@ mod r2_streaming_review_tests {
         state.apply_chunk(StreamChunk {
             tool_use_deltas: vec![ToolUseDelta {
                 id: Some("toolu_02".to_string()),
+                provider_id: None,
                 name: None,
                 arguments_delta: None,
                 arguments_done: true,

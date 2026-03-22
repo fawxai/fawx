@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use fx_core::error::LlmError;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 mod anthropic;
@@ -39,8 +40,8 @@ pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 pub use router::{
-    fetch_available_models_from_catalog, LlmRouter, ModelInfo, ModelRouter, ProviderCatalogEntry,
-    RouterError, RoutingStrategy,
+    context_window_for_model, fetch_available_models_from_catalog, LlmRouter, ModelInfo,
+    ModelRouter, ProviderCatalogEntry, RouterError, RoutingStrategy,
 };
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
@@ -51,7 +52,64 @@ pub use types::{
     THINKING_BUDGET_LOW,
 };
 
-/// Thinking levels supported by a provider/model family.
+/// Trim a conversation history to the most recent `max_history` messages,
+/// dropping the oldest messages first.
+pub fn trim_conversation_history(history: &mut Vec<Message>, max_history: usize) {
+    if history.len() <= max_history {
+        return;
+    }
+
+    let keep_from = history.len().saturating_sub(max_history);
+    let mut trimmed = history.split_off(keep_from);
+    normalize_trimmed_tool_history(&mut trimmed);
+    *history = trimmed;
+}
+
+fn normalize_trimmed_tool_history(history: &mut Vec<Message>) {
+    let tool_result_ids = history
+        .iter()
+        .flat_map(|message| {
+            message.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    let mut seen_tool_use_ids = HashSet::new();
+
+    for message in history.iter_mut() {
+        match message.role {
+            MessageRole::Assistant => {
+                message.content.retain(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        let keep = tool_result_ids.contains(id);
+                        if keep {
+                            seen_tool_use_ids.insert(id.clone());
+                        }
+                        keep
+                    }
+                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                    ContentBlock::ToolResult { .. } => false,
+                });
+            }
+            MessageRole::Tool => {
+                message.content.retain(|block| match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        seen_tool_use_ids.contains(tool_use_id)
+                    }
+                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                    ContentBlock::ToolUse { .. } => false,
+                });
+            }
+            MessageRole::System | MessageRole::User => {}
+        }
+    }
+
+    history.retain(|message| !message.content.is_empty());
+}
+
+/// Return the supported thinking levels for a given provider.
 pub fn supported_thinking_levels(provider: &str) -> Vec<String> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => vec!["off", "low", "adaptive", "high"],
@@ -164,5 +222,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn trim_conversation_history_drops_oldest() {
+        let mut history = vec![
+            Message::user("first"),
+            Message::assistant("second"),
+            Message::user("third"),
+            Message::assistant("fourth"),
+            Message::user("fifth"),
+        ];
+        trim_conversation_history(&mut history, 3);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], Message::user("third"));
+        assert_eq!(history[2], Message::user("fifth"));
+    }
+
+    #[test]
+    fn trim_conversation_history_noop_when_under_limit() {
+        let mut history = vec![Message::user("only")];
+        trim_conversation_history(&mut history, 10);
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn trim_conversation_history_noop_when_at_limit() {
+        let mut history = vec![Message::user("a"), Message::user("b")];
+        trim_conversation_history(&mut history, 2);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn trim_conversation_history_drops_orphaned_tool_result_at_window_start() {
+        let mut history = vec![
+            Message::user("older prompt"),
+            Message {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "lookup".to_string(),
+                    input: serde_json::json!({"q": "weather"}),
+                }],
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("first result"),
+                }],
+            },
+            Message::assistant("summary"),
+            Message::user("latest prompt"),
+        ];
+
+        trim_conversation_history(&mut history, 3);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], Message::assistant("summary"));
+        assert_eq!(history[1], Message::user("latest prompt"));
+    }
+
+    #[test]
+    fn trim_conversation_history_keeps_complete_tool_round_when_it_fits() {
+        let mut history = vec![
+            Message::user("older prompt"),
+            Message {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "lookup".to_string(),
+                    input: serde_json::json!({"q": "weather"}),
+                }],
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("first result"),
+                }],
+            },
+        ];
+
+        trim_conversation_history(&mut history, 2);
+
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0].content[0],
+            ContentBlock::ToolUse { id, .. } if id == "call_1"
+        ));
+        assert!(matches!(
+            &history[1].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"
+        ));
     }
 }

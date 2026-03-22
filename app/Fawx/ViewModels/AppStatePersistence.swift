@@ -11,30 +11,45 @@ enum AppStateStorageKey {
 
 actor AppStatePersistence {
     struct LaunchSnapshot: Sendable {
-        let storedServerURL: String
-        let pairedDeviceName: String?
-        let theme: AppTheme
-        let fontSize: AppFontSize
-        let setupComplete: Bool
-        let connectionModeRawValue: String?
-        let authToken: String?
+        struct PersistedState: Sendable {
+            let storedServerURL: String
+            let pairedDeviceName: String?
+            let theme: AppTheme
+            let fontSize: AppFontSize
+            let setupComplete: Bool
+            let connectionModeRawValue: String?
+            let authToken: String?
+        }
+
+        let persistedState: PersistedState
         let localInstallConfiguration: LocalInstallConfiguration?
+
+        var storedServerURL: String { persistedState.storedServerURL }
+        var pairedDeviceName: String? { persistedState.pairedDeviceName }
+        var theme: AppTheme { persistedState.theme }
+        var fontSize: AppFontSize { persistedState.fontSize }
+        var setupComplete: Bool { persistedState.setupComplete }
+        var connectionModeRawValue: String? { persistedState.connectionModeRawValue }
+        var authToken: String? { persistedState.authToken }
     }
 
     private let defaultsSuiteName: String?
     private let keychainService: String
     private let localInstallLoader: @Sendable () async -> LocalInstallConfiguration?
+    private let offMainExecutionProbe: (@Sendable () -> Void)?
 
     init(
         defaultsSuiteName: String? = nil,
         keychainService: String = KeychainHelper.defaultService,
         localInstallLoader: @escaping @Sendable () async -> LocalInstallConfiguration? = {
             await LocalInstallConfiguration.loadDefault()
-        }
+        },
+        offMainExecutionProbe: (@Sendable () -> Void)? = nil
     ) {
         self.defaultsSuiteName = defaultsSuiteName
         self.keychainService = keychainService
         self.localInstallLoader = localInstallLoader
+        self.offMainExecutionProbe = offMainExecutionProbe
     }
 
     static func defaultStore() -> AppStatePersistence {
@@ -50,26 +65,12 @@ actor AppStatePersistence {
     }
 
     func loadLaunchSnapshot(resetState: Bool) async -> LaunchSnapshot {
-        let userDefaults = defaults
-
-        if resetState {
-            resetPersistedConfiguration(userDefaults: userDefaults)
-        }
-
-        let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
-        let authToken = storedServerURL.isEmpty
-            ? nil
-            : (try? KeychainHelper.token(forServer: storedServerURL, service: keychainService))
+        async let persistedState = readPersistedState(resetState: resetState)
+        async let localInstallConfiguration = localInstallLoader()
 
         return LaunchSnapshot(
-            storedServerURL: storedServerURL,
-            pairedDeviceName: userDefaults.string(forKey: AppStateStorageKey.pairedDeviceName),
-            theme: storedTheme(),
-            fontSize: storedFontSize(),
-            setupComplete: userDefaults.bool(forKey: AppStateStorageKey.setupComplete),
-            connectionModeRawValue: userDefaults.string(forKey: AppStateStorageKey.connectionMode),
-            authToken: authToken,
-            localInstallConfiguration: await localInstallLoader()
+            persistedState: await persistedState,
+            localInstallConfiguration: await localInstallConfiguration
         )
     }
 
@@ -82,53 +83,122 @@ actor AppStatePersistence {
         token: String,
         deviceName: String,
         connectionMode: AppConnectionMode
-    ) throws {
-        let userDefaults = defaults
-        userDefaults.set(serverURLString, forKey: AppStateStorageKey.serverURL)
-        userDefaults.set(deviceName, forKey: AppStateStorageKey.pairedDeviceName)
-        userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
-        try KeychainHelper.saveToken(token, forServer: serverURLString, service: keychainService)
+    ) async throws {
+        let keychainService = self.keychainService
+
+        try await runOffMain { userDefaults in
+            userDefaults.set(serverURLString, forKey: AppStateStorageKey.serverURL)
+            userDefaults.set(deviceName, forKey: AppStateStorageKey.pairedDeviceName)
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+            try KeychainHelper.saveToken(token, forServer: serverURLString, service: keychainService)
+        }
     }
 
-    func clearPairing(serverURLString: String) {
-        let userDefaults = defaults
-        if !serverURLString.isEmpty {
-            try? KeychainHelper.deleteToken(forServer: serverURLString, service: keychainService)
-        }
+    func clearPairing(serverURLString: String) async {
+        let keychainService = self.keychainService
 
-        userDefaults.removeObject(forKey: AppStateStorageKey.serverURL)
-        userDefaults.removeObject(forKey: AppStateStorageKey.pairedDeviceName)
+        await runOffMain { userDefaults in
+            if !serverURLString.isEmpty {
+                try? KeychainHelper.deleteToken(forServer: serverURLString, service: keychainService)
+            }
+
+            userDefaults.removeObject(forKey: AppStateStorageKey.serverURL)
+            userDefaults.removeObject(forKey: AppStateStorageKey.pairedDeviceName)
+        }
     }
 
     func persistResolvedLaunchState(
         setupComplete: Bool,
         connectionMode: AppConnectionMode
-    ) {
-        let userDefaults = defaults
-        if setupComplete {
-            userDefaults.set(true, forKey: AppStateStorageKey.setupComplete)
+    ) async {
+        await runOffMain { userDefaults in
+            if setupComplete {
+                userDefaults.set(true, forKey: AppStateStorageKey.setupComplete)
+            }
+
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
         }
-
-        userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
     }
 
-    func setTheme(_ theme: AppTheme) {
-        defaults.set(theme.rawValue, forKey: AppStateStorageKey.theme)
+    func setTheme(_ theme: AppTheme) async {
+        await runOffMain { userDefaults in
+            userDefaults.set(theme.rawValue, forKey: AppStateStorageKey.theme)
+        }
     }
 
-    func setFontSize(_ fontSize: AppFontSize) {
-        defaults.set(fontSize.rawValue, forKey: AppStateStorageKey.fontSize)
+    func setFontSize(_ fontSize: AppFontSize) async {
+        await runOffMain { userDefaults in
+            userDefaults.set(fontSize.rawValue, forKey: AppStateStorageKey.fontSize)
+        }
     }
 
-    func setConnectionMode(_ connectionMode: AppConnectionMode) {
-        defaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+    func setConnectionMode(_ connectionMode: AppConnectionMode) async {
+        await runOffMain { userDefaults in
+            userDefaults.set(connectionMode.rawValue, forKey: AppStateStorageKey.connectionMode)
+        }
     }
 
-    func setSetupComplete(_ setupComplete: Bool) {
-        defaults.set(setupComplete, forKey: AppStateStorageKey.setupComplete)
+    func setSetupComplete(_ setupComplete: Bool) async {
+        await runOffMain { userDefaults in
+            userDefaults.set(setupComplete, forKey: AppStateStorageKey.setupComplete)
+        }
     }
 
-    private var defaults: UserDefaults {
+    private func readPersistedState(resetState: Bool) async -> LaunchSnapshot.PersistedState {
+        let keychainService = self.keychainService
+
+        return await runOffMain { userDefaults in
+            if resetState {
+                Self.resetPersistedConfiguration(
+                    userDefaults: userDefaults,
+                    keychainService: keychainService
+                )
+            }
+
+            let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
+            let authToken = storedServerURL.isEmpty
+                ? nil
+                : (try? KeychainHelper.token(forServer: storedServerURL, service: keychainService))
+
+            return LaunchSnapshot.PersistedState(
+                storedServerURL: storedServerURL,
+                pairedDeviceName: userDefaults.string(forKey: AppStateStorageKey.pairedDeviceName),
+                theme: Self.storedTheme(userDefaults: userDefaults),
+                fontSize: Self.storedFontSize(userDefaults: userDefaults),
+                setupComplete: userDefaults.bool(forKey: AppStateStorageKey.setupComplete),
+                connectionModeRawValue: userDefaults.string(forKey: AppStateStorageKey.connectionMode),
+                authToken: authToken
+            )
+        }
+    }
+
+    private func runOffMain<T: Sendable>(
+        _ operation: @escaping @Sendable (UserDefaults) -> T
+    ) async -> T {
+        let defaultsSuiteName = self.defaultsSuiteName
+        let offMainExecutionProbe = self.offMainExecutionProbe
+
+        return await Task.detached(priority: .utility) {
+            offMainExecutionProbe?()
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            return operation(userDefaults)
+        }.value
+    }
+
+    private func runOffMain<T: Sendable>(
+        _ operation: @escaping @Sendable (UserDefaults) throws -> T
+    ) async throws -> T {
+        let defaultsSuiteName = self.defaultsSuiteName
+        let offMainExecutionProbe = self.offMainExecutionProbe
+
+        return try await Task.detached(priority: .utility) {
+            offMainExecutionProbe?()
+            let userDefaults = Self.makeDefaults(suiteName: defaultsSuiteName)
+            return try operation(userDefaults)
+        }.value
+    }
+
+    private static func makeDefaults(suiteName defaultsSuiteName: String?) -> UserDefaults {
         if let defaultsSuiteName, let userDefaults = UserDefaults(suiteName: defaultsSuiteName) {
             return userDefaults
         }
@@ -143,19 +213,22 @@ actor AppStatePersistence {
         return .standard
     }
 
-    private func storedTheme() -> AppTheme {
+    private static func storedTheme(userDefaults: UserDefaults) -> AppTheme {
         AppTheme(
-            rawValue: defaults.string(forKey: AppStateStorageKey.theme) ?? AppTheme.system.rawValue
+            rawValue: userDefaults.string(forKey: AppStateStorageKey.theme) ?? AppTheme.system.rawValue
         ) ?? .system
     }
 
-    private func storedFontSize() -> AppFontSize {
+    private static func storedFontSize(userDefaults: UserDefaults) -> AppFontSize {
         AppFontSize(
-            rawValue: defaults.string(forKey: AppStateStorageKey.fontSize) ?? AppFontSize.medium.rawValue
+            rawValue: userDefaults.string(forKey: AppStateStorageKey.fontSize) ?? AppFontSize.medium.rawValue
         ) ?? .medium
     }
 
-    private func resetPersistedConfiguration(userDefaults: UserDefaults) {
+    private static func resetPersistedConfiguration(
+        userDefaults: UserDefaults,
+        keychainService: String
+    ) {
         let storedServerURL = userDefaults.string(forKey: AppStateStorageKey.serverURL) ?? ""
 
         if !storedServerURL.isEmpty {
