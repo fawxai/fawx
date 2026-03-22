@@ -145,7 +145,7 @@ pub fn generate_plist(config: &LaunchAgentConfig) -> String {
 #[cfg(target_os = "macos")]
 pub fn install(config: &LaunchAgentConfig) -> Result<(), LaunchAgentError> {
     let path = plist_path().ok_or(LaunchAgentError::HomeDirNotFound)?;
-    let domain = format!("gui/{}", current_uid()?);
+    let domain = launchctl_domain()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(LaunchAgentError::PlistWriteFailed)?;
     }
@@ -155,13 +155,23 @@ pub fn install(config: &LaunchAgentConfig) -> Result<(), LaunchAgentError> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn stop_service() -> Result<(), LaunchAgentError> {
+    let path = installed_plist_path()?;
+    let domain = launchctl_domain()?;
+    run_launchctl("bootout", &domain, &path)
+}
+
+#[cfg(target_os = "macos")]
+pub fn start_service() -> Result<(), LaunchAgentError> {
+    let path = installed_plist_path()?;
+    let domain = launchctl_domain()?;
+    run_launchctl("bootstrap", &domain, &path)
+}
+
+#[cfg(target_os = "macos")]
 pub fn uninstall() -> Result<(), LaunchAgentError> {
-    let path = plist_path().ok_or(LaunchAgentError::HomeDirNotFound)?;
-    let domain = format!("gui/{}", current_uid()?);
-    if !path.exists() {
-        return Err(LaunchAgentError::NotInstalled);
-    }
-    if let Err(error) = run_launchctl("bootout", &domain, &path) {
+    let path = installed_plist_path()?;
+    if let Err(error) = stop_service() {
         tracing::warn!("bootout failed (may be expected): {error}");
     }
     fs::remove_file(&path).map_err(LaunchAgentError::PlistWriteFailed)
@@ -170,7 +180,7 @@ pub fn uninstall() -> Result<(), LaunchAgentError> {
 #[cfg(target_os = "macos")]
 pub fn reload(config: &LaunchAgentConfig) -> Result<(), LaunchAgentError> {
     let path = plist_path().ok_or(LaunchAgentError::HomeDirNotFound)?;
-    let domain = format!("gui/{}", current_uid()?);
+    let domain = launchctl_domain()?;
     if let Err(error) = run_launchctl("bootout", &domain, &path) {
         tracing::warn!("bootout failed (may be expected): {error}");
     }
@@ -206,6 +216,21 @@ fn parse_current_uid(stdout: &[u8]) -> Result<u32, LaunchAgentError> {
 }
 
 #[cfg(target_os = "macos")]
+fn installed_plist_path() -> Result<PathBuf, LaunchAgentError> {
+    let path = plist_path().ok_or(LaunchAgentError::HomeDirNotFound)?;
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(LaunchAgentError::NotInstalled)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_domain() -> Result<String, LaunchAgentError> {
+    Ok(format!("gui/{}", current_uid()?))
+}
+
+#[cfg(target_os = "macos")]
 fn current_uid() -> Result<u32, LaunchAgentError> {
     let output = Command::new("id")
         .args(["-u"])
@@ -234,6 +259,16 @@ fn run_launchctl(subcommand: &str, domain: &str, path: &Path) -> Result<(), Laun
 
 #[cfg(not(target_os = "macos"))]
 pub fn install(_config: &LaunchAgentConfig) -> Result<(), LaunchAgentError> {
+    Err(LaunchAgentError::NotSupported)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn stop_service() -> Result<(), LaunchAgentError> {
+    Err(LaunchAgentError::NotSupported)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn start_service() -> Result<(), LaunchAgentError> {
     Err(LaunchAgentError::NotSupported)
 }
 
@@ -350,6 +385,24 @@ mod tests {
     fn error_display_not_supported() {
         let err = LaunchAgentError::NotSupported;
         assert_eq!(err.to_string(), "LaunchAgent is only supported on macOS");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stop_service_returns_not_supported_on_non_macos() {
+        assert!(matches!(
+            stop_service(),
+            Err(LaunchAgentError::NotSupported)
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn start_service_returns_not_supported_on_non_macos() {
+        assert!(matches!(
+            start_service(),
+            Err(LaunchAgentError::NotSupported)
+        ));
     }
 
     #[test]
