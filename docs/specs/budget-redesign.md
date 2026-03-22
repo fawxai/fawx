@@ -1,212 +1,215 @@
-# Budget Redesign: Simplified Model + Graceful Termination
+# Budget Redesign: Graceful Termination as First-Class Concept
 
 ## Status: SPEC REVIEW — Not approved for implementation
 
 ## Problem Statement
 
-Fawx's budget system has 11 configuration knobs, many redundant or unused, and lacks the one mechanism that actually matters: graceful termination. The agent goes silent when any budget limit fires because there's no forced synthesis turn.
+Fawx's budget system reliably enforces resource limits and allocates budgets across sub-goals. What it lacks is a graceful exit path: when any limit fires, the loop returns `BudgetExhausted` with stale `partial_response` and the user gets silence.
 
-The quick fix (PR for `fix/graceful-loop-termination`) adds forced synthesis on top of the existing 11-knob system. This spec proposes the clean version: simplify the budget model down to its essential concerns, then build graceful termination as a first-class concept rather than a bolt-on.
+The quick fix (PR for `fix/graceful-loop-termination`) bolts `forced_synthesis_turn()` onto the existing budget system. This spec proposes a cleaner integration: making graceful termination a first-class concept alongside enforcement and allocation, without dismantling the existing budget infrastructure.
 
-## Current State (11 knobs)
+## Current State — Full Audit
 
-```rust
-pub struct BudgetConfig {
-    pub max_llm_calls: u32,              // iteration cap
-    pub max_tool_invocations: u32,       // REDUNDANT — tools fire within LLM turns
-    pub max_tokens: u64,                 // token cap
-    pub max_cost_cents: u64,             // UNUSED — never wired to real pricing
-    pub max_wall_time_ms: u64,           // wall clock cap
-    pub max_recursion_depth: u32,        // decomposition depth
-    pub max_synthesis_tokens: u32,       // UNCLEAR — not meaningfully used
-    pub max_consecutive_failures: u16,   // retry policy (now in RetryPolicyConfig)
-    pub max_cycle_failures: u16,         // retry policy (now in RetryPolicyConfig)
-    pub max_tool_retries: u8,            // retry policy (backward compat shim)
-    pub decompose_depth_mode: DepthMode, // WRONG PLACE — decomposition concern, not budget
-}
-```
+### BudgetConfig (15 fields)
 
-### Why each removal is safe
+| Field | Purpose | Actively enforced | Used in allocation | Verdict |
+|---|---|---|---|---|
+| `max_llm_calls` | Iteration cap | Yes (`check_resources`) | Yes (distributed by weight) | **Keep** |
+| `max_tool_invocations` | Tool call cap | Yes (`check_resources`) | Yes (distributed, floor-checked) | **Keep** — 51 non-test refs, deeply wired into allocation/decomposition |
+| `max_tokens` | Token cap | Yes (`check_resources`) | Yes (distributed) | **Keep** |
+| `max_cost_cents` | Cost cap | Yes (`check_resources`) | Yes (distributed, floor-checked) | **Keep** — enforced on every check, distributed in allocation. Not wired to real pricing, but the enforcement path exists and is load-bearing in tests/decomposition |
+| `max_wall_time_ms` | Wall clock cap | Yes (`check_at`) | Yes (distributed) | **Keep** |
+| `max_recursion_depth` | Decomposition depth | Yes (`check_resources`) | No (checked directly) | **Keep** — part of safety boundary |
+| `decompose_depth_mode` | Static vs. adaptive depth | No (read in decompose logic) | No | **Relocatable** — strategy concern, not enforcement. Could move to decomposition config in a future PR |
+| `soft_ceiling_percent` | Triggers `BudgetState::Low` at N% | Yes (`state()`) | No | **Keep** — drives the wrap-up directive injection |
+| `max_fan_out` | Max parallel tool calls per turn | Yes (in tool execution) | No | **Keep** — safety guard |
+| `max_tool_result_bytes` | Per-result truncation | Yes (in tool execution) | No | **Keep** — prevents context blowup |
+| `max_aggregate_result_bytes` | Triggers `BudgetState::Low` | Yes (`state()`) | No | **Keep** — context pressure signal |
+| `max_synthesis_tokens` | Synthesis prompt token limit | Yes (in prompt assembly) | No | **Relocatable** — prompt assembly concern. Could move to prompt config in a future PR |
+| `max_consecutive_failures` | Per-tool retry limit | Yes (via `RetryPolicyConfig`) | No | **Consolidate** — PR #1569 introduced `RetryPolicyConfig`. This field exists for backward compat serde |
+| `max_cycle_failures` | Cycle-wide failure limit | Yes (via `RetryPolicyConfig`) | No | **Consolidate** — same as above |
+| `max_tool_retries` | Legacy retry field | Yes (deserialized into retry config) | No | **Consolidate** — backward compat shim |
 
-- **`max_tool_invocations`**: Tools are called within LLM turns. If `max_llm_calls` (iterations) is 64, and each turn produces 1-3 tool calls, the iteration cap already bounds tool usage. A separate tool invocation cap adds confusion without safety value.
+### Key Finding
 
-- **`max_cost_cents`**: The `estimate_cost()` function exists but is never called from real pricing data. No provider integration feeds actual costs. This is speculative infrastructure that was never completed.
+The previous spec incorrectly labeled `max_tool_invocations` and `max_cost_cents` as "unused." Both are actively enforced in `check_resources()` on every iteration and distributed across sub-goals in `BudgetAllocator::allocate()`. Removing them would break budget decomposition, floor enforcement, and resource tracking.
 
-- **`max_synthesis_tokens`**: Only referenced in `synthesis_budget()` which caps token allocation for synthesis/custom instructions. This is a prompt assembly concern, not a loop budget concern. It should live in prompt config, not budget config.
+### What Can Actually Change
 
-- **`decompose_depth_mode`**: Controls whether decomposition depth is static or adaptive. This is a decomposition strategy parameter, not a budget parameter. It should live in decomposition config.
+**Phase 1 (this spec):** Add graceful termination. Touch no existing fields.
 
-- **`max_consecutive_failures` / `max_cycle_failures` / `max_tool_retries`**: PR #1569 introduced `RetryPolicyConfig` as a sub-struct. The legacy fields exist for backward compatibility via serde. The redesign promotes `RetryPolicyConfig` as the single source of truth and removes the legacy fields from `BudgetConfig`, handling migration in deserialization.
+**Phase 2 (future, optional):** Consolidate retry fields into `RetryPolicyConfig` sub-struct (removing legacy shims). Relocate `decompose_depth_mode` and `max_synthesis_tokens` to their owning concerns. These are pure refactors with no behavioral change.
 
-## Proposed State (5 concerns)
+## Proposed Change: Graceful Termination
 
-```rust
-pub struct BudgetConfig {
-    /// Maximum LLM call iterations before forced termination.
-    pub max_iterations: u32,
+### New: `TerminationConfig`
 
-    /// Maximum wall clock time for the entire cycle.
-    pub max_wall_time_ms: u64,
-
-    /// Maximum total tokens (input + output) across the cycle.
-    pub max_tokens: u64,
-
-    /// Retry/failure policy (consecutive failures, cycle failures, per-tool retries).
-    pub retry_policy: RetryPolicyConfig,
-
-    /// Number of consecutive tool-only turns before injecting a progress nudge.
-    /// Set to 0 to disable.
-    pub tool_nudge_threshold: u16,
-}
-```
-
-### Backward Compatibility
-
-Serde handles the migration:
+Added to `BudgetConfig` as a sub-struct:
 
 ```rust
-#[serde(alias = "max_llm_calls")]
-pub max_iterations: u32,
-```
+/// Controls how the loop exits when a budget limit fires.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminationConfig {
+    /// When true, make one final LLM call with tools stripped to synthesize
+    /// findings before returning. When false, return immediately with
+    /// whatever partial response exists.
+    #[serde(default = "default_synthesize_on_exhaustion")]
+    pub synthesize_on_exhaustion: bool,
 
-Old configs with `max_llm_calls` deserialize into `max_iterations`. Removed fields (`max_tool_invocations`, `max_cost_cents`, etc.) are silently ignored via `#[serde(deny_unknown_fields)]` NOT being set (which is already the case).
-
-The `Default` impl and named constructors (`permissive()`, `conservative()`) produce the new shape. Any code reading removed fields gets a compile error, forcing explicit migration.
-
-### What happens to removed fields' logic
-
-| Removed field | Current behavior | Migration |
-|---|---|---|
-| `max_tool_invocations` | Checked in `BudgetTracker::check_at()` | Remove check. Iteration cap is sufficient. |
-| `max_cost_cents` | Checked in `BudgetTracker::check_at()` | Remove check. Never fed real data. |
-| `max_synthesis_tokens` | Read by `synthesis_budget()` | Move to prompt/synthesis config. Hardcode reasonable default (4096) at call site until moved. |
-| `max_recursion_depth` | Read by decomposition engine | Move to decomposition config. Keep reading from budget config with deprecation warning until moved. |
-| `decompose_depth_mode` | Read by decomposition engine | Same as above. |
-| Legacy retry fields | Deserialized into RetryPolicyConfig | Remove from BudgetConfig. RetryPolicyConfig is already the canonical source. |
-
-## Graceful Termination (First-Class)
-
-Instead of bolt-on `forced_synthesis_turn()`, termination is a proper phase in the loop:
-
-### TerminationPolicy
-
-```rust
-pub struct TerminationPolicy {
-    /// How to handle budget exhaustion.
-    pub on_budget_exhausted: TerminationAction,
-
-    /// How to handle wall time expiry.
-    pub on_wall_time_expired: TerminationAction,
-
-    /// Consecutive tool-only turns before progress nudge.
+    /// Consecutive tool-only turns before injecting a progress nudge.
+    /// 0 disables the nudge.
+    #[serde(default = "default_nudge_after_tool_turns")]
     pub nudge_after_tool_turns: u16,
-
-    /// Budget progress threshold for "start wrapping up" hint (0.0-1.0).
-    pub soft_landing_threshold: f32,
 }
 
-pub enum TerminationAction {
-    /// Make one final LLM call with tools stripped to synthesize findings.
-    Synthesize,
+fn default_synthesize_on_exhaustion() -> bool { true }
+fn default_nudge_after_tool_turns() -> u16 { 6 }
 
-    /// Return immediately with whatever partial response exists.
-    Immediate,
-
-    /// Return a static message.
-    Static(String),
-}
-
-impl Default for TerminationPolicy {
+impl Default for TerminationConfig {
     fn default() -> Self {
         Self {
-            on_budget_exhausted: TerminationAction::Synthesize,
-            on_wall_time_expired: TerminationAction::Synthesize,
+            synthesize_on_exhaustion: true,
             nudge_after_tool_turns: 6,
-            soft_landing_threshold: 0.7,
         }
     }
 }
 ```
 
-### Soft Landing Zone
+Why a bool instead of an enum with `Synthesize/Immediate/Static` variants: the quick fix showed that `Static` is just the fallback when synthesis fails, not a user choice. And `Immediate` is `synthesize_on_exhaustion: false`. The enum added design surface for zero practical value.
 
-At `soft_landing_threshold` (default 70% of iterations consumed), inject system-context into the next LLM call:
+### Existing: `soft_ceiling_percent` Is the Soft Landing
 
-```
-You have N iterations remaining. Begin working toward a conclusion.
-```
-
-At 90%:
+The spec originally proposed a `soft_landing_threshold` at 70%. This already exists as `soft_ceiling_percent` (default 80%). When `BudgetTracker::state()` returns `BudgetState::Low`, the loop already injects `BUDGET_LOW_WRAP_UP_DIRECTIVE` into the context:
 
 ```
-Final iterations. Wrap up and respond to the user.
+"You are running low on budget. Do not call any tools. Do not decompose.
+Summarize what you have accomplished and what remains undone. Be concise."
 ```
 
-This uses the existing system prompt assembly path (not tool result injection like Hermes). The model sees it as part of its instructions, not as metadata stuffed into a tool response.
+This is the soft landing. It already works. The gap is only what happens when the model ignores the directive and the hard limit fires — that's where forced synthesis comes in.
 
-### Synthesis Turn
+### Integration Points
 
-When termination fires and `TerminationAction::Synthesize` is configured:
+**`handle_budget_check()` change:**
 
-1. Build a `CompletionRequest` with:
-   - Same model as the main loop
-   - Current conversation messages
-   - `tools: vec![]` (empty — forces text response)
-   - System prompt append: "Your iteration budget is exhausted. Provide a final response summarizing your findings."
-2. Call `llm.complete()` with 30s timeout
-3. On success: return synthesized text as `LoopResult::Complete` (not `BudgetExhausted` — from the user's perspective, the agent completed)
-4. On failure: fall back to `partial_response` or structured fallback message
+Currently:
+```rust
+fn handle_budget_check(&mut self, cost: ActionCost, partial_response: Option<String>) -> Option<LoopResult> {
+    if self.budget.check_at(current_time_ms(), &cost).is_ok() {
+        return None;
+    }
+    // Immediately return BudgetExhausted with stale partial_response
+    Some(LoopResult::BudgetExhausted { partial_response, ... })
+}
+```
 
-### Why `LoopResult::Complete` instead of `BudgetExhausted`
+Proposed (requires LLM provider access):
+```rust
+fn handle_budget_check(&mut self, cost: ActionCost, partial_response: Option<String>, llm: &dyn LlmProvider, messages: &[Message]) -> Option<LoopResult> {
+    if self.budget.check_at(current_time_ms(), &cost).is_ok() {
+        return None;
+    }
+    
+    let response = if self.termination_config.synthesize_on_exhaustion {
+        self.forced_synthesis_turn(llm, messages).await
+            .unwrap_or_else(|| partial_response.unwrap_or_else(|| BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()))
+    } else {
+        partial_response.unwrap_or_else(|| BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string())
+    };
+    
+    Some(LoopResult::BudgetExhausted { partial_response: Some(response), ... })
+}
+```
 
-The distinction between "completed" and "budget exhausted" matters to the orchestrator/caller, but not to the user. If we successfully synthesize, the response is complete from the user's perspective. The caller can check iteration count to know it was a forced completion.
+**Signature change concern:** `handle_budget_check` is called from multiple sites in `run_iteration()`. Each call site already has access to the LLM provider and messages. The cleanest approach: keep `handle_budget_check` pure (returns the decision), and let the call site in `run_iteration()` handle the synthesis call before constructing the Terminal result. This avoids making `handle_budget_check` async.
 
-If we fail to synthesize, then it's truly `BudgetExhausted` with a fallback message.
+**Pattern:**
+```rust
+if let Some(exhaustion) = self.handle_budget_check(cost, state.partial_response.clone()) {
+    // NEW: attempt synthesis before returning
+    let final_response = if self.termination_config.synthesize_on_exhaustion {
+        match self.forced_synthesis_turn(llm, &perception.context_window).await {
+            Ok(text) => text,
+            Err(_) => exhaustion.partial_response_or_fallback(),
+        }
+    } else {
+        exhaustion.partial_response_or_fallback()
+    };
+    return Ok(IterationStep::Terminal(LoopResult::BudgetExhausted {
+        partial_response: Some(final_response),
+        ..exhaustion_fields
+    }));
+}
+```
 
-## Comparison: Quick Fix vs. Elegant Solution
+**`consecutive_tool_only_turns` in CycleState:**
 
-| Aspect | Quick Fix | Elegant Solution |
-|---|---|---|
-| Forced synthesis | Bolted onto `handle_budget_check()` | First-class `TerminationPolicy` |
-| Budget config | 11 knobs unchanged | 5 concerns, clean separation |
-| Soft landing | Not included | System-context injection at 70%/90% |
-| Nudge | Hardcoded threshold (6) | Configurable in `TerminationPolicy` |
-| Result type | `BudgetExhausted` with synthesized text | `Complete` on success, `BudgetExhausted` on synthesis failure |
-| Backward compat | Full (no config changes) | Serde aliases, removed fields silently ignored |
-| Complexity | ~30-40 lines added | ~200 lines changed, ~50 tests updated |
-| Risk | Low — additive only | Medium — touches serialization, budget tracker, test expectations |
+```rust
+struct CycleState {
+    learnings: Vec<Learning>,
+    tokens: TokenUsage,
+    partial_response: Option<String>,
+    consecutive_tool_only_turns: u16,  // NEW
+}
+```
 
-## Migration Plan
+Incremented in the tool-call path when the model produces tool calls without text. Reset when the model produces text. At threshold, inject `TOOL_ONLY_TURN_NUDGE` as a system message in the next perception step.
 
-### Phase 1: Ship quick fix
-- Forced synthesis + nudge counter on current budget model
-- Validates the UX improvement in production
+### Result Type: Keep `BudgetExhausted`
 
-### Phase 2: Budget simplification (this spec)
-- Remove unused fields, consolidate retry policy
-- Add `TerminationPolicy` as first-class concept
-- Update tests, verify serde backward compat
-- Benchmark against quick fix: same behavior, cleaner internals
-
-### Phase 3: Move displaced concerns
-- `max_synthesis_tokens` → prompt config
-- `max_recursion_depth` + `decompose_depth_mode` → decomposition config
-- Clean deprecation path
-
-## Open Questions
-
-1. **Should `TerminationPolicy` live in `BudgetConfig` or alongside it?** Termination is a budget concern (it fires when budget is exhausted), but the synthesis turn involves the LLM provider which is not a budget concept. Leaning toward: `BudgetConfig` owns the thresholds, `LoopRunner` owns the synthesis logic, `TerminationPolicy` bridges them.
-
-2. **Should soft landing injection be visible to the user?** The system-context injection is invisible to the user (it's in the system prompt). But should the TUI show a "wrapping up..." indicator? Probably yes for AX transparency.
-
-3. **Should `TerminationAction::Synthesize` be the default for all termination triggers?** Wall time expiry might not leave enough time for a synthesis call. Maybe `on_wall_time_expired` should default to `Immediate` with a timeout reserve check.
-
-4. **Is `LoopResult::Complete` the right result type for forced synthesis?** It means callers can't distinguish "agent decided to stop" from "budget forced it to stop." Could add a `forced: bool` field, or a `LoopResult::ForcedComplete` variant.
+The forced synthesis response goes into `BudgetExhausted.partial_response`. This preserves the semantic distinction for callers (orchestrators, fleet dispatchers, signals) that need to know the agent was terminated by budget, not by natural completion. The user-facing layer can present it identically to a `Complete` — that's a rendering concern, not a loop concern.
 
 ## Files Affected
 
-- `engine/crates/fx-kernel/src/budget.rs` — BudgetConfig simplification, TerminationPolicy
-- `engine/crates/fx-kernel/src/loop_engine.rs` — synthesis turn, nudge, soft landing injection
-- `engine/crates/fx-kernel/src/budget_tracker.rs` — remove checks for removed fields
-- Tests across both files (~50 test updates expected)
-- Config serialization tests for backward compat
+- `engine/crates/fx-kernel/src/budget.rs`:
+  - Add `TerminationConfig` struct
+  - Add `termination` field to `BudgetConfig` (with `#[serde(default)]`)
+  - Update `Default`, `permissive()`, `conservative()` constructors
+  - Update `From<BudgetConfig> for BudgetTracker` (pass through config)
+  - ~20 lines new code, ~10 lines modified
+
+- `engine/crates/fx-kernel/src/loop_engine.rs`:
+  - Add `forced_synthesis_turn()` method to `LoopRunner`
+  - Add `consecutive_tool_only_turns` to `CycleState`
+  - Modify budget-check call sites to attempt synthesis (3-4 sites)
+  - Add nudge injection in perception step
+  - ~50-70 lines new code
+
+- Tests in both files:
+  - New: forced synthesis on budget exhaustion, synthesis failure fallback, nudge threshold, nudge reset
+  - Modified: tests constructing `BudgetConfig` need `..Default::default()` for new field
+  - Estimated: ~8 new tests, ~15 test constructor updates (mechanical)
+
+## What This Spec Does NOT Change
+
+- No field removals from `BudgetConfig`
+- No changes to `check_resources()` or `BudgetAllocator::allocate()`
+- No changes to `BudgetState::Low` / soft ceiling behavior
+- No changes to retry policy or `RetryPolicyConfig`
+- No changes to `BudgetRemaining` or resource tracking
+- No serde breaking changes (new field has `#[serde(default)]`)
+
+## Comparison to Quick Fix
+
+| Aspect | Quick Fix | This Spec |
+|---|---|---|
+| Forced synthesis | Inline in `handle_budget_check` | Same mechanism, structured as `TerminationConfig` |
+| Nudge | Hardcoded threshold (6) | Configurable via `nudge_after_tool_turns` |
+| Config | No config changes | `TerminationConfig` sub-struct, serde-defaulted |
+| Testability | Tests against hardcoded behavior | Tests against configurable behavior |
+| Risk | Minimal — additive only | Low — additive, no removals, serde-compatible |
+| Complexity delta | ~30 lines | ~70 lines + config struct |
+
+## Open Questions
+
+1. **Should `forced_synthesis_turn` have its own timeout?** The main loop has `max_wall_time_ms`. If budget exhausts at 590s of a 600s wall time, is there enough time for synthesis? Proposal: use `min(30s, remaining_wall_time - 2s)` as the synthesis timeout. If <2s remain, skip synthesis.
+
+2. **Should the nudge be a system message or appended to the last tool result?** System message is cleaner (it's an instruction, not a tool output). Hermes stuffs it into tool results, which is a hack. Proposal: system message.
+
+3. **Should `TerminationConfig` be separate from `BudgetConfig`?** It could live on `LoopConfig` instead. But it's budget-triggered behavior, so `BudgetConfig` is the natural home. Proposal: keep it in `BudgetConfig`.
+
+## Migration Path
+
+1. **Ship quick fix first** — validates the UX improvement in production
+2. **If quick fix works well**, this spec replaces the hardcoded behavior with `TerminationConfig`, making it configurable and testable
+3. **Future (optional)**: consolidate retry fields, relocate `decompose_depth_mode` and `max_synthesis_tokens` — separate PRs, separate specs
