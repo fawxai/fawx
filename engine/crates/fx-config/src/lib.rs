@@ -42,6 +42,15 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_history = 20
 # thinking = "adaptive"  # "high" | "low" | "adaptive" | "off"
 
+[agent]
+# name = "Fawx"
+# personality = "casual"  # "casual" | "professional" | "technical" | "minimal" | "custom"
+# custom_personality = ""
+# [agent.behavior]
+# custom_instructions = "Be concise and direct."
+# verbosity = "normal"  # "terse" | "normal" | "thorough"
+# proactive = false
+
 [model]
 # default_model = "anthropic/claude-sonnet-4-20250514"
 # synthesis_instruction = "Be concise and direct."
@@ -120,6 +129,8 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 #[serde(default)]
 pub struct FawxConfig {
     pub general: GeneralConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     pub model: ModelConfig,
     pub logging: LoggingConfig,
     pub tools: ToolsConfig,
@@ -138,6 +149,44 @@ pub struct FawxConfig {
     pub budget: BudgetConfig,
     pub sandbox: SandboxConfig,
     pub proposals: ProposalConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub name: String,
+    pub personality: String,
+    pub custom_personality: Option<String>,
+    pub behavior: AgentBehaviorConfig,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            name: "Fawx".to_string(),
+            personality: "casual".to_string(),
+            custom_personality: None,
+            behavior: AgentBehaviorConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentBehaviorConfig {
+    pub custom_instructions: Option<String>,
+    pub verbosity: String,
+    pub proactive: bool,
+}
+
+impl Default for AgentBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            custom_instructions: None,
+            verbosity: "normal".to_string(),
+            proactive: false,
+        }
+    }
 }
 
 /// Workspace configuration for filesystem boundaries and defaults.
@@ -1239,6 +1288,37 @@ embeddings_enabled = false
     }
 
     #[test]
+    fn load_parses_agent_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[agent]
+name = "Rivet"
+personality = "custom"
+custom_personality = "Be sharply technical."
+
+[agent.behavior]
+custom_instructions = "Lead with the answer."
+verbosity = "terse"
+proactive = true
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        assert_eq!(loaded.agent.name, "Rivet");
+        assert_eq!(loaded.agent.personality, "custom");
+        assert_eq!(
+            loaded.agent.custom_personality.as_deref(),
+            Some("Be sharply technical.")
+        );
+        assert_eq!(
+            loaded.agent.behavior.custom_instructions.as_deref(),
+            Some("Lead with the answer.")
+        );
+        assert_eq!(loaded.agent.behavior.verbosity, "terse");
+        assert!(loaded.agent.behavior.proactive);
+    }
+
+    #[test]
     fn load_parses_logging_config() {
         let temp = TempDir::new().expect("tempdir");
         let content = r#"
@@ -1272,6 +1352,7 @@ log_dir = "~/.fawx/custom-logs"
 
         assert_eq!(loaded.general.max_iterations, 42);
         assert_eq!(loaded.general.max_history, 20);
+        assert_eq!(loaded.agent, AgentConfig::default());
         assert_eq!(loaded.logging, LoggingConfig::default());
         assert_eq!(loaded.tools.max_read_size, 1024 * 1024);
         assert_eq!(loaded.memory.max_entries, 1000);
@@ -1305,6 +1386,10 @@ log_dir = "~/.fawx/custom-logs"
 
     #[test]
     fn default_template_includes_power_user_sections() {
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[agent]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# name = \"Fawx\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# [agent.behavior]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# verbosity = \"normal\""));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[workspace]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# root = \".\""));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[permissions]"));
@@ -1330,6 +1415,9 @@ log_dir = "~/.fawx/custom-logs"
         let defaults = FawxConfig::default();
         assert_eq!(defaults.general.max_iterations, 10);
         assert_eq!(defaults.general.max_history, 20);
+        assert_eq!(defaults.agent.name, "Fawx");
+        assert_eq!(defaults.agent.personality, "casual");
+        assert_eq!(defaults.agent.behavior.verbosity, "normal");
         assert_eq!(defaults.logging, LoggingConfig::default());
         assert_eq!(defaults.tools.max_read_size, 1024 * 1024);
         assert_eq!(defaults.memory.max_entries, 1000);
@@ -1347,6 +1435,16 @@ log_dir = "~/.fawx/custom-logs"
                 max_iterations: 9,
                 max_history: 99,
                 thinking: None,
+            },
+            agent: AgentConfig {
+                name: "Rivet".to_string(),
+                personality: "technical".to_string(),
+                custom_personality: Some("Explain tradeoffs plainly.".to_string()),
+                behavior: AgentBehaviorConfig {
+                    custom_instructions: Some("Prefer concrete next steps.".to_string()),
+                    verbosity: "thorough".to_string(),
+                    proactive: true,
+                },
             },
             model: ModelConfig {
                 default_model: Some("claude-sonnet".to_string()),

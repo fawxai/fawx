@@ -132,7 +132,7 @@ struct ContentView: View {
             sessionViewModel: sessionViewModel,
             chatViewModel: chatViewModel,
             emptyStateTitle: "What are we working on?",
-            emptyStateMessage: "Create a new conversation from the sidebar, or start typing and Fawx will create one on your first message."
+            emptyStateMessage: "Start typing and Fawx will create a new conversation, or pick one from the sidebar."
         )
     }
 

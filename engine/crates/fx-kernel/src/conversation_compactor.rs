@@ -2,7 +2,7 @@ use crate::loop_engine::LlmProvider;
 use async_trait::async_trait;
 use fx_llm::{ContentBlock, Message, MessageRole};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -101,6 +101,34 @@ fn tool_ids_in_message(message: &Message) -> Vec<&str> {
         })
         .collect()
 }
+
+#[cfg(debug_assertions)]
+fn debug_assert_tool_pair_integrity(messages: &[Message]) {
+    let mut seen_tool_use_ids = HashSet::new();
+
+    for (message_index, message) in messages.iter().enumerate() {
+        for (block_index, block) in message.content.iter().enumerate() {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    seen_tool_use_ids.insert(id.as_str());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    debug_assert!(
+                        seen_tool_use_ids.contains(tool_use_id.as_str()),
+                        "orphaned tool_result '{}' at message {}, block {}",
+                        tool_use_id,
+                        message_index,
+                        block_index
+                    );
+                }
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_tool_pair_integrity(_: &[Message]) {}
 
 fn unresolved_tool_use_ids(messages: &[Message]) -> HashSet<&str> {
     let mut tool_use_ids = HashSet::new();
@@ -260,38 +288,145 @@ fn compaction_marker_tokens(compacted_count: usize) -> usize {
     estimate_message_tokens(&compaction_marker_message(compacted_count))
 }
 
+fn middle_tool_pair_map(
+    messages: &[Message],
+    bounds: &ZoneBounds,
+) -> HashMap<String, HashSet<usize>> {
+    let mut pair_map: HashMap<String, HashSet<usize>> = HashMap::new();
+
+    for (index, message) in messages
+        .iter()
+        .enumerate()
+        .take(bounds.tail_start)
+        .skip(bounds.prefix_end)
+    {
+        for id in tool_ids_in_message(message) {
+            pair_map.entry(id.to_string()).or_default().insert(index);
+        }
+    }
+
+    pair_map
+}
+
+fn middle_offset_to_index(bounds: &ZoneBounds, offset: usize) -> usize {
+    bounds.prefix_end + offset
+}
+
+fn middle_index_to_offset(bounds: &ZoneBounds, index: usize) -> usize {
+    index - bounds.prefix_end
+}
+
+fn paired_removal_offsets(
+    messages: &[Message],
+    bounds: &ZoneBounds,
+    start_offset: usize,
+    pair_map: &HashMap<String, HashSet<usize>>,
+    protected_middle: &HashSet<usize>,
+) -> Option<Vec<usize>> {
+    let mut pending = vec![middle_offset_to_index(bounds, start_offset)];
+    let mut seen_indices = HashSet::new();
+
+    while let Some(index) = pending.pop() {
+        if !seen_indices.insert(index) {
+            continue;
+        }
+
+        for id in tool_ids_in_message(&messages[index]) {
+            if let Some(partner_indices) = pair_map.get(id) {
+                for partner_index in partner_indices {
+                    if *partner_index == index {
+                        continue;
+                    }
+                    if protected_middle.contains(partner_index) {
+                        return None;
+                    }
+                    pending.push(*partner_index);
+                }
+            }
+        }
+    }
+
+    Some(
+        seen_indices
+            .into_iter()
+            .map(|index| middle_index_to_offset(bounds, index))
+            .collect(),
+    )
+}
+
+fn remove_middle_offsets(
+    keep_middle: &mut [bool],
+    middle_token_costs: &[usize],
+    offsets: &[usize],
+) -> (usize, usize) {
+    let mut removed_count = 0;
+    let mut removed_tokens = 0;
+
+    for offset in offsets {
+        if keep_middle[*offset] {
+            keep_middle[*offset] = false;
+            removed_count += 1;
+            removed_tokens += middle_token_costs[*offset];
+        }
+    }
+
+    (removed_count, removed_tokens)
+}
+
+fn update_compaction_marker_budget(
+    estimated_tokens: &mut usize,
+    marker_tokens: &mut usize,
+    compacted_count: usize,
+) {
+    let next_marker_tokens = compaction_marker_tokens(compacted_count);
+    if next_marker_tokens >= *marker_tokens {
+        *estimated_tokens = estimated_tokens.saturating_add(next_marker_tokens - *marker_tokens);
+    } else {
+        *estimated_tokens = estimated_tokens.saturating_sub(*marker_tokens - next_marker_tokens);
+    }
+    *marker_tokens = next_marker_tokens;
+}
+
 fn remove_oldest_middle_until_target(
     messages: &[Message],
     target_tokens: usize,
     bounds: &ZoneBounds,
     removable_offsets: &[usize],
+    protected_middle: &HashSet<usize>,
 ) -> Result<(Vec<bool>, usize), CompactionError> {
     let middle_len = bounds.tail_start.saturating_sub(bounds.prefix_end);
     let mut keep_middle = vec![true; middle_len];
     let mut compacted_count = 0;
     let mut estimated_tokens = ConversationBudget::estimate_tokens(messages);
     let mut marker_tokens = 0;
-    let removable_token_costs = removable_offsets
-        .iter()
-        .map(|offset| estimate_message_tokens(&messages[bounds.prefix_end + *offset]))
+    let middle_token_costs = (0..middle_len)
+        .map(|offset| estimate_message_tokens(&messages[middle_offset_to_index(bounds, offset)]))
         .collect::<Vec<_>>();
+    let pair_map = middle_tool_pair_map(messages, bounds);
 
-    for (offset, token_cost) in removable_offsets.iter().zip(removable_token_costs.iter()) {
+    for offset in removable_offsets {
         if estimated_tokens <= target_tokens {
             break;
         }
-
-        keep_middle[*offset] = false;
-        compacted_count += 1;
-        estimated_tokens = estimated_tokens.saturating_sub(*token_cost);
-
-        let next_marker_tokens = compaction_marker_tokens(compacted_count);
-        if next_marker_tokens >= marker_tokens {
-            estimated_tokens = estimated_tokens.saturating_add(next_marker_tokens - marker_tokens);
-        } else {
-            estimated_tokens = estimated_tokens.saturating_sub(marker_tokens - next_marker_tokens);
+        if !keep_middle[*offset] {
+            continue;
         }
-        marker_tokens = next_marker_tokens;
+
+        let Some(offsets_to_remove) =
+            paired_removal_offsets(messages, bounds, *offset, &pair_map, protected_middle)
+        else {
+            continue;
+        };
+
+        let (removed_count, removed_tokens) =
+            remove_middle_offsets(&mut keep_middle, &middle_token_costs, &offsets_to_remove);
+        if removed_count == 0 {
+            continue;
+        }
+
+        compacted_count += removed_count;
+        estimated_tokens = estimated_tokens.saturating_sub(removed_tokens);
+        update_compaction_marker_budget(&mut estimated_tokens, &mut marker_tokens, compacted_count);
     }
 
     if estimated_tokens > target_tokens {
@@ -308,13 +443,15 @@ fn sliding_compaction_result(
 ) -> Result<CompactionResult, CompactionError> {
     let before_tokens = ConversationBudget::estimate_tokens(messages);
     if before_tokens <= target_tokens {
-        return Ok(CompactionResult {
+        let result = CompactionResult {
             messages: messages.to_vec(),
             compacted_count: 0,
             estimated_tokens: before_tokens,
             used_summarization: false,
             evicted_indices: Vec::new(),
-        });
+        };
+        debug_assert_tool_pair_integrity(&result.messages);
+        return Ok(result);
     }
 
     let bounds = zone_bounds(messages, preserve_recent_turns);
@@ -325,19 +462,25 @@ fn sliding_compaction_result(
         return Err(CompactionError::AllMessagesProtected);
     }
 
-    let (keep_middle, compacted_count) =
-        remove_oldest_middle_until_target(messages, target_tokens, &bounds, &removable_offsets)?;
+    let (keep_middle, compacted_count) = remove_oldest_middle_until_target(
+        messages,
+        target_tokens,
+        &bounds,
+        &removable_offsets,
+        &protected_middle,
+    )?;
     let evicted_indices = evicted_indices_from_keep_middle(&bounds, &keep_middle);
     let compacted_messages =
         assemble_sliding_result(messages, &bounds, &keep_middle, compacted_count);
-
-    Ok(CompactionResult {
+    let result = CompactionResult {
         estimated_tokens: ConversationBudget::estimate_tokens(&compacted_messages),
         messages: compacted_messages,
         compacted_count,
         used_summarization: false,
         evicted_indices,
-    })
+    };
+    debug_assert_tool_pair_integrity(&result.messages);
+    Ok(result)
 }
 
 pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> CompactionResult {
@@ -783,13 +926,15 @@ impl CompactionStrategy for SummarizingCompactor {
     ) -> Result<CompactionResult, CompactionError> {
         let before_tokens = ConversationBudget::estimate_tokens(messages);
         if before_tokens <= target_tokens {
-            return Ok(CompactionResult {
+            let result = CompactionResult {
                 messages: messages.to_vec(),
                 compacted_count: 0,
                 estimated_tokens: before_tokens,
                 used_summarization: false,
                 evicted_indices: Vec::new(),
-            });
+            };
+            debug_assert_tool_pair_integrity(&result.messages);
+            return Ok(result);
         }
 
         let bounds = zone_bounds(messages, self.preserve_recent_turns);
@@ -805,13 +950,15 @@ impl CompactionStrategy for SummarizingCompactor {
             return Err(CompactionError::SummaryExceededTarget);
         }
 
-        Ok(CompactionResult {
+        let result = CompactionResult {
             messages: compacted_messages,
             compacted_count: summarizable_messages.len(),
             estimated_tokens,
             used_summarization: true,
             evicted_indices: summarizable_indices,
-        })
+        };
+        debug_assert_tool_pair_integrity(&result.messages);
+        Ok(result)
     }
 }
 
@@ -1034,6 +1181,17 @@ mod tests {
 
     fn has_compaction_marker(messages: &[Message]) -> bool {
         messages.iter().any(message_contains_marker)
+    }
+
+    fn target_after_removing(messages: &[Message], removed_indices: &[usize]) -> usize {
+        let removed_tokens = removed_indices
+            .iter()
+            .map(|index| estimate_message_tokens(&messages[*index]))
+            .sum::<usize>();
+
+        ConversationBudget::estimate_tokens(messages)
+            .saturating_sub(removed_tokens)
+            .saturating_add(compaction_marker_tokens(removed_indices.len()))
     }
 
     #[derive(Debug)]
@@ -1395,6 +1553,70 @@ mod tests {
             messages.len() + 1 - result.messages.len(),
             result.compacted_count
         );
+    }
+
+    #[tokio::test]
+    async fn sliding_compaction_preserves_tool_pairs() {
+        let compactor = SlidingWindowCompactor::new(2);
+        let paired_use = tool_use("paired");
+        let paired_result = tool_result("paired", 40);
+        let messages = vec![
+            user(20),
+            paired_use.clone(),
+            paired_result.clone(),
+            assistant(20),
+            user(20),
+            assistant(20),
+        ];
+        let target = target_after_removing(&messages, &[0, 1]);
+
+        let result = compactor.compact(&messages, target).await.expect("compact");
+        let has_use = result.messages.contains(&paired_use);
+        let has_result = result.messages.contains(&paired_result);
+
+        assert_eq!(
+            has_use, has_result,
+            "tool pair was split: {:#?}",
+            result.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn sliding_compaction_evicts_tool_pairs_atomically() {
+        let compactor = SlidingWindowCompactor::new(2);
+        let paired_use = tool_use("paired");
+        let paired_result = tool_result("paired", 40);
+        let messages = vec![
+            user(20),
+            paired_use.clone(),
+            paired_result.clone(),
+            assistant(20),
+            user(20),
+            assistant(20),
+        ];
+        let target = target_after_removing(&messages, &[0, 1, 2]);
+
+        let result = compactor.compact(&messages, target).await.expect("compact");
+
+        assert!(!result.messages.contains(&paired_use));
+        assert!(!result.messages.contains(&paired_result));
+        assert!(result.evicted_indices.contains(&1));
+        assert!(result.evicted_indices.contains(&2));
+    }
+
+    #[test]
+    fn debug_assert_tool_pair_integrity_passes_valid_sequence() {
+        let messages = vec![user(10), tool_use("paired"), tool_result("paired", 10)];
+
+        debug_assert_tool_pair_integrity(&messages);
+    }
+
+    #[test]
+    #[should_panic(expected = "orphaned tool_result")]
+    fn debug_assert_tool_pair_integrity_catches_orphan() {
+        let messages = vec![user(10), tool_result("orphan", 10)];
+
+        debug_assert_tool_pair_integrity(&messages);
     }
 
     #[test]
