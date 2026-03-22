@@ -17,6 +17,7 @@ use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
+use crate::validation::validate_tool_message_sequence;
 
 /// Maximum allowed thinking budget tokens — prevents token exhaustion attacks.
 /// Even if a caller constructs ThinkingConfig::Enabled with an arbitrary budget,
@@ -682,6 +683,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        validate_tool_message_sequence(&request.messages)?;
         let body = self.build_request_body(&request, false)?;
 
         let request_builder = self
@@ -1245,6 +1247,40 @@ mod tests {
         assert_eq!(serialized["system"], "System prelude\nFollow policy");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_orphaned_tool_result() {
+        let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-3-7-sonnet".to_string()]);
+        let request = CompletionRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![
+                Message::user("Find weather"),
+                Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: serde_json::json!("first result"),
+                    }],
+                },
+            ],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(256),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let error = provider.complete(request).await.expect_err("should reject");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid tool continuation messages"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

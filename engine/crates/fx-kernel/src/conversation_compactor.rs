@@ -170,6 +170,47 @@ fn protected_middle_indices(messages: &[Message], bounds: &ZoneBounds) -> HashSe
         .collect()
 }
 
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_tool_pair_integrity(messages: &[Message]) {
+    let mut seen_tool_use_ids = HashSet::new();
+
+    for (message_index, message) in messages.iter().enumerate() {
+        match message.role {
+            MessageRole::Assistant => {
+                for block in &message.content {
+                    if let ContentBlock::ToolUse { id, .. } = block {
+                        let trimmed = id.trim();
+                        if !trimmed.is_empty() {
+                            seen_tool_use_ids.insert(trimmed);
+                        }
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        let trimmed = tool_use_id.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        debug_assert!(
+                            seen_tool_use_ids.contains(trimmed),
+                            "tool_result '{}' at message {} has no matching earlier assistant tool_use",
+                            trimmed,
+                            message_index
+                        );
+                    }
+                }
+            }
+            MessageRole::System | MessageRole::User => {}
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn debug_assert_tool_pair_integrity(_: &[Message]) {}
+
 fn removable_middle_offsets(bounds: &ZoneBounds, protected_middle: &HashSet<usize>) -> Vec<usize> {
     (bounds.prefix_end..bounds.tail_start)
         .filter(|index| !protected_middle.contains(index))
@@ -245,10 +286,12 @@ fn assemble_sliding_result(
 fn assemble_emergency_result(
     messages: &[Message],
     bounds: &ZoneBounds,
+    protected_middle: &HashSet<usize>,
     compacted_count: usize,
 ) -> Vec<Message> {
     let mut compacted = Vec::new();
     compacted.extend_from_slice(&messages[..bounds.prefix_end]);
+    append_protected_middle_messages(&mut compacted, messages, bounds, protected_middle);
     if compacted_count > 0 {
         compacted.push(emergency_compaction_marker_message(compacted_count));
     }
@@ -342,7 +385,10 @@ fn sliding_compaction_result(
 
 pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> CompactionResult {
     let bounds = zone_bounds(messages, preserve_recent_turns);
-    let evicted_indices: Vec<usize> = (bounds.prefix_end..bounds.tail_start).collect();
+    let protected_middle = protected_middle_indices(messages, &bounds);
+    let evicted_indices: Vec<usize> = (bounds.prefix_end..bounds.tail_start)
+        .filter(|index| !protected_middle.contains(index))
+        .collect();
     let compacted_count = evicted_indices.len();
     if compacted_count == 0 {
         return CompactionResult {
@@ -354,7 +400,9 @@ pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> 
         };
     }
 
-    let result_messages = assemble_emergency_result(messages, &bounds, compacted_count);
+    let result_messages =
+        assemble_emergency_result(messages, &bounds, &protected_middle, compacted_count);
+    debug_assert_tool_pair_integrity(&result_messages);
     CompactionResult {
         estimated_tokens: ConversationBudget::estimate_tokens(&result_messages),
         messages: result_messages,
@@ -1032,6 +1080,26 @@ mod tests {
         }
     }
 
+    fn has_tool_use(messages: &[Message], expected_id: &str) -> bool {
+        messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == expected_id))
+        })
+    }
+
+    fn has_tool_result(messages: &[Message], expected_id: &str) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == expected_id
+                )
+            })
+        })
+    }
+
     fn has_compaction_marker(messages: &[Message]) -> bool {
         messages.iter().any(message_contains_marker)
     }
@@ -1467,6 +1535,79 @@ mod tests {
         assert_eq!(result.messages, messages);
         assert_eq!(result.compacted_count, 0);
         assert!(result.evicted_indices.is_empty());
+    }
+
+    #[test]
+    fn emergency_compact_preserves_tool_pairs_across_boundary() {
+        let messages = vec![
+            user(10),
+            tool_use("call-1"),
+            tool_result("call-1", 20),
+            user(20),
+            assistant(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+        let has_use = has_tool_use(&result.messages, "call-1");
+        let has_result = has_tool_result(&result.messages, "call-1");
+
+        assert_eq!(has_use, has_result);
+    }
+
+    #[test]
+    fn emergency_compact_keeps_tool_use_when_result_in_tail() {
+        let messages = vec![
+            user(10),
+            tool_use("call-1"),
+            user(20),
+            assistant(20),
+            tool_result("call-1", 20),
+            user(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert!(has_tool_use(&result.messages, "call-1"));
+        assert!(has_tool_result(&result.messages, "call-1"));
+    }
+
+    #[test]
+    fn emergency_compact_evicts_complete_pairs_in_middle() {
+        let messages = vec![
+            user(10),
+            tool_use("old"),
+            tool_result("old", 20),
+            user(120),
+            assistant(120),
+            user(20),
+            assistant(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert!(!has_tool_use(&result.messages, "old"));
+        assert!(!has_tool_result(&result.messages, "old"));
+    }
+
+    #[test]
+    fn emergency_compact_handles_multi_tool_chain() {
+        let messages = vec![
+            user(10),
+            tool_use("old"),
+            tool_result("old", 20),
+            user(20),
+            tool_use("keep"),
+            assistant(20),
+            tool_result("keep", 20),
+            user(20),
+        ];
+
+        let result = emergency_compact(&messages, 2);
+
+        assert!(!has_tool_use(&result.messages, "old"));
+        assert!(!has_tool_result(&result.messages, "old"));
+        assert!(has_tool_use(&result.messages, "keep"));
+        assert!(has_tool_result(&result.messages, "keep"));
     }
 
     // 5.3 SummarizingCompactor tests
