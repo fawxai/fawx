@@ -865,6 +865,24 @@ fn response_input_block(role: &str, block: &ContentBlock) -> Option<Value> {
     }
 }
 
+/// Remap non-OpenAI tool call ID prefixes to `fc_`.
+///
+/// OpenAI's Responses API requires `call_id` and `id` fields to match `^fc_`.
+/// When a conversation switches from Claude (which uses `toolu_*` IDs) to GPT,
+/// we normalize at serialization time so pairs stay matched.
+fn normalize_call_id(id: &str) -> String {
+    if id.starts_with("fc_") {
+        return id.to_string();
+    }
+
+    let stripped = id
+        .strip_prefix("toolu_")
+        .or_else(|| id.strip_prefix("call_"))
+        .unwrap_or(id);
+
+    format!("fc_{stripped}")
+}
+
 fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Result<(), LlmError> {
     push_text_input(input, "assistant", blocks);
 
@@ -878,10 +896,12 @@ fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Resu
         {
             let arguments = serde_json::to_string(tool_input)
                 .map_err(|error| LlmError::Serialization(error.to_string()))?;
+            let normalized_id = normalize_call_id(provider_id.as_deref().unwrap_or(id));
+            let normalized_call_id = normalize_call_id(id);
             input.push(json!({
                 "type": "function_call",
-                "id": provider_id.as_deref().unwrap_or(id),
-                "call_id": id,
+                "id": normalized_id,
+                "call_id": normalized_call_id,
                 "name": name,
                 "arguments": arguments,
             }));
@@ -906,9 +926,10 @@ fn push_tool_result_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
             }
 
             appended_tool_result = true;
+            let normalized_call_id = normalize_call_id(tool_use_id);
             input.push(json!({
                 "type": "function_call_output",
-                "call_id": tool_use_id,
+                "call_id": normalized_call_id,
                 "output": tool_result_output(content, &fallback_text),
             }));
         }
@@ -1821,19 +1842,19 @@ mod tests {
         );
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["id"], "fc_1");
-        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["call_id"], "fc_1");
         assert_eq!(input[1]["name"], "lookup");
         assert_eq!(input[1]["arguments"], "{\"q\":\"first\"}");
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[2]["id"], "fc_2");
-        assert_eq!(input[2]["call_id"], "call_2");
+        assert_eq!(input[2]["call_id"], "fc_2");
         assert_eq!(input[2]["name"], "lookup");
         assert_eq!(input[2]["arguments"], "{\"q\":\"second\"}");
         assert_eq!(
             input[3],
             serde_json::json!({
                 "type": "function_call_output",
-                "call_id": "call_1",
+                "call_id": "fc_1",
                 "output": "first result"
             })
         );
@@ -1841,7 +1862,7 @@ mod tests {
             input[4],
             serde_json::json!({
                 "type": "function_call_output",
-                "call_id": "call_2",
+                "call_id": "fc_2",
                 "output": "second result"
             })
         );
@@ -1939,7 +1960,7 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["call_id"], "fc_1");
         assert_eq!(input[1]["output"], "tool output");
     }
 
@@ -1957,7 +1978,7 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["call_id"], "fc_1");
         assert_eq!(input[1]["output"], "[ERROR] permission denied");
     }
 
@@ -2731,5 +2752,63 @@ mod tests {
         let tool_calls = collect_tool_calls(&output);
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_123");
+    }
+
+    #[test]
+    fn normalize_call_id_passes_fc_through() {
+        assert_eq!(normalize_call_id("fc_123"), "fc_123");
+    }
+
+    #[test]
+    fn normalize_call_id_remaps_toolu_prefix() {
+        assert_eq!(normalize_call_id("toolu_011VJLabcdef"), "fc_011VJLabcdef");
+    }
+
+    #[test]
+    fn normalize_call_id_remaps_call_prefix() {
+        assert_eq!(normalize_call_id("call_abc123"), "fc_abc123");
+    }
+
+    #[test]
+    fn normalize_call_id_prefixes_unknown_ids() {
+        assert_eq!(normalize_call_id("random_id"), "fc_random_id");
+    }
+
+    #[test]
+    fn build_request_normalizes_cross_provider_tool_ids() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "toolu_011VJLabcdef".to_string(),
+                        provider_id: None,
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/a"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "toolu_011VJLabcdef".to_string(),
+                        content: serde_json::json!("file contents"),
+                    }],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input[0]["call_id"], "fc_011VJLabcdef");
+        assert_eq!(input[1]["call_id"], "fc_011VJLabcdef");
     }
 }
