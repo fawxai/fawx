@@ -138,7 +138,8 @@ fn signal_kind_values() -> Vec<&'static str> {
             | SignalKind::UserIntervention
             | SignalKind::UserInput
             | SignalKind::UserFeedback
-            | SignalKind::Decision => {}
+            | SignalKind::Decision
+            | SignalKind::Observation => {}
         }
     }
 
@@ -156,6 +157,7 @@ fn signal_kind_values() -> Vec<&'static str> {
         SignalKind::UserInput,
         SignalKind::UserFeedback,
         SignalKind::Decision,
+        SignalKind::Observation,
     ]
     .iter()
     .map(|k| k.to_label())

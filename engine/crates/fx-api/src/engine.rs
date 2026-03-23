@@ -25,7 +25,6 @@ pub struct CycleResult {
 pub enum ResultKind {
     Complete,
     Partial,
-    NeedsInput,
     Error,
     Empty,
 }

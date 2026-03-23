@@ -1,5 +1,98 @@
 import SwiftUI
 
+struct ToolActivityGroupCardSnapshot: Equatable {
+    enum DetailStyle: Equatable {
+        case collapsed
+        case liveStatusOnly
+        case historicalPayload
+    }
+
+    let headerTitle: String
+    let groupSummary: String
+    let statusText: String
+    let accessibilityLabel: String
+    let accessibilityHint: String
+    let showsProgress: Bool
+    let canExpand: Bool
+    let isExpanded: Bool
+    let visibleToolCalls: [ToolCallRecord]
+    let detailStyle: DetailStyle
+
+    init(group: ToolActivityGroupRecord, isExpanded: Bool) {
+        let canExpand = !group.toolCalls.isEmpty
+        let effectiveExpanded = canExpand && isExpanded
+        let primaryToolCall = group.toolCalls.last(where: \.isRunning) ?? group.toolCalls.last
+        let detailStyle: DetailStyle
+
+        if !effectiveExpanded {
+            detailStyle = .collapsed
+        } else if group.isLive {
+            detailStyle = .liveStatusOnly
+        } else {
+            detailStyle = .historicalPayload
+        }
+
+        let headerTitle: String
+        if !effectiveExpanded, let primaryToolCall {
+            let additionalToolCount = max(0, group.toolCount - 1)
+            if additionalToolCount > 0 {
+                headerTitle = "\(primaryToolCall.displayName) +\(additionalToolCount)"
+            } else {
+                headerTitle = primaryToolCall.displayName
+            }
+        } else {
+            headerTitle = "Tool Activity"
+        }
+
+        let countLabel = group.toolCount == 1 ? "1 tool" : "\(group.toolCount) tools"
+        let groupSummary: String
+        if group.runningCount > 0 {
+            groupSummary = "\(countLabel), \(group.runningCount) running"
+        } else if group.errorCount > 0 {
+            let failedLabel = group.errorCount == 1 ? "1 failed" : "\(group.errorCount) failed"
+            groupSummary = "\(countLabel), \(failedLabel)"
+        } else if group.completedCount == group.toolCount {
+            groupSummary = "\(countLabel), completed"
+        } else {
+            groupSummary = countLabel
+        }
+
+        let statusText: String
+        if group.runningCount > 0 {
+            statusText = "Running"
+        } else if group.errorCount > 0 {
+            statusText = "Error"
+        } else {
+            statusText = "Complete"
+        }
+
+        self.headerTitle = headerTitle
+        self.groupSummary = groupSummary
+        self.statusText = statusText
+        accessibilityLabel = "\(headerTitle), \(groupSummary)"
+        if !canExpand {
+            accessibilityHint = "Tool activity details are unavailable."
+        } else if effectiveExpanded {
+            if group.isLive {
+                accessibilityHint = "Collapse tool activity. Detailed arguments and output appear after the response finishes."
+            } else {
+                accessibilityHint = "Collapse tool activity"
+            }
+        } else {
+            accessibilityHint = "Expand tool activity"
+        }
+        showsProgress = group.runningCount > 0
+        self.canExpand = canExpand
+        self.isExpanded = effectiveExpanded
+        visibleToolCalls = effectiveExpanded ? group.toolCalls : []
+        self.detailStyle = detailStyle
+    }
+
+    var showsPayloadDetails: Bool {
+        detailStyle == .historicalPayload
+    }
+}
+
 struct ToolActivityGroupCard: View {
     @Environment(\.containerWidth) private var containerWidth
 
@@ -9,7 +102,11 @@ struct ToolActivityGroupCard: View {
 
     init(group: ToolActivityGroupRecord) {
         self.group = group
-        _isExpanded = State(initialValue: group.runningCount > 0)
+        _isExpanded = State(initialValue: false)
+    }
+
+    private var snapshot: ToolActivityGroupCardSnapshot {
+        ToolActivityGroupCardSnapshot(group: group, isExpanded: isExpanded)
     }
 
     var body: some View {
@@ -24,6 +121,9 @@ struct ToolActivityGroupCard: View {
     private var cardContent: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
             Button {
+                guard snapshot.canExpand else {
+                    return
+                }
                 withAnimation(.easeInOut(duration: 0.18)) {
                     isExpanded.toggle()
                 }
@@ -31,17 +131,24 @@ struct ToolActivityGroupCard: View {
                 headerLabel
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(accessibilityLabel)
-            .accessibilityHint(isExpanded ? "Collapse tool activity" : "Expand tool activity")
+            .disabled(!snapshot.canExpand)
+            .accessibilityLabel(snapshot.accessibilityLabel)
+            .accessibilityHint(snapshot.accessibilityHint)
 
-            if isExpanded {
+            if snapshot.isExpanded {
                 VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
-                    ForEach(Array(group.toolCalls.enumerated()), id: \.element.id) { index, toolCall in
+                    if snapshot.detailStyle == .liveStatusOnly {
+                        Text("Detailed arguments and output appear after the response finishes.")
+                            .font(FawxTypography.status)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                    ForEach(Array(snapshot.visibleToolCalls.enumerated()), id: \.element.id) { index, toolCall in
                         if index > 0 {
                             Divider()
                                 .overlay(Color.fawxBorder.opacity(FawxOpacity.borderSubtle))
                         }
-                        toolRow(toolCall)
+                        toolRow(toolCall, showsPayloadDetails: snapshot.showsPayloadDetails)
                     }
                 }
             }
@@ -54,11 +161,6 @@ struct ToolActivityGroupCard: View {
                 .stroke(cardBorderColor, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-        .onChange(of: group.toolCalls) { _, toolCalls in
-            if toolCalls.contains(where: \.isRunning) {
-                isExpanded = true
-            }
-        }
     }
 
     private var headerLabel: some View {
@@ -70,12 +172,12 @@ struct ToolActivityGroupCard: View {
                 .clipShape(Circle())
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Tool Activity")
+                Text(snapshot.headerTitle)
                     .font(FawxTypography.sidebarTitle)
                     .foregroundStyle(Color.fawxText)
                     .lineLimit(1)
 
-                Text(groupSummary)
+                Text(snapshot.groupSummary)
                     .font(FawxTypography.status)
                     .foregroundStyle(Color.fawxTextSecondary)
                     .lineLimit(1)
@@ -83,12 +185,12 @@ struct ToolActivityGroupCard: View {
 
             Spacer(minLength: 0)
 
-            if group.runningCount > 0 {
+            if snapshot.showsProgress {
                 ProgressView()
                     .controlSize(.small)
             }
 
-            Text(statusText)
+            Text(snapshot.statusText)
                 .font(FawxTypography.status)
                 .foregroundStyle(statusColor)
                 .padding(.horizontal, FawxSpacing.paddingSM)
@@ -96,47 +198,14 @@ struct ToolActivityGroupCard: View {
                 .background(statusColor.opacity(FawxOpacity.fillSubtle))
                 .clipShape(Capsule())
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Status \(statusText)")
+                .accessibilityLabel("Status \(snapshot.statusText)")
 
-            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.fawxTextSecondary)
+            if snapshot.canExpand {
+                Image(systemName: snapshot.isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.fawxTextSecondary)
+            }
         }
-    }
-
-    private var groupSummary: String {
-        let countLabel = group.toolCount == 1 ? "1 tool" : "\(group.toolCount) tools"
-
-        if group.runningCount > 0 {
-            return "\(countLabel), \(group.runningCount) running"
-        }
-
-        if group.errorCount > 0 {
-            let failedLabel = group.errorCount == 1 ? "1 failed" : "\(group.errorCount) failed"
-            return "\(countLabel), \(failedLabel)"
-        }
-
-        if group.completedCount == group.toolCount {
-            return "\(countLabel), completed"
-        }
-
-        return countLabel
-    }
-
-    private var statusText: String {
-        if group.runningCount > 0 {
-            return "Running"
-        }
-
-        if group.errorCount > 0 {
-            return "Error"
-        }
-
-        return "Complete"
-    }
-
-    private var accessibilityLabel: String {
-        "Tool Activity, \(groupSummary)"
     }
 
     private var statusColor: Color {
@@ -175,7 +244,7 @@ struct ToolActivityGroupCard: View {
         return Color.fawxBorder
     }
 
-    private func toolRow(_ toolCall: ToolCallRecord) -> some View {
+    private func toolRow(_ toolCall: ToolCallRecord, showsPayloadDetails: Bool) -> some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
             HStack(alignment: .top, spacing: FawxSpacing.paddingSM) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -199,13 +268,13 @@ struct ToolActivityGroupCard: View {
                     .clipShape(Capsule())
             }
 
-            if !toolCall.arguments.isEmpty {
+            if showsPayloadDetails, !toolCall.arguments.isEmpty {
                 detailSection(title: "Arguments") {
                     CodeBlock(language: "json", content: toolCall.arguments)
                 }
             }
 
-            if let result = toolCall.result, !result.isEmpty {
+            if showsPayloadDetails, let result = toolCall.result, !result.isEmpty {
                 detailSection(title: toolCall.isError ? "Error Output" : "Result") {
                     CodeBlock(language: nil, content: result)
                 }

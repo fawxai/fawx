@@ -675,13 +675,32 @@ impl NotificationSender for StreamNotificationSender {
 }
 
 pub fn open_session_registry(data_dir: &Path) -> Option<fx_session::SessionRegistry> {
-    fx_session::SessionRegistry::open(&data_dir.join("sessions.redb"))
+    let sessions_path = data_dir.join("sessions.redb");
+    let storage = match open_with_retry("session registry", &sessions_path, || {
+        fx_storage::Storage::open(&sessions_path)
+    }) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(path = %sessions_path.display(), error = %error, "session storage unavailable");
+            return None;
+        }
+    };
+
+    match fx_session::SessionRegistry::new(fx_session::SessionStore::new(storage)) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            tracing::warn!(path = %sessions_path.display(), error = %error, "session registry unavailable");
+            None
+        }
+    }
 }
 
 pub(crate) fn open_credential_store(data_dir: &Path) -> Result<SharedCredentialStore, String> {
-    fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
-        .map(Arc::new)
-        .map_err(|error| error.to_string())
+    let credential_store_path = data_dir.join("credentials.db");
+    open_with_retry("credential store", &credential_store_path, || {
+        fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
+    })
+    .map(Arc::new)
 }
 
 pub(crate) fn build_token_broker(
@@ -1010,10 +1029,10 @@ fn build_skill_registry(
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store = match options.credential_store.clone() {
         Some(store) => Some(store),
-        None => match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
-            Ok(store) => Some(Arc::new(store)),
-            Err(e) => {
-                tracing::warn!("credential store unavailable: {e}");
+        None => match open_credential_store(data_dir) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::warn!("credential store unavailable: {error}");
                 None
             }
         },
@@ -1059,7 +1078,10 @@ fn build_skill_registry(
     }
 
     // Register cron/scheduler skill.
-    let cron_store = match fx_cron::CronStore::open(&data_dir.join("cron.redb")) {
+    let cron_store_path = data_dir.join("cron.redb");
+    let cron_store = match open_with_retry("cron store", &cron_store_path, || {
+        fx_cron::CronStore::open(&cron_store_path)
+    }) {
         Ok(store) => {
             let arc = Arc::new(tokio::sync::Mutex::new(store));
             let cron_skill = Arc::new(fx_tools::CronSkill::new(
@@ -1069,11 +1091,11 @@ fn build_skill_registry(
             registry.register(cron_skill);
             Some(arc)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "cron store unavailable");
+        Err(error) => {
+            tracing::warn!(error = %error, "cron store unavailable");
             startup_warnings.push(StartupWarning {
                 category: ErrorCategory::System,
-                message: format!("Cron store unavailable: {e}"),
+                message: format!("Cron store unavailable: {error}"),
             });
             None
         }
@@ -1499,9 +1521,54 @@ pub(crate) fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> 
         .unwrap_or_else(|| base_data_dir.to_path_buf())
 }
 
+/// Retry brief redb lock contention during startup.
+///
+/// This is intentionally scoped to startup paths that can race a just-stopped
+/// `fawx serve` process. Direct `SessionRegistry::open` callers outside that
+/// path still fail fast on contention because they are not part of the
+/// stop/start lock-release race.
+fn open_with_retry<T, E: fmt::Display>(
+    label: &str,
+    path: &Path,
+    opener: impl Fn() -> Result<T, E>,
+) -> Result<T, String> {
+    for attempt in 0..3u32 {
+        match opener() {
+            Ok(result) => return Ok(result),
+            Err(error) if attempt < 2 => {
+                let message = error.to_string();
+                if is_redb_lock_retryable(&message) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        attempt = attempt + 1,
+                        "{label} locked, retrying in {}ms",
+                        100 * (attempt + 1)
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ));
+                    continue;
+                }
+                return Err(message);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    unreachable!()
+}
+
+/// redb currently reports lock contention via formatted strings instead of a
+/// dedicated error type, so this match is a heuristic tied to the current
+/// "Database already open" / "Cannot acquire lock" wording.
+fn is_redb_lock_retryable(message: &str) -> bool {
+    message.contains("Database already open") || message.contains("Cannot acquire lock")
+}
+
 pub(crate) fn build_session_bus_for_data_dir(data_dir: &Path) -> Option<SessionBus> {
     let bus_db_path = data_dir.join("bus.redb");
-    let storage = match fx_storage::Storage::open(&bus_db_path) {
+    let storage = match open_with_retry("session bus", &bus_db_path, || {
+        fx_storage::Storage::open(&bus_db_path)
+    }) {
         Ok(storage) => storage,
         Err(error) => {
             tracing::warn!(path = %bus_db_path.display(), error = %error, "session bus unavailable");
@@ -1844,8 +1911,10 @@ mod tests {
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::test_support::create_test_model_dir;
     use fx_subagent::test_support::StubSubagentControl;
+    use std::cell::Cell;
     use std::io;
     use std::io::Write;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::Level;
@@ -1872,6 +1941,39 @@ mod tests {
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn open_with_retry_retries_lock_errors() {
+        let attempts = Cell::new(0);
+
+        let result = open_with_retry("session registry", Path::new("sessions.redb"), || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err("Database already open. Cannot acquire lock.")
+            } else {
+                Ok("opened")
+            }
+        });
+
+        assert_eq!(result.expect("retry should succeed"), "opened");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn open_with_retry_does_not_retry_non_lock_errors() {
+        let attempts = Cell::new(0);
+
+        let result: Result<(), String> =
+            open_with_retry("session registry", Path::new("sessions.redb"), || {
+                attempts.set(attempts.get() + 1);
+                Err("permission denied")
+            });
+
+        let error = result.expect_err("non-lock error should fail immediately");
+        assert_eq!(error, "permission denied");
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]

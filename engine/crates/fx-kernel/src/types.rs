@@ -238,76 +238,6 @@ pub enum GateResult {
     NeedsConfirmation { prompt: String },
 }
 
-/// Result produced by Verify.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VerificationResult {
-    /// Verification succeeded with evidence strings.
-    Confirmed { evidence: Vec<String> },
-    /// Verification failed and recommends recovery.
-    Failed {
-        reason: String,
-        recovery: RecoveryStrategy,
-    },
-    /// Verification could not determine success/failure.
-    Inconclusive { reason: String },
-}
-
-/// Recovery strategy for failed verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RecoveryStrategy {
-    /// Retry the same action.
-    Retry,
-    /// Re-run planning/reasoning.
-    Replan,
-    /// Gather additional evidence with a focused goal.
-    GatherEvidence(Goal),
-    /// Escalate to user/system with context.
-    Escalate(String),
-    /// Abort execution with explicit reason.
-    Abort(String),
-}
-
-/// Output produced by Learn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearningOutcome {
-    /// Episodic memories to persist.
-    pub episodic_entries: Vec<EpisodicEntry>,
-    /// Proposed semantic facts for consolidation.
-    pub semantic_proposals: Vec<SemanticProposal>,
-    /// Proposed reusable procedures.
-    pub procedural_proposals: Vec<ProceduralProposal>,
-}
-
-/// Decision emitted by Continue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ContinuationDecision {
-    /// Goal completed with evidence (boxed to reduce enum size).
-    Complete(Box<LoopEvidence>),
-    /// Continue the loop, optionally refreshing perception.
-    Continue { next_perception: bool },
-    /// Loop failed with unrecoverable error.
-    Failed(LoopError),
-    /// User input is required before proceeding.
-    NeedsUser(EscalationContext),
-    /// Recursion depth exceeded safety threshold.
-    DepthExceeded,
-    /// Budget has been exhausted.
-    BudgetExhausted,
-}
-
-/// Loop completion evidence returned to callers/audit trail.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoopEvidence {
-    /// Goal that was completed.
-    pub goal: Goal,
-    /// Optional final perception captured at completion.
-    pub final_perception: Option<PerceptionSnapshot>,
-    /// Verification result supporting completion.
-    pub verification: Option<VerificationResult>,
-    /// Additional evidence notes/artifacts.
-    pub evidence: Vec<String>,
-}
-
 /// Error describing an unrecoverable loop failure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopError {
@@ -317,17 +247,6 @@ pub struct LoopError {
     pub reason: String,
     /// Whether the error may be recoverable in a future attempt.
     pub recoverable: bool,
-}
-
-/// Context used when escalation to the user is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EscalationContext {
-    /// Prompt/question for the user.
-    pub prompt: String,
-    /// Optional associated goal.
-    pub goal: Option<Goal>,
-    /// Optional planned intent awaiting confirmation/input.
-    pub proposed_intent: Option<ReasonedIntent>,
 }
 
 /// Working-memory reference entry.
@@ -385,43 +304,6 @@ pub struct IdentityContext {
     pub preferences: HashMap<String, String>,
     /// Personality or style traits relevant to behavior.
     pub personality_traits: Vec<String>,
-}
-
-/// Episodic memory candidate extracted during Learn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpisodicEntry {
-    /// One-line summary of the experience.
-    pub summary: String,
-    /// Importance score in range 0.0..=1.0.
-    pub importance: f32,
-    /// Entities involved in the episode.
-    pub entities: Vec<String>,
-    /// Action taken by the agent.
-    pub action_taken: String,
-    /// Outcome after execution.
-    pub outcome: String,
-}
-
-/// Semantic fact candidate proposed by Learn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticProposal {
-    /// Candidate fact.
-    pub fact: String,
-    /// Confidence score in the fact.
-    pub confidence: f32,
-    /// Source tag (e.g. "inferred", "user_stated").
-    pub source: String,
-}
-
-/// Procedure candidate proposed by Learn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProceduralProposal {
-    /// Procedure name.
-    pub name: String,
-    /// Trigger condition.
-    pub trigger: String,
-    /// Step-by-step procedure text.
-    pub steps: Vec<String>,
 }
 
 #[cfg(test)]
@@ -515,97 +397,6 @@ mod tests {
 
         let invalid_criteria = Goal::new("Do thing", vec![" ".to_owned()], Some(1));
         assert!(invalid_criteria.validate().is_err());
-    }
-
-    #[test]
-    fn verification_and_recovery_patterns() {
-        let gather_goal = Goal::new(
-            "Collect more UI evidence",
-            vec!["Have at least one screenshot".to_owned()],
-            Some(2),
-        );
-
-        let failed = VerificationResult::Failed {
-            reason: "Expected element not visible".to_owned(),
-            recovery: RecoveryStrategy::GatherEvidence(gather_goal.clone()),
-        };
-
-        match failed {
-            VerificationResult::Failed { reason, recovery } => {
-                assert_eq!(reason, "Expected element not visible");
-                match recovery {
-                    RecoveryStrategy::GatherEvidence(goal) => {
-                        assert_eq!(goal.description, gather_goal.description);
-                    }
-                    _ => panic!("expected gather-evidence recovery"),
-                }
-            }
-            _ => panic!("expected failed verification"),
-        }
-
-        let confirmed = VerificationResult::Confirmed {
-            evidence: vec!["Element 'Send' is visible".to_owned()],
-        };
-        assert!(matches!(
-            confirmed,
-            VerificationResult::Confirmed { evidence } if evidence.len() == 1
-        ));
-    }
-
-    #[test]
-    fn continuation_decision_variants_are_constructible() {
-        let goal = Goal::new("Complete task", vec!["Task complete".to_owned()], Some(3));
-
-        let complete = ContinuationDecision::Complete(Box::new(LoopEvidence {
-            goal: goal.clone(),
-            final_perception: None,
-            verification: Some(VerificationResult::Confirmed {
-                evidence: vec!["Task marker detected".to_owned()],
-            }),
-            evidence: vec!["marker:task_complete".to_owned()],
-        }));
-        assert!(matches!(complete, ContinuationDecision::Complete(_)));
-
-        let continue_decision = ContinuationDecision::Continue {
-            next_perception: true,
-        };
-        assert!(matches!(
-            continue_decision,
-            ContinuationDecision::Continue {
-                next_perception: true
-            }
-        ));
-
-        let failed = ContinuationDecision::Failed(LoopError {
-            stage: "act".to_owned(),
-            reason: "executor unavailable".to_owned(),
-            recoverable: false,
-        });
-        assert!(matches!(failed, ContinuationDecision::Failed(_)));
-
-        let needs_user = ContinuationDecision::NeedsUser(EscalationContext {
-            prompt: "Should I proceed with deleting this draft?".to_owned(),
-            goal: Some(goal),
-            proposed_intent: Some(ReasonedIntent {
-                action: IntendedAction::Respond {
-                    text: "Awaiting confirmation".to_owned(),
-                },
-                rationale: "destructive action requires approval".to_owned(),
-                confidence: 0.92,
-                expected_outcome: None,
-                sub_goals: vec![],
-            }),
-        });
-        assert!(matches!(needs_user, ContinuationDecision::NeedsUser(_)));
-
-        assert!(matches!(
-            ContinuationDecision::DepthExceeded,
-            ContinuationDecision::DepthExceeded
-        ));
-        assert!(matches!(
-            ContinuationDecision::BudgetExhausted,
-            ContinuationDecision::BudgetExhausted
-        ));
     }
 
     #[test]

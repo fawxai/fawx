@@ -29,6 +29,7 @@ pub use thinking::{default_thinking_level, thinking_config_for_model, valid_thin
 mod test_helpers;
 pub mod thinking;
 mod types;
+mod validation;
 
 pub use anthropic::AnthropicAuthMode;
 pub use anthropic::AnthropicProvider;
@@ -158,6 +159,20 @@ pub(crate) fn normalize_tool_arguments(raw: &str) -> &str {
     } else {
         raw
     }
+}
+
+/// Parse tool call arguments into a JSON object, with a safe fallback.
+///
+/// If parsing fails, wraps the raw string as `{"__fawx_raw_args": "..."}` so
+/// the value remains a valid JSON object (providers require this) and the
+/// original string is preserved for debugging. The `__fawx_raw_args` key is
+/// prefixed to avoid collisions with legitimate tool parameter names.
+pub(crate) fn parse_tool_arguments_object(raw: &str) -> serde_json::Value {
+    let normalized = normalize_tool_arguments(raw);
+    serde_json::from_str(normalized).unwrap_or_else(|e| {
+        tracing::warn!("tool arguments JSON parse failed: {e}, wrapping as __fawx_raw_args");
+        serde_json::json!({ "__fawx_raw_args": raw })
+    })
 }
 
 #[cfg(test)]

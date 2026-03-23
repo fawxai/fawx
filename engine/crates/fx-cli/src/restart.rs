@@ -1,6 +1,7 @@
 use crate::startup;
 use anyhow::{anyhow, Context};
 use clap::Args;
+use fx_api::launchagent::{LaunchAgentError, LaunchAgentStatus};
 use std::{
     fs::{self, OpenOptions},
     io::ErrorKind,
@@ -120,11 +121,13 @@ fn execute_restart(
     config: &RestartConfig,
     request: RestartRequest,
 ) -> anyhow::Result<()> {
-    let pid = resolve_target_pid(system, &config.pid_file)?
-        .ok_or_else(|| anyhow!("no running fawx serve process found"))?;
     match request.mode {
-        RestartMode::Graceful => graceful_restart(system, pid),
-        RestartMode::Hard | RestartMode::Rebuild => stop_and_start(system, config, pid, request),
+        RestartMode::Graceful => {
+            let pid = resolve_target_pid(system, &config.pid_file)?
+                .ok_or_else(|| anyhow!("no running fawx serve process found"))?;
+            graceful_restart(system, pid)
+        }
+        RestartMode::Hard | RestartMode::Rebuild => stop_and_start(system, config, request),
     }
 }
 
@@ -137,15 +140,101 @@ fn graceful_restart(system: &impl RestartSystem, pid: u32) -> anyhow::Result<()>
 fn stop_and_start(
     system: &impl RestartSystem,
     config: &RestartConfig,
-    pid: u32,
     request: RestartRequest,
 ) -> anyhow::Result<()> {
+    let launchagent_status = system.launchagent_status();
+    if launchagent_status.installed && launchagent_status.loaded {
+        return restart_launchagent(system, config, request);
+    }
+    restart_via_spawn(system, config, request)
+}
+
+fn restart_launchagent(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+    request: RestartRequest,
+) -> anyhow::Result<()> {
+    stop_launchagent_for_restart(system, config)?;
+    rebuild_if_requested(system, config, request)?;
+    match system.start_launchagent_service() {
+        Ok(()) => {
+            println!("Restarted fawx (LaunchAgent)");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!("LaunchAgent start failed, falling back to direct spawn: {error}");
+            spawn_restarted_process(system, config, request.mode == RestartMode::Rebuild)
+        }
+    }
+}
+
+fn restart_via_spawn(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+    request: RestartRequest,
+) -> anyhow::Result<()> {
+    stop_running_process(system, config)?;
+    rebuild_if_requested(system, config, request)?;
+    spawn_restarted_process(system, config, request.mode == RestartMode::Rebuild)
+}
+
+fn stop_launchagent_for_restart(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+) -> anyhow::Result<()> {
+    match system.stop_launchagent_service() {
+        Ok(()) => remove_pid_file(&config.pid_file),
+        Err(error) => {
+            tracing::warn!("LaunchAgent stop failed, falling back to SIGTERM: {error}");
+            stop_running_process_if_present(system, config)
+        }
+    }
+}
+
+fn stop_running_process(system: &impl RestartSystem, config: &RestartConfig) -> anyhow::Result<()> {
+    let pid = resolve_target_pid(system, &config.pid_file)?
+        .ok_or_else(|| anyhow!("no running fawx serve process found"))?;
+    stop_pid(system, &config.pid_file, pid, config.stop_timeout)
+}
+
+fn stop_running_process_if_present(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+) -> anyhow::Result<()> {
+    match resolve_target_pid(system, &config.pid_file)? {
+        Some(pid) => stop_pid(system, &config.pid_file, pid, config.stop_timeout),
+        None => remove_pid_file(&config.pid_file),
+    }
+}
+
+fn stop_pid(
+    system: &impl RestartSystem,
+    pid_file: &Path,
+    pid: u32,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     system.send_signal(pid, RestartSignal::Terminate)?;
-    wait_for_exit(system, pid, config.stop_timeout)?;
+    wait_for_exit(system, pid, timeout)?;
+    remove_pid_file(pid_file)
+}
+
+fn rebuild_if_requested(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+    request: RestartRequest,
+) -> anyhow::Result<()> {
     if request.mode == RestartMode::Rebuild {
         rebuild_binary(system, config.repo_root.as_deref(), request.no_skills)?;
     }
-    let executable = executable_to_start(config, request.mode == RestartMode::Rebuild);
+    Ok(())
+}
+
+fn spawn_restarted_process(
+    system: &impl RestartSystem,
+    config: &RestartConfig,
+    rebuild: bool,
+) -> anyhow::Result<()> {
+    let executable = executable_to_start(config, rebuild);
     let new_pid = system.spawn_serve(&executable)?;
     println!("Started fawx via {} (pid {new_pid})", executable.display());
     Ok(())
@@ -296,6 +385,18 @@ pub(crate) trait RestartSystem {
     fn send_signal(&self, pid: u32, signal: RestartSignal) -> anyhow::Result<()>;
     fn build_all(&self, repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildOutcome>;
     fn spawn_serve(&self, executable: &Path) -> anyhow::Result<u32>;
+
+    fn launchagent_status(&self) -> LaunchAgentStatus {
+        fx_api::launchagent::status()
+    }
+
+    fn stop_launchagent_service(&self) -> Result<(), LaunchAgentError> {
+        fx_api::launchagent::stop_service()
+    }
+
+    fn start_launchagent_service(&self) -> Result<(), LaunchAgentError> {
+        fx_api::launchagent::start_service()
+    }
 }
 
 pub(crate) struct LiveRestartSystem;
@@ -503,6 +604,11 @@ mod tests {
         sent_signals: RefCell<Vec<(u32, RestartSignal)>>,
         build_requests: RefCell<Vec<(PathBuf, bool)>>,
         spawned_paths: RefCell<Vec<PathBuf>>,
+        launchagent_status: LaunchAgentStatus,
+        launchagent_status_calls: RefCell<usize>,
+        launchagent_events: RefCell<Vec<&'static str>>,
+        launchagent_stop_error: Option<&'static str>,
+        launchagent_start_error: Option<&'static str>,
         spawn_pid: u32,
     }
 
@@ -514,8 +620,31 @@ mod tests {
                 sent_signals: RefCell::new(Vec::new()),
                 build_requests: RefCell::new(Vec::new()),
                 spawned_paths: RefCell::new(Vec::new()),
+                launchagent_status: LaunchAgentStatus {
+                    installed: false,
+                    loaded: false,
+                },
+                launchagent_status_calls: RefCell::new(0),
+                launchagent_events: RefCell::new(Vec::new()),
+                launchagent_stop_error: None,
+                launchagent_start_error: None,
                 spawn_pid: 42_424,
             }
+        }
+
+        fn with_launchagent_status(mut self, installed: bool, loaded: bool) -> Self {
+            self.launchagent_status = LaunchAgentStatus { installed, loaded };
+            self
+        }
+
+        fn with_launchagent_stop_error(mut self, error: &'static str) -> Self {
+            self.launchagent_stop_error = Some(error);
+            self
+        }
+
+        fn with_launchagent_start_error(mut self, error: &'static str) -> Self {
+            self.launchagent_start_error = Some(error);
+            self
         }
     }
 
@@ -551,6 +680,35 @@ mod tests {
                 .borrow_mut()
                 .push(executable.to_path_buf());
             Ok(self.spawn_pid)
+        }
+
+        fn launchagent_status(&self) -> LaunchAgentStatus {
+            *self.launchagent_status_calls.borrow_mut() += 1;
+            self.launchagent_status.clone()
+        }
+
+        fn stop_launchagent_service(&self) -> Result<(), LaunchAgentError> {
+            self.launchagent_events.borrow_mut().push("stop");
+            launchagent_result("bootout", self.launchagent_stop_error)
+        }
+
+        fn start_launchagent_service(&self) -> Result<(), LaunchAgentError> {
+            self.launchagent_events.borrow_mut().push("start");
+            launchagent_result("bootstrap", self.launchagent_start_error)
+        }
+    }
+
+    fn launchagent_result(
+        command: &str,
+        error: Option<&'static str>,
+    ) -> Result<(), LaunchAgentError> {
+        match error {
+            Some(stderr) => Err(LaunchAgentError::LaunchctlFailed {
+                command: command.to_string(),
+                stderr: stderr.to_string(),
+                exit_code: Some(1),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -670,6 +828,95 @@ mod tests {
     }
 
     #[test]
+    fn hard_restart_with_loaded_launchagent_restarts_service_without_pid_lookup() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = test_restart_config(&temp_dir);
+        write_pid_file(&config.pid_file, 9002).expect("write pid file");
+        let system = MockRestartSystem::new(Vec::new(), None).with_launchagent_status(true, true);
+
+        execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Hard,
+                no_skills: false,
+            },
+        )
+        .expect("hard restart");
+
+        assert!(system.sent_signals.borrow().is_empty());
+        assert!(system.spawned_paths.borrow().is_empty());
+        assert_eq!(*system.launchagent_status_calls.borrow(), 1);
+        assert_eq!(*system.launchagent_events.borrow(), vec!["stop", "start"]);
+        assert_eq!(
+            read_pid_file(&config.pid_file).expect("read pid file"),
+            None
+        );
+    }
+
+    #[test]
+    fn hard_restart_with_launchagent_stop_failure_falls_back_to_sigterm() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = test_restart_config(&temp_dir);
+        write_pid_file(&config.pid_file, 9005).expect("write pid file");
+        let system = MockRestartSystem::new(vec![true, false], None)
+            .with_launchagent_status(true, true)
+            .with_launchagent_stop_error("denied");
+
+        execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Hard,
+                no_skills: false,
+            },
+        )
+        .expect("hard restart");
+
+        assert_eq!(
+            *system.sent_signals.borrow(),
+            vec![(9005, RestartSignal::Terminate)]
+        );
+        assert_eq!(*system.launchagent_events.borrow(), vec!["stop", "start"]);
+        assert!(system.spawned_paths.borrow().is_empty());
+        assert_eq!(
+            read_pid_file(&config.pid_file).expect("read pid file"),
+            None
+        );
+    }
+
+    #[test]
+    fn hard_restart_with_launchagent_start_failure_falls_back_to_direct_spawn() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = test_restart_config(&temp_dir);
+        write_pid_file(&config.pid_file, 9007).expect("write pid file");
+        let system = MockRestartSystem::new(Vec::new(), None)
+            .with_launchagent_status(true, true)
+            .with_launchagent_start_error("denied");
+
+        execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Hard,
+                no_skills: false,
+            },
+        )
+        .expect("hard restart");
+
+        assert!(system.sent_signals.borrow().is_empty());
+        assert_eq!(
+            *system.spawned_paths.borrow(),
+            vec![config.current_exe.clone()]
+        );
+        assert_eq!(*system.launchagent_events.borrow(), vec!["stop", "start"]);
+        assert_eq!(
+            read_pid_file(&config.pid_file).expect("read pid file"),
+            None
+        );
+    }
+
+    #[test]
     fn hard_restart_sends_sigterm_waits_and_restarts() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = test_restart_config(&temp_dir);
@@ -693,6 +940,10 @@ mod tests {
         assert_eq!(
             *system.spawned_paths.borrow(),
             vec![config.current_exe.clone()]
+        );
+        assert_eq!(
+            read_pid_file(&config.pid_file).expect("read pid file"),
+            None
         );
     }
 
@@ -731,6 +982,39 @@ mod tests {
             vec![(repo_root.clone(), false)]
         );
         assert_eq!(*system.spawned_paths.borrow(), vec![release_binary]);
+    }
+
+    #[test]
+    fn rebuild_restart_with_loaded_launchagent_rebuilds_before_restart() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp_dir.path().join("repo");
+        let config = RestartConfig {
+            pid_file: temp_dir.path().join(PID_FILE_NAME),
+            current_exe: temp_dir.path().join("target").join("debug").join("fawx"),
+            repo_root: Some(repo_root.clone()),
+            stop_timeout: Duration::from_millis(1),
+        };
+        write_pid_file(&config.pid_file, 9006).expect("write pid file");
+        let system = MockRestartSystem::new(Vec::new(), None).with_launchagent_status(true, true);
+
+        execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Rebuild,
+                no_skills: true,
+            },
+        )
+        .expect("rebuild restart");
+
+        assert_eq!(*system.build_requests.borrow(), vec![(repo_root, true)]);
+        assert_eq!(*system.launchagent_events.borrow(), vec!["stop", "start"]);
+        assert!(system.sent_signals.borrow().is_empty());
+        assert!(system.spawned_paths.borrow().is_empty());
+        assert_eq!(
+            read_pid_file(&config.pid_file).expect("read pid file"),
+            None
+        );
     }
 
     #[test]

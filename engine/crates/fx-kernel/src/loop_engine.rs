@@ -4,27 +4,28 @@ use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{
     build_skip_mask, effective_max_depth, estimate_complexity, truncate_tool_result, ActionCost,
     AllocationMode, AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState,
-    BudgetTracker, DepthMode, DEFAULT_LLM_CALL_COST_CENTS, DEFAULT_TOOL_INVOCATION_COST_CENTS,
+    BudgetTracker, DepthMode, RetryPolicyConfig, DEFAULT_LLM_CALL_COST_CENTS,
+    DEFAULT_TOOL_INVOCATION_COST_CENTS,
 };
 use crate::cancellation::CancellationToken;
 use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
-use crate::continuation::Continuation;
+
 use crate::conversation_compactor::{
-    emergency_compact, estimate_text_tokens, has_prunable_blocks, prune_tool_blocks,
-    CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult, CompactionStrategy,
-    ConversationBudget, SlidingWindowCompactor,
+    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, has_prunable_blocks,
+    prune_tool_blocks, CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult,
+    CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
 };
-use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
+use crate::decide::Decision;
 use crate::input::{LoopCommand, LoopInputChannel};
-use crate::learn::Learning;
+
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
 use crate::streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
-use crate::verify::Verification;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use fx_core::message::{InternalMessage, StreamPhase};
@@ -301,8 +302,6 @@ pub enum LoopResult {
         iterations: u32,
         /// Total tokens consumed by this cycle.
         tokens_used: TokenUsage,
-        /// Learning artifacts produced across iterations.
-        learnings: Vec<Learning>,
         /// Signals emitted during the cycle.
         signals: Vec<Signal>,
     },
@@ -311,15 +310,6 @@ pub enum LoopResult {
         /// Optional best-effort partial response text.
         partial_response: Option<String>,
         /// Iterations completed before exhaustion.
-        iterations: u32,
-        /// Signals emitted during the cycle.
-        signals: Vec<Signal>,
-    },
-    /// Loop requires additional user input.
-    NeedsInput {
-        /// Prompt to present to user.
-        prompt: String,
-        /// Iterations completed before requesting input.
         iterations: u32,
         /// Signals emitted during the cycle.
         signals: Vec<Signal>,
@@ -349,7 +339,6 @@ impl LoopResult {
         match self {
             Self::Complete { signals, .. }
             | Self::BudgetExhausted { signals, .. }
-            | Self::NeedsInput { signals, .. }
             | Self::UserStopped { signals, .. }
             | Self::Error { signals, .. } => signals,
         }
@@ -365,7 +354,6 @@ impl LoopResult {
                     .clone()
                     .unwrap_or_else(|| "budget exhausted".to_string()),
             ),
-            Self::NeedsInput { prompt, .. } => Some(prompt.clone()),
             Self::UserStopped {
                 partial_response, ..
             } => Some(
@@ -454,9 +442,15 @@ pub struct LoopEngine {
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
     budget_low_signaled: bool,
-    /// Per-tool attempt counter for the current cycle.
-    /// Key: tool name, Value: number of attempts (including first call).
-    tool_attempts: HashMap<String, u8>,
+    /// Consecutive iterations that used tools without producing user-facing text.
+    /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
+    /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
+    consecutive_tool_only_turns: u16,
+    /// Latest reasoning input messages for graceful budget-exhausted synthesis.
+    /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
+    last_reasoning_messages: Vec<Message>,
+    /// Tool retry tracker for the current cycle.
+    tool_retry_tracker: ToolRetryTracker,
     /// Whether a successful `notify` tool call occurred during the current cycle.
     notify_called_this_cycle: bool,
     /// Whether this cycle currently has an active notification delivery channel.
@@ -472,10 +466,6 @@ pub struct LoopEngine {
     thinking_config: Option<fx_llm::ThinkingConfig>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
-    /// Whether the loop should check for yield requests between iterations.
-    yield_between_iterations: bool,
-    /// Pending yield handle — if set, the loop parks on this between iterations.
-    pending_yield: Option<crate::yield_primitive::YieldHandle>,
 }
 
 impl std::fmt::Debug for LoopEngine {
@@ -488,7 +478,11 @@ impl std::fmt::Debug for LoopEngine {
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
-            .field("tool_attempts", &self.tool_attempts)
+            .field(
+                "consecutive_tool_only_turns",
+                &self.consecutive_tool_only_turns,
+            )
+            .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
                 "notify_tool_guidance_enabled",
@@ -533,6 +527,164 @@ impl Drop for ErrorCallbackGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoProgressState {
+    last_result_hash: u64,
+    consecutive_same: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ToolRetryTracker {
+    signature_failures: HashMap<CallSignature, u16>,
+    cycle_total_failures: u16,
+    no_progress: HashMap<CallSignature, NoProgressState>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CallSignature {
+    tool_name: String,
+    args_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryVerdict {
+    Allow,
+    Block { reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct BlockedToolCall {
+    call: ToolCall,
+    reason: String,
+}
+
+impl ToolRetryTracker {
+    fn should_allow(&self, call: &ToolCall, config: &RetryPolicyConfig) -> RetryVerdict {
+        if self.cycle_total_failures >= config.max_cycle_failures {
+            return RetryVerdict::Block {
+                reason: cycle_failure_limit_reason(),
+            };
+        }
+
+        let failures = self.consecutive_failures_for(call);
+        if failures >= config.max_consecutive_failures {
+            return RetryVerdict::Block {
+                reason: same_call_failure_reason(failures),
+            };
+        }
+
+        let signature = CallSignature::from_call(call);
+        if let Some(state) = self.no_progress.get(&signature) {
+            if state.consecutive_same >= config.max_no_progress {
+                return RetryVerdict::Block {
+                    reason: no_progress_reason(&call.name, state.consecutive_same),
+                };
+            }
+        }
+
+        RetryVerdict::Allow
+    }
+
+    fn record_results(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let result_map: HashMap<&str, &ToolResult> = results
+            .iter()
+            .map(|r| (r.tool_call_id.as_str(), r))
+            .collect();
+        for call in calls {
+            if let Some(result) = result_map.get(call.id.as_str()) {
+                self.record_result(call, result.success);
+                if result.success {
+                    self.record_progress(call, &result.output);
+                }
+            }
+        }
+    }
+
+    fn record_progress(&mut self, call: &ToolCall, output: &str) {
+        let signature = CallSignature::from_call(call);
+        let result_hash = hash_string(output);
+        let entry = self
+            .no_progress
+            .entry(signature)
+            .or_insert(NoProgressState {
+                last_result_hash: result_hash,
+                consecutive_same: 0,
+            });
+        if entry.last_result_hash == result_hash {
+            entry.consecutive_same = entry.consecutive_same.saturating_add(1);
+        } else {
+            entry.last_result_hash = result_hash;
+            entry.consecutive_same = 1;
+        }
+    }
+
+    fn record_result(&mut self, call: &ToolCall, success: bool) {
+        let signature = CallSignature::from_call(call);
+        if success {
+            self.signature_failures.insert(signature, 0);
+            return;
+        }
+
+        let failures = self.signature_failures.entry(signature).or_insert(0);
+        *failures = failures.saturating_add(1);
+        self.cycle_total_failures = self.cycle_total_failures.saturating_add(1);
+    }
+
+    fn consecutive_failures_for(&self, call: &ToolCall) -> u16 {
+        self.signature_failures
+            .get(&CallSignature::from_call(call))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn clear(&mut self) {
+        self.signature_failures.clear();
+        self.cycle_total_failures = 0;
+        self.no_progress.clear();
+    }
+}
+
+impl CallSignature {
+    fn from_call(call: &ToolCall) -> Self {
+        Self {
+            tool_name: call.name.clone(),
+            args_hash: hash_tool_arguments(&call.arguments),
+        }
+    }
+}
+
+fn hash_tool_arguments(arguments: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let canonical = serde_json::to_string(arguments).unwrap_or_default();
+    canonical.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cycle_failure_limit_reason() -> String {
+    "too many total failures this cycle".to_string()
+}
+
+fn same_call_failure_reason(failures: u16) -> String {
+    format!("same call failed {failures} times consecutively")
+}
+
+fn no_progress_reason(tool_name: &str, count: u16) -> String {
+    format!(
+        "tool '{}' returned the same result {} times with identical arguments \
+         — no progress detected",
+        tool_name, count
+    )
+}
+
+fn hash_string(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Default)]
 #[must_use = "builder does nothing unless .build() is called"]
 pub struct LoopEngineBuilder {
@@ -554,7 +706,6 @@ pub struct LoopEngineBuilder {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
-    yield_between_iterations: bool,
 }
 
 impl std::fmt::Debug for LoopEngineBuilder {
@@ -691,13 +842,6 @@ impl LoopEngineBuilder {
         self
     }
 
-    /// Enable yielding between iterations. When enabled, the loop checks
-    /// for pending yield requests after each iteration and parks until woken.
-    pub fn yield_between_iterations(mut self, enabled: bool) -> Self {
-        self.yield_between_iterations = enabled;
-        self
-    }
-
     pub fn build(self) -> Result<LoopEngine, LoopError> {
         let budget = required_builder_field(self.budget, "budget")?;
         let context = required_builder_field(self.context, "context")?;
@@ -732,7 +876,9 @@ impl LoopEngineBuilder {
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
-            tool_attempts: HashMap::new(),
+            consecutive_tool_only_turns: 0,
+            last_reasoning_messages: Vec::new(),
+            tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
             notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
@@ -741,8 +887,6 @@ impl LoopEngineBuilder {
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
-            yield_between_iterations: self.yield_between_iterations,
-            pending_yield: None,
         })
     }
 }
@@ -891,22 +1035,7 @@ fn default_session_memory() -> Arc<Mutex<SessionMemory>> {
 
 #[derive(Debug, Default, Clone)]
 struct CycleState {
-    learnings: Vec<Learning>,
     tokens: TokenUsage,
-    partial_response: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct IterationOutcome {
-    response_text: String,
-    continuation: Continuation,
-    learning: Learning,
-}
-
-#[derive(Debug, Clone)]
-enum IterationStep {
-    Progress(IterationOutcome),
-    Terminal(LoopResult),
 }
 
 #[derive(Debug, Clone)]
@@ -1117,10 +1246,9 @@ understands what present-you built. Write what you wish past-you had left behind
 const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
 Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
-
-const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
-const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
-const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
+const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
+const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
+const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
 
 impl LoopEngine {
     /// Create a loop engine builder.
@@ -1141,22 +1269,6 @@ impl LoopEngine {
     /// Attach a user-input channel for bare-word commands.
     pub fn set_input_channel(&mut self, channel: LoopInputChannel) {
         self.input_channel = Some(channel);
-    }
-
-    /// Set a pending yield handle. The loop will park on this between iterations.
-    pub fn set_pending_yield(&mut self, handle: crate::yield_primitive::YieldHandle) {
-        self.pending_yield = Some(handle);
-    }
-
-    /// Check and consume any pending yield. Returns the wake reason if yielded.
-    async fn check_yield_between_iterations(
-        &mut self,
-    ) -> Option<crate::yield_primitive::WakeReason> {
-        if !self.yield_between_iterations {
-            return None;
-        }
-        let handle = self.pending_yield.take()?;
-        Some(handle.wait().await)
     }
 
     pub fn set_synthesis_instruction(&mut self, instruction: String) -> Result<(), LoopError> {
@@ -1356,7 +1468,7 @@ impl LoopEngine {
 
     async fn run_cycle_streaming_inner(
         &mut self,
-        mut perception: PerceptionSnapshot,
+        perception: PerceptionSnapshot,
         llm: &dyn LlmProvider,
         stream_callback: Option<&StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
@@ -1365,47 +1477,104 @@ impl LoopEngine {
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
-        while self.iteration_count < self.max_iterations {
-            self.iteration_count = self.iteration_count.saturating_add(1);
-            self.refresh_iteration_state();
-            match self
-                .execute_iteration(&perception, llm, &mut state, stream)
-                .await?
-            {
-                IterationStep::Terminal(result) => {
-                    return Ok(self.finish_streaming_result(result, stream))
-                }
-                IterationStep::Progress(outcome) => {
-                    if let Some(result) =
-                        self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
-                    {
-                        return Ok(self.finish_streaming_result(result, stream));
-                    }
+        // Single pass — all tool chaining happens inside act_with_tools.
+        self.iteration_count = 1;
+        self.refresh_iteration_state();
 
-                    // Yield between iterations if configured and requested
-                    if let Some(reason) = self.check_yield_between_iterations().await {
-                        use crate::yield_primitive::WakeReason;
-                        match reason {
-                            WakeReason::Cancelled | WakeReason::Timeout => {
-                                return Ok(self.finish_streaming_result(
-                                    LoopResult::UserStopped {
-                                        partial_response: state.partial_response.clone(),
-                                        iterations: self.iteration_count,
-                                        signals: Vec::new(),
-                                    },
-                                    stream,
-                                ));
-                            }
-                            _ => {
-                                // UserMessage, TimerFired, Signal, etc. — continue loop
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(result) = self.budget_terminal(ActionCost::default(), None) {
+            return Ok(self.finish_streaming_result(result, stream));
+        }
+        if let Some(result) = self.check_cancellation(None) {
+            return Ok(self.finish_streaming_result(result, stream));
         }
 
-        Ok(self.finish_streaming_result(self.safety_limit_result(), stream))
+        stream.phase(Phase::Perceive);
+        let processed = self.perceive(&perception).await?;
+        let reason_cost = self.estimate_reasoning_cost(&processed);
+        if let Some(result) = self.budget_terminal(reason_cost, None) {
+            return Ok(self.finish_streaming_result(result, stream));
+        }
+
+        stream.phase(Phase::Reason);
+        let response = self.reason(&processed, llm, stream).await?;
+        self.record_reasoning_cost(reason_cost, &mut state);
+
+        let decision = self.decide(&response).await?;
+        if let Some(result) = self.budget_terminal(self.estimate_action_cost(&decision), None) {
+            return Ok(self.finish_streaming_result(result, stream));
+        }
+
+        stream.phase(Phase::Act);
+        let action = self
+            .act(&decision, llm, &processed.context_window, stream)
+            .await?;
+
+        // Budget accounting for non-tool actions.
+        if action.tool_results.is_empty() {
+            let action_cost = self.action_cost_from_result(&action);
+            if let Some(result) =
+                self.budget_terminal(action_cost, Some(action.response_text.clone()))
+            {
+                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            }
+            self.budget.record(&action_cost);
+        } else if let Some(result) =
+            self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
+        {
+            return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+        }
+
+        state.tokens.accumulate(action.tokens_used);
+        self.update_tool_only_turns(&action);
+
+        if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
+            return Ok(self.finish_streaming_result(result, stream));
+        }
+
+        self.emit_action_observations(&action);
+
+        Ok(self.finish_streaming_result(
+            LoopResult::Complete {
+                response: action.response_text,
+                iterations: self.iteration_count,
+                tokens_used: state.tokens,
+                signals: Vec::new(),
+            },
+            stream,
+        ))
+    }
+
+    /// Handle BudgetExhausted results with optional forced synthesis.
+    async fn finish_budget_exhausted(
+        &mut self,
+        result: LoopResult,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+    ) -> LoopResult {
+        let result = match result {
+            LoopResult::BudgetExhausted {
+                partial_response,
+                iterations,
+                signals,
+            } => {
+                let synthesized = if self.budget.config().termination.synthesize_on_exhaustion {
+                    let reasoning_messages = std::mem::take(&mut self.last_reasoning_messages);
+                    self.forced_synthesis_turn(llm, &reasoning_messages).await
+                } else {
+                    None
+                };
+                LoopResult::BudgetExhausted {
+                    partial_response: Some(Self::resolve_budget_exhausted_response(
+                        synthesized,
+                        partial_response,
+                    )),
+                    iterations,
+                    signals,
+                }
+            }
+            other => other,
+        };
+        self.finish_streaming_result(result, stream)
     }
 
     fn finish_streaming_result(
@@ -1430,39 +1599,6 @@ impl LoopEngine {
             NOTIFICATION_DEFAULT_TITLE,
             format!("Task complete ({iterations} steps)"),
         );
-    }
-
-    fn safety_limit_result(&self) -> LoopResult {
-        LoopResult::Error {
-            message: format!(
-                "Loop reached safety limit of {} iterations without completion.",
-                self.max_iterations
-            ),
-            recoverable: true,
-            signals: Vec::new(),
-        }
-    }
-
-    fn apply_iteration_outcome(
-        &mut self,
-        outcome: IterationOutcome,
-        perception: &mut PerceptionSnapshot,
-        state: &mut CycleState,
-        stream: CycleStream<'_>,
-    ) -> Option<LoopResult> {
-        let IterationOutcome {
-            response_text,
-            continuation,
-            learning,
-        } = outcome;
-        self.handle_continuation(
-            continuation,
-            response_text,
-            learning,
-            perception,
-            state,
-            stream,
-        )
     }
 
     /// Drain the input channel and return the highest-priority flow command.
@@ -1502,40 +1638,40 @@ impl LoopEngine {
     }
 
     /// Check both the cancellation token and input channel.
-    fn check_cancellation(&mut self, partial: Option<String>) -> Option<IterationStep> {
+    fn check_cancellation(&mut self, partial: Option<String>) -> Option<LoopResult> {
         if self.user_stop_requested {
             self.user_stop_requested = false;
-            return Some(self.user_stopped_step(partial, "user stopped", "input_channel"));
+            return Some(self.user_stopped_result(partial, "user stopped", "input_channel"));
         }
 
         if self.cancellation_token_triggered() {
-            return Some(self.user_stopped_step(partial, "user cancelled", "cancellation_token"));
+            return Some(self.user_stopped_result(partial, "user cancelled", "cancellation_token"));
         }
 
         if self.consume_stop_or_abort_command() {
-            return Some(self.user_stopped_step(partial, "user stopped", "input_channel"));
+            return Some(self.user_stopped_result(partial, "user stopped", "input_channel"));
         }
 
         None
     }
 
-    fn user_stopped_step(
+    fn user_stopped_result(
         &mut self,
         partial: Option<String>,
         message: &str,
         source: &str,
-    ) -> IterationStep {
+    ) -> LoopResult {
         self.emit_signal(
             LoopStep::Act,
             SignalKind::Blocked,
             message,
             serde_json::json!({ "source": source }),
         );
-        IterationStep::Terminal(LoopResult::UserStopped {
+        LoopResult::UserStopped {
             partial_response: partial,
             iterations: self.iteration_count,
             signals: Vec::new(),
-        })
+        }
     }
 
     fn consume_stop_or_abort_command(&mut self) -> bool {
@@ -1555,7 +1691,9 @@ impl LoopEngine {
         self.user_stop_requested = false;
         self.pending_steer = None;
         self.budget_low_signaled = false;
-        self.tool_attempts.clear();
+        self.consecutive_tool_only_turns = 0;
+        self.last_reasoning_messages.clear();
+        self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
         if let Some(token) = &self.cancel_token {
@@ -1564,91 +1702,12 @@ impl LoopEngine {
         self.tool_executor.clear_cache();
     }
 
-    async fn execute_iteration(
-        &mut self,
-        perception: &PerceptionSnapshot,
-        llm: &dyn LlmProvider,
-        state: &mut CycleState,
-        stream: CycleStream<'_>,
-    ) -> Result<IterationStep, LoopError> {
-        if let Some(step) =
-            self.budget_terminal(ActionCost::default(), state.partial_response.clone())
-        {
-            return Ok(step);
+    fn update_tool_only_turns(&mut self, action: &ActionResult) {
+        if !action.tool_results.is_empty() && action.response_text.trim().is_empty() {
+            self.consecutive_tool_only_turns = self.consecutive_tool_only_turns.saturating_add(1);
+        } else if !action.response_text.trim().is_empty() {
+            self.consecutive_tool_only_turns = 0;
         }
-
-        if let Some(step) = self.check_cancellation(state.partial_response.clone()) {
-            return Ok(step);
-        }
-
-        stream.phase(Phase::Perceive);
-        let processed = self.perceive(perception).await?;
-        let reason_cost = self.estimate_reasoning_cost(&processed);
-        if let Some(step) = self.budget_terminal(reason_cost, state.partial_response.clone()) {
-            return Ok(step);
-        }
-
-        stream.phase(Phase::Reason);
-        let response = self.reason(&processed, llm, stream).await?;
-        self.record_reasoning_cost(reason_cost, state);
-
-        let decision = self.decide(&response).await?;
-        if let Some(step) = self.budget_terminal(
-            self.estimate_action_cost(&decision),
-            state.partial_response.clone(),
-        ) {
-            return Ok(step);
-        }
-
-        stream.phase(Phase::Act);
-        self.execute_action_and_finalize(&decision, llm, state, &processed.context_window, stream)
-            .await
-    }
-
-    async fn execute_action_and_finalize(
-        &mut self,
-        decision: &Decision,
-        llm: &dyn LlmProvider,
-        state: &mut CycleState,
-        context_messages: &[Message],
-        stream: CycleStream<'_>,
-    ) -> Result<IterationStep, LoopError> {
-        let action = self.act(decision, llm, context_messages, stream).await?;
-
-        // Tool actions record costs incrementally inside act_with_tools().
-        // Non-tool actions need their costs recorded here.
-        if action.tool_results.is_empty() {
-            let action_cost = self.action_cost_from_result(&action);
-            if let Some(step) =
-                self.budget_terminal(action_cost, Some(action.response_text.clone()))
-            {
-                return Ok(step);
-            }
-            self.budget.record(&action_cost);
-        } else if let Some(step) =
-            self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
-        {
-            return Ok(step);
-        }
-
-        state.tokens.accumulate(action.tokens_used);
-        state.partial_response = Some(action.response_text.clone());
-
-        if let Some(step) = self.check_cancellation(state.partial_response.clone()) {
-            return Ok(step);
-        }
-
-        let verification = self.verify(&action).await?;
-        let learning = self.learn(&verification).await?;
-        let continuation = self
-            .should_continue(&action.decision, &verification, &learning)
-            .await?;
-
-        Ok(IterationStep::Progress(IterationOutcome {
-            response_text: action.response_text,
-            continuation,
-            learning,
-        }))
     }
 
     fn record_reasoning_cost(&mut self, reason_cost: ActionCost, state: &mut CycleState) {
@@ -1662,22 +1721,13 @@ impl LoopEngine {
         &mut self,
         cost: ActionCost,
         partial_response: Option<String>,
-    ) -> Option<IterationStep> {
-        self.handle_budget_check(cost, partial_response)
-            .map(IterationStep::Terminal)
-    }
-
-    fn handle_budget_check(
-        &mut self,
-        cost: ActionCost,
-        partial_response: Option<String>,
     ) -> Option<LoopResult> {
         if self.budget.check_at(current_time_ms(), &cost).is_ok() {
             return None;
         }
 
         self.emit_signal(
-            LoopStep::Continue,
+            LoopStep::Act,
             SignalKind::Blocked,
             "budget exhausted",
             serde_json::json!({"iterations": self.iteration_count}),
@@ -1690,34 +1740,83 @@ impl LoopEngine {
         })
     }
 
-    fn handle_continuation(
-        &mut self,
-        continuation: Continuation,
-        response_text: String,
-        learning: Learning,
-        perception: &mut PerceptionSnapshot,
-        state: &mut CycleState,
-        _stream: CycleStream<'_>,
-    ) -> Option<LoopResult> {
-        state.learnings.push(learning);
-        match continuation {
-            Continuation::Complete => Some(LoopResult::Complete {
-                response: response_text,
-                iterations: self.iteration_count,
-                tokens_used: state.tokens,
-                learnings: state.learnings.clone(),
-                signals: Vec::new(),
-            }),
-            Continuation::NeedsInput(prompt) => Some(LoopResult::NeedsInput {
-                prompt,
-                iterations: self.iteration_count,
-                signals: Vec::new(),
-            }),
-            Continuation::Continue(sub_goal) => {
-                *perception = next_perception_from_sub_goal(perception, &sub_goal);
+    /// Make one final LLM call with tools stripped to synthesize findings.
+    async fn forced_synthesis_turn(
+        &self,
+        llm: &dyn LlmProvider,
+        messages: &[Message],
+    ) -> Option<String> {
+        if !self.budget.config().termination.synthesize_on_exhaustion {
+            tracing::debug!("skipping forced synthesis: synthesize_on_exhaustion disabled");
+            return None;
+        }
+
+        let mut synthesis_messages = messages.to_vec();
+        synthesis_messages.push(Message::system(
+            BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE.to_string(),
+        ));
+
+        let request = CompletionRequest {
+            model: llm.model_name().to_string(),
+            messages: synthesis_messages,
+            tools: vec![],
+            temperature: Some(0.3),
+            max_tokens: Some(2048),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let remaining_wall_ms = self
+            .budget
+            .remaining(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            )
+            .wall_time_ms;
+        let timeout_ms = remaining_wall_ms.min(30_000).saturating_sub(2_000);
+        if timeout_ms == 0 {
+            tracing::warn!("skipping forced synthesis: insufficient wall time remaining");
+            return None;
+        }
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        match tokio::time::timeout(timeout, llm.complete(request)).await {
+            Ok(Ok(response)) => {
+                let text: String = response
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("forced synthesis turn failed: {e}");
+                None
+            }
+            Err(_elapsed) => {
+                tracing::warn!("forced synthesis turn timed out after {timeout_ms}ms");
                 None
             }
         }
+    }
+
+    fn resolve_budget_exhausted_response(
+        synthesized: Option<String>,
+        partial_response: Option<String>,
+    ) -> String {
+        synthesized
+            .or_else(|| partial_response.filter(|text| !text.trim().is_empty()))
+            .unwrap_or_else(|| BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string())
     }
 
     /// Perceive step.
@@ -1773,7 +1872,12 @@ impl LoopEngine {
             context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
         }
 
-        Ok(ProcessedPerception {
+        let nudge_at = self.budget.config().termination.nudge_after_tool_turns;
+        if nudge_at > 0 && self.consecutive_tool_only_turns >= nudge_at {
+            context_window.push(Message::system(TOOL_ONLY_TURN_NUDGE.to_string()));
+        }
+
+        let processed = ProcessedPerception {
             user_message: user_message.clone(),
             images: snapshot_with_steer
                 .user_input
@@ -1784,7 +1888,10 @@ impl LoopEngine {
             active_goals: vec![format!("Help the user with: {user_message}")],
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
-        })
+        };
+        self.last_reasoning_messages = build_reasoning_messages(&processed);
+
+        Ok(processed)
     }
 
     /// Reason step.
@@ -1794,10 +1901,25 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
+        let tc = &self.budget.config().termination;
+        let should_strip_tools = tc.nudge_after_tool_turns > 0
+            && self.consecutive_tool_only_turns
+                >= tc
+                    .nudge_after_tool_turns
+                    .saturating_add(tc.strip_tools_after_nudge);
+        let tools = if should_strip_tools {
+            tracing::info!(
+                turns = self.consecutive_tool_only_turns,
+                "stripping tools: agent exceeded nudge + grace threshold"
+            );
+            vec![]
+        } else {
+            self.tool_executor.tool_definitions()
+        };
         let request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
-            self.tool_executor.tool_definitions(),
+            tools,
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
@@ -2640,7 +2762,11 @@ impl LoopEngine {
             max_tool_result_bytes: template.max_tool_result_bytes,
             max_aggregate_result_bytes: template.max_aggregate_result_bytes,
             max_synthesis_tokens: template.max_synthesis_tokens,
+            max_consecutive_failures: template.max_consecutive_failures,
+            max_cycle_failures: template.max_cycle_failures,
+            max_no_progress: template.max_no_progress,
             max_tool_retries: template.max_tool_retries,
+            termination: template.termination.clone(),
         }
     }
 
@@ -2707,117 +2833,6 @@ impl LoopEngine {
         for signal in signals {
             self.signals.emit(signal.clone());
         }
-    }
-
-    /// Verify step.
-    async fn verify(&mut self, action: &ActionResult) -> Result<Verification, LoopError> {
-        let mut discrepancies = Vec::new();
-        let has_tool_failure = action.tool_results.iter().any(|result| !result.success);
-        let has_response = !action.response_text.trim().is_empty();
-
-        // Tool errors are informational when synthesis already produced a response.
-        // The synthesis prompt includes the error and the error relay instruction
-        // guides the LLM to surface it directly. Retrying blindly produces worse
-        // results because the continuation message confuses the model.
-        if has_tool_failure && !has_response {
-            discrepancies.push("tool calls failed and produced no response".to_string());
-        }
-
-        if !has_response && !has_tool_failure {
-            discrepancies.push("action produced an empty response".to_string());
-        }
-
-        // Detect safe fallback responses — the model returned no tool calls
-        // and produced empty/unparseable text that was replaced by the fallback.
-        // This triggers a retry with a tool-directive continuation message.
-        if action.response_text == SAFE_FALLBACK_RESPONSE && action.tool_results.is_empty() {
-            discrepancies.push(
-                "model produced fallback instead of using tools or giving a substantive answer"
-                    .to_string(),
-            );
-        }
-
-        let verification = build_verification(discrepancies);
-        self.emit_verification_signals(&verification);
-        Ok(verification)
-    }
-
-    /// Learn step.
-    async fn learn(&mut self, verification: &Verification) -> Result<Learning, LoopError> {
-        let episode = if verification.outcome_satisfactory {
-            "Action completed satisfactorily.".to_string()
-        } else {
-            format!(
-                "Verification found discrepancies: {}",
-                verification.discrepancies.join("; ")
-            )
-        };
-
-        let pattern = if verification.outcome_satisfactory {
-            None
-        } else {
-            Some("mismatch_between_intended_and_observed_outcome".to_string())
-        };
-
-        let adjustment = if verification.outcome_satisfactory {
-            None
-        } else {
-            Some("ask_for_clarification_or_refine_reasoning_prompt".to_string())
-        };
-
-        Ok(Learning {
-            episode,
-            pattern,
-            adjustment,
-        })
-    }
-
-    /// Continue step.
-    async fn should_continue(
-        &mut self,
-        decision: &Decision,
-        verification: &Verification,
-        _learning: &Learning,
-    ) -> Result<Continuation, LoopError> {
-        // Note: Clarify and Defer are not produced by decide() in the current
-        // loop engine flow, but are kept for external callers (Decision is pub).
-        if let Decision::Clarify(prompt) | Decision::Defer(prompt) = decision {
-            let continuation = Continuation::NeedsInput(prompt.clone());
-            self.emit_continue_signal(&continuation);
-            return Ok(continuation);
-        }
-
-        if verification.outcome_satisfactory {
-            let continuation = Continuation::Complete;
-            self.emit_continue_signal(&continuation);
-            return Ok(continuation);
-        }
-
-        // Post-Phase-2: CONFIDENCE_CLARIFY_THRESHOLD gates whether a
-        // low-confidence verification triggers a user-facing clarification
-        // request. This keeps the verify→continue safety net independent
-        // of the removed ReasonedIntent confidence gates.
-        if verification.confidence < CONFIDENCE_CLARIFY_THRESHOLD {
-            let continuation = Continuation::NeedsInput(
-                "I need a bit more detail to continue safely. Could you clarify your goal?"
-                    .to_string(),
-            );
-            self.emit_continue_signal(&continuation);
-            return Ok(continuation);
-        }
-
-        // When the model produced a safe fallback (no tools, no real response),
-        // retry with a tool-directive message to nudge toward tool use.
-        let is_fallback =
-            matches!(decision, Decision::Respond(text) if text == SAFE_FALLBACK_RESPONSE);
-        let message = if is_fallback {
-            "The previous attempt did not use tools. The user's question likely requires gathering information. Use the available tools (read_file, list_directory, search_text, etc.) to find the answer instead of responding with text alone."
-        } else {
-            "The previous attempt produced no response. Try a different approach to answer the user's question."
-        };
-        let continuation = Continuation::Continue(message.to_string());
-        self.emit_continue_signal(&continuation);
-        Ok(continuation)
     }
 
     fn emit_reason_trace_and_perf(&mut self, latency_ms: u64, usage: Option<&fx_llm::Usage>) {
@@ -2974,33 +2989,46 @@ impl LoopEngine {
         });
     }
 
-    fn emit_verification_signals(&mut self, verification: &Verification) {
-        self.emit_signal(
-            LoopStep::Verify,
-            SignalKind::Decision,
-            "verification evaluated",
-            serde_json::json!({
-                "outcome_satisfactory": verification.outcome_satisfactory,
-                "confidence": verification.confidence,
-            }),
-        );
-        if !verification.discrepancies.is_empty() {
+    /// Emit observability signals summarizing the action result.
+    fn emit_action_observations(&mut self, action: &ActionResult) {
+        let has_tool_failure = action.tool_results.iter().any(|r| !r.success);
+        let has_response = !action.response_text.trim().is_empty()
+            && action.response_text != SAFE_FALLBACK_RESPONSE;
+        let has_tools = !action.tool_results.is_empty();
+
+        if has_tool_failure && has_response {
+            let failed: Vec<&str> = action
+                .tool_results
+                .iter()
+                .filter(|r| !r.success)
+                .map(|r| r.tool_name.as_str())
+                .collect();
             self.emit_signal(
-                LoopStep::Verify,
-                SignalKind::Friction,
-                "verification discrepancy found",
-                serde_json::json!({"discrepancies": verification.discrepancies}),
+                LoopStep::Act,
+                SignalKind::Observation,
+                "tool_failure_with_response",
+                serde_json::json!({
+                    "failed_tools": failed,
+                    "response_len": action.response_text.len(),
+                }),
             );
         }
-    }
-
-    fn emit_continue_signal(&mut self, continuation: &Continuation) {
-        self.emit_signal(
-            LoopStep::Continue,
-            SignalKind::Decision,
-            "continuation decided",
-            serde_json::json!({"continuation": continuation_label(continuation)}),
-        );
+        if !has_response && !has_tools {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Observation,
+                "empty_response",
+                serde_json::json!({}),
+            );
+        }
+        if has_tools && !has_response {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Observation,
+                "tool_only_turn",
+                serde_json::json!({"tool_count": action.tool_results.len()}),
+            );
+        }
     }
 
     fn compaction_cooldown_active(
@@ -3320,6 +3348,7 @@ impl LoopEngine {
             }
             Some(CompactionTier::Prune) | None => current,
         };
+        debug_assert_tool_pair_integrity(current.as_ref());
         self.ensure_within_hard_limit(scope, current.as_ref())?;
         Ok(current)
     }
@@ -3724,6 +3753,7 @@ impl LoopEngine {
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
+        self.last_reasoning_messages = state.continuation_messages.clone();
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
@@ -3772,41 +3802,35 @@ impl LoopEngine {
         calls: &[ToolCall],
         stream: CycleStream<'_>,
     ) -> Result<Vec<ToolResult>, LoopError> {
-        let max_retries = self.budget.config().max_tool_retries;
-        let max_attempts = u16::from(max_retries).saturating_add(1);
+        let retry_policy = self.budget.config().retry_policy();
         let (allowed, blocked) =
-            partition_by_retry_budget(calls, &mut self.tool_attempts, max_attempts);
+            partition_by_retry_policy(calls, &self.tool_retry_tracker, &retry_policy);
 
-        self.emit_blocked_tool_errors(&blocked, max_retries, stream);
+        self.emit_blocked_tool_errors(&blocked, stream);
         let mut results = self.execute_allowed_tool_calls(&allowed, stream).await?;
-        results.extend(build_blocked_tool_results(&blocked, max_retries));
+        self.tool_retry_tracker.record_results(&allowed, &results);
+        results.extend(build_blocked_tool_results(&blocked));
         Ok(reorder_results_by_calls(calls, results))
     }
 
-    fn emit_blocked_tool_errors(
-        &mut self,
-        blocked: &[ToolCall],
-        max_retries: u8,
-        stream: CycleStream<'_>,
-    ) {
-        for call in blocked {
-            let attempts = self.tool_attempts.get(&call.name).copied().unwrap_or(0);
+    fn emit_blocked_tool_errors(&mut self, blocked: &[BlockedToolCall], stream: CycleStream<'_>) {
+        for blocked_call in blocked {
+            let call = &blocked_call.call;
+            let signature_failures = self.tool_retry_tracker.consecutive_failures_for(call);
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Blocked,
-                format!(
-                    "tool '{}' blocked: exceeded {} retries this cycle",
-                    call.name, max_retries
-                ),
+                format!("tool '{}' blocked: {}", call.name, blocked_call.reason),
                 serde_json::json!({
                     "tool": call.name,
-                    "attempts": attempts,
-                    "max_retries": max_retries,
+                    "reason": blocked_call.reason,
+                    "signature_failures": signature_failures,
+                    "cycle_total_failures": self.tool_retry_tracker.cycle_total_failures,
                 }),
             );
             stream.emit_error(
                 ErrorCategory::ToolExecution,
-                blocked_tool_message(&call.name, max_retries),
+                blocked_tool_message(&call.name, &blocked_call.reason),
                 true,
             );
         }
@@ -3821,10 +3845,35 @@ impl LoopEngine {
             return Ok(Vec::new());
         }
 
+        // Pre-flight: detect malformed tool arguments from parse-failure fallback.
+        let mut malformed_results: Vec<ToolResult> = Vec::new();
+        let valid: Vec<ToolCall> = allowed
+            .iter()
+            .filter(|call| {
+                if call.arguments.get("__fawx_raw_args").is_some() {
+                    tracing::warn!(
+                        tool = %call.name,
+                        "skipping tool call with malformed arguments"
+                    );
+                    malformed_results.push(ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: false,
+                        output: "Tool call failed: arguments could not be parsed as valid JSON"
+                            .into(),
+                    });
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
         let max_bytes = self.budget.config().max_tool_result_bytes;
         let executed = self
             .tool_executor
-            .execute_tools(allowed, self.cancel_token.as_ref())
+            .execute_tools(&valid, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
                 stream.emit_error(
@@ -3838,7 +3887,9 @@ impl LoopEngine {
                     error.recoverable,
                 )
             })?;
-        Ok(truncate_tool_results(executed, max_bytes))
+        let mut results = truncate_tool_results(executed, max_bytes);
+        results.append(&mut malformed_results);
+        Ok(results)
     }
 
     async fn request_tool_continuation(
@@ -4112,12 +4163,6 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
         LoopResult::Error {
             message, signals, ..
         } => failed_sub_goal_result_with_signals(goal, message, signals),
-        LoopResult::NeedsInput {
-            prompt, signals, ..
-        } => {
-            let message = format!("sub-goal needs user input: {prompt}");
-            failed_sub_goal_result_with_signals(goal, message, signals)
-        }
         LoopResult::UserStopped { signals, .. } => {
             let message = "sub-goal stopped before completion".to_string();
             failed_sub_goal_result_with_signals(goal, message, signals)
@@ -4296,27 +4341,17 @@ fn decision_variant(decision: &Decision) -> &'static str {
     }
 }
 
-fn continuation_label(continuation: &Continuation) -> &'static str {
-    match continuation {
-        Continuation::Complete => "complete",
-        Continuation::NeedsInput(_) => "needs_input",
-        Continuation::Continue(_) => "continue",
-    }
-}
-
 fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
     match result {
         LoopResult::Complete {
             response,
             iterations,
             tokens_used,
-            learnings,
             ..
         } => LoopResult::Complete {
             response,
             iterations,
             tokens_used,
-            learnings,
             signals,
         },
         LoopResult::BudgetExhausted {
@@ -4325,13 +4360,6 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             ..
         } => LoopResult::BudgetExhausted {
             partial_response,
-            iterations,
-            signals,
-        },
-        LoopResult::NeedsInput {
-            prompt, iterations, ..
-        } => LoopResult::NeedsInput {
-            prompt,
             iterations,
             signals,
         },
@@ -4460,33 +4488,30 @@ fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usiz
     }
 }
 
-/// Partition tool calls into allowed and blocked based on per-tool retry budget.
-///
-/// Increments `tool_attempts` for each allowed call. Calls whose tool name
-/// has already reached `max_attempts` are placed in the blocked list.
-fn partition_by_retry_budget(
+/// Partition tool calls into allowed and blocked based on the smart retry policy.
+fn partition_by_retry_policy(
     calls: &[ToolCall],
-    tool_attempts: &mut HashMap<String, u8>,
-    max_attempts: u16,
-) -> (Vec<ToolCall>, Vec<ToolCall>) {
+    tracker: &ToolRetryTracker,
+    config: &RetryPolicyConfig,
+) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
     let mut allowed = Vec::new();
     let mut blocked = Vec::new();
     for call in calls {
-        let count = tool_attempts.entry(call.name.clone()).or_insert(0);
-        if u16::from(*count) < max_attempts {
-            *count = count.saturating_add(1);
-            allowed.push(call.clone());
-        } else {
-            blocked.push(call.clone());
+        match tracker.should_allow(call, config) {
+            RetryVerdict::Allow => allowed.push(call.clone()),
+            RetryVerdict::Block { reason } => blocked.push(BlockedToolCall {
+                call: call.clone(),
+                reason,
+            }),
         }
     }
     (allowed, blocked)
 }
 
-fn blocked_tool_message(tool_name: &str, max_retries: u8) -> String {
+fn blocked_tool_message(tool_name: &str, reason: &str) -> String {
     format!(
-        "Tool '{}' blocked: exceeded {} retries this cycle. Try a different approach.",
-        tool_name, max_retries
+        "Tool '{}' blocked: {}. Try a different approach.",
+        tool_name, reason
     )
 }
 
@@ -4505,14 +4530,14 @@ fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> St
 }
 
 /// Build synthetic failure results for blocked tool calls.
-fn build_blocked_tool_results(blocked: &[ToolCall], max_retries: u8) -> Vec<ToolResult> {
+fn build_blocked_tool_results(blocked: &[BlockedToolCall]) -> Vec<ToolResult> {
     blocked
         .iter()
-        .map(|call| ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
+        .map(|blocked_call| ToolResult {
+            tool_call_id: blocked_call.call.id.clone(),
+            tool_name: blocked_call.call.name.clone(),
             success: false,
-            output: blocked_tool_message(&call.name, max_retries),
+            output: blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
         })
         .collect()
 }
@@ -5286,44 +5311,11 @@ fn response_usage_or_estimate(
     }
 }
 
-fn build_verification(discrepancies: Vec<String>) -> Verification {
-    let confidence = if discrepancies.is_empty() {
-        VERIFICATION_CONFIDENCE_CLEAN
-    } else if discrepancies.len() == 1 {
-        VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY
-    } else {
-        VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES
-    };
-
-    Verification {
-        outcome_satisfactory: discrepancies.is_empty(),
-        confidence,
-        discrepancies,
-    }
-}
-
 fn reasoning_token_usage(total_tokens: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: total_tokens.saturating_mul(3) / 5,
         output_tokens: total_tokens.saturating_mul(2) / 5,
     }
-}
-
-fn next_perception_from_sub_goal(
-    previous: &PerceptionSnapshot,
-    sub_goal: &str,
-) -> PerceptionSnapshot {
-    let timestamp_ms = previous.timestamp_ms.saturating_add(1);
-    let mut next = previous.clone();
-    next.timestamp_ms = timestamp_ms;
-    next.user_input = Some(UserInput {
-        text: sub_goal.to_string(),
-        source: InputSource::Text,
-        timestamp: timestamp_ms,
-        context_id: Some("loop-continuation".to_string()),
-        images: Vec::new(),
-    });
-    next
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -5404,9 +5396,13 @@ fn build_reasoning_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let context = perception.context_window.clone();
-    let user_prompt = reasoning_user_prompt(perception);
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    // When tools are explicitly empty (e.g., stripped for tool-only turn enforcement),
+    // skip adding the decompose tool — the intent is to force a text-only response.
+    let tools = if tool_definitions.is_empty() {
+        vec![]
+    } else {
+        tool_definitions_with_decompose(tool_definitions)
+    };
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -5415,17 +5411,22 @@ fn build_reasoning_request_with_notify_guidance(
 
     CompletionRequest {
         model: model.to_string(),
-        messages: [
-            context,
-            vec![build_processed_perception_message(perception, &user_prompt)],
-        ]
-        .concat(),
+        messages: build_reasoning_messages(perception),
         tools,
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
         thinking,
     }
+}
+
+fn build_reasoning_messages(perception: &ProcessedPerception) -> Vec<Message> {
+    let user_prompt = reasoning_user_prompt(perception);
+    [
+        perception.context_window.clone(),
+        vec![build_processed_perception_message(perception, &user_prompt)],
+    ]
+    .concat()
 }
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
@@ -6114,29 +6115,6 @@ mod tests {
         let decision = engine.decide(&response).await.expect("decision");
         assert!(matches!(decision, Decision::Respond(text) if text == SAFE_FALLBACK_RESPONSE));
     }
-
-    #[tokio::test]
-    async fn verify_passes_when_tools_succeed_without_intent() {
-        let mut engine = default_engine();
-        let action = ActionResult {
-            decision: Decision::UseTools(vec![ToolCall {
-                id: "1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path":"Cargo.toml"}),
-            }]),
-            tool_results: vec![ToolResult {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "read_file".to_string(),
-                success: true,
-                output: "ok".to_string(),
-            }],
-            response_text: "done".to_string(),
-            tokens_used: TokenUsage::default(),
-        };
-        let verification = engine.verify(&action).await.expect("verification");
-        assert!(verification.outcome_satisfactory);
-        assert!(verification.discrepancies.is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -6470,88 +6448,6 @@ mod phase2_tests {
         }
     }
 
-    #[tokio::test]
-    async fn verify_passes_when_tool_fails_but_synthesis_produced_response() {
-        let mut engine = test_engine();
-        let action = ActionResult {
-            decision: Decision::UseTools(vec![]),
-            tool_results: vec![ToolResult {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "path escapes working directory".to_string(),
-                success: false,
-            }],
-            response_text: "The file could not be read: path escapes working directory."
-                .to_string(),
-            tokens_used: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-            },
-        };
-
-        let verification = engine.verify(&action).await.expect("verify");
-        assert!(
-            verification.outcome_satisfactory,
-            "tool error with synthesis should pass verification"
-        );
-        assert!(verification.discrepancies.is_empty());
-    }
-
-    #[tokio::test]
-    async fn verify_fails_when_tool_fails_and_response_is_empty() {
-        let mut engine = test_engine();
-        let action = ActionResult {
-            decision: Decision::UseTools(vec![]),
-            tool_results: vec![ToolResult {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "path escapes working directory".to_string(),
-                success: false,
-            }],
-            response_text: "".to_string(),
-            tokens_used: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 0,
-            },
-        };
-
-        let verification = engine.verify(&action).await.expect("verify");
-        assert!(
-            !verification.outcome_satisfactory,
-            "tool error with empty response should fail"
-        );
-        assert!(!verification.discrepancies.is_empty());
-        assert!(verification
-            .discrepancies
-            .iter()
-            .any(|d| d.contains("tool calls failed and produced no response")));
-    }
-
-    #[tokio::test]
-    async fn verify_fails_when_response_is_empty_without_tool_failure() {
-        let mut engine = test_engine();
-        let action = ActionResult {
-            decision: Decision::UseTools(vec![]),
-            tool_results: vec![ToolResult {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "file contents here".to_string(),
-                success: true,
-            }],
-            response_text: "   ".to_string(),
-            tokens_used: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 5,
-            },
-        };
-
-        let verification = engine.verify(&action).await.expect("verify");
-        assert!(
-            !verification.outcome_satisfactory,
-            "empty response should still fail"
-        );
-    }
-
     // NB2-3: decide extracts multiple tool calls
     #[tokio::test]
     async fn decide_extracts_multiple_tool_calls() {
@@ -6757,14 +6653,13 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
 
         assert!(signals
             .iter()
-            .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Blocked));
+            .any(|s| s.step == LoopStep::Act && s.kind == SignalKind::Blocked));
     }
 
     #[tokio::test]
@@ -6790,7 +6685,6 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -6808,12 +6702,14 @@ mod phase2_tests {
         assert!(signals
             .iter()
             .any(|s| s.step == LoopStep::Decide && s.kind == SignalKind::Decision));
-        assert!(signals
-            .iter()
-            .any(|s| s.step == LoopStep::Verify && s.kind == SignalKind::Decision));
-        assert!(signals
-            .iter()
-            .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Decision));
+        // A clean text response (no tools, no failures) should NOT emit
+        // any observation signals — observations are only for noteworthy events.
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.step == LoopStep::Act && s.kind == SignalKind::Observation),
+            "clean text response should not emit observation signals"
+        );
     }
 
     #[tokio::test]
@@ -6904,7 +6800,6 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -6964,7 +6859,6 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7025,7 +6919,6 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -9001,7 +8894,6 @@ mod cancellation_tests {
                 response: "done".to_string(),
                 iterations: 2,
                 tokens_used: TokenUsage::default(),
-                learnings: Vec::new(),
                 signals: Vec::new(),
             },
             CycleStream::enabled(&callback),
@@ -9035,7 +8927,6 @@ mod cancellation_tests {
                 response: "done".to_string(),
                 iterations: 2,
                 tokens_used: TokenUsage::default(),
-                learnings: Vec::new(),
                 signals: Vec::new(),
             },
             CycleStream::enabled(&callback),
@@ -9058,7 +8949,6 @@ mod cancellation_tests {
                 response: "done".to_string(),
                 iterations: 1,
                 tokens_used: TokenUsage::default(),
-                learnings: Vec::new(),
                 signals: Vec::new(),
             },
             CycleStream::enabled(&callback),
@@ -9073,12 +8963,14 @@ mod cancellation_tests {
 
     #[tokio::test]
     async fn run_cycle_streaming_emits_done_when_budget_exhausted() {
+        // With single-pass loop, zero budget triggers BudgetExhausted
+        // immediately (before perceive), so partial_response is None.
         let zero_budget = crate::budget::BudgetConfig {
             max_llm_calls: 0,
             max_tool_invocations: 0,
             max_tokens: 0,
             max_cost_cents: 0,
-            max_wall_time_ms: 0,
+            max_wall_time_ms: 60_000,
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
             ..BudgetConfig::default()
@@ -9099,9 +8991,28 @@ mod cancellation_tests {
             .await
             .expect("run_cycle_streaming");
 
-        assert!(matches!(result, LoopResult::BudgetExhausted { .. }));
+        match result {
+            LoopResult::BudgetExhausted {
+                partial_response,
+                iterations,
+                ..
+            } => {
+                // With single-pass and zero budget, budget_terminal fires
+                // before perceive — no LLM call happens, so no partial response.
+                assert!(
+                    partial_response.is_none()
+                        || partial_response.as_deref() == Some(BUDGET_EXHAUSTED_FALLBACK_RESPONSE),
+                    "expected None or fallback, got: {partial_response:?}"
+                );
+                assert_eq!(iterations, 1);
+            }
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
+        }
         let events = events.lock().expect("lock").clone();
-        assert_done_event(&events, "budget exhausted");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "should emit a Done event"
+        );
     }
 
     #[tokio::test]
@@ -9677,13 +9588,16 @@ mod cancellation_tests {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         engine.budget = BudgetTracker::new(
             crate::budget::BudgetConfig {
+                max_consecutive_failures: 1,
                 max_tool_retries: 0,
                 ..crate::budget::BudgetConfig::default()
             },
             0,
             0,
         );
-        engine.tool_attempts.insert("read_file".to_string(), 1);
+        engine
+            .tool_retry_tracker
+            .record_result(&read_file_call("seed"), false);
         let (callback, events) = stream_recorder();
         let calls = vec![read_file_call("call-1")];
 
@@ -9699,7 +9613,7 @@ mod cancellation_tests {
                 message,
                 recoverable: true,
             } if message
-                == "Tool 'read_file' blocked: exceeded 0 retries this cycle. Try a different approach."
+                == &blocked_tool_message("read_file", &same_call_failure_reason(1))
         )));
     }
 
@@ -9880,22 +9794,17 @@ mod cancellation_tests {
 }
 
 #[cfg(test)]
-mod fallback_retry_tests {
+mod observation_signal_tests {
     use super::*;
-    use async_trait::async_trait;
-    use fx_core::error::LlmError as CoreLlmError;
-    use fx_core::types::{InputSource, ScreenState, UserInput};
-    use fx_llm::{
-        CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
-    };
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use crate::budget::BudgetTracker;
+    use fx_llm::ToolCall;
+    use std::sync::Arc;
 
     #[derive(Debug, Default)]
-    struct StubToolExecutor;
+    struct ObsNoopExecutor;
 
-    #[async_trait]
-    impl ToolExecutor for StubToolExecutor {
+    #[async_trait::async_trait]
+    impl ToolExecutor for ObsNoopExecutor {
         async fn execute_tools(
             &self,
             calls: &[ToolCall],
@@ -9903,135 +9812,93 @@ mod fallback_retry_tests {
         ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
             Ok(calls
                 .iter()
-                .map(|call| ToolResult {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
+                .map(|c| ToolResult {
+                    tool_call_id: c.id.clone(),
+                    tool_name: c.name.clone(),
                     success: true,
                     output: "ok".to_string(),
                 })
                 .collect())
         }
 
-        fn tool_definitions(&self) -> Vec<ToolDefinition> {
-            vec![ToolDefinition {
-                name: "read_file".to_string(),
-                description: "Read a file".to_string(),
-                parameters: serde_json::json!({"type":"object"}),
-            }]
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            Vec::new()
         }
     }
 
-    #[derive(Debug)]
-    struct SequentialMockLlm {
-        responses: Mutex<VecDeque<CompletionResponse>>,
-    }
-
-    impl SequentialMockLlm {
-        fn new(responses: Vec<CompletionResponse>) -> Self {
-            Self {
-                responses: Mutex::new(VecDeque::from(responses)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for SequentialMockLlm {
-        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
-            Ok("summary".to_string())
-        }
-
-        async fn generate_streaming(
-            &self,
-            _: &str,
-            _: u32,
-            callback: Box<dyn Fn(String) + Send + 'static>,
-        ) -> Result<String, CoreLlmError> {
-            callback("summary".to_string());
-            Ok("summary".to_string())
-        }
-
-        fn model_name(&self) -> &str {
-            "mock"
-        }
-
-        async fn complete(
-            &self,
-            _: CompletionRequest,
-        ) -> Result<CompletionResponse, ProviderError> {
-            self.responses
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
-        }
-    }
-
-    fn test_engine() -> LoopEngine {
+    fn obs_test_engine() -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(
                 crate::budget::BudgetConfig::default(),
-                0,
+                current_time_ms(),
                 0,
             ))
             .context(ContextCompactor::new(2048, 256))
             .max_iterations(3)
-            .tool_executor(Arc::new(StubToolExecutor))
-            .synthesis_instruction("Summarize tool output".to_string())
+            .tool_executor(Arc::new(ObsNoopExecutor))
+            .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("test engine build")
     }
 
-    fn test_snapshot(text: &str) -> PerceptionSnapshot {
-        PerceptionSnapshot {
-            timestamp_ms: 1,
-            screen: ScreenState {
-                current_app: "terminal".to_string(),
-                elements: Vec::new(),
-                text_content: text.to_string(),
-            },
-            notifications: Vec::new(),
-            active_app: "terminal".to_string(),
-            user_input: Some(UserInput {
-                text: text.to_string(),
-                source: InputSource::Text,
-                timestamp: 1,
-                context_id: None,
-                images: Vec::new(),
-            }),
-            sensor_data: None,
-            conversation_history: vec![Message::user(text)],
-            steer_context: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn verify_detects_safe_fallback_as_discrepancy() {
-        let mut engine = test_engine();
+    #[test]
+    fn emits_tool_failure_with_response_signal() {
+        let mut engine = obs_test_engine();
         let action = ActionResult {
-            decision: Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string()),
-            tool_results: Vec::new(),
-            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            decision: Decision::UseTools(vec![ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "missing.txt"}),
+            }]),
+            tool_results: vec![ToolResult {
+                tool_call_id: "1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: false,
+                output: "file not found".to_string(),
+            }],
+            response_text: "I couldn't find that file.".to_string(),
             tokens_used: TokenUsage::default(),
         };
 
-        let verification = engine.verify(&action).await.expect("verify");
-        assert!(
-            !verification.outcome_satisfactory,
-            "safe fallback should not pass verification"
-        );
-        assert!(
-            verification
-                .discrepancies
-                .iter()
-                .any(|d| d.contains("fallback")),
-            "discrepancy should mention fallback: {:?}",
-            verification.discrepancies
-        );
+        engine.emit_action_observations(&action);
+
+        let signals = engine.signals.drain_all();
+        let obs: Vec<_> = signals
+            .iter()
+            .filter(|s| s.message == "tool_failure_with_response")
+            .collect();
+        assert_eq!(obs.len(), 1);
+        let failed_count = obs[0]
+            .metadata
+            .get("failed_tools")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len);
+        assert_eq!(failed_count, Some(1));
     }
 
-    #[tokio::test]
-    async fn verify_does_not_flag_fallback_when_tools_were_used() {
-        let mut engine = test_engine();
+    #[test]
+    fn emits_empty_response_signal() {
+        let mut engine = obs_test_engine();
+        let action = ActionResult {
+            decision: Decision::Respond(String::new()),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+        };
+
+        engine.emit_action_observations(&action);
+
+        let signals = engine.signals.drain_all();
+        let obs: Vec<_> = signals
+            .iter()
+            .filter(|s| s.message == "empty_response")
+            .collect();
+        assert_eq!(obs.len(), 1);
+    }
+
+    #[test]
+    fn emits_tool_only_turn_signal() {
+        let mut engine = obs_test_engine();
         let action = ActionResult {
             decision: Decision::UseTools(vec![ToolCall {
                 id: "1".to_string(),
@@ -10042,180 +9909,48 @@ mod fallback_retry_tests {
                 tool_call_id: "1".to_string(),
                 tool_name: "read_file".to_string(),
                 success: true,
-                output: "ok".to_string(),
+                output: "contents".to_string(),
             }],
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+        };
+
+        engine.emit_action_observations(&action);
+
+        let signals = engine.signals.drain_all();
+        let obs: Vec<_> = signals
+            .iter()
+            .filter(|s| s.message == "tool_only_turn")
+            .collect();
+        assert_eq!(obs.len(), 1);
+        let count = obs[0]
+            .metadata
+            .get("tool_count")
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn safe_fallback_treated_as_no_response() {
+        let mut engine = obs_test_engine();
+        let action = ActionResult {
+            decision: Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string()),
+            tool_results: Vec::new(),
             response_text: SAFE_FALLBACK_RESPONSE.to_string(),
             tokens_used: TokenUsage::default(),
         };
 
-        let verification = engine.verify(&action).await.expect("verify");
-        assert!(
-            verification.outcome_satisfactory,
-            "fallback with tools used should still pass (tools produced results)"
-        );
-        assert!(
-            verification.discrepancies.is_empty(),
-            "fallback with tools used should not report discrepancies: {:?}",
-            verification.discrepancies
-        );
-    }
+        engine.emit_action_observations(&action);
 
-    #[tokio::test]
-    async fn should_continue_returns_tool_directive_for_fallback() {
-        let mut engine = test_engine();
-        let decision = Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string());
-        let verification = Verification {
-            outcome_satisfactory: false,
-            confidence: 0.45,
-            discrepancies: vec!["model produced fallback".to_string()],
-        };
-        let learning = Learning {
-            episode: "test".to_string(),
-            pattern: None,
-            adjustment: None,
-        };
-
-        let continuation = engine
-            .should_continue(&decision, &verification, &learning)
-            .await
-            .expect("should_continue");
-
-        match continuation {
-            Continuation::Continue(msg) => {
-                assert!(
-                    msg.contains("did not use tools"),
-                    "continuation for fallback should mention tools: {msg}"
-                );
-            }
-            other => panic!("expected Continue, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn should_continue_returns_generic_message_for_non_fallback_failure() {
-        let mut engine = test_engine();
-        let decision = Decision::Respond("some other response".to_string());
-        let verification = Verification {
-            outcome_satisfactory: false,
-            confidence: 0.45,
-            discrepancies: vec!["action produced an empty response".to_string()],
-        };
-        let learning = Learning {
-            episode: "test".to_string(),
-            pattern: None,
-            adjustment: None,
-        };
-
-        let continuation = engine
-            .should_continue(&decision, &verification, &learning)
-            .await
-            .expect("should_continue");
-
-        match continuation {
-            Continuation::Continue(msg) => {
-                assert!(
-                    msg.contains("produced no response"),
-                    "non-fallback continuation should use generic message: {msg}"
-                );
-            }
-            other => panic!("expected Continue, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_cycle_retries_on_fallback_then_succeeds_with_tools() {
-        let mut engine = test_engine();
-
-        // First response: model returns empty text (no tools) -> fallback
-        // Second response (retry): model uses tools
-        // Third response: tool continuation with final answer
-        let llm = SequentialMockLlm::new(vec![
-            // Iteration 1: empty response -> SAFE_FALLBACK
-            CompletionResponse {
-                content: Vec::new(),
-                tool_calls: Vec::new(),
-                usage: None,
-                stop_reason: None,
-            },
-            // Iteration 2 (retry): model uses tools
-            CompletionResponse {
-                content: Vec::new(),
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: serde_json::json!({"path": "README.md"}),
-                }],
-                usage: None,
-                stop_reason: Some("tool_use".to_string()),
-            },
-            // Tool continuation: final answer
-            CompletionResponse {
-                content: vec![ContentBlock::Text {
-                    text: "Here are the file contents.".to_string(),
-                }],
-                tool_calls: Vec::new(),
-                usage: None,
-                stop_reason: None,
-            },
-        ]);
-
-        let result = engine
-            .run_cycle(test_snapshot("read the readme"), &llm)
-            .await
-            .expect("run_cycle");
-
-        match result {
-            LoopResult::Complete {
-                response,
-                iterations,
-                ..
-            } => {
-                assert_eq!(iterations, 2, "should take 2 iterations (fallback + retry)");
-                assert_eq!(response, "Here are the file contents.");
-            }
-            other => panic!("expected Complete, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_cycle_exhausts_iterations_on_repeated_fallback() {
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(
-                crate::budget::BudgetConfig::default(),
-                0,
-                0,
-            ))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(2)
-            .tool_executor(Arc::new(StubToolExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("test engine build");
-
-        // Both iterations return empty -> fallback each time
-        let llm = SequentialMockLlm::new(vec![
-            CompletionResponse {
-                content: Vec::new(),
-                tool_calls: Vec::new(),
-                usage: None,
-                stop_reason: None,
-            },
-            CompletionResponse {
-                content: Vec::new(),
-                tool_calls: Vec::new(),
-                usage: None,
-                stop_reason: None,
-            },
-        ]);
-
-        let result = engine
-            .run_cycle(test_snapshot("do something broad"), &llm)
-            .await
-            .expect("run_cycle");
-
-        assert!(
-            matches!(result, LoopResult::Error { .. }),
-            "repeated fallbacks should exhaust iterations: {result:?}"
+        let signals = engine.signals.drain_all();
+        let obs: Vec<_> = signals
+            .iter()
+            .filter(|s| s.message == "empty_response")
+            .collect();
+        assert_eq!(
+            obs.len(),
+            1,
+            "SAFE_FALLBACK_RESPONSE should be treated as empty"
         );
     }
 }
@@ -10451,7 +10186,6 @@ mod decomposition_tests {
                 response: "done".to_string(),
                 iterations: 1,
                 tokens_used: TokenUsage::default(),
-                learnings: Vec::new(),
                 signals: complete.clone(),
             },
             complete,
@@ -10465,16 +10199,6 @@ mod decomposition_tests {
                 signals: budget_exhausted.clone(),
             },
             budget_exhausted,
-        );
-
-        let needs_input = vec![sample_signal("input")];
-        assert_loop_result_signals(
-            LoopResult::NeedsInput {
-                prompt: "next".to_string(),
-                iterations: 3,
-                signals: needs_input.clone(),
-            },
-            needs_input,
         );
 
         let stopped = vec![sample_signal("stopped")];
@@ -12244,66 +11968,8 @@ mod context_compaction_tests {
         assert!(error.reason.contains("invalid_compaction_config"));
     }
 
-    #[derive(Debug)]
-    struct RecordingLlm {
-        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
-        requests: Mutex<Vec<CompletionRequest>>,
-        generated_summary: String,
-    }
-
-    impl RecordingLlm {
-        fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
-            Self::with_generated_summary(responses, "summary".to_string())
-        }
-
-        fn with_generated_summary(
-            responses: Vec<Result<CompletionResponse, ProviderError>>,
-            generated_summary: String,
-        ) -> Self {
-            Self {
-                responses: Mutex::new(VecDeque::from(responses)),
-                requests: Mutex::new(Vec::new()),
-                generated_summary,
-            }
-        }
-
-        fn requests(&self) -> Vec<CompletionRequest> {
-            self.requests.lock().expect("requests lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for RecordingLlm {
-        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
-            Ok(self.generated_summary.clone())
-        }
-
-        async fn generate_streaming(
-            &self,
-            _: &str,
-            _: u32,
-            callback: Box<dyn Fn(String) + Send + 'static>,
-        ) -> Result<String, CoreLlmError> {
-            callback(self.generated_summary.clone());
-            Ok(self.generated_summary.clone())
-        }
-
-        fn model_name(&self) -> &str {
-            "mock"
-        }
-
-        async fn complete(
-            &self,
-            request: CompletionRequest,
-        ) -> Result<CompletionResponse, ProviderError> {
-            self.requests.lock().expect("requests lock").push(request);
-            self.responses
-                .lock()
-                .expect("response lock")
-                .pop_front()
-                .unwrap_or_else(|| Ok(text_response("ok")))
-        }
-    }
+    // RecordingLlm lives in test_fixtures (pub(super)) to avoid duplication.
+    use super::test_fixtures::RecordingLlm;
 
     #[derive(Debug)]
     struct ExtractionLlm {
@@ -12478,6 +12144,27 @@ mod context_compaction_tests {
             .expect("tool round");
 
         assert!(has_compaction_marker(&state.continuation_messages));
+    }
+
+    #[tokio::test]
+    async fn tool_round_updates_last_reasoning_messages_after_compaction() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 120 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .await
+            .expect("tool round");
+
+        assert!(has_compaction_marker(&engine.last_reasoning_messages));
+        assert_eq!(engine.last_reasoning_messages, state.continuation_messages);
     }
 
     #[tokio::test]
@@ -13082,6 +12769,46 @@ mod context_compaction_tests {
 
         assert!(has_emergency_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_emergency_tier_preserves_tool_pairs() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(false);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![
+            tool_use("call-1"),
+            user(250),
+            assistant(250),
+            tool_result("call-1", 230),
+            user(230),
+        ];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(compacted.as_ref().iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call-1"))
+        }));
+        assert!(compacted.as_ref().iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1"
+                )
+            })
+        }));
+        debug_assert_tool_pair_integrity(compacted.as_ref());
     }
 
     #[tokio::test]
@@ -14084,9 +13811,10 @@ mod r2_streaming_review_tests {
 
 #[cfg(test)]
 mod loop_resilience_tests {
+    use super::test_fixtures::RecordingLlm;
     use super::*;
     use crate::act::{ToolExecutor, ToolResult};
-    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker};
+    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker, TerminationConfig};
     use crate::cancellation::CancellationToken;
     use crate::context_manager::ContextCompactor;
     use async_trait::async_trait;
@@ -14253,6 +13981,21 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build")
+    }
+
+    fn engine_with_tracker(budget: BudgetTracker) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(budget)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn engine_with_budget(config: BudgetConfig) -> LoopEngine {
+        engine_with_tracker(BudgetTracker::new(config, 0, 0))
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -14470,6 +14213,344 @@ mod loop_resilience_tests {
             })
         });
         assert!(!has_wrap_up, "no wrap-up directive when budget normal");
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_args_skipped_with_error_result() {
+        let mut engine = high_budget_engine();
+        let calls = vec![
+            ToolCall {
+                id: "valid-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "/tmp/test.md"}),
+            },
+            ToolCall {
+                id: "malformed-1".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"__fawx_raw_args": "{broken json"}),
+            },
+        ];
+        let results = engine
+            .execute_allowed_tool_calls(&calls, CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        // Valid call should produce a result from the executor
+        let valid_result = results.iter().find(|r| r.tool_call_id == "valid-1");
+        assert!(valid_result.is_some(), "valid call should have a result");
+
+        // Malformed call should produce an error result without hitting the executor
+        let malformed_result = results
+            .iter()
+            .find(|r| r.tool_call_id == "malformed-1")
+            .expect("malformed call should have a result");
+        assert!(!malformed_result.success);
+        assert!(
+            malformed_result.output.contains("could not be parsed"),
+            "should explain the failure: {}",
+            malformed_result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_only_turn_nudge_injected_at_threshold() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_only_turns = 6;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(has_nudge, "tool-only nudge should be in context window");
+    }
+
+    #[tokio::test]
+    async fn tool_only_turn_nudge_not_injected_below_threshold() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_only_turns = 6 - 1;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(!has_nudge, "tool-only nudge should stay below threshold");
+    }
+
+    #[tokio::test]
+    async fn nudge_threshold_from_config() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 4,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        engine.consecutive_tool_only_turns = 4;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(has_nudge, "nudge should fire at custom threshold 4");
+    }
+
+    #[tokio::test]
+    async fn nudge_disabled_when_zero() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        engine.consecutive_tool_only_turns = 100;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(!has_nudge, "nudge should never fire when threshold is 0");
+    }
+
+    #[tokio::test]
+    async fn tools_stripped_immediately_when_grace_is_zero() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = engine_with_budget(config);
+        engine.consecutive_tool_only_turns = 3;
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Here is my summary.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        assert!(llm.requests()[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_stripped_after_nudge_grace() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 2,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        // At turn 5 (3 nudge + 2 grace), tools should be stripped
+        engine.consecutive_tool_only_turns = 5;
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Here is my summary.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].tools.is_empty(),
+            "tools should be stripped at turn {}, threshold {}",
+            5,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_not_stripped_before_grace() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 2,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        // At turn 4 (below 3+2=5), tools should NOT be stripped
+        engine.consecutive_tool_only_turns = 4;
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "still working".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].tools.is_empty(),
+            "tools should still be present at turn 4, threshold 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_skipped_when_disabled() {
+        let config = BudgetConfig {
+            max_llm_calls: 1,
+            termination: TerminationConfig {
+                synthesize_on_exhaustion: false,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut budget = BudgetTracker::new(config, 0, 0);
+        budget.record(&ActionCost {
+            llm_calls: 1,
+            ..ActionCost::default()
+        });
+
+        let engine = engine_with_tracker(budget);
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "synthesized".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+        let messages = vec![Message::user("hello")];
+
+        let result = engine.forced_synthesis_turn(&llm, &messages).await;
+
+        assert_eq!(result, None);
+        assert!(llm.requests().is_empty());
+    }
+
+    #[test]
+    fn default_termination_config_matches_current_behavior() {
+        let config = TerminationConfig::default();
+        assert!(config.synthesize_on_exhaustion);
+        assert_eq!(config.nudge_after_tool_turns, 6);
+        assert_eq!(config.strip_tools_after_nudge, 3);
+    }
+
+    #[test]
+    fn tool_only_turn_counter_tracks_and_resets() {
+        let mut engine = high_budget_engine();
+        let tool_action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            }],
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+        };
+        engine.update_tool_only_turns(&tool_action);
+        assert_eq!(engine.consecutive_tool_only_turns, 1);
+
+        let text_action = ActionResult {
+            decision: Decision::Respond("done".to_string()),
+            tool_results: Vec::new(),
+            response_text: "done".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        engine.update_tool_only_turns(&text_action);
+        assert_eq!(engine.consecutive_tool_only_turns, 0);
     }
 
     // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---
@@ -15001,6 +15082,73 @@ mod test_fixtures {
         }
     }
 
+    /// Mock LLM that records requests and replays scripted responses.
+    /// Consolidated from context_compaction_tests + test_fixtures to avoid duplication.
+    #[derive(Debug)]
+    pub(super) struct RecordingLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+        requests: Mutex<Vec<CompletionRequest>>,
+        generated_summary: String,
+    }
+
+    impl RecordingLlm {
+        pub(super) fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self::with_generated_summary(responses, "summary".to_string())
+        }
+
+        pub(super) fn ok(responses: Vec<CompletionResponse>) -> Self {
+            Self::new(responses.into_iter().map(Ok).collect())
+        }
+
+        pub(super) fn with_generated_summary(
+            responses: Vec<Result<CompletionResponse, ProviderError>>,
+            generated_summary: String,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
+                generated_summary,
+            }
+        }
+
+        pub(super) fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.generated_summary.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback(self.generated_summary.clone());
+            Ok(self.generated_summary.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "recording"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(text_response("ok")))
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for ScriptedLlm {
         async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
@@ -15471,6 +15619,127 @@ mod error_path_coverage_tests {
         }
     }
 
+    #[tokio::test]
+    async fn budget_exhaustion_before_reason_returns_synthesized_response() {
+        // With single-pass loop, budget exhaustion before reasoning triggers
+        // BudgetExhausted with forced synthesis. Use max_tokens: 0 to trigger
+        // immediately (before the reason step can run).
+        let config = BudgetConfig {
+            max_llm_calls: 5,
+            max_tool_invocations: 5,
+            max_tokens: 0,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), config, 0, 3);
+        let llm = ScriptedLlm::ok(vec![text_response("final synthesized answer")]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match result {
+            LoopResult::BudgetExhausted { iterations, .. } => {
+                assert_eq!(iterations, 1);
+            }
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_pass_completes_even_when_budget_tight() {
+        // With single-pass loop, max_llm_calls: 1 means the model gets exactly
+        // one call. If it produces text, the result is Complete (not BudgetExhausted)
+        // because the budget check happens after the response is consumed.
+        let config = BudgetConfig {
+            max_llm_calls: 1,
+            max_tool_invocations: 5,
+            max_tokens: 100_000,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), config, 0, 3);
+        let llm = ScriptedLlm::ok(vec![text_response("here is the answer")]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(response, "here is the answer");
+                assert_eq!(iterations, 1);
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_synthesis_turn_strips_tools_and_appends_directive() {
+        let engine = build_engine_with_executor(
+            Arc::new(StubToolExecutor),
+            budget_config_with_llm_calls(5, 2),
+            0,
+            3,
+        );
+        let llm = RecordingLlm::ok(vec![text_response("synthesized")]);
+        let messages = vec![Message::user("hello")];
+
+        let result = engine.forced_synthesis_turn(&llm, &messages).await;
+        let requests = llm.requests();
+
+        assert_eq!(result.as_deref(), Some("synthesized"));
+        assert_eq!(
+            requests.len(),
+            1,
+            "forced synthesis should make one LLM call"
+        );
+        assert!(
+            requests[0].tools.is_empty(),
+            "forced synthesis must strip tools"
+        );
+        assert!(
+            requests[0].messages.iter().any(|message| {
+                message.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => text.contains("Your tool budget is exhausted"),
+                    _ => false,
+                })
+            }),
+            "forced synthesis should append the budget-exhausted directive"
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_response_uses_non_empty_fallbacks() {
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(
+                Some("synthesized".to_string()),
+                Some("partial".to_string()),
+            ),
+            "synthesized"
+        );
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(None, Some("partial".to_string())),
+            "partial"
+        );
+        assert_eq!(
+            LoopEngine::resolve_budget_exhausted_response(None, Some("   ".to_string())),
+            BUDGET_EXHAUSTED_FALLBACK_RESPONSE
+        );
+    }
+
     // =========================================================================
     // 2. Decomposition depth >2 integration test
     // =========================================================================
@@ -15924,18 +16193,18 @@ mod error_path_coverage_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tool retry budget tests (#1101)
+// Per-tool retry policy tests (#1101)
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod per_tool_retry_budget_tests {
+mod per_tool_retry_policy_tests {
     use super::*;
     use crate::act::{ToolExecutorError, ToolResult};
-    use crate::budget::{BudgetConfig, BudgetTracker};
+    use crate::budget::{BudgetConfig, BudgetTracker, RetryPolicyConfig};
     use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
     use fx_llm::ToolCall;
     use std::sync::Arc;
 
-    /// Stub executor that always succeeds.
     #[derive(Debug)]
     struct AlwaysSucceedExecutor;
 
@@ -15948,305 +16217,535 @@ mod per_tool_retry_budget_tests {
         ) -> Result<Vec<ToolResult>, ToolExecutorError> {
             Ok(calls
                 .iter()
-                .map(|c| ToolResult {
-                    tool_call_id: c.id.clone(),
-                    tool_name: c.name.clone(),
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
                     success: true,
-                    output: format!("ok: {}", c.name),
+                    output: format!("ok: {}", call.name),
                 })
                 .collect())
         }
+
         fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
             Vec::new()
         }
+
+        fn clear_cache(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for AlwaysFailExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: format!("err: {}", call.name),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            Vec::new()
+        }
+
         fn clear_cache(&self) {}
     }
 
     fn make_call(id: &str, name: &str) -> ToolCall {
+        make_call_with_args(id, name, serde_json::json!({}))
+    }
+
+    fn make_call_with_args(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: id.to_string(),
             name: name.to_string(),
-            arguments: serde_json::json!({}),
+            arguments,
         }
     }
 
-    fn retry_engine(max_tool_retries: u8) -> LoopEngine {
-        let config = BudgetConfig {
+    fn retry_config(max_tool_retries: u8) -> BudgetConfig {
+        let max_consecutive_failures = u16::from(max_tool_retries).saturating_add(1);
+        BudgetConfig {
+            max_consecutive_failures,
             max_tool_retries,
             ..BudgetConfig::default()
-        };
+        }
+    }
+
+    fn retry_engine_with_executor(
+        config: BudgetConfig,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(config, 0, 0))
             .context(ContextCompactor::new(2048, 256))
             .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
+            .tool_executor(executor)
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build")
     }
 
-    // -----------------------------------------------------------------------
-    // Basic counting (tests 1–4)
-    // -----------------------------------------------------------------------
-
-    /// Test 1: Tool called once → tool_attempts == 1, execution proceeds.
-    #[tokio::test]
-    async fn single_call_increments_attempts_and_executes() {
-        let mut engine = retry_engine(2);
-        let calls = vec![make_call("1", "read_file")];
-
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert_eq!(results.len(), 1);
-        assert!(results[0].success);
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(1));
+    fn retry_engine(max_tool_retries: u8) -> LoopEngine {
+        retry_engine_with_executor(
+            retry_config(max_tool_retries),
+            Arc::new(AlwaysSucceedExecutor),
+        )
     }
 
-    /// Test 2: Tool called 3 times (default cap=2 retries) → all 3 execute.
-    #[tokio::test]
-    async fn three_calls_within_budget_all_execute() {
-        let mut engine = retry_engine(2);
+    fn failure_engine(max_tool_retries: u8) -> LoopEngine {
+        retry_engine_with_executor(retry_config(max_tool_retries), Arc::new(AlwaysFailExecutor))
+    }
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success, "call {i} should succeed");
+    fn block_message(tool_name: &str, failures: u16) -> String {
+        blocked_tool_message(tool_name, &same_call_failure_reason(failures))
+    }
+
+    fn block_signature(engine: &mut LoopEngine, call: &ToolCall) {
+        let failures = engine
+            .budget
+            .config()
+            .retry_policy()
+            .max_consecutive_failures;
+        seed_failures(engine, call, failures);
+    }
+
+    fn seed_failures(engine: &mut LoopEngine, call: &ToolCall, failures: u16) {
+        for _ in 0..failures {
+            engine.tool_retry_tracker.record_result(call, false);
         }
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(3));
     }
 
-    /// Test 3: Tool called 4th time → blocked, synthetic failure result.
+    fn is_signature_tracked(engine: &LoopEngine, call: &ToolCall) -> bool {
+        engine
+            .tool_retry_tracker
+            .signature_failures
+            .contains_key(&CallSignature::from_call(call))
+    }
+
     #[tokio::test]
-    async fn fourth_call_blocked_with_synthetic_failure() {
+    async fn successful_calls_keep_failure_counts_at_zero() {
         let mut engine = retry_engine(2);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success);
+        for id in 1..=3 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine
+                .execute_tool_calls(std::slice::from_ref(&call))
+                .await
+                .expect("execute");
+            assert!(results[0].success, "call {id} should succeed");
+            assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 0);
         }
 
-        let calls = vec![make_call("4", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].success);
-        assert!(results[0].output.contains("blocked"));
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 4: Different tools each called 3 times → all execute (independent).
     #[tokio::test]
-    async fn independent_counters_per_tool() {
-        let mut engine = retry_engine(2);
+    async fn consecutive_failures_block_specific_signature() {
+        let mut engine = failure_engine(2);
 
-        for i in 1..=3 {
-            let calls = vec![
-                make_call(&format!("r{i}"), "read_file"),
-                make_call(&format!("w{i}"), "write_file"),
-            ];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        for id in 1..=3 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine.execute_tool_calls(&[call]).await.expect("execute");
             assert!(
-                results.iter().all(|r| r.success),
-                "round {i} should all succeed"
+                !results[0].success,
+                "call {id} should fail but not be blocked"
             );
+            assert!(!results[0].output.contains("blocked"));
         }
-        assert_eq!(engine.tool_attempts.get("read_file").copied(), Some(3));
-        assert_eq!(engine.tool_attempts.get("write_file").copied(), Some(3));
+
+        let call = make_call("4", "read_file");
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute blocked call");
+        assert!(!results[0].success);
+        assert_eq!(results[0].output, block_message("read_file", 3));
+        assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 3);
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 3);
     }
 
-    // -----------------------------------------------------------------------
-    // Blocked behavior (tests 5–8)
-    // -----------------------------------------------------------------------
-
-    /// Test 5: Blocked tool returns success: false with message mentioning tool name.
     #[tokio::test]
-    async fn blocked_result_contains_tool_name_and_retry_count() {
+    async fn blocked_result_contains_tool_name_and_failure_reason() {
         let mut engine = retry_engine(2);
+        let call = make_call("blocked", "network_fetch");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "network_fetch")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        let calls = vec![make_call("4", "network_fetch")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        let results = engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
+        let reason = same_call_failure_reason(3);
         assert!(!results[0].success);
         assert!(results[0].output.contains("network_fetch"));
-        assert!(results[0].output.contains("2 retries"));
+        assert!(results[0].output.contains(&reason));
     }
 
-    /// Test 6: Blocked tool emits SignalKind::Blocked with tool name in metadata.
     #[tokio::test]
     async fn blocked_tool_emits_blocked_signal() {
         let mut engine = retry_engine(2);
+        let call = make_call("4", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        let calls = vec![make_call("4", "read_file")];
-        engine.execute_tool_calls(&calls).await.expect("execute");
+        engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
 
         let signals = engine.signals.drain_all();
         let blocked_signals: Vec<_> = signals
             .iter()
-            .filter(|s| s.kind == SignalKind::Blocked)
+            .filter(|signal| signal.kind == SignalKind::Blocked)
             .collect();
-        assert!(
-            !blocked_signals.is_empty(),
-            "should have emitted a Blocked signal"
+        let reason = same_call_failure_reason(3);
+
+        assert_eq!(blocked_signals.len(), 1);
+        assert_eq!(
+            blocked_signals[0].metadata["tool"],
+            serde_json::json!("read_file")
         );
-        let signal = &blocked_signals[0];
-        assert_eq!(signal.metadata["tool"], "read_file");
-        assert_eq!(signal.metadata["max_retries"], 2);
+        assert_eq!(
+            blocked_signals[0].metadata["reason"],
+            serde_json::json!(reason)
+        );
+        assert_eq!(
+            blocked_signals[0].metadata["signature_failures"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            blocked_signals[0].metadata["cycle_total_failures"],
+            serde_json::json!(3)
+        );
     }
 
-    /// Test 7: Tool blocked on 4th attempt remains blocked on 5th, 6th.
     #[tokio::test]
     async fn blocked_stays_blocked_within_cycle() {
         let mut engine = retry_engine(2);
+        let call = make_call("seed", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
-
-        for i in 4..=6 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(!results[0].success, "call {i} should be blocked");
+        for id in 4..=6 {
+            let blocked_call = make_call(&id.to_string(), "read_file");
+            let results = engine
+                .execute_tool_calls(&[blocked_call])
+                .await
+                .expect("execute blocked call");
+            assert_eq!(results[0].output, block_message("read_file", 3));
         }
     }
 
-    /// Test 8: Mixed batch: 1 blocked tool + 2 fresh → blocked gets synthetic, others execute.
     #[tokio::test]
     async fn mixed_batch_blocked_and_fresh() {
         let mut engine = retry_engine(2);
-
-        // Exhaust read_file
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
-        }
+        let blocked_call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &blocked_call);
 
         let calls = vec![
-            make_call("b1", "read_file"),
-            make_call("f1", "write_file"),
-            make_call("f2", "list_dir"),
+            blocked_call,
+            make_call("fresh-1", "write_file"),
+            make_call("fresh-2", "list_dir"),
         ];
         let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert_eq!(results.len(), 3);
 
-        // Results should be in original call order
-        assert!(!results[0].success, "read_file should be blocked");
-        assert!(results[0].output.contains("blocked"));
-        assert!(results[1].success, "write_file should succeed");
-        assert!(results[2].success, "list_dir should succeed");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].output, block_message("read_file", 3));
+        assert!(results[1].success);
+        assert!(results[2].success);
     }
 
-    // -----------------------------------------------------------------------
-    // Reset (tests 9–10)
-    // -----------------------------------------------------------------------
-
-    /// Test 9: After prepare_cycle(), a previously-blocked tool can be called again.
     #[tokio::test]
-    async fn prepare_cycle_resets_allows_blocked_tool() {
+    async fn prepare_cycle_allows_previously_blocked_signature() {
         let mut engine = retry_engine(2);
+        let call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &call);
 
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            engine.execute_tool_calls(&calls).await.expect("execute");
+        let blocked = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute blocked call");
+        assert_eq!(blocked[0].output, block_message("read_file", 3));
+
+        engine.prepare_cycle();
+
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute");
+        assert!(results[0].success);
+        assert_eq!(engine.tool_retry_tracker.consecutive_failures_for(&call), 0);
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_cycle_clears_retry_tracker() {
+        let mut engine = retry_engine(2);
+        let call = make_call("1", "read_file");
+        seed_failures(&mut engine, &call, 1);
+
+        assert!(!engine.tool_retry_tracker.signature_failures.is_empty());
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 1);
+
+        engine.prepare_cycle();
+
+        assert!(engine.tool_retry_tracker.signature_failures.is_empty());
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
+    }
+
+    #[test]
+    fn success_resets_failure_count() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 1);
+
+        tracker.record_result(&call, true);
+        assert_eq!(tracker.consecutive_failures_for(&call), 0);
+
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 1);
+        assert_eq!(tracker.cycle_total_failures, 2);
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn different_args_tracked_independently() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
+        };
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let mut tracker = ToolRetryTracker::default();
+
+        tracker.record_result(&call_a, false);
+        tracker.record_result(&call_a, false);
+
+        assert_eq!(tracker.consecutive_failures_for(&call_a), 2);
+        assert_eq!(tracker.consecutive_failures_for(&call_b), 0);
+        assert!(matches!(
+            tracker.should_allow(&call_a, &config),
+            RetryVerdict::Block { ref reason } if reason == &same_call_failure_reason(2)
+        ));
+        assert!(matches!(
+            tracker.should_allow(&call_b, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_all_tools() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 10,
+            max_cycle_failures: 2,
+            ..RetryPolicyConfig::default()
+        };
+        let mut tracker = ToolRetryTracker::default();
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let fresh_call = make_call("3", "write_file");
+
+        tracker.record_result(&call_a, false);
+        tracker.record_result(&call_b, false);
+
+        assert_eq!(tracker.cycle_total_failures, 2);
+        assert!(matches!(
+            tracker.should_allow(&fresh_call, &config),
+            RetryVerdict::Block { ref reason } if reason == &cycle_failure_limit_reason()
+        ));
+    }
+
+    #[test]
+    fn no_progress_blocks_after_threshold() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        for _ in 0..3 {
+            tracker.record_progress(&call, "same output");
         }
 
-        // Verify blocked
-        let calls = vec![make_call("4", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!results[0].success);
-
-        // Reset
-        engine.prepare_cycle();
-
-        // Should work again
-        let calls = vec![make_call("5", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(results[0].success);
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
     }
 
-    /// Test 10: tool_attempts is empty after prepare_cycle().
-    #[tokio::test]
-    async fn tool_attempts_empty_after_prepare_cycle() {
-        let mut engine = retry_engine(2);
+    #[test]
+    fn no_progress_resets_on_different_output() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
 
-        let calls = vec![make_call("1", "read_file")];
-        engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!engine.tool_attempts.is_empty());
+        tracker.record_progress(&call, "output A");
+        tracker.record_progress(&call, "output A");
+        tracker.record_progress(&call, "output B");
 
-        engine.prepare_cycle();
-        assert!(engine.tool_attempts.is_empty());
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
     }
 
-    // -----------------------------------------------------------------------
-    // Configuration (tests 11–13)
-    // -----------------------------------------------------------------------
+    #[test]
+    fn no_progress_independent_per_signature() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let mut tracker = ToolRetryTracker::default();
 
-    /// Test 11: max_tool_retries: 0 → tool blocked on 2nd attempt (1 attempt allowed).
+        for _ in 0..3 {
+            tracker.record_progress(&call_a, "same output");
+        }
+
+        assert!(matches!(
+            tracker.should_allow(&call_a, &config),
+            RetryVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            tracker.should_allow(&call_b, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn no_progress_does_not_affect_failures() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 5,
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        // Record failures (should not interact with no-progress)
+        tracker.record_result(&call, false);
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 2);
+
+        // Record same output (should not interact with failures)
+        tracker.record_progress(&call, "same output");
+        tracker.record_progress(&call, "same output");
+        assert_eq!(tracker.consecutive_failures_for(&call), 2);
+
+        // Still allowed (neither threshold hit)
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn clear_resets_no_progress() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        for _ in 0..3 {
+            tracker.record_progress(&call, "same output");
+        }
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Block { .. }
+        ));
+
+        tracker.clear();
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+        assert!(tracker.no_progress.is_empty());
+    }
+
+    #[test]
+    fn backward_compat_max_tool_retries() {
+        let mut value = serde_json::to_value(BudgetConfig::default()).expect("serialize");
+        value["max_tool_retries"] = serde_json::json!(0);
+
+        let config: BudgetConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(config.max_tool_retries, 0);
+        assert_eq!(config.max_consecutive_failures, 1);
+        assert_eq!(config.retry_policy().max_consecutive_failures, 1);
+    }
+
     #[tokio::test]
-    async fn zero_retries_blocks_on_second_attempt() {
+    async fn zero_retries_blocks_after_one_failure() {
         let mut engine = retry_engine(0);
+        let call = make_call("1", "read_file");
+        seed_failures(&mut engine, &call, 1);
 
-        let calls = vec![make_call("1", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(results[0].success);
-
-        let calls = vec![make_call("2", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(!results[0].success);
+        let results = engine
+            .execute_tool_calls(&[call])
+            .await
+            .expect("execute blocked call");
+        assert_eq!(results[0].output, block_message("read_file", 1));
     }
 
-    /// Test 12: max_tool_retries: u8::MAX → effectively unlimited retries.
     #[tokio::test]
     async fn max_retries_effectively_unlimited() {
-        let mut engine = retry_engine(u8::MAX);
+        let config = BudgetConfig {
+            max_consecutive_failures: u16::from(u8::MAX).saturating_add(1),
+            max_cycle_failures: u16::MAX,
+            max_tool_retries: u8::MAX,
+            ..BudgetConfig::default()
+        };
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysFailExecutor));
 
-        // Call the same tool 255 times — all should succeed
-        for i in 1..=255_u16 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(
-                results[0].success,
-                "call {i} should succeed with u8::MAX retries"
-            );
+        for id in 1..=255_u16 {
+            let call = make_call(&id.to_string(), "read_file");
+            let results = engine.execute_tool_calls(&[call]).await.expect("execute");
+            assert!(!results[0].success, "call {id} should not be blocked");
+            assert!(!results[0].output.contains("blocked"));
         }
+
+        let call = make_call("255", "read_file");
+        assert_eq!(
+            engine.tool_retry_tracker.consecutive_failures_for(&call),
+            255
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 255);
     }
 
-    /// Test 13: BudgetConfig::conservative() has max_tool_retries: 1 (2 total attempts).
-    #[test]
-    fn conservative_config_has_one_retry() {
-        let config = BudgetConfig::conservative();
-        assert_eq!(config.max_tool_retries, 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration with fan-out / budget (tests 14–16)
-    // -----------------------------------------------------------------------
-
-    /// Test 14: Fan-out deferred tools don't count toward tool_attempts.
     #[tokio::test]
-    async fn deferred_tools_do_not_count_toward_attempts() {
+    async fn deferred_tools_do_not_count_toward_failures() {
         let config = BudgetConfig {
             max_fan_out: 2,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
-
-        // 4 calls, fan-out cap 2 → first 2 execute, last 2 deferred
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
         let calls = vec![
             make_call("1", "tool_a"),
             make_call("2", "tool_b"),
@@ -16255,56 +16754,46 @@ mod per_tool_retry_budget_tests {
         ];
 
         let (execute, deferred) = engine.apply_fan_out_cap(&calls);
-        assert_eq!(execute.len(), 2);
-        assert_eq!(deferred.len(), 2);
-
-        // Only execute the allowed calls through execute_tool_calls
         let results = engine.execute_tool_calls(&execute).await.expect("execute");
-        assert_eq!(results.len(), 2);
 
-        // Deferred tools should NOT be in tool_attempts
-        assert!(!engine.tool_attempts.contains_key("tool_c"));
-        assert!(!engine.tool_attempts.contains_key("tool_d"));
-        // Executed tools should be counted
-        assert_eq!(engine.tool_attempts.get("tool_a").copied(), Some(1));
-        assert_eq!(engine.tool_attempts.get("tool_b").copied(), Some(1));
+        assert_eq!(results.len(), 2);
+        assert!(is_signature_tracked(&engine, &calls[0]));
+        assert!(is_signature_tracked(&engine, &calls[1]));
+        assert!(!is_signature_tracked(&engine, &deferred[0]));
+        assert!(!is_signature_tracked(&engine, &deferred[1]));
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 15: Deferred tools re-requested in next round start fresh counts.
     #[tokio::test]
     async fn deferred_tools_start_fresh_when_executed() {
         let config = BudgetConfig {
             max_fan_out: 1,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
+        let tool_a = make_call("1", "tool_a");
+        let tool_b = make_call("2", "tool_b");
 
-        // Round 1: tool_a executes, tool_b deferred
-        let calls = vec![make_call("1", "tool_a"), make_call("2", "tool_b")];
-        let (execute, _deferred) = engine.apply_fan_out_cap(&calls);
+        let (execute, _) = engine.apply_fan_out_cap(&[tool_a.clone(), tool_b.clone()]);
         engine.execute_tool_calls(&execute).await.expect("execute");
-        assert_eq!(engine.tool_attempts.get("tool_a").copied(), Some(1));
-        assert!(!engine.tool_attempts.contains_key("tool_b"));
+        assert!(is_signature_tracked(&engine, &tool_a));
+        assert!(!is_signature_tracked(&engine, &tool_b));
 
-        // Round 2: tool_b now executed
-        let calls = vec![make_call("3", "tool_b")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&tool_b))
+            .await
+            .expect("execute deferred tool");
         assert!(results[0].success);
-        assert_eq!(engine.tool_attempts.get("tool_b").copied(), Some(1));
+        assert!(is_signature_tracked(&engine, &tool_b));
+        assert_eq!(
+            engine.tool_retry_tracker.consecutive_failures_for(&tool_b),
+            0
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 0);
     }
 
-    /// Test 16: Tool retry blocked AND budget is Low → budget-low takes precedence.
-    /// Budget-low is checked at the top of act_with_tools() before tool dispatch,
-    /// so tools never reach execute_tool_calls when budget is Low.
-    /// This test exercises act_with_tools() directly to verify the precedence.
     #[tokio::test]
     async fn budget_low_takes_precedence_over_retry_cap() {
         use crate::budget::ActionCost;
@@ -16313,7 +16802,6 @@ mod per_tool_retry_budget_tests {
         use std::collections::VecDeque;
         use std::sync::Mutex;
 
-        /// Mock LLM that returns canned responses (same pattern as Phase4MockLlm).
         #[derive(Debug)]
         struct MockLlm {
             responses: Mutex<VecDeque<CompletionResponse>>,
@@ -16361,45 +16849,21 @@ mod per_tool_retry_budget_tests {
 
         let config = BudgetConfig {
             max_cost_cents: 100,
+            max_consecutive_failures: 3,
             max_tool_retries: 2,
             ..BudgetConfig::default()
         };
-        let mut engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(config, 0, 0))
-            .context(ContextCompactor::new(2048, 256))
-            .max_iterations(5)
-            .tool_executor(Arc::new(AlwaysSucceedExecutor))
-            .synthesis_instruction("Summarize".to_string())
-            .build()
-            .expect("build");
-
-        // Exhaust read_file retry budget (3 attempts = initial + 2 retries)
-        for i in 1..=3 {
-            let calls = vec![make_call(&i.to_string(), "read_file")];
-            let results = engine.execute_tool_calls(&calls).await.expect("execute");
-            assert!(results[0].success);
-        }
-        // Confirm read_file is blocked at execute_tool_calls level
-        let calls = vec![make_call("blocked", "read_file")];
-        let results = engine.execute_tool_calls(&calls).await.expect("execute");
-        assert!(
-            !results[0].success,
-            "read_file should be blocked by retry cap"
-        );
-
-        // Drain signals from the retry-cap blocking above
+        let mut engine = retry_engine_with_executor(config, Arc::new(AlwaysSucceedExecutor));
+        let blocked_call = make_call("blocked", "read_file");
+        block_signature(&mut engine, &blocked_call);
         engine.signals.drain_all();
 
-        // Now push budget to Low state
         engine.budget.record(&ActionCost {
             cost_cents: 81,
             ..ActionCost::default()
         });
         assert_eq!(engine.budget.state(), BudgetState::Low);
 
-        // Call act_with_tools with the blocked tool — budget-low should
-        // short-circuit before any tool dispatch, returning a budget-blocked
-        // result rather than a retry-cap-blocked result.
         let decision = Decision::UseTools(vec![make_call("5", "read_file")]);
         let tool_calls = match &decision {
             Decision::UseTools(calls) => calls.as_slice(),
@@ -16419,34 +16883,127 @@ mod per_tool_retry_budget_tests {
             .await
             .expect("act_with_tools should succeed with budget-low path");
 
-        // Budget-low path returns immediately — no tools executed at all
-        assert!(
-            action.tool_results.is_empty(),
-            "budget-low should prevent any tool execution, got {} results",
-            action.tool_results.len()
-        );
-        // Response text should mention budget/soft-ceiling, not retry cap
+        assert!(action.tool_results.is_empty());
         assert!(
             action.response_text.contains("budget")
-                || action.response_text.contains("soft-ceiling"),
-            "response should mention budget, got: {}",
-            action.response_text
+                || action.response_text.contains("soft-ceiling")
         );
 
-        // Verify the Blocked signal is for budget, not retry cap
         let signals = engine.signals.drain_all();
         let blocked_signals: Vec<_> = signals
             .iter()
-            .filter(|s| s.kind == SignalKind::Blocked)
+            .filter(|signal| signal.kind == SignalKind::Blocked)
             .collect();
-        assert!(
-            !blocked_signals.is_empty(),
-            "should have emitted a Blocked signal"
-        );
+        assert!(!blocked_signals.is_empty());
         assert_eq!(
-            blocked_signals[0].metadata["reason"], "budget_soft_ceiling",
-            "blocked signal should be budget-based, not retry-cap-based"
+            blocked_signals[0].metadata["reason"],
+            serde_json::json!("budget_soft_ceiling")
         );
+    }
+
+    #[test]
+    fn record_results_tracks_no_progress_end_to_end() {
+        let config = RetryPolicyConfig::default();
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file"), make_call("c2", "write_file")];
+        let results = vec![
+            ToolResult {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "same output".to_string(),
+            },
+            ToolResult {
+                tool_call_id: "c2".to_string(),
+                tool_name: "write_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            },
+        ];
+
+        // Three rounds of identical output for c1 should trigger no-progress.
+        for _ in 0..3 {
+            tracker.record_results(&calls, &results);
+        }
+
+        assert!(matches!(
+            tracker.should_allow(&calls[0], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+        // c2 has different output (same each round, but we need 3 rounds too)
+        // c2 also gets "ok" 3 times, so it should also be blocked.
+        assert!(matches!(
+            tracker.should_allow(&calls[1], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+    }
+
+    #[test]
+    fn record_results_failures_do_not_trigger_no_progress() {
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file")];
+        let failure_results = vec![ToolResult {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: false,
+            output: "error: not found".to_string(),
+        }];
+
+        // Record 5 rounds of failures — should NOT trigger no-progress.
+        for _ in 0..5 {
+            tracker.record_results(&calls, &failure_results);
+        }
+
+        // No-progress map should be empty because failures skip record_progress.
+        assert!(tracker.no_progress.is_empty());
+        // Failures should be tracked independently.
+        assert_eq!(tracker.consecutive_failures_for(&calls[0]), 5);
+    }
+
+    #[test]
+    fn record_results_mixed_success_failure_no_progress() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            max_consecutive_failures: 10,
+            max_cycle_failures: 20,
+        };
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file"), make_call("c2", "write_file")];
+
+        // c1 succeeds, c2 fails
+        let results = vec![
+            ToolResult {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "same output".to_string(),
+            },
+            ToolResult {
+                tool_call_id: "c2".to_string(),
+                tool_name: "write_file".to_string(),
+                success: false,
+                output: "error: permission denied".to_string(),
+            },
+        ];
+
+        for _ in 0..3 {
+            tracker.record_results(&calls, &results);
+        }
+
+        // c1 (success) should have no-progress tracked
+        assert!(matches!(
+            tracker.should_allow(&calls[0], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+        // c2 (failure) should NOT have no-progress tracked
+        assert!(!tracker
+            .no_progress
+            .contains_key(&CallSignature::from_call(&calls[1])));
+        // c2 failures tracked separately
+        assert_eq!(tracker.consecutive_failures_for(&calls[1]), 3);
     }
 }
 

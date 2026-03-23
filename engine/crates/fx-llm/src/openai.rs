@@ -694,8 +694,7 @@ fn map_openai_input_block(block: &ContentBlock) -> Option<OpenAiInputBlock> {
 }
 
 fn parse_json_or_string(value: &str) -> Value {
-    let normalized = crate::normalize_tool_arguments(value);
-    serde_json::from_str(normalized).unwrap_or_else(|_| Value::String(value.to_string()))
+    crate::parse_tool_arguments_object(value)
 }
 
 fn value_to_openai_content(value: Value) -> String {
