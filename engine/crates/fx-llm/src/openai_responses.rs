@@ -831,6 +831,22 @@ fn summarize_input_item(index: usize, item: &Value) -> String {
     format!("{index}:unknown")
 }
 
+/// Normalize a tool call ID for OpenAI Responses API compatibility.
+/// OpenAI requires call_id to match `^fc_`. If the ID already starts
+/// with `fc_`, return as-is. Otherwise, strip known prefixes and add `fc_`.
+fn normalize_call_id(id: &str) -> String {
+    if id.starts_with("fc_") {
+        return id.to_string();
+    }
+
+    let stripped = id
+        .strip_prefix("toolu_")
+        .or_else(|| id.strip_prefix("call_"))
+        .unwrap_or(id);
+
+    format!("fc_{stripped}")
+}
+
 fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
     let content = response_input_content(role, blocks);
     if content.is_empty() {
@@ -1626,6 +1642,69 @@ mod tests {
             max_tokens: None,
             thinking: None,
         }
+    }
+
+    #[test]
+    fn normalize_call_id_passes_fc_through() {
+        assert_eq!(normalize_call_id("fc_123"), "fc_123");
+    }
+
+    #[test]
+    fn normalize_call_id_remaps_toolu_prefix() {
+        assert_eq!(normalize_call_id("toolu_011VJLabcdef"), "fc_011VJLabcdef");
+    }
+
+    #[test]
+    fn normalize_call_id_remaps_call_prefix() {
+        assert_eq!(normalize_call_id("call_abc123"), "fc_abc123");
+    }
+
+    #[test]
+    fn normalize_call_id_remaps_unknown_prefix() {
+        assert_eq!(normalize_call_id("xyz789"), "fc_xyz789");
+    }
+
+    #[test]
+    fn build_request_body_normalizes_anthropic_tool_ids_for_openai_responses() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "toolu_011VJLabcdef".to_string(),
+                        provider_id: None,
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({"q": "weather"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "toolu_011VJLabcdef".to_string(),
+                        content: Value::String("sunny".to_string()),
+                    }],
+                },
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+        let function_call_call_id = input[0]["call_id"].as_str().unwrap();
+        let function_call_output_call_id = input[1]["call_id"].as_str().unwrap();
+
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert!(function_call_call_id.starts_with("fc_"));
+        assert!(function_call_output_call_id.starts_with("fc_"));
+        assert_eq!(function_call_call_id, function_call_output_call_id);
     }
 
     #[test]

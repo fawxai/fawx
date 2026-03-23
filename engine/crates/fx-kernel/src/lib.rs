@@ -48,6 +48,7 @@ pub mod reason;
 pub mod rollback;
 pub mod signals;
 pub mod streaming;
+pub mod system_prompt;
 pub mod types;
 pub mod user_facing_error;
 pub mod watchdog;
