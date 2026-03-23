@@ -140,6 +140,52 @@ pub struct BudgetConfig {
     /// Total attempts in the old model = `max_tool_retries + 1`.
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: u8,
+    /// Controls graceful termination behavior when budget limits fire and
+    /// how tool-only turn runs are handled.
+    #[serde(default)]
+    pub termination: TerminationConfig,
+}
+
+/// Controls how the loop exits when a budget limit fires and how consecutive
+/// tool-only turns are managed (nudge → strip → synthesize).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminationConfig {
+    /// When true, make one final LLM call with tools stripped to force a
+    /// text response before returning `BudgetExhausted`.
+    #[serde(default = "default_synthesize_on_exhaustion")]
+    pub synthesize_on_exhaustion: bool,
+
+    /// Consecutive tool-only turns before injecting a nudge message telling
+    /// the agent to respond to the user. 0 disables the nudge.
+    #[serde(default = "default_nudge_after_tool_turns")]
+    pub nudge_after_tool_turns: u16,
+
+    /// Additional consecutive tool-only turns *after the nudge fires* before
+    /// tools are stripped entirely, forcing a text response. 0 means strip
+    /// immediately when the nudge threshold is reached. Set to `u16::MAX`
+    /// to disable stripping while keeping the nudge.
+    #[serde(default = "default_strip_tools_after_nudge")]
+    pub strip_tools_after_nudge: u16,
+}
+
+fn default_synthesize_on_exhaustion() -> bool {
+    true
+}
+fn default_nudge_after_tool_turns() -> u16 {
+    6
+}
+fn default_strip_tools_after_nudge() -> u16 {
+    3
+}
+
+impl Default for TerminationConfig {
+    fn default() -> Self {
+        Self {
+            synthesize_on_exhaustion: true,
+            nudge_after_tool_turns: 6,
+            strip_tools_after_nudge: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +214,8 @@ struct BudgetConfigSerde {
     max_cycle_failures: u16,
     #[serde(default)]
     max_tool_retries: Option<u8>,
+    #[serde(default)]
+    termination: TerminationConfig,
 }
 
 impl From<BudgetConfigSerde> for BudgetConfig {
@@ -196,6 +244,7 @@ impl From<BudgetConfigSerde> for BudgetConfig {
             max_consecutive_failures,
             max_cycle_failures: value.max_cycle_failures,
             max_tool_retries,
+            termination: value.termination,
         }
     }
 }
@@ -273,6 +322,7 @@ impl BudgetConfig {
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
+            termination: TerminationConfig::default(),
         }
     }
 
@@ -312,6 +362,7 @@ impl BudgetConfig {
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
+            termination: TerminationConfig::default(),
         }
     }
 
@@ -343,6 +394,7 @@ impl Default for BudgetConfig {
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
             max_tool_retries,
+            termination: TerminationConfig::default(),
         }
     }
 }
@@ -494,6 +546,7 @@ impl BudgetAllocator {
                 max_consecutive_failures: template.max_consecutive_failures,
                 max_cycle_failures: template.max_cycle_failures,
                 max_tool_retries: template.max_tool_retries,
+                termination: template.termination.clone(),
             });
         }
 
@@ -1130,6 +1183,7 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_consecutive_failures: template.max_consecutive_failures,
         max_cycle_failures: template.max_cycle_failures,
         max_tool_retries: template.max_tool_retries,
+        termination: template.termination.clone(),
     }
 }
 
@@ -1150,6 +1204,7 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_consecutive_failures: template.max_consecutive_failures,
         max_cycle_failures: template.max_cycle_failures,
         max_tool_retries: template.max_tool_retries,
+        termination: template.termination.clone(),
     }
 }
 
@@ -1221,6 +1276,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         }
     }
 
@@ -1251,6 +1307,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         }
     }
 
@@ -1847,6 +1904,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
         let allocator = BudgetAllocator {
@@ -1893,6 +1951,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1949,6 +2008,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1983,6 +2043,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -2036,6 +2097,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -2098,6 +2160,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -2128,6 +2191,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -2162,6 +2226,7 @@ mod tests {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {

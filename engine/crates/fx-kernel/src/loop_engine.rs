@@ -1242,11 +1242,6 @@ Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
 const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
-/// Consecutive tool-only iterations before injecting a nudge asking the model
-/// to share progress. Tuned to balance responsiveness (lower = more nudges)
-/// against autonomy (higher = fewer interruptions). 6 is ~3 tool-call rounds
-/// in a typical agentic workflow.
-const TOOL_ONLY_TURN_NUDGE_THRESHOLD: u16 = 6;
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -1509,10 +1504,14 @@ impl LoopEngine {
                             iterations,
                             signals,
                         } => {
-                            let reasoning_messages =
-                                std::mem::take(&mut self.last_reasoning_messages);
                             let synthesized =
-                                self.forced_synthesis_turn(llm, &reasoning_messages).await;
+                                if self.budget.config().termination.synthesize_on_exhaustion {
+                                    let reasoning_messages =
+                                        std::mem::take(&mut self.last_reasoning_messages);
+                                    self.forced_synthesis_turn(llm, &reasoning_messages).await
+                                } else {
+                                    None
+                                };
                             LoopResult::BudgetExhausted {
                                 partial_response: Some(Self::resolve_budget_exhausted_response(
                                     synthesized,
@@ -1858,6 +1857,11 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         messages: &[Message],
     ) -> Option<String> {
+        if !self.budget.config().termination.synthesize_on_exhaustion {
+            tracing::debug!("skipping forced synthesis: synthesize_on_exhaustion disabled");
+            return None;
+        }
+
         let mut synthesis_messages = messages.to_vec();
         synthesis_messages.push(Message::system(
             BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE.to_string(),
@@ -2009,7 +2013,8 @@ impl LoopEngine {
             context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
         }
 
-        if self.consecutive_tool_only_turns >= TOOL_ONLY_TURN_NUDGE_THRESHOLD {
+        let nudge_at = self.budget.config().termination.nudge_after_tool_turns;
+        if nudge_at > 0 && self.consecutive_tool_only_turns >= nudge_at {
             context_window.push(Message::system(TOOL_ONLY_TURN_NUDGE.to_string()));
         }
 
@@ -2037,10 +2042,25 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
+        let tc = &self.budget.config().termination;
+        let should_strip_tools = tc.nudge_after_tool_turns > 0
+            && self.consecutive_tool_only_turns
+                >= tc
+                    .nudge_after_tool_turns
+                    .saturating_add(tc.strip_tools_after_nudge);
+        let tools = if should_strip_tools {
+            tracing::info!(
+                turns = self.consecutive_tool_only_turns,
+                "stripping tools: agent exceeded nudge + grace threshold"
+            );
+            vec![]
+        } else {
+            self.tool_executor.tool_definitions()
+        };
         let request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
-            self.tool_executor.tool_definitions(),
+            tools,
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
@@ -2886,6 +2906,7 @@ impl LoopEngine {
             max_consecutive_failures: template.max_consecutive_failures,
             max_cycle_failures: template.max_cycle_failures,
             max_tool_retries: template.max_tool_retries,
+            termination: template.termination.clone(),
         }
     }
 
@@ -5669,7 +5690,13 @@ fn build_reasoning_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    // When tools are explicitly empty (e.g., stripped for tool-only turn enforcement),
+    // skip adding the decompose tool — the intent is to force a text-only response.
+    let tools = if tool_definitions.is_empty() {
+        vec![]
+    } else {
+        tool_definitions_with_decompose(tool_definitions)
+    };
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -14363,9 +14390,10 @@ mod r2_streaming_review_tests {
 
 #[cfg(test)]
 mod loop_resilience_tests {
+    use super::test_fixtures::RecordingLlm;
     use super::*;
     use crate::act::{ToolExecutor, ToolResult};
-    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker};
+    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker, TerminationConfig};
     use crate::cancellation::CancellationToken;
     use crate::context_manager::ContextCompactor;
     use async_trait::async_trait;
@@ -14532,6 +14560,21 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build")
+    }
+
+    fn engine_with_tracker(budget: BudgetTracker) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(budget)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn engine_with_budget(config: BudgetConfig) -> LoopEngine {
+        engine_with_tracker(BudgetTracker::new(config, 0, 0))
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -14791,7 +14834,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_injected_at_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = TOOL_ONLY_TURN_NUDGE_THRESHOLD;
+        engine.consecutive_tool_only_turns = 6;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14810,7 +14853,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_not_injected_below_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = TOOL_ONLY_TURN_NUDGE_THRESHOLD - 1;
+        engine.consecutive_tool_only_turns = 6 - 1;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14824,6 +14867,242 @@ mod loop_resilience_tests {
             })
         });
         assert!(!has_nudge, "tool-only nudge should stay below threshold");
+    }
+
+    #[tokio::test]
+    async fn nudge_threshold_from_config() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 4,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        engine.consecutive_tool_only_turns = 4;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(has_nudge, "nudge should fire at custom threshold 4");
+    }
+
+    #[tokio::test]
+    async fn nudge_disabled_when_zero() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        engine.consecutive_tool_only_turns = 100;
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+
+        let has_nudge = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("working for several steps"),
+                _ => false,
+            })
+        });
+        assert!(!has_nudge, "nudge should never fire when threshold is 0");
+    }
+
+    #[tokio::test]
+    async fn tools_stripped_immediately_when_grace_is_zero() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = engine_with_budget(config);
+        engine.consecutive_tool_only_turns = 3;
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Here is my summary.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        assert!(llm.requests()[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_stripped_after_nudge_grace() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 2,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        // At turn 5 (3 nudge + 2 grace), tools should be stripped
+        engine.consecutive_tool_only_turns = 5;
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Here is my summary.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].tools.is_empty(),
+            "tools should be stripped at turn {}, threshold {}",
+            5,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_not_stripped_before_grace() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 2,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+        // At turn 4 (below 3+2=5), tools should NOT be stripped
+        engine.consecutive_tool_only_turns = 4;
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "still working".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].tools.is_empty(),
+            "tools should still be present at turn 4, threshold 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_skipped_when_disabled() {
+        let config = BudgetConfig {
+            max_llm_calls: 1,
+            termination: TerminationConfig {
+                synthesize_on_exhaustion: false,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut budget = BudgetTracker::new(config, 0, 0);
+        budget.record(&ActionCost {
+            llm_calls: 1,
+            ..ActionCost::default()
+        });
+
+        let engine = engine_with_tracker(budget);
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "synthesized".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+        let messages = vec![Message::user("hello")];
+
+        let result = engine.forced_synthesis_turn(&llm, &messages).await;
+
+        assert_eq!(result, None);
+        assert!(llm.requests().is_empty());
+    }
+
+    #[test]
+    fn default_termination_config_matches_current_behavior() {
+        let config = TerminationConfig::default();
+        assert!(config.synthesize_on_exhaustion);
+        assert_eq!(config.nudge_after_tool_turns, 6);
+        assert_eq!(config.strip_tools_after_nudge, 3);
     }
 
     #[test]
