@@ -544,10 +544,17 @@ impl Drop for ErrorCallbackGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoProgressState {
+    last_result_hash: u64,
+    consecutive_same: u16,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ToolRetryTracker {
     signature_failures: HashMap<CallSignature, u16>,
     cycle_total_failures: u16,
+    no_progress: HashMap<CallSignature, NoProgressState>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -583,15 +590,48 @@ impl ToolRetryTracker {
             };
         }
 
+        let signature = CallSignature::from_call(call);
+        if let Some(state) = self.no_progress.get(&signature) {
+            if state.consecutive_same >= config.max_no_progress {
+                return RetryVerdict::Block {
+                    reason: no_progress_reason(&call.name, state.consecutive_same),
+                };
+            }
+        }
+
         RetryVerdict::Allow
     }
 
     fn record_results(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
-        let result_successes = result_successes_by_id(results);
+        let result_map: HashMap<&str, &ToolResult> = results
+            .iter()
+            .map(|r| (r.tool_call_id.as_str(), r))
+            .collect();
         for call in calls {
-            if let Some(success) = result_successes.get(call.id.as_str()) {
-                self.record_result(call, *success);
+            if let Some(result) = result_map.get(call.id.as_str()) {
+                self.record_result(call, result.success);
+                if result.success {
+                    self.record_progress(call, &result.output);
+                }
             }
+        }
+    }
+
+    fn record_progress(&mut self, call: &ToolCall, output: &str) {
+        let signature = CallSignature::from_call(call);
+        let result_hash = hash_string(output);
+        let entry = self
+            .no_progress
+            .entry(signature)
+            .or_insert(NoProgressState {
+                last_result_hash: result_hash,
+                consecutive_same: 0,
+            });
+        if entry.last_result_hash == result_hash {
+            entry.consecutive_same = entry.consecutive_same.saturating_add(1);
+        } else {
+            entry.last_result_hash = result_hash;
+            entry.consecutive_same = 1;
         }
     }
 
@@ -617,6 +657,7 @@ impl ToolRetryTracker {
     fn clear(&mut self) {
         self.signature_failures.clear();
         self.cycle_total_failures = 0;
+        self.no_progress.clear();
     }
 }
 
@@ -638,19 +679,27 @@ fn hash_tool_arguments(arguments: &serde_json::Value) -> u64 {
     hasher.finish()
 }
 
-fn result_successes_by_id(results: &[ToolResult]) -> HashMap<&str, bool> {
-    results
-        .iter()
-        .map(|result| (result.tool_call_id.as_str(), result.success))
-        .collect()
-}
-
 fn cycle_failure_limit_reason() -> String {
     "too many total failures this cycle".to_string()
 }
 
 fn same_call_failure_reason(failures: u16) -> String {
     format!("same call failed {failures} times consecutively")
+}
+
+fn no_progress_reason(tool_name: &str, count: u16) -> String {
+    format!(
+        "tool '{}' returned the same result {} times with identical arguments \
+         — no progress detected",
+        tool_name, count
+    )
+}
+
+fn hash_string(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Default)]
@@ -2905,6 +2954,7 @@ impl LoopEngine {
             max_synthesis_tokens: template.max_synthesis_tokens,
             max_consecutive_failures: template.max_consecutive_failures,
             max_cycle_failures: template.max_cycle_failures,
+            max_no_progress: template.max_no_progress,
             max_tool_retries: template.max_tool_retries,
             termination: template.termination.clone(),
         }
@@ -17096,6 +17146,7 @@ mod per_tool_retry_policy_tests {
         let config = RetryPolicyConfig {
             max_consecutive_failures: 2,
             max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
         };
         let call = make_call("1", "read_file");
         let mut tracker = ToolRetryTracker::default();
@@ -17120,6 +17171,7 @@ mod per_tool_retry_policy_tests {
         let config = RetryPolicyConfig {
             max_consecutive_failures: 2,
             max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
         };
         let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
         let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
@@ -17145,6 +17197,7 @@ mod per_tool_retry_policy_tests {
         let config = RetryPolicyConfig {
             max_consecutive_failures: 10,
             max_cycle_failures: 2,
+            ..RetryPolicyConfig::default()
         };
         let mut tracker = ToolRetryTracker::default();
         let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
@@ -17159,6 +17212,120 @@ mod per_tool_retry_policy_tests {
             tracker.should_allow(&fresh_call, &config),
             RetryVerdict::Block { ref reason } if reason == &cycle_failure_limit_reason()
         ));
+    }
+
+    #[test]
+    fn no_progress_blocks_after_threshold() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        for _ in 0..3 {
+            tracker.record_progress(&call, "same output");
+        }
+
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+    }
+
+    #[test]
+    fn no_progress_resets_on_different_output() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        tracker.record_progress(&call, "output A");
+        tracker.record_progress(&call, "output A");
+        tracker.record_progress(&call, "output B");
+
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn no_progress_independent_per_signature() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call_a = make_call_with_args("1", "read_file", serde_json::json!({"path": "a"}));
+        let call_b = make_call_with_args("2", "read_file", serde_json::json!({"path": "b"}));
+        let mut tracker = ToolRetryTracker::default();
+
+        for _ in 0..3 {
+            tracker.record_progress(&call_a, "same output");
+        }
+
+        assert!(matches!(
+            tracker.should_allow(&call_a, &config),
+            RetryVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            tracker.should_allow(&call_b, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn no_progress_does_not_affect_failures() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 5,
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        // Record failures (should not interact with no-progress)
+        tracker.record_result(&call, false);
+        tracker.record_result(&call, false);
+        assert_eq!(tracker.consecutive_failures_for(&call), 2);
+
+        // Record same output (should not interact with failures)
+        tracker.record_progress(&call, "same output");
+        tracker.record_progress(&call, "same output");
+        assert_eq!(tracker.consecutive_failures_for(&call), 2);
+
+        // Still allowed (neither threshold hit)
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn clear_resets_no_progress() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = ToolRetryTracker::default();
+
+        for _ in 0..3 {
+            tracker.record_progress(&call, "same output");
+        }
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Block { .. }
+        ));
+
+        tracker.clear();
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+        assert!(tracker.no_progress.is_empty());
     }
 
     #[test]
@@ -17372,6 +17539,111 @@ mod per_tool_retry_policy_tests {
             blocked_signals[0].metadata["reason"],
             serde_json::json!("budget_soft_ceiling")
         );
+    }
+
+    #[test]
+    fn record_results_tracks_no_progress_end_to_end() {
+        let config = RetryPolicyConfig::default();
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file"), make_call("c2", "write_file")];
+        let results = vec![
+            ToolResult {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "same output".to_string(),
+            },
+            ToolResult {
+                tool_call_id: "c2".to_string(),
+                tool_name: "write_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            },
+        ];
+
+        // Three rounds of identical output for c1 should trigger no-progress.
+        for _ in 0..3 {
+            tracker.record_results(&calls, &results);
+        }
+
+        assert!(matches!(
+            tracker.should_allow(&calls[0], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+        // c2 has different output (same each round, but we need 3 rounds too)
+        // c2 also gets "ok" 3 times, so it should also be blocked.
+        assert!(matches!(
+            tracker.should_allow(&calls[1], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+    }
+
+    #[test]
+    fn record_results_failures_do_not_trigger_no_progress() {
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file")];
+        let failure_results = vec![ToolResult {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: false,
+            output: "error: not found".to_string(),
+        }];
+
+        // Record 5 rounds of failures — should NOT trigger no-progress.
+        for _ in 0..5 {
+            tracker.record_results(&calls, &failure_results);
+        }
+
+        // No-progress map should be empty because failures skip record_progress.
+        assert!(tracker.no_progress.is_empty());
+        // Failures should be tracked independently.
+        assert_eq!(tracker.consecutive_failures_for(&calls[0]), 5);
+    }
+
+    #[test]
+    fn record_results_mixed_success_failure_no_progress() {
+        let config = RetryPolicyConfig {
+            max_no_progress: 3,
+            max_consecutive_failures: 10,
+            max_cycle_failures: 20,
+        };
+        let mut tracker = ToolRetryTracker::default();
+
+        let calls = vec![make_call("c1", "read_file"), make_call("c2", "write_file")];
+
+        // c1 succeeds, c2 fails
+        let results = vec![
+            ToolResult {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "same output".to_string(),
+            },
+            ToolResult {
+                tool_call_id: "c2".to_string(),
+                tool_name: "write_file".to_string(),
+                success: false,
+                output: "error: permission denied".to_string(),
+            },
+        ];
+
+        for _ in 0..3 {
+            tracker.record_results(&calls, &results);
+        }
+
+        // c1 (success) should have no-progress tracked
+        assert!(matches!(
+            tracker.should_allow(&calls[0], &config),
+            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+        ));
+        // c2 (failure) should NOT have no-progress tracked
+        assert!(!tracker
+            .no_progress
+            .contains_key(&CallSignature::from_call(&calls[1])));
+        // c2 failures tracked separately
+        assert_eq!(tracker.consecutive_failures_for(&calls[1]), 3);
     }
 }
 

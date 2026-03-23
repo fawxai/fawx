@@ -28,6 +28,7 @@ pub(crate) const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 pub(crate) const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u16 = 3;
 const DEFAULT_MAX_CYCLE_FAILURES: u16 = 15;
+const DEFAULT_MAX_NO_PROGRESS: u16 = 3;
 #[cfg(test)]
 const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
 const COMPLEXITY_KEYWORDS: [&str; 6] = [
@@ -55,6 +56,9 @@ pub struct RetryPolicyConfig {
     /// Max total failures across all tools before circuit-breaking the cycle.
     #[serde(default = "default_max_cycle_failures")]
     pub max_cycle_failures: u16,
+    /// Max times the same (tool, args) can return the same result before blocking.
+    #[serde(default = "default_max_no_progress")]
+    pub max_no_progress: u16,
 }
 
 impl RetryPolicyConfig {
@@ -62,6 +66,7 @@ impl RetryPolicyConfig {
         Self {
             max_consecutive_failures: 2,
             max_cycle_failures: 8,
+            max_no_progress: 2,
         }
     }
 
@@ -69,6 +74,7 @@ impl RetryPolicyConfig {
         Self {
             max_consecutive_failures: 10,
             max_cycle_failures: 50,
+            max_no_progress: 5,
         }
     }
 
@@ -76,6 +82,7 @@ impl RetryPolicyConfig {
         Self {
             max_consecutive_failures: u16::MAX,
             max_cycle_failures: u16::MAX,
+            max_no_progress: u16::MAX,
         }
     }
 }
@@ -85,6 +92,7 @@ impl Default for RetryPolicyConfig {
         Self {
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
         }
     }
 }
@@ -136,6 +144,9 @@ pub struct BudgetConfig {
     /// Max total failures across all tools before circuit-breaking the cycle.
     #[serde(default = "default_max_cycle_failures")]
     pub max_cycle_failures: u16,
+    /// Max times the same (tool, args) can return the same result before blocking.
+    #[serde(default = "default_max_no_progress")]
+    pub max_no_progress: u16,
     /// Legacy compatibility field for configs that still set `max_tool_retries`.
     /// Total attempts in the old model = `max_tool_retries + 1`.
     #[serde(default = "default_max_tool_retries")]
@@ -212,6 +223,8 @@ struct BudgetConfigSerde {
     max_consecutive_failures: u16,
     #[serde(default = "default_max_cycle_failures")]
     max_cycle_failures: u16,
+    #[serde(default = "default_max_no_progress")]
+    max_no_progress: u16,
     #[serde(default)]
     max_tool_retries: Option<u8>,
     #[serde(default)]
@@ -243,6 +256,7 @@ impl From<BudgetConfigSerde> for BudgetConfig {
             max_synthesis_tokens: value.max_synthesis_tokens,
             max_consecutive_failures,
             max_cycle_failures: value.max_cycle_failures,
+            max_no_progress: value.max_no_progress,
             max_tool_retries,
             termination: value.termination,
         }
@@ -254,6 +268,7 @@ impl From<&BudgetConfig> for RetryPolicyConfig {
         Self {
             max_consecutive_failures: value.max_consecutive_failures,
             max_cycle_failures: value.max_cycle_failures,
+            max_no_progress: value.max_no_progress,
         }
     }
 }
@@ -284,6 +299,10 @@ fn default_max_consecutive_failures() -> u16 {
 
 fn default_max_cycle_failures() -> u16 {
     DEFAULT_MAX_CYCLE_FAILURES
+}
+
+fn default_max_no_progress() -> u16 {
+    DEFAULT_MAX_NO_PROGRESS
 }
 
 fn default_max_tool_retries() -> u8 {
@@ -319,6 +338,7 @@ impl BudgetConfig {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
+            max_no_progress: retry_policy.max_no_progress,
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
@@ -332,6 +352,7 @@ impl BudgetConfig {
         Self {
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
+            max_no_progress: retry_policy.max_no_progress,
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
@@ -359,6 +380,7 @@ impl BudgetConfig {
             max_synthesis_tokens: usize::MAX,
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
+            max_no_progress: retry_policy.max_no_progress,
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
@@ -393,6 +415,7 @@ impl Default for BudgetConfig {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
+            max_no_progress: retry_policy.max_no_progress,
             max_tool_retries,
             termination: TerminationConfig::default(),
         }
@@ -545,6 +568,7 @@ impl BudgetAllocator {
                 max_synthesis_tokens: template.max_synthesis_tokens,
                 max_consecutive_failures: template.max_consecutive_failures,
                 max_cycle_failures: template.max_cycle_failures,
+                max_no_progress: template.max_no_progress,
                 max_tool_retries: template.max_tool_retries,
                 termination: template.termination.clone(),
             });
@@ -1182,6 +1206,7 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_synthesis_tokens: template.max_synthesis_tokens,
         max_consecutive_failures: template.max_consecutive_failures,
         max_cycle_failures: template.max_cycle_failures,
+        max_no_progress: template.max_no_progress,
         max_tool_retries: template.max_tool_retries,
         termination: template.termination.clone(),
     }
@@ -1203,6 +1228,7 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_synthesis_tokens: template.max_synthesis_tokens,
         max_consecutive_failures: template.max_consecutive_failures,
         max_cycle_failures: template.max_cycle_failures,
+        max_no_progress: template.max_no_progress,
         max_tool_retries: template.max_tool_retries,
         termination: template.termination.clone(),
     }
@@ -1275,6 +1301,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         }
@@ -1306,6 +1333,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         }
@@ -1751,6 +1779,7 @@ mod tests {
         let expected = BudgetConfig {
             max_consecutive_failures: retry_policy.max_consecutive_failures,
             max_cycle_failures: retry_policy.max_cycle_failures,
+            max_no_progress: retry_policy.max_no_progress,
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
@@ -1903,6 +1932,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -1950,6 +1980,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2007,6 +2038,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2042,6 +2074,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2096,6 +2129,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2159,6 +2193,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2190,6 +2225,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2225,6 +2261,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             termination: TerminationConfig::default(),
         };
@@ -2365,6 +2402,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
@@ -2389,6 +2427,7 @@ mod tests {
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
+            max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
