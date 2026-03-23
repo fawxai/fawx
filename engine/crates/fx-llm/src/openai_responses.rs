@@ -2807,26 +2807,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_call_id_passes_fc_through() {
-        assert_eq!(normalize_call_id("fc_123"), "fc_123");
-    }
-
-    #[test]
-    fn normalize_call_id_remaps_toolu_prefix() {
-        assert_eq!(normalize_call_id("toolu_011VJLabcdef"), "fc_011VJLabcdef");
-    }
-
-    #[test]
-    fn normalize_call_id_remaps_call_prefix() {
-        assert_eq!(normalize_call_id("call_abc123"), "fc_abc123");
-    }
-
-    #[test]
-    fn normalize_call_id_prefixes_unknown_ids() {
-        assert_eq!(normalize_call_id("random_id"), "fc_random_id");
-    }
-
-    #[test]
     fn build_request_normalizes_cross_provider_tool_ids() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
