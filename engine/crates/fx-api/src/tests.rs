@@ -2998,6 +2998,30 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_empty_session_memory_returns_empty_arrays() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-empty");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let resp = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/memory")))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "key_decisions": [],
+                "active_files": [],
+                "custom_context": [],
+                "last_updated": 0
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn put_session_memory_persists_and_updates_loaded_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-put");

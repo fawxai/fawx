@@ -124,6 +124,24 @@ final class SessionTests: XCTestCase {
         XCTAssertGreaterThan(memory.estimatedTokens, memory.keyDecisions.count)
     }
 
+    func testSessionMemoryDecodesMinimalPayloadUsingEmptyCollectionDefaults() throws {
+        let payload = """
+        {
+          "project": "Compaction UX",
+          "last_updated": 42
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(SessionMemory.self, from: Data(payload.utf8))
+
+        XCTAssertEqual(decoded.project, "Compaction UX")
+        XCTAssertNil(decoded.currentState)
+        XCTAssertEqual(decoded.keyDecisions, [])
+        XCTAssertEqual(decoded.activeFiles, [])
+        XCTAssertEqual(decoded.customContext, [])
+        XCTAssertEqual(decoded.lastUpdated, 42)
+    }
+
     private func makeSession(
         key: String,
         label: String? = nil,
