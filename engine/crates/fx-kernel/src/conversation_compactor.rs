@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "orphaned tool_result")]
+    #[should_panic(expected = "has no matching earlier assistant tool_use")]
     fn debug_assert_tool_pair_integrity_catches_orphan() {
         let messages = vec![user(10), tool_result("orphan", 10)];
 
