@@ -631,42 +631,66 @@ final class ChatViewModel {
             return fetchedMessages
         }
 
-        let optimisticLocalTail = optimisticLocalTailMissingFromFetched(
-            existingMessages,
-            comparedTo: fetchedMessages
+        return mergeFetchedMessagesPreservingRelativeOrder(
+            localMessages: existingMessages,
+            fetchedMessages: fetchedMessages
         )
-        if !optimisticLocalTail.isEmpty {
-            return fetchedMessages + optimisticLocalTail
-        }
-
-        return fetchedMessages
     }
 
-    private func optimisticLocalTailMissingFromFetched(
-        _ localMessages: [SessionMessage],
-        comparedTo fetchedMessages: [SessionMessage]
+    private func mergeFetchedMessagesPreservingRelativeOrder(
+        localMessages: [SessionMessage],
+        fetchedMessages: [SessionMessage]
     ) -> [SessionMessage] {
         let sharedPrefixCount = commonEquivalentPrefixCount(localMessages, fetchedMessages)
-        guard sharedPrefixCount > 0, sharedPrefixCount < localMessages.count else {
-            return []
+        guard sharedPrefixCount > 0 else {
+            return fetchedMessages
         }
 
-        var nextFetchedSearchIndex = sharedPrefixCount
-        var missingLocalTail: [SessionMessage] = []
+        var mergedMessages = Array(fetchedMessages.prefix(sharedPrefixCount))
+        var nextLocalIndex = sharedPrefixCount
+        var nextFetchedIndex = sharedPrefixCount
 
-        for localMessage in localMessages.dropFirst(sharedPrefixCount) {
-            if let matchedIndex = indexOfEquivalentMessage(
-                localMessage,
-                in: fetchedMessages,
-                startingAt: nextFetchedSearchIndex
+        while nextLocalIndex < localMessages.count, nextFetchedIndex < fetchedMessages.count {
+            if messagesAreEquivalentForTranscriptMerge(
+                localMessages[nextLocalIndex],
+                fetchedMessages[nextFetchedIndex]
             ) {
-                nextFetchedSearchIndex = matchedIndex + 1
-            } else {
-                missingLocalTail.append(localMessage)
+                mergedMessages.append(fetchedMessages[nextFetchedIndex])
+                nextLocalIndex += 1
+                nextFetchedIndex += 1
+                continue
             }
+
+            guard let alignment = nextEquivalentMessageAlignment(
+                localMessages: localMessages,
+                startingAt: nextLocalIndex,
+                fetchedMessages: fetchedMessages,
+                startingAt: nextFetchedIndex
+            ) else {
+                mergedMessages.append(contentsOf: fetchedMessages[nextFetchedIndex...])
+                mergedMessages.append(contentsOf: localMessages[nextLocalIndex...])
+                return mergedMessages
+            }
+
+            if nextFetchedIndex < alignment.fetchedIndex {
+                mergedMessages.append(contentsOf: fetchedMessages[nextFetchedIndex..<alignment.fetchedIndex])
+            }
+            if nextLocalIndex < alignment.localIndex {
+                mergedMessages.append(contentsOf: localMessages[nextLocalIndex..<alignment.localIndex])
+            }
+            mergedMessages.append(fetchedMessages[alignment.fetchedIndex])
+            nextLocalIndex = alignment.localIndex + 1
+            nextFetchedIndex = alignment.fetchedIndex + 1
         }
 
-        return missingLocalTail
+        if nextFetchedIndex < fetchedMessages.count {
+            mergedMessages.append(contentsOf: fetchedMessages[nextFetchedIndex...])
+        }
+        if nextLocalIndex < localMessages.count {
+            mergedMessages.append(contentsOf: localMessages[nextLocalIndex...])
+        }
+
+        return mergedMessages
     }
 
     private func commonEquivalentPrefixCount(
@@ -683,6 +707,55 @@ final class ChatViewModel {
         }
 
         return prefixCount
+    }
+
+    /// Finds the nearest equivalent message pair between the local and fetched sequences,
+    /// starting from the given indices. "Nearest" is defined by minimum combined distance
+    /// from the start indices, with ties broken by preferring an earlier local index.
+    ///
+    /// Time complexity: O(L × F) where L = remaining local messages and F = remaining fetched
+    /// messages. Each local candidate triggers a linear scan of the fetched tail via
+    /// `indexOfEquivalentMessage`. This is acceptable for transcript-sized inputs (tens to
+    /// low hundreds of messages).
+    private func nextEquivalentMessageAlignment(
+        localMessages: [SessionMessage],
+        startingAt localStartIndex: Int,
+        fetchedMessages: [SessionMessage],
+        startingAt fetchedStartIndex: Int
+    ) -> (localIndex: Int, fetchedIndex: Int)? {
+        guard localStartIndex < localMessages.count, fetchedStartIndex < fetchedMessages.count else {
+            return nil
+        }
+
+        var bestAlignment: (localIndex: Int, fetchedIndex: Int, distance: Int)?
+
+        for localIndex in localStartIndex..<localMessages.count {
+            guard let fetchedIndex = indexOfEquivalentMessage(
+                localMessages[localIndex],
+                in: fetchedMessages,
+                startingAt: fetchedStartIndex
+            ) else {
+                continue
+            }
+
+            let distance = (localIndex - localStartIndex) + (fetchedIndex - fetchedStartIndex)
+            if let bestAlignment {
+                if distance > bestAlignment.distance {
+                    continue
+                }
+                if distance == bestAlignment.distance, localIndex > bestAlignment.localIndex {
+                    continue
+                }
+            }
+
+            bestAlignment = (localIndex, fetchedIndex, distance)
+        }
+
+        guard let bestAlignment else {
+            return nil
+        }
+
+        return (bestAlignment.localIndex, bestAlignment.fetchedIndex)
     }
 
     private func indexOfEquivalentMessage(

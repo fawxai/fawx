@@ -416,6 +416,85 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(toolGroups[0].toolCalls[0].result, "docs")
     }
 
+    func testApplyFetchedMessagesKeepsEarlierOptimisticAssistantBeforeLaterMatchedTurn() {
+        let sut = makeSUT()
+        let initialUserMessage = SessionMessage(role: .user, content: "Inspect the docs", timestamp: 11)
+        let optimisticEarlierAssistant = SessionMessage(
+            role: .assistant,
+            content: "Here's the status on how the env vars flow.",
+            timestamp: 12
+        )
+        let followUpUserMessage = SessionMessage(
+            role: .user,
+            content: "Create a full spec and submit a pull request.",
+            timestamp: 13
+        )
+        let optimisticLatestAssistant = SessionMessage(
+            role: .assistant,
+            content: "Now I have a complete picture.",
+            timestamp: 14
+        )
+
+        let fetchedInitialUserMessage = SessionMessage(
+            role: .user,
+            content: initialUserMessage.content,
+            timestamp: 21
+        )
+        let fetchedFollowUpUserMessage = SessionMessage(
+            role: .user,
+            content: followUpUserMessage.content,
+            timestamp: 22
+        )
+        let fetchedLatestAssistant = SessionMessage(
+            role: .assistant,
+            content: optimisticLatestAssistant.content,
+            timestamp: 23
+        )
+
+        sut.cacheMessages(
+            [
+                initialUserMessage,
+                optimisticEarlierAssistant,
+                followUpUserMessage,
+                optimisticLatestAssistant,
+            ],
+            for: "session-a"
+        )
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(
+            [
+                fetchedInitialUserMessage,
+                fetchedFollowUpUserMessage,
+                fetchedLatestAssistant,
+            ],
+            sessionID: "session-a"
+        )
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            [
+                initialUserMessage.content,
+                optimisticEarlierAssistant.content,
+                followUpUserMessage.content,
+                optimisticLatestAssistant.content,
+            ]
+        )
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.timestamp),
+            [21, 12, 22, 23]
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).map(\.content),
+            [
+                initialUserMessage.content,
+                optimisticEarlierAssistant.content,
+                followUpUserMessage.content,
+                optimisticLatestAssistant.content,
+            ]
+        )
+    }
+
     func testPrepareToDisplaySessionShowsLoadingStateWhenCacheIsMissing() {
         let sut = makeSUT()
 
@@ -1498,6 +1577,91 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTFail("Expected at least \(minimumCount) transcript item(s).")
+    }
+
+    // MARK: - Transcript merge edge-case tests
+
+    func testMergeFetchedMessagesReturnsServerTruthWhenNoSharedPrefix() {
+        let sut = makeSUT()
+        let localMessages = [
+            SessionMessage(role: .user, content: "local only", timestamp: 1),
+            SessionMessage(role: .assistant, content: "local reply", timestamp: 2),
+        ]
+        let fetchedMessages = [
+            SessionMessage(role: .user, content: "server only", timestamp: 10),
+            SessionMessage(role: .assistant, content: "server reply", timestamp: 11),
+        ]
+
+        sut.cacheMessages(localMessages, for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(fetchedMessages, sessionID: "session-a")
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            ["server only", "server reply"]
+        )
+    }
+
+    func testMergeFetchedMessagesFallsBackWhenNoAlignmentFoundAfterSharedPrefix() {
+        let sut = makeSUT()
+        let sharedMessage = SessionMessage(role: .user, content: "shared start", timestamp: 1)
+        let localTail = [
+            SessionMessage(role: .assistant, content: "local-a", timestamp: 2),
+            SessionMessage(role: .assistant, content: "local-b", timestamp: 3),
+        ]
+        let fetchedTail = [
+            SessionMessage(role: .assistant, content: "fetched-x", timestamp: 12),
+            SessionMessage(role: .assistant, content: "fetched-y", timestamp: 13),
+        ]
+
+        sut.cacheMessages([sharedMessage] + localTail, for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting([sharedMessage] + fetchedTail, sessionID: "session-a")
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            ["shared start", "fetched-x", "fetched-y", "local-a", "local-b"]
+        )
+    }
+
+    func testMergeFetchedMessagesInterleavesMultipleGapsCorrectly() {
+        let sut = makeSUT()
+        let anchor1 = SessionMessage(role: .user, content: "anchor-1", timestamp: 1)
+        let anchor2 = SessionMessage(role: .user, content: "anchor-2", timestamp: 5)
+        let anchor3 = SessionMessage(role: .user, content: "anchor-3", timestamp: 9)
+
+        let localMessages = [
+            anchor1,
+            SessionMessage(role: .assistant, content: "local-gap-1", timestamp: 2),
+            anchor2,
+            SessionMessage(role: .assistant, content: "local-gap-2", timestamp: 6),
+            anchor3,
+        ]
+        let fetchedMessages = [
+            anchor1,
+            SessionMessage(role: .assistant, content: "fetched-gap-1", timestamp: 3),
+            anchor2,
+            SessionMessage(role: .assistant, content: "fetched-gap-2", timestamp: 7),
+            anchor3,
+        ]
+
+        sut.cacheMessages(localMessages, for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(fetchedMessages, sessionID: "session-a")
+
+        let contents = sut.cachedMessages(for: "session-a")?.map(\.content)
+        XCTAssertEqual(contents, [
+            "anchor-1",
+            "fetched-gap-1",
+            "local-gap-1",
+            "anchor-2",
+            "fetched-gap-2",
+            "local-gap-2",
+            "anchor-3",
+        ])
     }
 
     private func waitForCompactionBannerToDismiss(on sut: ChatViewModel) async {
