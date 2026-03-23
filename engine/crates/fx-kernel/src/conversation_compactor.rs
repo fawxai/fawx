@@ -102,34 +102,6 @@ fn tool_ids_in_message(message: &Message) -> Vec<&str> {
         .collect()
 }
 
-#[cfg(debug_assertions)]
-fn debug_assert_tool_pair_integrity(messages: &[Message]) {
-    let mut seen_tool_use_ids = HashSet::new();
-
-    for (message_index, message) in messages.iter().enumerate() {
-        for (block_index, block) in message.content.iter().enumerate() {
-            match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    seen_tool_use_ids.insert(id.as_str());
-                }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    debug_assert!(
-                        seen_tool_use_ids.contains(tool_use_id.as_str()),
-                        "orphaned tool_result '{}' at message {}, block {}",
-                        tool_use_id,
-                        message_index,
-                        block_index
-                    );
-                }
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
-            }
-        }
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_assert_tool_pair_integrity(_: &[Message]) {}
-
 fn unresolved_tool_use_ids(messages: &[Message]) -> HashSet<&str> {
     let mut tool_use_ids = HashSet::new();
     let mut tool_result_ids = HashSet::new();
