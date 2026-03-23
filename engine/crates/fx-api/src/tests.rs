@@ -15,7 +15,7 @@ use crate::router::build_router;
 use crate::server_runtime::ServerRuntime;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{
-    build_channel_runtime, default_telemetry, ChannelRuntime, HttpState, SharedReadState,
+    build_channel_runtime, in_memory_telemetry, ChannelRuntime, HttpState, SharedReadState,
 };
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
@@ -1708,7 +1708,7 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         }
     }
 
@@ -1750,7 +1750,7 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         }
     }
 
@@ -2998,6 +2998,30 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_empty_session_memory_returns_empty_arrays() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-memory-empty");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let resp = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/memory")))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "key_decisions": [],
+                "active_files": [],
+                "custom_context": [],
+                "last_updated": 0
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn put_session_memory_persists_and_updates_loaded_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-put");
@@ -4109,7 +4133,7 @@ thinking = "high"
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         };
         let app = build_router(state, None);
         let req = Request::builder()

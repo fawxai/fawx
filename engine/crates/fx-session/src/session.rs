@@ -209,13 +209,13 @@ pub struct SessionMemory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_state: Option<String>,
     /// Key decisions made during this session (max 20).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub key_decisions: Vec<String>,
     /// Files actively being worked on.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub active_files: Vec<String>,
     /// Custom context the agent wants to remember (max 20).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub custom_context: Vec<String>,
     /// Unix epoch seconds of last update.
     #[serde(default)]
@@ -626,6 +626,21 @@ mod tests {
         let restored: SessionMemory = serde_json::from_str(&json).expect("deserialize memory");
 
         assert_eq!(restored, memory);
+    }
+
+    #[test]
+    fn session_memory_serializes_empty_collections_as_empty_arrays() {
+        let value = serde_json::to_value(SessionMemory::default()).expect("serialize memory");
+
+        assert_eq!(
+            value,
+            json!({
+                "key_decisions": [],
+                "active_files": [],
+                "custom_context": [],
+                "last_updated": 0
+            })
+        );
     }
 
     #[test]
