@@ -269,7 +269,6 @@ impl From<fx_cli::headless::ResultKind> for ResultKind {
         match kind {
             fx_cli::headless::ResultKind::Complete => Self::Complete,
             fx_cli::headless::ResultKind::Partial => Self::Partial,
-            fx_cli::headless::ResultKind::NeedsInput => Self::NeedsInput,
             fx_cli::headless::ResultKind::Error => Self::Error,
             fx_cli::headless::ResultKind::Empty => Self::Empty,
         }

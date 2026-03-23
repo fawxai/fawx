@@ -16,10 +16,6 @@ pub enum LoopStep {
     Act,
     #[serde(alias = "Synthesize")]
     Synthesize,
-    #[serde(alias = "Verify")]
-    Verify,
-    #[serde(alias = "Continue")]
-    Continue,
 }
 
 impl LoopStep {
@@ -30,8 +26,6 @@ impl LoopStep {
             Self::Decide => "decide",
             Self::Act => "act",
             Self::Synthesize => "synthesize",
-            Self::Verify => "verify",
-            Self::Continue => "continue",
         }
     }
 }
@@ -66,6 +60,8 @@ pub enum SignalKind {
     UserFeedback,
     #[serde(alias = "Decision")]
     Decision,
+    #[serde(alias = "Observation")]
+    Observation,
 }
 
 impl SignalKind {
@@ -81,6 +77,7 @@ impl SignalKind {
             Self::UserInput => "user_input",
             Self::UserFeedback => "user_feedback",
             Self::Decision => "decision",
+            Self::Observation => "observation",
         }
     }
 }
@@ -111,9 +108,7 @@ mod tests {
         assert_eq!(LoopStep::Reason.to_string(), "reason");
         assert_eq!(LoopStep::Act.to_string(), "act");
         assert_eq!(LoopStep::Synthesize.to_string(), "synthesize");
-        assert_eq!(LoopStep::Continue.to_string(), "continue");
         assert_eq!(LoopStep::Decide.to_string(), "decide");
-        assert_eq!(LoopStep::Verify.to_string(), "verify");
     }
 
     #[test]
@@ -124,10 +119,10 @@ mod tests {
 
     #[test]
     fn loop_step_deserializes_legacy_and_snake_case_labels() {
-        let legacy: LoopStep = serde_json::from_str("\"Continue\"").expect("legacy");
-        let snake_case: LoopStep = serde_json::from_str("\"continue\"").expect("snake_case");
-        assert_eq!(legacy, LoopStep::Continue);
-        assert_eq!(snake_case, LoopStep::Continue);
+        let legacy: LoopStep = serde_json::from_str("\"Synthesize\"").expect("legacy");
+        let snake_case: LoopStep = serde_json::from_str("\"synthesize\"").expect("snake_case");
+        assert_eq!(legacy, LoopStep::Synthesize);
+        assert_eq!(snake_case, LoopStep::Synthesize);
     }
 
     #[test]
@@ -145,6 +140,7 @@ mod tests {
         assert_eq!(SignalKind::Blocked.to_string(), "blocked");
         assert_eq!(SignalKind::UserInput.to_string(), "user_input");
         assert_eq!(SignalKind::UserFeedback.to_string(), "user_feedback");
+        assert_eq!(SignalKind::Observation.to_string(), "observation");
     }
 
     #[test]

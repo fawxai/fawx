@@ -146,7 +146,6 @@ pub struct ErrorRecord {
 pub enum ResultKind {
     Complete,
     Partial,
-    NeedsInput,
     Error,
     Empty,
 }
@@ -157,7 +156,6 @@ impl From<ResultKind> for ApiResultKind {
         match value {
             ResultKind::Complete => Self::Complete,
             ResultKind::Partial => Self::Partial,
-            ResultKind::NeedsInput => Self::NeedsInput,
             ResultKind::Error => Self::Error,
             ResultKind::Empty => Self::Empty,
         }
@@ -169,8 +167,7 @@ const NO_AI_PROVIDERS_STARTUP_WARNING: &str =
     "no AI providers configured; HTTP API available but chat disabled until a provider is added";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str =
     "I ran out of processing budget before finishing. Could you try again or simplify the request?";
-const NEEDS_INPUT_FALLBACK_RESPONSE: &str =
-    "I wasn't able to produce a complete answer. Could you rephrase or provide more context?";
+
 const TIMEOUT_ERROR_RESPONSE: &str =
     "The request timed out. The operation may still be running. You can try again.";
 const PERMISSION_ERROR_RESPONSE: &str =
@@ -3202,7 +3199,6 @@ fn extract_response_text(result: &LoopResult) -> String {
                 BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
             }
         }
-        LoopResult::NeedsInput { .. } => NEEDS_INPUT_FALLBACK_RESPONSE.to_string(),
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
@@ -3225,7 +3221,6 @@ fn extract_result_kind(result: &LoopResult) -> ResultKind {
                 ResultKind::Empty
             }
         }
-        LoopResult::NeedsInput { .. } => ResultKind::NeedsInput,
         LoopResult::Error { .. } => ResultKind::Error,
     }
 }
@@ -3265,7 +3260,6 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     match result {
         LoopResult::Complete { iterations, .. }
         | LoopResult::BudgetExhausted { iterations, .. }
-        | LoopResult::NeedsInput { iterations, .. }
         | LoopResult::UserStopped { iterations, .. } => *iterations,
         LoopResult::Error { .. } => 0,
     }
@@ -4843,30 +4837,12 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 2,
             },
-            learnings: Vec::new(),
             signals: Vec::new(),
         };
         assert_eq!(extract_response_text(&result), "done");
         assert_eq!(extract_iterations(&result), 1);
         assert_eq!(extract_token_usage(&result).total_tokens(), 5);
         assert_eq!(extract_result_kind(&result), ResultKind::Complete);
-    }
-
-    #[test]
-    fn extract_response_from_needs_input_is_friendly() {
-        let result = LoopResult::NeedsInput {
-            prompt: "What's your question?".to_string(),
-            iterations: 2,
-            signals: Vec::new(),
-        };
-
-        assert_eq!(
-            extract_response_text(&result),
-            NEEDS_INPUT_FALLBACK_RESPONSE
-        );
-        assert_ne!(extract_response_text(&result), "What's your question?");
-        assert_eq!(extract_iterations(&result), 2);
-        assert_eq!(extract_result_kind(&result), ResultKind::NeedsInput);
     }
 
     #[test]
@@ -4990,7 +4966,6 @@ mod tests {
                 response: "done".to_string(),
                 iterations: 1,
                 tokens_used: TokenUsage::default(),
-                learnings: Vec::new(),
                 signals: signals.clone(),
             },
         );
@@ -5005,16 +4980,6 @@ mod tests {
             },
         );
         assert_eq!(partial.result_kind, ResultKind::Partial);
-
-        let needs_input = app.finalize_cycle(
-            "hello",
-            &LoopResult::NeedsInput {
-                prompt: "clarify".to_string(),
-                iterations: 1,
-                signals: signals.clone(),
-            },
-        );
-        assert_eq!(needs_input.result_kind, ResultKind::NeedsInput);
 
         let error = app.finalize_cycle(
             "hello",

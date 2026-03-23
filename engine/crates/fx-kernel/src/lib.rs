@@ -2,20 +2,17 @@
 //! # fx-kernel — Fawx Kernel
 //!
 //! The kernel layer: loop orchestration, policy engine, permissions, budget
-//! enforcement, verification, rollback, and watchdog. Immutable at runtime.
+//! enforcement, rollback, and watchdog. Immutable at runtime.
 //!
 //! ## Architecture
 //!
 //! The kernel implements `Loop(goal, context, depth) → LoopResult` — the
-//! recursive seven-step agentic loop:
+//! single-pass agentic loop:
 //!
 //! 1. **Perceive** — assemble perception snapshot (screen, sensors, memory retrieval)
 //! 2. **Reason** — LLM planning given perception + identity + procedural memory
 //! 3. **Decide** — three-gate check: policy → budget → permission
-//! 4. **Act** — execute approved intent, checkpoint state first
-//! 5. **Verify** — artifact contract check + prediction comparison
-//! 6. **Learn** — extract episodic memories, propose semantic/procedural updates
-//! 7. **Continue** — evaluate completion, loop or return result
+//! 4. **Act** — execute approved intent with tool chaining inside act_with_tools
 //!
 //! ## Kernel Invariants
 //!
@@ -35,12 +32,10 @@ pub mod cancellation;
 pub mod channels;
 pub mod checkpoint;
 pub mod context_manager;
-pub mod continuation;
 pub mod conversation_compactor;
 pub mod decide;
 pub mod event_bus;
 pub mod input;
-pub mod learn;
 pub mod loop_engine;
 pub mod perceive;
 pub mod permission_gate;
@@ -55,7 +50,6 @@ pub mod signals;
 pub mod streaming;
 pub mod types;
 pub mod user_facing_error;
-pub mod verify;
 pub mod watchdog;
 pub mod yield_primitive;
 
@@ -66,14 +60,12 @@ pub use act::{
 pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;
 pub use channels::{ChannelRegistry, HttpChannel, ResponseRouter, TuiChannel};
-pub use continuation::Continuation;
 pub use decide::Decision;
 pub use event_bus::{CompletionEvent, EventBus, Observer, TaskResult};
 pub use fx_decompose::{
     AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
 pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSender};
-pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
 pub use permission_gate::{PermissionGateExecutor, PermissionPolicy};
@@ -87,6 +79,5 @@ pub use process_registry::{
 pub use proposal_gate::{is_tier3_path, ProposalGateExecutor, ProposalGateState};
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
 pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
-pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
-pub use verify::Verification;
+pub use types::LoopError;
 pub use yield_primitive::{WakeCondition, WakeReason, YieldHandle, YieldRequest, YieldWaker};

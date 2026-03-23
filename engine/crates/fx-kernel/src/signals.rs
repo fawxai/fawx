@@ -181,7 +181,7 @@ mod tests {
             2,
         ));
         collector.emit(mk_signal(
-            LoopStep::Verify,
+            LoopStep::Synthesize,
             SignalKind::Friction,
             "friction-1",
             3,
@@ -234,7 +234,7 @@ mod tests {
             2,
         ));
         collector.emit(mk_signal(
-            LoopStep::Verify,
+            LoopStep::Synthesize,
             SignalKind::Friction,
             "friction-2",
             3,
@@ -252,7 +252,7 @@ mod tests {
         let mut collector = SignalCollector::new(10);
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "tool ok", 1));
         collector.emit(mk_signal(
-            LoopStep::Verify,
+            LoopStep::Synthesize,
             SignalKind::Friction,
             "mismatch",
             2,
