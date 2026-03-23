@@ -1,6 +1,7 @@
 use crate::consent::TelemetryConsent;
-use crate::{SignalCategory, TelemetrySignal};
+use crate::{SignalCategory, TelemetryError, TelemetrySignal};
 use chrono::Utc;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use uuid::Uuid;
 
@@ -12,15 +13,25 @@ pub struct SignalCollector {
     buffer: RwLock<Vec<TelemetrySignal>>,
     session_id: String,
     max_buffer_size: usize,
+    data_dir: Option<PathBuf>,
 }
 
 impl SignalCollector {
     pub fn new(consent: TelemetryConsent) -> Self {
+        Self::build(consent, None)
+    }
+
+    pub fn new_with_persistence(consent: TelemetryConsent, data_dir: PathBuf) -> Self {
+        Self::build(consent, Some(data_dir))
+    }
+
+    fn build(consent: TelemetryConsent, data_dir: Option<PathBuf>) -> Self {
         Self {
             consent: RwLock::new(consent),
             buffer: RwLock::new(Vec::new()),
             session_id: Uuid::new_v4().to_string(),
             max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+            data_dir,
         }
     }
 
@@ -85,17 +96,24 @@ impl SignalCollector {
     }
 
     /// Update consent. Drops buffered signals for newly-disabled categories.
-    pub fn update_consent(&self, new_consent: TelemetryConsent) {
+    /// Persists to disk while locks are held to prevent TOCTOU races.
+    pub fn update_consent(&self, new_consent: TelemetryConsent) -> Result<(), TelemetryError> {
         let mut buffer = match self.buffer.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        buffer.retain(|signal| new_consent.is_category_enabled(&signal.category));
         let mut consent = match self.consent.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Persist before mutating in-memory state so a failed save
+        // doesn't leave memory diverged from disk.
+        if let Some(ref data_dir) = self.data_dir {
+            new_consent.save(data_dir)?;
+        }
+        buffer.retain(|signal| new_consent.is_category_enabled(&signal.category));
         *consent = new_consent;
+        Ok(())
     }
 
     /// Get current consent state.
@@ -173,7 +191,9 @@ mod tests {
 
         let mut new_consent = enabled_consent();
         new_consent.disable_category(SignalCategory::ToolUsage);
-        collector.update_consent(new_consent);
+        collector
+            .update_consent(new_consent)
+            .expect("consent update should succeed");
 
         assert_eq!(collector.pending_count(), 1);
         let signals = collector.drain();
@@ -196,7 +216,9 @@ mod tests {
             enabled: true,
             ..TelemetryConsent::default()
         };
-        collector.update_consent(new_consent);
+        collector
+            .update_consent(new_consent)
+            .expect("consent update should succeed");
         assert!(collector.consent().enabled);
     }
 

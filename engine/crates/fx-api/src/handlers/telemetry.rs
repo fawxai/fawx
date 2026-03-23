@@ -1,5 +1,6 @@
 use crate::handlers::HandlerResult;
 use crate::state::HttpState;
+use crate::types::ErrorBody;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -47,7 +48,10 @@ pub async fn handle_patch_consent(
     apply_category_patch(&mut consent, patch.categories);
     if changed {
         consent.updated_at = Utc::now();
-        state.telemetry.update_consent(consent.clone());
+        state
+            .telemetry
+            .update_consent(consent.clone())
+            .map_err(internal_error)?;
     }
     Ok(Json(consent_to_response(&consent)))
 }
@@ -114,4 +118,13 @@ fn parse_category(name: &str) -> Option<SignalCategory> {
     SignalCategory::all()
         .into_iter()
         .find(|category| category.to_string() == name)
+}
+
+fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: error.to_string(),
+        }),
+    )
 }

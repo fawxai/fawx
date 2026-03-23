@@ -112,6 +112,16 @@ struct SessionMemory: Codable, Sendable, Hashable {
         case lastUpdated = "last_updated"
     }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        project = try container.decodeIfPresent(String.self, forKey: .project)
+        currentState = try container.decodeIfPresent(String.self, forKey: .currentState)
+        keyDecisions = try container.decodeIfPresent([String].self, forKey: .keyDecisions) ?? []
+        activeFiles = try container.decodeIfPresent([String].self, forKey: .activeFiles) ?? []
+        customContext = try container.decodeIfPresent([String].self, forKey: .customContext) ?? []
+        lastUpdated = try container.decodeIfPresent(Int.self, forKey: .lastUpdated) ?? 0
+    }
+
     var isEmpty: Bool {
         normalizedProject == nil
             && normalizedCurrentState == nil

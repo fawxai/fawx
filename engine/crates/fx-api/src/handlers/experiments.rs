@@ -537,7 +537,7 @@ mod tests {
     use crate::experiment_registry::ExperimentRegistry;
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
-    use crate::state::{build_channel_runtime, default_telemetry, SharedReadState};
+    use crate::state::{build_channel_runtime, in_memory_telemetry, SharedReadState};
     use crate::types::{
         AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto,
         SkillSummaryDto, ThinkingLevelDto,
@@ -682,7 +682,7 @@ mod tests {
             cron_store: None,
             experiment_registry: test_registry(&data_dir),
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         };
         (temp_dir, state)
     }

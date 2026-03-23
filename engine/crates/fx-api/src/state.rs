@@ -11,7 +11,7 @@ use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
 use fx_session::SessionRegistry;
 use fx_telemetry::{SignalCollector, TelemetryConsent};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock as TokioRwLock};
@@ -127,7 +127,16 @@ pub struct ChannelRuntime {
     pub webhooks: Arc<HashMap<String, Arc<WebhookChannel>>>,
 }
 
-pub fn default_telemetry() -> Arc<SignalCollector> {
+pub fn default_telemetry(data_dir: &Path) -> Arc<SignalCollector> {
+    let consent = TelemetryConsent::load(data_dir);
+    Arc::new(SignalCollector::new_with_persistence(
+        consent,
+        data_dir.to_path_buf(),
+    ))
+}
+
+#[cfg(test)]
+pub fn in_memory_telemetry() -> Arc<SignalCollector> {
     Arc::new(SignalCollector::new(TelemetryConsent::default()))
 }
 
