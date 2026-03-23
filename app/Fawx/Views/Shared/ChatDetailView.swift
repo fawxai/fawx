@@ -49,7 +49,7 @@ struct ChatDetailView: View {
             to: decoratedTranscriptScrollView(
                 ModernTranscriptScrollView(
                     sessionID: sessionViewModel.selectedSessionID,
-                    lastTranscriptItemID: chatViewModel.transcriptItems.last?.id,
+                    transcriptUpdateID: chatViewModel.transcriptUpdateID,
                     hasVisibleTranscriptContent: hasVisibleTranscriptContent,
                     isLoadingHistory: chatViewModel.isLoadingHistory,
                     isCurrentSessionStreaming: chatViewModel.isCurrentSessionStreaming,
@@ -253,7 +253,7 @@ struct ChatDetailView: View {
             .onAppear {
                 scrollToBottom(using: proxy, animated: false)
             }
-            .onChange(of: chatViewModel.transcriptItems.last?.id) { _, _ in
+            .onChange(of: chatViewModel.transcriptUpdateID) { _, _ in
                 let scrollBehavior = chatViewModel.pendingTranscriptScrollBehavior
                 let animated = scrollBehavior == .animated && !chatViewModel.isLoadingHistory
                 let shouldPreserveScrollPosition = scrollBehavior == .preservePosition
@@ -884,7 +884,7 @@ private struct CompactionBannerStyle {
 @available(iOS 18.0, macOS 15.0, *)
 private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
     let sessionID: String?
-    let lastTranscriptItemID: String?
+    let transcriptUpdateID: Int
     let hasVisibleTranscriptContent: Bool
     let isLoadingHistory: Bool
     let isCurrentSessionStreaming: Bool
@@ -937,7 +937,7 @@ private struct ModernTranscriptScrollView<Content: View, Composer: View>: View {
                 )
             }
         }
-        .onChange(of: lastTranscriptItemID) { _, _ in
+        .onChange(of: transcriptUpdateID) { _, _ in
             handleTranscriptItemChange()
         }
         .onChange(of: visibleStreamingText) { _, _ in

@@ -286,7 +286,7 @@ final class SettingsViewModel {
         return "\(stripped[..<splitIndex])-\(stripped[splitIndex...])"
     }
 
-    static func parseScannedConnection(_ rawValue: String) -> ScannedConnectionInfo? {
+    nonisolated static func parseScannedConnection(_ rawValue: String) -> ScannedConnectionInfo? {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return nil
@@ -331,7 +331,7 @@ final class SettingsViewModel {
         return ScannedConnectionInfo(serverURL: canonicalURL, token: resolvedToken)
     }
 
-    private static func preferredScannedConnectionScheme(
+    private nonisolated static func preferredScannedConnectionScheme(
         host: String,
         explicitScheme: String?,
         transport: String?

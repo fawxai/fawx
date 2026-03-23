@@ -219,7 +219,14 @@ final class ChatViewModel {
     private static let compactionBannerTimeout: Duration = .seconds(4)
     static let maxCachedSessions = 10
 
-    var transcriptItems: [ChatTranscriptItem] = []
+    private(set) var transcriptUpdateID = 0
+    var transcriptItems: [ChatTranscriptItem] = [] {
+        didSet {
+            if oldValue != transcriptItems {
+                transcriptUpdateID &+= 1
+            }
+        }
+    }
     private var draftsBySession: [String: String] = [:]
     private var queuedMessagesBySession: [String: String] = [:]
     var isLoadingHistory = false
@@ -624,7 +631,74 @@ final class ChatViewModel {
             return fetchedMessages
         }
 
+        let optimisticLocalTail = optimisticLocalTailMissingFromFetched(
+            existingMessages,
+            comparedTo: fetchedMessages
+        )
+        if !optimisticLocalTail.isEmpty {
+            return fetchedMessages + optimisticLocalTail
+        }
+
         return fetchedMessages
+    }
+
+    private func optimisticLocalTailMissingFromFetched(
+        _ localMessages: [SessionMessage],
+        comparedTo fetchedMessages: [SessionMessage]
+    ) -> [SessionMessage] {
+        let sharedPrefixCount = commonEquivalentPrefixCount(localMessages, fetchedMessages)
+        guard sharedPrefixCount > 0, sharedPrefixCount < localMessages.count else {
+            return []
+        }
+
+        var nextFetchedSearchIndex = sharedPrefixCount
+        var missingLocalTail: [SessionMessage] = []
+
+        for localMessage in localMessages.dropFirst(sharedPrefixCount) {
+            if let matchedIndex = indexOfEquivalentMessage(
+                localMessage,
+                in: fetchedMessages,
+                startingAt: nextFetchedSearchIndex
+            ) {
+                nextFetchedSearchIndex = matchedIndex + 1
+            } else {
+                missingLocalTail.append(localMessage)
+            }
+        }
+
+        return missingLocalTail
+    }
+
+    private func commonEquivalentPrefixCount(
+        _ lhs: [SessionMessage],
+        _ rhs: [SessionMessage]
+    ) -> Int {
+        let sharedCount = min(lhs.count, rhs.count)
+        var prefixCount = 0
+
+        while prefixCount < sharedCount,
+              messagesAreEquivalentForTranscriptMerge(lhs[prefixCount], rhs[prefixCount])
+        {
+            prefixCount += 1
+        }
+
+        return prefixCount
+    }
+
+    private func indexOfEquivalentMessage(
+        _ message: SessionMessage,
+        in messages: [SessionMessage],
+        startingAt startIndex: Int
+    ) -> Int? {
+        guard startIndex < messages.count else {
+            return nil
+        }
+
+        for index in startIndex..<messages.count where messagesAreEquivalentForTranscriptMerge(message, messages[index]) {
+            return index
+        }
+
+        return nil
     }
 
     private func areEquivalentMessageSequences(

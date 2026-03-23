@@ -355,6 +355,67 @@ final class ChatViewModelTests: XCTestCase {
         )
     }
 
+    func testApplyFetchedMessagesPreservesOptimisticAssistantTailWhenToolHistoryArrivesFirst() {
+        let sut = makeSUT()
+        let localUserMessage = SessionMessage(role: .user, content: "Inspect the docs", timestamp: 11)
+        let optimisticAssistantMessage = SessionMessage(
+            role: .assistant,
+            content: "Now I have a complete picture.",
+            timestamp: 12
+        )
+        let fetchedUserMessage = SessionMessage(role: .user, content: "Inspect the docs", timestamp: 21)
+        let fetchedAssistantToolMessage = SessionMessage(
+            role: .assistant,
+            contentBlocks: [
+                .text("Let me check."),
+                .toolUse(
+                    id: "call_1",
+                    name: "read_file",
+                    input: .object(["path": .string("README.md")])
+                ),
+            ],
+            timestamp: 22
+        )
+        let fetchedToolResultMessage = SessionMessage(
+            role: .tool,
+            contentBlocks: [
+                .toolResult(toolUseId: "call_1", content: .string("docs"), isError: false)
+            ],
+            timestamp: 23
+        )
+
+        sut.cacheMessages([localUserMessage, optimisticAssistantMessage], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(
+            [fetchedUserMessage, fetchedAssistantToolMessage, fetchedToolResultMessage],
+            sessionID: "session-a"
+        )
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.role),
+            [.user, .assistant, .tool, .assistant]
+        )
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.last?.content,
+            optimisticAssistantMessage.content
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).last?.content,
+            optimisticAssistantMessage.content
+        )
+
+        let toolGroups = sut.transcriptItems.compactMap { item -> ToolActivityGroupRecord? in
+            guard case .toolActivityGroup(let group) = item else {
+                return nil
+            }
+            return group
+        }
+
+        XCTAssertEqual(toolGroups.count, 1)
+        XCTAssertEqual(toolGroups[0].toolCalls[0].result, "docs")
+    }
+
     func testPrepareToDisplaySessionShowsLoadingStateWhenCacheIsMissing() {
         let sut = makeSUT()
 
@@ -498,6 +559,106 @@ final class ChatViewModelTests: XCTestCase {
 
         XCTAssertEqual(groups.count, 1)
         XCTAssertEqual(groups[0].toolCalls.map(\.result), ["first result", "second result"])
+    }
+
+    func testLiveToolActivityIncrementsTranscriptUpdateIDEvenWhenLastItemIDIsStable() {
+        let sut = makeSUT()
+
+        sut.setStreamingSessionsForTesting(
+            ["session-a": (text: "", phase: .act)],
+            currentSessionID: "session-a"
+        )
+        sut.prepareToDisplaySession("session-a")
+        sut.beginToolCallForTesting(sessionID: "session-a", id: "call_1", name: "read_file")
+
+        let lastItemID = sut.transcriptItems.last?.id
+        let transcriptUpdateID = sut.transcriptUpdateID
+
+        sut.completeToolCallForTesting(
+            sessionID: "session-a",
+            id: "call_1",
+            name: "read_file",
+            arguments: "{\"path\":\"README.md\"}"
+        )
+
+        XCTAssertEqual(sut.transcriptItems.last?.id, lastItemID)
+        XCTAssertGreaterThan(sut.transcriptUpdateID, transcriptUpdateID)
+    }
+
+    func testLiveToolActivitySnapshotUsesStatusOnlyDetails() {
+        let group = ToolActivityGroupRecord(
+            id: "live-session-a",
+            toolCalls: [
+                ToolCallRecord(
+                    id: "call_1",
+                    name: "read_file",
+                    arguments: "{\"path\":\"README.md\"}",
+                    result: "contents",
+                    isRunning: true,
+                    isError: false
+                )
+            ],
+            isLive: true
+        )
+
+        let snapshot = ToolActivityGroupCardSnapshot(group: group, isExpanded: true)
+
+        XCTAssertEqual(snapshot.detailStyle, .liveStatusOnly)
+        XCTAssertFalse(snapshot.showsPayloadDetails)
+        XCTAssertEqual(snapshot.visibleToolCalls.map(\.id), ["call_1"])
+        XCTAssertEqual(
+            snapshot.accessibilityHint,
+            "Collapse tool activity. Detailed arguments and output appear after the response finishes."
+        )
+    }
+
+    func testToolActivitySnapshotDefaultsToCollapsedState() {
+        let group = ToolActivityGroupRecord(
+            id: "live-session-a",
+            toolCalls: [
+                ToolCallRecord(
+                    id: "call_1",
+                    name: "read_file",
+                    arguments: "{\"path\":\"README.md\"}",
+                    result: "contents",
+                    isRunning: true,
+                    isError: false
+                )
+            ],
+            isLive: true
+        )
+
+        let snapshot = ToolActivityGroupCardSnapshot(group: group, isExpanded: false)
+
+        XCTAssertEqual(snapshot.detailStyle, .collapsed)
+        XCTAssertFalse(snapshot.isExpanded)
+        XCTAssertEqual(snapshot.headerTitle, "read_file")
+        XCTAssertEqual(snapshot.visibleToolCalls, [])
+        XCTAssertEqual(snapshot.accessibilityHint, "Expand tool activity")
+    }
+
+    func testHistoricalToolActivitySnapshotUsesPayloadDetails() {
+        let group = ToolActivityGroupRecord(
+            id: "history-session-a",
+            toolCalls: [
+                ToolCallRecord(
+                    id: "call_1",
+                    name: "read_file",
+                    arguments: "{\"path\":\"README.md\"}",
+                    result: "contents",
+                    isRunning: false,
+                    isError: false
+                )
+            ],
+            isLive: false
+        )
+
+        let snapshot = ToolActivityGroupCardSnapshot(group: group, isExpanded: true)
+
+        XCTAssertEqual(snapshot.detailStyle, .historicalPayload)
+        XCTAssertTrue(snapshot.showsPayloadDetails)
+        XCTAssertEqual(snapshot.visibleToolCalls.map(\.arguments), ["{\"path\":\"README.md\"}"])
+        XCTAssertEqual(snapshot.accessibilityHint, "Collapse tool activity")
     }
 
     func testFetchedHistoryReplacesMatchingLiveToolOverlayInsteadOfDuplicatingIt() {
