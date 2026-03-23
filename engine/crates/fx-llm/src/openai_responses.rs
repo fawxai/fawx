@@ -881,24 +881,6 @@ fn response_input_block(role: &str, block: &ContentBlock) -> Option<Value> {
     }
 }
 
-/// Remap non-OpenAI tool call ID prefixes to `fc_`.
-///
-/// OpenAI's Responses API requires `call_id` and `id` fields to match `^fc_`.
-/// When a conversation switches from Claude (which uses `toolu_*` IDs) to GPT,
-/// we normalize at serialization time so pairs stay matched.
-fn normalize_call_id(id: &str) -> String {
-    if id.starts_with("fc_") {
-        return id.to_string();
-    }
-
-    let stripped = id
-        .strip_prefix("toolu_")
-        .or_else(|| id.strip_prefix("call_"))
-        .unwrap_or(id);
-
-    format!("fc_{stripped}")
-}
-
 fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Result<(), LlmError> {
     push_text_input(input, "assistant", blocks);
 
