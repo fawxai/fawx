@@ -577,7 +577,7 @@ struct ChatDetailView: View {
                 thinkingLevel: appState.thinkingLevel,
                 availableThinkingLevels: appState.availableThinkingLevels,
                 isUpdatingServerSettings: appState.isUpdatingServerSettings,
-                placeholder: sessionViewModel.selectedSessionID == nil ? "Let's go!" : "Message Fawx...",
+                placeholder: sessionViewModel.selectedSessionID == nil ? NewSessionCopy.composerPlaceholder : "Message Fawx...",
                 sendAction: chatViewModel.sendDraft,
                 stopAction: chatViewModel.stopStreaming,
                 dismissQueuedMessage: chatViewModel.dismissQueuedMessage,
