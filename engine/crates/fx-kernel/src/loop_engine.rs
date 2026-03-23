@@ -240,18 +240,26 @@ impl<'a> CycleStream<'a> {
 
 fn build_user_message(snapshot: &PerceptionSnapshot, user_message: &str) -> Message {
     match snapshot.user_input.as_ref() {
-        Some(user_input) if !user_input.images.is_empty() => {
-            Message::user_with_images(user_message, user_input.images.clone())
+        Some(user_input) if !user_input.images.is_empty() || !user_input.documents.is_empty() => {
+            Message::user_with_attachments(
+                user_message,
+                user_input.images.clone(),
+                user_input.documents.clone(),
+            )
         }
         _ => Message::user(user_message),
     }
 }
 
 fn build_processed_perception_message(perception: &ProcessedPerception, text: &str) -> Message {
-    if perception.images.is_empty() {
+    if perception.images.is_empty() && perception.documents.is_empty() {
         return Message::user(text);
     }
-    Message::user_with_images(text, perception.images.clone())
+    Message::user_with_attachments(
+        text,
+        perception.images.clone(),
+        perception.documents.clone(),
+    )
 }
 
 fn provider_stream_bridge(
@@ -974,6 +982,10 @@ fn format_extraction_block(block: &ContentBlock) -> String {
             truncate_prompt_text(&render_tool_result(content), 200)
         }
         ContentBlock::Image { .. } => "[image]".to_string(),
+        ContentBlock::Document { filename, .. } => filename
+            .as_ref()
+            .map(|filename| format!("[document:{filename}]"))
+            .unwrap_or_else(|| "[document]".to_string()),
     }
 }
 
@@ -1883,6 +1895,11 @@ impl LoopEngine {
                 .user_input
                 .as_ref()
                 .map(|user_input| user_input.images.clone())
+                .unwrap_or_default(),
+            documents: snapshot_with_steer
+                .user_input
+                .as_ref()
+                .map(|user_input| user_input.documents.clone())
                 .unwrap_or_default(),
             context_window,
             active_goals: vec![format!("Help the user with: {user_message}")],
@@ -4139,6 +4156,7 @@ fn build_sub_goal_snapshot(
             timestamp: timestamp_ms,
             context_id: None,
             images: Vec::new(),
+            documents: Vec::new(),
         }),
         sensor_data: None,
         conversation_history: context_messages.to_vec(),
@@ -5302,6 +5320,7 @@ fn response_usage_or_estimate(
             ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
             ContentBlock::ToolResult { content, .. } => estimate_tokens(&content.to_string()),
             ContentBlock::Image { data, .. } => estimate_tokens(data),
+            ContentBlock::Document { data, .. } => estimate_tokens(data),
         })
         .sum();
     let text = extract_response_text(response);
@@ -5334,6 +5353,14 @@ fn message_to_text(message: &Message) -> String {
                 format!("[tool_result:{tool_use_id}]")
             }
             fx_llm::ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
+            fx_llm::ContentBlock::Document {
+                media_type,
+                filename,
+                ..
+            } => filename
+                .as_ref()
+                .map(|filename| format!("[document:{media_type}:{filename}]"))
+                .unwrap_or_else(|| format!("[document:{media_type}]")),
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -5742,6 +5769,7 @@ mod tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -6328,6 +6356,7 @@ mod phase2_tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -7347,6 +7376,7 @@ mod phase2_tests {
         let perception = ProcessedPerception {
             user_message: "hello".to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
             context_window: vec![Message::user("hello")],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -7652,6 +7682,7 @@ mod phase4_tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -8608,6 +8639,7 @@ mod cancellation_tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -8756,6 +8788,7 @@ mod cancellation_tests {
         ProcessedPerception {
             user_message: message.to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
             context_window: vec![Message::user(message)],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -9150,6 +9183,7 @@ mod cancellation_tests {
         let perception = ProcessedPerception {
             user_message: "hello".to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
             context_window: vec![Message::user("hello")],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -10137,6 +10171,7 @@ mod decomposition_tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -10270,6 +10305,7 @@ mod decomposition_tests {
         ProcessedPerception {
             user_message: "Break this task into phases".to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
             context_window: vec![Message::user("context")],
             active_goals: vec!["Help the user".to_string()],
             budget_remaining: sample_budget_remaining(),
@@ -11687,6 +11723,7 @@ mod context_compaction_tests {
                 timestamp: 10,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: history,
@@ -14014,6 +14051,7 @@ mod loop_resilience_tests {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -15431,6 +15469,7 @@ mod test_fixtures {
                 timestamp: 1,
                 context_id: None,
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],

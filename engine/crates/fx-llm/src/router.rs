@@ -788,6 +788,7 @@ mod model_router_tests {
         response.content.iter().find_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
             ContentBlock::Image { .. } => None,
+            ContentBlock::Document { .. } => None,
             _ => None,
         })
     }

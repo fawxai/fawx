@@ -68,26 +68,6 @@ struct ReadyStep: View {
         }
     }
 
-    @ViewBuilder
-    private var headline: some View {
-        if viewModel.isBootstrapping {
-            VStack(spacing: FawxSpacing.paddingSM) {
-                ProgressView()
-                    .controlSize(.large)
-
-                Text(viewModel.bootstrapProgress ?? "Setting up Fawx...")
-                    .font(FawxTypography.chatBody)
-                    .foregroundStyle(Color.fawxTextSecondary)
-                    .multilineTextAlignment(.center)
-            }
-        } else {
-            Text("Ready to start")
-                .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(Color.fawxText)
-                .multilineTextAlignment(.center)
-        }
-    }
-
     private var autoStartRow: some View {
         HStack(spacing: FawxSpacing.paddingMD) {
             VStack(alignment: .leading, spacing: 2) {

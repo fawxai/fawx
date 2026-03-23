@@ -394,6 +394,13 @@ impl AnthropicProvider {
                         data: source.data,
                     });
                 }
+                AnthropicContentBlock::Document { source, title } => {
+                    content.push(ContentBlock::Document {
+                        media_type: source.media_type,
+                        data: source.data,
+                        filename: title,
+                    });
+                }
                 AnthropicContentBlock::Thinking { .. } => {
                     // Extended thinking block — skip (not surfaced to user)
                 }
@@ -850,6 +857,18 @@ fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBloc
                 data: data.clone(),
             },
         }),
+        ContentBlock::Document {
+            media_type,
+            data,
+            filename,
+        } => Ok(AnthropicContentBlock::Document {
+            source: AnthropicDocumentSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.clone(),
+                data: data.clone(),
+            },
+            title: filename.clone(),
+        }),
     }
 }
 
@@ -859,6 +878,7 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
             ContentBlock::Image { .. } => None,
+            ContentBlock::Document { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -935,6 +955,11 @@ enum AnthropicContentBlock {
     Image {
         source: AnthropicImageSource,
     },
+    Document {
+        source: AnthropicDocumentSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     Thinking {
         thinking: String,
     },
@@ -945,6 +970,14 @@ enum AnthropicContentBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnthropicDocumentSource {
     #[serde(rename = "type")]
     source_type: String,
     media_type: String,
@@ -1109,8 +1142,11 @@ fn validate_request(body: &AnthropicRequestBody) {
 mod tests {
     use super::*;
     use crate::streaming::{collect_stream_chunks, StreamEvent};
-    use crate::test_helpers::{callback_events, read_events, spawn_json_server};
+    use crate::test_helpers::{
+        callback_events, read_events, simple_pdf_with_text, spawn_json_server,
+    };
     use crate::types::ToolDefinition;
+    use base64::Engine;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1539,6 +1575,28 @@ mod tests {
             }
             other => panic!("expected image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn document_content_block_serializes_for_anthropic() {
+        let block = ContentBlock::Document {
+            media_type: "application/pdf".to_string(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(simple_pdf_with_text("Hello PDF")),
+            filename: Some("brief.pdf".to_string()),
+        };
+
+        let mapped = map_content_to_anthropic(&block).expect("mapped block");
+        let serialized = serde_json::to_value(&mapped).expect("serialized block");
+
+        assert_eq!(serialized["type"], "document");
+        assert_eq!(serialized["source"]["type"], "base64");
+        assert_eq!(serialized["source"]["media_type"], "application/pdf");
+        assert_eq!(serialized["title"], "brief.pdf");
+        assert!(serialized["source"]["data"]
+            .as_str()
+            .expect("base64 data")
+            .starts_with("JVBERi0"));
     }
 
     #[test]

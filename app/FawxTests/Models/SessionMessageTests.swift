@@ -159,4 +159,86 @@ final class SessionMessageTests: XCTestCase {
         XCTAssertEqual(content, .string("legacy output"))
         XCTAssertNil(isError)
     }
+
+    func testStructuredAttachmentMessagesDecodeBlocksAndTranscriptMarkers() throws {
+        let data = Data(
+            """
+            {
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "image",
+                      "media_type": "image/png",
+                      "data": "aW1hZ2U="
+                    },
+                    {
+                      "type": "document",
+                      "media_type": "application/pdf",
+                      "data": "cGRm",
+                      "filename": "brief.pdf"
+                    },
+                    {
+                      "type": "text",
+                      "text": "Please review"
+                    }
+                  ],
+                  "timestamp": 123
+                }
+              ],
+              "total": 1
+            }
+            """.utf8
+        )
+
+        let response = try JSONDecoder().decode(MessagesResponse.self, from: data)
+        let message = try XCTUnwrap(response.messages.first)
+
+        XCTAssertEqual(
+            message.transcriptDisplayText,
+            "[image]\n\n[document: brief.pdf]\n\nPlease review"
+        )
+        XCTAssertEqual(message.content, "[image]\n\n[document: brief.pdf]\n\nPlease review")
+
+        guard case .image(let imageMediaType, let imageData) = message.contentBlocks[0] else {
+            return XCTFail("Expected image block")
+        }
+
+        XCTAssertEqual(imageMediaType, "image/png")
+        XCTAssertEqual(imageData, "aW1hZ2U=")
+
+        guard case .document(let documentMediaType, let documentData, let filename) = message.contentBlocks[1] else {
+            return XCTFail("Expected document block")
+        }
+
+        XCTAssertEqual(documentMediaType, "application/pdf")
+        XCTAssertEqual(documentData, "cGRm")
+        XCTAssertEqual(filename, "brief.pdf")
+    }
+
+    func testAttachmentBlocksEncodeMediaTypeDataAndFilename() throws {
+        let message = SessionMessage(
+            role: .user,
+            contentBlocks: [
+                .image(mediaType: "image/png", data: "aW1hZ2U="),
+                .document(mediaType: "application/pdf", data: "cGRm", filename: "brief.pdf"),
+            ],
+            timestamp: 123
+        )
+
+        let data = try JSONEncoder().encode(message)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let content = try XCTUnwrap(json["content"] as? [[String: Any]])
+
+        XCTAssertEqual(content.count, 2)
+        XCTAssertEqual(content[0]["type"] as? String, "image")
+        XCTAssertEqual(content[0]["media_type"] as? String, "image/png")
+        XCTAssertEqual(content[0]["data"] as? String, "aW1hZ2U=")
+
+        XCTAssertEqual(content[1]["type"] as? String, "document")
+        XCTAssertEqual(content[1]["media_type"] as? String, "application/pdf")
+        XCTAssertEqual(content[1]["data"] as? String, "cGRm")
+        XCTAssertEqual(content[1]["filename"] as? String, "brief.pdf")
+    }
 }

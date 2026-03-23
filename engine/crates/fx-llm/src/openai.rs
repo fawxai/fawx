@@ -7,9 +7,11 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::document::document_text_fallback;
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
@@ -660,8 +662,17 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } => Some(Cow::Borrowed(text.as_str())),
             ContentBlock::Image { .. } => None,
+            ContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            } => Some(Cow::Owned(document_text_fallback(
+                media_type,
+                data,
+                filename.as_deref(),
+            ))),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -688,6 +699,13 @@ fn map_openai_input_block(block: &ContentBlock) -> Option<OpenAiInputBlock> {
             image_url: OpenAiImageUrl {
                 url: format!("data:{media_type};base64,{data}"),
             },
+        }),
+        ContentBlock::Document {
+            media_type,
+            data,
+            filename,
+        } => Some(OpenAiInputBlock::Text {
+            text: document_text_fallback(media_type, data, filename.as_deref()),
         }),
         ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
     }
@@ -886,8 +904,11 @@ impl OpenAiSseState {
 mod tests {
     use super::*;
     use crate::streaming::{collect_stream_chunks, StreamEvent};
-    use crate::test_helpers::{callback_events, read_events, spawn_json_server};
+    use crate::test_helpers::{
+        callback_events, read_events, simple_pdf_with_text, spawn_json_server,
+    };
     use crate::types::ToolDefinition;
+    use base64::Engine;
     use serde_json::json;
 
     #[tokio::test]
@@ -1010,6 +1031,26 @@ mod tests {
             serialized["messages"][0]["content"][1]["text"],
             "describe this image"
         );
+    }
+
+    #[test]
+    fn document_content_block_falls_back_to_text_for_openai() {
+        let document = ContentBlock::Document {
+            media_type: "application/pdf".to_string(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(simple_pdf_with_text("Hello PDF")),
+            filename: Some("brief.pdf".to_string()),
+        };
+
+        let mapped = map_openai_input_block(&document).expect("mapped block");
+
+        match mapped {
+            OpenAiInputBlock::Text { text } => {
+                assert!(text.contains("[file: brief.pdf]"));
+                assert!(text.contains("Hello PDF"));
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::engine::CycleResult;
 use crate::handlers::message::{
-    encoded_images_to_attachments, internal_error, validate_and_encode_images,
+    encoded_documents_to_attachments, encoded_images_to_attachments, internal_error,
+    validate_and_encode_documents, validate_and_encode_images, validate_message_request,
     validate_message_text,
 };
 use crate::sse::{
@@ -9,8 +10,8 @@ use crate::sse::{
 };
 use crate::state::HttpState;
 use crate::types::{
-    EncodedImage, ErrorBody, MessageRequest, MessageResponse, SendToSessionRequest,
-    SendToSessionResponse,
+    EncodedDocument, EncodedImage, ErrorBody, MessageRequest, MessageResponse,
+    SendToSessionRequest, SendToSessionResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -88,6 +89,7 @@ struct StreamingSessionMessageTask {
     key: SessionKey,
     message: String,
     images: Vec<EncodedImage>,
+    documents: Vec<EncodedDocument>,
     context: Vec<Message>,
     sender: mpsc::Sender<String>,
     disconnected: Arc<AtomicBool>,
@@ -298,8 +300,13 @@ pub(crate) async fn handle_send_message_for_session(
     };
     trim_conversation_history(&mut context, max_history);
 
-    validate_message_text(&request.message)?;
+    validate_message_request(
+        &request.message,
+        request.images.len(),
+        request.documents.len(),
+    )?;
     let images = validate_and_encode_images(&request.images)?;
+    let documents = validate_and_encode_documents(&request.documents)?;
 
     if wants_sse(&headers) {
         return Ok(stream_session_message_response(
@@ -308,6 +315,7 @@ pub(crate) async fn handle_send_message_for_session(
             key,
             request.message,
             images,
+            documents,
             context,
         )
         .await);
@@ -319,6 +327,7 @@ pub(crate) async fn handle_send_message_for_session(
         &key,
         &request.message,
         &images,
+        &documents,
         context,
     )
     .await
@@ -356,7 +365,9 @@ fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
                 ContentBlock::ToolResult { tool_use_id, .. } => {
                     tool_result_ids.insert(tool_use_id.clone());
                 }
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. } => {}
             }
         }
     }
@@ -373,7 +384,9 @@ fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
             message.content.retain(|block| match block {
                 ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
                 ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. } => true,
             });
             (!message.content.is_empty()).then_some(message)
         })
@@ -386,6 +399,7 @@ async fn stream_session_message_response(
     key: SessionKey,
     message: String,
     images: Vec<EncodedImage>,
+    documents: Vec<EncodedDocument>,
     context: Vec<Message>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
@@ -397,6 +411,7 @@ async fn stream_session_message_response(
             key,
             message,
             images,
+            documents,
             context,
             sender,
             disconnected,
@@ -413,6 +428,7 @@ async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
         &task.key,
         &task.message,
         &task.images,
+        &task.documents,
         task.context,
         Some(callback),
     )
@@ -446,10 +462,13 @@ async fn process_and_route_session_message(
     key: &SessionKey,
     message: &str,
     images: &[EncodedImage],
+    documents: &[EncodedDocument],
     context: Vec<Message>,
 ) -> Result<(CycleResult, String, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
-    let (result, session_messages, session_memory) =
-        execute_session_turn(state, registry, key, message, images, context, None).await?;
+    let (result, session_messages, session_memory) = execute_session_turn(
+        state, registry, key, message, images, documents, context, None,
+    )
+    .await?;
 
     state
         .channels
@@ -474,6 +493,7 @@ async fn execute_session_turn(
     key: &SessionKey,
     message: &str,
     images: &[EncodedImage],
+    documents: &[EncodedDocument],
     context: Vec<Message>,
     callback: Option<StreamCallback>,
 ) -> Result<(CycleResult, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
@@ -484,6 +504,7 @@ async fn execute_session_turn(
         .process_message_with_context(
             message,
             encoded_images_to_attachments(images),
+            encoded_documents_to_attachments(documents),
             context,
             InputSource::Http,
             callback,

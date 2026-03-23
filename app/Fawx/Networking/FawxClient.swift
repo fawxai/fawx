@@ -390,9 +390,17 @@ actor FawxClient {
     func sendMessage(
         sessionID: String,
         message: String,
-        images: [ImagePayload] = []
+        images: [ImagePayload] = [],
+        documents: [DocumentPayload] = []
     ) async throws -> MessageResponse {
-        let body = try encoder.encode(SendMessageBody(message: message, images: images, sessionID: nil))
+        let body = try encoder.encode(
+            SendMessageBody(
+                message: message,
+                images: images,
+                documents: documents,
+                sessionID: nil
+            )
+        )
         return try await performRequest(
             path: "/v1/sessions/\(sessionID)/messages",
             method: "POST",
@@ -404,9 +412,17 @@ actor FawxClient {
     func sendMessageStream(
         sessionID: String,
         message: String,
-        images: [ImagePayload] = []
+        images: [ImagePayload] = [],
+        documents: [DocumentPayload] = []
     ) throws -> AsyncThrowingStream<SSEEvent, Error> {
-        let body = try encoder.encode(SendMessageBody(message: message, images: images, sessionID: nil))
+        let body = try encoder.encode(
+            SendMessageBody(
+                message: message,
+                images: images,
+                documents: documents,
+                sessionID: nil
+            )
+        )
         let request = try makeRequest(
             path: "/v1/sessions/\(sessionID)/messages",
             method: "POST",
@@ -784,9 +800,17 @@ actor FawxClient {
     func sendTopLevelMessage(
         _ message: String,
         images: [ImagePayload] = [],
+        documents: [DocumentPayload] = [],
         sessionID: String? = nil
     ) async throws -> MessageResponse {
-        let body = try encoder.encode(SendMessageBody(message: message, images: images, sessionID: sessionID))
+        let body = try encoder.encode(
+            SendMessageBody(
+                message: message,
+                images: images,
+                documents: documents,
+                sessionID: sessionID
+            )
+        )
         return try await performRequest(
             path: "/message",
             method: "POST",
@@ -1140,11 +1164,13 @@ private struct GitCommitRequestBody: Encodable {
 private struct SendMessageBody: Encodable {
     let message: String
     let images: [ImagePayload]
+    let documents: [DocumentPayload]
     let sessionID: String?
 
     enum CodingKeys: String, CodingKey {
         case message
         case images
+        case documents
         case sessionID = "session_id"
     }
 }

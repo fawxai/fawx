@@ -1,8 +1,138 @@
 import Observation
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 #if os(iOS)
 import Combine
+import PhotosUI
+import QuickLook
 import UIKit
+#endif
+import UniformTypeIdentifiers
+
+enum AttachmentPreviewPresenter {
+    private static let previewDirectoryName = "FawxAttachments"
+    private static let stalePreviewLifetime: TimeInterval = 60 * 60
+
+    static func present(data: Data, filename: String) {
+        let fileManager = FileManager.default
+        let sanitizedFilename = filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "attachment"
+            : filename
+        let tempDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+            previewDirectoryName,
+            isDirectory: true
+        )
+        try? fileManager.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        cleanupStalePreviews(in: tempDirectory, fileManager: fileManager)
+        let url = tempDirectory.appendingPathComponent("\(UUID().uuidString)-\(sanitizedFilename)")
+
+        do {
+            try data.write(to: url, options: .atomic)
+#if os(macOS)
+            NSWorkspace.shared.open(url)
+#else
+            Task { @MainActor in
+                IOSPreviewCoordinator.shared.present(url: url)
+            }
+#endif
+        } catch {
+            assertionFailure("Failed to preview attachment: \(error.localizedDescription)")
+        }
+    }
+
+    private static func cleanupStalePreviews(in directory: URL, fileManager: FileManager) {
+        let expirationDate = Date().addingTimeInterval(-stalePreviewLifetime)
+        let resourceKeys: Set<URLResourceKey> = [.contentModificationDateKey]
+        guard let fileURLs = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        for fileURL in fileURLs {
+            guard
+                let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                let modifiedAt = values.contentModificationDate,
+                modifiedAt < expirationDate
+            else {
+                continue
+            }
+
+            try? fileManager.removeItem(at: fileURL)
+        }
+    }
+}
+
+#if os(iOS)
+@MainActor
+private final class IOSPreviewCoordinator: NSObject, QLPreviewControllerDataSource {
+    static let shared = IOSPreviewCoordinator()
+
+    private let previewController = QLPreviewController()
+    private var previewURL: URL?
+
+    private override init() {
+        super.init()
+        previewController.dataSource = self
+    }
+
+    func present(url: URL) {
+        previewURL = url
+        previewController.reloadData()
+
+        if previewController.presentingViewController == nil {
+            topViewController()?.present(previewController, animated: true)
+        }
+    }
+
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+        previewURL == nil ? 0 : 1
+    }
+
+    func previewController(
+        _ controller: QLPreviewController,
+        previewItemAt index: Int
+    ) -> (any QLPreviewItem) {
+        previewURL! as NSURL
+    }
+
+    private func topViewController() -> UIViewController? {
+        let activeScenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter {
+                $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive
+            }
+
+        let rootViewController = activeScenes
+            .compactMap { scene in
+                scene.windows.first(where: \.isKeyWindow)?.rootViewController
+                    ?? scene.windows.first?.rootViewController
+            }
+            .first
+
+        return topViewController(startingFrom: rootViewController)
+    }
+
+    private func topViewController(startingFrom root: UIViewController?) -> UIViewController? {
+        if let navigationController = root as? UINavigationController {
+            return topViewController(startingFrom: navigationController.visibleViewController)
+        }
+
+        if let tabBarController = root as? UITabBarController {
+            return topViewController(startingFrom: tabBarController.selectedViewController)
+        }
+
+        if let presentedViewController = root?.presentedViewController {
+            return topViewController(startingFrom: presentedViewController)
+        }
+
+        return root
+    }
+}
 #endif
 
 struct ChatDetailView: View {
@@ -19,6 +149,12 @@ struct ChatDetailView: View {
     @State private var pendingRipcordConfirmation: RipcordConfirmationAction?
     @State private var ripcordActionInFlight: RipcordAction?
     @State private var presentedSessionMemory: Session?
+    @State private var isAttachmentDropTargeted = false
+#if os(iOS)
+    @State private var isShowingPhotoLibraryPicker = false
+    @State private var isShowingDocumentPicker = false
+    @State private var isShowingCameraPicker = false
+#endif
 
     let emptyStateTitle: String
     let emptyStateMessage: String
@@ -26,12 +162,46 @@ struct ChatDetailView: View {
     var body: some View {
         GeometryReader(content: detailContainer)
             .background(Color.fawxBackground)
+#if os(macOS)
+            .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isAttachmentDropTargeted) { providers in
+                handleDroppedFileProviders(providers)
+            }
+#endif
             .sheet(item: $presentedSessionMemory) { session in
                 SessionMemoryPanel(appState: appState, session: session) {
                     presentedSessionMemory = nil
                 }
                 .fawxOpaqueModalPresentation()
             }
+#if os(iOS)
+            .sheet(isPresented: $isShowingPhotoLibraryPicker) {
+                PhotoLibraryPicker { pickedAttachments in
+                    handlePickedLibraryAttachments(pickedAttachments)
+                    isShowingPhotoLibraryPicker = false
+                }
+                .fawxOpaqueModalPresentation()
+            }
+            .sheet(isPresented: $isShowingDocumentPicker) {
+                AttachmentDocumentPicker { urls in
+                    handlePickedDocumentURLs(urls)
+                    isShowingDocumentPicker = false
+                }
+                .fawxOpaqueModalPresentation()
+            }
+            .sheet(isPresented: $isShowingCameraPicker) {
+                CameraImagePicker { imageData in
+                    if let imageData {
+                        chatViewModel.addImageAttachment(
+                            data: imageData,
+                            filename: "Camera Photo.jpg",
+                            mediaType: "image/jpeg"
+                        )
+                    }
+                    isShowingCameraPicker = false
+                }
+                .fawxOpaqueModalPresentation()
+            }
+#endif
     }
 
     @ViewBuilder
@@ -173,6 +343,13 @@ struct ChatDetailView: View {
             }
             .overlay(alignment: .top) {
                 topOverlay
+            }
+            .overlay {
+                if isAttachmentDropTargeted {
+                    RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius + 6, style: .continuous)
+                        .stroke(Color.fawxAccent, style: StrokeStyle(lineWidth: 2, dash: [10, 8]))
+                        .padding(FawxSpacing.paddingXL)
+                }
             }
             .animation(.easeInOut(duration: 0.22), value: chatViewModel.compactionBannerInfo)
     }
@@ -489,11 +666,7 @@ struct ChatDetailView: View {
     private func transcriptItemView(_ item: ChatTranscriptItem) -> some View {
         switch item {
         case .message(let message):
-            MessageBubble(
-                role: message.message.role,
-                content: message.displayText,
-                timestamp: message.message.timestamp
-            )
+            MessageBubble(message: message.message)
         case .toolActivityGroup(let group):
             ToolActivityGroupCard(group: group)
         }
@@ -569,6 +742,7 @@ struct ChatDetailView: View {
             InputBar(
                 text: $chatViewModel.draftMessage,
                 queuedMessage: chatViewModel.queuedMessage,
+                pendingAttachments: chatViewModel.pendingAttachments,
                 isStreaming: chatViewModel.isCurrentSessionStreaming,
                 connectionStatus: appState.connectionStatus,
                 currentPhase: chatViewModel.composerPhaseLabel,
@@ -577,10 +751,17 @@ struct ChatDetailView: View {
                 thinkingLevel: appState.thinkingLevel,
                 availableThinkingLevels: appState.availableThinkingLevels,
                 isUpdatingServerSettings: appState.isUpdatingServerSettings,
-                placeholder: sessionViewModel.selectedSessionID == nil ? "Let's go!" : "Message Fawx...",
+                placeholder: sessionViewModel.selectedSessionID == nil ? "What are we working on?" : "Message Fawx...",
                 sendAction: chatViewModel.sendDraft,
                 stopAction: chatViewModel.stopStreaming,
                 dismissQueuedMessage: chatViewModel.dismissQueuedMessage,
+                removeAttachment: chatViewModel.removeAttachment,
+                previewAttachment: previewAttachment,
+                showAttachmentPicker: showAttachmentPicker,
+                showPhotoLibrary: showPhotoLibrary,
+                showCamera: showCamera,
+                showFiles: showFiles,
+                pasteImage: chatViewModel.addPastedImage,
                 selectModel: { modelID in
                     Task {
                         try? await appState.setModel(modelID)
@@ -746,6 +927,103 @@ struct ChatDetailView: View {
 #endif
     }
 
+    private func previewAttachment(_ attachment: PendingAttachment) {
+        AttachmentPreviewPresenter.present(data: attachment.data, filename: attachment.filename)
+    }
+
+    private func showAttachmentPicker() {
+#if os(macOS)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = AttachmentComposer.supportedPickerContentTypes
+        panel.message = "Attach files to your message"
+        guard panel.runModal() == .OK else {
+            return
+        }
+
+        for url in panel.urls {
+            chatViewModel.addAttachment(fromFileURL: url)
+        }
+#else
+        isShowingDocumentPicker = true
+#endif
+    }
+
+    private func showPhotoLibrary() {
+#if os(iOS)
+        isShowingPhotoLibraryPicker = true
+#endif
+    }
+
+    private func showCamera() {
+#if os(iOS)
+        isShowingCameraPicker = true
+#endif
+    }
+
+    private func showFiles() {
+#if os(iOS)
+        isShowingDocumentPicker = true
+#else
+        showAttachmentPicker()
+#endif
+    }
+
+#if os(macOS)
+    private func handleDroppedFileProviders(_ providers: [NSItemProvider]) -> Bool {
+        let urlProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !urlProviders.isEmpty else {
+            return false
+        }
+
+        for provider in urlProviders {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                guard
+                    let data = item as? Data,
+                    let url = NSURL(
+                        absoluteURLWithDataRepresentation: data,
+                        relativeTo: nil
+                    ) as URL?
+                else {
+                    return
+                }
+
+                Task { @MainActor in
+                    chatViewModel.addAttachment(fromFileURL: url)
+                }
+            }
+        }
+
+        return true
+    }
+#endif
+
+#if os(iOS)
+    private func handlePickedLibraryAttachments(_ attachments: [PickedImageAttachment]) {
+        for attachment in attachments {
+            chatViewModel.addImageAttachment(
+                data: attachment.data,
+                filename: attachment.filename,
+                mediaType: attachment.mediaType
+            )
+        }
+    }
+
+    private func handlePickedDocumentURLs(_ urls: [URL]) {
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if scoped {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            chatViewModel.addAttachment(fromFileURL: url)
+        }
+    }
+#endif
+
     private var streamingBubbleContent: String {
         let streamed = chatViewModel.visibleStreamingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !streamed.isEmpty {
@@ -862,6 +1140,170 @@ struct ChatDetailView: View {
     }
 #endif
 }
+
+#if os(iOS)
+private struct PickedImageAttachment: Sendable, Hashable {
+    let data: Data
+    let filename: String
+    let mediaType: String
+}
+
+private actor PickedImageAttachmentStore {
+    private var attachments: [PickedImageAttachment] = []
+
+    func append(_ attachment: PickedImageAttachment) {
+        attachments.append(attachment)
+    }
+
+    func snapshot() -> [PickedImageAttachment] {
+        attachments
+    }
+}
+
+private struct PhotoLibraryPicker: UIViewControllerRepresentable {
+    let onComplete: ([PickedImageAttachment]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onComplete: onComplete)
+    }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration(photoLibrary: .shared())
+        configuration.filter = .images
+        configuration.selectionLimit = AttachmentComposer.maxAttachmentCount
+        let controller = PHPickerViewController(configuration: configuration)
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onComplete: ([PickedImageAttachment]) -> Void
+
+        init(onComplete: @escaping ([PickedImageAttachment]) -> Void) {
+            self.onComplete = onComplete
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            let group = DispatchGroup()
+            let pickedAttachments = PickedImageAttachmentStore()
+
+            for result in results {
+                let provider = result.itemProvider
+                guard let typeIdentifier = provider.registeredTypeIdentifiers.first else {
+                    continue
+                }
+                let filename = provider.suggestedName ?? "Photo"
+
+                group.enter()
+                provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                    guard let data else {
+                        group.leave()
+                        return
+                    }
+
+                    let type = UTType(typeIdentifier)
+                    let mediaType = type?.preferredMIMEType ?? "image/jpeg"
+                    Task {
+                        await pickedAttachments.append(
+                            PickedImageAttachment(
+                                data: data,
+                                filename: filename,
+                                mediaType: mediaType
+                            )
+                        )
+                        group.leave()
+                    }
+                }
+            }
+
+            group.notify(queue: .main) {
+                Task {
+                    let attachments = await pickedAttachments.snapshot()
+                    await MainActor.run {
+                        self.onComplete(attachments)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct AttachmentDocumentPicker: UIViewControllerRepresentable {
+    let onComplete: ([URL]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onComplete: onComplete)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let controller = UIDocumentPickerViewController(
+            forOpeningContentTypes: AttachmentComposer.supportedPickerContentTypes,
+            asCopy: true
+        )
+        controller.delegate = context.coordinator
+        controller.allowsMultipleSelection = true
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onComplete: ([URL]) -> Void
+
+        init(onComplete: @escaping ([URL]) -> Void) {
+            self.onComplete = onComplete
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onComplete(urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onComplete([])
+        }
+    }
+}
+
+private struct CameraImagePicker: UIViewControllerRepresentable {
+    let onComplete: (Data?) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onComplete: onComplete)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let controller = UIImagePickerController()
+        controller.delegate = context.coordinator
+        controller.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
+        controller.mediaTypes = ["public.image"]
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let onComplete: (Data?) -> Void
+
+        init(onComplete: @escaping (Data?) -> Void) {
+            self.onComplete = onComplete
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            onComplete(nil)
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]
+        ) {
+            let image = info[.originalImage] as? UIImage
+            onComplete(image?.jpegData(compressionQuality: 0.9))
+        }
+    }
+}
+#endif
 
 private struct CompactionBannerStyle {
     let background: Color

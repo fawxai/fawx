@@ -553,7 +553,7 @@ mod tests {
     use fx_bus::SessionBus;
     use fx_core::types::InputSource;
     use fx_kernel::StreamCallback;
-    use fx_llm::{ImageAttachment, Message};
+    use fx_llm::{DocumentAttachment, ImageAttachment, Message};
     use std::sync::Arc;
     use std::time::Instant;
     use tempfile::TempDir;
@@ -568,6 +568,7 @@ mod tests {
             &mut self,
             _input: &str,
             _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
             _source: InputSource,
             _callback: Option<StreamCallback>,
         ) -> Result<CycleResult, anyhow::Error> {
@@ -578,6 +579,7 @@ mod tests {
             &mut self,
             _input: &str,
             _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
             _context: Vec<Message>,
             _source: InputSource,
             _callback: Option<StreamCallback>,

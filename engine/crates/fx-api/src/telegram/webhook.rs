@@ -52,6 +52,7 @@ pub async fn handle_telegram_webhook(
         state.channels.router.as_ref(),
         &incoming.text,
         images,
+        Vec::new(),
         source,
         context,
     )

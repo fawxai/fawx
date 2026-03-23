@@ -9,6 +9,8 @@ pub struct MessageRequest {
     #[serde(default)]
     pub images: Vec<ImagePayload>,
     #[serde(default)]
+    pub documents: Vec<DocumentPayload>,
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
@@ -345,10 +347,25 @@ pub struct EncodedImage {
     pub base64_data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedDocument {
+    pub media_type: String,
+    pub base64_data: String,
+    pub filename: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ImagePayload {
     pub data: String,
     pub media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DocumentPayload {
+    pub data: String,
+    pub media_type: String,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

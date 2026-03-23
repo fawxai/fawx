@@ -120,6 +120,12 @@ fn format_content_block(block: &ContentBlock) -> Option<String> {
             }
         }
         ContentBlock::Image { .. } => Some("[image]".to_string()),
+        ContentBlock::Document { filename, .. } => Some(
+            filename
+                .as_ref()
+                .map(|filename| format!("[document:{filename}]"))
+                .unwrap_or_else(|| "[document]".to_string()),
+        ),
     }
 }
 

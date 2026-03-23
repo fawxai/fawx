@@ -1,3 +1,6 @@
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import Fawx
 
@@ -1385,6 +1388,314 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.queuedMessage, "follow up")
     }
 
+    func testPrepareMessageInjectsTextAttachmentsAndSeparatesBinaryPayloads() {
+        let imageData = Data([0x89, 0x50, 0x4E, 0x47])
+        let pdfData = Data("%PDF".utf8)
+        let textAttachment = makePendingAttachment(
+            kind: .textFile,
+            filename: "notes.txt",
+            data: Data("alpha\nbeta".utf8),
+            mediaType: "text/plain",
+            textContent: "alpha\nbeta"
+        )
+        let imageAttachment = makePendingAttachment(
+            kind: .image,
+            filename: "photo.png",
+            data: imageData,
+            mediaType: "image/png"
+        )
+        let documentAttachment = makePendingAttachment(
+            kind: .pdf,
+            filename: "brief.pdf",
+            data: pdfData,
+            mediaType: "application/pdf"
+        )
+
+        let payload = AttachmentComposer.prepareMessage(
+            message: "Please review",
+            attachments: [textAttachment, imageAttachment, documentAttachment]
+        )
+
+        let expectedMessage = """
+        [file: notes.txt]
+        alpha
+        beta
+        [/file: notes.txt]
+
+        Please review
+        """
+
+        XCTAssertEqual(payload.message, expectedMessage)
+        XCTAssertEqual(
+            payload.images,
+            [ImagePayload(data: imageData.base64EncodedString(), mediaType: "image/png")]
+        )
+        XCTAssertEqual(
+            payload.documents,
+            [
+                DocumentPayload(
+                    data: pdfData.base64EncodedString(),
+                    mediaType: "application/pdf",
+                    filename: "brief.pdf"
+                )
+            ]
+        )
+        XCTAssertEqual(
+            payload.contentBlocks,
+            [
+                .image(mediaType: "image/png", data: imageData.base64EncodedString()),
+                .document(
+                    mediaType: "application/pdf",
+                    data: pdfData.base64EncodedString(),
+                    filename: "brief.pdf"
+                ),
+                .text(expectedMessage),
+            ]
+        )
+    }
+
+    func testMaxAttachmentLimitRejectsEleventhAttachment() {
+        let existingAttachments = (0..<AttachmentComposer.maxAttachmentCount).map { index in
+            makePendingAttachment(
+                kind: .textFile,
+                filename: "file-\(index).txt",
+                data: Data(),
+                mediaType: "text/plain",
+                textContent: ""
+            )
+        }
+        let extraAttachment = makePendingAttachment(
+            kind: .textFile,
+            filename: "overflow.txt",
+            data: Data(),
+            mediaType: "text/plain",
+            textContent: ""
+        )
+
+        XCTAssertThrowsError(
+            try AttachmentComposer.append([extraAttachment], to: existingAttachments)
+        ) { error in
+            XCTAssertEqual(
+                error as? AttachmentComposerError,
+                .tooManyAttachments(limit: AttachmentComposer.maxAttachmentCount)
+            )
+        }
+    }
+
+    func testImageResizeAboveThreshold() throws {
+        var oversizedImageData = makeNoisyPNGData(width: 3_000, height: 3_000)
+        if oversizedImageData.count <= AttachmentComposer.maxImageBytes {
+            oversizedImageData = makeNoisyPNGData(width: 4_096, height: 4_096)
+        }
+
+        XCTAssertGreaterThan(oversizedImageData.count, AttachmentComposer.maxImageBytes)
+
+        let attachment = try AttachmentComposer.imageAttachment(
+            data: oversizedImageData,
+            filename: "oversized.png",
+            mediaType: "image/png"
+        )
+
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertEqual(attachment.mediaType, "image/jpeg")
+        XCTAssertLessThanOrEqual(attachment.data.count, AttachmentComposer.maxImageBytes)
+    }
+
+    func testPasteImageFromClipboardCreatesPendingAttachment() throws {
+        let attachment = try AttachmentComposer.pastedImageAttachment(
+            data: makeNoisyPNGData(width: 48, height: 48)
+        )
+
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertEqual(attachment.filename, "Pasted Image.png")
+        XCTAssertEqual(attachment.mediaType, "image/png")
+        XCTAssertFalse(attachment.data.isEmpty)
+    }
+
+    func testImageAttachmentPrefersDetectedMediaTypeOverProvidedLabel() throws {
+        let attachment = try AttachmentComposer.imageAttachment(
+            data: makeNoisyJPEGData(width: 96, height: 96),
+            filename: "logo.png",
+            mediaType: "image/png"
+        )
+
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertEqual(attachment.mediaType, "image/jpeg")
+    }
+
+    func testPendingAttachmentFromFileURLUsesDetectedImageMediaType() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("png")
+        try makeNoisyJPEGData(width: 96, height: 96).write(to: url)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        let attachment = try AttachmentComposer.pendingAttachment(fromFileURL: url)
+
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertEqual(attachment.filename, url.lastPathComponent)
+        XCTAssertEqual(attachment.mediaType, "image/jpeg")
+    }
+
+    func testTextFileReadAndInject() throws {
+        let attachment = try AttachmentComposer.textFileAttachment(
+            data: Data("name,email\nAlice,alice@example.com".utf8),
+            filename: "report.csv",
+            mediaType: "text/csv"
+        )
+
+        let payload = AttachmentComposer.prepareMessage(
+            message: "Analyze this customer list.",
+            attachments: [attachment]
+        )
+
+        XCTAssertEqual(
+            payload.message,
+            """
+            [file: report.csv]
+            name,email
+            Alice,alice@example.com
+            [/file: report.csv]
+
+            Analyze this customer list.
+            """
+        )
+        XCTAssertTrue(payload.images.isEmpty)
+        XCTAssertTrue(payload.documents.isEmpty)
+    }
+
+    func testTextFileRejectsBinary() {
+        XCTAssertThrowsError(
+            try AttachmentComposer.textFileAttachment(
+                data: Data([0xFF, 0x00, 0xD8, 0x42]),
+                filename: "report.csv",
+                mediaType: "text/csv"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AttachmentComposerError,
+                .binaryTextFile("report.csv")
+            )
+        }
+    }
+
+    func testTextFileSizeLimit() {
+        XCTAssertThrowsError(
+            try AttachmentComposer.textFileAttachment(
+                data: Data(repeating: 0x61, count: AttachmentComposer.maxTextBytes + 1),
+                filename: "large.txt",
+                mediaType: "text/plain"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AttachmentComposerError,
+                .textFileTooLarge("large.txt")
+            )
+        }
+    }
+
+    func testPDFAttachmentEncoding() throws {
+        let pdfData = makeMinimalPDFData()
+        let attachment = try AttachmentComposer.pdfAttachment(data: pdfData, filename: "brief.pdf")
+        let payload = AttachmentComposer.prepareMessage(message: "", attachments: [attachment])
+
+        XCTAssertEqual(
+            payload.documents,
+            [
+                DocumentPayload(
+                    data: pdfData.base64EncodedString(),
+                    mediaType: "application/pdf",
+                    filename: "brief.pdf"
+                )
+            ]
+        )
+        XCTAssertEqual(
+            payload.contentBlocks,
+            [
+                .document(
+                    mediaType: "application/pdf",
+                    data: pdfData.base64EncodedString(),
+                    filename: "brief.pdf"
+                )
+            ]
+        )
+    }
+
+    func testPDFSizeLimit() {
+        XCTAssertThrowsError(
+            try AttachmentComposer.pdfAttachment(
+                data: Data(repeating: 0x20, count: AttachmentComposer.maxPDFBytes + 1),
+                filename: "large.pdf"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AttachmentComposerError,
+                .pdfTooLarge("large.pdf")
+            )
+        }
+    }
+
+    func testSendDraftQueuesAttachmentOnlyMessageForCurrentStreamingSession() {
+        let sut = makeSUT(connectionStatus: .connected)
+        let documentAttachment = makePendingAttachment(
+            kind: .pdf,
+            filename: "brief.pdf",
+            data: Data("%PDF".utf8),
+            mediaType: "application/pdf"
+        )
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.pendingAttachments = [documentAttachment]
+
+        sut.sendDraft()
+
+        XCTAssertEqual(sut.draftMessage, "")
+        XCTAssertTrue(sut.pendingAttachments.isEmpty)
+        XCTAssertEqual(sut.queuedMessage, "Queued brief.pdf")
+
+        let delivery = sut.consumeQueuedMessageForTesting(finishedSessionID: "session-a")
+
+        XCTAssertEqual(delivery?.text, "")
+        XCTAssertEqual(delivery?.attachments, [documentAttachment])
+        XCTAssertEqual(delivery?.sessionID, "session-a")
+    }
+
+    func testQueuedAttachmentOnlyMessageUsesAttachmentCountSummary() {
+        let sut = makeSUT(connectionStatus: .connected)
+
+        sut.prepareToDisplaySession("session-a")
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a"
+        )
+        sut.pendingAttachments = [
+            makePendingAttachment(
+                kind: .image,
+                filename: "photo.png",
+                data: Data([0x89, 0x50, 0x4E, 0x47]),
+                mediaType: "image/png"
+            ),
+            makePendingAttachment(
+                kind: .pdf,
+                filename: "brief.pdf",
+                data: Data("%PDF".utf8),
+                mediaType: "application/pdf"
+            ),
+        ]
+
+        sut.sendDraft()
+
+        XCTAssertEqual(sut.queuedMessage, "Queued 2 attachments")
+    }
+
     func testSendDraftSendsImmediatelyWhenAnotherSessionIsStreaming() async {
         let sut = makeSUT(connectionStatus: .connected)
 
@@ -1577,6 +1888,108 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTFail("Expected at least \(minimumCount) transcript item(s).")
+    }
+
+    private func makePendingAttachment(
+        kind: PendingAttachmentKind,
+        filename: String,
+        data: Data,
+        mediaType: String,
+        textContent: String? = nil
+    ) -> PendingAttachment {
+        PendingAttachment(
+            kind: kind,
+            filename: filename,
+            data: data,
+            mediaType: mediaType,
+            textContent: textContent
+        )
+    }
+
+    private func makeNoisyPNGData(width: Int, height: Int) -> Data {
+        makeNoisyImageData(width: width, height: height, type: .png)
+    }
+
+    private func makeNoisyJPEGData(width: Int, height: Int) -> Data {
+        makeNoisyImageData(
+            width: width,
+            height: height,
+            type: .jpeg,
+            properties: [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary
+        )
+    }
+
+    private func makeNoisyImageData(
+        width: Int,
+        height: Int,
+        type: UTType,
+        properties: CFDictionary? = nil
+    ) -> Data {
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        var state: UInt64 = 0x1234_5678_9ABC_DEF0
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * bytesPerRow) + (x * bytesPerPixel)
+                state = state &* 6364136223846793005 &+ 1
+                pixels[offset] = UInt8(truncatingIfNeeded: state >> 24)
+                state = state &* 6364136223846793005 &+ 1
+                pixels[offset + 1] = UInt8(truncatingIfNeeded: state >> 16)
+                state = state &* 6364136223846793005 &+ 1
+                pixels[offset + 2] = UInt8(truncatingIfNeeded: state >> 8)
+                pixels[offset + 3] = 255
+            }
+        }
+
+        let provider = CGDataProvider(data: Data(pixels) as CFData)!
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )!
+
+        let output = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(
+            output,
+            type.identifier as CFString,
+            1,
+            nil
+        )!
+        CGImageDestinationAddImage(destination, image, properties)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return output as Data
+    }
+
+    private func makeMinimalPDFData() -> Data {
+        Data(
+            """
+            %PDF-1.4
+            1 0 obj
+            << /Type /Catalog /Pages 2 0 R >>
+            endobj
+            2 0 obj
+            << /Type /Pages /Count 1 /Kids [3 0 R] >>
+            endobj
+            3 0 obj
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>
+            endobj
+            trailer
+            << /Root 1 0 R >>
+            %%EOF
+            """.utf8
+        )
     }
 
     // MARK: - Transcript merge edge-case tests

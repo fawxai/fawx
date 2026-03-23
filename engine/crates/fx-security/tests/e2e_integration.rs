@@ -70,6 +70,7 @@ fn create_user_input(text: &str) -> UserInput {
             .as_millis() as u64,
         context_id: None,
         images: Vec::new(),
+        documents: Vec::new(),
     }
 }
 

@@ -33,6 +33,17 @@ pub struct ImageAttachment {
     pub data: String,
 }
 
+/// A base64-encoded document attachment for multimodal messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DocumentAttachment {
+    /// MIME type (e.g., "application/pdf").
+    pub media_type: String,
+    /// Base64-encoded document data.
+    pub data: String,
+    /// Original filename when available.
+    pub filename: Option<String>,
+}
+
 /// User input received from voice, text, or other sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInput {
@@ -51,6 +62,10 @@ pub struct UserInput {
     /// Base64-encoded images attached to the input.
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+
+    /// Base64-encoded documents attached to the input.
+    #[serde(default)]
+    pub documents: Vec<DocumentAttachment>,
 }
 
 /// Source of user input.

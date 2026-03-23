@@ -2,6 +2,9 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 #endif
+#if canImport(PDFKit)
+import PDFKit
+#endif
 #if os(iOS)
 import UIKit
 #endif
@@ -13,6 +16,7 @@ struct InputBar: View {
 #endif
 
     let queuedMessage: String?
+    let pendingAttachments: [PendingAttachment]
     let isStreaming: Bool
     let connectionStatus: ConnectionStatus
     let currentPhase: String?
@@ -25,6 +29,13 @@ struct InputBar: View {
     let sendAction: () -> Void
     let stopAction: () -> Void
     let dismissQueuedMessage: () -> Void
+    let removeAttachment: (UUID) -> Void
+    let previewAttachment: (PendingAttachment) -> Void
+    let showAttachmentPicker: () -> Void
+    let showPhotoLibrary: () -> Void
+    let showCamera: () -> Void
+    let showFiles: () -> Void
+    let pasteImage: (Data) -> Void
     let selectModel: (String) -> Void
     let selectThinking: (ThinkingLevel) -> Void
 
@@ -32,6 +43,10 @@ struct InputBar: View {
         VStack(spacing: FawxSpacing.paddingSM) {
             if let queuedMessage, !queuedMessage.isEmpty {
                 QueuedMessageChip(text: queuedMessage, dismiss: dismissQueuedMessage)
+            }
+
+            if !pendingAttachments.isEmpty {
+                attachmentPreviewStrip
             }
 
             VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
@@ -76,6 +91,7 @@ struct InputBar: View {
                 measuredHeight: $macComposerHeight,
                 textColor: NSColor(Color.fawxText),
                 font: .systemFont(ofSize: FawxTypography.chatBodyPointSize),
+                onPasteImage: pasteImage,
                 onSend: performPrimaryAction
             )
             .frame(height: macComposerHeight)
@@ -98,7 +114,10 @@ struct InputBar: View {
 #endif
 
     private var messageFieldPanel: some View {
-        messageField
+        HStack(alignment: .bottom, spacing: FawxSpacing.paddingSM) {
+            attachmentButton
+            messageField
+        }
             .padding(.horizontal, FawxSpacing.paddingMD)
             .padding(.vertical, FawxSpacing.paddingSM)
             .background(messageFieldBackground)
@@ -109,6 +128,21 @@ struct InputBar: View {
             .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
     }
 
+    private var attachmentPreviewStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: FawxSpacing.paddingSM) {
+                ForEach(pendingAttachments) { attachment in
+                    PendingAttachmentChipView(
+                        attachment: attachment,
+                        removeAttachment: { removeAttachment(attachment.id) },
+                        previewAttachment: { previewAttachment(attachment) }
+                    )
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
     private var controlsRow: some View {
         HStack(alignment: .center, spacing: FawxSpacing.paddingSM) {
             modelMenu
@@ -116,6 +150,34 @@ struct InputBar: View {
             Spacer(minLength: 0)
             primaryButton
         }
+    }
+
+    @ViewBuilder
+    private var attachmentButton: some View {
+#if os(iOS)
+        Menu {
+            Button("Photo Library", action: showPhotoLibrary)
+            Button("Camera", action: showCamera)
+            Button("Files", action: showFiles)
+        } label: {
+            attachmentButtonLabel
+        }
+#else
+        Button(action: showAttachmentPicker) {
+            attachmentButtonLabel
+        }
+#endif
+    }
+
+    private var attachmentButtonLabel: some View {
+        Image(systemName: "paperclip")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(Color.fawxTextSecondary)
+            .frame(width: 32, height: 32)
+            .background(Color.fawxSurfaceHover)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityIdentifier("attachmentButton")
+            .accessibilityLabel("Attach files")
     }
 
     private var modelMenu: some View {
@@ -174,7 +236,10 @@ struct InputBar: View {
     }
 
     private var primaryButtonTitle: String {
-        if isStreaming && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if isStreaming
+            && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && pendingAttachments.isEmpty
+        {
             return "Stop"
         }
         return "Send"
@@ -192,6 +257,7 @@ struct InputBar: View {
             return true
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && pendingAttachments.isEmpty
     }
 
     private var modelHelpText: String {
@@ -244,6 +310,7 @@ private struct MacComposerTextView: NSViewRepresentable {
 
     let textColor: NSColor
     let font: NSFont
+    let onPasteImage: (Data) -> Void
     let onSend: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -286,6 +353,7 @@ private struct MacComposerTextView: NSViewRepresentable {
         textView.string = text
         textView.textColor = textColor
         textView.font = font
+        textView.onPasteImage = onPasteImage
 
         scrollView.documentView = textView
         DispatchQueue.main.async {
@@ -305,6 +373,7 @@ private struct MacComposerTextView: NSViewRepresentable {
 
         textView.textColor = textColor
         textView.font = font
+        textView.onPasteImage = onPasteImage
         textView.onSend = onSend
         textView.onHeightChange = { height in
             context.coordinator.updateMeasuredHeight(height)
@@ -344,6 +413,7 @@ private struct MacComposerTextView: NSViewRepresentable {
 }
 
 private final class ComposerNSTextView: NSTextView {
+    var onPasteImage: ((Data) -> Void)?
     var onSend: () -> Void = {}
     var onHeightChange: ((CGFloat) -> Void)?
 
@@ -377,6 +447,15 @@ private final class ComposerNSTextView: NSTextView {
         refreshMeasuredHeight()
     }
 
+    override func paste(_ sender: Any?) {
+        if let data = pastedImageData() {
+            onPasteImage?(data)
+            return
+        }
+
+        super.paste(sender)
+    }
+
     func refreshMeasuredHeight() {
         guard let textContainer, let layoutManager else {
             return
@@ -387,5 +466,169 @@ private final class ComposerNSTextView: NSTextView {
         let measuredHeight = ceil(usedRect.height + (textContainerInset.height * 2))
         onHeightChange?(measuredHeight)
     }
+
+    private func pastedImageData() -> Data? {
+        let pasteboard = NSPasteboard.general
+        let preferredTypes: [NSPasteboard.PasteboardType] = [
+            .png,
+            .tiff,
+            .fileURL,
+        ]
+
+        for type in preferredTypes {
+            guard let data = pasteboard.data(forType: type) else {
+                continue
+            }
+
+            if type == .png {
+                return data
+            }
+
+            if type == .tiff,
+               let imageRep = NSBitmapImageRep(data: data),
+               let pngData = imageRep.representation(using: .png, properties: [:]) {
+                return pngData
+            }
+
+            if type == .fileURL,
+               let url = NSURL(
+                absoluteURLWithDataRepresentation: data,
+                relativeTo: nil
+               ) as URL?,
+               let image = NSImage(contentsOf: url),
+               let pngData = pngData(from: image) {
+                return pngData
+            }
+        }
+
+        return nil
+    }
+
+    private func pngData(from image: NSImage) -> Data? {
+        guard
+            let tiffData = image.tiffRepresentation,
+            let imageRep = NSBitmapImageRep(data: tiffData)
+        else {
+            return nil
+        }
+
+        return imageRep.representation(using: .png, properties: [:])
+    }
 }
 #endif
+
+private struct PendingAttachmentChipView: View {
+    let attachment: PendingAttachment
+    let removeAttachment: () -> Void
+    let previewAttachment: () -> Void
+
+    var body: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            Button(action: previewAttachment) {
+                HStack(spacing: FawxSpacing.paddingSM) {
+                    attachmentPreview
+                    Text(attachment.filename)
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxText)
+                        .lineLimit(1)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Button(action: removeAttachment) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(Color.fawxTextSecondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(attachment.filename)")
+        }
+        .padding(.horizontal, FawxSpacing.paddingSM)
+        .padding(.vertical, FawxSpacing.paddingXS)
+        .background(Color.fawxSurfaceHover)
+        .overlay(
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder.opacity(FawxOpacity.borderMedium), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+    }
+
+    @ViewBuilder
+    private var attachmentPreview: some View {
+        switch attachment.kind {
+        case .image:
+            AttachmentThumbnailPreview(data: attachment.data, kind: .image)
+        case .pdf:
+            AttachmentThumbnailPreview(data: attachment.data, kind: .pdf)
+        case .textFile:
+            Image(systemName: "doc.text")
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+    }
+}
+
+private enum AttachmentThumbnailKind {
+    case image
+    case pdf
+}
+
+private struct AttachmentThumbnailPreview: View {
+    let data: Data
+    let kind: AttachmentThumbnailKind
+
+    var body: some View {
+        Group {
+            switch kind {
+            case .image:
+                platformImage(data: data)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            case .pdf:
+                pdfPreviewImage(data: data)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            }
+        }
+        .frame(width: 28, height: 28)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    #if os(macOS)
+    private func platformImage(data: Data) -> Image {
+        if let image = NSImage(data: data) {
+            return Image(nsImage: image)
+        }
+
+        return Image(systemName: "photo")
+    }
+
+    private func pdfPreviewImage(data: Data) -> Image {
+        if
+            let document = PDFDocument(data: data),
+            let page = document.page(at: 0)
+        {
+            return Image(nsImage: page.thumbnail(of: NSSize(width: 80, height: 80), for: .mediaBox))
+        }
+
+        return Image(systemName: "doc.richtext")
+    }
+    #else
+    private func platformImage(data: Data) -> Image {
+        if let image = UIImage(data: data) {
+            return Image(uiImage: image)
+        }
+
+        return Image(systemName: "photo")
+    }
+
+    private func pdfPreviewImage(data: Data) -> Image {
+        if
+            let document = PDFDocument(data: data),
+            let page = document.page(at: 0)
+        {
+            return Image(uiImage: page.thumbnail(of: CGSize(width: 80, height: 80), for: .mediaBox))
+        }
+
+        return Image(systemName: "doc.richtext")
+    }
+    #endif
+}

@@ -93,7 +93,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use fx_core::types::InputSource;
-    use fx_llm::{ImageAttachment, Message};
+    use fx_llm::{DocumentAttachment, ImageAttachment, Message};
     use http_body_util::BodyExt;
     use hyper::Request;
     use std::sync::Arc;
@@ -112,6 +112,7 @@ mod tests {
             &mut self,
             _input: &str,
             _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
             _source: InputSource,
             _callback: Option<fx_kernel::StreamCallback>,
         ) -> Result<CycleResult, anyhow::Error> {
@@ -127,6 +128,7 @@ mod tests {
             &mut self,
             _input: &str,
             _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
             context: Vec<Message>,
             _source: InputSource,
             _callback: Option<fx_kernel::StreamCallback>,

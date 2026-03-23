@@ -11,11 +11,13 @@ llama-cpp = ["llama-cpp-sys/llama-cpp"]  # Enable llama.cpp integration
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 bytes = "1"
 fx-core.workspace = true
 futures.workspace = true
 http.workspace = true
 llama-cpp-sys = { path = "../llama-cpp-sys", optional = true }
+pdf-extract = "0.7"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

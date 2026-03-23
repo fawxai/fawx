@@ -35,6 +35,7 @@ pub async fn handle_webhook(
         state.channels.router.as_ref(),
         &request.text,
         Vec::new(),
+        Vec::new(),
         source,
         ResponseContext::default(),
     )

@@ -4,7 +4,7 @@ use crate::budget::BudgetSnapshot;
 use crate::conversation_compactor::estimate_text_tokens;
 use crate::types::*;
 use fx_core::types::{Notification, UiElement, UserInput};
-use fx_llm::{ImageAttachment, Message};
+use fx_llm::{DocumentAttachment, ImageAttachment, Message};
 use serde::{Deserialize, Serialize};
 
 /// Processed perception payload passed from Perceive to Reason.
@@ -15,6 +15,9 @@ pub struct ProcessedPerception {
     /// Base64-encoded images attached to the latest user turn.
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    /// Base64-encoded documents attached to the latest user turn.
+    #[serde(default)]
+    pub documents: Vec<DocumentAttachment>,
     /// Conversation context assembled for this reasoning turn.
     pub context_window: Vec<Message>,
     /// Goals currently active in this loop.
@@ -67,6 +70,7 @@ const MEMORY_ENTRY_OVERHEAD_TOKENS: usize = 3;
 const GOAL_OVERHEAD_TOKENS: usize = 4;
 const PREFERENCE_ENTRY_OVERHEAD_TOKENS: usize = 2;
 const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+const DOCUMENT_TOKEN_ESTIMATE: usize = 3200;
 
 impl PerceptionAssembler {
     /// Create a new [`PerceptionAssembler`] with fixed limits.
@@ -267,6 +271,7 @@ fn estimate_conversation_history_tokens(history: &[Message]) -> usize {
                             estimate_text_tokens(tool_use_id)
                         }
                         fx_llm::ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+                        fx_llm::ContentBlock::Document { .. } => DOCUMENT_TOKEN_ESTIMATE,
                     })
                     .sum::<usize>()
         })
