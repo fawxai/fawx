@@ -1748,7 +1748,7 @@ exit 0
     fn cleanup_stale_pid_file_removes_dead_process_pid() {
         let temp_dir = tempfile::TempDir::new().expect("tempdir");
         let pid_path = temp_dir.path().join("fawx.pid");
-        let mut child = std::process::Command::new("sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(":")
             .spawn()
@@ -1767,7 +1767,7 @@ exit 0
     fn cleanup_stale_pid_file_keeps_live_process_pid() {
         let temp_dir = tempfile::TempDir::new().expect("tempdir");
         let pid_path = temp_dir.path().join("fawx.pid");
-        let mut child = std::process::Command::new("sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("sleep 30")
             .spawn()
