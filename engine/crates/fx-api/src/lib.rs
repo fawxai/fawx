@@ -157,7 +157,7 @@ pub async fn run(
         cron_store: config.cron_store.clone(),
         experiment_registry,
         improvement_provider: config.improvement_provider.clone(),
-        telemetry: default_telemetry(),
+        telemetry: default_telemetry(&config.data_dir),
     };
     let router = build_router(state, fleet_manager);
 

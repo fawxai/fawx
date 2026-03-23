@@ -15,7 +15,7 @@ use crate::router::build_router;
 use crate::server_runtime::ServerRuntime;
 use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{
-    build_channel_runtime, default_telemetry, ChannelRuntime, HttpState, SharedReadState,
+    build_channel_runtime, in_memory_telemetry, ChannelRuntime, HttpState, SharedReadState,
 };
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
@@ -1708,7 +1708,7 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         }
     }
 
@@ -1750,7 +1750,7 @@ mod routing_and_status {
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         }
     }
 
@@ -4109,7 +4109,7 @@ thinking = "high"
                 Arc::new(tokio::sync::Mutex::new(registry))
             },
             improvement_provider: None,
-            telemetry: default_telemetry(),
+            telemetry: in_memory_telemetry(),
         };
         let app = build_router(state, None);
         let req = Request::builder()
