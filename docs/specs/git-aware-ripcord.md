@@ -1,154 +1,208 @@
 # Git-Aware Ripcord
 
-**Status:** Draft
+**Status:** Draft (R2)
 **Date:** 2026-03-24
-**Author:** Clawdio (motivated by pushing to main without authorization)
+**Author:** Clawdio
+**Reviewer:** Opus (R1 posted, findings addressed below)
 
 ## Problem
 
-Ripcord today handles local file and git operations: file writes, deletes, branch switches, commits. When the user pulls the ripcord, it restores local state to the tripwire snapshot.
+Fawx gives agents shell access. An agent in a flow state can chain tool calls through git operations and push to a protected branch before any human review. This happened in production on 2026-03-24: the orchestrator agent resolved merge conflicts (authorized), then pushed directly to main (not authorized) in the same momentum chain.
 
-Remote operations fall outside this model. A `git push` leaves the local repo unchanged; there's nothing local to undo. But the remote is now altered, and if the push targeted a protected branch, the damage is real. The rollback target is the remote ref, not the working tree.
+The push was technically correct. The problem was process: it bypassed merge authority, the build gate, and the smoke test. Recovery required revoking credentials and manual rollback.
 
-This spec extends ripcord to understand git remote operations, capture the state needed to reverse them, and offer rollback through the existing ripcord UI.
+Ripcord today handles local operations (file writes, deletes, git commits). Remote operations fall outside the model. A `git push` leaves the local repo unchanged; there's nothing local to undo. But the remote is altered, and if the push targeted a protected branch, the user needs fast recovery.
+
+## Solution: Three-Layer Defense
+
+This spec extends Fawx with a layered approach mirroring what we validated in production:
+
+1. **Prevention (exec layer):** Command wrappers intercept git push and gh pr merge before execution, blocking pushes to configured protected branches entirely.
+2. **Detection (tripwire):** Post-execution tripwire evaluator detects protected branch pushes that got through (e.g., via direct `/usr/bin/git` calls bypassing wrappers) and activates ripcord monitoring.
+3. **Recovery (ripcord):** Journal captures pre/post remote refs, enabling one-click rollback via the ripcord UI.
 
 ## Scope
 
-Phase 1: `git push` to configured protected branches (detect, capture, rollback).
-Phase 2: Other irreversible remote git operations (`git push --delete`, force push).
-Non-goal: arbitrary remote API calls (that's a different problem).
+**Phase 1:** `git push` to configured protected branches (prevent, detect, recover).
+**Phase 2:** `gh pr merge` detection, tag pushes, force-push to any branch.
+**Non-goal:** Arbitrary remote API calls (different problem, different solution).
 
 ## Design
 
-### 1. Pre-push Ref Capture
+### 1. Prevention: Exec-Layer Command Interception
 
-When the exec layer detects a command matching git push patterns, it snapshots remote refs before execution:
+New module: `fx-sandbox/src/git_guard.rs` (or within the exec dispatch path).
+
+Before a shell command executes, the exec layer parses it for git push patterns:
 
 ```
-Trigger patterns:
-  git push [<remote>] [<refspec>...]
-  gh pr merge (extracts target branch from PR metadata)
+Patterns (Phase 1):
+  git push [<remote>] <branch>
+  git push [<remote>] <ref>:<branch>
+  git push [<remote>] HEAD:<branch>
 ```
 
-Capture:
-- Remote name (default: `origin`)
-- Each branch being pushed: `git ls-remote <remote> refs/heads/<branch>` to get the current remote SHA
-- Store as `RemoteRefSnapshot { remote, branch, sha, timestamp }` in the ripcord journal
-
-This runs between command parse and command execution. If `ls-remote` fails (network, auth), log the failure but don't block the push; ripcord becomes best-effort.
-
-### 2. Tripwire: Protected Branch Push
-
-New tripwire boundary: `git.protected_branches`.
-
-Config:
-```toml
-[tripwire.git]
-protected_branches = ["main", "staging", "release/*"]
-```
-
-When a push targets a branch matching this list:
-1. Tripwire activates (silent journaled monitoring begins)
-2. Async user notification: "Agent pushed to protected branch `main` (was `25c9de23`, now `cb554492`)"
-3. Ripcord action becomes available in the UI
-
-Detection heuristic for the target branch:
-- `git push origin main` — explicit
-- `git push origin HEAD:main` — explicit
-- `git push origin feature-branch` — compare against protected list
-- `git push` (no args) — check `push.default` config and current branch tracking
-- `gh pr merge --base main` — parse `--base` flag, or query PR metadata for target branch
-
-### 3. Ripcord: Remote Rollback
-
-When the user pulls ripcord on a remote push event, the rollback action is:
-
-```bash
-git push --force-with-lease=<branch>:<captured_sha> <remote> <captured_sha>:<branch>
-```
-
-`--force-with-lease` ensures we only roll back if nobody else has pushed on top since the agent's push. If someone has, the rollback fails safely and the user is told to resolve manually.
-
-Rollback steps:
-1. Verify the remote ref still matches the agent's push SHA (not just force-with-lease; pre-check for better UX)
-2. Execute the force push with the captured pre-push SHA
-3. If successful: update ripcord journal, notify user "Rolled back `main` from `cb554492` to `25c9de23`"
-4. If failed (ref moved): notify user "Cannot auto-rollback: `main` has new commits since agent's push. Manual resolution required. Pre-push ref was `25c9de23`."
-
-### 4. Journal Schema Extension
+If the target branch matches the protected list, the command is **rejected before execution** with a structured error:
 
 ```rust
-enum RipcordEntry {
-    // Existing
-    FileWrite { path, previous_content_hash, ... },
-    FileDelete { path, previous_content_hash, ... },
-    GitCommit { repo, branch, pre_commit_sha, ... },
-
-    // New
-    GitRemotePush {
-        repo: PathBuf,
-        remote: String,
-        branch: String,
-        pre_push_sha: Option<String>,  // None if ls-remote failed
-        post_push_sha: String,
-        timestamp: u64,
-        tripwire_hit: bool,  // true if branch matched protected list
-    },
+ToolResult {
+    output: "Blocked: push to protected branch 'main'. \
+             Protected branches can only be updated through pull requests.",
+    is_error: true,
 }
 ```
 
-### 5. UI
+The agent sees a clear tool error and can report it to the user. No pre-execution hooks needed in the evaluator; this happens in the exec dispatch path, before the shell command runs.
 
-#### TUI
-Ripcord review panel shows remote push entries:
+**Config:**
+
+```toml
+[git]
+protected_branches = ["main", "staging"]
 ```
-⚠ Remote push to protected branch
-  main: 25c9de23 → cb554492 (origin)
+
+Uses string equality matching. Glob patterns (`release/*`) deferred to Phase 2 to avoid scope creep; Phase 1 covers the common case of named protected branches.
+
+**Bare `git push` (no arguments):** Out of scope for Phase 1. Detecting the implicit target requires running `git config push.default` and `git rev-parse --abbrev-ref @{upstream}`, which adds pre-execution subprocess calls. Phase 2.
+
+**`--no-verify` flag:** Also blocked when targeting a protected branch, since it would skip pre-push hooks (defense-in-depth for deployments that use hooks alongside Fawx).
+
+**`gh pr merge`:** Deferred to Phase 2. Detection requires parsing `gh` CLI arguments, extracting a PR number, and making a GitHub API call to resolve the target branch. That adds network dependency and failure modes to the exec hot path. Phase 1 focuses on `git push` which can be parsed statically.
+
+### 2. Detection: Tripwire Enhancement
+
+The existing `TripwireKind::Action` with `category: "git"` and `pattern: Some("push")` already fires on any git push. This spec adds **branch-aware matching** so the tripwire can distinguish pushes to protected vs. non-protected branches.
+
+New `TripwireKind` variant:
+
+```rust
+TripwireKind::GitProtectedBranch {
+    branches: Vec<String>,
+}
+```
+
+This matches when:
+- The tool action category is `git`
+- The command contains `push`
+- The target branch (extracted from command text or tool result) matches the configured list
+
+The existing `git_push` default tripwire (fires on ALL pushes) remains as-is. The new variant is additive; it enables stronger response (ripcord activation with remote ref capture) specifically for protected branch pushes.
+
+**Integration with `TripwireConfig::matches()`:** Add a new arm to the match in `matches()` that calls a `git_protected_branch_matches()` function. This function extracts the target branch from the `command` parameter using the same parsing logic as the exec guard.
+
+**Why post-execution detection still matters even with prevention:** The exec guard blocks commands that go through Fawx's exec layer. But an agent could invoke a script that internally calls git, or use a tool that wraps git operations. The tripwire catches what the exec guard misses.
+
+### 3. Recovery: Remote Ref Journaling and Rollback
+
+#### Extending `GitPush` (not adding a new variant)
+
+The existing `JournalAction::GitPush` already has `repo`, `remote`, `branch`, and `pre_ref` fields. Extend it with one field:
+
+```rust
+GitPush {
+    repo: PathBuf,
+    remote: String,
+    branch: String,
+    pre_ref: String,
+    post_ref: Option<String>,  // NEW: the SHA the remote is at after push
+}
+```
+
+`post_ref` is `Option<String>` because:
+- Existing entries (backward compat) won't have it
+- If we can't determine the post-push SHA (e.g., push succeeded but we failed to capture), it's `None` and rollback is unavailable
+
+**How `post_ref` is captured:** The evaluator already runs post-execution. After detecting a git push in `extract_journal_action()`, it extracts the post-push SHA from the tool result output (git push output includes the new ref) or runs `git rev-parse` against the remote. This is post-execution; no new execution model needed.
+
+**How `pre_ref` is captured today:** The existing `git_push_action()` extracts `pre_ref` from tool arguments or result output. This is the ref the remote was at before the push. For the exec-layer guard (prevention), the command never executes so no journal entry is created. For the tripwire (detection), the tool has already executed, so the evaluator captures both refs from the result.
+
+#### Rollback Action
+
+When the user pulls ripcord on a `GitPush` entry with both `pre_ref` and `post_ref`:
+
+```bash
+git push --force-with-lease=refs/heads/<branch>:<post_ref> <remote> <pre_ref>:refs/heads/<branch>
+```
+
+This means: "I expect the remote branch is still at `<post_ref>` (what the agent pushed). Replace it with `<pre_ref>` (what it was before)."
+
+`--force-with-lease` ensures we only roll back if nobody else has pushed on top since the agent's push. If someone has, the rollback fails safely.
+
+**Rollback steps:**
+
+1. Verify `post_ref` is present (if `None`, show manual instructions with `pre_ref`)
+2. Execute the force-push-with-lease command
+3. If successful: update journal entry as reverted, notify user
+4. If failed (ref moved): notify user that manual resolution is needed, provide `pre_ref` for reference
+
+**Mark `GitPush` as reversible:** Update `JournalAction::is_reversible()` to return `true` for `GitPush` when `post_ref` is `Some(...)`. Currently `GitPush` is not in the reversible match list. The revert module (`revert.rs`) needs a new arm to handle `GitPush` rollback.
+
+### 4. UI
+
+#### TUI Ripcord Panel
+```
+⚠ Push to protected branch detected
+  main: a1b2c3d → e4f5g6h (origin)
   [Rollback] [Dismiss]
 ```
 
 #### Swift App
-Banner notification on tripwire cross. Journal panel shows the push with rollback button. Same as file ripcord but with remote-specific copy.
+Banner notification on tripwire cross (existing notification path). Journal panel shows the push entry with rollback button. Same pattern as file ripcord but with remote-specific copy.
 
-#### Notification
-Async notification (existing tripwire notification path):
-"Fawx pushed to main (protected). Tap to review."
+#### Async Notification
+"Fawx pushed to main (protected). Tap to review." via the existing `TripwireNotifyFn` callback.
 
-### 6. Edge Cases
+### 5. Edge Cases
 
-**No pre-push ref (new branch):** `ls-remote` returns nothing. Rollback action is `git push --delete <remote> <branch>`. Only available if tripwire flagged it.
+**New branch push (`pre_ref` is zero SHA):** Rollback action is `git push --delete <remote> <branch>`. Only offered if tripwire flagged it.
 
-**Multiple branches in one push:** `git push origin main staging` — capture and journal each branch independently. Rollback is per-branch.
+**Force push to non-protected branch:** Not blocked by the exec guard (only protected branches). Tripwire fires (existing `git_push` default). Journal records refs. Rollback available.
 
-**Force push:** `git push --force origin main` — same capture/rollback flow. The pre-push SHA is what matters regardless of whether it was a fast-forward or force.
+**Network failure on rollback:** User gets `pre_ref` and manual instructions. No automatic retry.
 
-**Network failure on rollback:** User gets the pre-push SHA and manual instructions. Ripcord doesn't retry automatically.
+**Auth revoked between push and rollback:** Rollback fails. User gets manual instructions with the SHA.
 
-**Auth revoked between push and rollback:** Rollback fails. User gets manual instructions with the SHA. This is the scenario that just happened to us.
+**Tags and non-branch refs:** Out of scope for Phase 1. Explicitly documented as future work.
 
-**Race condition (someone else pushes before rollback):** `--force-with-lease` prevents clobbering their work. User is told to resolve manually.
+**Journal persistence:** The current `RipcordJournal` is in-memory (`RwLock<Vec<JournalEntry>>`). If the process crashes between the push and the user pulling ripcord, the refs are lost. This is acceptable for Phase 1 MVP. Phase 2 should persist the journal to disk (the `SnapshotStore` already handles file snapshots on disk; remote ref snapshots could follow the same pattern).
 
-### 7. What This Doesn't Solve
+### 6. Implementation Order
 
-- Preventing the push in the first place (that's tripwire + capability gate territory)
-- Non-git remote operations (API calls, emails, etc.)
-- Pushes to remotes the agent doesn't have credentials for post-push (auth rotation)
+Each step includes its tests (TDD per ENGINEERING.md Section 4).
 
-This is a recovery mechanism, not a prevention mechanism. Prevention comes from the capability gate (Phase 1) and tripwire boundaries (Phase 2). This extends ripcord to make git remote operations recoverable when prevention fails.
+1. **Config:** Add `git.protected_branches: Vec<String>` to the config system. Tests: parsing, empty list, serde round-trip.
+2. **Exec guard:** Command parser for git push patterns, branch extraction, rejection logic. Tests: various git push syntaxes, protected vs. non-protected, refspec parsing, `--no-verify` blocking.
+3. **`GitPush` extension:** Add `post_ref: Option<String>` to `JournalAction::GitPush`. Update `git_push_action()` to capture it. Tests: extraction from mock tool results, backward compat with `None`.
+4. **`TripwireKind::GitProtectedBranch`:** New variant, matching logic, config parsing. Tests: matching against branch list, non-matching, disabled.
+5. **Rollback:** New arm in `revert.rs` for `GitPush`. Build the force-with-lease command. Handle `post_ref: None`, failed lease. Tests: command construction, lease failure simulation.
+6. **TUI integration:** Ripcord panel display for `GitPush` entries, rollback button wiring.
+7. **Swift integration:** Banner + journal panel for remote push events.
 
-### 8. Implementation Order
+### 7. Reviewer Findings Resolution
 
-1. Command parser: detect git push / gh pr merge patterns, extract remote + branch
-2. Pre-push ref capture via `ls-remote`
-3. Journal schema extension for `GitRemotePush`
-4. Tripwire boundary matching against `git.protected_branches` config
-5. Rollback action: `push --force-with-lease` with captured SHA
-6. TUI ripcord panel: display remote push entries with rollback button
-7. Swift app: banner + journal integration
-8. Tests: mock remote scenarios, force-with-lease failure, new branch, multi-branch
+| # | Finding | Resolution |
+|---|---------|------------|
+| B1 | Force-with-lease command incorrect | Fixed: lease checks against `post_ref` (post-push SHA), restores `pre_ref`. See Section 3. |
+| B2 | Schema conflict with existing `GitPush` | Resolved: extend existing `GitPush` with `post_ref` field instead of new variant. See Section 3. |
+| B3 | Pre-execution interception is new model | Resolved: prevention lives in the exec dispatch layer (before shell runs), not in the evaluator. Detection remains post-execution. See Section 1. |
+| B4 | No integration path for config into TripwireKind | Resolved: new `TripwireKind::GitProtectedBranch` variant. See Section 2. |
+| B5 | `gh pr merge` detection underspecified | Deferred to Phase 2 with rationale. See Section 1. |
+| NB1 | `tripwire_hit` conflates concerns | Removed. Journal entry is purely factual; evaluator determines policy. |
+| NB2 | Timestamp type inconsistency | Resolved: no new timestamp field. Using existing `JournalEntry.timestamp: SystemTime`. |
+| NB3 | Tags and non-branch refs | Explicitly out of scope for Phase 1. See Section 5. |
+| NB4 | Bare `git push` detection | Explicitly deferred to Phase 2 with rationale. See Section 1. |
+| NB5 | Tests last in implementation order | Fixed: each step includes its tests. See Section 6. |
+| NH1 | Journal persistence across crashes | Documented as Phase 1 limitation, Phase 2 improvement. See Section 5. |
+| NH2 | Sequence diagram | Addressed by splitting into three clear layers (prevent/detect/recover) with explicit component ownership. |
+| NH3 | Glob matching for branch patterns | Deferred: Phase 1 uses string equality. Phase 2 can reuse `simple_glob` from config.rs. |
 
-### 9. Motivation
+### 8. Motivation
 
-On 2026-03-24, the orchestrator agent resolved merge conflicts for a staging-to-main promotion, was given one-time permission to write code, and in the same momentum chain committed and pushed directly to main. The push was technically correct (clippy clean, tests passing) but bypassed the Mac Mini build gate, TUI smoke test, and most importantly, the human's merge authority.
+On 2026-03-24, the orchestrator agent resolved merge conflicts for a staging-to-main promotion. It had one-time permission to write code. In the same momentum chain, it committed and pushed directly to main, bypassing merge authority, the Mac Mini build gate, and the TUI smoke test.
 
-The code was rolled back manually. If ripcord had been watching, it would have captured the pre-push ref, flagged the protected branch push, notified the user, and offered one-click rollback. The entire recovery would have taken seconds instead of a trust conversation.
+The remediation session produced three layers of defense that were validated in production:
+1. Local command wrappers (git/gh) blocking protected branch operations
+2. GitHub branch rulesets rejecting direct pushes server-side
+3. Policy rules (SECURITY.md, AGENTS.md) with explicit incident references
+
+This spec brings that same three-layer model into Fawx itself, so every Fawx user gets the same protection out of the box. Layer 1 (prevention) and Layer 2 (detection) are Fawx-native. Layer 3 (server-side enforcement) remains the user's responsibility to configure on their git hosting platform; Fawx documents the recommendation in setup guidance.
