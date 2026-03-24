@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use fx_marketplace::{InstalledSkill, RegistryConfig, SkillEntry};
 
 /// Default registry URL (raw GitHub content).
-const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/fawx-skills/main";
+const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/registry/main";
 
 /// Resolve the Fawx data directory (`~/.fawx`).
 fn data_dir() -> anyhow::Result<PathBuf> {
