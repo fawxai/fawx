@@ -1938,7 +1938,7 @@ mod tests {
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
             address: Some("10.0.0.5".to_string()),
-            user: Some("joseph".to_string()),
+            user: Some("admin".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
     }

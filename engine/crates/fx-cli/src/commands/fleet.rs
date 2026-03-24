@@ -505,10 +505,7 @@ mod tests {
 
     #[test]
     fn parsed_hostname_trims_trailing_newline() {
-        assert_eq!(
-            parsed_hostname(b"macmini\n"),
-            Some("node-alpha".to_string())
-        );
+        assert_eq!(parsed_hostname(b"macmini\n"), Some("macmini".to_string()));
     }
 
     #[test]
@@ -566,7 +563,7 @@ mod tests {
         let tokens = read_tokens(&fleet_dir);
         let token = tokens.first().expect("token should exist");
 
-        assert!(output.contains("✓ Node \"macmini\" registered"));
+        assert!(output.contains("✓ Node \"node-alpha\" registered"));
         assert!(output.contains("✓ Token generated"));
         assert!(output.contains("Join command (run on the worker):"));
         assert!(output.contains(&format!(
@@ -685,7 +682,7 @@ mod tests {
         let reloaded_manager = FleetManager::load(&fleet_dir).expect("fleet should load");
         let output = String::from_utf8(output).expect("utf8");
 
-        assert!(output.contains("✓ Node \"macmini\" removed and token revoked"));
+        assert!(output.contains("✓ Node \"node-alpha\" removed and token revoked"));
         assert_eq!(reloaded_manager.verify_bearer(&token.secret), None);
         assert!(reloaded_manager.list_nodes().is_empty());
     }
