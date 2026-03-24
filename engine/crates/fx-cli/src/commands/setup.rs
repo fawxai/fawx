@@ -570,10 +570,10 @@ impl SetupWizard {
     }
 
     async fn validate_model_connection(&self) -> anyhow::Result<()> {
-        let model = self
-            .default_model
-            .as_deref()
-            .context("model not selected")?;
+        let Some(model) = self.default_model.as_deref() else {
+            println!("  ⏭ Skipped (no model configured yet)");
+            return Ok(());
+        };
         let mut router =
             build_router(&self.auth_manager).map_err(|error| anyhow!(error.to_string()))?;
         router
