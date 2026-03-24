@@ -7,7 +7,7 @@ use fx_bus::SessionBus;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
-use fx_llm::{ImageAttachment, Message};
+use fx_llm::{DocumentAttachment, ImageAttachment, Message};
 use std::sync::{Arc, Mutex};
 
 pub type ConfigManagerHandle = Arc<Mutex<ConfigManager>>;
@@ -35,6 +35,7 @@ pub trait AppEngine: Send + Sync {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error>;
@@ -43,6 +44,7 @@ pub trait AppEngine: Send + Sync {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         context: Vec<Message>,
         source: InputSource,
         callback: Option<StreamCallback>,

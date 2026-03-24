@@ -9,6 +9,7 @@ use std::sync::Arc;
 const COMPACTION_MARKER_PREFIX: &str = "[context compacted:";
 const SUMMARY_MARKER_PREFIX: &str = "[context summary]";
 const IMAGE_TOKEN_ESTIMATE: usize = 1600;
+const DOCUMENT_TOKEN_ESTIMATE: usize = 3200;
 
 /// Shared token estimation heuristic used by loop and perception accounting.
 ///
@@ -39,6 +40,7 @@ fn estimate_content_tokens(content: &ContentBlock) -> usize {
             content,
         } => estimate_text_tokens(tool_use_id) + estimate_text_tokens(&content.to_string()),
         ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+        ContentBlock::Document { .. } => DOCUMENT_TOKEN_ESTIMATE,
     }
 }
 
@@ -97,7 +99,9 @@ fn tool_ids_in_message(message: &Message) -> Vec<&str> {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
             ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            ContentBlock::Text { .. } | ContentBlock::Image { .. } => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => None,
         })
         .collect()
 }
@@ -115,7 +119,9 @@ fn unresolved_tool_use_ids(messages: &[Message]) -> HashSet<&str> {
                 ContentBlock::ToolResult { tool_use_id, .. } => {
                     tool_result_ids.insert(tool_use_id.as_str());
                 }
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. } => {}
             }
         }
     }
@@ -655,6 +661,16 @@ fn maybe_prune_block(
             };
             (Some(replacement), before.saturating_sub(after))
         }
+        ContentBlock::Document { filename, .. } => {
+            let before = estimate_content_tokens(block);
+            let summary = filename
+                .as_ref()
+                .map(|filename| format!("[document:{filename}]"))
+                .unwrap_or_else(|| "[document]".to_string());
+            let after = estimate_text_tokens(&summary);
+            let replacement = ContentBlock::Text { text: summary };
+            (Some(replacement), before.saturating_sub(after))
+        }
         ContentBlock::Text { .. } => (None, 0),
     }
 }
@@ -930,6 +946,14 @@ fn message_to_summary_line(message: &Message) -> String {
                 format!("[tool_result:{tool_use_id}] {}", content)
             }
             ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
+            ContentBlock::Document {
+                media_type,
+                filename,
+                ..
+            } => filename
+                .as_ref()
+                .map(|filename| format!("[document:{media_type}:{filename}]"))
+                .unwrap_or_else(|| format!("[document:{media_type}]")),
         })
         .collect::<Vec<_>>()
         .join(" ");

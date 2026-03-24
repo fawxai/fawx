@@ -33,7 +33,7 @@ use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{
     valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
-    ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
+    DocumentAttachment, ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
     StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 use fx_memory::SignalStore;
@@ -492,12 +492,15 @@ impl SessionTurnCollector {
         &self,
         user_text: &str,
         images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
         fallback_response: &str,
     ) -> Vec<SessionMessage> {
         self.flush_pending_tool_results();
 
         let timestamp = current_epoch_secs();
-        let mut messages = vec![user_session_message(user_text, images, timestamp)];
+        let mut messages = vec![user_session_message(
+            user_text, images, documents, timestamp,
+        )];
         let assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
 
         if assistant_messages.is_empty() {
@@ -605,11 +608,12 @@ impl SessionTurnCollector {
 fn user_session_message(
     user_text: &str,
     images: &[ImageAttachment],
+    documents: &[DocumentAttachment],
     timestamp: u64,
 ) -> SessionMessage {
     SessionMessage::structured(
         SessionRecordRole::User,
-        user_message_blocks(user_text, images),
+        user_message_blocks(user_text, images, documents),
         timestamp,
         None,
     )
@@ -1190,13 +1194,14 @@ impl HeadlessApp {
         self.run_cycle_result(input, source).await
     }
 
-    pub async fn process_message_with_images(
+    pub async fn process_message_with_attachments(
         &mut self,
         input: &str,
         images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_images(input, images, source, None)
+        self.run_cycle_result_with_attachments(input, images, documents, source, None)
             .await
     }
 
@@ -1204,18 +1209,19 @@ impl HeadlessApp {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         context: Vec<Message>,
         source: &InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
         let original_history = std::mem::replace(&mut self.conversation_history, context);
-        let result = match (images.is_empty(), callback) {
+        let result = match (images.is_empty() && documents.is_empty(), callback) {
             (true, Some(callback)) => {
                 process_input_with_commands_streaming(self, input, Some(source), callback).await
             }
             (true, None) => process_input_with_commands(self, input, Some(source)).await,
             (false, _) => {
-                self.process_message_with_images(input, &images, source)
+                self.process_message_with_attachments(input, &images, &documents, source)
                     .await
             }
         };
@@ -1602,7 +1608,7 @@ impl HeadlessApp {
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_images(input, &[], source, None)
+        self.run_cycle_result_with_attachments(input, &[], &[], source, None)
             .await
     }
 
@@ -1612,7 +1618,7 @@ impl HeadlessApp {
         source: &InputSource,
         callback: StreamCallback,
     ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_images(input, &[], source, Some(callback))
+        self.run_cycle_result_with_attachments(input, &[], &[], source, Some(callback))
             .await
     }
 
@@ -1630,13 +1636,14 @@ impl HeadlessApp {
 
     #[cfg(test)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
-        self.finalize_cycle_with_turn_messages(input, &[], result, None)
+        self.finalize_cycle_with_turn_messages(input, &[], &[], result, None)
     }
 
     fn finalize_cycle_with_turn_messages(
         &mut self,
         input: &str,
         images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
         result: &LoopResult,
         collector: Option<&SessionTurnCollector>,
     ) -> CycleResult {
@@ -1656,7 +1663,9 @@ impl HeadlessApp {
         let signals = self.last_signals.clone();
         persist_headless_signals(self, &signals);
         let session_messages = collector
-            .map(|collector| collector.session_messages_for_turn(input, images, &response))
+            .map(|collector| {
+                collector.session_messages_for_turn(input, images, documents, &response)
+            })
             .unwrap_or_else(|| text_turn_messages(input, &response));
         self.record_session_turn_messages(session_messages);
         CycleResult {
@@ -1668,10 +1677,11 @@ impl HeadlessApp {
         }
     }
 
-    async fn run_cycle_result_with_images(
+    async fn run_cycle_result_with_attachments(
         &mut self,
         input: &str,
         images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
         source: &InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error> {
@@ -1687,11 +1697,8 @@ impl HeadlessApp {
             self.clear_startup_warnings();
         }
         self.update_memory_context(input);
-        let snapshot = if images.is_empty() {
-            self.build_perception_snapshot(input, source)
-        } else {
-            self.build_perception_snapshot_with_images(input, source, images)
-        };
+        let snapshot =
+            self.build_perception_snapshot_with_attachments(input, source, images, documents);
         let llm = RecordingLoopLlmProvider::new(
             RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone()),
             collector.clone(),
@@ -1703,7 +1710,13 @@ impl HeadlessApp {
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
         self.set_stream_callback(None);
         self.evaluate_canary(&result);
-        Ok(self.finalize_cycle_with_turn_messages(input, images, &result, Some(&collector)))
+        Ok(self.finalize_cycle_with_turn_messages(
+            input,
+            images,
+            documents,
+            &result,
+            Some(&collector),
+        ))
     }
 
     fn set_stream_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
@@ -1772,18 +1785,21 @@ impl HeadlessApp {
         }
     }
 
+    #[cfg(test)]
     fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
-        self.build_perception_snapshot_with_images(input, source, &[])
+        self.build_perception_snapshot_with_attachments(input, source, &[], &[])
     }
 
-    fn build_perception_snapshot_with_images(
+    fn build_perception_snapshot_with_attachments(
         &self,
         input: &str,
         source: &InputSource,
         images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
     ) -> PerceptionSnapshot {
         let timestamp_ms = current_time_ms();
         let image_pairs = images.to_vec();
+        let document_pairs = documents.to_vec();
         PerceptionSnapshot {
             screen: ScreenState {
                 current_app: "fawx.headless".to_string(),
@@ -1800,6 +1816,7 @@ impl HeadlessApp {
                 timestamp: timestamp_ms,
                 context_id: None,
                 images: image_pairs,
+                documents: document_pairs,
             }),
             conversation_history: self.conversation_history.clone(),
             steer_context: None,
@@ -1840,13 +1857,27 @@ impl HeadlessApp {
     }
 }
 
-fn user_message_blocks(user_text: &str, images: &[ImageAttachment]) -> Vec<SessionContentBlock> {
+fn user_message_blocks(
+    user_text: &str,
+    images: &[ImageAttachment],
+    documents: &[DocumentAttachment],
+) -> Vec<SessionContentBlock> {
     let mut blocks = images
         .iter()
         .map(|image| SessionContentBlock::Image {
             media_type: image.media_type.clone(),
+            data: Some(image.data.clone()),
         })
         .collect::<Vec<_>>();
+    blocks.extend(
+        documents
+            .iter()
+            .map(|document| SessionContentBlock::Document {
+                media_type: document.media_type.clone(),
+                data: document.data.clone(),
+                filename: document.filename.clone(),
+            }),
+    );
     if !user_text.is_empty() {
         blocks.push(SessionContentBlock::Text {
             text: user_text.to_string(),
@@ -1860,7 +1891,7 @@ fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessa
     vec![
         SessionMessage::structured(
             SessionRecordRole::User,
-            user_message_blocks(user_text, &[]),
+            user_message_blocks(user_text, &[], &[]),
             timestamp,
             None,
         ),
@@ -1882,6 +1913,7 @@ impl AppEngine for HeadlessApp {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<ApiCycleResult, anyhow::Error> {
@@ -1889,6 +1921,7 @@ impl AppEngine for HeadlessApp {
             self,
             input,
             images,
+            documents,
             self.conversation_history.clone(),
             &source,
             callback,
@@ -1910,12 +1943,13 @@ impl AppEngine for HeadlessApp {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         context: Vec<Message>,
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
         let (result, updated_history) = HeadlessApp::process_message_with_context(
-            self, input, images, context, &source, callback,
+            self, input, images, documents, context, &source, callback,
         )
         .await?;
 
@@ -3499,7 +3533,7 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         });
 
-        let messages = collector.session_messages_for_turn("open the readme", &[], "fallback");
+        let messages = collector.session_messages_for_turn("open the readme", &[], &[], "fallback");
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, SessionRecordRole::User);
@@ -3546,7 +3580,7 @@ mod tests {
             is_error: true,
         });
 
-        let messages = collector.session_messages_for_turn("open missing", &[], "fallback");
+        let messages = collector.session_messages_for_turn("open missing", &[], &[], "fallback");
 
         assert!(
             messages[2]
@@ -3580,7 +3614,7 @@ mod tests {
             is_error: false,
         });
 
-        let messages = collector.session_messages_for_turn("search rust", &[], "fallback");
+        let messages = collector.session_messages_for_turn("search rust", &[], &[], "fallback");
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
@@ -3618,7 +3652,8 @@ mod tests {
             stop_reason: Some("tool_use".to_string()),
         });
 
-        let messages = collector.session_messages_for_turn("weather in denver", &[], "fallback");
+        let messages =
+            collector.session_messages_for_turn("weather in denver", &[], &[], "fallback");
 
         assert_eq!(messages.len(), 2);
         let tool_use_blocks = messages[1]
@@ -4706,6 +4741,7 @@ mod tests {
             &mut app,
             "remember cats",
             Vec::new(),
+            Vec::new(),
             InputSource::Http,
             None,
         )
@@ -4717,6 +4753,7 @@ mod tests {
         let second = AppEngine::process_message(
             &mut app,
             "what did I say?",
+            Vec::new(),
             Vec::new(),
             InputSource::Http,
             None,

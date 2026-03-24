@@ -1,6 +1,7 @@
 use crate::engine::CycleResult;
 use crate::handlers::message::{
-    encoded_images_to_attachments, internal_error, validate_and_encode_images,
+    encoded_documents_to_attachments, encoded_images_to_attachments, internal_error,
+    validate_and_encode_documents, validate_and_encode_images, validate_message_request,
     validate_message_text,
 };
 use crate::sse::{
@@ -9,8 +10,8 @@ use crate::sse::{
 };
 use crate::state::HttpState;
 use crate::types::{
-    EncodedImage, ErrorBody, MessageRequest, MessageResponse, SendToSessionRequest,
-    SendToSessionResponse,
+    EncodedDocument, EncodedImage, ErrorBody, MessageRequest, MessageResponse,
+    SendToSessionRequest, SendToSessionResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,6 +27,7 @@ use fx_session::{
     SessionMessage, SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -35,6 +37,13 @@ use uuid::Uuid;
 
 const SESSION_MEMORY_MAX_ITEMS: usize = 20;
 const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
+
+struct TurnInput<'a> {
+    message: Cow<'a, str>,
+    images: Cow<'a, [EncodedImage]>,
+    documents: Cow<'a, [EncodedDocument]>,
+    context: Vec<Message>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -86,9 +95,7 @@ struct StreamingSessionMessageTask {
     state: HttpState,
     registry: SessionRegistry,
     key: SessionKey,
-    message: String,
-    images: Vec<EncodedImage>,
-    context: Vec<Message>,
+    input: TurnInput<'static>,
     sender: mpsc::Sender<String>,
     disconnected: Arc<AtomicBool>,
 }
@@ -298,17 +305,25 @@ pub(crate) async fn handle_send_message_for_session(
     };
     trim_conversation_history(&mut context, max_history);
 
-    validate_message_text(&request.message)?;
+    validate_message_request(
+        &request.message,
+        request.images.len(),
+        request.documents.len(),
+    )?;
     let images = validate_and_encode_images(&request.images)?;
+    let documents = validate_and_encode_documents(&request.documents)?;
 
     if wants_sse(&headers) {
         return Ok(stream_session_message_response(
             state,
             registry,
             key,
-            request.message,
-            images,
-            context,
+            TurnInput {
+                message: Cow::Owned(request.message),
+                images: Cow::Owned(images),
+                documents: Cow::Owned(documents),
+                context,
+            },
         )
         .await);
     }
@@ -317,9 +332,12 @@ pub(crate) async fn handle_send_message_for_session(
         &state,
         &registry,
         &key,
-        &request.message,
-        &images,
-        context,
+        TurnInput {
+            message: Cow::Borrowed(request.message.as_str()),
+            images: Cow::Borrowed(&images),
+            documents: Cow::Borrowed(&documents),
+            context,
+        },
     )
     .await
     .map_err(internal_error)?;
@@ -356,7 +374,9 @@ fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
                 ContentBlock::ToolResult { tool_use_id, .. } => {
                     tool_result_ids.insert(tool_use_id.clone());
                 }
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. } => {}
             }
         }
     }
@@ -373,7 +393,9 @@ fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
             message.content.retain(|block| match block {
                 ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
                 ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
-                ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. } => true,
             });
             (!message.content.is_empty()).then_some(message)
         })
@@ -384,9 +406,7 @@ async fn stream_session_message_response(
     state: HttpState,
     registry: SessionRegistry,
     key: SessionKey,
-    message: String,
-    images: Vec<EncodedImage>,
-    context: Vec<Message>,
+    input: TurnInput<'static>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
     let disconnected = Arc::new(AtomicBool::new(false));
@@ -395,9 +415,7 @@ async fn stream_session_message_response(
             state,
             registry,
             key,
-            message,
-            images,
-            context,
+            input,
             sender,
             disconnected,
         },
@@ -406,34 +424,33 @@ async fn stream_session_message_response(
 }
 
 async fn run_streaming_session_message_task(task: StreamingSessionMessageTask) {
-    let callback = stream_callback(task.sender.clone(), Arc::clone(&task.disconnected));
-    let result = execute_session_turn(
-        &task.state,
-        &task.registry,
-        &task.key,
-        &task.message,
-        &task.images,
-        task.context,
-        Some(callback),
-    )
-    .await;
+    let StreamingSessionMessageTask {
+        state,
+        registry,
+        key,
+        input,
+        sender,
+        disconnected,
+    } = task;
+    let callback = stream_callback(sender.clone(), Arc::clone(&disconnected));
+    let result = execute_session_turn(&state, &registry, &key, input, Some(callback)).await;
 
     match result {
         Ok((_result, session_messages, session_memory)) => {
             if let Err(error) =
-                persist_session_turn(&task.registry, &task.key, session_messages, session_memory)
+                persist_session_turn(&registry, &key, session_messages, session_memory)
             {
                 let _ = send_sse_frame(
-                    &task.sender,
-                    &task.disconnected,
+                    &sender,
+                    &disconnected,
                     error_stream_frame(&error.to_string()),
                 );
             }
         }
         Err(error) => {
             let _ = send_sse_frame(
-                &task.sender,
-                &task.disconnected,
+                &sender,
+                &disconnected,
                 error_stream_frame(&error.to_string()),
             );
         }
@@ -444,12 +461,10 @@ async fn process_and_route_session_message(
     state: &HttpState,
     registry: &SessionRegistry,
     key: &SessionKey,
-    message: &str,
-    images: &[EncodedImage],
-    context: Vec<Message>,
+    input: TurnInput<'_>,
 ) -> Result<(CycleResult, String, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
     let (result, session_messages, session_memory) =
-        execute_session_turn(state, registry, key, message, images, context, None).await?;
+        execute_session_turn(state, registry, key, input, None).await?;
 
     state
         .channels
@@ -472,9 +487,7 @@ async fn execute_session_turn(
     state: &HttpState,
     registry: &SessionRegistry,
     key: &SessionKey,
-    message: &str,
-    images: &[EncodedImage],
-    context: Vec<Message>,
+    input: TurnInput<'_>,
     callback: Option<StreamCallback>,
 ) -> Result<(CycleResult, Vec<SessionMessage>, SessionMemory), anyhow::Error> {
     let loaded_memory = registry.memory(key).map_err(anyhow::Error::new)?;
@@ -482,9 +495,10 @@ async fn execute_session_turn(
     let previous_memory = app.replace_session_memory(loaded_memory);
     let outcome = app
         .process_message_with_context(
-            message,
-            encoded_images_to_attachments(images),
-            context,
+            input.message.as_ref(),
+            encoded_images_to_attachments(input.images.as_ref()),
+            encoded_documents_to_attachments(input.documents.as_ref()),
+            input.context,
             InputSource::Http,
             callback,
         )

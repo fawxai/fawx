@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod anthropic;
 mod config;
+mod document;
 mod fallback;
 mod local;
 pub mod model_catalog;
@@ -47,7 +48,7 @@ pub use router::{
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
 pub use types::{
-    CompletionRequest, CompletionResponse, ContentBlock, ImageAttachment,
+    CompletionRequest, CompletionResponse, ContentBlock, DocumentAttachment, ImageAttachment,
     LlmError as ProviderError, Message, MessageRole, StreamChunk, ThinkingConfig, ToolCall,
     ToolDefinition, ToolUseDelta, Usage, THINKING_BUDGET_ADAPTIVE, THINKING_BUDGET_HIGH,
     THINKING_BUDGET_LOW,
@@ -90,7 +91,9 @@ fn normalize_trimmed_tool_history(history: &mut Vec<Message>) {
                         }
                         keep
                     }
-                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Document { .. } => true,
                     ContentBlock::ToolResult { .. } => false,
                 });
             }
@@ -99,7 +102,9 @@ fn normalize_trimmed_tool_history(history: &mut Vec<Message>) {
                     ContentBlock::ToolResult { tool_use_id, .. } => {
                         seen_tool_use_ids.contains(tool_use_id)
                     }
-                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => true,
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Document { .. } => true,
                     ContentBlock::ToolUse { .. } => false,
                 });
             }

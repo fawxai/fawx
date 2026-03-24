@@ -131,8 +131,8 @@ struct ContentView: View {
             appState: appState,
             sessionViewModel: sessionViewModel,
             chatViewModel: chatViewModel,
-            emptyStateTitle: NewSessionCopy.heroTitle,
-            emptyStateMessage: NewSessionCopy.heroMessage
+            emptyStateTitle: "Let's go!",
+            emptyStateMessage: "Start typing and Fawx will create a new conversation, or pick one from the sidebar."
         )
     }
 

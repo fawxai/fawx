@@ -1,107 +1,150 @@
 # Contributing to Fawx
 
-## Code Standards
+Thanks for your interest in contributing! Fawx is an agentic engine that runs
+locally, calls LLMs, executes tools, and learns from usage. We welcome
+contributions across the engine, skills, documentation, and testing.
 
-All contributions must follow [ENGINEERING.md](ENGINEERING.md). Key rules:
+## Before You Start
 
-- **TDD** — Write the test first. Every bug fix requires a regression test.
-- **No slop** — No `.unwrap()` outside tests. No functions > 40 lines. No > 5 params without a struct.
-- **DRY** — No copy-paste. Extract and parameterize.
-- **Fail fast** — Errors are explicit. No silent catches, no swallowed exceptions.
-- **Clippy clean** — `cargo clippy -- -D warnings` with zero warnings.
-- **Formatted** — `cargo fmt --all` before every commit.
+### Sign the CLA
 
-## Branch Model
+All contributors must sign the Fawx Contributor License Agreement before their
+first PR can be merged. When you open your first pull request, the CLA Assistant
+bot will prompt you to sign electronically.
 
-```
-feature/* → dev → staging → main
-```
+- [Individual CLA](docs/legal/CLA-individual.md)
+- [Corporate CLA](docs/legal/CLA-corporate.md) (if contributing on behalf of an employer)
 
-- **feature/*** — All work happens here. Branch from `dev`.
-- **dev** — Integration branch. PRs target `dev`.
-- **staging** — Pre-release. Promoted from `dev` after integration testing.
-- **main** — Production releases only.
+### Read the Standards
 
-## Pull Requests
+Fawx has strict engineering standards. Read these before writing code:
 
-1. Branch from `dev`: `git checkout -b feature/my-change origin/dev`
-2. Write tests, implement, verify: `cargo test && cargo clippy -- -D warnings && cargo fmt --check`
-3. Open PR against `dev`
-4. Address all review feedback — blocking, non-blocking, and nice-to-have items all get fixed.
+- [ENGINEERING.md](ENGINEERING.md) — code quality rules, testing requirements,
+  review criteria. Non-negotiable.
+- [TASTE.md](TASTE.md) — style preferences and design conventions.
 
-### PR Description
-- What changed and why
-- Test coverage added
-- Any new dependencies (with justification per ENGINEERING.md §0)
+## Getting Started
 
-## WASM Skill Development
+### Prerequisites
 
-Skills are standalone Rust crates compiled to `wasm32-unknown-unknown`. See [docs/WASM_SKILLS.md](docs/WASM_SKILLS.md) and existing skills in `skills/` for examples.
+- Rust stable (latest): `rustup update stable`
+- Git
+- macOS or Linux (Windows via WSL2 works but is not tested in CI)
+- For Swift app work: Xcode 16+, macOS 15+
 
-### Quick Start
+### Build
 
 ```bash
-# Create a new skill
-mkdir skills/my-skill && cd skills/my-skill
-cargo init --lib
-
-# Set crate type in Cargo.toml
-# crate-type = ["cdylib"]
-
-# Implement the `run()` export using host_api_v1
-# See skills/weather-skill/src/lib.rs for a minimal example
-
-# Build
-rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown
-
-# Test
-cargo test
-
-# Install
-fawx skill install target/wasm32-unknown-unknown/release/my_skill.wasm
+git clone https://github.com/fawxai/fawx.git
+cd fawx
+cargo build --workspace
 ```
 
-### Manifest
-
-Every skill needs a `manifest.toml`:
-
-```toml
-name = "my_skill"
-version = "1.0.0"
-description = "What the skill does"
-author = "Your Name"
-api_version = "host_api_v1"
-capabilities = ["network"]  # network, storage, or both
-entry_point = "run"
-
-[[tools]]
-name = "my_tool"
-description = "What the tool does"
-
-[[tools.parameters]]
-name = "input"
-type = "string"
-description = "The input parameter"
-required = true
-```
-
-## Testing
+### Test
 
 ```bash
-# All tests
 cargo test --workspace
-
-# Specific crate
-cargo test -p fx-tools
-
-# Skill tests
-cd skills/weather-skill && cargo test
-
-# Full CI check
-cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace
 ```
 
-## Architecture
+### Lint
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full crate map and design decisions. Key principle: the kernel is immutable at runtime. If your change touches `fx-kernel`, `fx-auth/src/crypto/`, or `.github/`, it will be blocked by the proposal gate.
+```bash
+cargo fmt --all
+cargo clippy --workspace --tests -- -D warnings
+```
+
+All three must pass before submitting a PR. CI enforces this.
+
+## What to Work On
+
+### Good first issues
+
+Look for issues labeled [`good-first-issue`](https://github.com/fawxai/fawx/labels/good-first-issue).
+These are scoped, well-defined tasks suitable for new contributors.
+
+### Skills
+
+Building WASM skills is the fastest way to contribute meaningful functionality.
+See the [Skill SDK documentation](docs/skills/) and existing skills in the
+[fawxai org](https://github.com/fawxai) for reference implementations.
+
+### Bug fixes
+
+Bug reports with reproduction steps are welcome as issues. If you want to fix
+one, comment on the issue to avoid duplicate work.
+
+### Features
+
+For larger features, open an issue first to discuss the design. We don't want
+you to invest time in a direction we can't merge.
+
+## Pull Request Process
+
+### Branch naming
+
+- `feat/<description>` for features
+- `fix/<description>` for bug fixes
+- `docs/<description>` for documentation
+
+### PR targets
+
+All PRs target the `dev` branch. We promote `dev` to `staging` to `main` for
+releases.
+
+### What a good PR looks like
+
+1. **Focused.** One logical change per PR. Don't bundle unrelated fixes.
+2. **Tested.** New behavior has tests. Bug fixes have regression tests.
+3. **Documented.** If the change affects user-facing behavior, update docs.
+4. **Clean.** `cargo fmt`, `cargo clippy`, `cargo test` all pass.
+5. **Described.** PR description explains what changed and why.
+
+### Review criteria
+
+Every PR is reviewed against the standards in ENGINEERING.md:
+
+- Clarity: can someone new understand this in one read?
+- Necessity: does every changed line serve the PR's purpose?
+- Simplicity: is there a simpler way?
+- Completeness: edge cases handled? Tests covering new behavior?
+- No regression: does it make existing code harder to maintain?
+
+### After review
+
+Address all review comments. We don't defer findings; everything gets fixed
+before merge. If you disagree with a finding, discuss it in the PR thread.
+
+## Code Style Quick Reference
+
+- Functions ≤ 40 lines
+- ≤ 5 parameters (use a struct for more)
+- No `.unwrap()` outside tests
+- No dead code, no TODO without a linked issue
+- Names describe behavior, not implementation
+- `clippy` clean with `-D warnings`
+- `pub` only what needs to be public
+
+## Building Skills
+
+Fawx skills are WASM modules that extend the engine's capabilities. To create
+a new skill:
+
+1. Use the skill template: `cargo generate fawxai/skill-template`
+2. Implement the `Skill` trait
+3. Test locally with `fawx skill install --path ./target/wasm32-wasi/release/`
+4. Publish to the marketplace (coming soon)
+
+See [docs/skills/](docs/skills/) for the full SDK reference.
+
+## License
+
+By contributing to Fawx, you agree that your contributions will be licensed
+under the [Business Source License 1.1](LICENSE). On the Change Date
+(2030-03-23), contributions will become available under the Apache License 2.0.
+
+## Questions?
+
+- Open a [discussion](https://github.com/fawxai/fawx/discussions)
+- Join the community on [Discord](https://discord.gg/fawx)
+
+Thanks for helping build Fawx.

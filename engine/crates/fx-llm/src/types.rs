@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-pub use fx_core::types::ImageAttachment;
+pub use fx_core::types::{DocumentAttachment, ImageAttachment};
 
 /// Token budget for "high" thinking mode.
 pub const THINKING_BUDGET_HIGH: u32 = 10_000;
@@ -89,6 +89,15 @@ impl Message {
 
     /// Create a user message with text and optional images.
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self::user_with_attachments(text, images, Vec::new())
+    }
+
+    /// Create a user message with text and optional images/documents.
+    pub fn user_with_attachments(
+        text: impl Into<String>,
+        images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
+    ) -> Self {
         let mut content: Vec<ContentBlock> = images
             .into_iter()
             .map(|image| ContentBlock::Image {
@@ -96,6 +105,15 @@ impl Message {
                 data: image.data,
             })
             .collect();
+        content.extend(
+            documents
+                .into_iter()
+                .map(|document| ContentBlock::Document {
+                    media_type: document.media_type,
+                    data: document.data,
+                    filename: document.filename,
+                }),
+        );
         let text = text.into();
         if !text.is_empty() {
             content.push(ContentBlock::Text { text });
@@ -171,6 +189,16 @@ pub enum ContentBlock {
         media_type: String,
         /// Base64-encoded image data (no data URI prefix).
         data: String,
+    },
+    /// Base64-encoded document content block.
+    Document {
+        /// MIME type (e.g., "application/pdf").
+        media_type: String,
+        /// Base64-encoded document data (no data URI prefix).
+        data: String,
+        /// Original filename when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
     },
 }
 
@@ -360,10 +388,49 @@ mod tests {
     }
 
     #[test]
+    fn user_with_attachments_includes_documents() {
+        let message = Message::user_with_attachments(
+            "summarize these",
+            vec![ImageAttachment {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }],
+            vec![DocumentAttachment {
+                media_type: "application/pdf".to_string(),
+                data: "pdf123".to_string(),
+                filename: Some("brief.pdf".to_string()),
+            }],
+        );
+
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content.len(), 3);
+        assert_eq!(
+            message.content[1],
+            ContentBlock::Document {
+                media_type: "application/pdf".to_string(),
+                data: "pdf123".to_string(),
+                filename: Some("brief.pdf".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn image_content_block_serde_round_trip() {
         let block = ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, deserialized);
+    }
+
+    #[test]
+    fn document_content_block_serde_round_trip() {
+        let block = ContentBlock::Document {
+            media_type: "application/pdf".to_string(),
+            data: "abc123".to_string(),
+            filename: Some("brief.pdf".to_string()),
         };
         let json = serde_json::to_string(&block).unwrap();
         let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();

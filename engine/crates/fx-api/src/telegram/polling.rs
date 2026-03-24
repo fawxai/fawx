@@ -38,8 +38,16 @@ pub async fn handle_telegram_update(
     let images = encode_photos(telegram, &mut incoming, data_dir).await;
     let source = InputSource::Channel("telegram".to_string());
     let context = telegram_context(&incoming);
-    if let Err(error) =
-        process_and_route_message(app, router, &incoming.text, images, source, context).await
+    if let Err(error) = process_and_route_message(
+        app,
+        router,
+        &incoming.text,
+        images,
+        Vec::new(),
+        source,
+        context,
+    )
+    .await
     {
         tracing::error!("Telegram poll loop error: {error}");
         queue_telegram_error(telegram, &incoming, &error);

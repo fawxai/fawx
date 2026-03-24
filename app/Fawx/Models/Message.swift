@@ -117,7 +117,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
     case text(String)
     case toolUse(id: String, name: String, input: JSONValue)
     case toolResult(toolUseId: String, content: JSONValue, isError: Bool?)
-    case image(mediaType: String)
+    case image(mediaType: String, data: String?)
+    case document(mediaType: String, data: String?, filename: String?)
 
     var displayText: String? {
         switch self {
@@ -128,6 +129,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
         case .toolResult:
             return nil
         case .image: return "[image]"
+        case .document(_, _, let filename):
+            return filename.map { "[document: \($0)]" } ?? "[document]"
         }
     }
 
@@ -137,6 +140,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
             return text
         case .image:
             return "[image]"
+        case .document(_, _, let filename):
+            return filename.map { "[document: \($0)]" } ?? "[document]"
         case .toolUse, .toolResult:
             return nil
         }
@@ -148,6 +153,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
             return text
         case .image:
             return "[image]"
+        case .document(_, _, let filename):
+            return filename.map { "[document: \($0)]" } ?? "[document]"
         case .toolUse, .toolResult:
             return nil
         }
@@ -165,6 +172,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
         case isError = "is_error"
         case toolUseId = "tool_use_id"
         case mediaType = "media_type"
+        case data
+        case filename
     }
 
     init(from decoder: Decoder) throws {
@@ -186,7 +195,13 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
             self = .toolResult(toolUseId: toolUseId, content: content, isError: isError)
         case "image":
             let mediaType = try container.decode(String.self, forKey: .mediaType)
-            self = .image(mediaType: mediaType)
+            let data = try? container.decode(String.self, forKey: .data)
+            self = .image(mediaType: mediaType, data: data)
+        case "document":
+            let mediaType = try container.decode(String.self, forKey: .mediaType)
+            let data = try? container.decode(String.self, forKey: .data)
+            let filename = try? container.decode(String.self, forKey: .filename)
+            self = .document(mediaType: mediaType, data: data, filename: filename)
         default:
             self = .text("[unknown block: \(type)]")
         }
@@ -208,9 +223,15 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
             try container.encode(toolUseId, forKey: .toolUseId)
             try container.encode(content, forKey: .content)
             try container.encodeIfPresent(isError, forKey: .isError)
-        case .image(let mediaType):
+        case .image(let mediaType, let data):
             try container.encode("image", forKey: .type)
             try container.encode(mediaType, forKey: .mediaType)
+            try container.encodeIfPresent(data, forKey: .data)
+        case .document(let mediaType, let data, let filename):
+            try container.encode("document", forKey: .type)
+            try container.encode(mediaType, forKey: .mediaType)
+            try container.encodeIfPresent(data, forKey: .data)
+            try container.encodeIfPresent(filename, forKey: .filename)
         }
     }
 }
@@ -233,6 +254,18 @@ struct ImagePayload: Codable, Sendable, Hashable {
     enum CodingKeys: String, CodingKey {
         case data
         case mediaType = "media_type"
+    }
+}
+
+struct DocumentPayload: Codable, Sendable, Hashable {
+    let data: String
+    let mediaType: String
+    let filename: String?
+
+    enum CodingKeys: String, CodingKey {
+        case data
+        case mediaType = "media_type"
+        case filename
     }
 }
 

@@ -31,8 +31,19 @@ pub enum SessionContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
-    /// Marker indicating an image was part of the message.
-    Image { media_type: String },
+    /// Persisted image attachment data for client-side rendering.
+    Image {
+        media_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+    /// Persisted document attachment data for client-side rendering.
+    Document {
+        media_type: String,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
 }
 
 impl From<ContentBlock> for SessionContentBlock {
@@ -58,7 +69,19 @@ impl From<ContentBlock> for SessionContentBlock {
                 content,
                 is_error: None,
             },
-            ContentBlock::Image { media_type, .. } => Self::Image { media_type },
+            ContentBlock::Image { media_type, data } => Self::Image {
+                media_type,
+                data: Some(data),
+            },
+            ContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            } => Self::Document {
+                media_type,
+                data,
+                filename,
+            },
         }
     }
 }
@@ -86,10 +109,20 @@ impl From<SessionContentBlock> for ContentBlock {
                 tool_use_id,
                 content,
             },
-            // Image payloads are intentionally not persisted; replay them as
-            // a readable marker so later turns retain the fact that vision was used.
-            SessionContentBlock::Image { media_type } => Self::Text {
+            // Image and document payloads are persisted in session history for
+            // client-side rendering, but replayed as text markers in LLM context
+            // to avoid re-sending large binary data on subsequent turns.
+            SessionContentBlock::Image { media_type, .. } => Self::Text {
                 text: format!("[image:{media_type}]"),
+            },
+            SessionContentBlock::Document {
+                media_type,
+                filename,
+                ..
+            } => Self::Text {
+                text: filename
+                    .map(|filename| format!("[document:{media_type}:{filename}]"))
+                    .unwrap_or_else(|| format!("[document:{media_type}]")),
             },
         }
     }
@@ -558,7 +591,15 @@ fn render_content_block_with_options(
                 format!("[tool_result:{tool_use_id}] {content}")
             }
         }
-        SessionContentBlock::Image { media_type } => format!("[image:{media_type}]"),
+        SessionContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
+        SessionContentBlock::Document {
+            media_type,
+            filename,
+            ..
+        } => filename
+            .as_ref()
+            .map(|filename| format!("[document:{media_type}:{filename}]"))
+            .unwrap_or_else(|| format!("[document:{media_type}]")),
     }
 }
 
@@ -928,6 +969,7 @@ mod tests {
                 },
                 SessionContentBlock::Image {
                     media_type: "image/png".to_string(),
+                    data: Some("abc123".to_string()),
                 },
             ],
             123,
@@ -964,6 +1006,7 @@ mod tests {
                 },
                 SessionContentBlock::Image {
                     media_type: "image/png".to_string(),
+                    data: Some("abc123".to_string()),
                 },
             ],
             123,
@@ -1091,6 +1134,22 @@ mod tests {
                 is_error: None,
             }]
         );
+    }
+
+    #[test]
+    fn session_message_deserializes_legacy_image_without_data() {
+        let json = r#"{"role":"user","content":[{"type":"image","media_type":"image/png"}],"timestamp":123}"#;
+
+        let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(
+            restored.content,
+            vec![SessionContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: None,
+            }]
+        );
+        assert_eq!(restored.render_text(), "[image:image/png]");
     }
 
     #[test]

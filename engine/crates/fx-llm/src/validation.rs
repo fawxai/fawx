@@ -95,6 +95,7 @@ fn summarize_content_block(block: &ContentBlock) -> String {
         ),
         ContentBlock::ToolResult { tool_use_id, .. } => format!("tool_result:{tool_use_id}"),
         ContentBlock::Image { .. } => "image".to_string(),
+        ContentBlock::Document { .. } => "document".to_string(),
     }
 }
 

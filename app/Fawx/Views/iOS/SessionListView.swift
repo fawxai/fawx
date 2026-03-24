@@ -192,8 +192,8 @@ struct SessionListView: View {
                     appState: appState,
                     sessionViewModel: sessionViewModel,
                     chatViewModel: chatViewModel,
-                    emptyStateTitle: NewSessionCopy.heroTitle,
-                    emptyStateMessage: NewSessionCopy.heroMessage
+                    emptyStateTitle: "Let's go!",
+                    emptyStateMessage: "Start typing and Fawx will create a new conversation."
                 )
                 .navigationTitle("New Session")
             )
@@ -206,8 +206,8 @@ struct SessionListView: View {
                     appState: appState,
                     sessionViewModel: sessionViewModel,
                     chatViewModel: chatViewModel,
-                    emptyStateTitle: NewSessionCopy.heroTitle,
-                    emptyStateMessage: NewSessionCopy.heroMessage
+                    emptyStateTitle: "Let's go!",
+                    emptyStateMessage: "Start typing and Fawx will create a new conversation."
                 )
                 .navigationTitle(sessionTitle(for: sessionID))
             )

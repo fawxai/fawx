@@ -10,6 +10,7 @@ use http::{header::HeaderValue, Request};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use tokio_tungstenite::tungstenite::{
     self,
@@ -18,6 +19,7 @@ use tokio_tungstenite::tungstenite::{
     Message as WsMessage,
 };
 
+use crate::document::document_text_fallback;
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
@@ -876,8 +878,16 @@ fn response_input_block(role: &str, block: &ContentBlock) -> Option<Value> {
             "type": "input_image",
             "image_url": format!("data:{media_type};base64,{data}")
         })),
+        ContentBlock::Document {
+            media_type,
+            data,
+            filename,
+        } if role == "user" => Some(json!({
+            "type": "input_text",
+            "text": document_text_fallback(media_type, data, filename.as_deref())
+        })),
         ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
-        ContentBlock::Image { .. } => None,
+        ContentBlock::Image { .. } | ContentBlock::Document { .. } => None,
     }
 }
 
@@ -1189,8 +1199,17 @@ fn extract_text(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } => Some(Cow::Borrowed(text.as_str())),
             ContentBlock::Image { .. } => None,
+            ContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            } => Some(Cow::Owned(document_text_fallback(
+                media_type,
+                data,
+                filename.as_deref(),
+            ))),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1446,7 +1465,8 @@ fn tool_use_blocks_from_pending(pending: &[PendingToolCall]) -> Vec<ContentBlock
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::spawn_json_server;
+    use crate::test_helpers::{simple_pdf_with_text, spawn_json_server};
+    use base64::Engine;
     use futures::{pin_mut, stream, StreamExt};
 
     #[test]
@@ -1543,6 +1563,23 @@ mod tests {
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn document_content_block_falls_back_to_text_for_openai_responses() {
+        let document = ContentBlock::Document {
+            media_type: "application/pdf".to_string(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(simple_pdf_with_text("Hello PDF")),
+            filename: Some("brief.pdf".to_string()),
+        };
+
+        let mapped = response_input_block("user", &document).expect("mapped block");
+
+        assert_eq!(mapped["type"], "input_text");
+        let text = mapped["text"].as_str().expect("text payload");
+        assert!(text.contains("[file: brief.pdf]"));
+        assert!(text.contains("Hello PDF"));
     }
 
     fn continuation_assistant_message() -> crate::types::Message {

@@ -1,6 +1,461 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import Observation
+import PDFKit
+import UniformTypeIdentifiers
+
+enum PendingAttachmentKind: String, Sendable, Hashable {
+    case image
+    case textFile
+    case pdf
+}
+
+struct PendingAttachment: Identifiable, Sendable, Hashable {
+    let id: UUID
+    let kind: PendingAttachmentKind
+    let filename: String
+    let data: Data
+    let mediaType: String
+    let textContent: String?
+
+    init(
+        id: UUID = UUID(),
+        kind: PendingAttachmentKind,
+        filename: String,
+        data: Data,
+        mediaType: String,
+        textContent: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.filename = filename
+        self.data = data
+        self.mediaType = mediaType
+        self.textContent = textContent
+    }
+}
+
+struct PreparedMessagePayload: Sendable, Hashable {
+    let message: String
+    let images: [ImagePayload]
+    let documents: [DocumentPayload]
+    let contentBlocks: [SessionContentBlock]
+}
+
+private struct QueuedDraft: Sendable, Hashable {
+    let text: String
+    let attachments: [PendingAttachment]
+
+    var summaryText: String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+
+        if attachments.count == 1 {
+            return "Queued \(attachments[0].filename)"
+        }
+
+        return "Queued \(attachments.count) attachments"
+    }
+}
+
+enum AttachmentComposerError: LocalizedError, Equatable {
+    case tooManyAttachments(limit: Int)
+    case unsupportedFileType(String)
+    case unsupportedImageType(String)
+    case invalidImageData
+    case imageStillTooLarge
+    case textFileTooLarge(String)
+    case binaryTextFile(String)
+    case pdfTooLarge(String)
+    case pdfTooManyPages(String, Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .tooManyAttachments(let limit):
+            return "You can attach up to \(limit) items per message."
+        case .unsupportedFileType(let filename):
+            return "Unsupported attachment type: \(filename)."
+        case .unsupportedImageType(let mediaType):
+            return "Unsupported image type: \(mediaType)."
+        case .invalidImageData:
+            return "That image couldn't be read."
+        case .imageStillTooLarge:
+            return "That image is still too large after resizing."
+        case .textFileTooLarge(let filename):
+            return "\(filename) is larger than 500KB."
+        case .binaryTextFile(let filename):
+            return "\(filename) isn't valid UTF-8 text."
+        case .pdfTooLarge(let filename):
+            return "\(filename) is larger than 10MB."
+        case .pdfTooManyPages(let filename, let pageCount):
+            return "\(filename) has \(pageCount) pages. PDFs are limited to 100 pages."
+        }
+    }
+}
+
+enum AttachmentComposer {
+    static let maxAttachmentCount = 10
+    static let maxImageBytes = 5 * 1024 * 1024
+    static let maxTextBytes = 500 * 1024
+    static let maxPDFBytes = 10 * 1024 * 1024
+    static let maxPDFPages = 100
+
+    private static let supportedImageMediaTypes: Set<String> = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+    ]
+
+    private static let supportedImageFileExtensions: [String] = [
+        "jpg", "jpeg", "png", "gif", "webp",
+    ]
+
+    private static let supportedTextFileExtensions: [String] = [
+        "txt", "md", "csv", "json", "xml", "yaml", "yml",
+        "py", "rs", "swift", "kt", "js", "ts", "html", "htm",
+        "css", "sh", "toml", "tsv", "log",
+    ]
+
+    private static let supportedTextExtensions = Set(supportedTextFileExtensions)
+
+    static let supportedPickerContentTypes: [UTType] = {
+        let supportedFileExtensions =
+            supportedImageFileExtensions + ["pdf"] + supportedTextFileExtensions
+        var types: [UTType] = []
+        for fileExtension in supportedFileExtensions {
+            guard
+                let type = UTType(filenameExtension: fileExtension),
+                !types.contains(type)
+            else {
+                continue
+            }
+            types.append(type)
+        }
+        return types
+    }()
+
+    static func append(
+        _ newAttachments: [PendingAttachment],
+        to existingAttachments: [PendingAttachment]
+    ) throws -> [PendingAttachment] {
+        guard existingAttachments.count + newAttachments.count <= maxAttachmentCount else {
+            throw AttachmentComposerError.tooManyAttachments(limit: maxAttachmentCount)
+        }
+
+        return existingAttachments + newAttachments
+    }
+
+    static func removeAttachment(id: UUID, from attachments: [PendingAttachment]) -> [PendingAttachment] {
+        attachments.filter { $0.id != id }
+    }
+
+    static func pendingAttachment(fromFileURL url: URL) throws -> PendingAttachment {
+        let filename = normalizedFilename(url.lastPathComponent, fallback: "Attachment")
+        let data = try Data(contentsOf: url)
+        let extensionType = url.pathExtension.lowercased()
+        let type = UTType(filenameExtension: extensionType)
+        let mediaType = type?.preferredMIMEType
+
+        if extensionType == "pdf" || mediaType == "application/pdf" {
+            return try pdfAttachment(data: data, filename: filename)
+        }
+
+        if isSupportedTextExtension(extensionType) {
+            return try textFileAttachment(
+                data: data,
+                filename: filename,
+                mediaType: mediaType ?? "text/plain"
+            )
+        }
+
+        if let imageMediaType = detectedImageMediaType(data: data) ?? normalizedImageMediaType(
+            preferredMIMEType: mediaType,
+            fallbackFilename: filename
+        ) {
+            return try imageAttachment(data: data, filename: filename, mediaType: imageMediaType)
+        }
+
+        throw AttachmentComposerError.unsupportedFileType(filename)
+    }
+
+    static func pastedImageAttachment(data: Data) throws -> PendingAttachment {
+        try imageAttachment(
+            data: data,
+            filename: "Pasted Image.png",
+            mediaType: "image/png"
+        )
+    }
+
+    static func imageAttachment(data: Data, filename: String, mediaType: String) throws -> PendingAttachment {
+        let resolvedMediaType = try resolvedImageMediaType(data: data, fallbackMediaType: mediaType)
+
+        let prepared = try normalizedImageData(data: data, originalMediaType: resolvedMediaType)
+        return PendingAttachment(
+            kind: .image,
+            filename: filename,
+            data: prepared.data,
+            mediaType: prepared.mediaType
+        )
+    }
+
+    static func textFileAttachment(
+        data: Data,
+        filename: String,
+        mediaType: String
+    ) throws -> PendingAttachment {
+        guard data.count <= maxTextBytes else {
+            throw AttachmentComposerError.textFileTooLarge(filename)
+        }
+
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AttachmentComposerError.binaryTextFile(filename)
+        }
+
+        return PendingAttachment(
+            kind: .textFile,
+            filename: filename,
+            data: data,
+            mediaType: mediaType,
+            textContent: text
+        )
+    }
+
+    static func pdfAttachment(data: Data, filename: String) throws -> PendingAttachment {
+        guard data.count <= maxPDFBytes else {
+            throw AttachmentComposerError.pdfTooLarge(filename)
+        }
+
+        if let document = PDFDocument(data: data), document.pageCount > maxPDFPages {
+            throw AttachmentComposerError.pdfTooManyPages(filename, document.pageCount)
+        }
+
+        return PendingAttachment(
+            kind: .pdf,
+            filename: filename,
+            data: data,
+            mediaType: "application/pdf"
+        )
+    }
+
+    static func prepareMessage(
+        message: String,
+        attachments: [PendingAttachment]
+    ) -> PreparedMessagePayload {
+        let textFiles = attachments.filter { $0.kind == .textFile }
+        let images = attachments.filter { $0.kind == .image }.map {
+            ImagePayload(data: $0.data.base64EncodedString(), mediaType: $0.mediaType)
+        }
+        let documents = attachments.filter { $0.kind == .pdf }.map {
+            DocumentPayload(
+                data: $0.data.base64EncodedString(),
+                mediaType: $0.mediaType,
+                filename: $0.filename
+            )
+        }
+        let composedMessage = injectedText(message: message, textAttachments: textFiles)
+        let contentBlocks = makeContentBlocks(
+            message: composedMessage,
+            attachments: attachments
+        )
+
+        return PreparedMessagePayload(
+            message: composedMessage,
+            images: images,
+            documents: documents,
+            contentBlocks: contentBlocks
+        )
+    }
+
+    private static func injectedText(
+        message: String,
+        textAttachments: [PendingAttachment]
+    ) -> String {
+        let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fileBlocks = textAttachments.compactMap { attachment -> String? in
+            guard let text = attachment.textContent else {
+                return nil
+            }
+
+            return """
+            [file: \(attachment.filename)]
+            \(text)
+            [/file: \(attachment.filename)]
+            """
+        }
+
+        var sections = fileBlocks
+        if !trimmedMessage.isEmpty {
+            sections.append(trimmedMessage)
+        }
+
+        return sections.joined(separator: "\n\n")
+    }
+
+    private static func makeContentBlocks(
+        message: String,
+        attachments: [PendingAttachment]
+    ) -> [SessionContentBlock] {
+        var blocks: [SessionContentBlock] = attachments.compactMap { attachment in
+            switch attachment.kind {
+            case .image:
+                return .image(
+                    mediaType: attachment.mediaType,
+                    data: attachment.data.base64EncodedString()
+                )
+            case .pdf:
+                return .document(
+                    mediaType: attachment.mediaType,
+                    data: attachment.data.base64EncodedString(),
+                    filename: attachment.filename
+                )
+            case .textFile:
+                return nil
+            }
+        }
+
+        if !message.isEmpty {
+            blocks.append(.text(message))
+        }
+
+        return blocks
+    }
+
+    private static func normalizedImageData(
+        data: Data,
+        originalMediaType: String
+    ) throws -> (data: Data, mediaType: String) {
+        guard data.count > maxImageBytes else {
+            return (data, originalMediaType)
+        }
+
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let resizedImage = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 2048,
+                ] as CFDictionary
+            ),
+            let jpegData = jpegData(from: resizedImage, quality: 0.8)
+        else {
+            throw AttachmentComposerError.invalidImageData
+        }
+
+        guard jpegData.count <= maxImageBytes else {
+            throw AttachmentComposerError.imageStillTooLarge
+        }
+
+        return (jpegData, "image/jpeg")
+    }
+
+    private static func jpegData(from image: CGImage, quality: CGFloat) -> Data? {
+        let output = NSMutableData()
+        guard
+            let destination = CGImageDestinationCreateWithData(
+                output,
+                UTType.jpeg.identifier as CFString,
+                1,
+                nil
+            )
+        else {
+            return nil
+        }
+
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+        )
+
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+
+        return output as Data
+    }
+
+    private static func resolvedImageMediaType(
+        data: Data,
+        fallbackMediaType: String
+    ) throws -> String {
+        if let detectedMediaType = detectedImageMediaType(data: data) {
+            guard supportedImageMediaTypes.contains(detectedMediaType) else {
+                throw AttachmentComposerError.unsupportedImageType(detectedMediaType)
+            }
+            return detectedMediaType
+        }
+
+        guard supportedImageMediaTypes.contains(fallbackMediaType) else {
+            throw AttachmentComposerError.unsupportedImageType(fallbackMediaType)
+        }
+
+        return fallbackMediaType
+    }
+
+    private static func detectedImageMediaType(data: Data) -> String? {
+        if data.starts(with: [0xFF, 0xD8, 0xFF]) {
+            return "image/jpeg"
+        }
+
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return "image/png"
+        }
+
+        if data.starts(with: Data("GIF87a".utf8)) || data.starts(with: Data("GIF89a".utf8)) {
+            return "image/gif"
+        }
+
+        if data.count >= 12,
+           data[0...3] == Data("RIFF".utf8),
+           data[8...11] == Data("WEBP".utf8) {
+            return "image/webp"
+        }
+
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let typeIdentifier = CGImageSourceGetType(source) as String?,
+            let detectedMediaType = UTType(typeIdentifier)?.preferredMIMEType
+        else {
+            return nil
+        }
+
+        return detectedMediaType
+    }
+
+    private static func normalizedImageMediaType(
+        preferredMIMEType: String?,
+        fallbackFilename: String
+    ) -> String? {
+        if let preferredMIMEType, supportedImageMediaTypes.contains(preferredMIMEType) {
+            return preferredMIMEType
+        }
+
+        let extensionType = URL(fileURLWithPath: fallbackFilename).pathExtension.lowercased()
+        switch extensionType {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        default: return nil
+        }
+    }
+
+    private static func isSupportedTextExtension(_ extensionType: String) -> Bool {
+        supportedTextExtensions.contains(extensionType)
+    }
+
+    private static func normalizedFilename(_ filename: String, fallback: String) -> String {
+        let trimmed = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}
 
 @MainActor
 final class StreamingDisplayController {
@@ -228,7 +683,8 @@ final class ChatViewModel {
         }
     }
     private var draftsBySession: [String: String] = [:]
-    private var queuedMessagesBySession: [String: String] = [:]
+    private var pendingAttachmentsBySession: [String: [PendingAttachment]] = [:]
+    private var queuedDraftsBySession: [String: QueuedDraft] = [:]
     var isLoadingHistory = false
     var isStreaming: Bool {
         !streamStates.isEmpty
@@ -293,11 +749,23 @@ final class ChatViewModel {
         }
     }
 
+    var pendingAttachments: [PendingAttachment] {
+        get { pendingAttachmentsBySession[draftStorageKey(for: currentSessionID)] ?? [] }
+        set {
+            let key = draftStorageKey(for: currentSessionID)
+            if newValue.isEmpty {
+                pendingAttachmentsBySession.removeValue(forKey: key)
+            } else {
+                pendingAttachmentsBySession[key] = newValue
+            }
+        }
+    }
+
     var queuedMessage: String? {
         guard let currentSessionID else {
             return nil
         }
-        return queuedMessagesBySession[currentSessionID]
+        return queuedDraftsBySession[currentSessionID]?.summaryText
     }
 
     var activeStreamSessionIDs: Set<String> {
@@ -403,7 +871,8 @@ final class ChatViewModel {
         liveToolGroupsBySession.removeValue(forKey: sessionID)
         anonymousToolCallCountersBySession.removeValue(forKey: sessionID)
         draftsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
-        queuedMessagesBySession.removeValue(forKey: sessionID)
+        pendingAttachmentsBySession.removeValue(forKey: draftStorageKey(for: sessionID))
+        queuedDraftsBySession.removeValue(forKey: sessionID)
         errorMessagesBySession.removeValue(forKey: errorStorageKey(for: sessionID))
         retryRequestsBySession.removeValue(forKey: sessionID)
         clearCompactionBanner(for: sessionID)
@@ -834,9 +1303,55 @@ final class ChatViewModel {
         await appState.refreshContext(for: nil)
     }
 
+    func addAttachment(fromFileURL url: URL) {
+        do {
+            let attachment = try AttachmentComposer.pendingAttachment(fromFileURL: url)
+            try appendPendingAttachment(attachment)
+            clearErrorMessage(for: currentSessionID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func addImageAttachment(data: Data, filename: String, mediaType: String) {
+        do {
+            let attachment = try AttachmentComposer.imageAttachment(
+                data: data,
+                filename: filename,
+                mediaType: mediaType
+            )
+            try appendPendingAttachment(attachment)
+            clearErrorMessage(for: currentSessionID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func addPastedImage(data: Data) {
+        do {
+            let attachment = try AttachmentComposer.pastedImageAttachment(data: data)
+            try appendPendingAttachment(attachment)
+            clearErrorMessage(for: currentSessionID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func removeAttachment(id: UUID) {
+        pendingAttachments = AttachmentComposer.removeAttachment(
+            id: id,
+            from: pendingAttachments
+        )
+    }
+
+    private func appendPendingAttachment(_ attachment: PendingAttachment) throws {
+        pendingAttachments = try AttachmentComposer.append([attachment], to: pendingAttachments)
+    }
+
     func sendDraft() {
         let trimmed = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        let attachments = pendingAttachments
+        guard !trimmed.isEmpty || !attachments.isEmpty else {
             return
         }
 
@@ -846,14 +1361,18 @@ final class ChatViewModel {
         }
 
         draftMessage = ""
+        pendingAttachments = []
 
         if isCurrentSessionStreaming, let currentSessionID {
-            queuedMessagesBySession[currentSessionID] = trimmed
+            queuedDraftsBySession[currentSessionID] = QueuedDraft(
+                text: trimmed,
+                attachments: attachments
+            )
             return
         }
 
         Task {
-            await send(trimmed)
+            await send(trimmed, attachments: attachments)
         }
     }
 
@@ -868,7 +1387,11 @@ final class ChatViewModel {
 
         retryRequestsBySession.removeValue(forKey: currentSessionID)
         Task {
-            await send(retryRequest.text, forceSessionID: retryRequest.sessionID)
+            await send(
+                retryRequest.text,
+                attachments: retryRequest.attachments,
+                forceSessionID: retryRequest.sessionID
+            )
         }
     }
 
@@ -925,10 +1448,15 @@ final class ChatViewModel {
         )
     }
 
-    private func send(_ text: String, forceSessionID: String? = nil) async {
+    private func send(
+        _ text: String,
+        attachments: [PendingAttachment] = [],
+        forceSessionID: String? = nil
+    ) async {
         await appState.synchronizeLocalConnectionIfNeeded()
         var targetSessionID = forceSessionID ?? currentSessionID
         setErrorMessage(nil, for: targetSessionID)
+        let payload = AttachmentComposer.prepareMessage(message: text, attachments: attachments)
 
         if targetSessionID == nil {
             do {
@@ -939,6 +1467,7 @@ final class ChatViewModel {
                 targetSessionID = createdSession.id
             } catch {
                 draftMessage = text
+                pendingAttachments = attachments
                 setErrorMessage("Failed to create session. \(error.localizedDescription)", for: nil)
                 return
             }
@@ -950,17 +1479,37 @@ final class ChatViewModel {
         }
 
         let timestamp = Int(Date().timeIntervalSince1970)
-        let userMessage = SessionMessage(role: .user, content: text, timestamp: timestamp)
+        let userMessage = SessionMessage(
+            role: .user,
+            contentBlocks: payload.contentBlocks,
+            timestamp: timestamp
+        )
         appendMessage(userMessage, for: sessionID)
-        sessionViewModel.updatePreview(for: sessionID, text: text, model: appState.activeModel?.modelID)
-        retryRequestsBySession[sessionID] = RetryRequest(text: text, sessionID: sessionID)
+        let previewText = userMessage.transcriptDisplayText
+        sessionViewModel.updatePreview(
+            for: sessionID,
+            text: previewText,
+            model: appState.activeModel?.modelID
+        )
+        retryRequestsBySession[sessionID] = RetryRequest(
+            text: text,
+            attachments: attachments,
+            sessionID: sessionID
+        )
 
         do {
             let stream = try await appState.client.sendMessageStream(
                 sessionID: sessionID,
-                message: text
+                message: payload.message,
+                images: payload.images,
+                documents: payload.documents
             )
-            startStreaming(stream, sessionID: sessionID, retryText: text)
+            startStreaming(
+                stream,
+                sessionID: sessionID,
+                retryText: text,
+                retryAttachments: attachments
+            )
         } catch {
             setErrorMessage("Failed to send message. \(error.localizedDescription)", for: sessionID)
         }
@@ -969,7 +1518,8 @@ final class ChatViewModel {
     private func startStreaming(
         _ stream: AsyncThrowingStream<SSEEvent, Error>,
         sessionID: String,
-        retryText: String
+        retryText: String,
+        retryAttachments: [PendingAttachment]
     ) {
         stopStreaming(sessionID: sessionID)
         streamStates[sessionID] = SessionStreamingState(text: "", phase: nil)
@@ -1034,10 +1584,17 @@ final class ChatViewModel {
                 if streamFailed && finalResponse == nil {
                     let recovered = await recoverInterruptedStream(
                         sessionID: sessionID,
-                        retryText: retryText
+                        retryContentBlocks: payloadContentBlocks(
+                            text: retryText,
+                            attachments: retryAttachments
+                        )
                     )
                     if !recovered {
-                        retryRequestsBySession[sessionID] = RetryRequest(text: retryText, sessionID: sessionID)
+                        retryRequestsBySession[sessionID] = RetryRequest(
+                            text: retryText,
+                            attachments: retryAttachments,
+                            sessionID: sessionID
+                        )
                         await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
                     }
                 } else {
@@ -1053,10 +1610,17 @@ final class ChatViewModel {
                 handleStreamError("Response interrupted. \(error.localizedDescription)", sessionID: sessionID)
                 let recovered = await recoverInterruptedStream(
                     sessionID: sessionID,
-                    retryText: retryText
+                    retryContentBlocks: payloadContentBlocks(
+                        text: retryText,
+                        attachments: retryAttachments
+                    )
                 )
                 if !recovered {
-                    retryRequestsBySession[sessionID] = RetryRequest(text: retryText, sessionID: sessionID)
+                    retryRequestsBySession[sessionID] = RetryRequest(
+                        text: retryText,
+                        attachments: retryAttachments,
+                        sessionID: sessionID
+                    )
                     await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
                 }
             }
@@ -1102,13 +1666,16 @@ final class ChatViewModel {
         }
     }
 
-    private func recoverInterruptedStream(sessionID: String, retryText: String) async -> Bool {
+    private func recoverInterruptedStream(
+        sessionID: String,
+        retryContentBlocks: [SessionContentBlock]
+    ) async -> Bool {
         streamingDisplayController(for: sessionID).streamDidEnd()
         do {
             let response = try await appState.client.sessionMessages(id: sessionID, limit: 200)
             guard
                 let lastUserIndex = response.messages.lastIndex(where: { message in
-                    message.role == .user && message.content == retryText
+                    message.role == .user && message.contentBlocks == retryContentBlocks
                 }),
                 response.messages.indices.contains(response.messages.index(after: lastUserIndex))
             else {
@@ -1136,12 +1703,23 @@ final class ChatViewModel {
         }
     }
 
+    private func payloadContentBlocks(
+        text: String,
+        attachments: [PendingAttachment]
+    ) -> [SessionContentBlock] {
+        AttachmentComposer.prepareMessage(message: text, attachments: attachments).contentBlocks
+    }
+
     private func sendQueuedMessageIfNeeded(finishedSessionID: String) async {
         guard let queuedDelivery = consumeQueuedMessageIfReady(finishedSessionID: finishedSessionID) else {
             return
         }
 
-        await send(queuedDelivery.text, forceSessionID: queuedDelivery.sessionID)
+        await send(
+            queuedDelivery.text,
+            attachments: queuedDelivery.attachments,
+            forceSessionID: queuedDelivery.sessionID
+        )
     }
 
     private func resetStreamingState(for sessionID: String) {
@@ -1180,11 +1758,11 @@ final class ChatViewModel {
             return
         }
 
-        queuedMessagesBySession.removeValue(forKey: sessionID)
+        queuedDraftsBySession.removeValue(forKey: sessionID)
     }
 
     private func clearQueuedMessages() {
-        queuedMessagesBySession.removeAll()
+        queuedDraftsBySession.removeAll()
     }
 
     private func handleContextCompacted(
@@ -1302,21 +1880,16 @@ final class ChatViewModel {
 
     private func consumeQueuedMessageIfReady(
         finishedSessionID: String
-    ) -> (text: String, sessionID: String?)? {
-        guard
-            let queued = queuedMessagesBySession[finishedSessionID]?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            !queued.isEmpty
-        else {
-            queuedMessagesBySession.removeValue(forKey: finishedSessionID)
+    ) -> (text: String, attachments: [PendingAttachment], sessionID: String?)? {
+        guard let queuedDraft = queuedDraftsBySession[finishedSessionID] else {
             return nil
         }
         guard appState.connectionStatus == .connected else {
             return nil
         }
 
-        queuedMessagesBySession.removeValue(forKey: finishedSessionID)
-        return (queued, finishedSessionID)
+        queuedDraftsBySession.removeValue(forKey: finishedSessionID)
+        return (queuedDraft.text, queuedDraft.attachments, finishedSessionID)
     }
 
     func respondToPermissionPrompt(_ decision: PermissionPromptDecision) {
@@ -1933,6 +2506,7 @@ final class ChatViewModel {
 
 private struct RetryRequest {
     let text: String
+    let attachments: [PendingAttachment]
     let sessionID: String
 }
 
@@ -2042,7 +2616,7 @@ extension ChatViewModel {
     func consumeQueuedMessageForTesting(
         finishedSessionID: String,
         connectionStatus: ConnectionStatus = .connected
-    ) -> (text: String, sessionID: String?)? {
+    ) -> (text: String, attachments: [PendingAttachment], sessionID: String?)? {
         let previousConnectionStatus = appState.connectionStatus
         appState.connectionStatus = connectionStatus
         defer {

@@ -347,6 +347,7 @@ mod tests {
                 timestamp: 1_700_000_000_122,
                 context_id: Some("ctx-123".to_owned()),
                 images: Vec::new(),
+                documents: Vec::new(),
             }),
             conversation_history: Vec::new(),
             steer_context: None,

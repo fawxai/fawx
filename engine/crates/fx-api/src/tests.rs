@@ -19,9 +19,9 @@ use crate::state::{
 };
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, ErrorBody,
-    ErrorRecordDto, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto,
-    SetupTokenRequest, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+    ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, DocumentPayload,
+    ErrorBody, ErrorRecordDto, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
+    ModelSwitchDto, SetupTokenRequest, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -31,6 +31,7 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use fx_bus::SessionBus;
 use fx_channel_telegram::{IncomingMessage, TelegramChannel};
 use fx_channel_webhook::WebhookChannel;
@@ -45,7 +46,8 @@ use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
 use fx_llm::{
-    CompletionResponse, CompletionStream, ContentBlock, ImageAttachment, Message, StreamChunk,
+    CompletionResponse, CompletionStream, ContentBlock, DocumentAttachment, ImageAttachment,
+    Message, StreamChunk,
 };
 use fx_telemetry::{SignalCategory, SignalCollector, TelemetryConsent};
 use http_body_util::BodyExt;
@@ -85,16 +87,17 @@ impl AppEngine for HeadlessApp {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<ApiCycleResult, anyhow::Error> {
-        let result = match (images.is_empty(), callback) {
+        let result = match (images.is_empty() && documents.is_empty(), callback) {
             (true, Some(callback)) => {
                 process_input_with_commands_streaming(self, input, Some(&source), callback).await?
             }
             (true, None) => process_input_with_commands(self, input, Some(&source)).await?,
             (false, _) => {
-                self.process_message_with_images(input, &images, &source)
+                self.process_message_with_attachments(input, &images, &documents, &source)
                     .await?
             }
         };
@@ -111,12 +114,13 @@ impl AppEngine for HeadlessApp {
         &mut self,
         input: &str,
         images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
         context: Vec<Message>,
         source: InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
         let (result, updated_history) = HeadlessApp::process_message_with_context(
-            self, input, images, context, &source, callback,
+            self, input, images, documents, context, &source, callback,
         )
         .await?;
 
@@ -634,6 +638,24 @@ fn message_request_rejects_missing_message() {
     let json = r#"{}"#;
     let result = serde_json::from_str::<MessageRequest>(json);
     assert!(result.is_err());
+}
+
+#[test]
+fn validate_and_encode_documents_rejects_oversized_payloads() {
+    let document = DocumentPayload {
+        data: base64::engine::general_purpose::STANDARD.encode(vec![0_u8; (10 * 1024 * 1024) + 1]),
+        media_type: "application/pdf".to_string(),
+        filename: Some("too-large.pdf".to_string()),
+    };
+
+    let error = crate::handlers::message::validate_and_encode_documents(&[document])
+        .expect_err("oversized document should be rejected");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1 .0.error,
+        "document at index 0 exceeds the 10MB limit"
+    );
 }
 
 #[test]
@@ -1446,11 +1468,19 @@ mod routing_and_status {
             &mut self,
             input: &str,
             images: Vec<ImageAttachment>,
+            documents: Vec<DocumentAttachment>,
             source: InputSource,
             callback: Option<StreamCallback>,
         ) -> Result<ApiCycleResult, anyhow::Error> {
             let (result, _) = self
-                .process_message_with_context(input, images, Vec::new(), source, callback)
+                .process_message_with_context(
+                    input,
+                    images,
+                    documents,
+                    Vec::new(),
+                    source,
+                    callback,
+                )
                 .await?;
             Ok(result)
         }
@@ -1459,6 +1489,7 @@ mod routing_and_status {
             &mut self,
             input: &str,
             _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
             context: Vec<Message>,
             _source: InputSource,
             callback: Option<StreamCallback>,
@@ -2683,6 +2714,34 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
         assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn documents_field_accepted_in_message_api() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-documents");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let body = serde_json::json!({
+            "message": "Summarize this brief",
+            "documents": [{
+                "data": base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4\n"),
+                "media_type": "application/pdf",
+                "filename": "brief.pdf"
+            }]
+        });
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                &body.to_string(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "mock-model");
     }
 
     #[tokio::test]
@@ -5064,6 +5123,7 @@ mod telegram_update {
             &router,
             "what's in this image?",
             images,
+            Vec::new(),
             InputSource::Channel("telegram".to_string()),
             ResponseContext {
                 routing_key: Some("12345".to_string()),
