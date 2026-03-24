@@ -1,0 +1,21 @@
+[package]
+name = "fx-memory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fawx memory — persistence for agent memory and signal storage."
+
+[dependencies]
+fx-core = { workspace = true }
+fx-embeddings = { workspace = true }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
+filetime = "0.2"
+sha2 = "0.10"

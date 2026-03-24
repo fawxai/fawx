@@ -1,0 +1,7 @@
+name = "calculator"
+version = "1.0.0"
+description = "Evaluates simple mathematical expressions (supports +, -, *, /)"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = []
+entry_point = "run"

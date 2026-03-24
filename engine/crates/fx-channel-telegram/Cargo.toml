@@ -1,0 +1,21 @@
+[package]
+name = "fx-channel-telegram"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fx-consensus.workspace = true
+fx-core = { path = "../fx-core" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] } # rt: progress callback spawns background task
+tracing.workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }

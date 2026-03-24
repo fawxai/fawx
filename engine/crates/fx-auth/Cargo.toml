@@ -1,0 +1,23 @@
+[package]
+name = "fx-auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Authentication and OAuth primitives for Fawx LLM providers."
+
+[dependencies]
+base64 = "0.22"
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+zeroize.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+fx-config.workspace = true
+fx-storage.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"

@@ -1,0 +1,15 @@
+[package]
+name = "fx-canary"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fx-kernel = { path = "../fx-kernel" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.14"
+tracing-subscriber.workspace = true

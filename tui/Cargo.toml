@@ -1,0 +1,52 @@
+[package]
+name = "fawx-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+default-run = "fawx-tui"
+
+[[bin]]
+name = "fawx-tui"
+path = "src/main.rs"
+
+[lib]
+name = "fawx_tui"
+path = "src/lib.rs"
+
+[features]
+default = []
+embedded = ["dep:fx-cli", "dep:fx-consensus"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
+fx-auth = { workspace = true }
+fx-cli = { workspace = true, optional = true, features = ["http"] }
+fx-consensus = { workspace = true, optional = true }
+fx-kernel = { workspace = true }
+fx-storage = { workspace = true }
+futures = { workspace = true }
+pulldown-cmark = "0.10"
+ratatui = { workspace = true }
+regex-lite = "0.1"
+reqwest = { workspace = true, features = ["json"] }
+ring = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sparx = { git = "https://github.com/abbudjoe/sparx.git", rev = "6e942de454cf854c289da9c0d1f089441c2c5d69" }
+textwrap = "0.16"
+tokio = { workspace = true }
+tracing = { workspace = true }
+unicode-width = "0.2"
+url = "2"
+
+[dev-dependencies]
+fx-config = { workspace = true, features = ["test-support"] }
+fx-llm = { workspace = true }
+fx-subagent = { workspace = true }
+insta = "1"
+itertools = "0.13"
+pretty_assertions = "1"

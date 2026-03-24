@@ -1,0 +1,17 @@
+[package]
+name = "fx-subagent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+async-trait.workspace = true
+fx-kernel.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid = { version = "1.13", features = ["v4"] }

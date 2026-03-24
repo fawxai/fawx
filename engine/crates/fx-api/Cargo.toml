@@ -1,0 +1,56 @@
+[package]
+name = "fx-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures.workspace = true
+fx-channel-telegram = { path = "../fx-channel-telegram" }
+fx-channel-webhook = { path = "../fx-channel-webhook" }
+fx-auth.workspace = true
+fx-bus.workspace = true
+fx-cron.workspace = true
+fx-config.workspace = true
+fx-core.workspace = true
+fx-fleet.workspace = true
+fx-kernel.workspace = true
+fx-improve.workspace = true
+fx-llm.workspace = true
+fx-memory.workspace = true
+fx-ripcord = { path = "../fx-ripcord" }
+fx-session.workspace = true
+fx-storage.workspace = true
+fx-telemetry = { path = "../fx-telemetry" }
+fx-tools.workspace = true
+rand = "0.8"
+reqwest.workspace = true
+ring.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+tokio.workspace = true
+tokio-util = "0.7"
+tracing.workspace = true
+toml_edit = "0.22"
+uuid = { version = "1.13", features = ["v4"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+fx-cli = { path = "../fx-cli", default-features = false, features = ["http"] }
+toml = { workspace = true }
+fx-subagent = { workspace = true, features = ["test-support"] }
+http-body-util = "0.1"
+hyper = "1.0"
+tempfile = "3.14"
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber.workspace = true

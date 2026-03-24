@@ -1,0 +1,150 @@
+[workspace]
+members = [
+    "tui",
+    "engine/crates/fx-config",
+    "engine/crates/fx-core",
+    "engine/crates/fx-propose",
+    "engine/crates/fx-subagent",
+    "engine/crates/fx-decompose",
+    "engine/crates/fx-kernel",
+    "engine/crates/fx-auth",
+    "engine/crates/fx-loadable",
+    "engine/crates/fx-agent",
+    "engine/crates/fx-llm",
+    "engine/crates/fx-security",
+    "engine/crates/fx-sandbox",
+    "engine/crates/fx-skills",
+    "engine/crates/fx-storage",
+    "engine/crates/fx-tools",
+    "engine/crates/fx-analysis",
+    "engine/crates/fx-api",
+    "engine/crates/fx-cli",
+    "engine/crates/fx-conversation",
+    "engine/crates/fx-memory",
+    "engine/crates/fx-embeddings",
+    "engine/crates/fx-improve",
+    "engine/crates/fx-transactions",
+    "engine/crates/fx-scratchpad",
+    "engine/crates/fx-preprocess",
+    "engine/crates/fawx-ripcord",
+    "engine/crates/fx-ripcord",
+    "engine/crates/fx-author",
+    "engine/crates/fx-marketplace",
+    "engine/crates/fawx-test",
+    "engine/crates/fx-canary",
+    "engine/crates/fx-fleet",
+    "engine/crates/fx-channel-webhook",
+    "engine/crates/fx-channel-telegram",
+    "engine/crates/fx-orchestrator",
+    "engine/crates/fx-journal",
+    "engine/crates/fx-session",
+    "engine/crates/fx-bus",
+    "engine/crates/fx-cron",
+    "engine/crates/fx-consensus",
+    "engine/crates/fx-training",
+  "engine/crates/fx-telemetry",
+  "engine/crates/fx-forge",
+]
+exclude = [
+    "skills/calculator-skill",
+    "skills/github-skill",
+    "skills/weather-skill",
+    "skills/vision-skill",
+    "skills/tts-skill",
+    "skills/stt-skill",
+    "skills/browser-skill",
+    "skills/canvas-skill",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Fawx AI"]
+license = "MIT"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+crossterm = "0.28"
+ratatui = "0.29"
+tui-textarea = "0.7"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Policy
+toml = "0.8"
+ring = "0.17"
+
+# Version management
+semver = "1.0"
+
+# Storage
+redb = "2.4"
+zeroize = "1.8"
+
+# WASM runtime (pinned exact to keep wasmtime + wasmtime-wasi in lockstep)
+wasmtime = "=40.0.4"
+wasmtime-wasi = "=40.0.4"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ureq = { version = "2", features = ["json"] }
+futures = "0.3"
+http = "1"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# Shared crates
+fx-config = { path = "engine/crates/fx-config" }
+fx-core = { path = "engine/crates/fx-core" }
+fx-propose = { path = "engine/crates/fx-propose" }
+fx-subagent = { path = "engine/crates/fx-subagent" }
+fx-decompose = { path = "engine/crates/fx-decompose" }
+fx-kernel = { path = "engine/crates/fx-kernel" }
+fx-auth = { path = "engine/crates/fx-auth" }
+fx-cli = { path = "engine/crates/fx-cli" }
+fx-conversation = { path = "engine/crates/fx-conversation" }
+fx-loadable = { path = "engine/crates/fx-loadable" }
+fx-agent = { path = "engine/crates/fx-agent" }
+fx-security = { path = "engine/crates/fx-security" }
+fx-skills = { path = "engine/crates/fx-skills" }
+fx-storage = { path = "engine/crates/fx-storage" }
+fx-tools = { path = "engine/crates/fx-tools" }
+fx-transactions = { path = "engine/crates/fx-transactions" }
+fx-analysis = { path = "engine/crates/fx-analysis" }
+fx-memory = { path = "engine/crates/fx-memory" }
+fx-embeddings = { path = "engine/crates/fx-embeddings" }
+fx-improve = { path = "engine/crates/fx-improve" }
+fx-scratchpad = { path = "engine/crates/fx-scratchpad" }
+fx-journal = { path = "engine/crates/fx-journal" }
+fx-llm = { path = "engine/crates/fx-llm" }
+fx-preprocess = { path = "engine/crates/fx-preprocess" }
+fx-author = { path = "engine/crates/fx-author" }
+fx-marketplace = { path = "engine/crates/fx-marketplace" }
+fx-fleet = { path = "engine/crates/fx-fleet" }
+fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
+fx-session = { path = "engine/crates/fx-session" }
+fx-bus = { path = "engine/crates/fx-bus" }
+fx-cron = { path = "engine/crates/fx-cron" }
+fx-consensus = { path = "engine/crates/fx-consensus" }
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true

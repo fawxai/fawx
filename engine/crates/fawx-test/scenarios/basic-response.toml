@@ -1,0 +1,14 @@
+[scenario]
+name = "basic_response"
+description = "Fawx responds to a simple prompt without using tools"
+timeout_seconds = 30
+
+[setup]
+files = []
+
+[input]
+prompt = "What is 2 + 2?"
+
+[expect]
+output_contains = ["4"]
+output_not_contains = ["error"]

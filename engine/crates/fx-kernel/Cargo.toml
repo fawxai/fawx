@@ -1,0 +1,35 @@
+[package]
+name = "fx-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fawx kernel — loop orchestration, policy engine, permissions, budget enforcement, verification, rollback, watchdog. Immutable at runtime."
+
+[features]
+kernel-blind = []
+
+[dependencies]
+fx-core = { workspace = true }
+fx-config.workspace = true
+fx-decompose = { workspace = true }
+fx-propose = { workspace = true }
+fx-storage = { workspace = true }
+fx-llm = { path = "../fx-llm" }
+fx-session = { workspace = true }
+
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Process group management (killpg) for clean SIGTERM→SIGKILL lifecycle on Unix.
+nix = { version = "0.29", features = ["signal", "process"] }
+
+tokio = { workspace = true, features = ["sync"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tempfile = "3.14"

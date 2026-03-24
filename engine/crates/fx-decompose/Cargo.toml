@@ -1,0 +1,24 @@
+[package]
+name = "fx-decompose"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Task decomposition types and sub-goal execution for the Fawx engine."
+
+[features]
+test-support = []
+
+[dependencies]
+fx-core = { workspace = true }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "process", "time", "sync", "macros"] }
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

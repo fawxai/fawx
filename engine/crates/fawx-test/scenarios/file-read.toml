@@ -1,0 +1,17 @@
+[scenario]
+name = "file_read"
+description = "Fawx reads a file using the read_file tool and reports its content"
+timeout_seconds = 30
+
+[setup]
+files = [
+    { path = "test.txt", content = "hello world" },
+]
+
+[input]
+prompt = "Read the file test.txt and tell me what it says"
+
+[expect]
+tool_calls = ["read_file"]
+output_contains = ["hello world"]
+output_not_contains = ["error", "cannot"]

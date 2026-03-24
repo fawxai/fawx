@@ -1,0 +1,24 @@
+[package]
+name = "fx-fleet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+fx-config.workspace = true
+ring = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2.6"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = "0.8"
+dirs = "6.0"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }

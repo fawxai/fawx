@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fawx — Roadmap</title>
+  <meta name="description" content="What's built, what's next, and where Fawx is headed.">
+  <style>
+    :root {
+      --orange-50: #FFF8F0; --orange-100: #FFEDD5; --orange-200: #FED7AA;
+      --orange-400: #FB923C; --orange-500: #F97316; --orange-600: #EA580C;
+      --cream: #FFFBF5; --cream-dark: #FFF5EB;
+      --charcoal: #1C1917; --charcoal-light: #44403C; --charcoal-muted: #78716C;
+      --white: #FFFFFF;
+      --terminal-bg: #1E1E2E; --terminal-green: #A6E3A1; --terminal-yellow: #F9E2AF;
+      --terminal-text: #CDD6F4; --terminal-muted: #6C7086;
+      --shadow-sm: 0 1px 3px rgba(0,0,0,0.06); --shadow-md: 0 4px 12px rgba(0,0,0,0.07);
+      --radius: 12px; --radius-lg: 20px;
+      --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+      --max-width: 860px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --cream: #1C1917; --cream-dark: #292524; --charcoal: #FAFAF9;
+        --charcoal-light: #D6D3D1; --charcoal-muted: #A8A29E; --white: #292524; }
+    }
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: var(--font-body); background: var(--cream); color: var(--charcoal); line-height: 1.6; }
+
+    .page-header { padding: 60px 24px 48px; text-align: center; }
+    .page-header h1 { font-size: 2.4rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 12px; }
+    .page-header p { font-size: 1.1rem; color: var(--charcoal-muted); max-width: 560px; margin: 0 auto; }
+
+    .timeline { max-width: var(--max-width); margin: 0 auto; padding: 0 24px 80px; }
+    .phase { margin-bottom: 48px; }
+    .phase-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .phase-badge { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em; padding: 4px 12px; border-radius: 20px; }
+    .badge-shipped { background: var(--terminal-green); color: #1E1E2E; }
+    .badge-building { background: var(--orange-400); color: #fff; }
+    .badge-planned { background: var(--charcoal-muted); color: #fff; }
+    .phase-title { font-size: 1.3rem; font-weight: 700; }
+    .phase-desc { color: var(--charcoal-muted); font-size: 0.95rem; margin-bottom: 16px; line-height: 1.7; }
+    .feature-list { list-style: none; display: grid; gap: 8px; }
+    .feature-list li { display: flex; align-items: flex-start; gap: 10px; font-size: 0.92rem; color: var(--charcoal-light); }
+    .feature-list .check { color: var(--terminal-green); flex-shrink: 0; }
+    .feature-list .wip { color: var(--orange-400); flex-shrink: 0; }
+    .feature-list .planned { color: var(--charcoal-muted); flex-shrink: 0; }
+    .divider { border: none; border-top: 1px solid var(--orange-100); margin: 0; }
+    @media (prefers-color-scheme: dark) { .divider { border-top-color: #44403C; } }
+
+    details.phase-collapsible { margin-bottom: 48px; }
+    details.phase-collapsible summary { cursor: pointer; list-style: none; }
+    details.phase-collapsible summary::-webkit-details-marker { display: none; }
+    details.phase-collapsible summary::marker { display: none; content: ""; }
+    details.phase-collapsible summary .phase-header { position: relative; }
+    details.phase-collapsible summary .phase-header::after {
+      content: "▸"; font-size: 0.9rem; color: var(--charcoal-muted);
+      position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+      transition: transform 0.2s;
+    }
+    details.phase-collapsible[open] summary .phase-header::after {
+      transform: translateY(-50%) rotate(90deg);
+    }
+  </style>
+</head>
+<body>
+
+  <header class="page-header">
+    <h1>Fawx Roadmap</h1>
+    <p>What's built, what's in progress, and where we're headed. Fully open source.</p>
+  </header>
+
+  <div class="timeline">
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!--  ACTIVE FOCUS: OSS LAUNCH + MARKETPLACE   -->
+    <!-- ═══════════════════════════════════════════ -->
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Open Source Launch</h2>
+      </div>
+      <p class="phase-desc">Fawx engine goes public under BSL 1.1 (converts to Apache 2.0 in 2030). All skills are Apache 2.0. BYOK is free forever; self-hosting always permitted.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> BSL 1.1 license (Change Date 2030-03-23, Change License Apache 2.0)</li>
+        <li><span class="check">✓</span> CLA drafts (individual + corporate)</li>
+        <li><span class="check">✓</span> CONTRIBUTING.md (CLA-first, build/test/PR process)</li>
+        <li><span class="check">✓</span> README rewritten for open source</li>
+        <li><span class="check">✓</span> 9 skill repos in fawxai org (Apache 2.0)</li>
+        <li><span class="check">✓</span> Business entity (Fawx AI LLC, Colorado)</li>
+        <li><span class="wip">◐</span> Clean snapshot extraction to fawxai/fawx</li>
+        <li><span class="planned">○</span> CLA Assistant configured on fawxai org</li>
+        <li><span class="planned">○</span> Make repos public</li>
+        <li><span class="planned">○</span> Reach out to early testers (Bart, X community)</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!--  SHIPPED: CORE ENGINE                      -->
+    <!-- ═══════════════════════════════════════════ -->
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Core Engine</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Single Rust binary. Single-pass agentic loop with tool calling, memory, and multi-provider support. Hard boundaries via TerminationConfig and ToolRetryTracker.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Single-pass agentic loop with multi-tool calls (verify/learn/should_continue removed)</li>
+        <li><span class="check">✓</span> TerminationConfig: nudge at 6 tool-only turns, strip tools at 9</li>
+        <li><span class="check">✓</span> ToolRetryTracker with no-progress detection and per-signature failure tracking</li>
+        <li><span class="check">✓</span> 13+ built-in tools (files, web, browser, code execution)</li>
+        <li><span class="check">✓</span> Persistent memory with semantic search</li>
+        <li><span class="check">✓</span> Multi-provider (Claude, GPT, local models)</li>
+        <li><span class="check">✓</span> Encrypted credential store (AES-256-GCM)</li>
+        <li><span class="check">✓</span> Config management with hot-reload (SIGHUP restart)</li>
+        <li><span class="check">✓</span> Token-by-token streaming over SSE</li>
+        <li><span class="check">✓</span> Reflective memory (fx-journal crate)</li>
+        <li><span class="check">✓</span> Conversation compaction with tool pair integrity preservation</li>
+        <li><span class="check">✓</span> Composable system prompt architecture</li>
+        <li><span class="check">✓</span> Graceful loop termination with forced synthesis</li>
+        <li><span class="check">✓</span> Chat attachments: images, text files, PDFs (provider-native rendering)</li>
+        <li><span class="check">✓</span> 1,800+ tests, clippy clean</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">TUI + Multi-Channel</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Terminal UI (ratatui), Telegram bot, HTTP API. Same engine, same memory, different surfaces.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Full terminal UI with streaming, markdown, and tool rendering</li>
+        <li><span class="check">✓</span> Telegram bot channel with image support</li>
+        <li><span class="check">✓</span> Webhook channel for external integrations</li>
+        <li><span class="check">✓</span> HTTP API (headless mode, dual-bind localhost + Tailscale)</li>
+        <li><span class="check">✓</span> Interactive setup wizard with credential store + permission presets</li>
+        <li><span class="check">✓</span> Model switching mid-conversation</li>
+        <li><span class="check">✓</span> Multi-session management</li>
+        <li><span class="check">✓</span> OAuth + API key + setup token authentication flows</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">AX-First Kernel Safety</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Agent Experience first. Capability space up front, tripwire/ripcord inside the boundary, OS-level enforcement outside it. The kernel is an optimization layer, not a checkpoint system.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> CapabilityMode (default): immediate structured denial for restricted actions</li>
+        <li><span class="check">✓</span> Prompt mode preserved as opt-in</li>
+        <li><span class="check">✓</span> Presets: Open / Standard / Restricted</li>
+        <li><span class="check">✓</span> Tripwire: silent boundary monitoring within capability space</li>
+        <li><span class="check">✓</span> Ripcord: atomic rollback of file/git operations from tripwire point</li>
+        <li><span class="check">✓</span> request_capability tool for agent-initiated escalation</li>
+        <li><span class="check">✓</span> OS-level sandbox (fx-sandbox: Landlock filesystem, seccomp-bpf syscalls, network policy)</li>
+        <li><span class="check">✓</span> Tier-3 immutable paths (compiled into binary)</li>
+        <li><span class="check">✓</span> Kernel manifest for structured self-introspection</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Native GUI (macOS + iOS)</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Swift native app. Setup wizard, chat, fleet, experiments, git, permissions, custom instructions. v1.0.0 and v1.1.0 released.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> SwiftUI app (macOS + iOS) with full chat streaming</li>
+        <li><span class="check">✓</span> Setup wizard (skippable, non-destructive, re-enterable)</li>
+        <li><span class="check">✓</span> Session management + model/thinking pickers</li>
+        <li><span class="check">✓</span> Skills browser + marketplace stubs</li>
+        <li><span class="check">✓</span> Fleet dashboard + experiment monitor</li>
+        <li><span class="check">✓</span> Git pane (status, diff, stage, commit, push)</li>
+        <li><span class="check">✓</span> Permissions UI with capability/prompt mode toggle</li>
+        <li><span class="check">✓</span> ChatGPT OAuth PKCE + setup token auth</li>
+        <li><span class="check">✓</span> LaunchAgent daemon architecture</li>
+        <li><span class="check">✓</span> Menu bar status icon (start/stop/restart)</li>
+        <li><span class="check">✓</span> Notarized DMG (signed, Apple notarized + stapled)</li>
+        <li><span class="check">✓</span> App icon, EULA, Terms, Privacy Policy</li>
+        <li><span class="check">✓</span> fawx.ai website (landing, download, about, docs)</li>
+        <li><span class="check">✓</span> v1.0.0 + v1.1.0 tagged and released</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">WASM Skill Plugins</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Hot-loadable WebAssembly skills with cryptographic signature verification.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> WASI runtime with sandboxing</li>
+        <li><span class="check">✓</span> Ed25519 signature verification</li>
+        <li><span class="check">✓</span> Hot-reload without restart</li>
+        <li><span class="check">✓</span> Skill creation CLI (fawx skill create)</li>
+        <li><span class="check">✓</span> Marketplace skills: weather, TTS, calculator, GitHub</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Auto-chain iterative refinement with build verification.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Core protocol engine (fx-consensus, 74+ tests)</li>
+        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
+        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
+        <li><span class="check">✓</span> Post-hoc build verification with retry</li>
+        <li><span class="check">✓</span> Recursive learning (chain history feeds into prompts)</li>
+        <li><span class="check">✓</span> Auto-chain iterative refinement (--max-rounds)</li>
+        <li><span class="check">✓</span> Canonical chain hashing + cargo-scoped evaluation</li>
+        <li><span class="check">✓</span> Experiment tool callable from chat and channels</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Distributed Fleet</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Tailnet-only distributed fleet. Token-based auth, task dispatch, worker registration across machines.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Fleet signing key (HMAC-SHA256) + bearer tokens</li>
+        <li><span class="check">✓</span> Fleet CLI: fawx fleet init / add / remove / list / join</li>
+        <li><span class="check">✓</span> Worker mode (fawx serve --fleet)</li>
+        <li><span class="check">✓</span> Task dispatch over Tailscale HTTP</li>
+        <li><span class="check">✓</span> Heartbeat monitoring + health checks</li>
+        <li><span class="check">✓</span> PAT borrowing for subagent GitHub access</li>
+        <li><span class="check">✓</span> Fleet dashboard + experiment monitor (5 endpoints each)</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <details class="phase-collapsible">
+      <summary>
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Self-Improving Fleet Coordination</h2>
+      </div>
+      </summary>
+      <p class="phase-desc">Hybrid DAG decomposition + linear refinement chains. Cross-branch tournaments, auto-decomposition, per-model thinking profiles.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Cross-branch tournament types</li>
+        <li><span class="check">✓</span> Auto-decomposition engine (DAG parser, dispatchers, aggregator)</li>
+        <li><span class="check">✓</span> Thinking registry with per-model profiles</li>
+        <li><span class="check">✓</span> Training data curation (4 export formats)</li>
+        <li><span class="check">✓</span> Semantic merge validation (BuildVerifyAggregator)</li>
+        <li><span class="check">✓</span> Fitness backpropagation</li>
+      </ul>
+    </details>
+    <hr class="divider">
+
+    <!-- Community contributions welcome — see CONTRIBUTING.md -->
+
+  </div>
+</body>
+</html>

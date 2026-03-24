@@ -1,0 +1,29 @@
+name = "vision"
+version = "1.0.0"
+description = "Analyze images using vision-capable LLMs (Anthropic Claude, OpenAI GPT-4o)"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
+
+[[tools]]
+name = "analyze_image"
+description = "Analyze an image using a vision model. Supports URLs and base64-encoded images."
+
+[[tools.parameters]]
+name = "image"
+type = "string"
+description = "Image URL (https://) or base64-encoded image data (data:image/...;base64,...)"
+required = true
+
+[[tools.parameters]]
+name = "prompt"
+type = "string"
+description = "What to analyze or ask about the image (default: 'Describe this image in detail')"
+required = false
+
+[[tools.parameters]]
+name = "provider"
+type = "string"
+description = "Vision provider: 'anthropic' or 'openai' (default: 'anthropic')"
+required = false

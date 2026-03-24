@@ -1,0 +1,35 @@
+name = "tts"
+version = "1.0.0"
+description = "Convert text to speech using OpenAI TTS or Edge TTS APIs"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
+
+[[tools]]
+name = "text_to_speech"
+description = "Convert text to speech audio. Returns a URL or file path to the generated audio."
+
+[[tools.parameters]]
+name = "text"
+type = "string"
+description = "Text to convert to speech"
+required = true
+
+[[tools.parameters]]
+name = "voice"
+type = "string"
+description = "Voice to use (default: 'alloy'). OpenAI voices: alloy, echo, fable, onyx, nova, shimmer"
+required = false
+
+[[tools.parameters]]
+name = "provider"
+type = "string"
+description = "TTS provider: 'openai' (default) or 'edge'"
+required = false
+
+[[tools.parameters]]
+name = "speed"
+type = "string"
+description = "Speech speed: 0.25 to 4.0 (default: '1.0'). OpenAI only."
+required = false

@@ -1,0 +1,8 @@
+# Top-level fields are the current engine contract for WASM skill manifests.
+name = "weather"
+version = "1.0.0"
+description = "Get current weather and forecasts for any location"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network"]
+entry_point = "run"

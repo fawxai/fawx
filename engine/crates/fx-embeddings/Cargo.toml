@@ -1,0 +1,22 @@
+[package]
+name = "fx-embeddings"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fawx embeddings — local text embeddings and model integrity checks."
+
+[features]
+default = []
+test-support = ["dep:tempfile"]
+
+[dependencies]
+tokenizers = "0.21"
+sha2 = "0.10"
+thiserror = "2.0"
+tracing = { workspace = true }
+serde_json.workspace = true
+tempfile = { version = "3.14", optional = true }
+
+[dev-dependencies]
+tempfile = "3.14"

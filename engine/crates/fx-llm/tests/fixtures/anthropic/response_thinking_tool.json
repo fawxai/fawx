@@ -1,0 +1,13 @@
+{
+  "id": "msg_thinking_tool_01",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-4-20250514",
+  "content": [
+    {"type": "thinking", "thinking": "I should read the file to understand the structure.", "signature": "sig_thinking_02"},
+    {"type": "text", "text": "Let me check that file."},
+    {"type": "tool_use", "id": "toolu_01XYZ", "name": "read_file", "input": {"path": "Cargo.toml"}}
+  ],
+  "stop_reason": "tool_use",
+  "usage": {"input_tokens": 30, "output_tokens": 25}
+}

@@ -1,0 +1,7 @@
+name = "github"
+version = "1.1.0"
+description = "GitHub integration: create PRs, comment on PRs, list PRs, view PR details, list issues, and create issues"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
