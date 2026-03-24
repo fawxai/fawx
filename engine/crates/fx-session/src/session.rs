@@ -1138,8 +1138,7 @@ mod tests {
 
     #[test]
     fn session_message_deserializes_legacy_image_without_data() {
-        let json =
-            r#"{"role":"user","content":[{"type":"image","media_type":"image/png"}],"timestamp":123}"#;
+        let json = r#"{"role":"user","content":[{"type":"image","media_type":"image/png"}],"timestamp":123}"#;
 
         let restored: SessionMessage = serde_json::from_str(json).expect("deserialize");
 
