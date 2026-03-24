@@ -1,17 +1,8 @@
 //! CLI commands for the skill marketplace (search, install, list).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use fx_marketplace::{InstalledSkill, RegistryConfig, SkillEntry};
-
-/// Default registry URL (raw GitHub content).
-const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/registry/main";
-
-/// Official fawxai publisher Ed25519 public key (32 bytes).
-const FAWXAI_PUBLIC_KEY: [u8; 32] = [
-    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188,
-    106, 55, 109, 208, 1, 191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
-];
+use fx_marketplace::{InstalledSkill, SkillEntry};
 
 /// Resolve the Fawx data directory (`~/.fawx`).
 fn data_dir() -> anyhow::Result<PathBuf> {
@@ -19,31 +10,10 @@ fn data_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".fawx"))
 }
 
-/// Load trusted keys: builtin fawxai key + any user-added keys from
-/// `~/.fawx/trusted_keys/`.
-fn load_trusted_keys(data: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut keys = vec![FAWXAI_PUBLIC_KEY.to_vec()];
-    let keys_dir = data.join("trusted_keys");
-    if keys_dir.exists() {
-        for entry in std::fs::read_dir(&keys_dir)? {
-            let path = entry?.path();
-            if path.is_file() {
-                keys.push(std::fs::read(&path)?);
-            }
-        }
-    }
-    Ok(keys)
-}
-
 /// Build a `RegistryConfig` from defaults.
-fn build_config() -> anyhow::Result<RegistryConfig> {
+fn build_config() -> anyhow::Result<fx_marketplace::RegistryConfig> {
     let data = data_dir()?;
-    let trusted_keys = load_trusted_keys(&data)?;
-    Ok(RegistryConfig {
-        registry_url: DEFAULT_REGISTRY.to_string(),
-        data_dir: data,
-        trusted_keys,
-    })
+    Ok(fx_marketplace::default_config(&data)?)
 }
 
 /// Print a list of skill entries from search results.
