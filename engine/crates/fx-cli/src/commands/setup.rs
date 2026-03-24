@@ -328,12 +328,14 @@ impl SetupWizard {
     }
 
     async fn run_model_phase(&mut self) -> anyhow::Result<()> {
+        let Some(provider) = self.selected_provider.clone() else {
+            println!("Step 2: Model Selection");
+            println!("  ⏭ Skipped (no provider configured yet)");
+            println!();
+            return Ok(());
+        };
         println!("Step 2: Model Selection");
         println!("  Fetching available models...");
-        let provider = self
-            .selected_provider
-            .clone()
-            .context("provider not selected")?;
         let models = self.available_models(&provider).await?;
         print_models(&provider, &models);
         println!("  (press Enter to skip)");
@@ -568,10 +570,10 @@ impl SetupWizard {
     }
 
     async fn validate_model_connection(&self) -> anyhow::Result<()> {
-        let model = self
-            .default_model
-            .as_deref()
-            .context("model not selected")?;
+        let Some(model) = self.default_model.as_deref() else {
+            println!("  ⏭ Skipped (no model configured yet)");
+            return Ok(());
+        };
         let mut router =
             build_router(&self.auth_manager).map_err(|error| anyhow!(error.to_string()))?;
         router
