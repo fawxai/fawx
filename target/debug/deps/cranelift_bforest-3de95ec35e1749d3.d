@@ -1,0 +1,10 @@
+/tmp/fawx-oss/target/debug/deps/cranelift_bforest-3de95ec35e1749d3.d: /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/lib.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/map.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/node.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/path.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/pool.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/set.rs
+
+/tmp/fawx-oss/target/debug/deps/libcranelift_bforest-3de95ec35e1749d3.rmeta: /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/lib.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/map.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/node.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/path.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/pool.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/set.rs
+
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/lib.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/map.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/node.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/path.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/pool.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-bforest-0.127.4/src/set.rs:

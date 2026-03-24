@@ -1,0 +1,3 @@
+cargo:rustc-env=GIT_HASH=4b84094
+cargo:rustc-env=BUILD_DATE=2026-03-24
+cargo:rustc-env=TARGET_TRIPLE=x86_64-unknown-linux-gnu

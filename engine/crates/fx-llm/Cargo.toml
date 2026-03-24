@@ -7,7 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-llama-cpp = ["llama-cpp-sys/llama-cpp"]  # Enable llama.cpp integration
 
 [dependencies]
 async-trait.workspace = true
@@ -16,7 +15,6 @@ bytes = "1"
 fx-core.workspace = true
 futures.workspace = true
 http.workspace = true
-llama-cpp-sys = { path = "../llama-cpp-sys", optional = true }
 pdf-extract = "0.7"
 reqwest.workspace = true
 serde.workspace = true

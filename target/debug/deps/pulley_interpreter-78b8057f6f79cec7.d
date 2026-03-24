@@ -1,0 +1,11 @@
+/tmp/fawx-oss/target/debug/deps/pulley_interpreter-78b8057f6f79cec7.d: /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/lib.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/regs.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/imms.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/op.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/opcode.rs
+
+/tmp/fawx-oss/target/debug/deps/libpulley_interpreter-78b8057f6f79cec7.rlib: /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/lib.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/regs.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/imms.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/op.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/opcode.rs
+
+/tmp/fawx-oss/target/debug/deps/libpulley_interpreter-78b8057f6f79cec7.rmeta: /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/lib.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/regs.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/imms.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/op.rs /home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/opcode.rs
+
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/lib.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/regs.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/imms.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/op.rs:
+/home/clawdio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pulley-interpreter-40.0.4/src/opcode.rs:

@@ -1,0 +1,26 @@
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/settings.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/types.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/opcodes.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/inst_builder.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/settings-pulley.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/settings-pulley.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/settings-x86.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/numerics.isle
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_numerics.rs
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/clif_opt.isle
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/clif_lower.isle
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/assembler.isle
+Writing generated file: /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/assembler-isle-macro.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_opt.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_opt.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_x64.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_x64.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_aarch64.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_aarch64.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_s390x.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_s390x.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_riscv64.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_riscv64.rs
+Rebuilding /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_pulley_shared.rs
+Writing ISLE-generated Rust code to /tmp/fawx-oss/target/debug/build/cranelift-codegen-961ca9a8b9072707/out/isle_pulley_shared.rs
+fatal: not a git repository (or any of the parent directories): .git

@@ -1,0 +1,2 @@
+cargo:rerun-if-changed=build.rs
+cargo:rustc-env=DEBUG_OUTPUT_DIR=/tmp/fawx-oss/target/debug/build/wiggle-macro-722e374dcd2e1bab/out
