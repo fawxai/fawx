@@ -487,6 +487,7 @@ async fn process_and_route_session_message(
     Ok((result, response, session_messages, session_memory))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_session_turn(
     state: &HttpState,
     registry: &SessionRegistry,
