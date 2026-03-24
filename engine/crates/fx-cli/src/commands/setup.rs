@@ -1744,8 +1744,13 @@ mod tests {
         let mut wizard = SetupWizard::new(false).expect("setup wizard");
         let data_dir = temp_home.path().join(".fawx");
 
-        EncryptedFileCredentialStore::open(&data_dir)
-            .expect("wizard should not lock credential store during construction");
+        {
+            // Verify the wizard did not eagerly open credentials.db during construction.
+            // The handle is scoped so the redb file lock is released before the wizard
+            // lazily opens the same database below.
+            EncryptedFileCredentialStore::open(&data_dir)
+                .expect("wizard should not lock credential store during construction");
+        }
 
         wizard
             .store_skill_credential("brave_api_key", "brv-test")
