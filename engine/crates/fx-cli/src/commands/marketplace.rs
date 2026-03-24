@@ -7,6 +7,12 @@ use fx_marketplace::{InstalledSkill, RegistryConfig, SkillEntry};
 /// Default registry URL (raw GitHub content).
 const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/registry/main";
 
+/// Official fawxai publisher Ed25519 public key (32 bytes).
+const FAWXAI_PUBLIC_KEY: [u8; 32] = [
+    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188, 106, 55, 109, 208, 1,
+    191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
+];
+
 /// Resolve the Fawx data directory (`~/.fawx`).
 fn data_dir() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
@@ -15,15 +21,14 @@ fn data_dir() -> anyhow::Result<PathBuf> {
 
 /// Load trusted keys from `~/.fawx/trusted_keys/`.
 fn load_trusted_keys(data: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut keys = vec![FAWXAI_PUBLIC_KEY.to_vec()];
     let keys_dir = data.join("trusted_keys");
-    if !keys_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut keys = Vec::new();
-    for entry in std::fs::read_dir(&keys_dir)? {
-        let path = entry?.path();
-        if path.is_file() {
-            keys.push(std::fs::read(&path)?);
+    if keys_dir.exists() {
+        for entry in std::fs::read_dir(&keys_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                keys.push(std::fs::read(&path)?);
+            }
         }
     }
     Ok(keys)
