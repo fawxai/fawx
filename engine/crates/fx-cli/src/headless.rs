@@ -1205,6 +1205,7 @@ impl HeadlessApp {
             .await
     }
 
+    #[cfg(test)]
     pub async fn process_message_with_images(
         &mut self,
         input: &str,
@@ -1795,6 +1796,7 @@ impl HeadlessApp {
         }
     }
 
+    #[cfg(test)]
     fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
         self.build_perception_snapshot_with_attachments(input, source, &[], &[])
     }

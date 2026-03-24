@@ -20,9 +20,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use fx_agent::intent::{IntentClassifier, ClassifierConfig, LlmClassifier};
+//! use fx_agent::intent::{ClassifierConfig, IntentClassifier};
 //! use fx_agent::{ClaudeClient, ClaudeConfig};
-//! use fx_core::types::{UserInput, InputSource};
+//! use fx_core::types::{InputSource, UserInput};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create Claude client (implements LlmClassifier)
@@ -43,6 +43,7 @@
 //!     timestamp: 1234567890,
 //!     context_id: None,
 //!     images: Vec::new(),
+//!     documents: Vec::new(),
 //! };
 //!
 //! let intent = classifier.classify(&input).await?;
