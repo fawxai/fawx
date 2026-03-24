@@ -457,7 +457,7 @@ mod tests {
 
         assert_eq!(token.node_id, node.node_id);
         assert_ne!(token.node_id, node.name);
-        assert!(token.node_id.starts_with("mac-mini-"));
+        assert!(token.node_id.starts_with("node-alpha-"));
         assert_eq!(node.name, "Node Alpha");
         assert_eq!(node.endpoint, "https://10.0.0.2:8400");
         assert_eq!(node.address.as_deref(), Some("10.0.0.2"));
@@ -692,7 +692,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["node-beta".to_string(), "node-alpha".to_string()]
+            vec!["node-alpha".to_string(), "node-beta".to_string()]
         );
     }
 
