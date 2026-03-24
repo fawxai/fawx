@@ -198,13 +198,22 @@ async fn install_skill_response<F>(
 where
     F: FnOnce(&Path, &str) -> Result<InstallResult, MarketplaceError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         let result = install_fn(&data_dir, &name)?;
         Ok::<InstallSkillResponse, MarketplaceError>(InstallSkillResponse::from(result))
     })
     .await
-    .map_err(|error| internal_error(error.to_string()))?
-    .map_err(marketplace_error)
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "Marketplace install failed");
+            Err(marketplace_error(error))
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Marketplace install task failed");
+            Err(internal_error(error.to_string()))
+        }
+    }
 }
 
 fn install_marketplace_skill(
@@ -230,9 +239,22 @@ async fn remove_skill_response(
     data_dir: PathBuf,
     name: String,
 ) -> Result<Value, (StatusCode, Json<ErrorBody>)> {
-    tokio::task::spawn_blocking(move || remove_skill_directory(&data_dir, &name))
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
+    match tokio::task::spawn_blocking(move || remove_skill_directory(&data_dir, &name)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => {
+            let Json(body) = &error.1;
+            tracing::error!(
+                status = %error.0,
+                error = %body.error,
+                "Marketplace remove failed"
+            );
+            Err(error)
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Marketplace remove task failed");
+            Err(internal_error(error.to_string()))
+        }
+    }
 }
 
 fn remove_skill_directory(
@@ -267,25 +289,33 @@ fn ensure_skill_dir_within_skills_dir(
     skill_dir: &Path,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let canonical_skill_dir = std::fs::canonicalize(skill_dir).map_err(|error| {
-        internal_error(format!(
-            "failed to resolve {}: {error}",
-            skill_dir.display()
-        ))
+        tracing::error!(
+            error = %error,
+            skill_dir = %skill_dir.display(),
+            "Failed to resolve skill directory"
+        );
+        invalid_skill_directory()
     })?;
     let canonical_skills_dir = std::fs::canonicalize(skills_dir).map_err(|error| {
-        internal_error(format!(
-            "failed to resolve {}: {error}",
-            skills_dir.display()
-        ))
+        tracing::error!(
+            error = %error,
+            skills_dir = %skills_dir.display(),
+            "Failed to resolve skills directory"
+        );
+        invalid_skill_directory()
     })?;
     if canonical_skill_dir.starts_with(&canonical_skills_dir) {
         return Ok(());
     }
 
-    Err(internal_error(format!(
-        "skill path escapes skills directory: {}",
-        skill_dir.display()
-    )))
+    tracing::error!(
+        skill_dir = %skill_dir.display(),
+        skills_dir = %skills_dir.display(),
+        canonical_skill_dir = %canonical_skill_dir.display(),
+        canonical_skills_dir = %canonical_skills_dir.display(),
+        "Skill directory outside allowed path"
+    );
+    Err(skill_directory_outside_allowed_path())
 }
 
 fn marketplace_error(error: MarketplaceError) -> (StatusCode, Json<ErrorBody>) {
@@ -316,6 +346,14 @@ fn validation_error(error: String) -> (StatusCode, Json<ErrorBody>) {
 
 fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error }))
+}
+
+fn invalid_skill_directory() -> (StatusCode, Json<ErrorBody>) {
+    internal_error("Invalid skill directory".to_string())
+}
+
+fn skill_directory_outside_allowed_path() -> (StatusCode, Json<ErrorBody>) {
+    internal_error("Skill directory outside allowed path".to_string())
 }
 
 fn skill_not_found(name: String) -> (StatusCode, Json<ErrorBody>) {
@@ -487,6 +525,20 @@ mod tests {
         assert!(response.installed);
     }
 
+    #[tokio::test]
+    async fn install_response_returns_status_when_marketplace_fails() {
+        let error = install_skill_response(PathBuf::new(), "weather".into(), |_, _| {
+            Err(MarketplaceError::InstallError("disk full".into()))
+        })
+        .await
+        .expect_err("install should fail");
+
+        let Json(body) = &error.1;
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "install error: disk full");
+    }
+
     #[test]
     fn marketplace_error_maps_all_variants() {
         let cases = vec![
@@ -551,7 +603,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn remove_response_rejects_symlink_escape() {
+    async fn remove_response_rejects_symlink_escape_without_leaking_paths() {
         let temp = TempDir::new().expect("tempdir");
         let outside_dir = temp.path().join("outside-weather");
         let skills_dir = temp.path().join("skills");
@@ -562,9 +614,13 @@ mod tests {
         let error = remove_skill_response(temp.path().to_path_buf(), "weather".into())
             .await
             .expect_err("symlink escape should fail");
+        let Json(body) = &error.1;
+        let client_error = body.error.as_str();
 
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(error.1 .0.error.contains("escapes skills directory"));
+        assert_eq!(client_error, "Skill directory outside allowed path");
+        assert!(!client_error.contains(outside_dir.to_string_lossy().as_ref()));
+        assert!(!client_error.contains(skills_dir.to_string_lossy().as_ref()));
         assert!(outside_dir.exists());
     }
 
