@@ -1,6 +1,6 @@
 # Git-Aware Ripcord
 
-**Status:** Draft (R4)
+**Status:** Draft (R5)
 **Date:** 2026-03-24
 **Author:** Clawdio
 **Reviewer:** Opus (R1 + R2 findings addressed below)
@@ -46,36 +46,46 @@ Both paths call a shared function:
 ```rust
 // fx-ripcord/src/git_guard.rs
 
-/// Check whether a push targets a protected branch.
-/// Returns Err with a user-facing message if blocked.
+/// Check whether any push targets are protected branches.
+/// Returns Err with a user-facing message listing blocked branches.
 pub fn check_push_allowed(
-    branch: &str,
+    targets: &[String],
     protected_branches: &[String],
 ) -> Result<(), String> {
-    if protected_branches.iter().any(|p| p == branch) {
-        Err(format!(
-            "Blocked: push to protected branch '{branch}'. \
-             Protected branches can only be updated through pull requests."
-        ))
-    } else {
+    let blocked: Vec<&String> = targets
+        .iter()
+        .filter(|t| protected_branches.iter().any(|p| p == *t))
+        .collect();
+    if blocked.is_empty() {
         Ok(())
+    } else {
+        Err(format!(
+            "Blocked: push to protected branch(es) {}. \
+             Protected branches can only be updated through pull requests.",
+            blocked.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", ")
+        ))
     }
 }
 
-/// Extract target branch from a shell command string.
-/// Returns None if the command is not a git push or the target can't be determined.
-/// Normalizes refs/heads/ prefix: "refs/heads/main" → "main".
-pub fn extract_push_target(command: &str) -> Option<String> {
-    // Parse: git push [flags] [<remote>] [<refspec>]
-    // Extract branch from direct name or <src>:<dst> refspec
-    // Strip "refs/heads/" prefix if present
+/// Extract target branches from a shell command string.
+/// Returns empty vec if the command is not a git push or targets can't be determined.
+/// Normalizes: strips "refs/heads/" prefix, strips "+" force prefix from refspecs.
+/// Handles multiple refspecs: "git push origin main staging" → ["main", "staging"].
+pub fn extract_push_targets(command: &str) -> Vec<String> {
+    // Parse: git push [flags] [<remote>] [<refspec>...]
+    // For each refspec:
+    //   - Strip leading "+" (force push prefix)
+    //   - Extract branch from direct name or <src>:<dst> (take dst)
+    //   - Strip "refs/heads/" prefix
     // ...
 }
 ```
 
-**Path A integration (`fx-tools`):** `GitSkill::execute_push` calls `check_push_allowed(&branch, &config.protected_branches)` before invoking git. On `Err`, returns a `ToolResult { output: msg, is_error: true }`.
+**Path A integration (`fx-tools`):** `GitSkill::execute_push` calls `check_push_allowed(&[branch.clone()], &config.protected_branches)` before invoking git. On `Err`, returns a `ToolResult { output: msg, is_error: true }`.
 
-**Path B integration (`fx-tools`, `ShellSkill::execute`):** In the shell tool's `execute` method (the function that runs `bash -c <command>`), call `extract_push_target(command)` before spawning the subprocess. If it returns `Some(branch)`, call `check_push_allowed`. On `Err`, return the error as a `ToolResult` without executing the command. This is the narrowest integration point: one check in one function, covering all shell-executed git pushes.
+**Path B integration (`fx-tools`, `ShellSkill::execute`):** In the shell tool's `execute` method (the function that runs `bash -c <command>`), call `extract_push_targets(command)` before spawning the subprocess. If the result is non-empty, call `check_push_allowed`. On `Err`, return the error as a `ToolResult` without executing the command. This is the narrowest integration point: one check in one function, covering all shell-executed git pushes.
+
+**Shell variable limitation:** `extract_push_targets` operates on the literal command string. Shell variable expansion (`$BRANCH`, `${TARGET}`) and script-wrapped pushes produce command strings where the target can't be statically determined. The exec guard returns an empty vec (no targets found), so the push proceeds unblocked. The detection layer (tripwire) catches these post-execution by also parsing the tool result output (see Section 2).
 
 Both paths produce identical structured errors. The agent sees the same message regardless of how it attempted the push.
 
@@ -113,7 +123,11 @@ This matches when:
 
 The existing `git_push` default tripwire (fires on ALL pushes) remains as-is. The new variant is additive; it enables stronger response (ripcord activation with remote ref capture) specifically for protected branch pushes.
 
-**Integration with `TripwireConfig::matches()`:** Add a new arm to the match in `matches()` that calls a `git_protected_branch_matches()` function. This function uses `git_guard::extract_push_target()` to parse the target branch from the `command` parameter (shared with the exec guard for DRY), then checks it against the configured branch list.
+**Integration with `TripwireConfig::matches()`:** Add a new arm to the match in `matches()` that calls a `git_protected_branch_matches()` function. Two-pass detection:
+1. Try `git_guard::extract_push_targets()` on the command string (shared with exec guard, DRY).
+2. If that returns empty (shell variables, scripts, opaque commands), fall back to parsing the tool result output for `old..new refs/heads/<branch>` patterns. Git push output always contains the target ref regardless of how the command was constructed.
+
+This ensures the tripwire catches pushes even when the command string is opaque (e.g., `git push origin $BRANCH`).
 
 **Why post-execution detection still matters even with prevention:** The exec guard blocks commands that go through Fawx's exec layer. But an agent could invoke a script that internally calls git, or use a tool that wraps git operations. The tripwire catches what the exec guard misses.
 
@@ -121,9 +135,9 @@ The existing `git_push` default tripwire (fires on ALL pushes) remains as-is. Th
 - Category `git` with command containing `push` (structured tool path)
 - Category `shell` with command matching git push patterns (shell path)
 
-The matching logic uses `extract_push_target()` on the command string regardless of category. If a target branch is extracted and matches the protected list, the tripwire fires.
+The matching logic first tries `extract_push_targets()` on the command string, then falls back to result output parsing. If any extracted target branch matches the protected list, the tripwire fires. This applies regardless of category (`git` or `shell`).
 
-**Shell push journal promotion:** When the evaluator detects a shell command that is a git push (via `extract_push_target()`), it should journal the action as `JournalAction::GitPush` (not `ShellCommand`) so that ref tracking and rollback are available. The `git_push_action()` extractor in `evaluator.rs` already handles structured git pushes; extend the `shell_action()` extractor to detect git push commands and promote them to `GitPush` entries with refs parsed from the output. This ensures the recovery layer covers both paths.
+**Shell push journal promotion:** When the evaluator detects a shell command that is a git push (via `extract_push_targets()`), it should journal the action as `JournalAction::GitPush` (not `ShellCommand`) so that ref tracking and rollback are available. The `git_push_action()` extractor in `evaluator.rs` already handles structured git pushes; extend the `shell_action()` extractor to detect git push commands and promote them to `GitPush` entries with refs parsed from the output. This ensures the recovery layer covers both paths.
 
 ### 3. Recovery: Remote Ref Journaling and Rollback
 
@@ -197,6 +211,12 @@ Banner notification on tripwire cross (existing notification path). Journal pane
 
 **Tags and non-branch refs:** Out of scope for Phase 1. Explicitly documented as future work.
 
+**Known exec-guard bypass patterns (caught by tripwire post-execution):**
+- Shell variable expansion: `git push origin $BRANCH` — target can't be statically resolved
+- Script wrappers: `./deploy.sh` that internally runs git push — opaque to command parsing
+- Heredoc/pipe constructs: `echo "main" | xargs git push origin` — command string doesn't contain the branch
+- All of these are caught by the tripwire's result-output fallback (git push output always contains the target ref)
+
 **Journal persistence:** The current `RipcordJournal` is in-memory (`RwLock<Vec<JournalEntry>>`). If the process crashes between the push and the user pulling ripcord, the refs are lost. This is acceptable for Phase 1 MVP. Phase 2 should persist the journal to disk (the `SnapshotStore` already handles file snapshots on disk; remote ref snapshots could follow the same pattern).
 
 ### 6. Implementation Order
@@ -204,12 +224,12 @@ Banner notification on tripwire cross (existing notification path). Journal pane
 Each step includes its tests (TDD per ENGINEERING.md Section 4).
 
 1. **Config:** Add `git.protected_branches: Vec<String>` to the config system. Tests: parsing, empty list, serde round-trip.
-2. **Shared guard (`fx-ripcord/src/git_guard.rs`):** `check_push_allowed()` and `extract_push_target()` functions. Tests: various git push syntaxes (direct branch, refspec, HEAD:branch), protected vs. non-protected, `--no-verify` detection.
+2. **Shared guard (`fx-ripcord/src/git_guard.rs`):** `check_push_allowed()` and `extract_push_targets()` functions. Tests: various git push syntaxes (direct branch, refspec, HEAD:branch, `+force:prefix`, multiple refspecs, `refs/heads/` prefix), protected vs. non-protected, `--no-verify` detection. Also: `extract_push_targets_from_output()` for result-output fallback parsing.
 3. **Path A guard (`fx-tools`):** Wire `check_push_allowed()` into `GitSkill::execute_push`. Tests: structured push to protected branch returns error, non-protected passes through.
-4. **Path B guard (shell exec):** Wire `extract_push_target()` + `check_push_allowed()` into shell command dispatch. Tests: shell `git push origin main` blocked, `git push origin dev` allowed.
+4. **Path B guard (shell exec):** Wire `extract_push_targets()` + `check_push_allowed()` into shell command dispatch. Tests: shell `git push origin main` blocked, `git push origin dev` allowed.
 5. **`GitPush` extension:** Add `post_ref: Option<String>` to `JournalAction::GitPush`. Update `git_push_action()` to parse `old..new` from output. For Path A, have `execute_push` include post-push SHA in result. Tests: extraction from mock tool results, backward compat with `None`.
-6. **Shell journal promotion:** Extend `shell_action()` in `evaluator.rs` to detect git push commands via `extract_push_target()` and emit `GitPush` entries instead of `ShellCommand`. Parse `pre_ref` and `post_ref` from shell output. Tests: shell `git push` produces `GitPush` journal entry, non-push shell commands still produce `ShellCommand`.
-7. **`TripwireKind::GitProtectedBranch`:** New variant, matching logic using shared `extract_push_target()`, cross-category matching (both `git` and `shell` categories), config parsing. Tests: matching against branch list from both categories, non-matching, disabled.
+6. **Shell journal promotion:** Extend `shell_action()` in `evaluator.rs` to detect git push commands via `extract_push_targets()` and emit `GitPush` entries instead of `ShellCommand`. Parse `pre_ref` and `post_ref` from shell output. Tests: shell `git push` produces `GitPush` journal entry, non-push shell commands still produce `ShellCommand`.
+7. **`TripwireKind::GitProtectedBranch`:** New variant, two-pass matching (command string then result output fallback), cross-category matching (both `git` and `shell` categories), config parsing. Tests: matching against branch list from both categories, opaque command with result fallback, non-matching, disabled.
 8. **Rollback:** New arm in `revert.rs` for `GitPush`. Build the force-with-lease command. Handle `post_ref: None`, failed lease. Tests: command construction, lease failure simulation.
 9. **TUI integration:** Ripcord panel display for `GitPush` entries, rollback button wiring.
 10. **Swift integration:** Banner + journal panel for remote push events.
@@ -240,7 +260,7 @@ Each step includes its tests (TDD per ENGINEERING.md Section 4).
 |---|---------|------------|
 | B1 | Two exec paths, only one guarded | Fixed: Section 1 now describes both Path A (structured `git_push` tool) and Path B (shell commands). Both call shared `check_push_allowed()`. |
 | B2 | Wrong crate (`fx-sandbox`) for git guard | Fixed: guard module lives in `fx-ripcord/src/git_guard.rs`. Application-level git policy belongs with ripcord, not OS-level sandboxing. |
-| NB1 | Shared branch-extraction function for DRY | Fixed: `extract_push_target()` in `git_guard.rs` is shared by exec guard (Section 1) and tripwire matching (Section 2). |
+| NB1 | Shared branch-extraction function for DRY | Fixed: `extract_push_targets()` in `git_guard.rs` is shared by exec guard (Section 1) and tripwire matching (Section 2). |
 | NB2 | `post_ref` capture parsing strategy | Fixed: Section 3 now specifies parsing `old..new` from git push output, and Path A including post-push SHA in tool result. Graceful degradation to `None`. |
 | NH1 | Note clean insertion point in `execute_push` | Acknowledged: `GitSkill::execute_push` is the natural integration point for Path A. Noted in Section 1. |
 
@@ -248,10 +268,19 @@ Each step includes its tests (TDD per ENGINEERING.md Section 4).
 
 | # | Finding | Resolution |
 |---|---------|------------|
-| NB1 | `GitProtectedBranch` tripwire only catches `git` category, not `shell` | Fixed: tripwire matches both `git` and `shell` categories using `extract_push_target()` on command string. See Section 2. |
+| NB1 | `GitProtectedBranch` tripwire only catches `git` category, not `shell` | Fixed: tripwire matches both `git` and `shell` categories using `extract_push_targets()` on command string. See Section 2. |
 | NB2 | Shell pushes journaled as `ShellCommand` (no refs), no rollback | Fixed: `shell_action()` promotes git push commands to `GitPush` journal entries with parsed refs. See Section 2 and implementation step 6. |
 | NB3 | `extract_push_target` needs `refs/heads/` normalization | Fixed: function doc specifies stripping `refs/heads/` prefix. See Section 1. |
 | NB4 | Path B integration point too generic | Fixed: named `ShellSkill::execute` as the specific integration point. See Section 1. |
+
+#### R4 Findings
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| NB1 | `extract_push_target` returns singular, misses multi-refspec | Fixed: renamed to `extract_push_targets()` returning `Vec<String>`. `check_push_allowed` takes `&[String]`. See Section 1. |
+| NB2 | Force-push `+` prefix not stripped | Fixed: `extract_push_targets()` strips leading `+` from refspecs. See Section 1 function doc. |
+| NB3 | Shell variable expansion bypasses command parsing | Fixed: tripwire uses two-pass detection (command string then result output fallback). Exec guard limitation documented. See Sections 1 and 2. |
+| NH1 | Document known bypass patterns | Fixed: Edge Cases now lists shell variables, script wrappers, heredoc/pipe patterns, all caught by tripwire result fallback. See Section 5. |
 
 ### 8. Motivation
 
