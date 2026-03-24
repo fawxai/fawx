@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main, staging ]
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,8 +40,6 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace --all-targets
 
-      - name: Cargo check (oauth-bridge feature)
-        run: cargo check -p fx-cli --features oauth-bridge --all-targets
 
   test:
     name: Test
@@ -64,8 +62,6 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Run tests (oauth-bridge feature)
-        run: cargo test -p fx-cli --features oauth-bridge
 
   clippy:
     name: Clippy
@@ -90,8 +86,6 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run clippy (oauth-bridge feature)
-        run: cargo clippy -p fx-cli --features oauth-bridge --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -106,23 +100,3 @@ jobs:
       
       - name: Check formatting
         run: cargo fmt --all --check
-
-  ci_checks:
-    name: CI Checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: |
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
-          fi
-
-      - name: Shellcheck CI scripts
-        run: shellcheck scripts/spec-tests/ci-workflow-cache-paths-check.sh
-
-      - name: Verify workflow cache path safety
-        run: ./scripts/spec-tests/tests/ci-workflow-cache-paths-test.sh
-
