@@ -9,8 +9,8 @@ const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/registr
 
 /// Official fawxai publisher Ed25519 public key (32 bytes).
 const FAWXAI_PUBLIC_KEY: [u8; 32] = [
-    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188,
-    106, 55, 109, 208, 1, 191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
+    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188, 106, 55, 109, 208, 1,
+    191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
 ];
 
 /// Resolve the Fawx data directory (`~/.fawx`).
