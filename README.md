@@ -13,16 +13,15 @@ Fawx is a local-first agentic engine. It runs on your machine, calls LLMs for re
 ## Quick Start
 
 ```bash
-# Build
 git clone https://github.com/fawxai/fawx.git
-cd fawx && cargo build --release
+cd fawx
+./scripts/install.sh
 
-# Configure (interactive wizard)
-./target/release/fawx setup
-
-# Run
-./target/release/fawx serve
+fawx setup
+fawx serve
 ```
+
+This builds from source, installs the `fawx` binary to `~/.local/bin/`, and walks you through configuration. Set `INSTALL_DIR` to change the install location.
 
 Bring your own API key (Anthropic, OpenAI, or local models). Fawx never sends data anywhere except the LLM provider you choose.
 
