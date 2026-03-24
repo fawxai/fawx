@@ -19,6 +19,7 @@ use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusRe
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
+use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
 use fx_subagent::{
     SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
 };
@@ -82,6 +83,7 @@ pub struct FawxToolExecutor {
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    protected_branches: Vec<String>,
     kernel_budget: KernelBudgetConfig,
     start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
@@ -133,6 +135,7 @@ impl FawxToolExecutor {
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
             config_manager: None,
+            protected_branches: Vec::new(),
             kernel_budget: KernelBudgetConfig::default(),
             start_time: std::time::Instant::now(),
             subagent_control: None,
@@ -180,6 +183,12 @@ impl FawxToolExecutor {
     /// Attach a config manager for runtime config read/write tools.
     pub fn with_config_manager(mut self, mgr: Arc<Mutex<ConfigManager>>) -> Self {
         self.config_manager = Some(mgr);
+        self
+    }
+
+    #[must_use]
+    pub fn with_protected_branches(mut self, protected_branches: Vec<String>) -> Self {
+        self.protected_branches = protected_branches;
         self
     }
 
@@ -530,6 +539,7 @@ impl FawxToolExecutor {
             return Err("command cannot be empty".to_string());
         }
         let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
+        self.guard_push_command(command)?;
         let child = build_command(command, parsed.shell.unwrap_or(false), &working_dir)?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -542,6 +552,7 @@ impl FawxToolExecutor {
     fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ExecBackgroundArgs = parse_args(args)?;
         let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
+        self.guard_push_command(&parsed.command)?;
         let result = self
             .process_registry
             .spawn(parsed.command, working_dir, parsed.label)?;
@@ -568,6 +579,14 @@ impl FawxToolExecutor {
             "session_id": parsed.session_id,
             "status": "killed",
         }))
+    }
+
+    fn guard_push_command(&self, command: &str) -> Result<(), String> {
+        let targets = extract_push_targets(command);
+        if targets.is_empty() {
+            return Ok(());
+        }
+        check_push_allowed(&targets, &self.protected_branches)
     }
 
     fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
@@ -2626,6 +2645,45 @@ mod tests {
         serde_json::from_str(output).expect("valid json output")
     }
 
+    fn executor_with_protected_branches(root: &Path, branches: &[&str]) -> FawxToolExecutor {
+        test_executor(root).with_protected_branches(
+            branches
+                .iter()
+                .map(|branch| (*branch).to_string())
+                .collect(),
+        )
+    }
+
+    fn run_git_ok(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command should run in tests");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_push_repo() -> (TempDir, TempDir) {
+        let repo = TempDir::new().expect("repo tempdir");
+        let remote = TempDir::new().expect("remote tempdir");
+        let remote_path = remote.path().to_str().expect("utf8 remote path");
+        run_git_ok(repo.path(), &["init"]);
+        run_git_ok(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git_ok(repo.path(), &["config", "user.name", "Test"]);
+        run_git_ok(remote.path(), &["init", "--bare"]);
+        run_git_ok(repo.path(), &["remote", "add", "origin", remote_path]);
+        fs::write(repo.path().join("file.txt"), "data\n").expect("write seed file");
+        run_git_ok(repo.path(), &["add", "file.txt"]);
+        run_git_ok(repo.path(), &["commit", "-m", "initial"]);
+        run_git_ok(repo.path(), &["checkout", "-b", "dev"]);
+        (repo, remote)
+    }
+
     fn test_executor_with_subagents(root: &Path) -> FawxToolExecutor {
         test_executor_with_control(root, Arc::new(StubSubagentControl::new()))
     }
@@ -3416,6 +3474,47 @@ three
     }
 
     #[tokio::test]
+    async fn run_command_blocks_push_to_protected_branch() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_protected_branches(temp.path(), &["main"]);
+
+        let error = executor
+            .handle_run_command(&serde_json::json!({"command": "git push origin main"}))
+            .await
+            .expect_err("protected push should be blocked");
+
+        assert!(error.contains("protected branch(es) 'main'"));
+    }
+
+    #[tokio::test]
+    async fn run_command_allows_push_to_unprotected_branch() {
+        let (repo, remote) = init_push_repo();
+        let executor = executor_with_protected_branches(repo.path(), &["main"]);
+
+        let output = executor
+            .handle_run_command(&serde_json::json!({"command": "git push origin dev"}))
+            .await
+            .expect("unprotected push should execute");
+
+        assert!(
+            output.contains("exit_code: 0"),
+            "unexpected output: {output}"
+        );
+        let remote_path = remote.path().to_str().expect("utf8 remote path");
+        let status = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                remote_path,
+                "show-ref",
+                "--verify",
+                "refs/heads/dev",
+            ])
+            .output()
+            .expect("verify remote ref");
+        assert!(status.status.success(), "remote dev branch should exist");
+    }
+
+    #[tokio::test]
     async fn exec_background_returns_session_id_and_status() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -3502,6 +3601,18 @@ three
             .expect_err("outside working dir should fail");
 
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn exec_background_blocks_push_to_protected_branch() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_protected_branches(temp.path(), &["main"]);
+
+        let error = executor
+            .handle_exec_background(&serde_json::json!({"command": "git push origin main"}))
+            .expect_err("protected push should be blocked");
+
+        assert!(error.contains("protected branch(es) 'main'"));
     }
 
     #[test]

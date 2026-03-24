@@ -934,7 +934,8 @@ fn build_skill_registry(
     }));
     ProcessRegistry::spawn_cleanup_task(&process_registry);
     let mut startup_warnings = Vec::new();
-    let executor = build_tool_executor(&options, tool_config, process_registry);
+    let executor = build_tool_executor(&options, tool_config, process_registry)
+        .with_protected_branches(config.git.protected_branches.clone());
     let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
         attach_memory_if_enabled(
             executor,
@@ -1053,7 +1054,8 @@ fn build_skill_registry(
             std::sync::Arc::new(move || cp.get_credential("github_token"))
                 as std::sync::Arc<dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync>
         });
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn);
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn)
+        .with_protected_branches(config.git.protected_branches.clone());
     registry.register(Arc::new(git_skill));
 
     // Load WASM skills from ~/.fawx/skills/

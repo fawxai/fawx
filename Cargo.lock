@@ -2036,6 +2036,7 @@ dependencies = [
  "fx-loadable",
  "fx-memory",
  "fx-propose",
+ "fx-ripcord",
  "fx-session",
  "fx-storage",
  "fx-subagent",

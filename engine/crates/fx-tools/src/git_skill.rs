@@ -3,6 +3,7 @@ use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfi
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 use fx_loadable::{Skill, SkillError};
+use fx_ripcord::git_guard::check_push_allowed;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -31,6 +32,7 @@ pub struct GitSkill {
     working_dir: PathBuf,
     self_modify: Option<SelfModifyConfig>,
     github_token: Option<GitHubTokenProvider>,
+    protected_branches: Vec<String>,
 }
 
 impl std::fmt::Debug for GitSkill {
@@ -39,6 +41,7 @@ impl std::fmt::Debug for GitSkill {
             .field("working_dir", &self.working_dir)
             .field("self_modify", &self.self_modify)
             .field("github_token", &self.github_token.is_some())
+            .field("protected_branches", &self.protected_branches)
             .finish()
     }
 }
@@ -107,7 +110,14 @@ impl GitSkill {
             working_dir,
             self_modify,
             github_token,
+            protected_branches: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_protected_branches(mut self, protected_branches: Vec<String>) -> Self {
+        self.protected_branches = protected_branches;
+        self
     }
 
     async fn run_git(&self, args: &[&str]) -> Result<String, String> {
@@ -278,6 +288,7 @@ impl GitSkill {
         };
         validate_remote_name(remote)?;
         validate_branch_name(&branch)?;
+        self.ensure_push_allowed(&branch)?;
         let token = self.require_github_token()?;
         self.run_git_with_token_auth(&["push", remote, &branch], &token, PUSH_TIMEOUT)
             .await
@@ -319,6 +330,11 @@ impl GitSkill {
             return Err("not on a branch (detached HEAD)".to_string());
         }
         Ok(branch)
+    }
+
+    fn ensure_push_allowed(&self, branch: &str) -> Result<(), String> {
+        let target = branch.to_string();
+        check_push_allowed(std::slice::from_ref(&target), &self.protected_branches)
     }
 
     fn require_github_token(&self) -> Result<Zeroizing<String>, String> {
@@ -822,6 +838,22 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn fake_token_provider() -> Option<GitHubTokenProvider> {
+        Some(Arc::new(|| Some(Zeroizing::new("ghp_fake".to_string()))))
+    }
+
+    fn init_push_remote(repo: &TempDir) -> TempDir {
+        let remote = TempDir::new().expect("remote tempdir");
+        let remote_path = remote.path().to_str().expect("utf8 remote path");
+        let output = StdCommand::new("git")
+            .args(["init", "--bare", remote_path])
+            .output()
+            .expect("init bare remote");
+        assert!(output.status.success(), "bare remote init should succeed");
+        run_git_ok(repo, &["remote", "add", "origin", remote_path]);
+        remote
     }
 
     #[test]
@@ -1531,6 +1563,55 @@ mod tests {
     #[test]
     fn validate_remote_name_accepts_origin() {
         assert!(validate_remote_name("origin").is_ok());
+    }
+
+    #[tokio::test]
+    async fn git_push_blocks_protected_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "f.txt", "data\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, None)
+            .with_protected_branches(vec!["main".to_string()]);
+
+        let error = run_tool(
+            &skill,
+            "git_push",
+            serde_json::json!({"remote": "origin", "branch": "main"}),
+        )
+        .await
+        .expect_err("push to protected branch should fail");
+
+        assert!(error.contains("protected branch(es) 'main'"));
+    }
+
+    #[tokio::test]
+    async fn git_push_allows_unprotected_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "f.txt", "data\n");
+        run_git_ok(&repo, &["checkout", "-b", "dev"]);
+        let remote = init_push_remote(&repo);
+        let skill = GitSkill::new(repo.path().to_path_buf(), None, fake_token_provider())
+            .with_protected_branches(vec!["main".to_string()]);
+
+        run_tool(
+            &skill,
+            "git_push",
+            serde_json::json!({"remote": "origin", "branch": "dev"}),
+        )
+        .await
+        .expect("push to unprotected branch should succeed");
+
+        let remote_path = remote.path().to_str().expect("utf8 remote path");
+        let output = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                remote_path,
+                "show-ref",
+                "--verify",
+                "refs/heads/dev",
+            ])
+            .output()
+            .expect("verify remote ref");
+        assert!(output.status.success(), "remote dev branch should exist");
     }
 
     #[tokio::test]
