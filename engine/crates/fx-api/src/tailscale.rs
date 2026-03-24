@@ -108,11 +108,11 @@ mod tests {
 
     #[test]
     fn parse_tailscale_cli_output_returns_cgnat_ip() {
-        let stdout = b"10.0.0.4\n";
+        let stdout = b"100.100.1.1\n";
 
         assert_eq!(
             parse_tailscale_cli_output(stdout),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 89, 174, 76)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)))
         );
     }
 
@@ -132,11 +132,11 @@ mod tests {
 
     #[test]
     fn parse_macos_ifconfig_line_extracts_cgnat_ip() {
-        let line = "inet 10.0.0.5 --> 10.0.0.5 netmask 0xffffffff";
+        let line = "inet 100.100.2.1 --> 100.100.2.1 netmask 0xffffffff";
 
         assert_eq!(
             extract_ip_from_line(line),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 123, 20, 63)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 100, 2, 1)))
         );
     }
 
@@ -157,12 +157,11 @@ mod tests {
 
     #[test]
     fn linux_ip_output_still_parsed_correctly() {
-        let text =
-            "7: tailscale0    inet 10.0.0.4/32 brd 10.0.0.4 scope global tailscale0";
+        let text = "7: tailscale0    inet 100.100.1.1/32 brd 100.100.1.1 scope global tailscale0";
 
         assert_eq!(
             find_cgnat_ip(text),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 89, 174, 76)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)))
         );
     }
 }

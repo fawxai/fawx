@@ -690,7 +690,10 @@ mod tests {
 
         let names = sorted_node_names(manager.list_nodes());
 
-        assert_eq!(names, vec!["node-beta".to_string(), "node-alpha".to_string()]);
+        assert_eq!(
+            names,
+            vec!["node-beta".to_string(), "node-alpha".to_string()]
+        );
     }
 
     fn sorted_node_names(nodes: Vec<&NodeInfo>) -> Vec<String> {

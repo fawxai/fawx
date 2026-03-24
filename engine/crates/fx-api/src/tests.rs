@@ -425,7 +425,7 @@ fn tailscale_ip_accepts_valid_range() {
         Ipv4Addr::new(100, 127, 255, 255)
     )));
     assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
-        Ipv4Addr::new(100, 93, 251, 101)
+        Ipv4Addr::new(100, 100, 1, 1)
     )));
 }
 
@@ -450,14 +450,14 @@ fn tailscale_ip_rejects_ipv6() {
 
 #[test]
 fn listen_targets_bind_localhost_and_tailscale() {
-    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101))));
+    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1))));
     let tailscale = plan.tailscale.expect("tailscale target");
 
     assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
     assert_eq!(plan.local.label, "local");
     assert_eq!(
         tailscale.addr,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101)), 8400)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)), 8400)
     );
     assert_eq!(tailscale.label, "Tailscale");
 }
@@ -515,7 +515,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
             label: "Tailscale",
         }),
         true,
@@ -523,7 +523,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
 
     assert_eq!(lines[0], "Fawx API listening on:");
     assert_eq!(lines[1], "  http://127.0.0.1:8400 (local)");
-    assert_eq!(lines[2], "  https://10.0.0.1:8400 (Tailscale)");
+    assert_eq!(lines[2], "  https://100.100.1.1:8400 (Tailscale)");
 }
 
 #[test]
@@ -534,14 +534,14 @@ fn startup_target_lines_use_http_for_tailscale_when_tls_disabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
             label: "Tailscale",
         }),
         false,
     );
 
     assert_eq!(lines[0], "Fawx HTTP API listening on:");
-    assert_eq!(lines[2], "  http://10.0.0.1:8400 (Tailscale)");
+    assert_eq!(lines[2], "  http://100.100.1.1:8400 (Tailscale)");
 }
 
 #[tokio::test]
@@ -555,7 +555,7 @@ async fn tailscale_bind_failure_falls_back_to_localhost_server() {
         .expect("bind localhost");
     let local_addr = local_listener.local_addr().expect("local addr");
     let tailscale_target = ListenTarget {
-        addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+        addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
         label: "Tailscale",
     };
     let listeners = BoundListeners {
@@ -615,9 +615,9 @@ async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
 
 #[test]
 fn extract_ip_parses_ip_addr_output() {
-    let line = "4: tailscale0    inet 10.0.0.1/32 scope global tailscale0";
+    let line = "4: tailscale0    inet 100.100.1.1/32 scope global tailscale0";
     let ip = crate::tailscale::extract_ip_from_line(line);
-    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101))));
+    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1))));
 }
 
 #[test]
@@ -715,13 +715,13 @@ fn status_response_has_expected_fields() {
         model: "claude-3".to_string(),
         skills: vec!["read_file".to_string()],
         memory_entries: 42,
-        tailscale_ip: Some("10.0.0.1".to_string()),
+        tailscale_ip: Some("100.100.1.1".to_string()),
         config: None,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["tailscale_ip"], "10.0.0.1");
+    assert_eq!(json["tailscale_ip"], "100.100.1.1");
     assert_eq!(json["memory_entries"], 42);
     assert!(json["skills"].is_array());
 }

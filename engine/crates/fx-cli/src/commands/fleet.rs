@@ -505,7 +505,10 @@ mod tests {
 
     #[test]
     fn parsed_hostname_trims_trailing_newline() {
-        assert_eq!(parsed_hostname(b"macmini\n"), Some("node-alpha".to_string()));
+        assert_eq!(
+            parsed_hostname(b"macmini\n"),
+            Some("node-alpha".to_string())
+        );
     }
 
     #[test]
