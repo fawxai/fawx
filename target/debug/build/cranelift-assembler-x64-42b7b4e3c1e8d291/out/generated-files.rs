@@ -1,3 +1,0 @@
-vec![
-  "/tmp/fawx-oss/target/debug/build/cranelift-assembler-x64-42b7b4e3c1e8d291/out/assembler.rs".into(),
-]

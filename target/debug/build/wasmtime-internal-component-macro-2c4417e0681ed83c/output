@@ -1,2 +1,0 @@
-cargo:rerun-if-changed=build.rs
-cargo:rustc-env=DEBUG_OUTPUT_DIR=/tmp/fawx-oss/target/debug/build/wasmtime-internal-component-macro-2c4417e0681ed83c/out
