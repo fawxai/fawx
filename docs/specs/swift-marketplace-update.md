@@ -1,6 +1,6 @@
 # Swift UI Marketplace Update Spec
 
-## Status: DRAFT (R2 — reviewer findings incorporated)
+## Status: DRAFT (R3 — all reviewer findings resolved)
 ## Date: 2026-03-24
 
 ## Context
@@ -66,8 +66,17 @@ pub fn load_trusted_keys(data_dir: &Path) -> Result<Vec<Vec<u8>>, MarketplaceErr
                 .map_err(|e| MarketplaceError::InstallError(format!("read entry: {e}")))?
                 .path();
             if path.is_file() {
-                keys.push(std::fs::read(&path)
-                    .map_err(|e| MarketplaceError::InstallError(format!("read key: {e}")))?);
+                let key_bytes = std::fs::read(&path)
+                    .map_err(|e| MarketplaceError::InstallError(format!("read key: {e}")))?;
+                if key_bytes.len() != 32 {
+                    tracing::warn!(
+                        "Skipping invalid key file {} (expected 32 bytes, got {})",
+                        path.display(),
+                        key_bytes.len()
+                    );
+                    continue;
+                }
+                keys.push(key_bytes);
             }
         }
     }
@@ -120,7 +129,7 @@ Call `fx_marketplace::search(config, query)` via `spawn_blocking` and map `Skill
 Mapping:
 ```
 SkillEntry.name → MarketplaceSkillSummary.name
-SkillEntry.name (title-cased) → MarketplaceSkillSummary.title
+SkillEntry.name (title-cased: first char uppercase, rest lowercase; e.g. "weather" → "Weather", "web-fetch" → "Web-fetch") → MarketplaceSkillSummary.title
 SkillEntry.description → MarketplaceSkillSummary.description
 SkillEntry.author → MarketplaceSkillSummary.publisher
 true → MarketplaceSkillSummary.signed (all registry skills are signed)
@@ -176,12 +185,12 @@ pub async fn handle_remove_skill(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
 ```
 
-Steps:
+Steps (all wrapped in `spawn_blocking` for consistency):
 1. Validate skill name (`fx_marketplace::validate_skill_name`) → 400 if invalid
 2. Build `skill_dir = data_dir/skills/{name}/`
-3. **Canonicalize and verify prefix:** resolve `skill_dir` to absolute path and verify it starts with `data_dir/skills/`. This prevents symlink traversal attacks (same pattern `install` already uses).
-4. Check exists → 404 if not
-5. `std::fs::remove_dir_all` (can be sync; it's local I/O, not a network call, so `spawn_blocking` is optional but recommended for consistency)
+3. Check exists → 404 if not (must come before canonicalize since `canonicalize` fails on non-existent paths)
+4. **Canonicalize and verify prefix:** resolve `skill_dir` to absolute path via `std::fs::canonicalize` and verify it starts with `canonicalize(data_dir/skills/)`. This prevents symlink traversal attacks (same pattern `install` already uses).
+5. `std::fs::remove_dir_all`
 6. Return 200 with `{"removed": true, "name": "<name>"}`
 
 ### 7. `RegistryConfig` needs `Send`
