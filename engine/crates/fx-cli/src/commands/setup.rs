@@ -328,12 +328,14 @@ impl SetupWizard {
     }
 
     async fn run_model_phase(&mut self) -> anyhow::Result<()> {
+        let Some(provider) = self.selected_provider.clone() else {
+            println!("Step 2: Model Selection");
+            println!("  ⏭ Skipped (no provider configured yet)");
+            println!();
+            return Ok(());
+        };
         println!("Step 2: Model Selection");
         println!("  Fetching available models...");
-        let provider = self
-            .selected_provider
-            .clone()
-            .context("provider not selected")?;
         let models = self.available_models(&provider).await?;
         print_models(&provider, &models);
         println!("  (press Enter to skip)");
