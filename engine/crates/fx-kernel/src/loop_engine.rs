@@ -448,10 +448,10 @@ pub struct LoopEngine {
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
     budget_low_signaled: bool,
-    /// Consecutive iterations that used tools without producing user-facing text.
+    /// Consecutive iterations that included tool calls.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
-    consecutive_tool_only_turns: u16,
+    consecutive_tool_turns: u16,
     /// Latest reasoning input messages for graceful budget-exhausted synthesis.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     last_reasoning_messages: Vec<Message>,
@@ -484,10 +484,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
-            .field(
-                "consecutive_tool_only_turns",
-                &self.consecutive_tool_only_turns,
-            )
+            .field("consecutive_tool_turns", &self.consecutive_tool_turns)
             .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
@@ -885,7 +882,7 @@ impl LoopEngineBuilder {
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
-            consecutive_tool_only_turns: 0,
+            consecutive_tool_turns: 0,
             last_reasoning_messages: Vec::new(),
             tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
@@ -1375,7 +1372,8 @@ Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
-const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+const TOOL_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several rounds without providing a response. Share your progress with the user now. If you have enough information to answer, do so immediately instead of calling more tools.";
 /// Maximum time to wait for a best-effort summary during emergency compaction.
 const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1657,7 +1655,7 @@ impl LoopEngine {
         }
 
         state.tokens.accumulate(action.tokens_used);
-        self.update_tool_only_turns(&action);
+        self.update_tool_turns(&action);
 
         if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
             return Ok(self.finish_streaming_result(result, stream));
@@ -1823,7 +1821,7 @@ impl LoopEngine {
         self.user_stop_requested = false;
         self.pending_steer = None;
         self.budget_low_signaled = false;
-        self.consecutive_tool_only_turns = 0;
+        self.consecutive_tool_turns = 0;
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
@@ -1834,11 +1832,39 @@ impl LoopEngine {
         self.tool_executor.clear_cache();
     }
 
-    fn update_tool_only_turns(&mut self, action: &ActionResult) {
-        if !action.tool_results.is_empty() && action.response_text.trim().is_empty() {
-            self.consecutive_tool_only_turns = self.consecutive_tool_only_turns.saturating_add(1);
-        } else if !action.response_text.trim().is_empty() {
-            self.consecutive_tool_only_turns = 0;
+    fn update_tool_turns(&mut self, action: &ActionResult) {
+        if !action.tool_results.is_empty() {
+            self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
+        } else {
+            self.consecutive_tool_turns = 0;
+        }
+    }
+
+    /// Apply nudge/strip policy for the current tool continuation round.
+    ///
+    /// Mutates `continuation_messages` by appending a progress nudge at the
+    /// nudge threshold round. Returns the tool definitions to use: either the
+    /// full set (normal) or an empty vec (tools stripped at strip threshold).
+    fn apply_tool_round_progress_policy(
+        &self,
+        round: u32,
+        continuation_messages: &mut Vec<Message>,
+    ) -> Vec<ToolDefinition> {
+        let tc = &self.budget.config().termination;
+        let nudge_threshold = u32::from(tc.tool_round_nudge_after);
+        let strip_threshold =
+            nudge_threshold.saturating_add(u32::from(tc.tool_round_strip_after_nudge));
+
+        // Fire nudge exactly once (at the threshold round) to avoid stacking
+        // duplicate nudge messages in continuation_messages across rounds.
+        if nudge_threshold > 0 && round == nudge_threshold {
+            continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
+        }
+
+        if nudge_threshold > 0 && round >= strip_threshold {
+            Vec::new()
+        } else {
+            self.tool_executor.tool_definitions()
         }
     }
 
@@ -2005,8 +2031,8 @@ impl LoopEngine {
         }
 
         let nudge_at = self.budget.config().termination.nudge_after_tool_turns;
-        if nudge_at > 0 && self.consecutive_tool_only_turns >= nudge_at {
-            context_window.push(Message::system(TOOL_ONLY_TURN_NUDGE.to_string()));
+        if nudge_at > 0 && self.consecutive_tool_turns >= nudge_at {
+            context_window.push(Message::system(TOOL_TURN_NUDGE.to_string()));
         }
 
         let processed = ProcessedPerception {
@@ -2040,13 +2066,13 @@ impl LoopEngine {
     ) -> Result<CompletionResponse, LoopError> {
         let tc = &self.budget.config().termination;
         let should_strip_tools = tc.nudge_after_tool_turns > 0
-            && self.consecutive_tool_only_turns
+            && self.consecutive_tool_turns
                 >= tc
                     .nudge_after_tool_turns
                     .saturating_add(tc.strip_tools_after_nudge);
         let tools = if should_strip_tools {
             tracing::info!(
-                turns = self.consecutive_tool_only_turns,
+                turns = self.consecutive_tool_turns,
                 "stripping tools: agent exceeded nudge + grace threshold"
             );
             vec![]
@@ -3811,8 +3837,11 @@ impl LoopEngine {
                 break;
             }
 
+            let continuation_tools =
+                self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
+
             match self
-                .execute_tool_round(round + 1, llm, &mut state, stream)
+                .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
                 .await?
             {
                 ToolRoundOutcome::Cancelled => {
@@ -3977,6 +4006,7 @@ impl LoopEngine {
         round: u32,
         llm: &dyn LlmProvider,
         state: &mut ToolRoundState,
+        continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
@@ -4016,6 +4046,7 @@ impl LoopEngine {
             .request_tool_continuation(
                 llm,
                 &state.continuation_messages,
+                continuation_tools,
                 &mut state.tokens_used,
                 stream,
             )
@@ -4143,13 +4174,14 @@ impl LoopEngine {
         &mut self,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        continuation_tools: Vec<ToolDefinition>,
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
-            self.tool_executor.tool_definitions(),
+            continuation_tools,
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
@@ -4997,6 +5029,14 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
     )
 }
 
+fn completion_request_tools(tool_definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    if tool_definitions.is_empty() {
+        Vec::new()
+    } else {
+        tool_definitions_with_decompose(tool_definitions)
+    }
+}
+
 fn tool_definitions_with_decompose(
     mut tool_definitions: Vec<ToolDefinition>,
 ) -> Vec<ToolDefinition> {
@@ -5071,7 +5111,7 @@ fn build_continuation_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    let tools = completion_request_tools(tool_definitions);
     let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -5122,7 +5162,7 @@ fn build_truncation_continuation_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    let tools = completion_request_tools(tool_definitions);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
@@ -5653,13 +5693,7 @@ fn build_reasoning_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    // When tools are explicitly empty (e.g., stripped for tool-only turn enforcement),
-    // skip adding the decompose tool — the intent is to force a text-only response.
-    let tools = if tool_definitions.is_empty() {
-        vec![]
-    } else {
-        tool_definitions_with_decompose(tool_definitions)
-    };
+    let tools = completion_request_tools(tool_definitions);
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -7686,6 +7720,7 @@ mod phase2_tests {
 #[cfg(test)]
 mod phase4_tests {
     use super::*;
+    use crate::budget::{BudgetConfig, BudgetTracker, TerminationConfig};
     use crate::cancellation::CancellationToken;
     use crate::input::{loop_input_channel, LoopCommand};
     use async_trait::async_trait;
@@ -7882,18 +7917,38 @@ mod phase4_tests {
     }
 
     fn p4_engine() -> LoopEngine {
+        p4_engine_with_config(BudgetConfig::default(), 3)
+    }
+
+    fn p4_engine_with_config(config: BudgetConfig, max_iterations: u32) -> LoopEngine {
         LoopEngine::builder()
-            .budget(BudgetTracker::new(
-                crate::budget::BudgetConfig::default(),
-                0,
-                0,
-            ))
+            .budget(BudgetTracker::new(config, 0, 0))
             .context(ContextCompactor::new(2048, 256))
-            .max_iterations(3)
+            .max_iterations(max_iterations)
             .tool_executor(Arc::new(Phase4StubToolExecutor))
             .synthesis_instruction("Summarize tool output".to_string())
             .build()
             .expect("test engine build")
+    }
+
+    fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains(TOOL_ROUND_PROGRESS_NUDGE),
+                _ => false,
+            })
+        })
+    }
+
+    fn tool_round_budget_config(nudge_after: u16, strip_after_nudge: u16) -> BudgetConfig {
+        BudgetConfig {
+            termination: TerminationConfig {
+                tool_round_nudge_after: nudge_after,
+                tool_round_strip_after_nudge: strip_after_nudge,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        }
     }
 
     fn p4_snapshot(text: &str) -> PerceptionSnapshot {
@@ -8101,6 +8156,196 @@ mod phase4_tests {
                     })
             }),
             "second continuation request should preserve provider item ids for the next tool round"
+        );
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_nudges_after_threshold() {
+        let config = tool_round_budget_config(1, 10);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done after nudge"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!has_tool_round_progress_nudge(&requests[0].messages));
+        assert!(has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_strips_tools_after_threshold() {
+        let config = tool_round_budget_config(1, 1);
+        let mut engine = p4_engine_with_config(config, 4);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            text_response("done after strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[1].tools.is_empty());
+        assert!(requests[2].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_no_nudge_when_disabled() {
+        let config = tool_round_budget_config(0, 2);
+        let mut engine = p4_engine_with_config(config, 4);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            text_response("done without nudge"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert!(requests.iter().all(|request| {
+            !has_tool_round_progress_nudge(&request.messages) && !request.tools.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_aggressive_config() {
+        let config = tool_round_budget_config(1, 0);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done after aggressive strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(has_tool_round_progress_nudge(&requests[1].messages));
+        assert!(requests[1].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_no_nudge_before_threshold() {
+        let config = tool_round_budget_config(2, 2);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done before threshold"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_nudge_fires_exactly_once() {
+        // With nudge_after=1 and strip_after=3, the model runs 3 rounds past
+        // the nudge threshold. Verify the nudge message appears exactly once
+        // (not stacked on every round).
+        let config = tool_round_budget_config(1, 3);
+        let mut engine = p4_engine_with_config(config, 5);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            tool_use_response(vec![read_file_call("call-4", "d.txt")]),
+            text_response("done after strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        // The last request has the full continuation_messages history.
+        // Count nudge messages in it — should be exactly 1 (not stacked).
+        let last_request = requests.last().expect("should have requests");
+        let nudge_count = last_request
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains(TOOL_ROUND_PROGRESS_NUDGE)
+                    )
+                })
+            })
+            .count();
+        assert_eq!(
+            nudge_count, 1,
+            "nudge should appear exactly once, not stack"
         );
     }
 
@@ -12444,8 +12689,9 @@ mod context_compaction_tests {
         let calls = vec![read_call("call-1")];
         let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
 
+        let tools = engine.tool_executor.tool_definitions();
         let _ = engine
-            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .execute_tool_round(1, &llm, &mut state, tools, CycleStream::disabled())
             .await
             .expect("tool round");
 
@@ -12464,8 +12710,9 @@ mod context_compaction_tests {
         let calls = vec![read_call("call-1")];
         let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
 
+        let tools = engine.tool_executor.tool_definitions();
         engine
-            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .execute_tool_round(1, &llm, &mut state, tools, CycleStream::disabled())
             .await
             .expect("tool round");
 
@@ -14897,7 +15144,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_injected_at_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = 6;
+        engine.consecutive_tool_turns = 6;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14916,7 +15163,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_not_injected_below_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = 6 - 1;
+        engine.consecutive_tool_turns = 6 - 1;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14949,7 +15196,7 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build");
-        engine.consecutive_tool_only_turns = 4;
+        engine.consecutive_tool_turns = 4;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14982,7 +15229,7 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build");
-        engine.consecutive_tool_only_turns = 100;
+        engine.consecutive_tool_turns = 100;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -15009,7 +15256,7 @@ mod loop_resilience_tests {
             ..BudgetConfig::default()
         };
         let mut engine = engine_with_budget(config);
-        engine.consecutive_tool_only_turns = 3;
+        engine.consecutive_tool_turns = 3;
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "Here is my summary.".to_string(),
@@ -15050,7 +15297,7 @@ mod loop_resilience_tests {
             .build()
             .expect("build");
         // At turn 5 (3 nudge + 2 grace), tools should be stripped
-        engine.consecutive_tool_only_turns = 5;
+        engine.consecutive_tool_turns = 5;
 
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -15099,7 +15346,7 @@ mod loop_resilience_tests {
             .build()
             .expect("build");
         // At turn 4 (below 3+2=5), tools should NOT be stripped
-        engine.consecutive_tool_only_turns = 4;
+        engine.consecutive_tool_turns = 4;
 
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -15160,18 +15407,8 @@ mod loop_resilience_tests {
         assert!(llm.requests().is_empty());
     }
 
-    #[test]
-    fn default_termination_config_matches_current_behavior() {
-        let config = TerminationConfig::default();
-        assert!(config.synthesize_on_exhaustion);
-        assert_eq!(config.nudge_after_tool_turns, 6);
-        assert_eq!(config.strip_tools_after_nudge, 3);
-    }
-
-    #[test]
-    fn tool_only_turn_counter_tracks_and_resets() {
-        let mut engine = high_budget_engine();
-        let tool_action = ActionResult {
+    fn tool_action(response_text: &str) -> ActionResult {
+        ActionResult {
             decision: Decision::UseTools(Vec::new()),
             tool_results: vec![ToolResult {
                 tool_call_id: "call-1".to_string(),
@@ -15179,20 +15416,66 @@ mod loop_resilience_tests {
                 success: true,
                 output: "ok".to_string(),
             }],
-            response_text: String::new(),
+            response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
-        };
-        engine.update_tool_only_turns(&tool_action);
-        assert_eq!(engine.consecutive_tool_only_turns, 1);
+        }
+    }
 
-        let text_action = ActionResult {
-            decision: Decision::Respond("done".to_string()),
+    fn text_only_action(response_text: &str) -> ActionResult {
+        ActionResult {
+            decision: Decision::Respond(response_text.to_string()),
             tool_results: Vec::new(),
-            response_text: "done".to_string(),
+            response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
-        };
-        engine.update_tool_only_turns(&text_action);
-        assert_eq!(engine.consecutive_tool_only_turns, 0);
+        }
+    }
+
+    #[test]
+    fn default_termination_config_matches_current_behavior() {
+        let config = TerminationConfig::default();
+        assert!(config.synthesize_on_exhaustion);
+        assert_eq!(config.nudge_after_tool_turns, 6);
+        assert_eq!(config.strip_tools_after_nudge, 3);
+        assert_eq!(config.tool_round_nudge_after, 4);
+        assert_eq!(config.tool_round_strip_after_nudge, 2);
+    }
+
+    #[test]
+    fn update_tool_turns_increments_on_tools_with_text() {
+        let mut engine = high_budget_engine();
+
+        engine.update_tool_turns(&tool_action("still working"));
+
+        assert_eq!(engine.consecutive_tool_turns, 1);
+    }
+
+    #[test]
+    fn update_tool_turns_resets_on_text_only() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_turns = 2;
+
+        engine.update_tool_turns(&text_only_action("done"));
+
+        assert_eq!(engine.consecutive_tool_turns, 0);
+    }
+
+    #[test]
+    fn update_tool_turns_increments_on_tools_only() {
+        let mut engine = high_budget_engine();
+
+        engine.update_tool_turns(&tool_action(""));
+
+        assert_eq!(engine.consecutive_tool_turns, 1);
+    }
+
+    #[test]
+    fn update_tool_turns_saturating_add() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_turns = u16::MAX;
+
+        engine.update_tool_turns(&tool_action("still working"));
+
+        assert_eq!(engine.consecutive_tool_turns, u16::MAX);
     }
 
     // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---
