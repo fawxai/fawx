@@ -1206,6 +1206,7 @@ impl HeadlessApp {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn process_message_with_images(
         &mut self,
         input: &str,
