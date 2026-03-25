@@ -76,7 +76,7 @@ Evictable messages
 
 The threshold ordering becomes: `prune (0.40) < slide (0.60) < emergency (0.95)`. The `summarize_threshold` field is removed; summarization is always attempted before sliding.
 
-When `use_summarization: false` or the LLM call fails, behavior falls back to current sliding (lossy delete + count marker). This preserves backward compat and handles offline/no-LLM scenarios.
+When `use_summarization: false`, `compaction_llm` is None, or the LLM call fails, behavior falls back to current sliding (lossy delete + count marker). This preserves backward compat and handles offline/no-LLM/BYOK-without-compaction scenarios.
 
 ### Config changes
 
@@ -129,8 +129,12 @@ async fn apply_slide_tier(&self, current, scope, iteration) -> Result<...> {
     let bounds = zone_bounds(current, preserve_recent_turns);
     let evictable = identify_evictable_messages(current, &bounds);
 
+    // Gate: summarization requires both config flag AND available LLM
+    let can_summarize = self.compaction_config.use_summarization
+        && self.compaction_llm.is_some();
+
     // Step 1: Try to summarize evictable messages
-    let summary = if self.compaction_config.use_summarization {
+    let summary = if can_summarize {
         match self.generate_eviction_summary(&evictable).await {
             Ok(summary) => Some(summary),
             Err(err) => {
@@ -142,9 +146,8 @@ async fn apply_slide_tier(&self, current, scope, iteration) -> Result<...> {
         None
     };
 
-    // Step 2: Build compacted messages
+    // Step 2: Build compacted messages with summary marker
     let result = if let Some(ref summary) = summary {
-        // Replace evicted messages with summary marker
         assemble_summarized_slide(current, &bounds, summary, &evictable)
     } else {
         // Fallback: lossy slide with count marker (current behavior)
@@ -156,20 +159,40 @@ async fn apply_slide_tier(&self, current, scope, iteration) -> Result<...> {
         self.flush_summary_to_journal(summary, &evictable, scope).await;
     }
 
-    // Step 4: Extract session memory from summary (not raw messages, no second LLM call)
+    // Step 4: Extract session memory from summary (no second LLM call)
     if let Some(ref summary) = summary {
         self.extract_memory_from_summary(summary).await;
     }
 
-    // Step 5: If still over target after summary replacement, slide the remainder
+    // Step 5: If still over target after summary replacement, slide the excess
+    // This produces ONLY a count marker for the additionally-removed messages.
+    // The summary marker from Step 2 is treated as a system-like message and
+    // protected from further eviction (message_is_system_like returns true
+    // for summary markers).
     if ConversationBudget::estimate_tokens(&result.messages) > target {
-        // Summary was too long; apply mechanical sliding on top
         self.run_sliding_compaction(&result.messages, scope, target).await?
     } else {
         Ok(result)
     }
 }
 ```
+
+### Dual-marker composition
+
+When the summary is too large and a fallback slide fires (Step 5), the result contains both markers:
+
+```
+[system prompt]
+[context summary]                    ← from Step 2 (protected, not evictable)
+Decisions: ...
+Files modified: ...
+[context compacted: 8 messages removed]  ← from Step 5 (additional slide)
+[recent messages...]
+```
+
+The summary marker is protected because `message_is_system_like()` already returns true for messages starting with `[context summary]` (it checks for `SUMMARY_MARKER_PREFIX`). This means the summary survives the follow-up slide. The count marker only covers the additional messages removed by Step 5, not the already-summarized ones.
+
+This is the correct behavior: the summary captures the important context, and the additional slide only removes overflow that didn't fit. The user loses some detail but retains the structured summary.
 
 ### In-context marker (new)
 
@@ -247,6 +270,14 @@ If parsing fails, falls back to the current LLM extraction call.
 
 These are proportional to model context sizes. A 200K context session generates more facts worth remembering than a 32K session. Future: make caps proportional to `model_context_limit`.
 
+### `preserve_recent_turns` increase
+
+- Default: 6 → 12
+
+In tool-heavy sessions, a single multi-tool turn can consume 3-4 message slots (assistant with tool_use, tool result, assistant response, etc.). With `preserve_recent_turns: 6`, only 1-2 complete conversation rounds are protected. At 12, we protect 3-4 complete rounds, which gives the agent enough recent context to maintain coherence.
+
+This is configurable, so users with smaller context windows can reduce it.
+
 ---
 
 ## Scope and non-goals
@@ -265,6 +296,7 @@ These are proportional to model context sizes. A 200K context session generates 
 - Dynamic session memory caps proportional to model context
 - Streaming summarization (generate summary while still processing tool calls)
 - Compaction-aware tool retry (avoid re-running tools whose results were just evicted)
+- Dedicated lightweight compaction model (currently uses `compaction_llm`, which is typically the session model)
 
 ---
 
@@ -295,20 +327,51 @@ This test should FAIL on the old code (count marker) and PASS on the new code (s
 
 ## Migration
 
-- `summarize_threshold` field accepted but ignored in config
+- `summarize_threshold` field accepted but ignored in config via `#[serde(default)]`
 - `CompactionTier::Summarize` removed from enum
 - `SummarizingCompactor` struct retained (used by the pre-step), but no longer a standalone tier
 - `apply_summarize_tier` removed
 - `highest_compaction_tier` simplified (3 tiers, not 4)
 - Config validation: 3-threshold monotonicity instead of 4
+- `ThresholdsNotMonotonic` error variant updated (3 fields instead of 4)
+- `summarize_target()` on `ConversationBudget` removed (dead code)
+- `build_strategy()` no longer needs to construct `SummarizingCompactor` as a standalone strategy; the summarizer is constructed inline in `apply_slide_tier` when `compaction_llm` is available
+
+### Test impact
+
+~15 existing tests reference `CompactionTier::Summarize` or the 4-tier cascade:
+- Tests for `highest_compaction_tier` at summarize threshold → remove or update
+- Tests for `apply_summarize_tier` → remove (function removed)
+- Tests for config validation with 4 monotonic thresholds → update to 3
+- Tests for `summarize_target()` → remove
+- Tests for `CompactionTier::as_str()` → update
+
+New tests (see Testing section) replace removed tests and cover the new behavior.
 
 ---
 
-## Cost analysis
+## Cost and latency analysis
 
-**Before:** 0-1 LLM calls per compaction event (extraction only, often skipped)
-**After:** 1 LLM call per compaction event (summary, which feeds extraction too)
+### Cost
 
-Net cost: ~1 additional LLM call per compaction event, generating ~1K tokens. At typical rates, this is <$0.01 per compaction. Compaction events are infrequent (every ~20-50 tool calls depending on context size). The cost of losing user context is infinitely higher than $0.01.
+**Before:** 0-2 LLM calls per compaction event (extraction + potential parse retry)
+**After:** 1 LLM call per compaction event (summary), 0 for extraction (parsed from summary)
 
-The second LLM call (memory extraction) is eliminated, partially offsetting the cost.
+The summary call generates ~1K tokens via `compaction_llm`. This is currently the same model as the main session. On frontier models (Claude Opus, GPT-4), this costs $0.02-0.06 per compaction. On lighter models (Sonnet, GPT-4o-mini), $0.001-0.005.
+
+Future optimization: configure a dedicated lightweight compaction model. The summary prompt is simple structured extraction; it doesn't need the most capable model.
+
+Compaction events are infrequent (every ~20-50 tool calls). The cost of losing user context mid-session is orders of magnitude higher than the summarization cost.
+
+If `compaction_llm` is None (no LLM configured), the cost is zero: fallback to current lossy sliding.
+
+### Latency
+
+The summarization LLM call adds 1-3 seconds to the compaction path. This happens mid-turn (during `compact_tool_continuation` or `compact_if_needed` in perceive). During this time, the agent appears to pause.
+
+Mitigations:
+- Emit a `context_compacting` SSE event before the summary call so the UI can show a brief "Organizing context..." indicator
+- The summary call uses `max_summary_tokens: 1024`, which bounds generation time
+- If latency is unacceptable for a specific deployment, `use_summarization: false` disables it entirely
+
+This is acceptable for v1. Streaming summarization (generating summary tokens while continuing the main turn) is a future optimization.
