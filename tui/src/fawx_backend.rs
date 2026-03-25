@@ -556,11 +556,14 @@ fn handle_tool_error(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::
 
 fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
     let d: ToolResultData = serde_json::from_str(data).context("decode tool_result")?;
+    if d.is_error {
+        return Ok(());
+    }
     try_send(
         tx,
         BackendEvent::ToolResult {
             name: d.id,
-            success: !d.is_error,
+            success: true,
             content: d.output.unwrap_or_default(),
         },
     );
@@ -881,7 +884,7 @@ model = "gpt-4"
     }
 
     #[test]
-    fn dispatch_tool_result_error_maps_is_error_to_success_false() {
+    fn dispatch_tool_result_error_is_ignored_in_favor_of_tool_error_event() {
         let (tx, mut rx) = unbounded_channel();
         let mut saw = false;
         dispatch_sse_frame(
@@ -890,10 +893,10 @@ model = "gpt-4"
             &mut saw,
         )
         .expect("should decode");
-        match rx.try_recv().expect("event") {
-            BackendEvent::ToolResult { success, .. } => assert!(!success),
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            rx.try_recv().is_err(),
+            "error tool_result should be skipped"
+        );
     }
 
     #[test]

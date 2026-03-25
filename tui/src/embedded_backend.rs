@@ -164,8 +164,7 @@ fn handle_stream_event(
         }
         StreamEvent::Done { .. }
         | StreamEvent::PhaseChange { .. }
-        | StreamEvent::PermissionPrompt(_)
-        | StreamEvent::ContextCompacted { .. } => {}
+        | StreamEvent::PermissionPrompt(_) => {}
     }
 }
 
