@@ -22,21 +22,23 @@ During a real session, the user asked Fawx to "review the pdf and build turboqua
 
 ## Root Cause Analysis
 
-### Bug 1: Tool-only turn counter resets on interstitial text
+### Bug 1: Tool-only turn counter resets on interstitial text (latent, cross-cycle)
 
-**Location:** `loop_engine.rs` → `update_tool_only_turns()`
+**Location:** `loop_engine.rs` → `update_tool_only_turns()` (line ~1837)
 
 ```rust
 fn update_tool_only_turns(&mut self, action: &ActionResult) {
     if !action.tool_results.is_empty() && action.response_text.trim().is_empty() {
-        self.consecutive_tool_only_turns += 1;
+        self.consecutive_tool_only_turns = self.consecutive_tool_only_turns.saturating_add(1);
     } else if !action.response_text.trim().is_empty() {
         self.consecutive_tool_only_turns = 0;  // ← RESETS even if tools were also called
     }
 }
 ```
 
-**Problem:** When the model emits text + tool calls in the same turn (e.g., "Now let me look at the MLX training script..." + `read_file`), the counter resets to 0. The model learns to emit throwaway interstitial text to avoid the nudge/strip mechanism. The TerminationConfig's nudge_at_6/strip_at_9 never fires because the counter never reaches 6.
+**Scope clarification:** This counter operates at the **cross-cycle** level. `update_tool_only_turns` is called once per cycle (line 1660), after `act_with_tools` returns. In the current single-pass architecture, the nudge_at_6 threshold means 6 separate user messages each producing tool-containing responses. **This bug did NOT cause the incident** (that was Bug 2). However, it is a latent bug: in multi-cycle scenarios, a model that always emits interstitial text alongside tools will never trigger the cross-cycle nudge/strip, allowing indefinite tool usage across messages.
+
+**Problem:** When the model emits text + tool calls in the same turn (e.g., "Now let me look at the MLX training script..." + `read_file`), the counter resets to 0. The TerminationConfig's nudge_at_6/strip_at_9 never fires because the counter never reaches 6.
 
 **Fix:** The counter should track _consecutive turns that include tool calls_ (regardless of whether text is also present), not _turns that are tool-only_. The reset condition should be: a turn that produces text with NO tool results. A turn that produces both text and tool results should still increment the counter.
 
@@ -46,7 +48,7 @@ fn update_tool_only_turns(&mut self, action: &ActionResult) {
 
 The current architecture is single-pass: `perceive → reason → decide → act`. The `act_with_tools` function runs the tool continuation loop (up to `max_iterations=10` rounds), but there is **no nudge/strip check inside this loop**. The nudge is only injected during `perceive` and tools are only stripped during `reason`, both of which execute once per cycle.
 
-This means: within a single user turn, the model can chain 10 rounds of tool calls with no termination enforcement beyond the budget ceiling. The nudge_at_6 threshold is meaningless when 10 tool rounds happen inside a single act phase.
+This means: within a single user turn, the model can chain 10 rounds of tool calls with no termination enforcement beyond the budget ceiling. The cross-cycle nudge_at_6 threshold (Bug 1) is irrelevant here because it only evaluates between cycles, not within the tool continuation loop. **This is the root cause of the incident.**
 
 **Fix:** The tool continuation loop in `act_with_tools` must enforce its own progress check. After N tool rounds without the model producing a final text response (i.e., every round produces more tool calls), inject the nudge directive into the continuation messages. After N+M more rounds, strip tools from the continuation request, forcing a text response. This mirrors the cycle-level nudge/strip but operates within the tool continuation loop.
 
@@ -58,7 +60,7 @@ When the model returns text + tool_calls in a tool continuation response, the te
 
 This is the root cause of the double-response pattern filed as #1614. The model emits partial "thinking aloud" text alongside tool calls.
 
-**Fix:** During tool continuation rounds, if the response contains both text and tool calls, the text should be treated as internal reasoning (not streamed to the user as a response). Only the final response (the one with no tool calls) should be delivered. The interstitial text can optionally be preserved in the continuation context (so the model maintains coherence) but should not be streamed.
+**Fix:** During tool continuation rounds, if the response contains both text and tool calls, the text should be treated as internal reasoning (not streamed to the user as a response). Only the final response (the one with no tool calls) should be delivered. The interstitial text should be preserved in the continuation context (so the model maintains coherence) and accumulated in an internal buffer, but should not be streamed. If the accumulated interstitial text contains information relevant to the final answer, the implementer should consider whether to append it to the final response context.
 
 ### Bug 4: Tool errors silently swallowed in continuation chain
 
@@ -99,7 +101,7 @@ New logic:
 fn update_tool_turns(&mut self, action: &ActionResult) {
     if !action.tool_results.is_empty() {
         // Any turn with tool results increments, even if text was also emitted.
-        self.consecutive_tool_turns += 1;
+        self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
     } else {
         // Only a pure text turn (no tools) resets the counter.
         self.consecutive_tool_turns = 0;
@@ -115,29 +117,40 @@ Add a `tool_round_counter` inside `act_with_tools` (local to the function, not e
 
 ```rust
 // Inside act_with_tools loop:
-let nudge_threshold = self.budget.config().termination.tool_round_nudge_threshold();
-let strip_threshold = nudge_threshold + self.budget.config().termination.tool_round_strip_after_nudge();
+let tc = &self.budget.config().termination;
+let nudge_threshold = tc.tool_round_nudge_after;
+let strip_threshold = nudge_threshold.saturating_add(tc.tool_round_strip_after_nudge);
 
-if round >= strip_threshold {
+if nudge_threshold > 0 && round >= strip_threshold {
     // Force text-only response
     continuation_request.tools = vec![];
 }
-if round >= nudge_threshold {
+if nudge_threshold > 0 && round >= nudge_threshold {
     // Inject progress nudge
     state.continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
 }
 ```
 
-New `TerminationConfig` fields:
+New `TerminationConfig` fields (with serde defaults for backward compatibility):
 ```rust
 /// Tool rounds within act_with_tools before injecting a progress nudge.
 /// 0 disables. Default: 4.
+#[serde(default = "default_tool_round_nudge_after")]
 pub tool_round_nudge_after: u16,
 
 /// Additional tool rounds after nudge before stripping tools.
 /// Default: 2.
+#[serde(default = "default_tool_round_strip_after_nudge")]
 pub tool_round_strip_after_nudge: u16,
 ```
+
+Corresponding default functions:
+```rust
+fn default_tool_round_nudge_after() -> u16 { 4 }
+fn default_tool_round_strip_after_nudge() -> u16 { 2 }
+```
+
+The `Default` impl for `TerminationConfig` must also include these fields.
 
 ### Change 3: Suppress interstitial text during tool continuation
 
@@ -148,7 +161,13 @@ In `act_with_tools`, when a tool continuation response contains both text and to
 2. Preserve the text in continuation_messages for model coherence.
 3. Only stream/return the text from the final response (no tool calls).
 
-Implementation: the `request_tool_continuation` path already streams text deltas via the callback. To suppress interstitial text, wrap the callback during non-final rounds to buffer text deltas instead of forwarding them. If the response turns out to be final (no tool calls), flush the buffer. If it's not final (more tool calls), discard the buffer.
+**Streaming timing constraint:** Text deltas are forwarded eagerly during `request_completion` via `ProviderStreamEvent::TextDelta` callbacks. You cannot decide to suppress text retroactively after the response completes. The implementation must use a **two-phase buffering approach**:
+
+1. During ALL tool continuation rounds, use a buffering callback wrapper that captures `TextDelta` events into a buffer instead of forwarding them to the user-facing callback.
+2. After the continuation response completes: if `response.tool_calls.is_empty()` (this is the final round), flush the buffered text deltas to the real callback as if they streamed normally. If `response.tool_calls` is non-empty (more tool rounds coming), discard the buffer.
+3. This means text in continuation rounds is always buffered and only flushed retroactively for the final round. The user never sees interstitial "thinking aloud" text.
+4. Non-text stream events (`ToolCallStart`, `ToolCallEnd`, `ToolResult`, etc.) should still be forwarded immediately — only `TextDelta` is buffered.
+5. The discarded interstitial text should still be included in `continuation_messages` for model coherence (the model needs to see what it said to maintain context).
 
 ### Change 4: Surface tool errors in streaming + continuation directive
 
@@ -157,6 +176,8 @@ Implementation: the `request_tool_continuation` path already streams text deltas
 - `engine/crates/fx-kernel/src/streaming.rs`
 
 Add `StreamEvent::ToolError { tool_name: String, error: String }` variant.
+
+**Backward compatibility:** `StreamEvent` derives `Serialize`/`Deserialize` (streaming.rs). The new variant must be additive. Existing consumers (TUI, Swift app, SSE clients) that don't know about `ToolError` should gracefully ignore it. Serde's default tagged enum handling will produce an unknown variant for old consumers; the TUI's `handle_stream_event` match should include a catch-all arm that ignores unknown events.
 
 In `execute_tool_round`, after executing tool calls, check for failures. If any:
 1. Emit `StreamEvent::ToolError` for each failed tool.
@@ -171,7 +192,7 @@ After every N tool rounds (e.g., every 3), inject a system message into continua
 "Reminder: The user's request was: '{original_user_message}'. Stay focused on delivering this output. If you have enough information, produce the result now."
 ```
 
-This is the `user_message` from `ProcessedPerception`, which is already available. Pass it through to `act_with_tools` so it can inject it periodically.
+This is the `user_message` from `ProcessedPerception`, which is already available. To make it accessible inside `act_with_tools`, store the user message in engine state during `perceive` (e.g., `self.current_user_message = Some(user_message.clone())`). This avoids changing the `act_with_tools` function signature (`decision, calls, llm, context_messages, stream`) and keeps the anchor injection self-contained. Clear the field in `prepare_cycle`.
 
 ---
 
@@ -195,12 +216,33 @@ Existing fields unchanged:
 
 ### Unit tests (per change):
 
-1. **Counter fix:** Turn with tools+text increments counter; turn with text-only resets.
-2. **Continuation nudge:** After N rounds, continuation messages include progress directive.
-3. **Continuation strip:** After N+M rounds, continuation request has empty tools.
-4. **Interstitial suppression:** Text+tools response does not emit TextDelta stream events for the text; final text-only response does.
-5. **Error surfacing:** Failed tool emits ToolError stream event and error directive in continuation messages.
-6. **Task anchor:** After every 3 rounds, continuation messages include task reminder.
+1. **Counter fix:**
+   - Turn with tools+text increments counter.
+   - Turn with text-only resets counter.
+   - Turn with tools-only increments counter (existing behavior preserved).
+   - Counter uses `saturating_add` (no overflow on u16::MAX).
+
+2. **Continuation nudge/strip (boundary conditions):**
+   - At round = `tool_round_nudge_after - 1`: no nudge in messages.
+   - At round = `tool_round_nudge_after`: nudge directive present in messages.
+   - At round = `tool_round_nudge_after + tool_round_strip_after_nudge - 1`: nudge present, tools NOT stripped.
+   - At round = `tool_round_nudge_after + tool_round_strip_after_nudge`: tools stripped (empty vec), nudge present.
+   - With `tool_round_nudge_after = 0`: nudge and strip disabled, loop runs to `max_iterations`.
+
+3. **Interstitial suppression:**
+   - Text+tools continuation response does not emit `TextDelta` stream events for the text.
+   - Final text-only response DOES emit `TextDelta` stream events.
+   - Non-text stream events (`ToolCallStart`, etc.) are forwarded immediately regardless of round.
+   - Discarded interstitial text is still present in continuation_messages for model coherence.
+
+4. **Error surfacing:**
+   - Failed tool emits `ToolError` stream event with tool name and error message.
+   - Error directive appears in continuation messages after a failed tool.
+   - Successful tools do not emit `ToolError` or inject error directive.
+
+5. **Task anchor:**
+   - After every 3 rounds, continuation messages include task reminder with original user message.
+   - Anchor not injected before round 3.
 
 ### Integration test (TUI smoke):
 
