@@ -179,7 +179,14 @@ pub fn parse_command(value: &str) -> ParsedCommand {
             name: parts.next().map(ToString::to_string),
         },
         "search" => ParsedCommand::Search {
-            query: parts.next().map(ToString::to_string),
+            query: {
+                let rest: Vec<&str> = parts.collect();
+                if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.join(" "))
+                }
+            },
         },
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
@@ -944,6 +951,16 @@ mod tests {
             parse_command("/search weather"),
             ParsedCommand::Search {
                 query: Some("weather".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_search_command_with_multi_word_query() {
+        assert_eq!(
+            parse_command("/search weather api"),
+            ParsedCommand::Search {
+                query: Some("weather api".to_string()),
             }
         );
     }

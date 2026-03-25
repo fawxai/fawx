@@ -1996,6 +1996,7 @@ mod tests {
     use fx_config::manager::ConfigManager;
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::test_support::create_test_model_dir;
+    use fx_loadable::test_support::write_test_skill;
     use fx_subagent::test_support::StubSubagentControl;
     use std::cell::Cell;
     use std::io;
@@ -2015,49 +2016,6 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("data dir");
         config.general.data_dir = Some(data_dir);
         (config, temp_dir)
-    }
-
-    fn test_manifest_toml(name: &str) -> String {
-        format!(
-            r#"name = "{name}"
-version = "1.0.0"
-description = "{name} skill"
-author = "Test"
-api_version = "host_api_v1"
-entry_point = "run"
-"#
-        )
-    }
-
-    fn invocable_wasm_bytes() -> Vec<u8> {
-        let wat = r#"
-            (module
-                (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
-                (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
-                (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
-                (import "host_api_v1" "get_input" (func $get_input (result i32)))
-                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
-                (memory (export "memory") 1)
-                (func (export "run")
-                    (i32.store8 (i32.const 0) (i32.const 111))
-                    (i32.store8 (i32.const 1) (i32.const 107))
-                    (call $set_output (i32.const 0) (i32.const 2))
-                )
-            )
-        "#;
-        wat.as_bytes().to_vec()
-    }
-
-    fn write_test_skill(skills_dir: &Path, name: &str) {
-        let skill_dir = skills_dir.join(name);
-        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
-        std::fs::write(skill_dir.join("manifest.toml"), test_manifest_toml(name))
-            .expect("write manifest");
-        std::fs::write(
-            skill_dir.join(format!("{name}.wasm")),
-            invocable_wasm_bytes(),
-        )
-        .expect("write wasm");
     }
 
     fn registry_has_skill(bundle: &LoopEngineBundle, name: &str) -> bool {
@@ -2737,7 +2695,7 @@ entry_point = "run"
         );
 
         tokio::time::sleep(Duration::from_millis(500)).await;
-        write_test_skill(&skills_dir, "runtimeinstallwatcher");
+        write_test_skill(&skills_dir, "runtimeinstallwatcher").expect("write test skill");
         wait_for_skill_registration(&bundle, "runtimeinstallwatcher").await;
     }
 
