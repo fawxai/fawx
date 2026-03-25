@@ -43,16 +43,21 @@ impl CloudGpuSkill {
         )
     }
 
-    async fn execute_tool(&self, tool_name: &str, arguments: &str) -> Result<String, SkillError> {
+    async fn execute_tool(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         match tool_name {
             GPU_CREATE_TOOL => self.handle_create(arguments).await,
             GPU_LIST_TOOL => self.handle_list(arguments).await,
             GPU_STATUS_TOOL => self.handle_status(arguments).await,
             GPU_STOP_TOOL => self.handle_stop(arguments).await,
             GPU_DESTROY_TOOL => self.handle_destroy(arguments).await,
-            GPU_EXEC_TOOL => self.handle_exec(arguments).await,
-            GPU_UPLOAD_TOOL => self.handle_upload(arguments).await,
-            GPU_DOWNLOAD_TOOL => self.handle_download(arguments).await,
+            GPU_EXEC_TOOL => self.handle_exec(arguments, cancel).await,
+            GPU_UPLOAD_TOOL => self.handle_upload(arguments, cancel).await,
+            GPU_DOWNLOAD_TOOL => self.handle_download(arguments, cancel).await,
             _ => Err(format!("unknown cloud gpu tool: {tool_name}")),
         }
     }
@@ -111,20 +116,38 @@ impl CloudGpuSkill {
         })
     }
 
-    async fn handle_exec(&self, arguments: &str) -> Result<String, SkillError> {
+    async fn handle_exec(
+        &self,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         let request: GpuExecRequest = parse_request(arguments)?;
         let result = self
             .provider
-            .exec(&request.pod_id, &request.command, request.timeout_seconds)
+            .exec(
+                &request.pod_id,
+                &request.command,
+                request.timeout_seconds,
+                cancel,
+            )
             .await
             .map_err(serialize_gpu_error)?;
         serialize_response(&GpuExecResponse { result })
     }
 
-    async fn handle_upload(&self, arguments: &str) -> Result<String, SkillError> {
+    async fn handle_upload(
+        &self,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         let request: GpuUploadRequest = parse_request(arguments)?;
         self.provider
-            .upload(&request.pod_id, &request.local_path, &request.remote_path)
+            .upload(
+                &request.pod_id,
+                &request.local_path,
+                &request.remote_path,
+                cancel,
+            )
             .await
             .map_err(serialize_gpu_error)?;
         serialize_response(&GpuUploadResponse {
@@ -135,10 +158,19 @@ impl CloudGpuSkill {
         })
     }
 
-    async fn handle_download(&self, arguments: &str) -> Result<String, SkillError> {
+    async fn handle_download(
+        &self,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         let request: GpuDownloadRequest = parse_request(arguments)?;
         self.provider
-            .download(&request.pod_id, &request.remote_path, &request.local_path)
+            .download(
+                &request.pod_id,
+                &request.remote_path,
+                &request.local_path,
+                cancel,
+            )
             .await
             .map_err(serialize_gpu_error)?;
         serialize_response(&GpuDownloadResponse {
@@ -177,12 +209,12 @@ impl Skill for CloudGpuSkill {
         &self,
         tool_name: &str,
         arguments: &str,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
         if !Self::handles_tool(tool_name) {
             return None;
         }
-        Some(self.execute_tool(tool_name, arguments).await)
+        Some(self.execute_tool(tool_name, arguments, cancel).await)
     }
 }
 
@@ -302,12 +334,13 @@ fn serialize_gpu_error(error: GpuError) -> SkillError {
 }
 
 fn serialize_error_message(message: String) -> SkillError {
-    let response = ErrorResponse {
-        error: message.clone(),
-    };
+    let response = ErrorResponse { error: message };
     match serde_json::to_string(&response) {
         Ok(json) => json,
-        Err(error) => format!("serialization failed: {error}; original error: {message}"),
+        Err(error) => format!(
+            "serialization failed: {error}; original error: {}",
+            response.error
+        ),
     }
 }
 
@@ -465,7 +498,7 @@ fn pod_config_schema() -> serde_json::Value {
                 "additionalProperties": { "type": "string" }
             }
         },
-        "required": ["name", "gpu", "gpu_count", "image", "disk_gb", "env"]
+        "required": ["name", "gpu", "gpu_count", "image", "disk_gb"]
     })
 }
 
@@ -515,6 +548,12 @@ mod tests {
         fn record_call(&self, call: impl Into<String>) {
             self.calls.lock().unwrap().push(call.into());
         }
+
+        fn cancel_suffix(cancel: Option<&CancellationToken>) -> String {
+            cancel.map_or_else(String::new, |token| {
+                format!(":cancelled:{}", token.is_cancelled())
+            })
+        }
     }
 
     #[async_trait]
@@ -557,8 +596,12 @@ mod tests {
             pod_id: &str,
             command: &str,
             timeout_seconds: u32,
+            cancel: Option<&CancellationToken>,
         ) -> Result<ExecResult, GpuError> {
-            self.record_call(format!("exec:{pod_id}:{command}:{timeout_seconds}"));
+            self.record_call(format!(
+                "exec:{pod_id}:{command}:{timeout_seconds}{}",
+                Self::cancel_suffix(cancel)
+            ));
             Ok(sample_exec_result())
         }
 
@@ -567,10 +610,12 @@ mod tests {
             pod_id: &str,
             local_path: &std::path::Path,
             remote_path: &str,
+            cancel: Option<&CancellationToken>,
         ) -> Result<(), GpuError> {
             self.record_call(format!(
-                "upload:{pod_id}:{}:{remote_path}",
-                local_path.display()
+                "upload:{pod_id}:{}:{remote_path}{}",
+                local_path.display(),
+                Self::cancel_suffix(cancel)
             ));
             Ok(())
         }
@@ -580,10 +625,12 @@ mod tests {
             pod_id: &str,
             remote_path: &str,
             local_path: &std::path::Path,
+            cancel: Option<&CancellationToken>,
         ) -> Result<(), GpuError> {
             self.record_call(format!(
-                "download:{pod_id}:{remote_path}:{}",
-                local_path.display()
+                "download:{pod_id}:{remote_path}:{}{}",
+                local_path.display(),
+                Self::cancel_suffix(cancel)
             ));
             Ok(())
         }
@@ -632,8 +679,17 @@ mod tests {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, SkillError> {
+        execute_tool_with_cancel(skill, tool_name, arguments, None).await
+    }
+
+    async fn execute_tool_with_cancel(
+        skill: &CloudGpuSkill,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         skill
-            .execute(tool_name, &arguments.to_string(), None)
+            .execute(tool_name, &arguments.to_string(), cancel)
             .await
             .expect("tool should be handled")
     }
@@ -647,7 +703,7 @@ mod tests {
             .expect("create pod");
         let pods = provider.list_pods().await.expect("list pods");
         let exec = provider
-            .exec("pod-1", "nvidia-smi", 30)
+            .exec("pod-1", "nvidia-smi", 30, None)
             .await
             .expect("exec command");
 
@@ -657,18 +713,13 @@ mod tests {
     }
 
     async fn exercise_lifecycle_tools(skill: &CloudGpuSkill) {
+        let _ = execute_tool(skill, GPU_CREATE_TOOL, json!({ "config": sample_config() })).await;
+        let _ = execute_tool(skill, GPU_LIST_TOOL, json!({})).await;
+        let _ = execute_tool(skill, GPU_STATUS_TOOL, json!({ "pod_id": "pod-1" })).await;
+        let _ = execute_tool(skill, GPU_STOP_TOOL, json!({ "pod_id": "pod-1" })).await;
+        let _ = execute_tool(skill, GPU_DESTROY_TOOL, json!({ "pod_id": "pod-1" })).await;
         let _ = execute_tool(
-            &skill,
-            GPU_CREATE_TOOL,
-            json!({ "config": sample_config() }),
-        )
-        .await;
-        let _ = execute_tool(&skill, GPU_LIST_TOOL, json!({})).await;
-        let _ = execute_tool(&skill, GPU_STATUS_TOOL, json!({ "pod_id": "pod-1" })).await;
-        let _ = execute_tool(&skill, GPU_STOP_TOOL, json!({ "pod_id": "pod-1" })).await;
-        let _ = execute_tool(&skill, GPU_DESTROY_TOOL, json!({ "pod_id": "pod-1" })).await;
-        let _ = execute_tool(
-            &skill,
+            skill,
             GPU_EXEC_TOOL,
             json!({ "pod_id": "pod-1", "command": "nvidia-smi", "timeout_seconds": 30 }),
         )
@@ -677,7 +728,7 @@ mod tests {
 
     async fn exercise_transfer_tools(skill: &CloudGpuSkill) {
         let _ = execute_tool(
-            &skill,
+            skill,
             GPU_UPLOAD_TOOL,
             json!({
                 "pod_id": "pod-1",
@@ -687,7 +738,7 @@ mod tests {
         )
         .await;
         let _ = execute_tool(
-            &skill,
+            skill,
             GPU_DOWNLOAD_TOOL,
             json!({
                 "pod_id": "pod-1",
@@ -722,6 +773,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_upload_and_download_forward_cancellation_token() {
+        let (skill, calls) = test_skill(false);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let _ = execute_tool_with_cancel(
+            &skill,
+            GPU_EXEC_TOOL,
+            json!({ "pod_id": "pod-1", "command": "nvidia-smi", "timeout_seconds": 30 }),
+            Some(&cancel),
+        )
+        .await;
+        let _ = execute_tool_with_cancel(
+            &skill,
+            GPU_UPLOAD_TOOL,
+            json!({
+                "pod_id": "pod-1",
+                "local_path": "/tmp/input.txt",
+                "remote_path": "/workspace/input.txt"
+            }),
+            Some(&cancel),
+        )
+        .await;
+        let _ = execute_tool_with_cancel(
+            &skill,
+            GPU_DOWNLOAD_TOOL,
+            json!({
+                "pod_id": "pod-1",
+                "remote_path": "/workspace/output.txt",
+                "local_path": "/tmp/output.txt"
+            }),
+            Some(&cancel),
+        )
+        .await;
+
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![
+                "exec:pod-1:nvidia-smi:30:cancelled:true",
+                "upload:pod-1:/tmp/input.txt:/workspace/input.txt:cancelled:true",
+                "download:pod-1:/workspace/output.txt:/tmp/output.txt:cancelled:true",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_tool_returns_none() {
         let (skill, _) = test_skill(false);
         let result = skill.execute("gpu_unknown", "{}", None).await;
@@ -738,6 +835,20 @@ mod tests {
         let payload: ErrorResponse = serde_json::from_str(&result).expect("error json");
 
         assert_eq!(payload.error, "pod not found: pod-404");
+    }
+
+    #[test]
+    fn gpu_create_schema_allows_omitting_env() {
+        let schema = gpu_create_definition().parameters;
+        let required = schema["properties"]["config"]["required"]
+            .as_array()
+            .expect("config schema should list required fields");
+        let required_fields: Vec<&str> = required
+            .iter()
+            .map(|field| field.as_str().expect("required field should be a string"))
+            .collect();
+
+        assert!(!required_fields.contains(&"env"));
     }
 
     #[test]
