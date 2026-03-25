@@ -1810,6 +1810,7 @@ dependencies = [
  "fx-session",
  "fx-skills",
  "fx-transactions",
+ "libc",
  "notify",
  "serde",
  "serde_json",

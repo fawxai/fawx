@@ -355,80 +355,44 @@ impl SkillRuntime {
                  body_ptr: u32,
                  body_len: u32|
                  -> u32 {
-                    // Check Network capability
                     if !caller.data().has_capability(&Capability::Network) {
                         tracing::warn!("http_request denied: skill lacks Network capability");
                         return 0;
                     }
-
-                    // Read all string parameters from WASM memory
-                    let method = match caller.data().read_string(&caller, method_ptr, method_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read method: {}", e);
-                            return 0;
-                        }
+                    let Some(method) = Self::read_host_string(
+                        &caller,
+                        method_ptr,
+                        method_len,
+                        "http_request method",
+                    ) else {
+                        return 0;
                     };
-
-                    let url = match caller.data().read_string(&caller, url_ptr, url_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read url: {}", e);
-                            return 0;
-                        }
+                    let Some(url) =
+                        Self::read_host_string(&caller, url_ptr, url_len, "http_request url")
+                    else {
+                        return 0;
                     };
-
-                    let headers = match caller.data().read_string(&caller, headers_ptr, headers_len)
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read headers: {}", e);
-                            return 0;
-                        }
+                    let Some(headers) = Self::read_host_string(
+                        &caller,
+                        headers_ptr,
+                        headers_len,
+                        "http_request headers",
+                    ) else {
+                        return 0;
                     };
-
-                    let body = match caller.data().read_string(&caller, body_ptr, body_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read body: {}", e);
-                            return 0;
-                        }
+                    let Some(body) =
+                        Self::read_host_string(&caller, body_ptr, body_len, "http_request body")
+                    else {
+                        return 0;
                     };
-
-                    // Call the host API
-                    let response = match caller
+                    let Some(response) = caller
                         .data()
                         .api
                         .http_request(&method, &url, &headers, &body)
-                    {
-                        Some(r) => r,
-                        None => return 0,
+                    else {
+                        return 0;
                     };
-
-                    // Write response to WASM memory
-                    let memory = match caller.data().memory {
-                        Some(m) => m,
-                        None => {
-                            tracing::error!("Memory not initialized for http_request");
-                            return 0;
-                        }
-                    };
-                    let mut alloc_offset = caller.data().alloc_offset;
-                    match HostState::write_to_memory(
-                        memory,
-                        &mut caller,
-                        &response,
-                        &mut alloc_offset,
-                    ) {
-                        Ok(ptr) => {
-                            caller.data_mut().alloc_offset = alloc_offset;
-                            ptr
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to write http_request response: {}", e);
-                            0
-                        }
-                    }
+                    Self::write_host_string(&mut caller, &response, "http_request")
                 },
             )
             .map_err(|e| SkillError::Execution(format!("Failed to link http_request: {}", e)))?;

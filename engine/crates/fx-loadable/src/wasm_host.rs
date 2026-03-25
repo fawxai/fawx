@@ -10,6 +10,8 @@ use fx_skills::manifest::Capability;
 use fx_skills::storage::SkillStorage;
 use serde::Serialize;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -210,11 +212,31 @@ fn execute_shell_command(command: &str, timeout_ms: u32) -> Option<String> {
 }
 
 fn spawn_shell(command: &str) -> std::io::Result<Child> {
-    Command::new("sh")
-        .args(["-c", command])
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    configure_shell_process_group(&mut cmd);
+    cmd.spawn()
+}
+
+#[cfg(unix)]
+fn configure_shell_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(create_process_group);
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_shell_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn create_process_group() -> std::io::Result<()> {
+    if unsafe { libc::setpgid(0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn take_command_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
@@ -236,29 +258,16 @@ where
     thread::spawn(move || read_capped_output(reader))
 }
 
-fn read_capped_output<R>(mut reader: R) -> Vec<u8>
+fn read_capped_output<R>(reader: R) -> Vec<u8>
 where
     R: Read,
 {
     let mut output = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return output,
-            Ok(read) => append_capped_bytes(&mut output, &buffer[..read]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                tracing::error!("exec_command: failed to read process output: {error}");
-                return output;
-            }
-        }
+    let mut limited_reader = reader.take(COMMAND_OUTPUT_LIMIT_BYTES as u64);
+    if let Err(error) = limited_reader.read_to_end(&mut output) {
+        tracing::error!("exec_command: failed to read process output: {error}");
     }
-}
-
-fn append_capped_bytes(output: &mut Vec<u8>, chunk: &[u8]) {
-    let remaining = COMMAND_OUTPUT_LIMIT_BYTES.saturating_sub(output.len());
-    let take = remaining.min(chunk.len());
-    output.extend_from_slice(&chunk[..take]);
+    output
 }
 
 fn wait_for_command(child: &mut Child, timeout_ms: u32) -> i32 {
@@ -279,7 +288,7 @@ fn wait_for_command(child: &mut Child, timeout_ms: u32) -> i32 {
 }
 
 fn kill_timed_out_child(child: &mut Child) -> i32 {
-    if let Err(error) = child.kill() {
+    if let Err(error) = terminate_timed_out_child(child) {
         tracing::error!("exec_command: failed to kill timed out child: {error}");
         return COMMAND_FAILURE_EXIT_CODE;
     }
@@ -288,6 +297,23 @@ fn kill_timed_out_child(child: &mut Child) -> i32 {
         return COMMAND_FAILURE_EXIT_CODE;
     }
     COMMAND_TIMEOUT_EXIT_CODE
+}
+
+#[cfg(unix)]
+fn terminate_timed_out_child(child: &mut Child) -> std::io::Result<()> {
+    if unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn terminate_timed_out_child(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
 }
 
 fn join_output_reader(handle: JoinHandle<Vec<u8>>, stream_name: &str) -> Option<String> {
@@ -402,6 +428,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::env;
+    use std::io::Write;
     use tempfile::TempDir;
     use zeroize::Zeroizing;
 
@@ -415,8 +443,32 @@ mod tests {
         }
     }
 
+    const STDIN_HELPER_ENV: &str = "FX_LOADABLE_STDIN_HELPER";
+
     fn make_api(input: &str) -> LiveHostApi {
         LiveHostApi::new(make_config(input))
+    }
+
+    fn make_shell_api() -> LiveHostApi {
+        LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Shell],
+            credential_provider: None,
+        })
+    }
+
+    fn parse_command_result(json: &str) -> Value {
+        serde_json::from_str(json).expect("parse command result")
+    }
+
+    fn run_shell_command(command: &str, timeout_ms: u32) -> Value {
+        let api = make_shell_api();
+        let json = api
+            .exec_command(command, timeout_ms)
+            .expect("shell command result");
+        parse_command_result(&json)
     }
 
     /// Mock credential provider for testing.
@@ -440,6 +492,57 @@ mod tests {
     impl CredentialProvider for MockCredentialProvider {
         fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
             self.credentials.get(key).map(|v| Zeroizing::new(v.clone()))
+        }
+    }
+
+    struct FailAfterLimitReader {
+        bytes_remaining: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for FailAfterLimitReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes_remaining == 0 {
+                panic!("reader was polled after hitting the output cap");
+            }
+            let bytes_to_read = self.bytes_remaining.min(self.chunk_size).min(buf.len());
+            buf[..bytes_to_read].fill(b'x');
+            self.bytes_remaining -= bytes_to_read;
+            Ok(bytes_to_read)
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_background_pid(pid_file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(pid) = std::fs::read_to_string(pid_file) {
+                return pid.trim().parse().expect("background pid");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for background pid at {}",
+            pid_file.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if !process_exists(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -561,21 +664,86 @@ mod tests {
 
     #[test]
     fn exec_command_allowed_with_shell_capability() {
-        let api = LiveHostApi::new(LiveHostApiConfig {
-            skill_name: "test",
-            input: String::new(),
-            storage_quota: None,
-            capabilities: vec![Capability::Shell],
-            credential_provider: None,
-        });
-
-        let json = api
-            .exec_command("printf hello", 1_000)
-            .expect("shell command result");
-        let result: Value = serde_json::from_str(&json).expect("parse command result");
+        let result = run_shell_command("printf hello", 1_000);
         assert_eq!(result["stdout"], "hello");
         assert_eq!(result["stderr"], "");
         assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    fn read_capped_output_stops_after_limit() {
+        let reader = FailAfterLimitReader {
+            bytes_remaining: COMMAND_OUTPUT_LIMIT_BYTES,
+            chunk_size: 8192,
+        };
+
+        let output = read_capped_output(reader);
+
+        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT_BYTES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_stdin_helper_reads_eof() {
+        if env::var_os(STDIN_HELPER_ENV).is_none() {
+            return;
+        }
+        let result = run_shell_command(
+            r#"if read value; then printf '%s' "$value"; else printf eof; fi"#,
+            1_000,
+        );
+        assert_eq!(result["stdout"], "eof");
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_does_not_inherit_parent_stdin() {
+        let exe = env::current_exe().expect("test binary path");
+        let mut child = Command::new(exe)
+            .arg("--exact")
+            .arg("exec_command_stdin_helper_reads_eof")
+            .env(STDIN_HELPER_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stdin helper");
+        child
+            .stdin
+            .take()
+            .expect("helper stdin")
+            .write_all(b"from-parent\n")
+            .expect("write helper stdin");
+        let output = child.wait_with_output().expect("helper output");
+        assert!(
+            output.status.success(),
+            "stdin helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_timeout_kills_background_process_group() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let pid_file = temp_dir.path().join("background.pid");
+        let command = format!("sleep 1 & echo $! > '{}' && wait", pid_file.display());
+        let started_at = Instant::now();
+
+        let result = run_shell_command(&command, 50);
+        let elapsed = started_at.elapsed();
+        let background_pid = read_background_pid(&pid_file);
+        wait_for_process_exit(background_pid);
+        if process_exists(background_pid) {
+            let _ = unsafe { libc::kill(background_pid, libc::SIGKILL) };
+        }
+
+        assert_eq!(result["exit_code"], COMMAND_TIMEOUT_EXIT_CODE);
+        assert!(elapsed < Duration::from_millis(500));
+        assert!(!process_exists(background_pid));
     }
 
     #[test]
