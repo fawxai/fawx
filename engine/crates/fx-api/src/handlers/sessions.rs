@@ -35,8 +35,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const SESSION_MEMORY_MAX_ITEMS: usize = 40;
-const SESSION_MEMORY_MAX_TOKENS: usize = 4_000;
+// Coarse API validation gate. Session-level dynamic caps enforce the real limit.
+const SESSION_MEMORY_MAX_ITEMS: usize = 80;
+const SESSION_MEMORY_MAX_TOKENS: usize = 8_000;
 
 struct TurnInput<'a> {
     message: Cow<'a, str>,
@@ -744,6 +745,32 @@ mod tests {
                     ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
+    }
+
+    #[test]
+    fn validate_session_memory_accepts_maximum_dynamic_item_cap() {
+        let mut memory = SessionMemory::default();
+        memory.active_files = (0..SESSION_MEMORY_MAX_ITEMS)
+            .map(|index| format!("file-{index}.rs"))
+            .collect();
+
+        let validated = validate_session_memory(memory).expect("validation should pass");
+
+        assert_eq!(validated.active_files.len(), SESSION_MEMORY_MAX_ITEMS);
+    }
+
+    #[test]
+    fn validate_session_memory_accepts_maximum_dynamic_token_cap() {
+        let mut memory = SessionMemory::default();
+        memory.project = Some("a ".repeat(7_900).trim_end().to_string());
+
+        let estimated_tokens = memory.estimated_tokens();
+        assert!(estimated_tokens > 4_000);
+        assert!(estimated_tokens <= SESSION_MEMORY_MAX_TOKENS);
+
+        let validated = validate_session_memory(memory).expect("validation should pass");
+
+        assert_eq!(validated.estimated_tokens(), estimated_tokens);
     }
 
     #[test]

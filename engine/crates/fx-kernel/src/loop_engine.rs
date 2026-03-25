@@ -1067,7 +1067,7 @@ fn parse_summary_sections(summary: &str) -> ParsedSummarySections {
 
 fn summary_section_header(line: &str) -> Option<(SummarySection, Option<&str>)> {
     let (heading, remainder) = line.split_once(':')?;
-    let section = match heading.trim() {
+    let section = match strip_summary_section_numbering(heading) {
         text if text.eq_ignore_ascii_case("Decisions") => SummarySection::Decisions,
         text if text.eq_ignore_ascii_case("Files modified") => SummarySection::FilesModified,
         text if text.eq_ignore_ascii_case("Task state") => SummarySection::TaskState,
@@ -1076,6 +1076,21 @@ fn summary_section_header(line: &str) -> Option<(SummarySection, Option<&str>)> 
     };
     let inline = (!remainder.trim().is_empty()).then_some(remainder.trim());
     Some((section, inline))
+}
+
+fn strip_summary_section_numbering(heading: &str) -> &str {
+    let trimmed = heading.trim();
+    let digits_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
+        return trimmed;
+    }
+    trimmed[digits_len..]
+        .strip_prefix('.')
+        .map_or(trimmed, |remainder| remainder.trim_start())
 }
 
 fn push_summary_section_line(
@@ -1361,6 +1376,8 @@ Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
 const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+/// Maximum time to wait for a best-effort summary during emergency compaction.
+const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl LoopEngine {
     /// Create a loop engine builder.
@@ -3503,9 +3520,8 @@ impl LoopEngine {
     ) -> Option<CompactionResult> {
         let plan = slide_summarization_plan(messages, self.compaction_config.preserve_recent_turns)
             .ok()?;
-        let timeout = std::time::Duration::from_millis(500);
         match tokio::time::timeout(
-            timeout,
+            EMERGENCY_SUMMARY_TIMEOUT,
             self.generate_eviction_summary(&plan.evicted_messages),
         )
         .await
@@ -12914,6 +12930,45 @@ mod context_compaction_tests {
         assert!(llm.prompts()[0].contains("Conversation:"));
     }
 
+    #[tokio::test]
+    async fn extract_memory_from_numbered_summary_skips_llm_fallback() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok("{}".to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let summary = concat!(
+            "1. Decisions:\n",
+            "- summarize before slide\n",
+            "2. Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "3. Task state:\n",
+            "- preserving summary context\n",
+            "4. Key context:\n",
+            "- no second LLM call needed"
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")], Some(summary))
+            .await;
+
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("preserving summary context")
+        );
+        assert_eq!(memory.key_decisions, vec!["summarize before slide"]);
+        assert_eq!(
+            memory.active_files,
+            vec!["engine/crates/fx-kernel/src/loop_engine.rs"]
+        );
+        assert_eq!(memory.custom_context, vec!["no second LLM call needed"]);
+        assert!(llm.prompts().is_empty());
+    }
+
     #[test]
     fn build_extraction_prompt_formats_messages() {
         let prompt = build_extraction_prompt(&[
@@ -12963,6 +13018,44 @@ mod context_compaction_tests {
             "Task state:\n",
             "- Implementing Phase 2\n",
             "Key context:\n",
+            "- Preserve summary markers during follow-up slide"
+        );
+
+        let update = parse_summary_memory_update(summary).expect("summary parse");
+
+        assert_eq!(update.project, None);
+        assert_eq!(
+            update.current_state.as_deref(),
+            Some("Implementing Phase 2")
+        );
+        assert_eq!(
+            update.key_decisions,
+            Some(vec!["Use summarize-before-slide".to_string()])
+        );
+        assert_eq!(
+            update.active_files,
+            Some(vec![
+                "engine/crates/fx-kernel/src/loop_engine.rs".to_string()
+            ])
+        );
+        assert_eq!(
+            update.custom_context,
+            Some(vec![
+                "Preserve summary markers during follow-up slide".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_summary_memory_update_extracts_numbered_sections() {
+        let summary = concat!(
+            "1. Decisions:\n",
+            "- Use summarize-before-slide\n",
+            "2. Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "3. Task state:\n",
+            "- Implementing Phase 2\n",
+            "4. Key context:\n",
             "- Preserve summary markers during follow-up slide"
         );
 
@@ -13318,7 +13411,7 @@ mod context_compaction_tests {
         );
         let llm = Arc::new(ExtractionLlm::with_delay(
             vec![Ok(summary.to_string()), Ok("{}".to_string())],
-            Some(std::time::Duration::from_millis(510)),
+            Some(EMERGENCY_SUMMARY_TIMEOUT + std::time::Duration::from_millis(10)),
         ));
         let mut config = tiered_compaction_config(true);
         config.prune_tool_blocks = false;

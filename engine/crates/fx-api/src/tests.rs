@@ -3145,7 +3145,7 @@ allowed_chat_ids = [123]
             .expect("seed memory");
         let app = build_router(test_state_with_sessions(registry.clone()), None);
 
-        let oversized_project = "memory ".repeat(2_200);
+        let oversized_project = "a ".repeat(8_100);
         let request_body = serde_json::json!({
             "project": oversized_project,
             "last_updated": 0
