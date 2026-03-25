@@ -301,10 +301,16 @@ enum SkillCommands {
     /// List installed skills
     List,
 
+    /// Search the skill registry
+    Search {
+        /// Search query. Leave empty to show all available skills.
+        query: Option<String>,
+    },
+
     /// Install a skill
     Install {
-        /// Path to skill WASM file
-        path: String,
+        /// Skill name or path to WASM file
+        name_or_path: String,
     },
 
     /// Remove a skill
@@ -905,16 +911,33 @@ async fn dispatch_audit(command: AuditCommands) -> anyhow::Result<i32> {
     }
 }
 
+fn looks_like_local_skill_path(name_or_path: &str) -> bool {
+    name_or_path.contains('/') || name_or_path.contains('\\') || name_or_path.ends_with(".wasm")
+}
+
+async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
+    if looks_like_local_skill_path(name_or_path) {
+        commands::skills::install(name_or_path).await?;
+    } else {
+        println!("{}", commands::marketplace::install_output(name_or_path)?);
+    }
+    Ok(0)
+}
+
 async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     match command {
         SkillCommands::List => {
-            commands::skills::list().await?;
+            println!("{}", commands::marketplace::list_output()?);
             Ok(0)
         }
-        SkillCommands::Install { path } => {
-            commands::skills::install(&path).await?;
+        SkillCommands::Search { query } => {
+            println!(
+                "{}",
+                commands::marketplace::search_output(query.as_deref().unwrap_or(""))?
+            );
             Ok(0)
         }
+        SkillCommands::Install { name_or_path } => dispatch_skill_install(&name_or_path).await,
         SkillCommands::Remove { name } => {
             commands::skills::remove(&name).await?;
             Ok(0)
@@ -1055,15 +1078,15 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
         Commands::Search { query } => {
-            commands::marketplace::search_cmd(&query)?;
+            println!("{}", commands::marketplace::search_output(&query)?);
             Ok(0)
         }
         Commands::Install { name } => {
-            commands::marketplace::install_cmd(&name)?;
+            println!("{}", commands::marketplace::install_output(&name)?);
             Ok(0)
         }
         Commands::List => {
-            commands::marketplace::list_cmd()?;
+            println!("{}", commands::marketplace::list_output()?);
             Ok(0)
         }
         #[cfg(not(feature = "oauth-bridge"))]
@@ -1186,9 +1209,9 @@ mod tests {
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
         cleanup_stale_pid_file_at, dispatch_command, ensure_headless_chat_model_available,
-        fawx_tui_binary_name, find_fawx_tui_binary_from, resolve_ripcord_path_with,
-        ripcord_binary_name, Cli, Commands, SessionsCommands, SkillCommands,
-        FAWX_TUI_NOT_FOUND_MESSAGE,
+        fawx_tui_binary_name, find_fawx_tui_binary_from, looks_like_local_skill_path,
+        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SessionsCommands,
+        SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1363,6 +1386,50 @@ mod tests {
                 && tool_name.as_deref() == Some("weather_tool")
                 && path.as_deref() == Some("/tmp/skills")
         ));
+    }
+
+    #[test]
+    fn cli_parses_skill_install_command() {
+        let cli = Cli::parse_from(["fawx", "skill", "install", "github"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Install { name_or_path }
+            }) if name_or_path == "github"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_skill_search_without_query() {
+        let cli = Cli::parse_from(["fawx", "skill", "search"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Search { query: None }
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_parses_skill_search_with_query() {
+        let cli = Cli::parse_from(["fawx", "skill", "search", "weather"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Search { query: Some(query) }
+            }) if query == "weather"
+        ));
+    }
+
+    #[test]
+    fn looks_like_local_skill_path_detects_marketplace_names_and_paths() {
+        assert!(!looks_like_local_skill_path("github"));
+        assert!(!looks_like_local_skill_path("weather"));
+        assert!(!looks_like_local_skill_path("web.fetch"));
+        assert!(looks_like_local_skill_path("weather.wasm"));
+        assert!(looks_like_local_skill_path("./weather"));
+        assert!(looks_like_local_skill_path("/tmp/skill.wasm"));
+        assert!(looks_like_local_skill_path("skills\\weather"));
     }
 
     #[test]

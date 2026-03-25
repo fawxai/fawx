@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod evaluator;
+pub mod git_guard;
 pub mod journal;
 pub mod revert;
 pub mod snapshot;
