@@ -1053,6 +1053,19 @@ fn serialize_stream_event_serializes_error_event_payload() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_tool_error_payload() {
+    let frame = serialize_stream_event(StreamEvent::ToolError {
+        tool_name: "read_file".to_string(),
+        error: "permission denied".to_string(),
+    })
+    .expect("tool error frame");
+
+    assert!(frame.contains("event: tool_error"));
+    assert!(frame.contains("\"tool_name\":\"read_file\""));
+    assert!(frame.contains("\"error\":\"permission denied\""));
+}
+
+#[test]
 fn send_sse_frame_stops_when_receiver_is_closed() {
     let (sender, receiver) = mpsc::channel(1);
     let disconnected = Arc::new(AtomicBool::new(false));
