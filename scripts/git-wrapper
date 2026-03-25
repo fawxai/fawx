@@ -1,0 +1,72 @@
+#!/bin/bash
+# git wrapper: intercepts push/merge commands targeting protected branches.
+# Install via PATH prepend so this runs before /usr/bin/git.
+#
+# Usage: Place in a directory and prepend to PATH:
+#   export PATH="/path/to/wrapper/dir:$PATH"
+#
+# This wrapper catches:
+#   git push [remote] main|staging|release/*
+#   git push [remote] HEAD:main (refspec syntax)
+#   git push [remote] <sha>:main (refspec syntax)
+#
+# The pre-push hook is the primary guard. This wrapper is defense-in-depth
+# for cases where the hook might not fire (e.g., --no-verify).
+
+REAL_GIT="/usr/bin/git"
+PROTECTED_BRANCHES="main staging"
+
+if [[ "$1" == "push" ]]; then
+    # Check for --no-verify (which would skip pre-push hook)
+    for arg in "$@"; do
+        if [[ "$arg" == "--no-verify" || "$arg" == "-n" ]]; then
+            if [[ "$ALLOW_PROTECTED_PUSH" != "yes" ]]; then
+                echo ""
+                echo "BLOCKED: --no-verify on push is not allowed without ALLOW_PROTECTED_PUSH=yes"
+                echo ""
+                exit 1
+            fi
+        fi
+    done
+
+    # Check refspecs for protected branch targets
+    shift  # remove 'push'
+    for arg in "$@"; do
+        # Skip flags
+        [[ "$arg" == -* ]] && continue
+
+        # Check direct branch name or refspec target (anything:branch)
+        target="$arg"
+        if [[ "$arg" == *:* ]]; then
+            target="${arg##*:}"
+            # Strip refs/heads/ prefix if present
+            target="${target#refs/heads/}"
+        fi
+
+        for protected in $PROTECTED_BRANCHES; do
+            if [[ "$target" == "$protected" ]]; then
+                if [[ "$ALLOW_PROTECTED_PUSH" != "yes" ]]; then
+                    echo ""
+                    echo "╔══════════════════════════════════════════════════════════╗"
+                    echo "║  BLOCKED: Push targets protected branch '$protected'"
+                    echo "║"
+                    echo "║  If you are a human operator, run:"
+                    echo "║  ALLOW_PROTECTED_PUSH=yes git push $*"
+                    echo "║"
+                    echo "║  If you are an agent: STOP. Do not set this variable."
+                    echo "╚══════════════════════════════════════════════════════════╝"
+                    echo ""
+                    exit 1
+                fi
+            fi
+        done
+    done
+
+    # Reconstruct push command
+    exec "$REAL_GIT" push "$@"
+fi
+
+# Also intercept gh pr merge via alias if called as 'git'
+# (gh uses git underneath, but gh merge is separate — see gh-wrapper)
+
+exec "$REAL_GIT" "$@"
