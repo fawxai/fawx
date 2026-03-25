@@ -361,10 +361,12 @@ mod tests {
 
         let args = fs::read_to_string(&args_file).expect("pip args");
         let lines: Vec<_> = args.lines().collect();
+        let canonical_experiment_dir =
+            std::fs::canonicalize(&experiment_dir).expect("canonicalize experiment dir");
         assert_eq!(lines[0], "install");
         assert_eq!(lines[1], "--no-cache-dir");
         assert_eq!(lines[2], "-r");
-        assert!(lines[3].starts_with(experiment_dir.to_string_lossy().as_ref()));
+        assert!(lines[3].starts_with(canonical_experiment_dir.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
