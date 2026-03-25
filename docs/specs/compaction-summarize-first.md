@@ -35,7 +35,7 @@ This marker tells the agent how many messages were lost but nothing about what t
 
 1. **Journal flush is truncated:** Pre-eviction flush writes to journal entries capped at 4KB total / 500B per tool result. Tool-heavy sessions hit this cap immediately. The richest context gets the worst preservation.
 
-2. **Session memory extraction is a separate LLM call** on raw evicted messages (tool results truncated to 200 chars). It produces structured memory but is capped at 2,000 tokens / 20 items. Fills up after a few compaction rounds, then new extractions are silently rejected.
+2. **Session memory extraction is a separate LLM call** on raw evicted messages. The extraction prompt in `build_extraction_prompt()` receives full evicted messages, while tool results in the *pruning* path are truncated to 100 chars (`tool_block_summary_max_chars`). Extracted memory is capped at 2,000 tokens / 20 items. Fills up after a few compaction rounds, then new extractions are silently rejected.
 
 3. **Recall is opt-in:** Flushed journal entries are only searchable via `recall_session_context`. The agent must explicitly call it with a query. No automatic re-injection after compaction.
 
@@ -71,8 +71,10 @@ Evictable messages
                   Step 3: Replace evicted messages with summary marker
                   Step 4: If still over target, slide remaining (rare — summary is compact)
    80%: [removed as separate tier — summarization now built into slide]
-   95%: Tier 4 — EMERGENCY (aggressive delete)  [unchanged]
+   95%: Tier 3 — EMERGENCY (aggressive delete, with best-effort summary)
 ```
+
+**Emergency tier:** At 95%, context is critical. Emergency compaction attempts a fast summary (same LLM call, same `max_summary_tokens` cap) before aggressive deletion. If the LLM call fails or takes too long (500ms timeout, shorter than the normal 1-3s), it falls back to current emergency behavior (delete with count marker). The "context is on fire" scenario should still try to preserve what it can, but never block on it.
 
 The threshold ordering becomes: `prune (0.40) < slide (0.60) < emergency (0.95)`. The `summarize_threshold` field is removed; summarization is always attempted before sliding.
 
@@ -212,6 +214,18 @@ Key context: Working in ~/parameter-golf repo. Python 3.11 environment.
 
 The marker uses the existing `summary_message()` function (already implemented for the summarizing compactor). The prompt is the existing `SummarizingCompactor::summary_prompt()`.
 
+### Refactoring the `SummarizingCompactor`
+
+The current `SummarizingCompactor` implements the `CompactionStrategy` trait. With summarization moving into `apply_slide_tier` as a pre-step, the trait-based architecture becomes awkward: `self.conversation_compactor` would always be a `SlidingWindowCompactor`, making the stored strategy field partially redundant.
+
+**Approach: Extract summarization into standalone functions.**
+
+The summarization logic (`generate_summary`, `summary_prompt`, `assemble_summarized_messages`) is extracted from the `SummarizingCompactor` struct into free functions in `conversation_compactor.rs`. The `SummarizingCompactor` struct and `CompactionStrategy` trait are removed. `apply_slide_tier` calls these functions directly when `compaction_llm` is available.
+
+The `self.conversation_compactor` field is removed from `LoopEngine`. `run_sliding_compaction` already constructs a fresh `SlidingWindowCompactor`; the stored strategy was only useful for the Summarize tier, which no longer exists.
+
+This avoids the leaky abstraction where the trait does something different from what `apply_slide_tier` orchestrates.
+
 ---
 
 ## Journal flush changes
@@ -261,14 +275,25 @@ The change is in the caller (`flush_evicted` in loop_engine), not in the journal
 
 `extract_memory_from_summary` parses the already-generated summary text to extract the same structured fields. No second LLM call needed. The summary prompt already produces the same sections (Decisions, Files modified, Task state, Key context).
 
-If parsing fails, falls back to the current LLM extraction call.
+If parsing fails, falls back to the current LLM extraction call. This fallback path is expected to be rarely needed once the summary format stabilizes; flag as technical debt to remove after the summary parsing path is proven stable over ~100 compaction events in production.
 
 ### Cap increase
 
 - Token cap: 2,000 → 4,000 tokens
 - Item cap per list: 20 → 40 items
 
-These are proportional to model context sizes. A 200K context session generates more facts worth remembering than a 32K session. Future: make caps proportional to `model_context_limit`.
+Define caps as fractions of context window to avoid future migrations:
+
+```rust
+fn max_memory_tokens(context_limit: usize) -> usize {
+    (context_limit / 50).clamp(2_000, 8_000)
+}
+fn max_memory_items(context_limit: usize) -> usize {
+    (context_limit / 5_000).clamp(20, 80)
+}
+```
+
+For a 200K context: 4,000 tokens / 40 items. For a 32K context: 2,000 tokens / 20 items (unchanged). This scales automatically with model context size.
 
 ### `preserve_recent_turns` increase
 
@@ -293,10 +318,10 @@ This is configurable, so users with smaller context windows can reduce it.
 
 ### Not in scope (future)
 - Auto-recall when summary markers are themselves evicted (multi-round compaction)
-- Dynamic session memory caps proportional to model context
 - Streaming summarization (generate summary while still processing tool calls)
 - Compaction-aware tool retry (avoid re-running tools whose results were just evicted)
 - Dedicated lightweight compaction model (currently uses `compaction_llm`, which is typically the session model)
+- Logical-turn-based preservation: `preserve_recent_turns` currently counts raw messages, not logical conversation rounds. A single multi-tool turn can consume all protected slots. Future work: count user→assistant exchanges instead of raw messages, ensuring at least N complete conversation rounds are always protected regardless of tool density.
 
 ---
 
@@ -310,7 +335,7 @@ This is configurable, so users with smaller context windows can reduce it.
 6. **Unit: session memory extraction from summary** — verify no second LLM call, structured fields extracted
 7. **Unit: session memory cap increase** — verify 4,000 token / 40 item limits
 8. **Unit: backward-compatible config** — verify old configs with `summarize_threshold` still parse
-9. **Integration: multi-round compaction** — verify summary markers survive into tail zone for subsequent compaction rounds
+9. **Integration: single-round compaction survival** — verify summary marker exists after compaction and is treated as system-like (protected). Multi-round eviction of summary markers is deferred to future auto-recall work.
 10. **Integration: tool-heavy session** — verify user messages are preserved (as summary) after compaction of 20+ tool calls
 
 ### Regression test for the original bug
