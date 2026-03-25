@@ -2204,6 +2204,18 @@ impl CommandHost for HeadlessApp {
     fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
         Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
     }
+
+    fn list_skills(&self) -> anyhow::Result<String> {
+        crate::commands::marketplace::list_output()
+    }
+
+    fn install_skill(&self, name: &str) -> anyhow::Result<String> {
+        crate::commands::marketplace::install_output(name)
+    }
+
+    fn search_skills(&self, query: &str) -> anyhow::Result<String> {
+        crate::commands::marketplace::search_output(query)
+    }
 }
 
 fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {

@@ -93,6 +93,7 @@ syn = { version = "2", features = ["full"] }
 fx-config = { workspace = true, features = ["test-support"] }
 fx-consensus = { workspace = true, features = ["test-support"] }
 fx-embeddings = { workspace = true, features = ["test-support"] }
+fx-loadable = { path = "../fx-loadable", features = ["test-support"] }
 fx-subagent = { workspace = true, features = ["test-support"] }
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }

@@ -1512,15 +1512,21 @@ mod tests {
 
     struct HomeGuard {
         original_home: Option<String>,
+        original_data_dir: Option<String>,
     }
 
     impl HomeGuard {
         fn set(temp_home: &TempDir) -> Self {
             let original_home = std::env::var("HOME").ok();
+            let original_data_dir = std::env::var("FAWX_DATA_DIR").ok();
             unsafe {
                 std::env::set_var("HOME", temp_home.path());
+                std::env::remove_var("FAWX_DATA_DIR");
             }
-            Self { original_home }
+            Self {
+                original_home,
+                original_data_dir,
+            }
         }
     }
 
@@ -1533,6 +1539,16 @@ mod tests {
             } else {
                 unsafe {
                     std::env::remove_var("HOME");
+                }
+            }
+
+            if let Some(data_dir) = &self.original_data_dir {
+                unsafe {
+                    std::env::set_var("FAWX_DATA_DIR", data_dir);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("FAWX_DATA_DIR");
                 }
             }
         }
@@ -1744,15 +1760,11 @@ mod tests {
         let temp_home = TempDir::new().expect("temp home");
         let _home = HomeGuard::set(&temp_home);
         let mut wizard = SetupWizard::new(false).expect("setup wizard");
-        let data_dir = temp_home.path().join(".fawx");
 
-        {
-            // Verify the wizard did not eagerly open credentials.db during construction.
-            // The handle is scoped so the redb file lock is released before the wizard
-            // lazily opens the same database below.
-            EncryptedFileCredentialStore::open(&data_dir)
-                .expect("wizard should not lock credential store during construction");
-        }
+        assert!(
+            wizard.skill_credential_store.is_none(),
+            "wizard should not eagerly open the skill credential store"
+        );
 
         wizard
             .store_skill_credential("brave_api_key", "brv-test")

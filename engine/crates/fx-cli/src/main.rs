@@ -919,7 +919,7 @@ async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
     if looks_like_local_skill_path(name_or_path) {
         commands::skills::install(name_or_path).await?;
     } else {
-        commands::marketplace::install_cmd(name_or_path)?;
+        println!("{}", commands::marketplace::install_output(name_or_path)?);
     }
     Ok(0)
 }
@@ -927,11 +927,14 @@ async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
 async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     match command {
         SkillCommands::List => {
-            commands::marketplace::list_cmd()?;
+            println!("{}", commands::marketplace::list_output()?);
             Ok(0)
         }
         SkillCommands::Search { query } => {
-            commands::marketplace::search_cmd(query.as_deref().unwrap_or(""))?;
+            println!(
+                "{}",
+                commands::marketplace::search_output(query.as_deref().unwrap_or(""))?
+            );
             Ok(0)
         }
         SkillCommands::Install { name_or_path } => dispatch_skill_install(&name_or_path).await,
@@ -1075,15 +1078,15 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
         Commands::Search { query } => {
-            commands::marketplace::search_cmd(&query)?;
+            println!("{}", commands::marketplace::search_output(&query)?);
             Ok(0)
         }
         Commands::Install { name } => {
-            commands::marketplace::install_cmd(&name)?;
+            println!("{}", commands::marketplace::install_output(&name)?);
             Ok(0)
         }
         Commands::List => {
-            commands::marketplace::list_cmd()?;
+            println!("{}", commands::marketplace::list_output()?);
             Ok(0)
         }
         #[cfg(not(feature = "oauth-bridge"))]
