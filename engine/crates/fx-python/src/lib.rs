@@ -1,4 +1,5 @@
 mod installer;
+mod process;
 mod runner;
 mod venv;
 
@@ -50,8 +51,8 @@ impl PythonSkill {
         let venv_root = data_dir.join("venvs");
         let experiments_root = data_dir.join("experiments");
         let venv_manager = VenvManager::new(&venv_root);
-        let runner = PythonRunner::new(venv_manager.clone(), experiments_root);
-        let installer = PythonInstaller::new(venv_manager.clone());
+        let runner = PythonRunner::new(venv_manager.clone(), experiments_root.clone());
+        let installer = PythonInstaller::new(venv_manager.clone(), experiments_root);
 
         Self {
             venv_manager,
@@ -60,9 +61,13 @@ impl PythonSkill {
         }
     }
 
-    async fn handle_run(&self, arguments: &str) -> Result<String, SkillError> {
+    async fn handle_run(
+        &self,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         let args: PythonRunArgs = parse_arguments(arguments)?;
-        let result = self.runner.run(args).await?;
+        let result = self.runner.run(args, cancel).await?;
         serialize_response(&result)
     }
 
@@ -133,10 +138,10 @@ impl Skill for PythonSkill {
         &self,
         tool_name: &str,
         arguments: &str,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
         match tool_name {
-            "python_run" => Some(self.handle_run(arguments).await),
+            "python_run" => Some(self.handle_run(arguments, cancel).await),
             "python_install" => Some(self.handle_install(arguments).await),
             "python_venvs" => Some(self.handle_venvs(arguments).await),
             _ => None,
@@ -189,7 +194,12 @@ fn python_install_definition() -> ToolDefinition {
                 },
                 "requirements_file": {
                     "type": ["string", "null"],
-                    "description": "Optional requirements file path"
+                    "description": "Optional requirements file path inside the experiment directory"
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Pip install timeout in seconds",
+                    "default": 600
                 }
             },
             "required": ["venv"]
@@ -264,5 +274,29 @@ mod tests {
         let result = skill.execute("unknown_tool", "{}", None).await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn python_run_uses_cancellation_token() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let skill = skill_in_tempdir(&temp_dir);
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+
+        let result = skill
+            .execute(
+                "python_run",
+                r#"{"code":"import time\ntime.sleep(5)\n","venv":"test"}"#,
+                Some(&token),
+            )
+            .await
+            .expect("known tool")
+            .expect_err("run should be cancelled");
+
+        assert!(result.contains("cancelled"));
     }
 }

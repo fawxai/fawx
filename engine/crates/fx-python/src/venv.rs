@@ -1,3 +1,4 @@
+use crate::process::format_process_output;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -43,7 +44,7 @@ impl VenvManager {
         self.ensure_root().await?;
 
         let venv_path = self.venv_path(name);
-        if self.python_path(name).exists() {
+        if path_exists(&self.python_path(name)).await? {
             self.ensure_pip_entrypoint(name).await?;
             return Ok(venv_path);
         }
@@ -55,7 +56,7 @@ impl VenvManager {
     }
 
     pub async fn list_venvs(&self) -> Result<Vec<String>, String> {
-        if !self.root.exists() {
+        if !path_exists(&self.root).await? {
             return Ok(Vec::new());
         }
 
@@ -86,7 +87,7 @@ impl VenvManager {
     pub async fn delete_venv(&self, name: &str) -> Result<(), String> {
         validate_venv_name(name)?;
         let path = self.venv_path(name);
-        if !path.exists() {
+        if !path_exists(&path).await? {
             return Ok(());
         }
 
@@ -97,7 +98,7 @@ impl VenvManager {
 
     pub async fn info(&self, name: &str) -> Result<Vec<PackageInfo>, String> {
         validate_venv_name(name)?;
-        ensure_existing_venv(self, name)?;
+        ensure_existing_venv(self, name).await?;
 
         let output = Command::new(self.pip_path(name))
             .args(["list", "--format=json"])
@@ -119,7 +120,7 @@ impl VenvManager {
 
     async fn ensure_pip_entrypoint(&self, name: &str) -> Result<(), String> {
         let pip_path = self.pip_path(name);
-        if pip_path.exists() {
+        if path_exists(&pip_path).await? {
             return Ok(());
         }
 
@@ -127,8 +128,8 @@ impl VenvManager {
     }
 }
 
-fn ensure_existing_venv(manager: &VenvManager, name: &str) -> Result<(), String> {
-    if manager.python_path(name).exists() {
+async fn ensure_existing_venv(manager: &VenvManager, name: &str) -> Result<(), String> {
+    if path_exists(&manager.python_path(name)).await? {
         return Ok(());
     }
 
@@ -149,17 +150,31 @@ fn validate_venv_name(name: &str) -> Result<(), String> {
 
 async fn detect_python_binary() -> Result<String, String> {
     for candidate in ["python3", "python"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .output()
-            .await
-            .is_ok()
-        {
+        if supports_python_three(candidate).await? {
             return Ok(candidate.to_string());
         }
     }
 
-    Err("python interpreter not found; tried python3 and python".to_string())
+    Err("python 3 interpreter not found; tried python3 and python".to_string())
+}
+
+async fn supports_python_three(candidate: &str) -> Result<bool, String> {
+    match Command::new(candidate).arg("--version").output().await {
+        Ok(output) => Ok(matches!(parse_python_major_version(&output), Some(major) if major >= 3)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {candidate}: {error}")),
+    }
+}
+
+fn parse_python_major_version(output: &Output) -> Option<u64> {
+    let version = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = version.lines().next()?.trim();
+    let version = line.strip_prefix("Python ")?;
+    version.split('.').next()?.parse().ok()
 }
 
 async fn create_venv(python: &str, venv_path: &Path, name: &str) -> Result<(), String> {
@@ -238,16 +253,15 @@ fn require_success(output: Output, action: &str) -> Result<Output, String> {
     ))
 }
 
-fn format_process_output(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() { stderr } else { stdout };
-    format!("status {:?}; {detail}", output.status.code())
-}
-
 fn parse_package_list(stdout: &[u8]) -> Result<Vec<PackageInfo>, String> {
     serde_json::from_slice(stdout)
         .map_err(|error| format!("failed to parse pip list output: {error}"))
+}
+
+async fn path_exists(path: &Path) -> Result<bool, String> {
+    fs::try_exists(path)
+        .await
+        .map_err(|error| format!("failed to inspect '{}': {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -287,5 +301,27 @@ mod tests {
         manager.delete_venv("alpha").await.expect("venv deleted");
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn parse_python_major_version_accepts_python_three() {
+        let output = Output {
+            status: std::process::ExitStatus::default(),
+            stdout: b"Python 3.12.2\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert_eq!(parse_python_major_version(&output), Some(3));
+    }
+
+    #[test]
+    fn parse_python_major_version_rejects_python_two() {
+        let output = Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: b"Python 2.7.18\n".to_vec(),
+        };
+
+        assert_eq!(parse_python_major_version(&output), Some(2));
     }
 }

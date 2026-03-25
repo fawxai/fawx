@@ -1902,6 +1902,7 @@ dependencies = [
  "fx-kernel",
  "fx-llm",
  "fx-loadable",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
