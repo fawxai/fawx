@@ -389,6 +389,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_stops_pip_install() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let installer = installer_with_fake_pip(&temp_dir, sleeping_pip_script());
+
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+
+        // Cancel after 200ms — well before the sleeping pip would finish
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+        });
+
+        let error = installer
+            .install(
+                PythonInstallArgs {
+                    packages: vec!["demo".to_string()],
+                    venv: "test".to_string(),
+                    requirements_file: None,
+                    timeout_seconds: 600,
+                },
+                Some(&token),
+            )
+            .await
+            .expect_err("cancelled pip should fail");
+
+        assert!(
+            error.contains("cancelled"),
+            "expected cancelled, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn install_adds_no_cache_dir_for_package_installs() {
         let temp_dir = TempDir::new().expect("tempdir");
         let args_file = temp_dir.path().join("package-args.txt");
