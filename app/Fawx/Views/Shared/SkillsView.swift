@@ -667,7 +667,15 @@ private struct SkillCapabilityRow: View {
 
             Spacer(minLength: 0)
 
-            Toggle("", isOn: Binding(get: { isEnabled }, set: setEnabled))
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { isEnabled },
+                    set: { newValue in
+                        setEnabled(newValue)
+                    }
+                )
+            )
                 .labelsHidden()
                 .toggleStyle(.switch)
         }

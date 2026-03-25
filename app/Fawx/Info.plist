@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.2.0</string>
 	<key>SUFeedURL</key>
 	<string>https://fawx.ai/appcast.xml</string>
 	<key>SUPublicEDKey</key>
@@ -32,6 +32,6 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 </dict>
 </plist>
