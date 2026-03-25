@@ -71,9 +71,13 @@ impl PythonSkill {
         serialize_response(&result)
     }
 
-    async fn handle_install(&self, arguments: &str) -> Result<String, SkillError> {
+    async fn handle_install(
+        &self,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<String, SkillError> {
         let args: PythonInstallArgs = parse_arguments(arguments)?;
-        let result = self.installer.install(args).await?;
+        let result = self.installer.install(args, cancel).await?;
         serialize_response(&result)
     }
 
@@ -142,7 +146,7 @@ impl Skill for PythonSkill {
     ) -> Option<Result<String, SkillError>> {
         match tool_name {
             "python_run" => Some(self.handle_run(arguments, cancel).await),
-            "python_install" => Some(self.handle_install(arguments).await),
+            "python_install" => Some(self.handle_install(arguments, cancel).await),
             "python_venvs" => Some(self.handle_venvs(arguments).await),
             _ => None,
         }

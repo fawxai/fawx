@@ -3,6 +3,7 @@ use crate::process::{
     MAX_TIMEOUT_SECONDS,
 };
 use crate::venv::{PackageInfo, VenvManager};
+use fx_kernel::cancellation::CancellationToken;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,13 +50,17 @@ impl PythonInstaller {
         }
     }
 
-    pub async fn install(&self, args: PythonInstallArgs) -> Result<InstallResult, String> {
+    pub async fn install(
+        &self,
+        args: PythonInstallArgs,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<InstallResult, String> {
         validate_install_request(&args)?;
         self.manager.ensure_venv(&args.venv).await?;
         let plan = self.plan_install(&args).await?;
 
         let started = Instant::now();
-        let output = self.run_pip_install(&args, &plan).await?;
+        let output = self.run_pip_install(&args, &plan, cancel).await?;
         let installed = self
             .resolve_installed_packages(&args, &output.stdout)
             .await?;
@@ -77,6 +82,7 @@ impl PythonInstaller {
         &self,
         args: &PythonInstallArgs,
         plan: &InstallPlan,
+        cancel: Option<&CancellationToken>,
     ) -> Result<CapturedProcess, String> {
         let mut command = Command::new(self.manager.pip_path(&args.venv));
         configure_install_command(&mut command, args, plan);
@@ -86,7 +92,7 @@ impl PythonInstaller {
             command,
             "pip install",
             Duration::from_secs(plan.timeout_seconds),
-            None,
+            cancel,
         )
         .await?;
         require_success(output, plan.timeout_seconds)
@@ -309,12 +315,15 @@ mod tests {
         fs::write(&outside, "requests==2.32.3\n").expect("outside requirements");
 
         let error = installer
-            .install(PythonInstallArgs {
-                packages: Vec::new(),
-                venv: "test".to_string(),
-                requirements_file: Some(outside.to_string_lossy().into_owned()),
-                timeout_seconds: 600,
-            })
+            .install(
+                PythonInstallArgs {
+                    packages: Vec::new(),
+                    venv: "test".to_string(),
+                    requirements_file: Some(outside.to_string_lossy().into_owned()),
+                    timeout_seconds: 600,
+                },
+                None,
+            )
             .await
             .expect_err("outside requirements should fail");
 
@@ -338,12 +347,15 @@ mod tests {
         .expect("requirements file");
 
         installer
-            .install(PythonInstallArgs {
-                packages: Vec::new(),
-                venv: "test".to_string(),
-                requirements_file: Some("requirements.txt".to_string()),
-                timeout_seconds: 600,
-            })
+            .install(
+                PythonInstallArgs {
+                    packages: Vec::new(),
+                    venv: "test".to_string(),
+                    requirements_file: Some("requirements.txt".to_string()),
+                    timeout_seconds: 600,
+                },
+                None,
+            )
             .await
             .expect("install should succeed");
 
@@ -361,12 +373,15 @@ mod tests {
         let installer = installer_with_fake_pip(&temp_dir, sleeping_pip_script());
 
         let error = installer
-            .install(PythonInstallArgs {
-                packages: vec!["demo".to_string()],
-                venv: "test".to_string(),
-                requirements_file: None,
-                timeout_seconds: 1,
-            })
+            .install(
+                PythonInstallArgs {
+                    packages: vec!["demo".to_string()],
+                    venv: "test".to_string(),
+                    requirements_file: None,
+                    timeout_seconds: 1,
+                },
+                None,
+            )
             .await
             .expect_err("sleeping pip should time out");
 
@@ -383,12 +398,15 @@ mod tests {
         );
 
         installer
-            .install(PythonInstallArgs {
-                packages: vec!["demo".to_string()],
-                venv: "test".to_string(),
-                requirements_file: None,
-                timeout_seconds: 600,
-            })
+            .install(
+                PythonInstallArgs {
+                    packages: vec!["demo".to_string()],
+                    venv: "test".to_string(),
+                    requirements_file: None,
+                    timeout_seconds: 600,
+                },
+                None,
+            )
             .await
             .expect("install should succeed");
 
