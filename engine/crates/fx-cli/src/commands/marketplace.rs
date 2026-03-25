@@ -2,17 +2,17 @@
 
 use std::path::PathBuf;
 
+use crate::startup;
 use fx_marketplace::{InstalledSkill, SkillEntry};
 
-/// Resolve the Fawx data directory (`~/.fawx`).
-fn data_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    Ok(home.join(".fawx"))
+/// Resolve the Fawx data directory.
+fn data_dir() -> PathBuf {
+    startup::fawx_data_dir()
 }
 
 /// Build a `RegistryConfig` from defaults.
 fn build_config() -> anyhow::Result<fx_marketplace::RegistryConfig> {
-    let data = data_dir()?;
+    let data = data_dir();
     Ok(fx_marketplace::default_config(&data)?)
 }
 
@@ -75,7 +75,7 @@ pub fn install_cmd(name: &str) -> anyhow::Result<()> {
 
 /// `fawx list`
 pub fn list_cmd() -> anyhow::Result<()> {
-    let data = data_dir()?;
+    let data = data_dir();
     let skills = fx_marketplace::list_installed(&data)?;
     print_installed(&skills);
     Ok(())
