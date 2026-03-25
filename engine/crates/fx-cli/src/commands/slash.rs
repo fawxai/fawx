@@ -69,6 +69,15 @@ pub trait CommandHost {
     fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> Result<String> {
         Ok("WASM signing is not available in this mode.".to_string())
     }
+    fn list_skills(&self) -> Result<String> {
+        Ok("Skill listing is not available in this mode.".to_string())
+    }
+    fn install_skill(&self, _name: &str) -> Result<String> {
+        Ok("Skill installation is not available in this mode.".to_string())
+    }
+    fn search_skills(&self, _query: &str) -> Result<String> {
+        Ok("Skill search is not available in this mode.".to_string())
+    }
 }
 
 pub struct CommandContext<'a, H: CommandHost> {
@@ -97,6 +106,13 @@ pub enum ParsedCommand {
     Sign {
         target: Option<String>,
         has_extra_args: bool,
+    },
+    Skills,
+    Install {
+        name: Option<String>,
+    },
+    Search {
+        query: Option<String>,
     },
     Budget,
     Loop,
@@ -157,6 +173,13 @@ pub fn parse_command(value: &str) -> ParsedCommand {
         "sign" => ParsedCommand::Sign {
             target: parts.next().map(ToString::to_string),
             has_extra_args: parts.next().is_some(),
+        },
+        "skills" => ParsedCommand::Skills,
+        "install" => ParsedCommand::Install {
+            name: parts.next().map(ToString::to_string),
+        },
+        "search" => ParsedCommand::Search {
+            query: parts.next().map(ToString::to_string),
         },
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
@@ -222,6 +245,16 @@ pub fn execute_command<H: CommandHost>(
             has_extra_args,
         } => execute_embedded_only(ctx.app, |app| {
             app.handle_sign(target.as_deref(), *has_extra_args)
+                .map(response)
+        }),
+        ParsedCommand::Skills => {
+            execute_embedded_only(ctx.app, |app| app.list_skills().map(response))
+        }
+        ParsedCommand::Install { name } => {
+            execute_embedded_only(ctx.app, |app| execute_install(app, name.as_deref()))
+        }
+        ParsedCommand::Search { query } => execute_embedded_only(ctx.app, |app| {
+            app.search_skills(query.as_deref().unwrap_or(""))
                 .map(response)
         }),
         ParsedCommand::Budget => Some(Ok(response(ctx.app.show_budget_status()))),
@@ -436,9 +469,12 @@ pub fn help_text() -> &'static str {
         "  /keys list     List trusted public keys\n",
         "  /keys trust <path>\n",
         "  /keys revoke <fingerprint>\n",
-        "  /sign <skill>  Sign one WASM skill\n",
-        "  /sign --all    Sign all installed WASM skills\n",
-        "  /status        Show model, tokens, budget summary\n",
+        "  /sign <skill>   Sign one WASM skill\n",
+        "  /sign --all     Sign all installed WASM skills\n",
+        "  /skills         List installed skills\n",
+        "  /install <name> Install a skill from the marketplace\n",
+        "  /search [query] Search the skill marketplace\n",
+        "  /status         Show model, tokens, budget summary\n",
         "  /budget        Show detailed budget usage\n",
         "  /loop          Show loop iteration details\n",
         "  /signals       Show condensed signal summary for last turn\n",
@@ -569,6 +605,13 @@ fn execute_keys<H: CommandHost>(
         .map(response)
 }
 
+fn execute_install<H: CommandHost>(app: &mut H, name: Option<&str>) -> Result<CommandResult> {
+    match name {
+        Some(name) => app.install_skill(name).map(response),
+        None => Ok(response("Usage: /install <skill-name>".to_string())),
+    }
+}
+
 fn execute_config<H: CommandHost>(app: &mut H, action: Option<&str>) -> Result<CommandResult> {
     match action {
         None => app.show_config().map(response),
@@ -672,6 +715,9 @@ mod tests {
         thinking: String,
         init: String,
         reload: String,
+        skills: String,
+        installed_skill: String,
+        search_results: String,
         last_model: Option<String>,
         thinking_level: Option<String>,
     }
@@ -735,6 +781,20 @@ mod tests {
         fn handle_thinking(&mut self, level: Option<&str>) -> Result<String> {
             self.thinking_level = level.map(ToString::to_string);
             Ok(self.thinking.clone())
+        }
+
+        fn list_skills(&self) -> Result<String> {
+            Ok(self.skills.clone())
+        }
+
+        fn install_skill(&self, name: &str) -> Result<String> {
+            let _ = name;
+            Ok(self.installed_skill.clone())
+        }
+
+        fn search_skills(&self, query: &str) -> Result<String> {
+            let _ = query;
+            Ok(self.search_results.clone())
         }
     }
 
@@ -848,6 +908,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_skills_command() {
+        assert_eq!(parse_command("/skills"), ParsedCommand::Skills);
+    }
+
+    #[test]
+    fn parse_install_command_with_name() {
+        assert_eq!(
+            parse_command("/install weather"),
+            ParsedCommand::Install {
+                name: Some("weather".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_install_command_without_name() {
+        assert_eq!(
+            parse_command("/install"),
+            ParsedCommand::Install { name: None }
+        );
+    }
+
+    #[test]
+    fn parse_search_command_without_query() {
+        assert_eq!(
+            parse_command("/search"),
+            ParsedCommand::Search { query: None }
+        );
+    }
+
+    #[test]
+    fn parse_search_command_with_query() {
+        assert_eq!(
+            parse_command("/search weather"),
+            ParsedCommand::Search {
+                query: Some("weather".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn parse_proposals_accepts_optional_id() {
         assert_eq!(
             parse_command("/proposals"),
@@ -931,6 +1032,47 @@ mod tests {
             loop_status.response,
             "Loop status is not available in this mode."
         );
+    }
+
+    #[test]
+    fn execute_command_routes_skill_commands() {
+        let mut host = StubHost {
+            skills: "Installed skills".to_string(),
+            installed_skill: "Installed github".to_string(),
+            search_results: "Search results".to_string(),
+            ..StubHost::default()
+        };
+        let mut context = CommandContext { app: &mut host };
+
+        let skills = execute_command(&mut context, &ParsedCommand::Skills)
+            .expect("server-side")
+            .expect("ok");
+        assert_eq!(skills.response, "Installed skills");
+
+        let install = execute_command(
+            &mut context,
+            &ParsedCommand::Install {
+                name: Some("github".to_string()),
+            },
+        )
+        .expect("server-side")
+        .expect("ok");
+        assert_eq!(install.response, "Installed github");
+
+        let install_usage = execute_command(&mut context, &ParsedCommand::Install { name: None })
+            .expect("server-side")
+            .expect("ok");
+        assert_eq!(install_usage.response, "Usage: /install <skill-name>");
+
+        let search = execute_command(
+            &mut context,
+            &ParsedCommand::Search {
+                query: Some("weather".to_string()),
+            },
+        )
+        .expect("server-side")
+        .expect("ok");
+        assert_eq!(search.response, "Search results");
     }
 
     #[test]

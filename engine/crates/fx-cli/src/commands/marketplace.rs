@@ -16,67 +16,99 @@ fn build_config() -> anyhow::Result<fx_marketplace::RegistryConfig> {
     Ok(fx_marketplace::default_config(&data)?)
 }
 
-/// Print a list of skill entries from search results.
-fn print_search_results(entries: &[SkillEntry]) {
+/// Render a list of skill entries from search results.
+fn render_search_results(entries: &[SkillEntry]) -> String {
     if entries.is_empty() {
-        println!("No skills found.");
-        return;
+        return "No skills found.".to_string();
     }
-    for e in entries {
-        let size = e
+
+    let mut lines = Vec::new();
+    for entry in entries {
+        let size = entry
             .size_bytes
-            .map(|b| format!("{} KB", b / 1024))
+            .map(|bytes| format!("{} KB", bytes / 1024))
             .unwrap_or_else(|| "unknown".to_string());
-        let caps = e.capabilities.join(", ");
-        println!("  {} v{} — {}", e.name, e.version, e.description);
-        println!("    by {} | capabilities: {} | {}", e.author, caps, size);
+        let capabilities = entry.capabilities.join(", ");
+        lines.push(format!(
+            "  {} v{}: {}",
+            entry.name, entry.version, entry.description
+        ));
+        lines.push(format!(
+            "    by {} | capabilities: {} | {}",
+            entry.author, capabilities, size
+        ));
     }
-    let n = entries.len();
-    let noun = if n == 1 { "skill" } else { "skills" };
-    println!("\n{n} {noun} found.");
+
+    let count = entries.len();
+    let noun = if count == 1 { "skill" } else { "skills" };
+    lines.push(String::new());
+    lines.push(format!("{count} {noun} found."));
+    lines.join("\n")
 }
 
-/// Print a list of installed skills.
-fn print_installed(skills: &[InstalledSkill]) {
+/// Render a list of installed skills.
+fn render_installed(skills: &[InstalledSkill]) -> String {
     if skills.is_empty() {
-        println!("No installed skills.");
-        return;
+        return "No installed skills.".to_string();
     }
-    println!("Installed skills:");
-    for s in skills {
-        let caps = if s.capabilities.is_empty() {
+
+    let mut lines = vec!["Installed skills:".to_string()];
+    for skill in skills {
+        let capabilities = if skill.capabilities.is_empty() {
             String::new()
         } else {
-            format!("  ({})", s.capabilities.join(", "))
+            format!("  ({})", skill.capabilities.join(", "))
         };
-        println!("  {:16} v{}{}", s.name, s.version, caps);
+        lines.push(format!(
+            "  {:16} v{}{}",
+            skill.name, skill.version, capabilities
+        ));
     }
+    lines.join("\n")
+}
+
+pub fn search_output(query: &str) -> anyhow::Result<String> {
+    let config = build_config()?;
+    let results = fx_marketplace::search(&config, query)?;
+    Ok(format!(
+        "Registry: fawxai/registry\n\n{}",
+        render_search_results(&results)
+    ))
+}
+
+pub fn install_output(name: &str) -> anyhow::Result<String> {
+    let config = build_config()?;
+    let result = fx_marketplace::install(&config, name)?;
+    Ok(format!(
+        "Installing {name}...\n  Downloaded: {} KB\n  Signature: verified ✓\n  Installed to: {}",
+        result.size_bytes / 1024,
+        result.install_path.display()
+    ))
+}
+
+pub fn list_output() -> anyhow::Result<String> {
+    let data = data_dir();
+    let skills = fx_marketplace::list_installed(&data)?;
+    Ok(render_installed(&skills))
 }
 
 /// `fawx search <query>`
+#[allow(dead_code)]
 pub fn search_cmd(query: &str) -> anyhow::Result<()> {
-    let config = build_config()?;
-    println!("Registry: fawxai/registry\n");
-    let results = fx_marketplace::search(&config, query)?;
-    print_search_results(&results);
+    println!("{}", search_output(query)?);
     Ok(())
 }
 
 /// `fawx install <name>`
+#[allow(dead_code)]
 pub fn install_cmd(name: &str) -> anyhow::Result<()> {
-    let config = build_config()?;
-    println!("Installing {name}...");
-    let result = fx_marketplace::install(&config, name)?;
-    println!("  Downloaded: {} KB", result.size_bytes / 1024);
-    println!("  Signature: verified ✓");
-    println!("  Installed to: {}", result.install_path.display());
+    println!("{}", install_output(name)?);
     Ok(())
 }
 
 /// `fawx list`
+#[allow(dead_code)]
 pub fn list_cmd() -> anyhow::Result<()> {
-    let data = data_dir();
-    let skills = fx_marketplace::list_installed(&data)?;
-    print_installed(&skills);
+    println!("{}", list_output()?);
     Ok(())
 }
