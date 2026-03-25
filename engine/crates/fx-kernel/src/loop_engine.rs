@@ -1840,6 +1840,11 @@ impl LoopEngine {
         }
     }
 
+    /// Apply nudge/strip policy for the current tool continuation round.
+    ///
+    /// Mutates `continuation_messages` by appending a progress nudge at the
+    /// nudge threshold round. Returns the tool definitions to use: either the
+    /// full set (normal) or an empty vec (tools stripped at strip threshold).
     fn apply_tool_round_progress_policy(
         &self,
         round: u32,
@@ -1850,7 +1855,9 @@ impl LoopEngine {
         let strip_threshold =
             nudge_threshold.saturating_add(u32::from(tc.tool_round_strip_after_nudge));
 
-        if nudge_threshold > 0 && round >= nudge_threshold {
+        // Fire nudge exactly once (at the threshold round) to avoid stacking
+        // duplicate nudge messages in continuation_messages across rounds.
+        if nudge_threshold > 0 && round == nudge_threshold {
             continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
         }
 
@@ -8291,6 +8298,55 @@ mod phase4_tests {
         let requests = llm.requests();
         assert_eq!(requests.len(), 2);
         assert!(!has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_nudge_fires_exactly_once() {
+        // With nudge_after=1 and strip_after=3, the model runs 3 rounds past
+        // the nudge threshold. Verify the nudge message appears exactly once
+        // (not stacked on every round).
+        let config = tool_round_budget_config(1, 3);
+        let mut engine = p4_engine_with_config(config, 5);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            tool_use_response(vec![read_file_call("call-4", "d.txt")]),
+            text_response("done after strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        // The last request has the full continuation_messages history.
+        // Count nudge messages in it — should be exactly 1 (not stacked).
+        let last_request = requests.last().expect("should have requests");
+        let nudge_count = last_request
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains(TOOL_ROUND_PROGRESS_NUDGE)
+                    )
+                })
+            })
+            .count();
+        assert_eq!(
+            nudge_count, 1,
+            "nudge should appear exactly once, not stack"
+        );
     }
 
     #[tokio::test]
