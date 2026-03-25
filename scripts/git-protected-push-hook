@@ -1,0 +1,34 @@
+#!/bin/bash
+# pre-push hook: blocks pushes to protected branches unless explicitly allowed.
+# Install: cp scripts/git-protected-push-hook .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# To bypass (human-only, from your terminal):
+#   ALLOW_PROTECTED_PUSH=yes git push origin main
+#
+# Protected branches: main, staging, release/*
+
+PROTECTED_PATTERN="^refs/heads/(main|staging|release/)"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" =~ $PROTECTED_PATTERN ]]; then
+        branch="${remote_ref#refs/heads/}"
+        if [[ "$ALLOW_PROTECTED_PUSH" != "yes" ]]; then
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════╗"
+            echo "║  BLOCKED: Push to protected branch '$branch'"
+            echo "║"
+            echo "║  Protected branches require explicit authorization."
+            echo "║  If you are a human operator, run:"
+            echo "║"
+            echo "║    ALLOW_PROTECTED_PUSH=yes git push origin $branch"
+            echo "║"
+            echo "║  If you are an agent: STOP. Provide the push command"
+            echo "║  to the human operator. Do not set this variable."
+            echo "╚══════════════════════════════════════════════════════════╝"
+            echo ""
+            exit 1
+        fi
+    fi
+done
+
+exit 0
