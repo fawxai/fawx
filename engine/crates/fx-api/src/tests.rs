@@ -3033,14 +3033,13 @@ allowed_chat_ids = [123]
     async fn get_session_memory_returns_stored_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-get");
-        let memory = SessionMemory {
-            project: Some("Phase 6".to_string()),
-            current_state: Some("Reviewing compaction UX".to_string()),
-            key_decisions: vec!["Use a subtle banner".to_string()],
-            active_files: vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()],
-            custom_context: vec!["Keep session memory user-editable".to_string()],
-            last_updated: 1_742_000_000,
-        };
+        let mut memory = SessionMemory::default();
+        memory.project = Some("Phase 6".to_string());
+        memory.current_state = Some("Reviewing compaction UX".to_string());
+        memory.key_decisions = vec!["Use a subtle banner".to_string()];
+        memory.active_files = vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()];
+        memory.custom_context = vec!["Keep session memory user-editable".to_string()];
+        memory.last_updated = 1_742_000_000;
         registry
             .record_turn(&key, Vec::new(), memory.clone())
             .expect("seed memory");
@@ -3084,10 +3083,8 @@ allowed_chat_ids = [123]
     async fn put_session_memory_persists_and_updates_loaded_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-put");
-        let initial_loaded_memory = SessionMemory {
-            project: Some("Old loaded memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut initial_loaded_memory = SessionMemory::default();
+        initial_loaded_memory.project = Some("Old loaded memory".to_string());
         let (app, app_state) =
             session_memory_test_router(registry.clone(), initial_loaded_memory, Some(key.clone()));
 
@@ -3141,16 +3138,14 @@ allowed_chat_ids = [123]
     async fn put_session_memory_rejects_payloads_that_exceed_token_cap() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-too-large");
-        let seeded_memory = SessionMemory {
-            project: Some("Existing memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("Existing memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
         let app = build_router(test_state_with_sessions(registry.clone()), None);
 
-        let oversized_project = "memory ".repeat(2_200);
+        let oversized_project = "a ".repeat(8_100);
         let request_body = serde_json::json!({
             "project": oversized_project,
             "last_updated": 0
@@ -3179,14 +3174,10 @@ allowed_chat_ids = [123]
     async fn session_message_persists_updated_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-persist");
-        let seeded_memory = SessionMemory {
-            project: Some("persistent project".to_string()),
-            ..SessionMemory::default()
-        };
-        let restored_memory = SessionMemory {
-            project: Some("shared app memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("persistent project".to_string());
+        let mut restored_memory = SessionMemory::default();
+        restored_memory.project = Some("shared app memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
@@ -3223,14 +3214,10 @@ allowed_chat_ids = [123]
     async fn session_message_stream_persists_updated_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-stream-persist");
-        let seeded_memory = SessionMemory {
-            project: Some("persistent project".to_string()),
-            ..SessionMemory::default()
-        };
-        let restored_memory = SessionMemory {
-            project: Some("shared app memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("persistent project".to_string());
+        let mut restored_memory = SessionMemory::default();
+        restored_memory.project = Some("shared app memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
