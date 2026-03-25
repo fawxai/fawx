@@ -1545,6 +1545,7 @@ dependencies = [
  "fx-marketplace",
  "fx-memory",
  "fx-propose",
+ "fx-python",
  "fx-ripcord",
  "fx-scratchpad",
  "fx-security",
@@ -1891,6 +1892,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "fx-python"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fx-kernel",
+ "fx-llm",
+ "fx-loadable",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
