@@ -67,6 +67,13 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
                 "is_error": is_error,
             }),
         ),
+        StreamEvent::ToolError { tool_name, error } => sse_frame(
+            "tool_error",
+            serde_json::json!({
+                "tool_name": tool_name,
+                "error": error,
+            }),
+        ),
         StreamEvent::PermissionPrompt(prompt) => sse_frame(
             "permission_prompt",
             serde_json::json!({
@@ -285,6 +292,20 @@ mod tests {
         assert_eq!(
             frame,
             "event: permission_prompt\ndata: {\"expires_at\":1742000000,\"id\":\"prompt-1\",\"reason\":\"Needed to inspect the repo\",\"request_summary\":\"git status --short --branch\",\"session_scoped_allow_available\":true,\"title\":\"Allow shell command\",\"tool\":\"shell\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn tool_error_event_serializes() {
+        let frame = serialize_stream_event(StreamEvent::ToolError {
+            tool_name: "read_file".to_string(),
+            error: "permission denied".to_string(),
+        })
+        .expect("tool error frame");
+
+        assert_eq!(
+            frame,
+            "event: tool_error\ndata: {\"error\":\"permission denied\",\"tool_name\":\"read_file\"}\n\n"
         );
     }
 

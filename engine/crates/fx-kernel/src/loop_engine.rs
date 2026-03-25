@@ -220,6 +220,13 @@ impl<'a> CycleStream<'a> {
         });
     }
 
+    fn tool_error(self, tool_name: &str, error: &str) {
+        self.emit(StreamEvent::ToolError {
+            tool_name: tool_name.to_string(),
+            error: error.to_string(),
+        });
+    }
+
     fn notification(self, title: impl Into<String>, body: impl Into<String>) {
         self.emit(StreamEvent::Notification {
             title: title.into(),
@@ -1376,6 +1383,7 @@ Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
 const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+const TOOL_ERROR_RELAY_DIRECTIVE: &str = "One or more tools failed. Report the errors to the user before continuing with additional tool calls.";
 /// Maximum time to wait for a best-effort summary during emergency compaction.
 const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -3111,6 +3119,15 @@ impl LoopEngine {
         }
     }
 
+    fn emit_tool_errors(&self, results: &[ToolResult], stream: CycleStream<'_>) -> bool {
+        let mut has_errors = false;
+        for result in results.iter().filter(|result| !result.success) {
+            has_errors = true;
+            stream.tool_error(&result.tool_name, &result.output);
+        }
+        has_errors
+    }
+
     fn publish_tool_result(&mut self, result: &ToolResult) {
         if result.success && result.tool_name == NOTIFY_TOOL_NAME {
             self.notify_called_this_cycle = true;
@@ -3985,6 +4002,7 @@ impl LoopEngine {
             .execute_tool_calls_with_stream(&state.current_calls, stream)
             .await?;
         self.publish_tool_results(&results, stream);
+        let has_tool_errors = self.emit_tool_errors(&results, stream);
         self.record_tool_execution_cost(results.len());
 
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
@@ -3996,6 +4014,11 @@ impl LoopEngine {
             &self.tool_call_provider_ids,
             &results,
         )?;
+        if has_tool_errors {
+            state
+                .continuation_messages
+                .push(Message::system(TOOL_ERROR_RELAY_DIRECTIVE.to_string()));
+        }
         state.all_tool_results.extend(results);
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
@@ -12416,6 +12439,36 @@ mod context_compaction_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingToolRoundExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingToolRoundExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: "permission denied".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "read file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
     #[tokio::test]
     async fn long_conversation_triggers_compaction_in_perceive() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
@@ -12471,6 +12524,93 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(&engine.last_reasoning_messages));
         assert_eq!(engine.last_reasoning_messages, state.continuation_messages);
+    }
+
+    fn stream_recorder() -> (StreamCallback, Arc<Mutex<Vec<StreamEvent>>>) {
+        let events: Arc<Mutex<Vec<StreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        (callback, events)
+    }
+
+    #[tokio::test]
+    async fn tool_error_event_emitted_on_failure() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(FailingToolRoundExecutor);
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let (callback, events) = stream_recorder();
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, CycleStream::enabled(&callback))
+            .await
+            .expect("tool round");
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.contains(&StreamEvent::ToolError {
+            tool_name: "read_file".to_string(),
+            error: "permission denied".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_error_directive_injected_on_failure() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(FailingToolRoundExecutor);
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .await
+            .expect("tool round");
+
+        assert!(state
+            .continuation_messages
+            .iter()
+            .map(message_to_text)
+            .any(|text| text.contains(TOOL_ERROR_RELAY_DIRECTIVE)));
+    }
+
+    #[tokio::test]
+    async fn no_tool_error_on_success() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 5 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let (callback, events) = stream_recorder();
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, CycleStream::enabled(&callback))
+            .await
+            .expect("tool round");
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolError { .. })));
+        assert!(!state
+            .continuation_messages
+            .iter()
+            .map(message_to_text)
+            .any(|text| text.contains(TOOL_ERROR_RELAY_DIRECTIVE)));
     }
 
     #[tokio::test]

@@ -113,6 +113,13 @@ struct ToolResultData {
     is_error: bool,
 }
 
+/// Data payload for `tool_error` events.
+#[derive(Deserialize)]
+struct ToolErrorData {
+    tool_name: String,
+    error: String,
+}
+
 /// Data payload for `done` events.
 #[derive(Deserialize)]
 struct DoneData {
@@ -534,6 +541,19 @@ fn handle_tool_call_complete(data: &str, tx: &UnboundedSender<BackendEvent>) -> 
     Ok(())
 }
 
+fn handle_tool_error(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolErrorData = serde_json::from_str(data).context("decode tool_error")?;
+    try_send(
+        tx,
+        BackendEvent::ToolResult {
+            name: Some(d.tool_name),
+            success: false,
+            content: d.error,
+        },
+    );
+    Ok(())
+}
+
 fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
     let d: ToolResultData = serde_json::from_str(data).context("decode tool_result")?;
     try_send(
@@ -600,6 +620,7 @@ fn dispatch_sse_frame(
         "tool_call_start" => handle_tool_call_start(&sse.data, tx)?,
         "tool_call_complete" => handle_tool_call_complete(&sse.data, tx)?,
         "tool_result" => handle_tool_result(&sse.data, tx)?,
+        "tool_error" => handle_tool_error(&sse.data, tx)?,
         "done" => handle_done(&sse.data, tx, *saw_text_delta)?,
         "phase" => { /* Phase changes are informational; TUI doesn't need them yet. */ }
         "error" => handle_error(&sse.data, tx)?,
