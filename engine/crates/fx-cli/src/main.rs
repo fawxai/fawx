@@ -912,10 +912,7 @@ async fn dispatch_audit(command: AuditCommands) -> anyhow::Result<i32> {
 }
 
 fn looks_like_local_skill_path(name_or_path: &str) -> bool {
-    name_or_path.contains('/')
-        || name_or_path.contains('\\')
-        || name_or_path.contains('.')
-        || Path::new(name_or_path).exists()
+    name_or_path.contains('/') || name_or_path.contains('\\') || name_or_path.ends_with(".wasm")
 }
 
 async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
@@ -1423,14 +1420,13 @@ mod tests {
 
     #[test]
     fn looks_like_local_skill_path_detects_marketplace_names_and_paths() {
-        let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        fs::write(temp_dir.path().join("weather"), "").expect("write file");
-        let (_guard, _cwd_guard) = CurrentDirGuard::set(temp_dir.path());
-
-        assert!(looks_like_local_skill_path("weather"));
         assert!(!looks_like_local_skill_path("github"));
+        assert!(!looks_like_local_skill_path("weather"));
+        assert!(!looks_like_local_skill_path("web.fetch"));
         assert!(looks_like_local_skill_path("weather.wasm"));
         assert!(looks_like_local_skill_path("./weather"));
+        assert!(looks_like_local_skill_path("/tmp/skill.wasm"));
+        assert!(looks_like_local_skill_path("skills\\weather"));
     }
 
     #[test]
@@ -1736,25 +1732,6 @@ exit 0
                 Some(previous) => std::env::set_var("PATH", previous),
                 None => std::env::remove_var("PATH"),
             }
-        }
-    }
-
-    struct CurrentDirGuard {
-        previous: std::path::PathBuf,
-    }
-
-    impl CurrentDirGuard {
-        fn set(path: &Path) -> (std::sync::MutexGuard<'static, ()>, Self) {
-            let guard = env_lock().lock().expect("cwd lock");
-            let previous = std::env::current_dir().expect("current dir");
-            std::env::set_current_dir(path).expect("set current dir");
-            (guard, Self { previous })
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.previous).expect("restore current dir");
         }
     }
 
