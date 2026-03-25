@@ -858,6 +858,10 @@ impl LoopEngineBuilder {
         let compaction_llm_for_extraction = self.compaction_llm.as_ref().map(Arc::clone);
         let (compaction_config, conversation_budget) =
             build_compaction_components(self.compaction_config)?;
+        let session_memory = self
+            .session_memory
+            .unwrap_or_else(|| default_session_memory(compaction_config.model_context_limit));
+        configure_session_memory(&session_memory, compaction_config.model_context_limit);
 
         Ok(LoopEngine {
             budget,
@@ -867,7 +871,7 @@ impl LoopEngineBuilder {
             iteration_count: 0,
             synthesis_instruction,
             memory_context: self.memory_context,
-            session_memory: self.session_memory.unwrap_or_else(default_session_memory),
+            session_memory,
             scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
             cancel_token: self.cancel_token,
@@ -1130,8 +1134,15 @@ fn normalize_memory_context(memory_context: String) -> Option<String> {
     }
 }
 
-fn default_session_memory() -> Arc<Mutex<SessionMemory>> {
-    Arc::new(Mutex::new(SessionMemory::default()))
+fn default_session_memory(context_limit: usize) -> Arc<Mutex<SessionMemory>> {
+    Arc::new(Mutex::new(SessionMemory::with_context_limit(context_limit)))
+}
+
+fn configure_session_memory(memory: &Arc<Mutex<SessionMemory>>, context_limit: usize) {
+    let mut memory = memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    memory.set_context_limit(context_limit);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1392,11 +1403,13 @@ impl LoopEngine {
     }
 
     pub fn replace_session_memory(&self, memory: SessionMemory) -> SessionMemory {
+        let mut replacement = memory;
+        replacement.set_context_limit(self.compaction_config.model_context_limit);
         let mut stored = match self.session_memory.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        std::mem::replace(&mut *stored, memory)
+        std::mem::replace(&mut *stored, replacement)
     }
 
     pub fn session_memory_snapshot(&self) -> SessionMemory {
@@ -1442,6 +1455,7 @@ impl LoopEngine {
             self.compaction_config.slide_threshold,
             self.compaction_config.reserved_system_tokens,
         );
+        configure_session_memory(&self.session_memory, new_limit);
     }
 
     /// Synchronise the shared iteration counter and refresh scratchpad context.
@@ -12094,6 +12108,40 @@ mod context_compaction_tests {
     }
 
     #[test]
+    fn builder_applies_context_scaled_session_memory_caps() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = CompactionConfig {
+            model_context_limit: 200_000,
+            ..CompactionConfig::default()
+        };
+        let memory = Arc::new(Mutex::new(SessionMemory::default()));
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config.clone())
+            .session_memory(Arc::clone(&memory))
+            .build()
+            .expect("test engine build");
+
+        let stored = engine.session_memory_snapshot();
+        assert_eq!(
+            stored.token_cap(),
+            fx_session::max_memory_tokens(config.model_context_limit)
+        );
+        assert_eq!(
+            stored.item_cap(),
+            fx_session::max_memory_items(config.model_context_limit)
+        );
+    }
+
+    #[test]
     fn builder_full_config() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let config = CompactionConfig {
@@ -12490,11 +12538,10 @@ mod context_compaction_tests {
     #[tokio::test]
     async fn session_memory_injected_in_context() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
-        let memory = Arc::new(Mutex::new(SessionMemory {
-            project: Some("Phase 3".to_string()),
-            current_state: Some("testing injection".to_string()),
-            ..SessionMemory::default()
-        }));
+        let mut stored_memory = SessionMemory::default();
+        stored_memory.project = Some("Phase 3".to_string());
+        stored_memory.current_state = Some("testing injection".to_string());
+        let memory = Arc::new(Mutex::new(stored_memory));
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(
                 crate::budget::BudgetConfig::default(),

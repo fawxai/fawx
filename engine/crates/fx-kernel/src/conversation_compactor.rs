@@ -1120,7 +1120,7 @@ impl Default for CompactionConfig {
             prune_threshold: 0.40,
             _legacy_summarize_threshold: 0.80,
             emergency_threshold: 0.95,
-            preserve_recent_turns: 6,
+            preserve_recent_turns: 12,
             model_context_limit: 128_000,
             reserved_system_tokens: 2_000,
             recompact_cooldown_turns: 2,
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(config.prune_threshold, 0.40);
         assert_eq!(config.slide_threshold, 0.60);
         assert_eq!(config.emergency_threshold, 0.95);
-        assert_eq!(config.preserve_recent_turns, 6);
+        assert_eq!(config.preserve_recent_turns, 12);
         assert_eq!(config.model_context_limit, 128_000);
         assert_eq!(config.reserved_system_tokens, 2_000);
         assert_eq!(config.recompact_cooldown_turns, 2);

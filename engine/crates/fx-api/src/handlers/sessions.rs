@@ -35,8 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const SESSION_MEMORY_MAX_ITEMS: usize = 20;
-const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
+const SESSION_MEMORY_MAX_ITEMS: usize = 40;
+const SESSION_MEMORY_MAX_TOKENS: usize = 4_000;
 
 struct TurnInput<'a> {
     message: Cow<'a, str>,
@@ -748,12 +748,10 @@ mod tests {
 
     #[test]
     fn validate_session_memory_rejects_too_many_active_files() {
-        let memory = SessionMemory {
-            active_files: (0..=SESSION_MEMORY_MAX_ITEMS)
-                .map(|index| format!("file-{index}.rs"))
-                .collect(),
-            ..SessionMemory::default()
-        };
+        let mut memory = SessionMemory::default();
+        memory.active_files = (0..=SESSION_MEMORY_MAX_ITEMS)
+            .map(|index| format!("file-{index}.rs"))
+            .collect();
 
         let error = validate_session_memory(memory).expect_err("validation should fail");
 
