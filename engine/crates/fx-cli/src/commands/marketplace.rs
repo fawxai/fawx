@@ -91,24 +91,3 @@ pub fn list_output() -> anyhow::Result<String> {
     let skills = fx_marketplace::list_installed(&data)?;
     Ok(render_installed(&skills))
 }
-
-/// `fawx search <query>`
-#[allow(dead_code)]
-pub fn search_cmd(query: &str) -> anyhow::Result<()> {
-    println!("{}", search_output(query)?);
-    Ok(())
-}
-
-/// `fawx install <name>`
-#[allow(dead_code)]
-pub fn install_cmd(name: &str) -> anyhow::Result<()> {
-    println!("{}", install_output(name)?);
-    Ok(())
-}
-
-/// `fawx list`
-#[allow(dead_code)]
-pub fn list_cmd() -> anyhow::Result<()> {
-    println!("{}", list_output()?);
-    Ok(())
-}

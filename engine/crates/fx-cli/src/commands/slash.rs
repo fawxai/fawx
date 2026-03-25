@@ -708,6 +708,7 @@ mod tests {
     use fx_core::signals::{LoopStep, Signal, SignalKind};
     use fx_kernel::budget::BudgetRemaining;
     use fx_kernel::loop_engine::LoopStatus;
+    use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -726,6 +727,8 @@ mod tests {
         installed_skill: String,
         search_results: String,
         last_model: Option<String>,
+        last_installed_skill: RefCell<Option<String>>,
+        last_search_query: RefCell<Option<String>>,
         thinking_level: Option<String>,
     }
 
@@ -795,12 +798,12 @@ mod tests {
         }
 
         fn install_skill(&self, name: &str) -> Result<String> {
-            let _ = name;
+            self.last_installed_skill.replace(Some(name.to_string()));
             Ok(self.installed_skill.clone())
         }
 
         fn search_skills(&self, query: &str) -> Result<String> {
-            let _ = query;
+            self.last_search_query.replace(Some(query.to_string()));
             Ok(self.search_results.clone())
         }
     }
@@ -1052,44 +1055,80 @@ mod tests {
     }
 
     #[test]
-    fn execute_command_routes_skill_commands() {
+    fn execute_skills_command_lists_installed() {
         let mut host = StubHost {
             skills: "Installed skills".to_string(),
-            installed_skill: "Installed github".to_string(),
-            search_results: "Search results".to_string(),
             ..StubHost::default()
         };
         let mut context = CommandContext { app: &mut host };
 
-        let skills = execute_command(&mut context, &ParsedCommand::Skills)
+        let result = execute_command(&mut context, &ParsedCommand::Skills)
             .expect("server-side")
             .expect("ok");
-        assert_eq!(skills.response, "Installed skills");
 
-        let install = execute_command(
-            &mut context,
-            &ParsedCommand::Install {
-                name: Some("github".to_string()),
-            },
-        )
-        .expect("server-side")
-        .expect("ok");
-        assert_eq!(install.response, "Installed github");
+        assert_eq!(result.response, "Installed skills");
+    }
 
-        let install_usage = execute_command(&mut context, &ParsedCommand::Install { name: None })
+    #[test]
+    fn execute_install_command_with_name() {
+        let mut host = StubHost {
+            installed_skill: "Installed github".to_string(),
+            ..StubHost::default()
+        };
+        let result = {
+            let mut context = CommandContext { app: &mut host };
+            execute_command(
+                &mut context,
+                &ParsedCommand::Install {
+                    name: Some("github".to_string()),
+                },
+            )
             .expect("server-side")
-            .expect("ok");
-        assert_eq!(install_usage.response, "Usage: /install <skill-name>");
+            .expect("ok")
+        };
 
-        let search = execute_command(
-            &mut context,
-            &ParsedCommand::Search {
-                query: Some("weather".to_string()),
-            },
-        )
-        .expect("server-side")
-        .expect("ok");
-        assert_eq!(search.response, "Search results");
+        assert_eq!(result.response, "Installed github");
+        assert_eq!(
+            host.last_installed_skill.borrow().as_deref(),
+            Some("github")
+        );
+    }
+
+    #[test]
+    fn execute_install_command_without_name_shows_usage() {
+        let mut host = StubHost::default();
+
+        let result = {
+            let mut context = CommandContext { app: &mut host };
+            execute_command(&mut context, &ParsedCommand::Install { name: None })
+                .expect("server-side")
+                .expect("ok")
+        };
+
+        assert_eq!(result.response, "Usage: /install <skill-name>");
+        assert!(host.last_installed_skill.borrow().is_none());
+    }
+
+    #[test]
+    fn execute_search_command_routes_query() {
+        let mut host = StubHost {
+            search_results: "Search results".to_string(),
+            ..StubHost::default()
+        };
+        let result = {
+            let mut context = CommandContext { app: &mut host };
+            execute_command(
+                &mut context,
+                &ParsedCommand::Search {
+                    query: Some("weather".to_string()),
+                },
+            )
+            .expect("server-side")
+            .expect("ok")
+        };
+
+        assert_eq!(result.response, "Search results");
+        assert_eq!(host.last_search_query.borrow().as_deref(), Some("weather"));
     }
 
     #[test]
