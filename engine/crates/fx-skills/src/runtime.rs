@@ -326,6 +326,9 @@ impl SkillRuntime {
             .map_err(|e| SkillError::Execution(format!("Failed to link set_output: {}", e)))?;
 
         Self::link_http_request(linker)?;
+        Self::link_exec_command(linker)?;
+        Self::link_read_file(linker)?;
+        Self::link_write_file(linker)?;
         Self::link_v2_host_functions(linker)?;
 
         Ok(())
@@ -352,85 +355,176 @@ impl SkillRuntime {
                  body_ptr: u32,
                  body_len: u32|
                  -> u32 {
-                    // Check Network capability
                     if !caller.data().has_capability(&Capability::Network) {
                         tracing::warn!("http_request denied: skill lacks Network capability");
                         return 0;
                     }
-
-                    // Read all string parameters from WASM memory
-                    let method = match caller.data().read_string(&caller, method_ptr, method_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read method: {}", e);
-                            return 0;
-                        }
+                    let Some(method) = Self::read_host_string(
+                        &caller,
+                        method_ptr,
+                        method_len,
+                        "http_request method",
+                    ) else {
+                        return 0;
                     };
-
-                    let url = match caller.data().read_string(&caller, url_ptr, url_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read url: {}", e);
-                            return 0;
-                        }
+                    let Some(url) =
+                        Self::read_host_string(&caller, url_ptr, url_len, "http_request url")
+                    else {
+                        return 0;
                     };
-
-                    let headers = match caller.data().read_string(&caller, headers_ptr, headers_len)
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read headers: {}", e);
-                            return 0;
-                        }
+                    let Some(headers) = Self::read_host_string(
+                        &caller,
+                        headers_ptr,
+                        headers_len,
+                        "http_request headers",
+                    ) else {
+                        return 0;
                     };
-
-                    let body = match caller.data().read_string(&caller, body_ptr, body_len) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("http_request: failed to read body: {}", e);
-                            return 0;
-                        }
+                    let Some(body) =
+                        Self::read_host_string(&caller, body_ptr, body_len, "http_request body")
+                    else {
+                        return 0;
                     };
-
-                    // Call the host API
-                    let response = match caller
+                    let Some(response) = caller
                         .data()
                         .api
                         .http_request(&method, &url, &headers, &body)
-                    {
-                        Some(r) => r,
-                        None => return 0,
+                    else {
+                        return 0;
                     };
-
-                    // Write response to WASM memory
-                    let memory = match caller.data().memory {
-                        Some(m) => m,
-                        None => {
-                            tracing::error!("Memory not initialized for http_request");
-                            return 0;
-                        }
-                    };
-                    let mut alloc_offset = caller.data().alloc_offset;
-                    match HostState::write_to_memory(
-                        memory,
-                        &mut caller,
-                        &response,
-                        &mut alloc_offset,
-                    ) {
-                        Ok(ptr) => {
-                            caller.data_mut().alloc_offset = alloc_offset;
-                            ptr
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to write http_request response: {}", e);
-                            0
-                        }
-                    }
+                    Self::write_host_string(&mut caller, &response, "http_request")
                 },
             )
             .map_err(|e| SkillError::Execution(format!("Failed to link http_request: {}", e)))?;
 
         Ok(())
+    }
+
+    fn link_exec_command(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "exec_command",
+                |mut caller: Caller<'_, HostState>,
+                 command_ptr: u32,
+                 command_len: u32,
+                 timeout_ms: u32|
+                 -> u32 {
+                    if !caller.data().has_capability(&Capability::Shell) {
+                        tracing::warn!("exec_command denied: skill lacks Shell capability");
+                        return 0;
+                    }
+                    let Some(command) =
+                        Self::read_host_string(&caller, command_ptr, command_len, "exec_command")
+                    else {
+                        return 0;
+                    };
+                    let Some(response) = caller.data().api.exec_command(&command, timeout_ms)
+                    else {
+                        return 0;
+                    };
+                    Self::write_host_string(&mut caller, &response, "exec_command")
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link exec_command: {}", e)))?;
+        Ok(())
+    }
+
+    fn link_read_file(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "read_file",
+                |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
+                    if !caller.data().has_capability(&Capability::Filesystem) {
+                        tracing::warn!("read_file denied: skill lacks Filesystem capability");
+                        return 0;
+                    }
+                    let Some(path) =
+                        Self::read_host_string(&caller, path_ptr, path_len, "read_file")
+                    else {
+                        return 0;
+                    };
+                    let Some(contents) = caller.data().api.read_file(&path) else {
+                        return 0;
+                    };
+                    Self::write_host_string(&mut caller, &contents, "read_file")
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link read_file: {}", e)))?;
+        Ok(())
+    }
+
+    fn link_write_file(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "write_file",
+                |caller: Caller<'_, HostState>,
+                 path_ptr: u32,
+                 path_len: u32,
+                 content_ptr: u32,
+                 content_len: u32|
+                 -> i32 {
+                    if !caller.data().has_capability(&Capability::Filesystem) {
+                        tracing::warn!("write_file denied: skill lacks Filesystem capability");
+                        return 0;
+                    }
+                    let Some(path) =
+                        Self::read_host_string(&caller, path_ptr, path_len, "write_file path")
+                    else {
+                        return 0;
+                    };
+                    let Some(content) = Self::read_host_string(
+                        &caller,
+                        content_ptr,
+                        content_len,
+                        "write_file content",
+                    ) else {
+                        return 0;
+                    };
+                    i32::from(caller.data().api.write_file(&path, &content))
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link write_file: {}", e)))?;
+        Ok(())
+    }
+
+    fn read_host_string(
+        caller: &Caller<'_, HostState>,
+        ptr: u32,
+        len: u32,
+        context: &str,
+    ) -> Option<String> {
+        caller
+            .data()
+            .read_string(caller, ptr, len)
+            .map_err(|e| {
+                tracing::error!("{context}: failed to read string: {e}");
+                e
+            })
+            .ok()
+    }
+
+    fn write_host_string(caller: &mut Caller<'_, HostState>, value: &str, context: &str) -> u32 {
+        let memory = match caller.data().memory {
+            Some(memory) => memory,
+            None => {
+                tracing::error!("Memory not initialized for {context}");
+                return 0;
+            }
+        };
+        let mut alloc_offset = caller.data().alloc_offset;
+        match HostState::write_to_memory(memory, caller, value, &mut alloc_offset) {
+            Ok(ptr) => {
+                caller.data_mut().alloc_offset = alloc_offset;
+                ptr
+            }
+            Err(e) => {
+                tracing::error!("Failed to write {context} response: {e}");
+                0
+            }
+        }
     }
 
     /// Link host_api_v2 functions to the WASM linker.
@@ -769,6 +863,70 @@ mod tests {
         wat.as_bytes().to_vec()
     }
 
+    #[derive(Debug)]
+    struct CapabilityRuntimeHostApi {
+        base: crate::host_api::HostApiBase,
+    }
+
+    impl CapabilityRuntimeHostApi {
+        fn new() -> Self {
+            Self {
+                base: crate::host_api::HostApiBase::new("input"),
+            }
+        }
+    }
+
+    impl HostApi for CapabilityRuntimeHostApi {
+        fn log(&self, _level: u32, _message: &str) {}
+
+        fn kv_get(&self, key: &str) -> Option<String> {
+            self.base.kv_get(key)
+        }
+
+        fn kv_set(&mut self, key: &str, value: &str) -> Result<(), SkillError> {
+            self.base.kv_set(key, value);
+            Ok(())
+        }
+
+        fn get_input(&self) -> String {
+            self.base.get_input()
+        }
+
+        fn set_output(&mut self, text: &str) {
+            self.base.set_output(text);
+        }
+
+        fn http_request(
+            &self,
+            _method: &str,
+            _url: &str,
+            _headers: &str,
+            _body: &str,
+        ) -> Option<String> {
+            None
+        }
+
+        fn exec_command(&self, _command: &str, _timeout_ms: u32) -> Option<String> {
+            Some("exec_result".to_string())
+        }
+
+        fn read_file(&self, _path: &str) -> Option<String> {
+            Some("file_result".to_string())
+        }
+
+        fn write_file(&self, path: &str, content: &str) -> bool {
+            path == "out.txt" && content == "hello"
+        }
+
+        fn get_output(&self) -> String {
+            self.base.get_output()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     #[test]
     fn test_register_and_list_skills() {
         let mut runtime = SkillRuntime::new().expect("Should create runtime");
@@ -1078,6 +1236,76 @@ mod tests {
         wat.as_bytes().to_vec()
     }
 
+    fn create_exec_command_wasm() -> Vec<u8> {
+        let wat = r#"
+            (module
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (import "host_api_v1" "exec_command"
+                    (func $exec_command (param i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "echo ok")
+                (data (i32.const 100) "no_response")
+
+                (func (export "run")
+                    (local $resp_ptr i32)
+                    (local.set $resp_ptr
+                        (call $exec_command (i32.const 0) (i32.const 7) (i32.const 1000)))
+                    (if (i32.eqz (local.get $resp_ptr))
+                        (then (call $set_output (i32.const 100) (i32.const 11)))
+                        (else (call $set_output (local.get $resp_ptr) (i32.const 11))))
+                )
+            )
+        "#;
+        wat.as_bytes().to_vec()
+    }
+
+    fn create_read_file_wasm() -> Vec<u8> {
+        let wat = r#"
+            (module
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (import "host_api_v1" "read_file"
+                    (func $read_file (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "/tmp/input.txt")
+                (data (i32.const 100) "no_response")
+
+                (func (export "run")
+                    (local $resp_ptr i32)
+                    (local.set $resp_ptr (call $read_file (i32.const 0) (i32.const 14)))
+                    (if (i32.eqz (local.get $resp_ptr))
+                        (then (call $set_output (i32.const 100) (i32.const 11)))
+                        (else (call $set_output (local.get $resp_ptr) (i32.const 11))))
+                )
+            )
+        "#;
+        wat.as_bytes().to_vec()
+    }
+
+    fn create_write_file_wasm() -> Vec<u8> {
+        let wat = r#"
+            (module
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (import "host_api_v1" "write_file"
+                    (func $write_file (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "out.txt")
+                (data (i32.const 32) "hello")
+                (data (i32.const 100) "written")
+                (data (i32.const 120) "failed")
+
+                (func (export "run")
+                    (if (i32.eq (call $write_file
+                            (i32.const 0) (i32.const 7)
+                            (i32.const 32) (i32.const 5))
+                            (i32.const 1))
+                        (then (call $set_output (i32.const 100) (i32.const 7)))
+                        (else (call $set_output (i32.const 120) (i32.const 6))))
+                )
+            )
+        "#;
+        wat.as_bytes().to_vec()
+    }
+
     fn create_http_manifest(name: &str, with_network: bool) -> SkillManifest {
         SkillManifest {
             name: name.to_string(),
@@ -1152,6 +1380,60 @@ mod tests {
         // Without Network capability, http_request returns 0 → "no_response"
         let output = runtime.invoke("no_net", "input").expect("Should invoke");
         assert_eq!(output, "no_response");
+    }
+
+    #[test]
+    fn test_wasm_exec_command_with_shell_capability() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let mut manifest = create_test_manifest("exec_command");
+        manifest.capabilities = vec![Capability::Shell];
+        let skill = loader
+            .load(&create_exec_command_wasm(), &manifest, None)
+            .expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let output = runtime
+            .invoke_with_api("exec_command", Box::new(CapabilityRuntimeHostApi::new()))
+            .expect("Should invoke");
+        assert_eq!(output, "exec_result");
+    }
+
+    #[test]
+    fn test_wasm_read_file_with_filesystem_capability() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let mut manifest = create_test_manifest("read_file");
+        manifest.capabilities = vec![Capability::Filesystem];
+        let skill = loader
+            .load(&create_read_file_wasm(), &manifest, None)
+            .expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let output = runtime
+            .invoke_with_api("read_file", Box::new(CapabilityRuntimeHostApi::new()))
+            .expect("Should invoke");
+        assert_eq!(output, "file_result");
+    }
+
+    #[test]
+    fn test_wasm_write_file_with_filesystem_capability() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let mut manifest = create_test_manifest("write_file");
+        manifest.capabilities = vec![Capability::Filesystem];
+        let skill = loader
+            .load(&create_write_file_wasm(), &manifest, None)
+            .expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let output = runtime
+            .invoke_with_api("write_file", Box::new(CapabilityRuntimeHostApi::new()))
+            .expect("Should invoke");
+        assert_eq!(output, "written");
     }
 
     #[test]

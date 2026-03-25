@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Fawx loadable layer — skill registry, plugin loading, built-in tool adapters. Hot-swappable at runtime."
 
+[features]
+test-support = []
+
 [dependencies]
 fx-core = { workspace = true }
 fx-kernel = { workspace = true }
@@ -23,6 +26,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 dirs = "6.0"
 futures.workspace = true
+libc = "0.2"
 notify = { version = "7", features = ["macos_fsevent"] }
 sha2 = "0.10"
 

@@ -360,7 +360,7 @@ mod tests {
     fn node_dto_serializes() {
         let response = FleetNodeDto {
             id: "node-1".to_string(),
-            name: "Node Alpha".to_string(),
+            name: "Worker Node A".to_string(),
             status: "healthy".to_string(),
             last_seen_at: 1_742_000_100,
             active_tasks: 0,
@@ -373,7 +373,7 @@ mod tests {
             json,
             json!({
                 "id": "node-1",
-                "name": "Node Alpha",
+                "name": "Worker Node A",
                 "status": "healthy",
                 "last_seen_at": 1_742_000_100,
                 "active_tasks": 0,
@@ -433,7 +433,7 @@ mod tests {
     fn effective_status_marks_old_busy_nodes_degraded() {
         let node = NodeInfo {
             node_id: "node-1".to_string(),
-            name: "Node Alpha".to_string(),
+            name: "Worker Node A".to_string(),
             endpoint: "https://127.0.0.1:8400".to_string(),
             auth_token: None,
             capabilities: vec![NodeCapability::AgenticLoop],

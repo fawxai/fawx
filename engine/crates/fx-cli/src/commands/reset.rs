@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn all_reset_preserves_credentials_while_resetting_the_rest() {
         let fixture = ResetFixture::new(
-            "[http]\nbearer_token = \"keep-me\"\n\n[telegram]\nbot_token = \"keep-bot\"\n\n[[fleet.nodes]]\nid = \"node-1\"\nname = \"Node One\"\nendpoint = \"https://node.example\"\nauth_token = \"keep-token\"\nssh_key = \"~/.ssh/node-1\"\ncapabilities = [\"agentic_loop\"]\naddress = \"100.64.0.1\"\nuser = \"deploy\"\n",
+            "[http]\nbearer_token = \"keep-me\"\n\n[telegram]\nbot_token = \"keep-bot\"\n\n[[fleet.nodes]]\nid = \"node-1\"\nname = \"Node One\"\nendpoint = \"https://node.example\"\nauth_token = \"keep-token\"\nssh_key = \"~/.ssh/node-1\"\ncapabilities = [\"agentic_loop\"]\naddress = \"203.0.113.30\"\nuser = \"deploy\"\n",
         );
         write_dir_file(&fixture.layout.data_dir.join("memory"), "memory.json");
         write_dir_file(&fixture.layout.embedding_model_dir, "index.bin");

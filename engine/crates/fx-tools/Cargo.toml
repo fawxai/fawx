@@ -20,6 +20,7 @@ fx-llm = { path = "../fx-llm" }
 fx-loadable.workspace = true
 fx-config.workspace = true
 fx-auth.workspace = true
+fx-ripcord = { path = "../fx-ripcord" }
 fx-consensus.workspace = true
 fx-memory.workspace = true
 fx-subagent = { path = "../fx-subagent" }

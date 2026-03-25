@@ -3,6 +3,7 @@
 use fx_core::error::SkillError;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Capability a skill can request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -14,6 +15,10 @@ pub enum Capability {
     NetworkRestricted { allowed_domains: Vec<String> },
     /// Persistent key-value storage
     Storage,
+    /// Execute shell commands
+    Shell,
+    /// Read and write local files
+    Filesystem,
     /// Send notifications
     Notifications,
     /// Read sensor data
@@ -22,9 +27,11 @@ pub enum Capability {
     PhoneActions,
 }
 
-pub const ALL_CAPABILITIES: [Capability; 5] = [
+pub const ALL_CAPABILITIES: [Capability; 7] = [
     Capability::Network,
     Capability::Storage,
+    Capability::Shell,
+    Capability::Filesystem,
     Capability::Notifications,
     Capability::Sensors,
     Capability::PhoneActions,
@@ -36,6 +43,8 @@ impl Capability {
             Capability::Network => "network",
             Capability::NetworkRestricted { .. } => "network_restricted",
             Capability::Storage => "storage",
+            Capability::Shell => "shell",
+            Capability::Filesystem => "filesystem",
             Capability::Notifications => "notifications",
             Capability::Sensors => "sensors",
             Capability::PhoneActions => "phone_actions",
@@ -43,9 +52,18 @@ impl Capability {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+impl FromStr for Capability {
+    type Err = SkillError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         ALL_CAPABILITIES
             .into_iter()
             .find(|capability| capability.as_str() == value)
+            .ok_or_else(|| SkillError::InvalidManifest(format!("Unknown capability '{}'", value)))
     }
 }
 
@@ -256,13 +274,15 @@ version = "1.0.0"
 description = "Test skill"
 author = "Fawx"
 api_version = "host_api_v1"
-capabilities = ["network", "storage", "notifications", "sensors", "phone_actions"]
+capabilities = ["network", "storage", "shell", "filesystem", "notifications", "sensors", "phone_actions"]
         "#;
 
         let manifest = parse_manifest(toml).expect("Should parse");
-        assert_eq!(manifest.capabilities.len(), 5);
+        assert_eq!(manifest.capabilities.len(), 7);
         assert!(manifest.capabilities.contains(&Capability::Network));
         assert!(manifest.capabilities.contains(&Capability::Storage));
+        assert!(manifest.capabilities.contains(&Capability::Shell));
+        assert!(manifest.capabilities.contains(&Capability::Filesystem));
         assert!(manifest.capabilities.contains(&Capability::Notifications));
         assert!(manifest.capabilities.contains(&Capability::Sensors));
         assert!(manifest.capabilities.contains(&Capability::PhoneActions));
@@ -325,9 +345,27 @@ capabilities = ["network", "storage", "notifications", "sensors", "phone_actions
             "network_restricted"
         );
         assert_eq!(format!("{}", Capability::Storage), "storage");
+        assert_eq!(format!("{}", Capability::Shell), "shell");
+        assert_eq!(format!("{}", Capability::Filesystem), "filesystem");
         assert_eq!(format!("{}", Capability::Notifications), "notifications");
         assert_eq!(format!("{}", Capability::Sensors), "sensors");
         assert_eq!(format!("{}", Capability::PhoneActions), "phone_actions");
+    }
+
+    #[test]
+    fn shell_capability_serializes() {
+        let json = serde_json::to_string(&Capability::Shell).expect("serialize shell");
+        assert_eq!(json, "\"shell\"");
+        let parsed: Capability = serde_json::from_str(&json).expect("deserialize shell");
+        assert_eq!(parsed, Capability::Shell);
+    }
+
+    #[test]
+    fn filesystem_capability_serializes() {
+        let json = serde_json::to_string(&Capability::Filesystem).expect("serialize filesystem");
+        assert_eq!(json, "\"filesystem\"");
+        let parsed: Capability = serde_json::from_str(&json).expect("deserialize filesystem");
+        assert_eq!(parsed, Capability::Filesystem);
     }
 
     #[test]

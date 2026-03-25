@@ -478,11 +478,9 @@ mod tests {
             .expect("create");
 
         let messages = vec![SessionMessage::text(MessageRole::Assistant, "saved", 7)];
-        let memory = SessionMemory {
-            project: Some("session memory".to_string()),
-            current_state: Some("testing".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut memory = SessionMemory::default();
+        memory.project = Some("session memory".to_string());
+        memory.current_state = Some("testing".to_string());
         reg.record_turn(&key, messages, memory.clone())
             .expect("record turn");
 

@@ -34,6 +34,8 @@ mod fleet_command {
         include!("commands/fleet.rs");
     }
 }
+#[path = "commands/marketplace.rs"]
+pub(crate) mod marketplace_commands;
 #[cfg(test)]
 #[allow(dead_code)]
 mod repo_root;
@@ -48,6 +50,7 @@ mod start_stop_command {
     include!("commands/start_stop.rs");
 }
 mod commands {
+    pub(crate) use super::marketplace_commands as marketplace;
     pub(crate) use super::slash_commands as slash;
 }
 mod config_bridge;

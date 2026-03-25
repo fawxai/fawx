@@ -1,111 +1,93 @@
 //! CLI commands for the skill marketplace (search, install, list).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use fx_marketplace::{InstalledSkill, RegistryConfig, SkillEntry};
+use crate::startup;
+use fx_marketplace::{InstalledSkill, SkillEntry};
 
-/// Default registry URL (raw GitHub content).
-const DEFAULT_REGISTRY: &str = "https://raw.githubusercontent.com/fawxai/registry/main";
-
-/// Official fawxai publisher Ed25519 public key (32 bytes).
-const FAWXAI_PUBLIC_KEY: [u8; 32] = [
-    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188, 106, 55, 109, 208, 1,
-    191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
-];
-
-/// Resolve the Fawx data directory (`~/.fawx`).
-fn data_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
-    Ok(home.join(".fawx"))
-}
-
-/// Load trusted keys from `~/.fawx/trusted_keys/`.
-fn load_trusted_keys(data: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut keys = vec![FAWXAI_PUBLIC_KEY.to_vec()];
-    let keys_dir = data.join("trusted_keys");
-    if keys_dir.exists() {
-        for entry in std::fs::read_dir(&keys_dir)? {
-            let path = entry?.path();
-            if path.is_file() {
-                keys.push(std::fs::read(&path)?);
-            }
-        }
-    }
-    Ok(keys)
+/// Resolve the Fawx data directory.
+fn data_dir() -> PathBuf {
+    startup::fawx_data_dir()
 }
 
 /// Build a `RegistryConfig` from defaults.
-fn build_config() -> anyhow::Result<RegistryConfig> {
-    let data = data_dir()?;
-    let trusted_keys = load_trusted_keys(&data)?;
-    Ok(RegistryConfig {
-        registry_url: DEFAULT_REGISTRY.to_string(),
-        data_dir: data,
-        trusted_keys,
-    })
+fn build_config() -> anyhow::Result<fx_marketplace::RegistryConfig> {
+    let data = data_dir();
+    Ok(fx_marketplace::default_config(&data)?)
 }
 
-/// Print a list of skill entries from search results.
-fn print_search_results(entries: &[SkillEntry]) {
+/// Render a list of skill entries from search results.
+fn render_search_results(entries: &[SkillEntry]) -> String {
     if entries.is_empty() {
-        println!("No skills found.");
-        return;
+        return "No skills found.".to_string();
     }
-    for e in entries {
-        let size = e
+
+    let mut lines = Vec::new();
+    for entry in entries {
+        let size = entry
             .size_bytes
-            .map(|b| format!("{} KB", b / 1024))
+            .map(|bytes| format!("{} KB", bytes / 1024))
             .unwrap_or_else(|| "unknown".to_string());
-        let caps = e.capabilities.join(", ");
-        println!("  {} v{} — {}", e.name, e.version, e.description);
-        println!("    by {} | capabilities: {} | {}", e.author, caps, size);
+        let capabilities = entry.capabilities.join(", ");
+        lines.push(format!(
+            "  {} v{}: {}",
+            entry.name, entry.version, entry.description
+        ));
+        lines.push(format!(
+            "    by {} | capabilities: {} | {}",
+            entry.author, capabilities, size
+        ));
     }
-    let n = entries.len();
-    let noun = if n == 1 { "skill" } else { "skills" };
-    println!("\n{n} {noun} found.");
+
+    let count = entries.len();
+    let noun = if count == 1 { "skill" } else { "skills" };
+    lines.push(String::new());
+    lines.push(format!("{count} {noun} found."));
+    lines.join("\n")
 }
 
-/// Print a list of installed skills.
-fn print_installed(skills: &[InstalledSkill]) {
+/// Render a list of installed skills.
+fn render_installed(skills: &[InstalledSkill]) -> String {
     if skills.is_empty() {
-        println!("No installed skills.");
-        return;
+        return "No installed skills.".to_string();
     }
-    println!("Installed skills:");
-    for s in skills {
-        let caps = if s.capabilities.is_empty() {
+
+    let mut lines = vec!["Installed skills:".to_string()];
+    for skill in skills {
+        let capabilities = if skill.capabilities.is_empty() {
             String::new()
         } else {
-            format!("  ({})", s.capabilities.join(", "))
+            format!("  ({})", skill.capabilities.join(", "))
         };
-        println!("  {:16} v{}{}", s.name, s.version, caps);
+        lines.push(format!(
+            "  {:16} v{}{}",
+            skill.name, skill.version, capabilities
+        ));
     }
+    lines.join("\n")
 }
 
-/// `fawx search <query>`
-pub fn search_cmd(query: &str) -> anyhow::Result<()> {
+pub fn search_output(query: &str) -> anyhow::Result<String> {
     let config = build_config()?;
-    println!("Registry: fawxai/fawx-skills\n");
     let results = fx_marketplace::search(&config, query)?;
-    print_search_results(&results);
-    Ok(())
+    Ok(format!(
+        "Registry: fawxai/registry\n\n{}",
+        render_search_results(&results)
+    ))
 }
 
-/// `fawx install <name>`
-pub fn install_cmd(name: &str) -> anyhow::Result<()> {
+pub fn install_output(name: &str) -> anyhow::Result<String> {
     let config = build_config()?;
-    println!("Installing {name}...");
     let result = fx_marketplace::install(&config, name)?;
-    println!("  Downloaded: {} KB", result.size_bytes / 1024);
-    println!("  Signature: verified ✓");
-    println!("  Installed to: {}", result.install_path.display());
-    Ok(())
+    Ok(format!(
+        "Installing {name}...\n  Downloaded: {} KB\n  Signature: verified ✓\n  Installed to: {}",
+        result.size_bytes / 1024,
+        result.install_path.display()
+    ))
 }
 
-/// `fawx list`
-pub fn list_cmd() -> anyhow::Result<()> {
-    let data = data_dir()?;
+pub fn list_output() -> anyhow::Result<String> {
+    let data = data_dir();
     let skills = fx_marketplace::list_installed(&data)?;
-    print_installed(&skills);
-    Ok(())
+    Ok(render_installed(&skills))
 }
