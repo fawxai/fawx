@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Official fawxai publisher Ed25519 public key (32 bytes).
+pub const FAWXAI_PUBLIC_KEY: [u8; 32] = [
+    62, 38, 70, 230, 12, 59, 226, 179, 11, 150, 52, 48, 238, 181, 159, 188, 106, 55, 109, 208, 1,
+    191, 157, 233, 161, 111, 154, 212, 209, 133, 28, 68,
+];
+
+/// Default registry URL (raw GitHub content).
+pub const DEFAULT_REGISTRY_URL: &str = "https://raw.githubusercontent.com/fawxai/registry/main";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -117,6 +126,62 @@ pub fn parse_index(json: &str) -> Result<Vec<SkillEntry>, MarketplaceError> {
     let index: RegistryIndex =
         serde_json::from_str(json).map_err(|e| MarketplaceError::InvalidIndex(e.to_string()))?;
     Ok(index.skills)
+}
+
+/// Load trusted keys: builtin fawxai key + any user-added keys from
+/// `{data_dir}/trusted_keys/`.
+pub fn load_trusted_keys(data_dir: &Path) -> Result<Vec<Vec<u8>>, MarketplaceError> {
+    let mut keys = vec![FAWXAI_PUBLIC_KEY.to_vec()];
+    let keys_dir = data_dir.join("trusted_keys");
+    if !keys_dir.exists() {
+        return Ok(keys);
+    }
+
+    for path in trusted_key_paths(&keys_dir)? {
+        if let Some(key) = read_trusted_key(&path)? {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Build a default `RegistryConfig` for the given data directory.
+pub fn default_config(data_dir: &Path) -> Result<RegistryConfig, MarketplaceError> {
+    Ok(RegistryConfig {
+        registry_url: DEFAULT_REGISTRY_URL.to_string(),
+        data_dir: data_dir.to_path_buf(),
+        trusted_keys: load_trusted_keys(data_dir)?,
+    })
+}
+
+fn trusted_key_paths(keys_dir: &Path) -> Result<Vec<PathBuf>, MarketplaceError> {
+    let mut paths = Vec::new();
+    let entries = fs::read_dir(keys_dir)
+        .map_err(|e| MarketplaceError::InstallError(format!("read trusted_keys: {e}")))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| MarketplaceError::InstallError(format!("read entry: {e}")))?
+            .path();
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_trusted_key(path: &Path) -> Result<Option<Vec<u8>>, MarketplaceError> {
+    let key_bytes =
+        fs::read(path).map_err(|e| MarketplaceError::InstallError(format!("read key: {e}")))?;
+    if key_bytes.len() != 32 {
+        tracing::warn!(
+            path = %path.display(),
+            size = key_bytes.len(),
+            "Skipping invalid trusted key file"
+        );
+        return Ok(None);
+    }
+    Ok(Some(key_bytes))
 }
 
 /// Validate that a skill name contains only safe characters.
@@ -441,6 +506,37 @@ capabilities = ["network"]
         );
         fs::create_dir_all(dir).expect("create dir");
         fs::write(dir.join("manifest.toml"), manifest).expect("write manifest");
+    }
+
+    #[test]
+    fn load_trusted_keys_returns_builtin_and_valid_user_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        let keys_dir = tmp.path().join("trusted_keys");
+        fs::create_dir_all(&keys_dir).expect("mkdir trusted_keys");
+        fs::write(keys_dir.join("a.key"), vec![7_u8; 32]).expect("write valid key");
+        fs::write(keys_dir.join("b.key"), vec![9_u8; 31]).expect("write invalid key");
+
+        let keys = load_trusted_keys(tmp.path()).expect("load trusted keys");
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], FAWXAI_PUBLIC_KEY.to_vec());
+        assert_eq!(keys[1], vec![7_u8; 32]);
+    }
+
+    #[test]
+    fn default_config_uses_default_registry_and_loaded_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        let keys_dir = tmp.path().join("trusted_keys");
+        fs::create_dir_all(&keys_dir).expect("mkdir trusted_keys");
+        fs::write(keys_dir.join("publisher.key"), vec![5_u8; 32]).expect("write key");
+
+        let config = default_config(tmp.path()).expect("default config");
+
+        assert_eq!(config.registry_url, DEFAULT_REGISTRY_URL);
+        assert_eq!(config.data_dir, tmp.path());
+        assert_eq!(config.trusted_keys.len(), 2);
+        assert_eq!(config.trusted_keys[0], FAWXAI_PUBLIC_KEY.to_vec());
+        assert_eq!(config.trusted_keys[1], vec![5_u8; 32]);
     }
 
     // 1. search_filters_by_name

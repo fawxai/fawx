@@ -399,78 +399,13 @@ fn collect_expired(pending: &mut HashMap<String, Instant>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        invocable_wasm_bytes, test_manifest_toml, versioned_manifest_toml, write_test_skill,
+        write_versioned_test_skill,
+    };
     use crate::wasm_skill::compute_wasm_hash;
     use std::fs;
     use tempfile::TempDir;
-
-    fn test_manifest_toml(name: &str) -> String {
-        format!(
-            r#"name = "{name}"
-version = "1.0.0"
-description = "{name} skill"
-author = "Test"
-api_version = "host_api_v1"
-entry_point = "run"
-"#
-        )
-    }
-
-    fn versioned_manifest_toml(name: &str, version: &str) -> String {
-        format!(
-            r#"name = "{name}"
-version = "{version}"
-description = "{name} skill"
-author = "Test"
-api_version = "host_api_v1"
-entry_point = "run"
-"#
-        )
-    }
-
-    fn invocable_wasm_bytes() -> Vec<u8> {
-        let wat = r#"
-            (module
-                (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
-                (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
-                (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
-                (import "host_api_v1" "get_input" (func $get_input (result i32)))
-                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
-                (memory (export "memory") 1)
-                (func (export "run")
-                    (i32.store8 (i32.const 0) (i32.const 111))
-                    (i32.store8 (i32.const 1) (i32.const 107))
-                    (call $set_output (i32.const 0) (i32.const 2))
-                )
-            )
-        "#;
-        wat.as_bytes().to_vec()
-    }
-
-    fn setup_skill_dir(skills_dir: &Path, name: &str) {
-        let skill_dir = skills_dir.join(name);
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("manifest.toml"), test_manifest_toml(name)).unwrap();
-        fs::write(
-            skill_dir.join(format!("{name}.wasm")),
-            invocable_wasm_bytes(),
-        )
-        .unwrap();
-    }
-
-    fn setup_versioned_skill_dir(skills_dir: &Path, name: &str, version: &str) {
-        let skill_dir = skills_dir.join(name);
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("manifest.toml"),
-            versioned_manifest_toml(name, version),
-        )
-        .unwrap();
-        fs::write(
-            skill_dir.join(format!("{name}.wasm")),
-            invocable_wasm_bytes(),
-        )
-        .unwrap();
-    }
 
     #[test]
     fn reload_event_is_debug_and_clone() {
@@ -511,7 +446,7 @@ entry_point = "run"
     fn skill_dir_is_valid_with_all_files() {
         let tmp = TempDir::new().unwrap();
         let name = "test_skill";
-        setup_skill_dir(tmp.path(), name);
+        write_test_skill(tmp.path(), name).unwrap();
         assert!(skill_dir_is_valid(&tmp.path().join(name), name));
     }
 
@@ -548,8 +483,8 @@ entry_point = "run"
     #[test]
     fn initialize_hashes_populates_from_existing_skills() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "alpha");
-        setup_skill_dir(tmp.path(), "beta");
+        write_test_skill(tmp.path(), "alpha").unwrap();
+        write_test_skill(tmp.path(), "beta").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
@@ -570,7 +505,7 @@ entry_point = "run"
     #[test]
     fn initialize_hashes_correct_hash_value() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "test_hash");
+        write_test_skill(tmp.path(), "test_hash").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
@@ -591,7 +526,7 @@ entry_point = "run"
     #[test]
     fn initialize_hashes_stores_version() {
         let tmp = TempDir::new().unwrap();
-        setup_versioned_skill_dir(tmp.path(), "versioned", "2.5.0");
+        write_versioned_test_skill(tmp.path(), "versioned", "2.5.0").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
@@ -645,7 +580,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_loads_new_skill() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "newskill");
+        write_test_skill(tmp.path(), "newskill").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -675,7 +610,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_loads_with_correct_version() {
         let tmp = TempDir::new().unwrap();
-        setup_versioned_skill_dir(tmp.path(), "verskill", "3.1.0");
+        write_versioned_test_skill(tmp.path(), "verskill", "3.1.0").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -720,7 +655,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_updates_existing_skill() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "updskill");
+        write_test_skill(tmp.path(), "updskill").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -750,7 +685,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_update_reports_old_version() {
         let tmp = TempDir::new().unwrap();
-        setup_versioned_skill_dir(tmp.path(), "upver", "1.0.0");
+        write_versioned_test_skill(tmp.path(), "upver", "1.0.0").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -794,7 +729,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_same_hash_no_reload() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "sameskill");
+        write_test_skill(tmp.path(), "sameskill").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -820,7 +755,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_removal() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "rmskill");
+        write_test_skill(tmp.path(), "rmskill").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -851,7 +786,7 @@ entry_point = "run"
     #[tokio::test]
     async fn process_skill_change_error_keeps_existing() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "errskill");
+        write_test_skill(tmp.path(), "errskill").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -917,7 +852,7 @@ entry_point = "run"
     #[tokio::test]
     async fn debounce_multiple_events_single_reload() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "debounce");
+        write_test_skill(tmp.path(), "debounce").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -981,7 +916,7 @@ entry_point = "run"
     #[tokio::test]
     async fn handle_removal_uses_try_send() {
         let tmp = TempDir::new().unwrap();
-        setup_skill_dir(tmp.path(), "trysend");
+        write_test_skill(tmp.path(), "trysend").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         // Channel with capacity 1 — fill it to verify try_send doesn't block

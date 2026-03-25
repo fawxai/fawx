@@ -536,7 +536,8 @@ impl SessionTurnCollector {
             StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
                 self.flush_pending_tool_results();
             }
-            StreamEvent::TextDelta { .. }
+            StreamEvent::ToolError { .. }
+            | StreamEvent::TextDelta { .. }
             | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. }
@@ -1202,6 +1203,18 @@ impl HeadlessApp {
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
         self.run_cycle_result_with_attachments(input, images, documents, source, None)
+            .await
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn process_message_with_images(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        source: &InputSource,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.process_message_with_attachments(input, images, &[], source)
             .await
     }
 
@@ -2192,6 +2205,18 @@ impl CommandHost for HeadlessApp {
 
     fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
         Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
+    }
+
+    fn list_skills(&self) -> anyhow::Result<String> {
+        crate::commands::marketplace::list_output()
+    }
+
+    fn install_skill(&self, name: &str) -> anyhow::Result<String> {
+        crate::commands::marketplace::install_output(name)
+    }
+
+    fn search_skills(&self, query: &str) -> anyhow::Result<String> {
+        crate::commands::marketplace::search_output(query)
     }
 }
 

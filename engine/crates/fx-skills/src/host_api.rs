@@ -33,6 +33,25 @@ pub trait HostApi: Send + Sync {
     /// - `body`: Request body (empty string for no body)
     fn http_request(&self, method: &str, url: &str, headers: &str, body: &str) -> Option<String>;
 
+    /// Execute a shell command. Returns JSON: {"stdout": "...", "stderr": "...", "exit_code": N}
+    /// Returns None if Shell capability is not granted.
+    fn exec_command(&self, command: &str, timeout_ms: u32) -> Option<String> {
+        let _ = (command, timeout_ms);
+        None
+    }
+
+    /// Read a file's contents as UTF-8. Returns None if Filesystem capability is not granted.
+    fn read_file(&self, path: &str) -> Option<String> {
+        let _ = path;
+        None
+    }
+
+    /// Write content to a file. Returns true on success.
+    fn write_file(&self, path: &str, content: &str) -> bool {
+        let _ = (path, content);
+        false
+    }
+
     /// Get the output that was set by the skill.
     fn get_output(&self) -> String;
 

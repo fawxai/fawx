@@ -678,7 +678,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "unknown capability 'flying', valid: network, storage, notifications, sensors, phone_actions"
+            "unknown capability 'flying', valid: network, storage, shell, filesystem, notifications, sensors, phone_actions"
         );
     }
 

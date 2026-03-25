@@ -12,9 +12,11 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 
 use crate::conversation_compactor::{
-    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, has_prunable_blocks,
-    prune_tool_blocks, CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult,
-    CompactionStrategy, ConversationBudget, SlidingWindowCompactor,
+    assemble_summarized_messages, debug_assert_tool_pair_integrity, emergency_compact,
+    estimate_text_tokens, generate_summary, has_prunable_blocks, prune_tool_blocks,
+    slide_summarization_plan, summary_message, CompactionConfig, CompactionError,
+    CompactionMemoryFlush, CompactionResult, ConversationBudget, SlideSummarizationPlan,
+    SlidingWindowCompactor,
 };
 use crate::decide::Decision;
 use crate::input::{LoopCommand, LoopInputChannel};
@@ -218,6 +220,13 @@ impl<'a> CycleStream<'a> {
         });
     }
 
+    fn tool_error(self, tool_name: &str, error: &str) {
+        self.emit(StreamEvent::ToolError {
+            tool_name: tool_name.to_string(),
+            error: error.to_string(),
+        });
+    }
+
     fn notification(self, title: impl Into<String>, body: impl Into<String>) {
         self.emit(StreamEvent::Notification {
             title: title.into(),
@@ -401,7 +410,6 @@ impl std::fmt::Display for CompactionScope {
 enum CompactionTier {
     Prune,
     Slide,
-    Summarize,
     Emergency,
 }
 
@@ -410,7 +418,6 @@ impl CompactionTier {
         match self {
             Self::Prune => "prune",
             Self::Slide => "slide",
-            Self::Summarize => "summarize",
             Self::Emergency => "emergency",
         }
     }
@@ -418,10 +425,9 @@ impl CompactionTier {
 
 /// Core orchestrator for the 7-step agentic loop.
 ///
-/// Note: `LoopEngine` previously derived `Clone`, but Phases 1-3
-/// (context window compaction) introduced two non-`Clone` fields:
-/// `conversation_compactor: Box<dyn CompactionStrategy>` and
-/// `compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`.
+/// Note: `LoopEngine` previously derived `Clone`, but context compaction
+/// introduced a non-`Clone` cooldown tracker
+/// (`compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`).
 /// `LoopInputChannel` also contains an `mpsc::Receiver`, which remains
 /// non-`Clone`. No existing code clones `LoopEngine`, so this is a safe change.
 pub struct LoopEngine {
@@ -442,7 +448,6 @@ pub struct LoopEngine {
     event_bus: Option<fx_core::EventBus>,
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
-    conversation_compactor: Box<dyn CompactionStrategy>,
     /// LLM for compaction-time memory extraction.
     compaction_llm: Option<Arc<dyn LlmProvider>>,
     memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
@@ -450,10 +455,10 @@ pub struct LoopEngine {
     /// Guards performance signal to fire only on the Normal→Low transition,
     /// not on every `perceive()` call while the budget stays Low.
     budget_low_signaled: bool,
-    /// Consecutive iterations that used tools without producing user-facing text.
+    /// Consecutive iterations that included tool calls.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
-    consecutive_tool_only_turns: u16,
+    consecutive_tool_turns: u16,
     /// Latest reasoning input messages for graceful budget-exhausted synthesis.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     last_reasoning_messages: Vec<Message>,
@@ -486,10 +491,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("scratchpad_context", &self.scratchpad_context)
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
-            .field(
-                "consecutive_tool_only_turns",
-                &self.consecutive_tool_only_turns,
-            )
+            .field("consecutive_tool_turns", &self.consecutive_tool_turns)
             .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
@@ -858,8 +860,12 @@ impl LoopEngineBuilder {
         let synthesis_instruction =
             required_builder_field(self.synthesis_instruction, "synthesis_instruction")?;
         let compaction_llm_for_extraction = self.compaction_llm.as_ref().map(Arc::clone);
-        let (compaction_config, conversation_budget, conversation_compactor) =
-            build_compaction_components(self.compaction_config, self.compaction_llm)?;
+        let (compaction_config, conversation_budget) =
+            build_compaction_components(self.compaction_config)?;
+        let session_memory = self
+            .session_memory
+            .unwrap_or_else(|| default_session_memory(compaction_config.model_context_limit));
+        configure_session_memory(&session_memory, compaction_config.model_context_limit);
 
         Ok(LoopEngine {
             budget,
@@ -869,7 +875,7 @@ impl LoopEngineBuilder {
             iteration_count: 0,
             synthesis_instruction,
             memory_context: self.memory_context,
-            session_memory: self.session_memory.unwrap_or_else(default_session_memory),
+            session_memory,
             scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
             cancel_token: self.cancel_token,
@@ -879,12 +885,11 @@ impl LoopEngineBuilder {
             event_bus: self.event_bus,
             compaction_config,
             conversation_budget,
-            conversation_compactor,
             compaction_llm: compaction_llm_for_extraction,
             memory_flush: self.memory_flush,
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
-            consecutive_tool_only_turns: 0,
+            consecutive_tool_turns: 0,
             last_reasoning_messages: Vec::new(),
             tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
@@ -901,15 +906,7 @@ impl LoopEngineBuilder {
 
 fn build_compaction_components(
     config: Option<CompactionConfig>,
-    llm: Option<Arc<dyn LlmProvider>>,
-) -> Result<
-    (
-        CompactionConfig,
-        ConversationBudget,
-        Box<dyn CompactionStrategy>,
-    ),
-    LoopError,
-> {
+) -> Result<(CompactionConfig, ConversationBudget), LoopError> {
     let compaction_config = config.unwrap_or_default();
     compaction_config.validate().map_err(|error| {
         loop_error(
@@ -924,8 +921,7 @@ fn build_compaction_components(
         compaction_config.slide_threshold,
         compaction_config.reserved_system_tokens,
     );
-    let strategy = compaction_config.build_strategy(llm);
-    Ok((compaction_config, conversation_budget, strategy))
+    Ok((compaction_config, conversation_budget))
 }
 
 fn build_extraction_prompt(messages: &[Message]) -> String {
@@ -1023,6 +1019,122 @@ fn parse_extraction_response(response: &str) -> Option<SessionMemoryUpdate> {
     None
 }
 
+#[derive(Clone, Copy)]
+enum SummarySection {
+    Decisions,
+    FilesModified,
+    TaskState,
+    KeyContext,
+}
+
+#[derive(Default)]
+struct ParsedSummarySections {
+    decisions: Vec<String>,
+    files_modified: Vec<String>,
+    task_state: Vec<String>,
+    key_context: Vec<String>,
+}
+
+fn parse_summary_memory_update(summary: &str) -> Option<SessionMemoryUpdate> {
+    let sections = parse_summary_sections(summary);
+    let update = SessionMemoryUpdate {
+        project: None,
+        current_state: joined_summary_section(&sections.task_state),
+        key_decisions: optional_summary_items(sections.decisions),
+        active_files: optional_summary_items(sections.files_modified),
+        custom_context: optional_summary_items(sections.key_context),
+    };
+    has_memory_update_fields(&update).then_some(update)
+}
+
+fn parse_summary_sections(summary: &str) -> ParsedSummarySections {
+    let mut sections = ParsedSummarySections::default();
+    let mut current = None;
+    for line in summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some((section, inline)) = summary_section_header(line) {
+            current = Some(section);
+            if let Some(text) = inline {
+                push_summary_section_line(&mut sections, section, text);
+            }
+            continue;
+        }
+        if let Some(section) = current {
+            push_summary_section_line(&mut sections, section, line);
+        }
+    }
+    sections
+}
+
+fn summary_section_header(line: &str) -> Option<(SummarySection, Option<&str>)> {
+    let (heading, remainder) = line.split_once(':')?;
+    let section = match strip_summary_section_numbering(heading) {
+        text if text.eq_ignore_ascii_case("Decisions") => SummarySection::Decisions,
+        text if text.eq_ignore_ascii_case("Files modified") => SummarySection::FilesModified,
+        text if text.eq_ignore_ascii_case("Task state") => SummarySection::TaskState,
+        text if text.eq_ignore_ascii_case("Key context") => SummarySection::KeyContext,
+        _ => return None,
+    };
+    let inline = (!remainder.trim().is_empty()).then_some(remainder.trim());
+    Some((section, inline))
+}
+
+fn strip_summary_section_numbering(heading: &str) -> &str {
+    let trimmed = heading.trim();
+    let digits_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
+        return trimmed;
+    }
+    trimmed[digits_len..]
+        .strip_prefix('.')
+        .map_or(trimmed, |remainder| remainder.trim_start())
+}
+
+fn push_summary_section_line(
+    sections: &mut ParsedSummarySections,
+    section: SummarySection,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    let item = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim();
+    if item.is_empty() {
+        return;
+    }
+    match section {
+        SummarySection::Decisions => sections.decisions.push(item.to_string()),
+        SummarySection::FilesModified => sections.files_modified.push(item.to_string()),
+        SummarySection::TaskState => sections.task_state.push(item.to_string()),
+        SummarySection::KeyContext => sections.key_context.push(item.to_string()),
+    }
+}
+
+fn joined_summary_section(items: &[String]) -> Option<String> {
+    (!items.is_empty()).then(|| items.join("; "))
+}
+
+fn optional_summary_items(items: Vec<String>) -> Option<Vec<String>> {
+    (!items.is_empty()).then_some(items)
+}
+
+fn has_memory_update_fields(update: &SessionMemoryUpdate) -> bool {
+    update.project.is_some()
+        || update.current_state.is_some()
+        || update.key_decisions.is_some()
+        || update.active_files.is_some()
+        || update.custom_context.is_some()
+}
+
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -1041,8 +1153,15 @@ fn normalize_memory_context(memory_context: String) -> Option<String> {
     }
 }
 
-fn default_session_memory() -> Arc<Mutex<SessionMemory>> {
-    Arc::new(Mutex::new(SessionMemory::default()))
+fn default_session_memory(context_limit: usize) -> Arc<Mutex<SessionMemory>> {
+    Arc::new(Mutex::new(SessionMemory::with_context_limit(context_limit)))
+}
+
+fn configure_session_memory(memory: &Arc<Mutex<SessionMemory>>, context_limit: usize) {
+    let mut memory = memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    memory.set_context_limit(context_limit);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1260,7 +1379,19 @@ Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
-const TOOL_ONLY_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+const TOOL_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
+const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several rounds without providing a response. Share your progress with the user now. If you have enough information to answer, do so immediately instead of calling more tools.";
+const TOOL_ERROR_RELAY_PREFIX: &str = "The following tools failed. Report these errors to the user before continuing with additional tool calls:";
+
+fn tool_error_relay_directive(failed_tools: &[(&str, &str)]) -> String {
+    let details: Vec<String> = failed_tools
+        .iter()
+        .map(|(name, error)| format!("- Tool '{}' failed with: {}", name, error))
+        .collect();
+    format!("{}\n{}", TOOL_ERROR_RELAY_PREFIX, details.join("\n"))
+}
+/// Maximum time to wait for a best-effort summary during emergency compaction.
+const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl LoopEngine {
     /// Create a loop engine builder.
@@ -1303,11 +1434,13 @@ impl LoopEngine {
     }
 
     pub fn replace_session_memory(&self, memory: SessionMemory) -> SessionMemory {
+        let mut replacement = memory;
+        replacement.set_context_limit(self.compaction_config.model_context_limit);
         let mut stored = match self.session_memory.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        std::mem::replace(&mut *stored, memory)
+        std::mem::replace(&mut *stored, replacement)
     }
 
     pub fn session_memory_snapshot(&self) -> SessionMemory {
@@ -1353,6 +1486,7 @@ impl LoopEngine {
             self.compaction_config.slide_threshold,
             self.compaction_config.reserved_system_tokens,
         );
+        configure_session_memory(&self.session_memory, new_limit);
     }
 
     /// Synchronise the shared iteration counter and refresh scratchpad context.
@@ -1537,7 +1671,7 @@ impl LoopEngine {
         }
 
         state.tokens.accumulate(action.tokens_used);
-        self.update_tool_only_turns(&action);
+        self.update_tool_turns(&action);
 
         if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
             return Ok(self.finish_streaming_result(result, stream));
@@ -1703,7 +1837,7 @@ impl LoopEngine {
         self.user_stop_requested = false;
         self.pending_steer = None;
         self.budget_low_signaled = false;
-        self.consecutive_tool_only_turns = 0;
+        self.consecutive_tool_turns = 0;
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
@@ -1714,11 +1848,39 @@ impl LoopEngine {
         self.tool_executor.clear_cache();
     }
 
-    fn update_tool_only_turns(&mut self, action: &ActionResult) {
-        if !action.tool_results.is_empty() && action.response_text.trim().is_empty() {
-            self.consecutive_tool_only_turns = self.consecutive_tool_only_turns.saturating_add(1);
-        } else if !action.response_text.trim().is_empty() {
-            self.consecutive_tool_only_turns = 0;
+    fn update_tool_turns(&mut self, action: &ActionResult) {
+        if !action.tool_results.is_empty() {
+            self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
+        } else {
+            self.consecutive_tool_turns = 0;
+        }
+    }
+
+    /// Apply nudge/strip policy for the current tool continuation round.
+    ///
+    /// Mutates `continuation_messages` by appending a progress nudge at the
+    /// nudge threshold round. Returns the tool definitions to use: either the
+    /// full set (normal) or an empty vec (tools stripped at strip threshold).
+    fn apply_tool_round_progress_policy(
+        &self,
+        round: u32,
+        continuation_messages: &mut Vec<Message>,
+    ) -> Vec<ToolDefinition> {
+        let tc = &self.budget.config().termination;
+        let nudge_threshold = u32::from(tc.tool_round_nudge_after);
+        let strip_threshold =
+            nudge_threshold.saturating_add(u32::from(tc.tool_round_strip_after_nudge));
+
+        // Fire nudge exactly once (at the threshold round) to avoid stacking
+        // duplicate nudge messages in continuation_messages across rounds.
+        if nudge_threshold > 0 && round == nudge_threshold {
+            continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
+        }
+
+        if nudge_threshold > 0 && round >= strip_threshold {
+            Vec::new()
+        } else {
+            self.tool_executor.tool_definitions()
         }
     }
 
@@ -1885,8 +2047,8 @@ impl LoopEngine {
         }
 
         let nudge_at = self.budget.config().termination.nudge_after_tool_turns;
-        if nudge_at > 0 && self.consecutive_tool_only_turns >= nudge_at {
-            context_window.push(Message::system(TOOL_ONLY_TURN_NUDGE.to_string()));
+        if nudge_at > 0 && self.consecutive_tool_turns >= nudge_at {
+            context_window.push(Message::system(TOOL_TURN_NUDGE.to_string()));
         }
 
         let processed = ProcessedPerception {
@@ -1920,13 +2082,13 @@ impl LoopEngine {
     ) -> Result<CompletionResponse, LoopError> {
         let tc = &self.budget.config().termination;
         let should_strip_tools = tc.nudge_after_tool_turns > 0
-            && self.consecutive_tool_only_turns
+            && self.consecutive_tool_turns
                 >= tc
                     .nudge_after_tool_turns
                     .saturating_add(tc.strip_tools_after_nudge);
         let tools = if should_strip_tools {
             tracing::info!(
-                turns = self.consecutive_tool_only_turns,
+                turns = self.consecutive_tool_turns,
                 "stripping tools: agent exceeded nudge + grace threshold"
             );
             vec![]
@@ -2991,6 +3153,15 @@ impl LoopEngine {
         }
     }
 
+    fn emit_tool_errors(&self, results: &[ToolResult], stream: CycleStream<'_>) -> bool {
+        let mut has_errors = false;
+        for result in results.iter().filter(|result| !result.success) {
+            has_errors = true;
+            stream.tool_error(&result.tool_name, &result.output);
+        }
+        has_errors
+    }
+
     fn publish_tool_result(&mut self, result: &ToolResult) {
         if result.success && result.tool_name == NOTIFY_TOOL_NAME {
             self.notify_called_this_cycle = true;
@@ -3078,13 +3249,6 @@ impl LoopEngine {
         {
             return Some(CompactionTier::Emergency);
         }
-        if self.compaction_config.use_summarization
-            && self
-                .conversation_budget
-                .at_tier(messages, self.compaction_config.summarize_threshold)
-        {
-            return Some(CompactionTier::Summarize);
-        }
         if self
             .conversation_budget
             .at_tier(messages, self.compaction_config.slide_threshold)
@@ -3147,6 +3311,30 @@ impl LoopEngine {
         );
     }
 
+    fn collect_evicted_messages(
+        &self,
+        messages: &[Message],
+        evicted_indices: &[usize],
+    ) -> Vec<Message> {
+        evicted_indices
+            .iter()
+            .filter_map(|&index| messages.get(index).cloned())
+            .collect()
+    }
+
+    fn apply_session_memory_update(&self, update: SessionMemoryUpdate) {
+        let mut memory = self
+            .session_memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(err) = memory.apply_update(update) {
+            tracing::warn!(
+                error = %err,
+                "auto-extracted memory update rejected (token cap)"
+            );
+        }
+    }
+
     async fn flush_evicted(
         &self,
         messages: &[Message],
@@ -3157,17 +3345,19 @@ impl LoopEngine {
             return;
         }
 
-        let evicted: Vec<Message> = result
-            .evicted_indices
-            .iter()
-            .filter_map(|&index| messages.get(index).cloned())
-            .collect();
-        if evicted.is_empty() {
-            return;
-        }
-
+        let evicted = self.collect_evicted_messages(messages, &result.evicted_indices);
         if let Some(flush) = &self.memory_flush {
-            if let Err(err) = flush.flush(&evicted, scope.as_str()).await {
+            let flush_result = if let Some(summary) = result.summary.as_deref() {
+                let summary = summary_message(summary);
+                flush
+                    .flush(std::slice::from_ref(&summary), scope.as_str())
+                    .await
+            } else if evicted.is_empty() {
+                Ok(())
+            } else {
+                flush.flush(&evicted, scope.as_str()).await
+            };
+            if let Err(err) = flush_result {
                 tracing::warn!(
                     scope = scope.as_str(),
                     error = %err,
@@ -3182,10 +3372,21 @@ impl LoopEngine {
             }
         }
 
-        self.extract_memory_from_evicted(&evicted).await;
+        self.extract_memory_from_evicted(&evicted, result.summary.as_deref())
+            .await;
     }
 
-    async fn extract_memory_from_evicted(&self, evicted: &[Message]) {
+    async fn extract_memory_from_evicted(&self, evicted: &[Message], summary: Option<&str>) {
+        if let Some(summary) = summary {
+            if let Some(update) = parse_summary_memory_update(summary) {
+                self.apply_session_memory_update(update);
+                return;
+            }
+        }
+        self.extract_memory_with_llm(evicted).await;
+    }
+
+    async fn extract_memory_with_llm(&self, evicted: &[Message]) {
         let Some(llm) = &self.compaction_llm else {
             return;
         };
@@ -3197,16 +3398,7 @@ impl LoopEngine {
         match llm.generate(&prompt, 512).await {
             Ok(response) => {
                 if let Some(update) = parse_extraction_response(&response) {
-                    let mut memory = self
-                        .session_memory
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(err) = memory.apply_update(update) {
-                        tracing::warn!(
-                            error = %err,
-                            "auto-extracted memory update rejected (token cap)"
-                        );
-                    }
+                    self.apply_session_memory_update(update);
                 }
             }
             Err(err) => {
@@ -3215,6 +3407,82 @@ impl LoopEngine {
                     "memory extraction from evicted messages failed"
                 );
             }
+        }
+    }
+
+    async fn generate_eviction_summary(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, CompactionError> {
+        let llm =
+            self.compaction_llm
+                .as_ref()
+                .ok_or_else(|| CompactionError::SummarizationFailed {
+                    source: Box::new(std::io::Error::other("no compaction LLM")),
+                })?;
+        generate_summary(
+            llm.as_ref(),
+            messages,
+            self.compaction_config.max_summary_tokens,
+        )
+        .await
+    }
+
+    fn summarized_compaction_result(
+        &self,
+        messages: &[Message],
+        plan: &SlideSummarizationPlan,
+        summary: String,
+    ) -> CompactionResult {
+        let compacted_messages = assemble_summarized_messages(messages, plan, &summary);
+        CompactionResult {
+            estimated_tokens: ConversationBudget::estimate_tokens(&compacted_messages),
+            messages: compacted_messages,
+            compacted_count: plan.evicted_messages.len(),
+            used_summarization: true,
+            summary: Some(summary),
+            evicted_indices: plan.evicted_indices.clone(),
+        }
+    }
+
+    async fn apply_follow_up_slide(
+        &self,
+        result: CompactionResult,
+        target_tokens: usize,
+        scope: CompactionScope,
+    ) -> CompactionResult {
+        if result.estimated_tokens <= target_tokens {
+            return result;
+        }
+
+        match self
+            .run_sliding_compaction(&result.messages, scope, target_tokens)
+            .await
+        {
+            Ok(follow_up) => Self::merge_summarized_follow_up(result, follow_up),
+            Err(error) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Slide.as_str(),
+                    error = ?error,
+                    "follow-up slide after summarization failed; keeping summary result"
+                );
+                result
+            }
+        }
+    }
+
+    fn merge_summarized_follow_up(
+        base: CompactionResult,
+        follow_up: CompactionResult,
+    ) -> CompactionResult {
+        CompactionResult {
+            messages: follow_up.messages,
+            compacted_count: base.compacted_count + follow_up.compacted_count,
+            estimated_tokens: follow_up.estimated_tokens,
+            used_summarization: true,
+            summary: base.summary,
+            evicted_indices: base.evicted_indices,
         }
     }
 
@@ -3264,6 +3532,72 @@ impl LoopEngine {
         current
     }
 
+    fn can_summarize_eviction(&self) -> bool {
+        self.compaction_config.use_summarization && self.compaction_llm.is_some()
+    }
+
+    async fn summarize_before_slide(
+        &self,
+        messages: &[Message],
+        target_tokens: usize,
+        scope: CompactionScope,
+    ) -> Result<CompactionResult, LoopError> {
+        let plan = slide_summarization_plan(messages, self.compaction_config.preserve_recent_turns)
+            .map_err(|error| compaction_failed_error(scope, error))?;
+        match self.generate_eviction_summary(&plan.evicted_messages).await {
+            Ok(summary) => {
+                let result = self.summarized_compaction_result(messages, &plan, summary);
+                Ok(self
+                    .apply_follow_up_slide(result, target_tokens, scope)
+                    .await)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Slide.as_str(),
+                    error = %error,
+                    "pre-slide summarization failed; falling back to lossy slide"
+                );
+                self.run_sliding_compaction(messages, scope, target_tokens)
+                    .await
+            }
+        }
+    }
+
+    async fn best_effort_emergency_summary(
+        &self,
+        messages: &[Message],
+        scope: CompactionScope,
+    ) -> Option<CompactionResult> {
+        let plan = slide_summarization_plan(messages, self.compaction_config.preserve_recent_turns)
+            .ok()?;
+        match tokio::time::timeout(
+            EMERGENCY_SUMMARY_TIMEOUT,
+            self.generate_eviction_summary(&plan.evicted_messages),
+        )
+        .await
+        {
+            Ok(Ok(summary)) => Some(self.summarized_compaction_result(messages, &plan, summary)),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Emergency.as_str(),
+                    error = %error,
+                    "emergency summarization failed; falling back to mechanical emergency compaction"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    tier = CompactionTier::Emergency.as_str(),
+                    "emergency summarization timed out; falling back to mechanical emergency compaction"
+                );
+                None
+            }
+        }
+    }
+
     async fn apply_slide_tier<'a>(
         &self,
         current: Cow<'a, [Message]>,
@@ -3271,10 +3605,14 @@ impl LoopEngine {
         iteration: u32,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
         let target_tokens = self.conversation_budget.compaction_target();
-        match self
-            .run_sliding_compaction(current.as_ref(), scope, target_tokens)
-            .await
-        {
+        let result = if self.can_summarize_eviction() {
+            self.summarize_before_slide(current.as_ref(), target_tokens, scope)
+                .await
+        } else {
+            self.run_sliding_compaction(current.as_ref(), scope, target_tokens)
+                .await
+        };
+        match result {
             Ok(result) => Ok(self
                 .finish_tier(
                     CompactionTier::Slide,
@@ -3297,48 +3635,26 @@ impl LoopEngine {
         }
     }
 
-    async fn apply_summarize_tier<'a>(
-        &self,
-        current: Cow<'a, [Message]>,
-        scope: CompactionScope,
-        iteration: u32,
-    ) -> Result<Cow<'a, [Message]>, LoopError> {
-        let target_tokens = self.conversation_budget.summarize_target();
-        match self
-            .run_compaction_strategy(scope, current.as_ref(), target_tokens)
-            .await
-        {
-            Ok(result) => Ok(self
-                .finish_tier(
-                    CompactionTier::Summarize,
-                    current,
-                    result,
-                    scope,
-                    Some(iteration),
-                    target_tokens,
-                )
-                .await),
-            Err(error) => {
-                tracing::warn!(
-                    scope = scope.as_str(),
-                    tier = CompactionTier::Summarize.as_str(),
-                    error = ?error,
-                    "conversation compaction tier failed; continuing"
-                );
-                Ok(current)
-            }
-        }
-    }
-
     async fn apply_emergency_tier<'a>(
         &self,
         current: Cow<'a, [Message]>,
         scope: CompactionScope,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        let result = emergency_compact(
-            current.as_ref(),
-            self.compaction_config.preserve_recent_turns,
-        );
+        let result = if self.can_summarize_eviction() {
+            self.best_effort_emergency_summary(current.as_ref(), scope)
+                .await
+                .unwrap_or_else(|| {
+                    emergency_compact(
+                        current.as_ref(),
+                        self.compaction_config.preserve_recent_turns,
+                    )
+                })
+        } else {
+            emergency_compact(
+                current.as_ref(),
+                self.compaction_config.preserve_recent_turns,
+            )
+        };
         Ok(self
             .finish_tier(CompactionTier::Emergency, current, result, scope, None, 0)
             .await)
@@ -3354,11 +3670,9 @@ impl LoopEngine {
         let current = self.apply_prune_tier(current, scope);
         let current = match self.highest_compaction_tier(current.as_ref()) {
             Some(CompactionTier::Emergency) => self.apply_emergency_tier(current, scope).await?,
-            Some(tier @ (CompactionTier::Summarize | CompactionTier::Slide)) => {
+            Some(tier @ CompactionTier::Slide) => {
                 if self.should_skip_compaction(scope, iteration, tier) {
                     current
-                } else if matches!(tier, CompactionTier::Summarize) {
-                    self.apply_summarize_tier(current, scope, iteration).await?
                 } else {
                     self.apply_slide_tier(current, scope, iteration).await?
                 }
@@ -3425,39 +3739,6 @@ impl LoopEngine {
             .compact(messages, target_tokens)
             .await
             .map_err(|error| compaction_failed_error(scope, error))
-    }
-
-    async fn run_compaction_strategy(
-        &self,
-        scope: CompactionScope,
-        messages: &[Message],
-        target_tokens: usize,
-    ) -> Result<CompactionResult, LoopError> {
-        match self
-            .conversation_compactor
-            .compact(messages, target_tokens)
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(CompactionError::SummarizationFailed { source }) => {
-                tracing::warn!(
-                    error = %source,
-                    scope = scope.as_str(),
-                    "summarization compaction failed; trying sliding fallback"
-                );
-                self.run_sliding_compaction(messages, scope, target_tokens)
-                    .await
-            }
-            Err(CompactionError::SummaryExceededTarget) => {
-                tracing::warn!(
-                    scope = scope.as_str(),
-                    "summary exceeded compaction target; trying sliding fallback"
-                );
-                self.run_sliding_compaction(messages, scope, target_tokens)
-                    .await
-            }
-            Err(error) => Err(compaction_failed_error(scope, error)),
-        }
     }
 
     fn ensure_within_hard_limit(
@@ -3581,8 +3862,11 @@ impl LoopEngine {
                 break;
             }
 
+            let continuation_tools =
+                self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
+
             match self
-                .execute_tool_round(round + 1, llm, &mut state, stream)
+                .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
                 .await?
             {
                 ToolRoundOutcome::Cancelled => {
@@ -3747,6 +4031,7 @@ impl LoopEngine {
         round: u32,
         llm: &dyn LlmProvider,
         state: &mut ToolRoundState,
+        continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
@@ -3755,6 +4040,7 @@ impl LoopEngine {
             .execute_tool_calls_with_stream(&state.current_calls, stream)
             .await?;
         self.publish_tool_results(&results, stream);
+        let has_tool_errors = self.emit_tool_errors(&results, stream);
         self.record_tool_execution_cost(results.len());
 
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
@@ -3766,6 +4052,16 @@ impl LoopEngine {
             &self.tool_call_provider_ids,
             &results,
         )?;
+        if has_tool_errors {
+            let failed: Vec<(&str, &str)> = results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| (result.tool_name.as_str(), result.output.as_str()))
+                .collect();
+            state
+                .continuation_messages
+                .push(Message::system(tool_error_relay_directive(&failed)));
+        }
         state.all_tool_results.extend(results);
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
@@ -3786,6 +4082,7 @@ impl LoopEngine {
             .request_tool_continuation(
                 llm,
                 &state.continuation_messages,
+                continuation_tools,
                 &mut state.tokens_used,
                 stream,
             )
@@ -3913,13 +4210,14 @@ impl LoopEngine {
         &mut self,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        continuation_tools: Vec<ToolDefinition>,
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
-            self.tool_executor.tool_definitions(),
+            continuation_tools,
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.thinking_config.clone(),
@@ -4767,6 +5065,14 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
     )
 }
 
+fn completion_request_tools(tool_definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    if tool_definitions.is_empty() {
+        Vec::new()
+    } else {
+        tool_definitions_with_decompose(tool_definitions)
+    }
+}
+
 fn tool_definitions_with_decompose(
     mut tool_definitions: Vec<ToolDefinition>,
 ) -> Vec<ToolDefinition> {
@@ -4841,7 +5147,7 @@ fn build_continuation_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    let tools = completion_request_tools(tool_definitions);
     let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -4892,7 +5198,7 @@ fn build_truncation_continuation_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = tool_definitions_with_decompose(tool_definitions);
+    let tools = completion_request_tools(tool_definitions);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
@@ -5423,13 +5729,7 @@ fn build_reasoning_request_with_notify_guidance(
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    // When tools are explicitly empty (e.g., stripped for tool-only turn enforcement),
-    // skip adding the decompose tool — the intent is to force a text-only response.
-    let tools = if tool_definitions.is_empty() {
-        vec![]
-    } else {
-        tool_definitions_with_decompose(tool_definitions)
-    };
+    let tools = completion_request_tools(tool_definitions);
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
@@ -7456,6 +7756,7 @@ mod phase2_tests {
 #[cfg(test)]
 mod phase4_tests {
     use super::*;
+    use crate::budget::{BudgetConfig, BudgetTracker, TerminationConfig};
     use crate::cancellation::CancellationToken;
     use crate::input::{loop_input_channel, LoopCommand};
     use async_trait::async_trait;
@@ -7652,18 +7953,38 @@ mod phase4_tests {
     }
 
     fn p4_engine() -> LoopEngine {
+        p4_engine_with_config(BudgetConfig::default(), 3)
+    }
+
+    fn p4_engine_with_config(config: BudgetConfig, max_iterations: u32) -> LoopEngine {
         LoopEngine::builder()
-            .budget(BudgetTracker::new(
-                crate::budget::BudgetConfig::default(),
-                0,
-                0,
-            ))
+            .budget(BudgetTracker::new(config, 0, 0))
             .context(ContextCompactor::new(2048, 256))
-            .max_iterations(3)
+            .max_iterations(max_iterations)
             .tool_executor(Arc::new(Phase4StubToolExecutor))
             .synthesis_instruction("Summarize tool output".to_string())
             .build()
             .expect("test engine build")
+    }
+
+    fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains(TOOL_ROUND_PROGRESS_NUDGE),
+                _ => false,
+            })
+        })
+    }
+
+    fn tool_round_budget_config(nudge_after: u16, strip_after_nudge: u16) -> BudgetConfig {
+        BudgetConfig {
+            termination: TerminationConfig {
+                tool_round_nudge_after: nudge_after,
+                tool_round_strip_after_nudge: strip_after_nudge,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        }
     }
 
     fn p4_snapshot(text: &str) -> PerceptionSnapshot {
@@ -7871,6 +8192,196 @@ mod phase4_tests {
                     })
             }),
             "second continuation request should preserve provider item ids for the next tool round"
+        );
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_nudges_after_threshold() {
+        let config = tool_round_budget_config(1, 10);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done after nudge"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!has_tool_round_progress_nudge(&requests[0].messages));
+        assert!(has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_strips_tools_after_threshold() {
+        let config = tool_round_budget_config(1, 1);
+        let mut engine = p4_engine_with_config(config, 4);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            text_response("done after strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[1].tools.is_empty());
+        assert!(requests[2].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_no_nudge_when_disabled() {
+        let config = tool_round_budget_config(0, 2);
+        let mut engine = p4_engine_with_config(config, 4);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            text_response("done without nudge"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert!(requests.iter().all(|request| {
+            !has_tool_round_progress_nudge(&request.messages) && !request.tools.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_aggressive_config() {
+        let config = tool_round_budget_config(1, 0);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done after aggressive strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(has_tool_round_progress_nudge(&requests[1].messages));
+        assert!(requests[1].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_no_nudge_before_threshold() {
+        let config = tool_round_budget_config(2, 2);
+        let mut engine = p4_engine_with_config(config, 3);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done before threshold"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_nudge_fires_exactly_once() {
+        // With nudge_after=1 and strip_after=3, the model runs 3 rounds past
+        // the nudge threshold. Verify the nudge message appears exactly once
+        // (not stacked on every round).
+        let config = tool_round_budget_config(1, 3);
+        let mut engine = p4_engine_with_config(config, 5);
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            tool_use_response(vec![read_file_call("call-4", "d.txt")]),
+            text_response("done after strip"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let _action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        let requests = llm.requests();
+        // The last request has the full continuation_messages history.
+        // Count nudge messages in it — should be exactly 1 (not stacked).
+        let last_request = requests.last().expect("should have requests");
+        let nudge_count = last_request
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains(TOOL_ROUND_PROGRESS_NUDGE)
+                    )
+                })
+            })
+            .count();
+        assert_eq!(
+            nudge_count, 1,
+            "nudge should appear exactly once, not stack"
         );
     }
 
@@ -11559,7 +12070,7 @@ mod context_compaction_tests {
         CompactionConfig {
             slide_threshold: 0.60,
             prune_threshold: 0.40,
-            summarize_threshold: 0.80,
+            _legacy_summarize_threshold: 0.80,
             emergency_threshold: 0.95,
             preserve_recent_turns: 2,
             model_context_limit: 5_096,
@@ -11735,7 +12246,7 @@ mod context_compaction_tests {
         CompactionConfig {
             slide_threshold: 0.2,
             prune_threshold: 0.1,
-            summarize_threshold: 0.8,
+            _legacy_summarize_threshold: 0.8,
             emergency_threshold: 0.95,
             preserve_recent_turns: 2,
             model_context_limit: 5_000,
@@ -11859,10 +12370,6 @@ mod context_compaction_tests {
             defaults.prune_threshold
         );
         assert_eq!(
-            engine.compaction_config.summarize_threshold,
-            defaults.summarize_threshold
-        );
-        assert_eq!(
             engine.compaction_config.emergency_threshold,
             defaults.emergency_threshold
         );
@@ -11898,12 +12405,46 @@ mod context_compaction_tests {
     }
 
     #[test]
+    fn builder_applies_context_scaled_session_memory_caps() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = CompactionConfig {
+            model_context_limit: 200_000,
+            ..CompactionConfig::default()
+        };
+        let memory = Arc::new(Mutex::new(SessionMemory::default()));
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config.clone())
+            .session_memory(Arc::clone(&memory))
+            .build()
+            .expect("test engine build");
+
+        let stored = engine.session_memory_snapshot();
+        assert_eq!(
+            stored.token_cap(),
+            fx_session::max_memory_tokens(config.model_context_limit)
+        );
+        assert_eq!(
+            stored.item_cap(),
+            fx_session::max_memory_items(config.model_context_limit)
+        );
+    }
+
+    #[test]
     fn builder_full_config() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let config = CompactionConfig {
             slide_threshold: 0.3,
             prune_threshold: 0.2,
-            summarize_threshold: 0.4,
+            _legacy_summarize_threshold: 0.4,
             emergency_threshold: 0.9,
             preserve_recent_turns: 3,
             model_context_limit: 5_200,
@@ -11976,14 +12517,12 @@ mod context_compaction_tests {
     }
 
     #[test]
-    fn build_compaction_components_default_to_valid_budget_and_strategy() {
-        let (config, budget, _strategy) =
-            build_compaction_components(None, None).expect("components should build");
+    fn build_compaction_components_default_to_valid_budget() {
+        let (config, budget) = build_compaction_components(None).expect("components should build");
         let defaults = CompactionConfig::default();
 
         assert_eq!(config.slide_threshold, defaults.slide_threshold);
         assert_eq!(config.prune_threshold, defaults.prune_threshold);
-        assert_eq!(config.summarize_threshold, defaults.summarize_threshold);
         assert_eq!(config.emergency_threshold, defaults.emergency_threshold);
         assert_eq!(config.preserve_recent_turns, defaults.preserve_recent_turns);
         assert_eq!(
@@ -11999,8 +12538,7 @@ mod context_compaction_tests {
         let mut config = CompactionConfig::default();
         config.recompact_cooldown_turns = 0;
 
-        let error =
-            build_compaction_components(Some(config), None).expect_err("invalid config rejected");
+        let error = build_compaction_components(Some(config)).expect_err("invalid config rejected");
         assert_eq!(error.stage, "init");
         assert!(error.reason.contains("invalid_compaction_config"));
     }
@@ -12012,13 +12550,22 @@ mod context_compaction_tests {
     struct ExtractionLlm {
         responses: Mutex<VecDeque<Result<String, CoreLlmError>>>,
         prompts: Mutex<Vec<String>>,
+        delay: Option<std::time::Duration>,
     }
 
     impl ExtractionLlm {
         fn new(responses: Vec<Result<String, CoreLlmError>>) -> Self {
+            Self::with_delay(responses, None)
+        }
+
+        fn with_delay(
+            responses: Vec<Result<String, CoreLlmError>>,
+            delay: Option<std::time::Duration>,
+        ) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 prompts: Mutex::new(Vec::new()),
+                delay,
             }
         }
 
@@ -12034,6 +12581,9 @@ mod context_compaction_tests {
                 .lock()
                 .expect("prompts lock")
                 .push(prompt.to_string());
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             self.responses
                 .lock()
                 .expect("responses lock")
@@ -12147,6 +12697,36 @@ mod context_compaction_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingToolRoundExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingToolRoundExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: "permission denied".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "read file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
     #[tokio::test]
     async fn long_conversation_triggers_compaction_in_perceive() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
@@ -12175,8 +12755,9 @@ mod context_compaction_tests {
         let calls = vec![read_call("call-1")];
         let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
 
+        let tools = engine.tool_executor.tool_definitions();
         let _ = engine
-            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .execute_tool_round(1, &llm, &mut state, tools, CycleStream::disabled())
             .await
             .expect("tool round");
 
@@ -12195,13 +12776,115 @@ mod context_compaction_tests {
         let calls = vec![read_call("call-1")];
         let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
 
+        let tools = engine.tool_executor.tool_definitions();
         engine
-            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
+            .execute_tool_round(1, &llm, &mut state, tools, CycleStream::disabled())
             .await
             .expect("tool round");
 
         assert!(has_compaction_marker(&engine.last_reasoning_messages));
         assert_eq!(engine.last_reasoning_messages, state.continuation_messages);
+    }
+
+    fn stream_recorder() -> (StreamCallback, Arc<Mutex<Vec<StreamEvent>>>) {
+        let events: Arc<Mutex<Vec<StreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        (callback, events)
+    }
+
+    #[tokio::test]
+    async fn tool_error_event_emitted_on_failure() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(FailingToolRoundExecutor);
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let (callback, events) = stream_recorder();
+
+        engine
+            .execute_tool_round(
+                1,
+                &llm,
+                &mut state,
+                Vec::new(),
+                CycleStream::enabled(&callback),
+            )
+            .await
+            .expect("tool round");
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.contains(&StreamEvent::ToolError {
+            tool_name: "read_file".to_string(),
+            error: "permission denied".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_error_directive_injected_on_failure() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(FailingToolRoundExecutor);
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+
+        engine
+            .execute_tool_round(1, &llm, &mut state, Vec::new(), CycleStream::disabled())
+            .await
+            .expect("tool round");
+
+        let relay_message = state
+            .continuation_messages
+            .iter()
+            .map(message_to_text)
+            .find(|text| text.contains(TOOL_ERROR_RELAY_PREFIX))
+            .expect("tool error relay message");
+        assert!(relay_message.contains("- Tool 'read_file' failed with: permission denied"));
+    }
+
+    #[tokio::test]
+    async fn no_tool_error_on_success() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 5 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::ok(vec![text_response("done")]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let (callback, events) = stream_recorder();
+
+        engine
+            .execute_tool_round(
+                1,
+                &llm,
+                &mut state,
+                Vec::new(),
+                CycleStream::enabled(&callback),
+            )
+            .await
+            .expect("tool round");
+
+        let events = events.lock().expect("lock").clone();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolError { .. })));
+        assert!(!state
+            .continuation_messages
+            .iter()
+            .map(message_to_text)
+            .any(|text| text.contains(TOOL_ERROR_RELAY_PREFIX)));
     }
 
     #[tokio::test]
@@ -12285,11 +12968,10 @@ mod context_compaction_tests {
     #[tokio::test]
     async fn session_memory_injected_in_context() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
-        let memory = Arc::new(Mutex::new(SessionMemory {
-            project: Some("Phase 3".to_string()),
-            current_state: Some("testing injection".to_string()),
-            ..SessionMemory::default()
-        }));
+        let mut stored_memory = SessionMemory::default();
+        stored_memory.project = Some("Phase 3".to_string());
+        stored_memory.current_state = Some("testing injection".to_string());
+        let memory = Arc::new(Mutex::new(stored_memory));
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(
                 crate::budget::BudgetConfig::default(),
@@ -12539,7 +13221,7 @@ mod context_compaction_tests {
             Message::assistant("LoopEngine needs automatic extraction."),
         ];
 
-        engine.extract_memory_from_evicted(&evicted).await;
+        engine.extract_memory_from_evicted(&evicted, None).await;
 
         let memory = engine.session_memory_snapshot();
         assert_eq!(memory.project.as_deref(), Some("Phase 5"));
@@ -12566,7 +13248,7 @@ mod context_compaction_tests {
         );
 
         engine
-            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .extract_memory_from_evicted(&[Message::user("remember this")], None)
             .await;
 
         assert!(engine.session_memory_snapshot().is_empty());
@@ -12586,7 +13268,7 @@ mod context_compaction_tests {
         );
 
         engine
-            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .extract_memory_from_evicted(&[Message::user("remember this")], None)
             .await;
 
         assert!(engine.session_memory_snapshot().is_empty());
@@ -12604,7 +13286,7 @@ mod context_compaction_tests {
         );
 
         engine
-            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .extract_memory_from_evicted(&[Message::user("remember this")], None)
             .await;
 
         assert!(engine.session_memory_snapshot().is_empty());
@@ -12624,10 +13306,81 @@ mod context_compaction_tests {
         );
 
         engine
-            .extract_memory_from_evicted(&[Message::user("remember this")])
+            .extract_memory_from_evicted(&[Message::user("remember this")], None)
             .await;
 
         assert!(engine.session_memory_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_memory_from_summary_falls_back_to_llm_when_parsing_fails() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(serde_json::json!({
+            "project": "Phase 2",
+            "current_state": "LLM fallback after malformed summary"
+        })
+        .to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+
+        engine
+            .extract_memory_from_evicted(
+                &[Message::user("remember this")],
+                Some("freeform summary without section headers"),
+            )
+            .await;
+
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(memory.project.as_deref(), Some("Phase 2"));
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("LLM fallback after malformed summary")
+        );
+        assert_eq!(llm.prompts().len(), 1);
+        assert!(llm.prompts()[0].contains("Conversation:"));
+    }
+
+    #[tokio::test]
+    async fn extract_memory_from_numbered_summary_skips_llm_fallback() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok("{}".to_string())]));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let summary = concat!(
+            "1. Decisions:\n",
+            "- summarize before slide\n",
+            "2. Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "3. Task state:\n",
+            "- preserving summary context\n",
+            "4. Key context:\n",
+            "- no second LLM call needed"
+        );
+
+        engine
+            .extract_memory_from_evicted(&[Message::user("remember this")], Some(summary))
+            .await;
+
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("preserving summary context")
+        );
+        assert_eq!(memory.key_decisions, vec!["summarize before slide"]);
+        assert_eq!(
+            memory.active_files,
+            vec!["engine/crates/fx-kernel/src/loop_engine.rs"]
+        );
+        assert_eq!(memory.custom_context, vec!["no second LLM call needed"]);
+        assert!(llm.prompts().is_empty());
     }
 
     #[test]
@@ -12667,6 +13420,82 @@ mod context_compaction_tests {
     #[test]
     fn parse_extraction_response_returns_none_for_garbage() {
         assert!(parse_extraction_response("definitely not json").is_none());
+    }
+
+    #[test]
+    fn parse_summary_memory_update_extracts_sections() {
+        let summary = concat!(
+            "Decisions:\n",
+            "- Use summarize-before-slide\n",
+            "Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "Task state:\n",
+            "- Implementing Phase 2\n",
+            "Key context:\n",
+            "- Preserve summary markers during follow-up slide"
+        );
+
+        let update = parse_summary_memory_update(summary).expect("summary parse");
+
+        assert_eq!(update.project, None);
+        assert_eq!(
+            update.current_state.as_deref(),
+            Some("Implementing Phase 2")
+        );
+        assert_eq!(
+            update.key_decisions,
+            Some(vec!["Use summarize-before-slide".to_string()])
+        );
+        assert_eq!(
+            update.active_files,
+            Some(vec![
+                "engine/crates/fx-kernel/src/loop_engine.rs".to_string()
+            ])
+        );
+        assert_eq!(
+            update.custom_context,
+            Some(vec![
+                "Preserve summary markers during follow-up slide".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_summary_memory_update_extracts_numbered_sections() {
+        let summary = concat!(
+            "1. Decisions:\n",
+            "- Use summarize-before-slide\n",
+            "2. Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "3. Task state:\n",
+            "- Implementing Phase 2\n",
+            "4. Key context:\n",
+            "- Preserve summary markers during follow-up slide"
+        );
+
+        let update = parse_summary_memory_update(summary).expect("summary parse");
+
+        assert_eq!(update.project, None);
+        assert_eq!(
+            update.current_state.as_deref(),
+            Some("Implementing Phase 2")
+        );
+        assert_eq!(
+            update.key_decisions,
+            Some(vec!["Use summarize-before-slide".to_string()])
+        );
+        assert_eq!(
+            update.active_files,
+            Some(vec![
+                "engine/crates/fx-kernel/src/loop_engine.rs".to_string()
+            ])
+        );
+        assert_eq!(
+            update.custom_context,
+            Some(vec![
+                "Preserve summary markers during follow-up slide".to_string()
+            ])
+        );
     }
 
     #[tokio::test]
@@ -12714,6 +13543,74 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
+    async fn flush_evicted_uses_summary_for_flush_and_memory_extraction() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let flush = Arc::new(RecordingMemoryFlush::default());
+        let summary = concat!(
+            "Decisions:\n",
+            "- summarize before slide\n",
+            "Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "Task state:\n",
+            "- preserving old context\n",
+            "Key context:\n",
+            "- summary markers stay protected"
+        );
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(summary.to_string())]));
+        let mut config = tiered_compaction_config(true);
+        config.prune_tool_blocks = false;
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .compaction_llm(Arc::clone(&llm) as Arc<dyn LlmProvider>)
+            .memory_flush(Arc::clone(&flush) as Arc<dyn CompactionMemoryFlush>)
+            .build()
+            .expect("test engine build");
+        let messages = vec![
+            Message::user(format!("older decision {}", words(199))),
+            Message::assistant(format!("older file change {}", words(199))),
+            Message::user(format!("recent state {}", words(124))),
+            Message::assistant(format!("recent context {}", words(124))),
+        ];
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+
+        assert!(has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        let calls = flush.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].scope, "perceive");
+        assert_eq!(calls[0].evicted.len(), 1);
+        assert!(message_to_text(&calls[0].evicted[0]).contains("[context summary]"));
+        let memory = engine.session_memory_snapshot();
+        assert_eq!(
+            memory.current_state.as_deref(),
+            Some("preserving old context")
+        );
+        assert_eq!(memory.key_decisions, vec!["summarize before slide"]);
+        assert_eq!(
+            memory.active_files,
+            vec!["engine/crates/fx-kernel/src/loop_engine.rs"]
+        );
+        assert_eq!(
+            memory.custom_context,
+            vec!["summary markers stay protected"]
+        );
+        assert_eq!(llm.prompts().len(), 1);
+    }
+
+    #[tokio::test]
     async fn tiered_compaction_prune_only() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let config = tiered_compaction_config(false);
@@ -12749,7 +13646,7 @@ mod context_compaction_tests {
         let messages = vec![user(200), assistant(200), user(125), assistant(125)];
 
         let usage = budget.usage_ratio(&messages);
-        assert!(usage > 0.60 && usage < 0.80, "usage ratio was {usage}");
+        assert!(usage > 0.60 && usage < 0.95, "usage ratio was {usage}");
 
         let compacted = engine
             .compact_if_needed(&messages, CompactionScope::Perceive, 10)
@@ -12762,15 +13659,61 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
-    async fn tiered_compaction_summarize_when_slide_insufficient() {
+    async fn slide_tier_summarizes_before_eviction_when_llm_available() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
-        let config = tiered_compaction_config(true);
+        let summary = concat!(
+            "Decisions:\n",
+            "- preserve older context\n",
+            "Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "Task state:\n",
+            "- summary inserted before slide\n",
+            "Key context:\n",
+            "- older messages remain recoverable"
+        );
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(summary.to_string())]));
+        let mut config = tiered_compaction_config(true);
+        config.prune_tool_blocks = false;
         let budget = tiered_budget(&config);
-        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
-            Vec::new(),
-            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
-                .to_string(),
-        ));
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            config,
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let messages = vec![
+            Message::user(format!("older plan {}", words(199))),
+            Message::assistant(format!("older file {}", words(199))),
+            Message::user(format!("recent state {}", words(124))),
+            Message::assistant(format!("recent context {}", words(124))),
+        ];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.60 && usage < 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("slide compaction");
+
+        assert!(has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_compaction_marker(compacted.as_ref()));
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("older plan"));
+        assert!(prompts[0].contains("older file"));
+    }
+
+    #[tokio::test]
+    async fn slide_tier_falls_back_to_lossy_slide_when_summary_fails() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let llm = Arc::new(ExtractionLlm::new(vec![
+            Err(CoreLlmError::ApiRequest("boom".to_string())),
+            Err(CoreLlmError::ApiRequest("boom".to_string())),
+        ]));
+        let mut config = tiered_compaction_config(true);
+        config.prune_tool_blocks = false;
+        let budget = tiered_budget(&config);
         let engine =
             engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
         let messages = vec![user(250), assistant(250), user(175), assistant(175)];
@@ -12781,10 +13724,31 @@ mod context_compaction_tests {
         let compacted = engine
             .compact_if_needed(&messages, CompactionScope::Perceive, 10)
             .await
-            .expect("summarizing compaction");
+            .expect("slide compaction");
 
-        assert!(has_conversation_summary_marker(compacted.as_ref()));
-        assert!(!has_compaction_marker(compacted.as_ref()));
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn slide_tier_falls_back_to_lossy_slide_without_compaction_llm() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(250), assistant(250), user(175), assistant(175)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.80 && usage < 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("slide compaction");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
         assert!(!has_emergency_compaction_marker(compacted.as_ref()));
     }
 
@@ -12806,6 +13770,87 @@ mod context_compaction_tests {
 
         assert!(has_emergency_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn emergency_tier_uses_summary_when_llm_is_fast_enough() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let summary = concat!(
+            "Decisions:\n",
+            "- capture emergency context\n",
+            "Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "Task state:\n",
+            "- emergency summary completed\n",
+            "Key context:\n",
+            "- fallback count marker avoided"
+        );
+        let llm = Arc::new(ExtractionLlm::new(vec![Ok(summary.to_string())]));
+        let mut config = tiered_compaction_config(true);
+        config.prune_tool_blocks = false;
+        let budget = tiered_budget(&config);
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            config,
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let messages = vec![user(250), assistant(250), user(230), assistant(230)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_conversation_summary_marker(compacted.as_ref()));
+        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+        assert_eq!(llm.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_tier_attempts_best_effort_summary_before_fallback() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let summary = concat!(
+            "Decisions:\n",
+            "- capture emergency context\n",
+            "Files modified:\n",
+            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
+            "Task state:\n",
+            "- timeout fallback\n",
+            "Key context:\n",
+            "- summary was too slow"
+        );
+        let llm = Arc::new(ExtractionLlm::with_delay(
+            vec![Ok(summary.to_string()), Ok("{}".to_string())],
+            Some(EMERGENCY_SUMMARY_TIMEOUT + std::time::Duration::from_millis(10)),
+        ));
+        let mut config = tiered_compaction_config(true);
+        config.prune_tool_blocks = false;
+        let budget = tiered_budget(&config);
+        let engine = engine_with_compaction_llm(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            config,
+            Arc::clone(&llm) as Arc<dyn LlmProvider>,
+        );
+        let messages = vec![user(250), assistant(250), user(230), assistant(230)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("emergency compaction");
+
+        assert!(has_emergency_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+        let prompts = llm.prompts();
+        assert!(!prompts.is_empty());
+        assert!(prompts[0].contains("Sections (required):"));
     }
 
     #[tokio::test]
@@ -12849,16 +13894,10 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
-    async fn cooldown_skips_slide_and_summarize() {
+    async fn cooldown_skips_slide_but_allows_emergency() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let config = tiered_compaction_config(true);
-        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
-            Vec::new(),
-            "Decisions:\n- keep\nFiles modified:\n- none\nTask state:\n- active\nKey context:\n- summarized"
-                .to_string(),
-        ));
-        let engine =
-            engine_with_compaction_llm(ContextCompactor::new(2_048, 256), executor, config, llm);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
         let slide_input = vec![user(200), assistant(200), user(125), assistant(125)];
 
         let first = engine
@@ -12870,11 +13909,6 @@ mod context_compaction_tests {
             CompactionScope::Perceive,
             11,
             CompactionTier::Slide
-        ));
-        assert!(engine.should_skip_compaction(
-            CompactionScope::Perceive,
-            11,
-            CompactionTier::Summarize
         ));
 
         let emergency_input = vec![user(250), assistant(250), user(230), assistant(230)];
@@ -12960,40 +13994,24 @@ mod context_compaction_tests {
     }
 
     #[tokio::test]
-    async fn summary_exceeded_target_falls_back_to_sliding_compactor() {
+    async fn legacy_summarize_threshold_does_not_trigger_compaction_below_slide_threshold() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
-        let mut config = compaction_config();
-        config.use_summarization = true;
-        config.summarize_threshold = 0.3;
-        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
-            Vec::new(),
-            words(2_000),
-        ));
+        let mut config = tiered_compaction_config(true);
+        config.slide_threshold = 0.80;
+        config._legacy_summarize_threshold = 0.30;
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(125), assistant(125), user(125), assistant(125)];
 
-        let engine = LoopEngine::builder()
-            .budget(BudgetTracker::new(
-                crate::budget::BudgetConfig::default(),
-                current_time_ms(),
-                0,
-            ))
-            .context(ContextCompactor::new(2_048, 256))
-            .max_iterations(4)
-            .tool_executor(executor)
-            .synthesis_instruction("synthesize".to_string())
-            .compaction_config(config)
-            .compaction_llm(llm)
-            .build()
-            .expect("test engine build");
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.30 && usage < 0.80, "usage ratio was {usage}");
 
-        let history = large_history(10, 70);
         let compacted = engine
-            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .compact_if_needed(&messages, CompactionScope::Perceive, 1)
             .await
-            .expect("compaction should fall back to sliding window");
+            .expect("legacy summarize threshold should be ignored");
 
-        assert!(has_compaction_marker(compacted.as_ref()));
-        assert!(!has_conversation_summary_marker(compacted.as_ref()));
-        assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+        assert_eq!(compacted.as_ref(), messages.as_slice());
     }
 
     #[tokio::test]
@@ -14293,7 +15311,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_injected_at_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = 6;
+        engine.consecutive_tool_turns = 6;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14312,7 +15330,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn tool_only_turn_nudge_not_injected_below_threshold() {
         let mut engine = high_budget_engine();
-        engine.consecutive_tool_only_turns = 6 - 1;
+        engine.consecutive_tool_turns = 6 - 1;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14345,7 +15363,7 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build");
-        engine.consecutive_tool_only_turns = 4;
+        engine.consecutive_tool_turns = 4;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14378,7 +15396,7 @@ mod loop_resilience_tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build");
-        engine.consecutive_tool_only_turns = 100;
+        engine.consecutive_tool_turns = 100;
 
         let processed = engine
             .perceive(&test_snapshot("hello"))
@@ -14405,7 +15423,7 @@ mod loop_resilience_tests {
             ..BudgetConfig::default()
         };
         let mut engine = engine_with_budget(config);
-        engine.consecutive_tool_only_turns = 3;
+        engine.consecutive_tool_turns = 3;
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "Here is my summary.".to_string(),
@@ -14446,7 +15464,7 @@ mod loop_resilience_tests {
             .build()
             .expect("build");
         // At turn 5 (3 nudge + 2 grace), tools should be stripped
-        engine.consecutive_tool_only_turns = 5;
+        engine.consecutive_tool_turns = 5;
 
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -14495,7 +15513,7 @@ mod loop_resilience_tests {
             .build()
             .expect("build");
         // At turn 4 (below 3+2=5), tools should NOT be stripped
-        engine.consecutive_tool_only_turns = 4;
+        engine.consecutive_tool_turns = 4;
 
         let llm = RecordingLlm::ok(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -14556,18 +15574,8 @@ mod loop_resilience_tests {
         assert!(llm.requests().is_empty());
     }
 
-    #[test]
-    fn default_termination_config_matches_current_behavior() {
-        let config = TerminationConfig::default();
-        assert!(config.synthesize_on_exhaustion);
-        assert_eq!(config.nudge_after_tool_turns, 6);
-        assert_eq!(config.strip_tools_after_nudge, 3);
-    }
-
-    #[test]
-    fn tool_only_turn_counter_tracks_and_resets() {
-        let mut engine = high_budget_engine();
-        let tool_action = ActionResult {
+    fn tool_action(response_text: &str) -> ActionResult {
+        ActionResult {
             decision: Decision::UseTools(Vec::new()),
             tool_results: vec![ToolResult {
                 tool_call_id: "call-1".to_string(),
@@ -14575,20 +15583,66 @@ mod loop_resilience_tests {
                 success: true,
                 output: "ok".to_string(),
             }],
-            response_text: String::new(),
+            response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
-        };
-        engine.update_tool_only_turns(&tool_action);
-        assert_eq!(engine.consecutive_tool_only_turns, 1);
+        }
+    }
 
-        let text_action = ActionResult {
-            decision: Decision::Respond("done".to_string()),
+    fn text_only_action(response_text: &str) -> ActionResult {
+        ActionResult {
+            decision: Decision::Respond(response_text.to_string()),
             tool_results: Vec::new(),
-            response_text: "done".to_string(),
+            response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
-        };
-        engine.update_tool_only_turns(&text_action);
-        assert_eq!(engine.consecutive_tool_only_turns, 0);
+        }
+    }
+
+    #[test]
+    fn default_termination_config_matches_current_behavior() {
+        let config = TerminationConfig::default();
+        assert!(config.synthesize_on_exhaustion);
+        assert_eq!(config.nudge_after_tool_turns, 6);
+        assert_eq!(config.strip_tools_after_nudge, 3);
+        assert_eq!(config.tool_round_nudge_after, 4);
+        assert_eq!(config.tool_round_strip_after_nudge, 2);
+    }
+
+    #[test]
+    fn update_tool_turns_increments_on_tools_with_text() {
+        let mut engine = high_budget_engine();
+
+        engine.update_tool_turns(&tool_action("still working"));
+
+        assert_eq!(engine.consecutive_tool_turns, 1);
+    }
+
+    #[test]
+    fn update_tool_turns_resets_on_text_only() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_turns = 2;
+
+        engine.update_tool_turns(&text_only_action("done"));
+
+        assert_eq!(engine.consecutive_tool_turns, 0);
+    }
+
+    #[test]
+    fn update_tool_turns_increments_on_tools_only() {
+        let mut engine = high_budget_engine();
+
+        engine.update_tool_turns(&tool_action(""));
+
+        assert_eq!(engine.consecutive_tool_turns, 1);
+    }
+
+    #[test]
+    fn update_tool_turns_saturating_add() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_turns = u16::MAX;
+
+        engine.update_tool_turns(&tool_action("still working"));
+
+        assert_eq!(engine.consecutive_tool_turns, u16::MAX);
     }
 
     // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---

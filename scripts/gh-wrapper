@@ -1,0 +1,25 @@
+#!/bin/bash
+# gh CLI wrapper: blocks pr merge entirely.
+# Agent should never merge PRs — that's the human operator's job.
+# Install via PATH prepend alongside git-wrapper.
+
+REAL_GH="/usr/bin/gh"
+
+# Find real gh if not at /usr/bin/gh
+if [[ ! -x "$REAL_GH" ]]; then
+    REAL_GH=$(which -a gh 2>/dev/null | grep -v "$(dirname "$0")" | head -1)
+fi
+
+if [[ "$1" == "pr" && "$2" == "merge" ]]; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  BLOCKED: gh pr merge is not available to agents.       ║"
+    echo "║                                                         ║"
+    echo "║  Only the human operator merges PRs.                    ║"
+    echo "║  Provide the merge command to them instead.             ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+fi
+
+exec "$REAL_GH" "$@"

@@ -83,17 +83,17 @@ fn tool_definition() -> ToolDefinition {
                 "key_decisions": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Key decisions to remember (appended, max 20)"
+                    "description": "Key decisions to remember (appended, capped by session memory budget)"
                 },
                 "active_files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Files actively being worked on (replaces list)"
+                    "description": "Files actively being worked on (replaces list, capped by session memory budget)"
                 },
                 "custom_context": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Any other context to remember (appended, max 20)"
+                    "description": "Any other context to remember (appended, capped by session memory budget)"
                 }
             }
         }),
