@@ -55,7 +55,9 @@ fn text_blocks(message: &Message) -> impl Iterator<Item = &str> {
 }
 
 fn message_contains_marker(message: &Message) -> bool {
-    text_blocks(message).any(|text| text.starts_with(COMPACTION_MARKER_PREFIX))
+    text_blocks(message).any(|text| {
+        text.starts_with(COMPACTION_MARKER_PREFIX) || text.starts_with(SUMMARY_MARKER_PREFIX)
+    })
 }
 
 fn message_is_system_like(message: &Message) -> bool {
@@ -68,7 +70,7 @@ fn message_is_system_like(message: &Message) -> bool {
 /// This can create adjacent assistant-role messages in the compacted window,
 /// which is acceptable in the current integration because message ordering is
 /// preserved and no role alternation invariant is enforced by providers.
-fn summary_message(summary: &str) -> Message {
+pub(crate) fn summary_message(summary: &str) -> Message {
     Message::assistant(format!("{SUMMARY_MARKER_PREFIX}\n{summary}"))
 }
 
@@ -468,6 +470,7 @@ fn sliding_compaction_result(
             compacted_count: 0,
             estimated_tokens: before_tokens,
             used_summarization: false,
+            summary: None,
             evicted_indices: Vec::new(),
         };
         debug_assert_tool_pair_integrity(&result.messages);
@@ -497,6 +500,7 @@ fn sliding_compaction_result(
         messages: compacted_messages,
         compacted_count,
         used_summarization: false,
+        summary: None,
         evicted_indices,
     };
     debug_assert_tool_pair_integrity(&result.messages);
@@ -516,6 +520,7 @@ pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> 
             compacted_count: 0,
             estimated_tokens: ConversationBudget::estimate_tokens(messages),
             used_summarization: false,
+            summary: None,
             evicted_indices,
         };
     }
@@ -528,6 +533,7 @@ pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> 
         messages: result_messages,
         compacted_count,
         used_summarization: false,
+        summary: None,
         evicted_indices,
     }
 }
@@ -785,6 +791,7 @@ pub struct CompactionResult {
     pub(crate) compacted_count: usize,
     pub(crate) estimated_tokens: usize,
     pub(crate) used_summarization: bool,
+    pub(crate) summary: Option<String>,
     /// Indices into the original message slice for messages evicted by compaction.
     pub(crate) evicted_indices: Vec<usize>,
 }
@@ -813,6 +820,14 @@ impl SlidingWindowCompactor {
 
 pub const DEFAULT_MAX_SUMMARY_TOKENS: usize = 1_024;
 
+#[derive(Debug, Clone)]
+pub(crate) struct SlideSummarizationPlan {
+    bounds: ZoneBounds,
+    protected_middle: HashSet<usize>,
+    pub(crate) evicted_indices: Vec<usize>,
+    pub(crate) evicted_messages: Vec<Message>,
+}
+
 fn summarizable_indices(
     bounds: &ZoneBounds,
     protected_middle: &HashSet<usize>,
@@ -822,6 +837,22 @@ fn summarizable_indices(
         return Err(CompactionError::AllMessagesProtected);
     }
     Ok(indices)
+}
+
+pub(crate) fn slide_summarization_plan(
+    messages: &[Message],
+    preserve_recent_turns: usize,
+) -> Result<SlideSummarizationPlan, CompactionError> {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let protected_middle = protected_middle_indices(messages, &bounds);
+    let evicted_indices = summarizable_indices(&bounds, &protected_middle)?;
+    let evicted_messages = cloned_messages_at_indices(messages, &evicted_indices);
+    Ok(SlideSummarizationPlan {
+        bounds,
+        protected_middle,
+        evicted_indices,
+        evicted_messages,
+    })
 }
 
 pub async fn summarized_compaction_result(
@@ -838,19 +869,16 @@ pub async fn summarized_compaction_result(
             compacted_count: 0,
             estimated_tokens: before_tokens,
             used_summarization: false,
+            summary: None,
             evicted_indices: Vec::new(),
         };
         debug_assert_tool_pair_integrity(&result.messages);
         return Ok(result);
     }
 
-    let bounds = zone_bounds(messages, preserve_recent_turns);
-    let protected_middle = protected_middle_indices(messages, &bounds);
-    let summarizable_indices = summarizable_indices(&bounds, &protected_middle)?;
-    let summarizable_messages = cloned_messages_at_indices(messages, &summarizable_indices);
-    let summary = generate_summary(llm, &summarizable_messages, max_summary_tokens).await?;
-    let compacted_messages =
-        assemble_summarized_messages(messages, &bounds, &protected_middle, &summary);
+    let plan = slide_summarization_plan(messages, preserve_recent_turns)?;
+    let summary = generate_summary(llm, &plan.evicted_messages, max_summary_tokens).await?;
+    let compacted_messages = assemble_summarized_messages(messages, &plan, &summary);
     let estimated_tokens = ConversationBudget::estimate_tokens(&compacted_messages);
     if estimated_tokens > target_tokens {
         return Err(CompactionError::SummaryExceededTarget);
@@ -858,16 +886,17 @@ pub async fn summarized_compaction_result(
 
     let result = CompactionResult {
         messages: compacted_messages,
-        compacted_count: summarizable_messages.len(),
+        compacted_count: plan.evicted_messages.len(),
         estimated_tokens,
         used_summarization: true,
-        evicted_indices: summarizable_indices,
+        summary: Some(summary),
+        evicted_indices: plan.evicted_indices,
     };
     debug_assert_tool_pair_integrity(&result.messages);
     Ok(result)
 }
 
-async fn generate_summary(
+pub(crate) async fn generate_summary(
     llm: &dyn LlmProvider,
     summarizable_messages: &[Message],
     max_summary_tokens: usize,
@@ -880,21 +909,25 @@ async fn generate_summary(
         })
 }
 
-fn assemble_summarized_messages(
+pub(crate) fn assemble_summarized_messages(
     messages: &[Message],
-    bounds: &ZoneBounds,
-    protected_middle: &HashSet<usize>,
+    plan: &SlideSummarizationPlan,
     summary: &str,
 ) -> Vec<Message> {
     let mut compacted_messages = Vec::new();
-    compacted_messages.extend_from_slice(&messages[..bounds.prefix_end]);
-    append_protected_middle_messages(&mut compacted_messages, messages, bounds, protected_middle);
+    compacted_messages.extend_from_slice(&messages[..plan.bounds.prefix_end]);
+    append_protected_middle_messages(
+        &mut compacted_messages,
+        messages,
+        &plan.bounds,
+        &plan.protected_middle,
+    );
     compacted_messages.push(summary_message(summary));
-    compacted_messages.extend_from_slice(&messages[bounds.tail_start..]);
+    compacted_messages.extend_from_slice(&messages[plan.bounds.tail_start..]);
     compacted_messages
 }
 
-fn summary_prompt(messages: &[Message]) -> String {
+pub(crate) fn summary_prompt(messages: &[Message]) -> String {
     let conversation = messages
         .iter()
         .map(message_to_summary_line)
@@ -1806,14 +1839,8 @@ mod tests {
             assistant(30),
             user(20),
         ];
-        let bounds = zone_bounds(&messages, 2);
-        let protected_middle = protected_middle_indices(&messages, &bounds);
-        let compacted = assemble_summarized_messages(
-            &messages,
-            &bounds,
-            &protected_middle,
-            "Decisions:\n- keep",
-        );
+        let plan = slide_summarization_plan(&messages, 2).expect("summary plan");
+        let compacted = assemble_summarized_messages(&messages, &plan, "Decisions:\n- keep");
 
         assert_eq!(compacted.first(), Some(&messages[0]));
         assert_eq!(
@@ -1826,6 +1853,13 @@ mod tests {
             1
         );
         assert_eq!(&compacted[compacted.len() - 2..], &messages[4..]);
+    }
+
+    #[test]
+    fn summary_markers_are_treated_as_system_like() {
+        assert!(message_is_system_like(&summary_message(
+            "Decisions:\n- keep"
+        )));
     }
 
     #[tokio::test]
