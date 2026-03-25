@@ -68,6 +68,10 @@ pub enum StreamEvent {
         output: String,
         is_error: bool,
     },
+    ToolError {
+        tool_name: String,
+        error: String,
+    },
     PermissionPrompt(crate::permission_prompt::PermissionPrompt),
     PhaseChange {
         phase: Phase,
@@ -123,6 +127,18 @@ mod tests {
             category: ErrorCategory::Provider,
             message: "rate limit exceeded".to_string(),
             recoverable: true,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn tool_error_event_serializes_correctly() {
+        let event = StreamEvent::ToolError {
+            tool_name: "read_file".to_string(),
+            error: "permission denied".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();

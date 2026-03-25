@@ -536,7 +536,8 @@ impl SessionTurnCollector {
             StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
                 self.flush_pending_tool_results();
             }
-            StreamEvent::TextDelta { .. }
+            StreamEvent::ToolError { .. }
+            | StreamEvent::TextDelta { .. }
             | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. }

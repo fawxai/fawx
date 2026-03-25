@@ -151,7 +151,13 @@ fn handle_stream_event(
             is_error,
         } => {
             complete_experiment_tool(active_experiments, experiment_panel, &id);
-            send_tool_result(tx, output, is_error);
+            if !is_error {
+                send_tool_result(tx, None, output, true);
+            }
+        }
+        StreamEvent::ToolError { tool_name, error } => {
+            tracing::warn!(tool = %tool_name, "tool error in embedded mode: {error}");
+            send_tool_result(tx, Some(tool_name), error, false);
         }
         StreamEvent::Error { message, .. } => {
             tracing::warn!("stream error in embedded mode: {message}");
@@ -238,12 +244,17 @@ fn send_tool_call_complete(tx: &UnboundedSender<BackendEvent>, name: String, arg
     );
 }
 
-fn send_tool_result(tx: &UnboundedSender<BackendEvent>, output: String, is_error: bool) {
+fn send_tool_result(
+    tx: &UnboundedSender<BackendEvent>,
+    name: Option<String>,
+    output: String,
+    success: bool,
+) {
     try_send(
         tx,
         BackendEvent::ToolResult {
-            name: None,
-            success: !is_error,
+            name,
+            success,
             content: output,
         },
     );
@@ -615,7 +626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_stream_event_maps_tool_result_to_backend_tool_result() {
+    async fn handle_stream_event_maps_successful_tool_result_to_backend_tool_result() {
         let (tx, mut rx) = unbounded_channel();
         let saw_text_delta = AtomicBool::new(false);
         let experiment_panel = test_experiment_panel();
@@ -628,8 +639,8 @@ mod tests {
             &active_experiments,
             StreamEvent::ToolResult {
                 id: "call-1".to_string(),
-                output: "denied".to_string(),
-                is_error: true,
+                output: "file contents".to_string(),
+                is_error: false,
             },
         );
 
@@ -640,6 +651,38 @@ mod tests {
                 content,
             } => {
                 assert!(name.is_none());
+                assert!(success);
+                assert_eq!(content, "file contents");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_stream_event_maps_tool_error_to_backend_tool_result() {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            StreamEvent::ToolError {
+                tool_name: "read".to_string(),
+                error: "denied".to_string(),
+            },
+        );
+
+        match recv_event(&mut rx).await {
+            BackendEvent::ToolResult {
+                name,
+                success,
+                content,
+            } => {
+                assert_eq!(name.as_deref(), Some("read"));
                 assert!(!success);
                 assert_eq!(content, "denied");
             }
