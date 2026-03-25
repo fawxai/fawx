@@ -9,6 +9,7 @@ members = [
     "engine/crates/fx-kernel",
     "engine/crates/fx-auth",
     "engine/crates/fx-loadable",
+    "engine/crates/fx-cloud-gpu",
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
     "engine/crates/fx-security",

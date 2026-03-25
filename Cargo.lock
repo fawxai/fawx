@@ -1582,6 +1582,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fx-cloud-gpu"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fx-kernel",
+ "fx-llm",
+ "fx-loadable",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "fx-config"
 version = "0.1.0"
 dependencies = [
