@@ -152,13 +152,13 @@ pub struct BudgetConfig {
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: u8,
     /// Controls graceful termination behavior when budget limits fire and
-    /// how tool-only turn runs are handled.
+    /// how tool-turn runs are handled.
     #[serde(default)]
     pub termination: TerminationConfig,
 }
 
-/// Controls how the loop exits when a budget limit fires and how consecutive
-/// tool-only turns are managed (nudge → strip → synthesize).
+/// Controls how the loop exits when a budget limit fires and how tool-use
+/// runs are managed across cycles and within continuation rounds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminationConfig {
     /// When true, make one final LLM call with tools stripped to force a
@@ -166,17 +166,27 @@ pub struct TerminationConfig {
     #[serde(default = "default_synthesize_on_exhaustion")]
     pub synthesize_on_exhaustion: bool,
 
-    /// Consecutive tool-only turns before injecting a nudge message telling
-    /// the agent to respond to the user. 0 disables the nudge.
+    /// Consecutive tool turns before injecting a nudge message telling the
+    /// agent to respond to the user. 0 disables the nudge.
     #[serde(default = "default_nudge_after_tool_turns")]
     pub nudge_after_tool_turns: u16,
 
-    /// Additional consecutive tool-only turns *after the nudge fires* before
-    /// tools are stripped entirely, forcing a text response. 0 means strip
+    /// Additional consecutive tool turns *after the nudge fires* before tools
+    /// are stripped entirely, forcing a text response. 0 means strip
     /// immediately when the nudge threshold is reached. Set to `u16::MAX`
     /// to disable stripping while keeping the nudge.
     #[serde(default = "default_strip_tools_after_nudge")]
     pub strip_tools_after_nudge: u16,
+
+    /// Tool continuation rounds before injecting a progress nudge. 0 disables
+    /// both the nudge and the follow-up strip enforcement.
+    #[serde(default = "default_tool_round_nudge_after")]
+    pub tool_round_nudge_after: u16,
+
+    /// Additional continuation rounds after the nudge before tools are
+    /// stripped, forcing a text response.
+    #[serde(default = "default_tool_round_strip_after_nudge")]
+    pub tool_round_strip_after_nudge: u16,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -188,13 +198,21 @@ fn default_nudge_after_tool_turns() -> u16 {
 fn default_strip_tools_after_nudge() -> u16 {
     3
 }
+fn default_tool_round_nudge_after() -> u16 {
+    4
+}
+fn default_tool_round_strip_after_nudge() -> u16 {
+    2
+}
 
 impl Default for TerminationConfig {
     fn default() -> Self {
         Self {
-            synthesize_on_exhaustion: true,
-            nudge_after_tool_turns: 6,
-            strip_tools_after_nudge: 3,
+            synthesize_on_exhaustion: default_synthesize_on_exhaustion(),
+            nudge_after_tool_turns: default_nudge_after_tool_turns(),
+            strip_tools_after_nudge: default_strip_tools_after_nudge(),
+            tool_round_nudge_after: default_tool_round_nudge_after(),
+            tool_round_strip_after_nudge: default_tool_round_strip_after_nudge(),
         }
     }
 }
