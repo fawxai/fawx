@@ -34,6 +34,7 @@ fx-auth.workspace = true
 fx-conversation.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
+fx-python.workspace = true
 fx-memory.workspace = true
 fx-embeddings.workspace = true
 fx-analysis.workspace = true

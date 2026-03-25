@@ -43,6 +43,7 @@ use fx_loadable::{
 };
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_python::PythonSkill;
 use fx_ripcord::{resolve_tripwires, RipcordJournal, TripwireEvaluator};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
@@ -1008,6 +1009,8 @@ fn build_skill_registry(
     let session_memory = Arc::new(Mutex::new(fx_session::SessionMemory::default()));
     let session_memory_skill = SessionMemorySkill::new(Arc::clone(&session_memory));
     registry.register(Arc::new(session_memory_skill));
+    let python_skill = PythonSkill::new(data_dir);
+    registry.register(Arc::new(python_skill));
 
     if let Some(session_registry) = options.session_registry.clone() {
         let session_skill = SessionToolsSkill::new(session_registry);
