@@ -8,10 +8,27 @@ use fx_skills::host_api::HostApi;
 use fx_skills::live_host_api::{execute_http_request, CredentialProvider};
 use fx_skills::manifest::Capability;
 use fx_skills::storage::SkillStorage;
+use serde::Serialize;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Default storage quota per skill: 64 KiB.
 const DEFAULT_STORAGE_QUOTA: usize = 64 * 1024;
+const COMMAND_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
+const COMMAND_TIMEOUT_EXIT_CODE: i32 = -1;
+const COMMAND_FAILURE_EXIT_CODE: i32 = -2;
+const COMMAND_POLL_INTERVAL_MS: u64 = 10;
+
+#[derive(Serialize)]
+struct ShellCommandResult {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
 
 /// Live host API backed by real runtime services.
 ///
@@ -78,6 +95,10 @@ impl LiveHostApi {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
     }
+
+    fn has_capability(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
 }
 
 impl HostApi for LiveHostApi {
@@ -132,6 +153,30 @@ impl HostApi for LiveHostApi {
         execute_http_request(method, url, headers, body)
     }
 
+    fn exec_command(&self, command: &str, timeout_ms: u32) -> Option<String> {
+        if !self.has_capability(Capability::Shell) {
+            tracing::error!("exec_command denied: Shell capability not declared");
+            return None;
+        }
+        execute_shell_command(command, timeout_ms)
+    }
+
+    fn read_file(&self, path: &str) -> Option<String> {
+        if !self.has_capability(Capability::Filesystem) {
+            tracing::error!("read_file denied: Filesystem capability not declared");
+            return None;
+        }
+        read_utf8_file(path)
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> bool {
+        if !self.has_capability(Capability::Filesystem) {
+            tracing::error!("write_file denied: Filesystem capability not declared");
+            return false;
+        }
+        write_utf8_file(path, content)
+    }
+
     fn get_output(&self) -> String {
         self.output
             .lock()
@@ -141,6 +186,173 @@ impl HostApi for LiveHostApi {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn execute_shell_command(command: &str, timeout_ms: u32) -> Option<String> {
+    let mut child = spawn_shell(command)
+        .map_err(|error| {
+            tracing::error!("exec_command failed to spawn '{command}': {error}");
+            error
+        })
+        .ok()?;
+    let (stdout, stderr) = take_command_pipes(&mut child)?;
+    let stdout_handle = spawn_output_reader(stdout);
+    let stderr_handle = spawn_output_reader(stderr);
+    let exit_code = wait_for_command(&mut child, timeout_ms);
+    let stdout = join_output_reader(stdout_handle, "stdout")?;
+    let stderr = add_timeout_message(
+        join_output_reader(stderr_handle, "stderr")?,
+        exit_code,
+        timeout_ms,
+    );
+    serialize_command_result(stdout, stderr, exit_code)
+}
+
+fn spawn_shell(command: &str) -> std::io::Result<Child> {
+    Command::new("sh")
+        .args(["-c", command])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+}
+
+fn take_command_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
+    let stdout = child.stdout.take().or_else(|| {
+        tracing::error!("exec_command: stdout pipe missing");
+        None
+    })?;
+    let stderr = child.stderr.take().or_else(|| {
+        tracing::error!("exec_command: stderr pipe missing");
+        None
+    })?;
+    Some((stdout, stderr))
+}
+
+fn spawn_output_reader<R>(reader: R) -> JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || read_capped_output(reader))
+}
+
+fn read_capped_output<R>(mut reader: R) -> Vec<u8>
+where
+    R: Read,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return output,
+            Ok(read) => append_capped_bytes(&mut output, &buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::error!("exec_command: failed to read process output: {error}");
+                return output;
+            }
+        }
+    }
+}
+
+fn append_capped_bytes(output: &mut Vec<u8>, chunk: &[u8]) {
+    let remaining = COMMAND_OUTPUT_LIMIT_BYTES.saturating_sub(output.len());
+    let take = remaining.min(chunk.len());
+    output.extend_from_slice(&chunk[..take]);
+}
+
+fn wait_for_command(child: &mut Child, timeout_ms: u32) -> i32 {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(COMMAND_FAILURE_EXIT_CODE),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(COMMAND_POLL_INTERVAL_MS));
+            }
+            Ok(None) => return kill_timed_out_child(child),
+            Err(error) => {
+                tracing::error!("exec_command: failed to wait on child: {error}");
+                return COMMAND_FAILURE_EXIT_CODE;
+            }
+        }
+    }
+}
+
+fn kill_timed_out_child(child: &mut Child) -> i32 {
+    if let Err(error) = child.kill() {
+        tracing::error!("exec_command: failed to kill timed out child: {error}");
+        return COMMAND_FAILURE_EXIT_CODE;
+    }
+    if let Err(error) = child.wait() {
+        tracing::error!("exec_command: failed to reap timed out child: {error}");
+        return COMMAND_FAILURE_EXIT_CODE;
+    }
+    COMMAND_TIMEOUT_EXIT_CODE
+}
+
+fn join_output_reader(handle: JoinHandle<Vec<u8>>, stream_name: &str) -> Option<String> {
+    match handle.join() {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => {
+            tracing::error!("exec_command: {stream_name} reader thread panicked");
+            None
+        }
+    }
+}
+
+fn add_timeout_message(mut stderr: String, exit_code: i32, timeout_ms: u32) -> String {
+    if exit_code == COMMAND_TIMEOUT_EXIT_CODE {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!("command timed out after {timeout_ms}ms"));
+    }
+    stderr
+}
+
+fn serialize_command_result(stdout: String, stderr: String, exit_code: i32) -> Option<String> {
+    serde_json::to_string(&ShellCommandResult {
+        stdout,
+        stderr,
+        exit_code,
+    })
+    .map_err(|error| {
+        tracing::error!("exec_command: failed to serialize result: {error}");
+        error
+    })
+    .ok()
+}
+
+fn read_utf8_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| {
+            tracing::error!("read_file failed for '{}': {}", path, error);
+            error
+        })
+        .ok()
+}
+
+fn write_utf8_file(path: &str, content: &str) -> bool {
+    let path = Path::new(path);
+    if let Err(error) = ensure_parent_directory(path) {
+        tracing::error!(
+            "write_file failed to create parent for '{}': {}",
+            path.display(),
+            error
+        );
+        return false;
+    }
+    if let Err(error) = std::fs::write(path, content) {
+        tracing::error!("write_file failed for '{}': {}", path.display(), error);
+        return false;
+    }
+    true
+}
+
+fn ensure_parent_directory(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
     }
 }
 
@@ -188,7 +400,9 @@ fn extract_host(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use zeroize::Zeroizing;
 
     fn make_config(input: &str) -> LiveHostApiConfig<'_> {
@@ -336,6 +550,70 @@ mod tests {
         assert_eq!(
             api.kv_get("github_token"),
             Some("from_provider".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_command_denied_without_shell_capability() {
+        let api = make_api("");
+        assert_eq!(api.exec_command("printf hello", 1_000), None);
+    }
+
+    #[test]
+    fn exec_command_allowed_with_shell_capability() {
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Shell],
+            credential_provider: None,
+        });
+
+        let json = api
+            .exec_command("printf hello", 1_000)
+            .expect("shell command result");
+        let result: Value = serde_json::from_str(&json).expect("parse command result");
+        assert_eq!(result["stdout"], "hello");
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    fn read_file_denied_without_filesystem_capability() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("data.txt");
+        std::fs::write(&path, "hello").expect("write fixture");
+        let api = make_api("");
+
+        assert_eq!(api.read_file(path.to_str().expect("utf-8 path")), None);
+    }
+
+    #[test]
+    fn write_file_denied_without_filesystem_capability() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("data.txt");
+        let api = make_api("");
+
+        assert!(!api.write_file(path.to_str().expect("utf-8 path"), "hello"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_write_file_round_trip() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("nested").join("data.txt");
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Filesystem],
+            credential_provider: None,
+        });
+
+        assert!(api.write_file(path.to_str().expect("utf-8 path"), "hello"));
+        assert_eq!(
+            api.read_file(path.to_str().expect("utf-8 path")),
+            Some("hello".to_string())
         );
     }
 
