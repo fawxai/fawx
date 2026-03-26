@@ -3258,6 +3258,9 @@ fn extract_response_text(result: &LoopResult) -> String {
                 BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
             }
         }
+        LoopResult::Incomplete {
+            partial_response, ..
+        } => partial_response.clone().unwrap_or_default(),
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
@@ -3269,6 +3272,9 @@ fn extract_result_kind(result: &LoopResult) -> ResultKind {
     match result {
         LoopResult::Complete { .. } => ResultKind::Complete,
         LoopResult::BudgetExhausted {
+            partial_response, ..
+        }
+        | LoopResult::Incomplete {
             partial_response, ..
         }
         | LoopResult::UserStopped {
@@ -3319,6 +3325,7 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     match result {
         LoopResult::Complete { iterations, .. }
         | LoopResult::BudgetExhausted { iterations, .. }
+        | LoopResult::Incomplete { iterations, .. }
         | LoopResult::UserStopped { iterations, .. } => *iterations,
         LoopResult::Error { .. } => 0,
     }
@@ -5018,6 +5025,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_response_from_incomplete_preserves_partial_response() {
+        let result = LoopResult::Incomplete {
+            partial_response: Some("need direction".to_string()),
+            iterations: 2,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), "need direction");
+        assert_eq!(extract_iterations(&result), 2);
+        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
+    }
+
+    #[test]
     fn finalize_cycle_sets_result_kind_for_each_variant() {
         let mut app = test_app();
         let signals = Vec::new();
@@ -5042,6 +5062,16 @@ mod tests {
             },
         );
         assert_eq!(partial.result_kind, ResultKind::Partial);
+
+        let incomplete = app.finalize_cycle(
+            "hello",
+            &LoopResult::Incomplete {
+                partial_response: Some("need direction".to_string()),
+                iterations: 1,
+                signals: signals.clone(),
+            },
+        );
+        assert_eq!(incomplete.result_kind, ResultKind::Partial);
 
         let error = app.finalize_cycle(
             "hello",

@@ -340,6 +340,15 @@ pub enum LoopResult {
         /// Signals emitted during the cycle.
         signals: Vec<Signal>,
     },
+    /// Loop stopped without completing the task and needs follow-up direction.
+    Incomplete {
+        /// Best-effort partial response text.
+        partial_response: Option<String>,
+        /// Iterations completed before the loop yielded.
+        iterations: u32,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
+    },
     /// Loop ended with a recoverable or non-recoverable runtime error.
     Error {
         /// Error message to surface to the caller.
@@ -357,6 +366,7 @@ impl LoopResult {
             Self::Complete { signals, .. }
             | Self::BudgetExhausted { signals, .. }
             | Self::UserStopped { signals, .. }
+            | Self::Incomplete { signals, .. }
             | Self::Error { signals, .. } => signals,
         }
     }
@@ -377,6 +387,13 @@ impl LoopResult {
                 partial_response
                     .clone()
                     .unwrap_or_else(|| "user stopped".to_string()),
+            ),
+            Self::Incomplete {
+                partial_response, ..
+            } => Some(
+                partial_response
+                    .clone()
+                    .unwrap_or_else(|| "needs follow-up".to_string()),
             ),
             Self::Error { .. } => None,
         }
@@ -1174,6 +1191,7 @@ struct ToolRoundState {
     all_tool_results: Vec<ToolResult>,
     current_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
+    base_message_count: usize,
     tokens_used: TokenUsage,
 }
 
@@ -1183,6 +1201,7 @@ impl ToolRoundState {
             all_tool_results: Vec::new(),
             current_calls: calls.to_vec(),
             continuation_messages: context_messages.to_vec(),
+            base_message_count: context_messages.len(),
             tokens_used: TokenUsage::default(),
         }
     }
@@ -1194,6 +1213,76 @@ enum ToolRoundOutcome {
     /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
     BudgetLow,
     Response(CompletionResponse),
+}
+
+#[derive(Debug, Clone)]
+enum ActionStep {
+    Final(ActionResult),
+    Continue(ActionContinuation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationTerminalKind {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationTerminal {
+    kind: ContinuationTerminalKind,
+    response_text: String,
+}
+
+impl ContinuationTerminal {
+    fn complete(response_text: String) -> Self {
+        Self {
+            kind: ContinuationTerminalKind::Complete,
+            response_text,
+        }
+    }
+
+    fn incomplete(response_text: String) -> Self {
+        Self {
+            kind: ContinuationTerminalKind::Incomplete,
+            response_text,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActionContinuation {
+    action: ActionResult,
+    context_updates: Vec<Message>,
+    terminal: ContinuationTerminal,
+}
+
+impl ActionContinuation {
+    fn complete(action: ActionResult, context_updates: Vec<Message>) -> Self {
+        Self {
+            terminal: ContinuationTerminal::complete(action.response_text.clone()),
+            action,
+            context_updates,
+        }
+    }
+
+    fn incomplete(action: ActionResult, context_updates: Vec<Message>) -> Self {
+        Self {
+            terminal: ContinuationTerminal::incomplete(action.response_text.clone()),
+            action,
+            context_updates,
+        }
+    }
+}
+
+impl std::ops::Deref for ActionStep {
+    type Target = ActionResult;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Final(action) => action,
+            Self::Continue(continuation) => &continuation.action,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1622,6 +1711,7 @@ impl LoopEngine {
         self.notify_tool_guidance_enabled = stream_callback.is_some();
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
+        let mut pending_terminal: Option<ContinuationTerminal> = None;
 
         // Multi-pass: loops until model stops using tools.
         self.iteration_count = 1;
@@ -1652,9 +1742,10 @@ impl LoopEngine {
 
         loop {
             stream.phase(Phase::Act);
-            let action = self
+            let action_step = self
                 .act(&decision, llm, &processed.context_window, stream)
                 .await?;
+            let action = std::ops::Deref::deref(&action_step).clone();
 
             // Budget accounting for non-tool actions.
             if action.tool_results.is_empty() {
@@ -1679,71 +1770,48 @@ impl LoopEngine {
             }
 
             self.emit_action_observations(&action);
+            let partial_response = action.response_text.clone();
 
-            // CONTINUATION CHECK: if tools were used, the model may have more work.
-            // Re-prompt to let it decide. If no tools were used, it's done.
-            if action.tool_results.is_empty() {
-                // Text-only response, no tools involved. Model is done.
-                return Ok(self.finish_streaming_result(
-                    LoopResult::Complete {
-                        response: action.response_text,
-                        iterations: self.iteration_count,
-                        tokens_used: state.tokens,
-                        signals: Vec::new(),
-                    },
-                    stream,
-                ));
-            }
+            let continuation = match action_step {
+                ActionStep::Final(action) => {
+                    let result = if let Some(terminal) = pending_terminal.take() {
+                        Self::terminal_result_from_continuation(
+                            &terminal,
+                            Some(action.response_text.as_str()),
+                            self.iteration_count,
+                            state.tokens,
+                        )
+                    } else {
+                        LoopResult::Complete {
+                            response: action.response_text,
+                            iterations: self.iteration_count,
+                            tokens_used: state.tokens,
+                            signals: Vec::new(),
+                        }
+                    };
+                    return Ok(self.finish_streaming_result(result, stream));
+                }
+                ActionStep::Continue(continuation) => continuation,
+            };
 
-            // Tools were used. Check max before incrementing so the
-            // reported iteration count is accurate (not inflated by 1).
             if self.iteration_count >= self.max_iterations {
-                // Safety cap reached. Return what we have.
-                return Ok(self.finish_streaming_result(
-                    LoopResult::Complete {
-                        response: action.response_text,
-                        iterations: self.iteration_count,
-                        tokens_used: state.tokens,
-                        signals: Vec::new(),
-                    },
-                    stream,
-                ));
+                let result = Self::terminal_result_from_continuation(
+                    &continuation.terminal,
+                    Some(partial_response.as_str()),
+                    self.iteration_count,
+                    state.tokens,
+                );
+                return Ok(self.finish_streaming_result(result, stream));
             }
             self.iteration_count += 1;
 
             self.refresh_iteration_state();
+            pending_terminal = Some(continuation.terminal.clone());
 
-            // Append a summary of what happened to the context window so
-            // the next reason() call sees the model's tool results. Without
-            // this the model would be re-prompted with stale context.
-            // NOTE: each continuation iteration adds one assistant message.
-            // Bounded by max_iterations (default 10), so growth is small.
-            //
-            // We build a compact assistant message with the synthesis text
-            // (which already summarizes tool outputs) rather than replaying
-            // every tool call/result message, because act_with_tools may
-            // have run multiple inner rounds with different call IDs that
-            // don't map 1:1 to the original Decision::UseTools calls.
-            if !action.response_text.is_empty() {
+            if !continuation.context_updates.is_empty() {
                 processed
                     .context_window
-                    .push(Message::assistant(action.response_text.clone()));
-            } else {
-                // Tools ran but no synthesis text — include tool names so the
-                // model knows which tools executed when deciding next steps.
-                let tool_names: Vec<&str> = action
-                    .tool_results
-                    .iter()
-                    .map(|r| r.tool_name.as_str())
-                    .collect();
-                let placeholder = if tool_names.is_empty() {
-                    "Tool execution completed.".to_string()
-                } else {
-                    format!("Tool execution completed: {}", tool_names.join(", "))
-                };
-                processed
-                    .context_window
-                    .push(Message::assistant(placeholder));
+                    .extend(continuation.context_updates.into_iter());
             }
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
@@ -1798,6 +1866,51 @@ impl LoopEngine {
             other => other,
         };
         self.finish_streaming_result(result, stream)
+    }
+
+    fn resolve_incomplete_response(partial_response: Option<&str>) -> String {
+        partial_response
+            .filter(|response| !response.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                "I made progress, but I need another pass or direction to finish this safely."
+                    .to_string()
+            })
+    }
+
+    fn terminal_result_from_continuation(
+        terminal: &ContinuationTerminal,
+        follow_up_response: Option<&str>,
+        iterations: u32,
+        tokens_used: TokenUsage,
+    ) -> LoopResult {
+        let response_text = Self::resolve_continuation_terminal_response(terminal, follow_up_response);
+        match terminal.kind {
+            ContinuationTerminalKind::Complete => LoopResult::Complete {
+                response: response_text,
+                iterations,
+                tokens_used,
+                signals: Vec::new(),
+            },
+            ContinuationTerminalKind::Incomplete => LoopResult::Incomplete {
+                partial_response: Some(Self::resolve_incomplete_response(Some(
+                    response_text.as_str(),
+                ))),
+                iterations,
+                signals: Vec::new(),
+            },
+        }
+    }
+
+    fn resolve_continuation_terminal_response(
+        terminal: &ContinuationTerminal,
+        follow_up_response: Option<&str>,
+    ) -> String {
+        follow_up_response
+            .filter(|response| has_meaningful_response_text(response))
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| terminal.response_text.clone())
     }
 
     fn finish_streaming_result(
@@ -2194,6 +2307,7 @@ impl LoopEngine {
                 llm,
                 LoopStep::Reason,
                 stream,
+                true,
             )
             .await?;
         let latency_ms = current_time_ms().saturating_sub(started);
@@ -2231,6 +2345,22 @@ impl LoopEngine {
                     .await
             }
         }
+    }
+
+    async fn request_internal_completion(
+        &mut self,
+        llm: &dyn LlmProvider,
+        request: CompletionRequest,
+        stage: &str,
+    ) -> Result<CompletionResponse, LoopError> {
+        llm.complete(request).await.map_err(|error| {
+            self.emit_background_error(
+                ErrorCategory::Provider,
+                format!("LLM request failed: {error}"),
+                false,
+            );
+            loop_error(stage, &format!("completion failed: {error}"), true)
+        })
     }
 
     async fn request_buffered_completion(
@@ -2389,6 +2519,7 @@ impl LoopEngine {
         continuation_messages: &[Message],
         step: LoopStep,
         stream: CycleStream<'_>,
+        emit_stream_events: bool,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
         let request = build_truncation_continuation_request_with_notify_guidance(
@@ -2402,15 +2533,19 @@ impl LoopEngine {
             self.notify_tool_guidance_enabled,
         );
         let request_messages = request.messages.clone();
-        let response = self
-            .request_completion(
+        let response = if emit_stream_events {
+            self.request_completion(
                 llm,
                 request,
                 stream_phase_for_step(step),
                 step_stage(step),
                 stream,
             )
-            .await?;
+            .await?
+        } else {
+            self.request_internal_completion(llm, request, step_stage(step))
+                .await?
+        };
         self.record_continuation_budget(&response, &request_messages);
         Ok(response)
     }
@@ -2422,6 +2557,7 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         step: LoopStep,
         stream: CycleStream<'_>,
+        emit_stream_events: bool,
     ) -> Result<CompletionResponse, LoopError> {
         let mut attempts = 0;
         let mut full_text = extract_response_text(&initial_response);
@@ -2433,7 +2569,13 @@ impl LoopEngine {
             self.emit_continuation_trace(step, attempts);
             let continuation_messages = build_continuation_messages(base_messages, &full_text);
             let continued = self
-                .request_truncated_continuation(llm, &continuation_messages, step, stream)
+                .request_truncated_continuation(
+                    llm,
+                    &continuation_messages,
+                    step,
+                    stream,
+                    emit_stream_events,
+                )
                 .await?;
             combined = merge_continuation_response(combined, continued, &mut full_text);
         }
@@ -2483,19 +2625,24 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
         stream: CycleStream<'_>,
-    ) -> Result<ActionResult, LoopError> {
+    ) -> Result<ActionStep, LoopError> {
         match decision {
             // Note: Clarify and Defer are not produced by decide() in the current
             // loop engine flow, but are kept for external callers (Decision is pub).
             Decision::Respond(text) | Decision::Clarify(text) | Decision::Defer(text) => {
-                Ok(self.text_action_result(decision, text))
+                Ok(ActionStep::Final(self.text_action_result(decision, text)))
             }
             Decision::UseTools(calls) => {
-                let action = self
+                let step = self
                     .act_with_tools(decision, calls, llm, context_messages, stream)
                     .await?;
-                self.emit_action_signals(&action.tool_results);
-                Ok(action)
+                match &step {
+                    ActionStep::Final(action) => self.emit_action_signals(&action.tool_results),
+                    ActionStep::Continue(continuation) => {
+                        self.emit_action_signals(&continuation.action.tool_results)
+                    }
+                }
+                Ok(step)
             }
             Decision::Decompose(plan) => {
                 if let Some(gate_result) = self
@@ -2520,7 +2667,7 @@ impl LoopEngine {
         decision: &Decision,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
-    ) -> Option<Result<ActionResult, LoopError>> {
+    ) -> Option<Result<ActionStep, LoopError>> {
         if self.is_batch_plan(plan) {
             self.emit_signal(
                 LoopStep::Act,
@@ -2553,7 +2700,7 @@ impl LoopEngine {
         plan: &DecompositionPlan,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
-    ) -> Result<ActionResult, LoopError> {
+    ) -> Result<ActionStep, LoopError> {
         let calls = self.batch_to_tool_calls(plan);
         let decision = Decision::UseTools(calls);
         let calls_ref = match &decision {
@@ -2575,7 +2722,7 @@ impl LoopEngine {
         &mut self,
         plan: &DecompositionPlan,
         decision: &Decision,
-    ) -> Option<Result<ActionResult, LoopError>> {
+    ) -> Option<Result<ActionStep, LoopError>> {
         let remaining = self.budget.remaining(current_time_ms());
         let estimated = estimate_plan_cost(plan);
         if estimated.cost_cents > remaining.cost_cents.saturating_mul(3) / 2 {
@@ -2596,7 +2743,7 @@ impl LoopEngine {
                     estimated.cost_cents, remaining.cost_cents
                 ),
             );
-            return Some(Ok(result));
+            return Some(Ok(ActionStep::Final(result)));
         }
         None
     }
@@ -2657,16 +2804,20 @@ impl LoopEngine {
         plan: &DecompositionPlan,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
-    ) -> Result<ActionResult, LoopError> {
+    ) -> Result<ActionStep, LoopError> {
         if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(decision, "decomposition"));
+            return Ok(ActionStep::Final(
+                self.budget_low_blocked_result(decision, "decomposition"),
+            ));
         }
 
         let timestamp_ms = current_time_ms();
         let remaining = self.budget.remaining(timestamp_ms);
         let effective_cap = self.effective_decomposition_depth_cap(&remaining);
         if self.decomposition_depth_limited(effective_cap) {
-            return Ok(self.depth_limited_decomposition_result(decision));
+            return Ok(ActionStep::Final(
+                self.depth_limited_decomposition_result(decision),
+            ));
         }
 
         if let Some(original_sub_goals) = plan.truncated_from {
@@ -2678,12 +2829,25 @@ impl LoopEngine {
             .execute_allocated_sub_goals(plan, &allocation, llm, context_messages)
             .await;
 
-        Ok(ActionResult {
+        let summary = aggregate_sub_goal_results(&results);
+        let action = ActionResult {
             decision: decision.clone(),
             tool_results: Vec::new(),
-            response_text: aggregate_sub_goal_results(&results),
+            response_text: summary.clone(),
             tokens_used: TokenUsage::default(),
-        })
+        };
+        let context_updates = vec![Message::assistant(decomposition_continuation_text(
+            plan, &results, &summary,
+        ))];
+        let continuation = if results
+            .iter()
+            .all(|result| matches!(result.outcome, SubGoalOutcome::Completed(_)))
+        {
+            ActionContinuation::complete(action, context_updates)
+        } else {
+            ActionContinuation::incomplete(action, context_updates)
+        };
+        Ok(ActionStep::Continue(continuation))
     }
 
     fn prepare_allocation_plan(
@@ -3915,9 +4079,11 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
         stream: CycleStream<'_>,
-    ) -> Result<ActionResult, LoopError> {
+    ) -> Result<ActionStep, LoopError> {
         if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(decision, "tool dispatch"));
+            return Ok(ActionStep::Final(
+                self.budget_low_blocked_result(decision, "tool dispatch"),
+            ));
         }
 
         let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
@@ -3931,7 +4097,9 @@ impl LoopEngine {
 
         for round in 0..self.max_iterations {
             if self.tool_round_interrupted() {
-                return Ok(self.cancelled_tool_action_from_state(decision, state));
+                return Ok(ActionStep::Final(
+                    self.cancelled_tool_action_from_state(decision, state),
+                ));
             }
 
             if self.budget.state() == BudgetState::Low {
@@ -3947,7 +4115,9 @@ impl LoopEngine {
                 .await?
             {
                 ToolRoundOutcome::Cancelled => {
-                    return Ok(self.cancelled_tool_action_from_state(decision, state));
+                    return Ok(ActionStep::Final(
+                        self.cancelled_tool_action_from_state(decision, state),
+                    ));
                 }
                 ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
@@ -3970,15 +4140,15 @@ impl LoopEngine {
                             &state.continuation_messages,
                             llm,
                             LoopStep::Act,
-                            stream,
+                            CycleStream::disabled(),
+                            false,
                         )
                         .await?;
 
                     return Ok(self.finalize_tool_response(
                         decision,
-                        state.all_tool_results,
+                        &state,
                         &response,
-                        state.tokens_used,
                     ));
                 }
             }
@@ -3992,6 +4162,7 @@ impl LoopEngine {
             stream,
         )
         .await
+        .map(ActionStep::Final)
     }
 
     fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
@@ -4289,7 +4460,7 @@ impl LoopEngine {
         context_messages: &[Message],
         continuation_tools: Vec<ToolDefinition>,
         tokens_used: &mut TokenUsage,
-        stream: CycleStream<'_>,
+        _stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let request = build_continuation_request_with_notify_guidance(
             context_messages,
@@ -4302,7 +4473,7 @@ impl LoopEngine {
         );
 
         let response = self
-            .request_completion(llm, request, StreamPhase::Synthesize, "act", stream)
+            .request_internal_completion(llm, request, "act")
             .await?;
 
         tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
@@ -4312,10 +4483,9 @@ impl LoopEngine {
     fn finalize_tool_response(
         &mut self,
         decision: &Decision,
-        tool_results: Vec<ToolResult>,
+        state: &ToolRoundState,
         response: &CompletionResponse,
-        tokens_used: TokenUsage,
-    ) -> ActionResult {
+    ) -> ActionStep {
         let text = extract_response_text(response);
         let readable = extract_readable_text(&text);
         let (response_text, used_fallback) = ensure_non_empty_response_with_flag(&readable);
@@ -4325,16 +4495,19 @@ impl LoopEngine {
                 SignalKind::Trace,
                 "tool continuation returned empty text; using safe fallback",
                 serde_json::json!({
-                    "tool_count": tool_results.len(),
+                    "tool_count": state.all_tool_results.len(),
                 }),
             );
         }
-        ActionResult {
-            decision: decision.clone(),
-            tool_results,
-            response_text,
-            tokens_used,
-        }
+        ActionStep::Continue(ActionContinuation::complete(
+            ActionResult {
+                decision: decision.clone(),
+                tool_results: state.all_tool_results.clone(),
+                response_text,
+                tokens_used: state.tokens_used,
+            },
+            state.continuation_messages[state.base_message_count..].to_vec(),
+        ))
     }
 
     async fn synthesize_tool_fallback(
@@ -4516,17 +4689,23 @@ fn build_sub_goal_snapshot(
     timestamp_ms: u64,
 ) -> PerceptionSnapshot {
     let description = sub_goal.description.clone();
+    let expected_output = sub_goal.expected_output.as_deref().unwrap_or_default();
+    let task_text = if expected_output.is_empty() {
+        description.clone()
+    } else {
+        format!("{description}\n\nDefinition of done:\n- {expected_output}")
+    };
     PerceptionSnapshot {
         timestamp_ms,
         screen: ScreenState {
             current_app: "decomposition".to_string(),
             elements: Vec::new(),
-            text_content: description.clone(),
+            text_content: task_text.clone(),
         },
         notifications: Vec::new(),
         active_app: "decomposition".to_string(),
         user_input: Some(UserInput {
-            text: description,
+            text: task_text,
             source: InputSource::Text,
             timestamp: timestamp_ms,
             context_id: None,
@@ -4553,6 +4732,16 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             outcome: SubGoalOutcome::BudgetExhausted,
             signals,
         },
+        LoopResult::Incomplete {
+            partial_response,
+            signals,
+            ..
+        } => {
+            let message = partial_response.unwrap_or_else(|| {
+                "sub-goal needs follow-up before it can be completed".to_string()
+            });
+            failed_sub_goal_result_with_signals(goal, message, signals)
+        }
         LoopResult::Error {
             message, signals, ..
         } => failed_sub_goal_result_with_signals(goal, message, signals),
@@ -4608,6 +4797,44 @@ fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
     for (index, result) in results.iter().enumerate() {
         lines.push(format_sub_goal_line(index + 1, result));
     }
+    lines.join("\n")
+}
+
+fn decomposition_continuation_text(
+    plan: &DecompositionPlan,
+    results: &[SubGoalResult],
+    summary: &str,
+) -> String {
+    let mut lines = vec![
+        "Sub-goal execution results are available below. Use them as evidence, not as a final answer."
+            .to_string(),
+        summary.to_string(),
+    ];
+
+    let expected_outputs: Vec<String> = plan
+        .sub_goals
+        .iter()
+        .filter_map(|goal| {
+            goal.expected_output
+                .as_ref()
+                .map(|expected| format!("- {} => expected: {}", goal.description, expected))
+        })
+        .collect();
+    if !expected_outputs.is_empty() {
+        lines.push("Expected outputs:".to_string());
+        lines.extend(expected_outputs);
+    }
+
+    if results
+        .iter()
+        .any(|result| !matches!(result.outcome, SubGoalOutcome::Completed(_)))
+    {
+        lines.push(
+            "At least one sub-goal is unfinished. Ask for direction if a missing dependency blocks completion."
+                .to_string(),
+        );
+    }
+
     lines.join("\n")
 }
 
@@ -4761,6 +4988,15 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             iterations,
             ..
         } => LoopResult::UserStopped {
+            partial_response,
+            iterations,
+            signals,
+        },
+        LoopResult::Incomplete {
+            partial_response,
+            iterations,
+            ..
+        } => LoopResult::Incomplete {
             partial_response,
             iterations,
             signals,
@@ -5983,6 +6219,11 @@ fn ensure_non_empty_response(text: &str) -> String {
     ensure_non_empty_response_with_flag(text).0
 }
 
+fn has_meaningful_response_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed != SAFE_FALLBACK_RESPONSE
+}
+
 fn ensure_non_empty_response_with_flag(text: &str) -> (String, bool) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -7081,12 +7322,7 @@ mod phase2_tests {
             .await
             .expect("run_cycle");
 
-        let signals = match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
-        };
+        let signals = result.signals().to_vec();
 
         assert!(signals
             .iter()
@@ -7113,12 +7349,7 @@ mod phase2_tests {
             .await
             .expect("run_cycle");
 
-        let signals = match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
-        };
+        let signals = result.signals().to_vec();
 
         // Verify expected signal types for a text-response cycle.
         assert!(signals
@@ -7228,12 +7459,7 @@ mod phase2_tests {
             .run_cycle(test_snapshot("hello"), &llm)
             .await
             .expect("run cycle");
-        let signals = match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
-        };
+        let signals = result.signals().to_vec();
 
         let cache_signal = signals
             .iter()
@@ -7296,12 +7522,7 @@ mod phase2_tests {
             .await
             .expect("run_cycle");
 
-        let signals = match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
-        };
+        let signals = result.signals().to_vec();
 
         assert!(signals.iter().any(|signal| {
             signal.step == LoopStep::Decide && signal.kind == SignalKind::Decision
@@ -7365,12 +7586,7 @@ mod phase2_tests {
             .await
             .expect("run_cycle");
 
-        let signals = match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
-        };
+        let signals = result.signals().to_vec();
 
         let round_trace_count = signals
             .iter()
@@ -7577,6 +7793,7 @@ mod phase2_tests {
                 &llm,
                 LoopStep::Reason,
                 CycleStream::disabled(),
+                true,
             )
             .await
             .expect("continuation should succeed");
@@ -7605,6 +7822,7 @@ mod phase2_tests {
                 &llm,
                 LoopStep::Reason,
                 CycleStream::disabled(),
+                true,
             )
             .await
             .expect("continuation should stop at max attempts");
@@ -7629,6 +7847,7 @@ mod phase2_tests {
                 &llm,
                 LoopStep::Reason,
                 CycleStream::disabled(),
+                true,
             )
             .await
             .expect("continuation should stop when natural stop reason arrives");
@@ -11074,8 +11293,8 @@ mod decomposition_tests {
     async fn low_budget_decomposition_avoids_budget_exhaustion_signal() {
         let (result, llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 
-        assert!(matches!(&result, LoopResult::Complete { .. }));
-        assert_eq!(llm_calls, 1);
+        assert!(matches!(&result, LoopResult::Incomplete { .. }));
+        assert_eq!(llm_calls, 2);
 
         let blocked_budget_signals = signals_from_result(&result)
             .iter()
@@ -11091,8 +11310,11 @@ mod decomposition_tests {
         let (result, _llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 
         let response = match &result {
-            LoopResult::Complete { response, .. } => response,
-            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+            LoopResult::Incomplete {
+                partial_response: Some(response),
+                ..
+            } => response,
+            other => panic!("expected LoopResult::Incomplete, got: {other:?}"),
         };
         assert!(response.contains("first => skipped (below floor)"));
         assert!(response.contains("second => skipped (below floor)"));
@@ -11107,6 +11329,36 @@ mod decomposition_tests {
             })
             .count();
         assert_eq!(progress_signals, 3);
+    }
+
+    #[tokio::test]
+    async fn unfinished_decomposition_follow_up_stays_incomplete() {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let llm = ScriptedLlm::new(vec![
+            Ok(decompose_plan_response(&["first", "second", "third"])),
+            Ok(text_response(
+                "I need direction on the blocked sub-goals before I can finish this safely.",
+            )),
+        ]);
+
+        let result = engine
+            .run_cycle(
+                decomposition_run_snapshot("break this into sub-goals"),
+                &llm,
+            )
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::Incomplete {
+                partial_response: Some(response),
+                ..
+            } => assert_eq!(
+                response,
+                "I need direction on the blocked sub-goals before I can finish this safely."
+            ),
+            other => panic!("expected LoopResult::Incomplete, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
