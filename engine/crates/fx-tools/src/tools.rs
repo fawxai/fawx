@@ -590,10 +590,15 @@ impl FawxToolExecutor {
     }
 
     fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let desired = requested.unwrap_or_else(|| self.working_dir.to_str().unwrap_or("."));
+        let desired = requested
+            .map(expand_tilde)
+            .unwrap_or_else(|| self.working_dir.clone());
         if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(Path::new(desired));
+            return canonicalize_existing_or_parent(&desired);
         }
+        let desired = desired
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         validate_path(&self.working_dir, desired)
     }
 
@@ -1590,12 +1595,15 @@ pub fn fawx_tool_definitions(
         },
         ToolDefinition {
             name: "run_command".to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
+            description: "Run a command and capture exit code, stdout, and stderr. `working_dir` supports `~` to reference the home directory.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Optional working directory. Supports `~` to reference the home directory."
+                    },
                     "shell": { "type": "boolean" }
                 },
                 "required": ["command"]
@@ -1603,12 +1611,15 @@ pub fn fawx_tool_definitions(
         },
         ToolDefinition {
             name: "exec_background".to_string(),
-            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
+            description: "Start a command in the background and return a session ID for monitoring. `working_dir` supports `~` to reference the home directory.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Optional working directory. Supports `~` to reference the home directory."
+                    },
                     "label": { "type": "string" }
                 },
                 "required": ["command"]
@@ -3471,6 +3482,18 @@ three
             .handle_run_command(&serde_json::json!({"command": "echo hi", "working_dir": "../"}))
             .await;
         assert!(output.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_command_expands_tilde_working_directory_override() {
+        let home = dirs::home_dir().expect("home dir");
+        let executor = test_executor(&home);
+        let output = executor
+            .handle_run_command(&serde_json::json!({"command": "pwd", "working_dir": "~"}))
+            .await
+            .expect("command");
+
+        assert!(output.contains(&format!("stdout:\n{}\n", home.display())));
     }
 
     #[tokio::test]
