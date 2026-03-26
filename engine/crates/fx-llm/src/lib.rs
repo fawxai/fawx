@@ -40,7 +40,14 @@ pub use local::LocalModel;
 pub use model_catalog::{CatalogModel, ModelCatalog};
 pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
-pub use provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
+pub use provider::{
+    default_loop_response_classification, default_loop_truncation_resume_messages,
+    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream,
+    LlmProvider as CompletionProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
+    LoopModelProfile, LoopPromptOverlayContext, LoopResponseClassification,
+    LoopResponseTextClassification, LoopStreamingRecoveryStrategy, LoopTextDeltaMode,
+    ProviderCapabilities, StaticLoopModelProfile,
+};
 pub use router::{
     context_window_for_model, fetch_available_models_from_catalog, LlmRouter, ModelInfo,
     ModelRouter, ProviderCatalogEntry, RouterError, RoutingStrategy,

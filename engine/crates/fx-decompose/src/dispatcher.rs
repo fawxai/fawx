@@ -82,14 +82,32 @@ impl SubGoalDispatcher for SequentialDispatcher {
 
             match self.executor.execute(goal, experiment, &results).await {
                 Ok(result) => {
-                    let event = if matches!(result.outcome, SubGoalOutcome::Failed(_)) {
-                        failed = true;
-                        DecompositionEvent::SubGoalFailed {
-                            index,
-                            error: "execution returned failure".to_owned(),
+                    let event = match &result.outcome {
+                        SubGoalOutcome::Completed(_) => {
+                            DecompositionEvent::SubGoalCompleted { index }
                         }
-                    } else {
-                        DecompositionEvent::SubGoalCompleted { index }
+                        SubGoalOutcome::Incomplete(message) => {
+                            failed = true;
+                            DecompositionEvent::SubGoalFailed {
+                                index,
+                                error: format!("execution returned incomplete result: {message}"),
+                            }
+                        }
+                        SubGoalOutcome::Failed(_) => {
+                            failed = true;
+                            DecompositionEvent::SubGoalFailed {
+                                index,
+                                error: "execution returned failure".to_owned(),
+                            }
+                        }
+                        SubGoalOutcome::BudgetExhausted => {
+                            failed = true;
+                            DecompositionEvent::SubGoalFailed {
+                                index,
+                                error: "execution exhausted budget".to_owned(),
+                            }
+                        }
+                        SubGoalOutcome::Skipped => DecompositionEvent::SubGoalCompleted { index },
                     };
                     emit(progress, event);
                     results.push(result);
@@ -328,7 +346,7 @@ fn emit(progress: Option<&DecompositionProgressCallback>, event: DecompositionEv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ComplexityHint;
+    use crate::{ComplexityHint, SubGoalContract};
 
     fn sample_experiment() -> Experiment {
         Experiment {
@@ -339,11 +357,13 @@ mod tests {
     fn plan(count: usize, strategy: AggregationStrategy) -> DecompositionPlan {
         DecompositionPlan {
             sub_goals: (0..count)
-                .map(|index| SubGoal {
-                    description: format!("Goal {index}"),
-                    required_tools: vec![],
-                    expected_output: None,
-                    complexity_hint: Some(ComplexityHint::Trivial),
+                .map(|index| {
+                    SubGoal::new(
+                        format!("Goal {index}"),
+                        vec![],
+                        SubGoalContract::default(),
+                        Some(ComplexityHint::Trivial),
+                    )
                 })
                 .collect(),
             strategy,

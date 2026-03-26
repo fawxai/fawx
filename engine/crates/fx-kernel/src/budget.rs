@@ -1301,6 +1301,7 @@ fn recipient_indices(skip_mask: &[bool]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_decompose::SubGoalContract;
     use std::collections::HashMap;
 
     fn test_config() -> BudgetConfig {
@@ -1362,15 +1363,15 @@ mod tests {
         required_tools: &[&str],
         hint: Option<ComplexityHint>,
     ) -> SubGoal {
-        SubGoal {
-            description: description.to_string(),
-            required_tools: required_tools
+        SubGoal::new(
+            description.to_string(),
+            required_tools
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
-            expected_output: None,
-            complexity_hint: hint,
-        }
+            SubGoalContract::default(),
+            hint,
+        )
     }
 
     fn sum_llm_calls(budgets: &[BudgetConfig]) -> u32 {

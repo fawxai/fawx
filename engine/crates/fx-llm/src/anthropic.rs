@@ -10,7 +10,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::Duration;
 
-use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::provider::{
+    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
+    LoopHarness, LoopModelMatch, LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities,
+    StaticLoopModelProfile,
+};
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::types::{
@@ -30,6 +34,75 @@ const MIN_RESPONSE_TOKENS: u32 = 1024;
 const VALID_ANTHROPIC_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
 const CLAUDE_CODE_SYSTEM_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_REASONING_OVERLAY: &str = "\n\nModel-family guidance for Claude models: \
+Prefer answering from the evidence already in context instead of extending the tool loop. \
+If a tool pattern is repeating or failing without new information, stop, explain the blocker, and ask for direction instead of retrying variations.";
+
+const CLAUDE_TOOL_CONTINUATION_OVERLAY: &str = "\n\nModel-family guidance for Claude models: \
+When continuing after tool calls, either answer from the current evidence or name the specific missing fact that justifies another tool call. \
+Avoid repeating near-identical tool calls once the evidence trend is clear.";
+
+#[derive(Debug)]
+struct AnthropicMessagesLoopHarness {
+    use_claude_overlays: bool,
+}
+
+impl LoopHarness for AnthropicMessagesLoopHarness {
+    fn prompt_overlay(&self, context: LoopPromptOverlayContext) -> Option<&'static str> {
+        if !self.use_claude_overlays {
+            return None;
+        }
+
+        match context {
+            LoopPromptOverlayContext::Reasoning => Some(CLAUDE_REASONING_OVERLAY),
+            LoopPromptOverlayContext::ToolContinuation => Some(CLAUDE_TOOL_CONTINUATION_OVERLAY),
+        }
+    }
+
+    fn is_truncated(&self, stop_reason: Option<&str>) -> bool {
+        matches!(
+            stop_reason
+                .map(|reason| reason.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("max_tokens" | "incomplete")
+        )
+    }
+}
+
+static ANTHROPIC_MESSAGES_LOOP_HARNESS: AnthropicMessagesLoopHarness =
+    AnthropicMessagesLoopHarness {
+        use_claude_overlays: false,
+    };
+
+static ANTHROPIC_CLAUDE_MESSAGES_LOOP_HARNESS: AnthropicMessagesLoopHarness =
+    AnthropicMessagesLoopHarness {
+        use_claude_overlays: true,
+    };
+
+static ANTHROPIC_CLAUDE_MESSAGES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "anthropic_claude",
+    matcher: LoopModelMatch::Prefix("claude-"),
+    harness: &ANTHROPIC_CLAUDE_MESSAGES_LOOP_HARNESS,
+};
+
+static ANTHROPIC_DEFAULT_MESSAGES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "anthropic_default",
+    matcher: LoopModelMatch::Any,
+    harness: &ANTHROPIC_MESSAGES_LOOP_HARNESS,
+};
+
+static ANTHROPIC_MESSAGES_LOOP_PROFILES: [&'static dyn LoopModelProfile; 2] = [
+    &ANTHROPIC_CLAUDE_MESSAGES_LOOP_PROFILE,
+    &ANTHROPIC_DEFAULT_MESSAGES_LOOP_PROFILE,
+];
+
+fn anthropic_messages_loop_harness(model: &str) -> &'static dyn LoopHarness {
+    resolve_loop_harness_from_profiles(
+        &ANTHROPIC_MESSAGES_LOOP_PROFILES,
+        model,
+        null_loop_harness(),
+    )
+}
 
 /// Anthropic auth mode — determines how credentials are sent.
 #[derive(Clone)]
@@ -792,6 +865,10 @@ impl LlmProvider for AnthropicProvider {
             supports_temperature: true,
             requires_streaming: false,
         }
+    }
+
+    fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
+        anthropic_messages_loop_harness(model)
     }
 }
 

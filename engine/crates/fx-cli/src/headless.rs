@@ -318,6 +318,10 @@ where
         self.inner.model_name()
     }
 
+    fn loop_harness(&self) -> &'static dyn fx_llm::LoopHarness {
+        self.inner.loop_harness()
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest,
