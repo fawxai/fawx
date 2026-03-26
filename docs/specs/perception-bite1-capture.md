@@ -79,9 +79,24 @@ config.capturesAudio = false
 - `CGEvent.tapCreate(tap:place:options:eventsOfInterest:callback:userInfo:)` — passive event tap
 - Event types: `.leftMouseDown`, `.rightMouseDown`, `.keyDown`, `.scrollWheel`, `.mouseMoved`
 
+### Secure input suppression:
+When a password field or secure text entry is focused, macOS enables secure event input. **All keyboard event recording must be suppressed during secure input mode** to avoid leaking password length or timing.
+
+```swift
+// Check before recording any key event:
+if SecureEventInputEnabled() {
+    // Emit a boundary event instead of key data
+    // {"type":"secure_input_start"} / {"type":"secure_input_end"}
+    return
+}
+```
+
+Poll `SecureEventInputEnabled()` in the CGEventTap callback. When it transitions true, emit `{"type":"secure_input_start"}`. When it transitions false, emit `{"type":"secure_input_end"}`. No key events between these boundaries.
+
 ### Privacy-safe recording:
 ```swift
 // Keyboard: record ONLY modifier flags + key category, never actual characters
+// ONLY when SecureEventInputEnabled() == false
 struct KeyEvent {
     let timestamp_ms: UInt64
     let modifiers: [String]       // ["cmd", "shift"] etc.
@@ -155,6 +170,11 @@ Decision: **Bite 1 records bundle ID only, not window title.** This avoids the A
 {"ts":1711234568290,"type":"frame","id":2,"app":"com.apple.Safari"}
 ```
 
+App-switch events for explicit transition tracking:
+```json
+{"ts":1711234568050,"type":"app_switch","from":"com.apple.mail","to":"com.apple.Safari"}
+```
+
 Compact keys to minimize file size. Frame events interleaved with input events, all in one timeline.
 
 ### metadata.json:
@@ -180,6 +200,13 @@ Compact keys to minimize file size. Frame events interleaved with input events, 
 - Write frames async on a background queue to avoid blocking capture
 - Flush events.jsonl every 100 events (not every event)
 
+### Disk space safety:
+- **Pre-start check:** Before starting a session, verify at least `min_free_disk_gb` (default: 10GB) of free space. Refuse to start with a menu bar warning if below threshold.
+- **Max session size:** Configurable `max_session_gb` (default: 8GB) in config.json. Auto-pause capture when session crosses this limit. Show menu bar warning.
+- **Max session duration:** Configurable `max_session_hours` (default: 8) in config.json. Auto-pause when exceeded. Safety net against forgotten sessions.
+- **Runtime monitoring:** Check free disk space every 60 seconds during capture. If free space drops below `min_free_disk_gb`, auto-pause with menu bar warning.
+- **ENOSPC handling:** If a frame write fails due to disk full, catch the error, auto-pause capture, show red menu bar icon with "Disk full" message. Do not crash. Events written up to that point are preserved (append-only JSONL + individual frame files).
+
 ---
 
 ## Menu Bar App (main.swift)
@@ -203,7 +230,7 @@ Compact keys to minimize file size. Frame events interleaved with input events, 
 ### Lifecycle:
 1. App launches → check TCC permissions → start session
 2. If permissions missing → show warning icon with instructions
-3. On app exclusion: stop frame capture when excluded app is frontmost, resume when switching away
+3. On app exclusion: stop frame capture when excluded app is frontmost, resume when switching away. **Note:** overlays/popups from excluded apps (e.g., 1Password autofill) appearing over non-excluded apps are an accepted risk in Bite 1. Detecting overlay windows requires the Accessibility API (extra TCC permission). Revisit in a later bite if this proves problematic.
 4. On pause: stop both capture and input monitoring
 5. On quit: write metadata.json, close session cleanly
 6. On crash/force-quit: events.jsonl is append-only (already flushed), frames are individual files. Metadata will be missing but data is recoverable.
@@ -218,6 +245,9 @@ Default exclusion list in `~/.fawx/capture/config.json`:
   "fps": 5,
   "jpeg_quality": 0.6,
   "capture_scale": 0.5,
+  "min_free_disk_gb": 10,
+  "max_session_gb": 8,
+  "max_session_hours": 8,
   "excluded_apps": [
     "com.1password.1password",
     "com.agilebits.onepassword7",
@@ -227,7 +257,10 @@ Default exclusion list in `~/.fawx/capture/config.json`:
 }
 ```
 
-User can edit this file. App reads it on launch and on SIGHUP.
+User can edit this file. App reads it on launch. Config reload via:
+- **"Reload Config" menu item** in the menu bar dropdown
+- **FSEvents file watcher** on `config.json` for automatic reload on save
+- SIGHUP also supported as a fallback for scripted reload
 
 ---
 
@@ -236,14 +269,22 @@ User can edit this file. App reads it on launch and on SIGHUP.
 ```bash
 cd fawx-capture
 swift build -c release
-# Binary at .build/release/fawx-capture
+
+# Code sign (required for TCC Screen Recording prompt on macOS 14+)
+# Ad-hoc signing is sufficient for local development:
+codesign --sign - --force .build/release/fawx-capture
+
+# For reliable TCC behavior, use a Developer ID or local signing identity:
+# codesign --sign "Developer ID Application: ..." .build/release/fawx-capture
 
 # Run
 .build/release/fawx-capture
 
-# Or during development
+# Or during development (ad-hoc signed automatically by swift run)
 swift run
 ```
+
+**Important:** Unsigned Swift binaries may silently fail to receive Screen Recording TCC permission on macOS 14+. `SCShareableContent.current()` returns empty content instead of prompting the user. Always ad-hoc sign at minimum.
 
 No Xcode project. Pure Swift Package Manager. The `Package.swift` declares macOS 13.0+ deployment target for ScreenCaptureKit availability.
 
@@ -287,6 +328,8 @@ After 1 week:
 3. **Multi-display?** Bite 1: capture primary display only. Multi-display is a Bite 3 concern.
 
 4. **What happens when Mac sleeps?** ScreenCaptureKit stream pauses automatically. Resume on wake. Log the gap in events.jsonl as a `{"type":"sleep"}` / `{"type":"wake"}` event.
+
+5. **What happens on display changes?** (external monitor connect/disconnect, resolution change) Listen for `NSApplication.didChangeScreenParametersNotification`. On change, stop the current SCStream and start a new one with updated dimensions. Log `{"type":"display_change","width":...,"height":...}` in events.jsonl. Frames before and after may have different dimensions; metadata.json records the initial resolution, and display_change events mark transitions.
 
 ---
 

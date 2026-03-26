@@ -29,7 +29,7 @@ Python evaluation script. No model fine-tuning. No integration with Fawx engine.
 
 ```
 fawx-perception-eval/
-  pyproject.toml              — dependencies (transformers, torch, Pillow)
+  pyproject.toml              — dependencies (transformers, torch, Pillow); requires-python = ">=3.10"
   README.md                   — setup + usage
   src/
     eval_florence2.py          — main evaluation script
@@ -47,10 +47,12 @@ fawx-perception-eval/
 Grab 30-50 diverse screenshots manually:
 
 ```bash
-# Half-retina capture (Bite 1's target resolution)
-screencapture -x -t jpg -R 0,0,1728,1117 /tmp/frame.jpg
-# Or full capture, resize in script
+# Full-screen capture, then resize in Python to target resolution
+screencapture -x -t jpg /tmp/frame_full.jpg
+# Script auto-detects display resolution and computes half/quarter retina
 ```
+
+The helper script should detect actual display resolution (via `system_profiler SPDisplaysDataType` or Python's `AppKit`), compute half-retina and quarter-retina dimensions, and resize using Pillow. No hardcoded resolution values.
 
 ### Target diversity:
 - **Browsers:** Safari, Chrome (tabs, forms, content pages)
@@ -119,7 +121,9 @@ prompt = "<CAPTION_TO_PHRASE_GROUNDING>buttons and text fields"
 **6. Referring Expression (targeted detection)**
 ```python
 prompt = "<REFERRING_EXPRESSION_SEGMENTATION>the submit button"
-# Returns segmentation mask for specific element
+# Returns segmentation mask as polygon coordinates (list of [x,y] pairs)
+# Florence-2 returns masks as polygons in normalized coordinates [0,1]
+# Store as polygon coords in JSON; render to binary mask PNG for visualization
 ```
 
 ### For each screenshot, run all 6 tasks and save:
@@ -134,7 +138,7 @@ prompt = "<REFERRING_EXPRESSION_SEGMENTATION>the submit button"
     "OCR": {"text": "..."},
     "OCR_WITH_REGION": {"text_boxes": [...]},
     "CAPTION_GROUNDING": {"boxes": [...], "phrases": [...]},
-    "REFERRING": {"masks": [...]}
+    "REFERRING": {"polygons": [[{"x": 0.12, "y": 0.34}, ...]]}
   }
 }
 ```
@@ -234,10 +238,12 @@ results/
 
 ## Build & Run
 
+Requires Python 3.10+ (for torch MPS support and HuggingFace transformers compatibility).
+
 ```bash
 cd fawx-perception-eval
 
-# Setup
+# Setup (Python 3.10+ required)
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -294,3 +300,5 @@ python -m src.visualize --results results/ --output results/annotated/
 3. **Video memory:** Florence-2-large at float16 needs ~1.5GB VRAM. Mac Mini M2 Pro has 16GB unified memory. Should be fine but verify.
 
 4. **Annotation effort:** Manually annotating 10-15 screenshots is 1-2 hours of work. Worth it for quantitative metrics, or rely on visual inspection only?
+
+5. **OCR baseline:** Consider running Apple's Vision framework OCR (`VNRecognizeTextRequest`) on the same screenshots as a baseline comparison. This is free, runs locally, and gives a "how much better/worse is Florence-2's unified OCR vs a dedicated OCR engine?" data point. Low priority since it's a separate script, but useful context for the decision.
