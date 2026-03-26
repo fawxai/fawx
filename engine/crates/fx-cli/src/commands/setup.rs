@@ -15,6 +15,7 @@ use fx_config::{PermissionAction, PermissionPreset, PermissionsConfig, DEFAULT_C
 use fx_llm::{CompletionRequest, Message, ModelCatalog};
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -27,6 +28,19 @@ const OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = fx_auth::oauth::OPENAI_CLIENT_ID;
 #[cfg(test)]
 static TEST_EXIT_CODE: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Wrap database-lock errors with a user-friendly hint to stop Fawx before running setup.
+fn wrap_db_lock_error(error: impl fmt::Display) -> anyhow::Error {
+    let message = error.to_string();
+    if message.contains("Database already open") || message.contains("Cannot acquire lock") {
+        anyhow!(
+            "Could not open the database because another Fawx process is using it.\n\
+             Stop it with `fawx stop` and try again."
+        )
+    } else {
+        anyhow!("{}", message)
+    }
+}
 
 pub async fn run(force: bool) -> anyhow::Result<i32> {
     #[cfg(test)]
@@ -188,7 +202,7 @@ impl SetupWizard {
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let config_path = data_dir.join("config.toml");
         let existing_config = config_path.exists();
-        let recovered = open_auth_store_with_recovery(&data_dir).map_err(|error| anyhow!(error))?;
+        let recovered = open_auth_store_with_recovery(&data_dir).map_err(wrap_db_lock_error)?;
         let store_recreated = recovered.recreated;
         let auth_store = recovered.store;
         let auth_manager = auth_store
@@ -414,8 +428,8 @@ impl SetupWizard {
 
     fn skill_credential_store(&mut self) -> anyhow::Result<&EncryptedFileCredentialStore> {
         if self.skill_credential_store.is_none() {
-            let store = EncryptedFileCredentialStore::open(&self.data_dir)
-                .map_err(|error| anyhow!(error))?;
+            let store =
+                EncryptedFileCredentialStore::open(&self.data_dir).map_err(wrap_db_lock_error)?;
             self.skill_credential_store = Some(store);
         }
         self.skill_credential_store
@@ -1507,6 +1521,23 @@ pub(crate) enum ChannelSelection {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn wrap_db_lock_error_rewrites_lock_message() {
+        let err = wrap_db_lock_error("Database already open. Cannot acquire lock.");
+        let msg = err.to_string();
+        assert!(msg.contains("fawx stop"), "expected hint: {msg}");
+        assert!(
+            !msg.contains("Database already open"),
+            "raw error leaked: {msg}"
+        );
+    }
+
+    #[test]
+    fn wrap_db_lock_error_passes_through_other_errors() {
+        let err = wrap_db_lock_error("file not found");
+        assert_eq!(err.to_string(), "file not found");
+    }
 
     #[test]
     fn parse_chat_ids_accepts_blank_input() {
