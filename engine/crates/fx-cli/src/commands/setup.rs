@@ -15,7 +15,6 @@ use fx_config::{PermissionAction, PermissionPreset, PermissionsConfig, DEFAULT_C
 use fx_llm::{CompletionRequest, Message, ModelCatalog};
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -30,7 +29,8 @@ const OPENAI_CLIENT_ID: &str = fx_auth::oauth::OPENAI_CLIENT_ID;
 static TEST_EXIT_CODE: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Wrap database-lock errors with a user-friendly hint to stop Fawx before running setup.
-fn wrap_db_lock_error(error: impl fmt::Display) -> anyhow::Error {
+fn wrap_db_lock_error<E: Into<anyhow::Error>>(error: E) -> anyhow::Error {
+    let error = error.into();
     let message = error.to_string();
     if message.contains("Database already open") || message.contains("Cannot acquire lock") {
         anyhow!(
@@ -38,7 +38,7 @@ fn wrap_db_lock_error(error: impl fmt::Display) -> anyhow::Error {
              Stop it with `fawx stop` and try again."
         )
     } else {
-        anyhow!("{}", message)
+        error
     }
 }
 
@@ -202,7 +202,9 @@ impl SetupWizard {
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let config_path = data_dir.join("config.toml");
         let existing_config = config_path.exists();
-        let recovered = open_auth_store_with_recovery(&data_dir).map_err(wrap_db_lock_error)?;
+        let recovered = open_auth_store_with_recovery(&data_dir)
+            .map_err(anyhow::Error::msg)
+            .map_err(wrap_db_lock_error)?;
         let store_recreated = recovered.recreated;
         let auth_store = recovered.store;
         let auth_manager = auth_store
@@ -1524,7 +1526,7 @@ mod tests {
 
     #[test]
     fn wrap_db_lock_error_rewrites_lock_message() {
-        let err = wrap_db_lock_error("Database already open. Cannot acquire lock.");
+        let err = wrap_db_lock_error(anyhow!("Database already open. Cannot acquire lock."));
         let msg = err.to_string();
         assert!(msg.contains("fawx stop"), "expected hint: {msg}");
         assert!(
@@ -1534,8 +1536,15 @@ mod tests {
     }
 
     #[test]
+    fn wrap_db_lock_error_rewrites_lock_only_message() {
+        let err = wrap_db_lock_error(anyhow!("Cannot acquire lock"));
+        let msg = err.to_string();
+        assert!(msg.contains("fawx stop"), "expected hint: {msg}");
+    }
+
+    #[test]
     fn wrap_db_lock_error_passes_through_other_errors() {
-        let err = wrap_db_lock_error("file not found");
+        let err = wrap_db_lock_error(anyhow!("file not found"));
         assert_eq!(err.to_string(), "file not found");
     }
 
