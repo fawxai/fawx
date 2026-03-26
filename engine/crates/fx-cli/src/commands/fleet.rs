@@ -35,7 +35,7 @@ pub enum FleetCommands {
     },
     /// Join a fleet as a worker node
     Join {
-        /// Primary node endpoint (e.g., 100.93.251.101:8400)
+        /// Primary node endpoint (e.g., 192.0.2.1:8400)
         primary: String,
         /// Bearer token from `fawx fleet add`
         #[arg(long)]
@@ -550,7 +550,7 @@ mod tests {
         execute_fleet_command(
             &FleetCommands::Add {
                 name: "macmini".to_string(),
-                ip: "100.75.191.19".to_string(),
+                ip: "198.51.100.19".to_string(),
                 port: 8400,
             },
             &fleet_dir,
@@ -567,7 +567,7 @@ mod tests {
         assert!(output.contains("✓ Token generated"));
         assert!(output.contains("Join command (run on the worker):"));
         assert!(output.contains(&format!(
-            "fawx fleet join 100.75.191.19:8400 --token {}",
+            "fawx fleet join 198.51.100.19:8400 --token {}",
             token.secret
         )));
     }
@@ -584,7 +584,7 @@ mod tests {
         execute_fleet_command(
             &FleetCommands::Add {
                 name: "macmini".to_string(),
-                ip: "100.75.191.19".to_string(),
+                ip: "198.51.100.19".to_string(),
                 port: 8400,
             },
             &fleet_dir,
@@ -596,7 +596,7 @@ mod tests {
         let result = execute_fleet_command(
             &FleetCommands::Add {
                 name: "macmini".to_string(),
-                ip: "100.75.191.20".to_string(),
+                ip: "198.51.100.20".to_string(),
                 port: 8400,
             },
             &fleet_dir,
@@ -665,7 +665,7 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
 
         let mut output = Vec::new();
@@ -738,10 +738,10 @@ mod tests {
 
         let mut manager = FleetManager::load(&fleet_dir).expect("fleet should load");
         manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("first node should add");
         manager
-            .add_node("macbook", "100.75.191.20", 8400)
+            .add_node("macbook", "198.51.100.20", 8400)
             .expect("second node should add");
 
         let now_ms = current_time_ms();
@@ -763,8 +763,8 @@ mod tests {
         assert!(output.contains("Fleet Nodes:"));
         assert!(output.contains("macbook"));
         assert!(output.contains("macmini"));
-        assert!(output.contains("100.75.191.19:8400"));
-        assert!(output.contains("100.75.191.20:8400"));
+        assert!(output.contains("198.51.100.19:8400"));
+        assert!(output.contains("198.51.100.20:8400"));
         assert!(output.contains("online"));
         assert!(output.contains("offline"));
         assert!(output.contains("1m ago"));
@@ -777,7 +777,7 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
 
         let nodes = manager.list_nodes();

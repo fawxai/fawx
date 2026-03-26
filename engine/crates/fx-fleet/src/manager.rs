@@ -448,7 +448,7 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         let token = manager
-            .add_node("Mac Mini", "100.75.191.19", 8400)
+            .add_node("Mac Mini", "198.51.100.19", 8400)
             .expect("node should add");
         let node = manager
             .list_nodes()
@@ -459,8 +459,8 @@ mod tests {
         assert_ne!(token.node_id, node.name);
         assert!(token.node_id.starts_with("mac-mini-"));
         assert_eq!(node.name, "Mac Mini");
-        assert_eq!(node.endpoint, "https://100.75.191.19:8400");
-        assert_eq!(node.address.as_deref(), Some("100.75.191.19"));
+        assert_eq!(node.endpoint, "https://198.51.100.19:8400");
+        assert_eq!(node.address.as_deref(), Some("198.51.100.19"));
         assert_eq!(node.status, NodeStatus::Offline);
     }
 
@@ -470,9 +470,9 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("first node should add");
-        let result = manager.add_node("macmini", "100.75.191.20", 8400);
+        let result = manager.add_node("macmini", "198.51.100.20", 8400);
 
         assert!(matches!(result, Err(FleetError::DuplicateNode)));
     }
@@ -482,7 +482,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
 
         manager
@@ -510,7 +510,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("Mac Mini", "100.75.191.19", 8400)
+            .add_node("Mac Mini", "198.51.100.19", 8400)
             .expect("node should add");
 
         let verified = manager.verify_bearer(&token.secret);
@@ -523,7 +523,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
         manager
             .remove_node("macmini")
@@ -547,7 +547,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
 
         let node = manager
@@ -571,7 +571,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
 
         manager
@@ -592,7 +592,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
         manager
             .record_worker_heartbeat(&token.node_id, NodeStatus::Busy, 100)
@@ -617,10 +617,10 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let active = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("first node should add");
         let revoked = manager
-            .add_node("macbook", "100.75.191.20", 8401)
+            .add_node("macbook", "198.51.100.20", 8401)
             .expect("second node should add");
         manager
             .remove_node("macbook")
@@ -648,7 +648,7 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         manager
-            .add_node("Mac Mini", "100.75.191.19", 8400)
+            .add_node("Mac Mini", "198.51.100.19", 8400)
             .expect("node should add");
 
         assert_private_permissions(&nodes_path(temp_dir.path()));
@@ -682,10 +682,10 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("first node should add");
         manager
-            .add_node("macbook", "100.75.191.20", 8401)
+            .add_node("macbook", "198.51.100.20", 8401)
             .expect("second node should add");
 
         let names = sorted_node_names(manager.list_nodes());
