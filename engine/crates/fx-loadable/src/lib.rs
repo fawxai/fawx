@@ -69,7 +69,7 @@ pub enum SlotState {
 mod tests {
     #[test]
     fn stub_modules_track_shared_implementation_issue() {
-        let expected = "https://github.com/abbudjoe/fawx/issues/860";
+        let expected = "https://github.com/fawxai/fawx/issues/860";
 
         assert!(include_str!("ab_slots.rs").contains(expected));
         assert!(include_str!("config.rs").contains(expected));

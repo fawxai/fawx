@@ -1,6 +1,6 @@
 # ENGINEERING.md — Immutable Doctrine (Fawx + Ember)
 
-Effective 2026-02-27. These standards apply to all work in `abbudjoe/fawx` and `abbudjoe/ember`.
+Effective 2026-02-27. These standards apply to all work in `fawxai/fawx` and `fawxai/ember`.
 
 This file is **immutable doctrine**. These rules are machine-enforceable, non-negotiable, and cannot be weakened by the agent. They are the compiled invariants of the development process.
 

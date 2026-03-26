@@ -1531,22 +1531,22 @@ mod tests {
 
     #[test]
     fn parse_github_remote_https() {
-        let (owner, repo) = parse_github_remote("https://github.com/abbudjoe/fawx.git").unwrap();
-        assert_eq!(owner, "abbudjoe");
+        let (owner, repo) = parse_github_remote("https://github.com/fawxai/fawx.git").unwrap();
+        assert_eq!(owner, "fawxai");
         assert_eq!(repo, "fawx");
     }
 
     #[test]
     fn parse_github_remote_https_no_suffix() {
-        let (owner, repo) = parse_github_remote("https://github.com/abbudjoe/fawx").unwrap();
-        assert_eq!(owner, "abbudjoe");
+        let (owner, repo) = parse_github_remote("https://github.com/fawxai/fawx").unwrap();
+        assert_eq!(owner, "fawxai");
         assert_eq!(repo, "fawx");
     }
 
     #[test]
     fn parse_github_remote_ssh() {
-        let (owner, repo) = parse_github_remote("git@github.com:abbudjoe/fawx.git").unwrap();
-        assert_eq!(owner, "abbudjoe");
+        let (owner, repo) = parse_github_remote("git@github.com:fawxai/fawx.git").unwrap();
+        assert_eq!(owner, "fawxai");
         assert_eq!(repo, "fawx");
     }
 
