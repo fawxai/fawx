@@ -7,7 +7,7 @@
 
 ---
 
-## Root Cause 1: Built-in tools aren't trait objects
+## Root Cause 1: Built-in tools aren't trait objects → [#1639](https://github.com/abbudjoe/fawx/issues/1639)
 
 The `Skill` trait correctly models WASM skills as self-describing, polymorphic trait objects. Built-in tools are methods on a 5,464-line monolith (`FawxToolExecutor`) with string-based dispatch. Every system that needs to classify a tool call reinvents its own string registry. These registries drift out of sync.
 
@@ -26,7 +26,7 @@ The `Skill` trait correctly models WASM skills as self-describing, polymorphic t
 
 ---
 
-## Root Cause 2: Provider metadata isn't on the provider trait
+## Root Cause 2: Provider metadata isn't on the provider trait → [#1640](https://github.com/abbudjoe/fawx/issues/1640)
 
 `LlmProvider` trait handles execution correctly. But catalog endpoints, thinking levels, auth header format, and fallback model lists live in external functions matching on provider name strings.
 
@@ -51,17 +51,17 @@ The `Skill` trait correctly models WASM skills as self-describing, polymorphic t
 
 Large files that absorbed their children instead of composing them. Not string-matching violations, but they violate the fractal principle: same shape at every scale.
 
-| ID | Category | Instance | Location | Severity | Notes |
+| ID | Category | Instance | Location | Severity | Issue |
 |----|----------|----------|----------|----------|-------|
-| RC3-01 | God object | `loop_engine.rs` (19,408 lines, 284 prod fns) | `fx-kernel` | High | Iteration, streaming, compaction, decomposition, synthesis, cancellation, budgets, scratchpads all in one file |
-| RC3-02 | God object | `headless.rs` (5,373 lines) | `fx-cli` | Moderate | CLI routing, auth, config, analysis, improvement, keys, setup, signing |
-| RC3-03 | God object | `config/lib.rs` (2,403 lines) | `fx-config` | Moderate | Config struct, validation, presets, serialization, env parsing |
+| RC3-01 | God object | `loop_engine.rs` (19,408 lines, 284 prod fns) | `fx-kernel` | High | [#1641](https://github.com/abbudjoe/fawx/issues/1641) |
+| RC3-02 | God object | `headless.rs` (5,373 lines) | `fx-cli` | Moderate | [#1642](https://github.com/abbudjoe/fawx/issues/1642) |
+| RC3-03 | God object | `config/lib.rs` (2,403 lines) | `fx-config` | Moderate | [#1643](https://github.com/abbudjoe/fawx/issues/1643) |
 
 **Fix:** Decompose into composable units. Loop engine: phase traits (`Think`, `Act`, `Observe`, `Compact`). Headless: command pattern. Config: separate preset, validation, and serialization modules.
 
 ---
 
-## Root Cause 4: Stringly-typed dispatch in agent subsystem
+## Root Cause 4: Stringly-typed dispatch in agent subsystem → [#1644](https://github.com/abbudjoe/fawx/issues/1644)
 
 Action steps use string `action` fields (`"tap"`, `"swipe"`, `"launch_app"`) matched in plan_builder.rs. Same anti-pattern as tool dispatch.
 
@@ -75,7 +75,7 @@ Action steps use string `action` fields (`"tap"`, `"swipe"`, `"launch_app"`) mat
 
 ---
 
-## Root Cause 5: Feature flags as composition mechanism
+## Root Cause 5: Feature flags as composition mechanism → resolved by [#1639](https://github.com/abbudjoe/fawx/issues/1639)
 
 Feature flags (`#[cfg(feature = "improvement")]`) gate tool inclusion in the `FawxToolExecutor` monolith. 10 instances in `tools.rs` alone. This is conditional compilation doing the job of runtime composition.
 
@@ -112,19 +112,20 @@ Feature flags (`#[cfg(feature = "improvement")]`) gate tool inclusion in the `Fa
 
 ## Totals
 
-| Root Cause | Instances | Severity Range |
-|-----------|-----------|----------------|
-| RC1: Built-in tools aren't trait objects | 8 | Critical-High |
-| RC2: Provider metadata outside provider trait | 9 | Moderate-Low |
-| RC3: Monoliths resist composition | 3 | High-Moderate |
-| RC4: Stringly-typed agent actions | 3 | Moderate-Low |
-| RC5: Feature flags as composition | 2 | Moderate-Low |
-| **Total** | **25** | |
+| Root Cause | Instances | Severity Range | Issue |
+|-----------|-----------|----------------|-------|
+| RC1: Built-in tools aren't trait objects | 8 | Critical-High | [#1639](https://github.com/abbudjoe/fawx/issues/1639) |
+| RC2: Provider metadata outside provider trait | 9 | Moderate-Low | [#1640](https://github.com/abbudjoe/fawx/issues/1640) |
+| RC3: Monoliths resist composition | 3 | High-Moderate | [#1641](https://github.com/abbudjoe/fawx/issues/1641), [#1642](https://github.com/abbudjoe/fawx/issues/1642), [#1643](https://github.com/abbudjoe/fawx/issues/1643) |
+| RC4: Stringly-typed agent actions | 3 | Moderate-Low | [#1644](https://github.com/abbudjoe/fawx/issues/1644) |
+| RC5: Feature flags as composition | 2 | Moderate-Low | Resolved by [#1639](https://github.com/abbudjoe/fawx/issues/1639) |
+| **Total** | **25** | | **6 issues** |
 
 ## Priority
 
-1. **RC1** — biggest blast radius (8 instances), enables extensibility, blocks perception work. Also resolves RC5.
-2. **RC3** — monoliths resist the composition perception needs. The 19K-line loop engine is the structural bottleneck.
-3. **RC2** — 9 instances but lower urgency; provider set grows slowly.
-4. **RC4** — will matter when perception adds new action types. Low urgency today.
-5. **RC5** — resolves automatically with RC1.
+1. **[#1639](https://github.com/abbudjoe/fawx/issues/1639) (RC1)** — biggest blast radius (8 instances), enables extensibility, blocks perception work. Also resolves RC5.
+2. **[#1641](https://github.com/abbudjoe/fawx/issues/1641) (RC3-01)** — the 19K-line loop engine is the structural bottleneck for extensibility.
+3. **[#1640](https://github.com/abbudjoe/fawx/issues/1640) (RC2)** — 9 instances but lower urgency; provider set grows slowly.
+4. **[#1642](https://github.com/abbudjoe/fawx/issues/1642) (RC3-02)** — headless decomposition. Independent of other work.
+5. **[#1643](https://github.com/abbudjoe/fawx/issues/1643) (RC3-03)** — config decomposition. Independent, low risk.
+6. **[#1644](https://github.com/abbudjoe/fawx/issues/1644) (RC4)** — will matter when perception adds new action types.
