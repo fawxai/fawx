@@ -423,7 +423,7 @@ mod tests {
             restricted: vec!["kernel_modify".to_string()],
             working_dir: "/workspace".to_string(),
         })
-        .user_context("Prefers short answers.")
+        .user_context("Joe prefers short answers.")
         .surface(Surface::HeadlessApi)
         .session(SessionContext {
             is_new: false,
@@ -437,7 +437,7 @@ mod tests {
             "Behavioral:\nKeep answers grounded in evidence.",
             "Capabilities:\n- web_fetch: Fetch a web page",
             "Security:\n- Mode: capability\n- Restricted: kernel_modify\n- Working directory: /workspace",
-            "User context:\nPrefers short answers.",
+            "User context:\nJoe prefers short answers.",
             "Surface: Headless API. Return plain content without UI-specific references.",
             "Session:\n- State: continuing\n- Message count: 3\n- Recent summary: Reviewed deployment notes.",
             "Directives:\n- Return machine-readable content when asked.",

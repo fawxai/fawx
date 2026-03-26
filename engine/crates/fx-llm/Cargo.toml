@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 default = []
+llama-cpp = []  # Enable local LLM integration
 
 [dependencies]
 async-trait.workspace = true
@@ -15,6 +16,7 @@ bytes = "1"
 fx-core.workspace = true
 futures.workspace = true
 http.workspace = true
+# local LLM backend (not included in OSS release)
 pdf-extract = "0.7"
 reqwest.workspace = true
 serde.workspace = true

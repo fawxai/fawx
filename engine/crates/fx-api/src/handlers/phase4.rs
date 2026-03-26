@@ -256,7 +256,7 @@ mod tests {
                 installed: true,
                 running: true,
                 logged_in: true,
-                hostname: Some("node.example.ts.net".to_string()),
+                hostname: Some("myhost.example.com".to_string()),
                 cert_ready: true,
             },
         };
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(json["launchagent"]["loaded"], true);
         assert_eq!(json["local_server"]["port"], 8400);
         assert_eq!(json["auth"]["providers_configured"][0], "anthropic");
-        assert_eq!(json["tailscale"]["hostname"], "node.example.ts.net");
+        assert_eq!(json["tailscale"]["hostname"], "myhost.example.com");
     }
 
     #[test]

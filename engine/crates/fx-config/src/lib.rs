@@ -2057,9 +2057,9 @@ max_iterations = 10
 
     #[test]
     fn tilde_expansion_does_not_expand_tilde_user() {
-        let path = PathBuf::from("~user/.config");
+        let path = PathBuf::from("~joe/.config");
         let expanded = expand_tilde(&path);
-        assert_eq!(expanded, PathBuf::from("~user/.config"));
+        assert_eq!(expanded, PathBuf::from("~joe/.config"));
     }
 
     #[test]

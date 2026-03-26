@@ -29,7 +29,7 @@ pub struct NodeInfo {
     pub node_id: String,
     /// Human-readable name.
     pub name: String,
-    /// HTTP API endpoint (e.g., "https://203.0.113.5:8400").
+    /// HTTP API endpoint (e.g., "https://192.0.2.5:8400").
     pub endpoint: String,
     /// Bearer token for authenticating with this node.
     pub auth_token: Option<String>,
@@ -436,19 +436,19 @@ mod tests {
     fn node_info_from_config_maps_fleet_fields() {
         let config = NodeConfig {
             id: "mac-mini".to_string(),
-            name: "Worker Node A".to_string(),
+            name: "Mac Mini".to_string(),
             endpoint: Some("https://10.0.0.5:8400".to_string()),
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
             address: Some("10.0.0.5".to_string()),
-            user: Some("builder".to_string()),
+            user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         };
 
         let node = NodeInfo::from(&config);
 
         assert_eq!(node.node_id, "mac-mini");
-        assert_eq!(node.name, "Worker Node A");
+        assert_eq!(node.name, "Mac Mini");
         assert_eq!(node.endpoint, "https://10.0.0.5:8400");
         assert_eq!(node.auth_token.as_deref(), Some("token"));
         assert_eq!(
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(node.last_heartbeat_ms, 0);
         assert!(node.registered_at_ms > 0);
         assert_eq!(node.address.as_deref(), Some("10.0.0.5"));
-        assert_eq!(node.ssh_user.as_deref(), Some("builder"));
+        assert_eq!(node.ssh_user.as_deref(), Some("joseph"));
         assert_eq!(node.ssh_key.as_deref(), Some("~/.ssh/id_ed25519"));
     }
 

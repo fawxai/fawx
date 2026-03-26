@@ -396,14 +396,14 @@ mod phase4_tests {
         let response = qr_pairing_response(
             &test_runtime(false),
             &QrTailscaleStatus {
-                hostname: Some("node.example.ts.net".to_string()),
+                hostname: Some("myhost.example.com".to_string()),
                 cert_ready: true,
             },
         );
-        assert_eq!(response.display_host, "node.example.ts.net");
+        assert_eq!(response.display_host, "myhost.example.com");
         assert_eq!(response.transport, "tailscale_https");
         assert!(!response.same_network_only);
-        assert!(response.scheme_url.contains("host=node.example.ts.net"));
+        assert!(response.scheme_url.contains("host=myhost.example.com"));
     }
 
     #[test]

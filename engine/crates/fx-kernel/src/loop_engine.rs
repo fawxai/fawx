@@ -1343,7 +1343,7 @@ Never narrate your process, hedge with qualifiers, or reference tool mechanics. 
 Avoid filler openers like \"I notice\", \"I can see that\", \"Based on the results\", \
 \"It appears that\", \"Let me\", or \"I aim to\". Just answer the question. \
 If the user makes a statement (not a question), acknowledge it naturally and briefly. \
-If a tool call stores data (like memory_write), confirm the action in one short sentence. You are Fawx, a TUI-first agentic engine built in Rust. You were created by Fawx AI. Your architecture separates an immutable safety kernel from a loadable intelligence layer: the kernel enforces hard security boundaries that you cannot override at runtime. You are designed to be self-extending through a WASM plugin system. \
+If a tool call stores data (like memory_write), confirm the action in one short sentence. You are Fawx, a TUI-first agentic engine built in Rust. You were created by Joe. Your architecture separates an immutable safety kernel from a loadable intelligence layer: the kernel enforces hard security boundaries that you cannot override at runtime. You are designed to be self-extending through a WASM plugin system. \
 Your source code is at ~/fawx. Your config is at ~/.fawx/config.toml. \
 Your data (conversations, memory) is at the data_dir set in config. \
 Your conversation history is stored as JSONL files in the data directory. \
@@ -1623,7 +1623,7 @@ impl LoopEngine {
         let mut state = CycleState::default();
         let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
-        // Single pass — all tool chaining happens inside act_with_tools.
+        // Multi-pass: loops until model stops using tools.
         self.iteration_count = 1;
         self.refresh_iteration_state();
 
@@ -1635,7 +1635,7 @@ impl LoopEngine {
         }
 
         stream.phase(Phase::Perceive);
-        let processed = self.perceive(&perception).await?;
+        let mut processed = self.perceive(&perception).await?;
         let reason_cost = self.estimate_reasoning_cost(&processed);
         if let Some(result) = self.budget_terminal(reason_cost, None) {
             return Ok(self.finish_streaming_result(result, stream));
@@ -1645,49 +1645,126 @@ impl LoopEngine {
         let response = self.reason(&processed, llm, stream).await?;
         self.record_reasoning_cost(reason_cost, &mut state);
 
-        let decision = self.decide(&response).await?;
+        let mut decision = self.decide(&response).await?;
         if let Some(result) = self.budget_terminal(self.estimate_action_cost(&decision), None) {
             return Ok(self.finish_streaming_result(result, stream));
         }
 
-        stream.phase(Phase::Act);
-        let action = self
-            .act(&decision, llm, &processed.context_window, stream)
-            .await?;
+        loop {
+            stream.phase(Phase::Act);
+            let action = self
+                .act(&decision, llm, &processed.context_window, stream)
+                .await?;
 
-        // Budget accounting for non-tool actions.
-        if action.tool_results.is_empty() {
-            let action_cost = self.action_cost_from_result(&action);
-            if let Some(result) =
-                self.budget_terminal(action_cost, Some(action.response_text.clone()))
+            // Budget accounting for non-tool actions.
+            if action.tool_results.is_empty() {
+                let action_cost = self.action_cost_from_result(&action);
+                if let Some(result) =
+                    self.budget_terminal(action_cost, Some(action.response_text.clone()))
+                {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
+                self.budget.record(&action_cost);
+            } else if let Some(result) =
+                self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
             {
                 return Ok(self.finish_budget_exhausted(result, llm, stream).await);
             }
-            self.budget.record(&action_cost);
-        } else if let Some(result) =
-            self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
-        {
-            return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+
+            state.tokens.accumulate(action.tokens_used);
+            self.update_tool_turns(&action);
+
+            if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
+
+            self.emit_action_observations(&action);
+
+            // CONTINUATION CHECK: if tools were used, the model may have more work.
+            // Re-prompt to let it decide. If no tools were used, it's done.
+            if action.tool_results.is_empty() {
+                // Text-only response, no tools involved. Model is done.
+                return Ok(self.finish_streaming_result(
+                    LoopResult::Complete {
+                        response: action.response_text,
+                        iterations: self.iteration_count,
+                        tokens_used: state.tokens,
+                        signals: Vec::new(),
+                    },
+                    stream,
+                ));
+            }
+
+            // Tools were used. Check max before incrementing so the
+            // reported iteration count is accurate (not inflated by 1).
+            if self.iteration_count >= self.max_iterations {
+                // Safety cap reached. Return what we have.
+                return Ok(self.finish_streaming_result(
+                    LoopResult::Complete {
+                        response: action.response_text,
+                        iterations: self.iteration_count,
+                        tokens_used: state.tokens,
+                        signals: Vec::new(),
+                    },
+                    stream,
+                ));
+            }
+            self.iteration_count += 1;
+
+            self.refresh_iteration_state();
+
+            // Append a summary of what happened to the context window so
+            // the next reason() call sees the model's tool results. Without
+            // this the model would be re-prompted with stale context.
+            // NOTE: each continuation iteration adds one assistant message.
+            // Bounded by max_iterations (default 10), so growth is small.
+            //
+            // We build a compact assistant message with the synthesis text
+            // (which already summarizes tool outputs) rather than replaying
+            // every tool call/result message, because act_with_tools may
+            // have run multiple inner rounds with different call IDs that
+            // don't map 1:1 to the original Decision::UseTools calls.
+            if !action.response_text.is_empty() {
+                processed
+                    .context_window
+                    .push(Message::assistant(action.response_text.clone()));
+            } else {
+                // Tools ran but no synthesis text — include tool names so the
+                // model knows which tools executed when deciding next steps.
+                let tool_names: Vec<&str> = action
+                    .tool_results
+                    .iter()
+                    .map(|r| r.tool_name.as_str())
+                    .collect();
+                let placeholder = if tool_names.is_empty() {
+                    "Tool execution completed.".to_string()
+                } else {
+                    format!("Tool execution completed: {}", tool_names.join(", "))
+                };
+                processed
+                    .context_window
+                    .push(Message::assistant(placeholder));
+            }
+
+            let reason_cost = self.estimate_reasoning_cost(&processed);
+            if let Some(result) =
+                self.budget_terminal(reason_cost, Some(action.response_text.clone()))
+            {
+                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            }
+
+            // No re-perceive needed; context_window was updated in-place above.
+            stream.phase(Phase::Reason);
+            let response = self.reason(&processed, llm, stream).await?;
+            self.record_reasoning_cost(reason_cost, &mut state);
+
+            decision = self.decide(&response).await?;
+            if let Some(result) = self.budget_terminal(self.estimate_action_cost(&decision), None) {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
+
+            // Loop back to act with new decision
         }
-
-        state.tokens.accumulate(action.tokens_used);
-        self.update_tool_turns(&action);
-
-        if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
-            return Ok(self.finish_streaming_result(result, stream));
-        }
-
-        self.emit_action_observations(&action);
-
-        Ok(self.finish_streaming_result(
-            LoopResult::Complete {
-                response: action.response_text,
-                iterations: self.iteration_count,
-                tokens_used: state.tokens,
-                signals: Vec::new(),
-            },
-            stream,
-        ))
     }
 
     /// Handle BudgetExhausted results with optional forced synthesis.
@@ -6824,6 +6901,7 @@ mod phase2_tests {
 
         // First response: LLM returns a tool call
         // Second response: LLM synthesizes the tool results into a final answer
+        // Third response: continuation re-prompt gets text-only, ending the outer loop
         let llm = SequentialMockLlm::new(vec![
             CompletionResponse {
                 content: Vec::new(),
@@ -6835,6 +6913,15 @@ mod phase2_tests {
                 usage: None,
                 stop_reason: Some("tool_use".to_string()),
             },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "README loaded".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            // Outer loop continuation: model re-prompted, responds text-only
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "README loaded".to_string(),
@@ -6857,10 +6944,11 @@ mod phase2_tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_completes_in_one_iteration_when_tool_fails_but_synthesis_exists() {
+    async fn run_cycle_completes_after_tool_fails_with_synthesis() {
         let mut engine = failing_tool_engine();
 
         let llm = SequentialMockLlm::new(vec![
+            // reason: LLM returns a tool call
             CompletionResponse {
                 content: Vec::new(),
                 tool_calls: vec![ToolCall {
@@ -6871,6 +6959,16 @@ mod phase2_tests {
                 usage: None,
                 stop_reason: Some("tool_use".to_string()),
             },
+            // act_with_tools re-prompt: LLM synthesizes tool failure
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "The file could not be read: path escapes working directory.".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            // outer loop continuation: re-prompted model responds text-only
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "The file could not be read: path escapes working directory.".to_string(),
@@ -6892,7 +6990,11 @@ mod phase2_tests {
                 iterations,
                 ..
             } => {
-                assert_eq!(iterations, 1, "expected exactly one iteration");
+                // iteration 1: tool call + synthesis, iteration 2: continuation text-only
+                assert_eq!(
+                    iterations, 2,
+                    "expected two iterations (tool + continuation)"
+                );
                 assert_eq!(
                     response,
                     "The file could not be read: path escapes working directory."
@@ -7178,6 +7280,15 @@ mod phase2_tests {
                 usage: None,
                 stop_reason: None,
             },
+            // Outer loop continuation: text-only response ends the loop
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
         ]);
 
         let result = engine
@@ -7238,6 +7349,15 @@ mod phase2_tests {
                 }),
                 stop_reason: None,
             },
+            // Outer loop continuation: text-only response ends the loop
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
         ]);
 
         let result = engine
@@ -7288,6 +7408,15 @@ mod phase2_tests {
             },
             CompletionResponse {
                 content: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            // Outer loop continuation: text-only response ends the loop
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: SAFE_FALLBACK_RESPONSE.to_string(),
+                }],
                 tool_calls: Vec::new(),
                 usage: None,
                 stop_reason: None,
@@ -7537,6 +7666,8 @@ mod phase2_tests {
             ),
             text_response("Tool answer part", Some("length"), None),
             text_response(" two", Some("stop"), None),
+            // Outer loop continuation: text-only response ends the loop
+            text_response("Tool answer part two", None, None),
         ]);
 
         let result = engine
@@ -7545,7 +7676,7 @@ mod phase2_tests {
             .expect("run_cycle should succeed");
         let (response, iterations, _) = expect_complete(result);
 
-        assert_eq!(iterations, 1);
+        assert_eq!(iterations, 2);
         assert_eq!(response, "Tool answer part two");
     }
 
@@ -7567,6 +7698,8 @@ mod phase2_tests {
             },
             text_response(" and summarize it", Some("stop"), None),
             text_response("tool executed", Some("stop"), None),
+            // Outer loop continuation: text-only response ends the loop
+            text_response("tool executed", None, None),
         ]);
 
         let result = engine
@@ -7599,6 +7732,8 @@ mod phase2_tests {
             ),
             text_response(&first, Some("max_tokens"), None),
             text_response(&second, Some("stop"), None),
+            // Outer loop continuation: text-only response ends the loop
+            text_response(&expected, None, None),
         ]);
 
         let result = engine
@@ -7634,6 +7769,8 @@ mod phase2_tests {
             ),
             text_response("Act part", Some("length"), None),
             text_response(" complete", Some("stop"), None),
+            // Outer loop continuation: text-only response ends the loop
+            text_response("Act part complete", None, None),
         ]);
 
         let act_result = act_engine
@@ -9394,7 +9531,12 @@ mod cancellation_tests {
     #[tokio::test]
     async fn run_cycle_streaming_emits_tool_events_and_synthesize_phase() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
-        let llm = ScriptedLlm::new(vec![tool_use_response("call-1"), text_response("done")]);
+        // Third response: outer loop continuation re-prompt returns text-only
+        let llm = ScriptedLlm::new(vec![
+            tool_use_response("call-1"),
+            text_response("done"),
+            text_response("done"),
+        ]);
         let (callback, events) = stream_recorder();
 
         let result = engine
@@ -16968,6 +17110,8 @@ mod error_path_coverage_tests {
         let llm = ScriptedLlm::ok(vec![
             tool_use_response(vec![read_file_call("call-1")]),
             text_response("I was unable to read the file due to an error."),
+            // Outer loop continuation: text-only response ends the loop
+            text_response("I was unable to read the file due to an error."),
         ]);
 
         let result = engine
@@ -16981,9 +17125,10 @@ mod error_path_coverage_tests {
                 iterations,
                 ..
             } => {
+                // iteration 1: tool call + synthesis, iteration 2: continuation text-only
                 assert_eq!(
-                    *iterations, 1,
-                    "should complete in 1 iteration, not retry: got {iterations}"
+                    *iterations, 2,
+                    "expected two iterations (tool + continuation): got {iterations}"
                 );
                 assert!(
                     response.contains("unable to read") || response.contains("error"),
@@ -17006,11 +17151,13 @@ mod error_path_coverage_tests {
             2, // Only 2 iterations
         );
 
-        // Only script the responses that will actually be consumed in 2
-        // iterations: tool call → failure → tool call → failure → synthesis.
+        // Responses: reason (tool_use) → act_with_tools chains (tool_use → text)
+        // → outer loop continuation: reason (text-only) → act (text-only, exits)
         let llm = ScriptedLlm::ok(vec![
             tool_use_response(vec![read_file_call("call-1")]),
             tool_use_response(vec![read_file_call("call-2")]),
+            text_response("tools keep failing"),
+            // Outer loop continuation
             text_response("tools keep failing"),
         ]);
 
@@ -17057,6 +17204,8 @@ mod error_path_coverage_tests {
 
         let llm = ScriptedLlm::ok(vec![
             tool_use_response(vec![read_file_call("call-1")]),
+            text_response("synthesized"),
+            // Outer loop continuation: text-only response ends the loop
             text_response("synthesized"),
         ]);
 

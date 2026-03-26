@@ -405,7 +405,7 @@ mod tests {
                 version: 1,
             }],
             identity_context: IdentityContext {
-                user_name: Some("Example User".to_owned()),
+                user_name: Some("Joe".to_owned()),
                 preferences,
                 personality_traits: vec!["focused".to_owned(), "concise".to_owned()],
             },

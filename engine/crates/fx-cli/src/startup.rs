@@ -2055,12 +2055,12 @@ mod tests {
     fn test_fleet_node_config() -> fx_config::NodeConfig {
         fx_config::NodeConfig {
             id: "mac-mini".to_string(),
-            name: "Worker Node A".to_string(),
+            name: "Mac Mini".to_string(),
             endpoint: Some("https://10.0.0.5:8400".to_string()),
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
             address: Some("10.0.0.5".to_string()),
-            user: Some("builder".to_string()),
+            user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
     }
