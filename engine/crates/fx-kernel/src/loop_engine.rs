@@ -1695,9 +1695,9 @@ impl LoopEngine {
                 ));
             }
 
-            // Tools were used. Increment iteration and check max.
-            self.iteration_count += 1;
-            if self.iteration_count > self.max_iterations {
+            // Tools were used. Check max before incrementing so the
+            // reported iteration count is accurate (not inflated by 1).
+            if self.iteration_count >= self.max_iterations {
                 // Safety cap reached. Return what we have.
                 return Ok(self.finish_streaming_result(
                     LoopResult::Complete {
@@ -1709,12 +1709,15 @@ impl LoopEngine {
                     stream,
                 ));
             }
+            self.iteration_count += 1;
 
             self.refresh_iteration_state();
 
             // Append a summary of what happened to the context window so
             // the next reason() call sees the model's tool results. Without
             // this the model would be re-prompted with stale context.
+            // NOTE: each continuation iteration adds one assistant message.
+            // Bounded by max_iterations (default 10), so growth is small.
             //
             // We build a compact assistant message with the synthesis text
             // (which already summarizes tool outputs) rather than replaying
@@ -1726,11 +1729,21 @@ impl LoopEngine {
                     .context_window
                     .push(Message::assistant(action.response_text.clone()));
             } else {
-                // Tools ran but no synthesis text — add a placeholder so the
-                // model knows tools were executed.
+                // Tools ran but no synthesis text — include tool names so the
+                // model knows which tools executed when deciding next steps.
+                let tool_names: Vec<&str> = action
+                    .tool_results
+                    .iter()
+                    .map(|r| r.tool_name.as_str())
+                    .collect();
+                let placeholder = if tool_names.is_empty() {
+                    "Tool execution completed.".to_string()
+                } else {
+                    format!("Tool execution completed: {}", tool_names.join(", "))
+                };
                 processed
                     .context_window
-                    .push(Message::assistant("Tool execution completed.".to_string()));
+                    .push(Message::assistant(placeholder));
             }
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
@@ -1740,6 +1753,7 @@ impl LoopEngine {
                 return Ok(self.finish_budget_exhausted(result, llm, stream).await);
             }
 
+            // No re-perceive needed; context_window was updated in-place above.
             stream.phase(Phase::Reason);
             let response = self.reason(&processed, llm, stream).await?;
             self.record_reasoning_cost(reason_cost, &mut state);
@@ -17112,9 +17126,9 @@ mod error_path_coverage_tests {
                 ..
             } => {
                 // iteration 1: tool call + synthesis, iteration 2: continuation text-only
-                assert!(
-                    *iterations <= 3,
-                    "should not exceed max_iterations: got {iterations}"
+                assert_eq!(
+                    *iterations, 2,
+                    "expected two iterations (tool + continuation): got {iterations}"
                 );
                 assert!(
                     response.contains("unable to read") || response.contains("error"),
