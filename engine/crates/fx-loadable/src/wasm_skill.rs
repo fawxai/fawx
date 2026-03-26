@@ -445,6 +445,7 @@ fn read_skill_directories(skills_dir: &Path) -> Result<Vec<std::fs::DirEntry>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::invocable_wasm_bytes;
     use fx_skills::loader::SkillLoader;
     use fx_skills::manifest::SkillManifest;
 
@@ -458,25 +459,6 @@ mod tests {
             capabilities: vec![],
             entry_point: "run".to_string(),
         }
-    }
-
-    fn invocable_wasm_bytes() -> Vec<u8> {
-        let wat = r#"
-            (module
-                (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
-                (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
-                (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
-                (import "host_api_v1" "get_input" (func $get_input (result i32)))
-                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
-                (memory (export "memory") 1)
-                (func (export "run")
-                    (i32.store8 (i32.const 0) (i32.const 111))
-                    (i32.store8 (i32.const 1) (i32.const 107))
-                    (call $set_output (i32.const 0) (i32.const 2))
-                )
-            )
-        "#;
-        wat.as_bytes().to_vec()
     }
 
     fn load_test_skill(name: &str) -> LoadedSkill {

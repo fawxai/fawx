@@ -157,7 +157,7 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-alpha", "10.0.0.2", 8400)
+            .add_node("node-a", "203.0.113.10", 8400)
             .expect("node should add");
         TestFleet {
             _temp_dir: temp_dir,
@@ -168,7 +168,7 @@ mod tests {
 
     fn registration_request(token: &str) -> FleetRegistrationRequest {
         FleetRegistrationRequest {
-            node_name: "node-alpha".to_string(),
+            node_name: "node-a".to_string(),
             bearer_token: token.to_string(),
             capabilities: vec!["agentic_loop".to_string(), "macos-aarch64".to_string()],
             rust_version: Some("1.85.0".to_string()),

@@ -1398,6 +1398,7 @@ dependencies = [
  "fx-improve",
  "fx-kernel",
  "fx-llm",
+ "fx-marketplace",
  "fx-memory",
  "fx-ripcord",
  "fx-session",
@@ -1544,6 +1545,7 @@ dependencies = [
  "fx-marketplace",
  "fx-memory",
  "fx-propose",
+ "fx-python",
  "fx-ripcord",
  "fx-scratchpad",
  "fx-security",
@@ -1578,6 +1580,20 @@ dependencies = [
  "uuid",
  "which",
  "zeroize",
+]
+
+[[package]]
+name = "fx-cloud-gpu"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fx-kernel",
+ "fx-llm",
+ "fx-loadable",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -1808,6 +1824,7 @@ dependencies = [
  "fx-session",
  "fx-skills",
  "fx-transactions",
+ "libc",
  "notify",
  "serde",
  "serde_json",
@@ -1828,6 +1845,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
  "ureq",
 ]
 
@@ -1873,6 +1891,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "fx-python"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fx-kernel",
+ "fx-llm",
+ "fx-loadable",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2035,6 +2068,7 @@ dependencies = [
  "fx-loadable",
  "fx-memory",
  "fx-propose",
+ "fx-ripcord",
  "fx-session",
  "fx-storage",
  "fx-subagent",

@@ -380,7 +380,7 @@ async fn mock_status() -> Json<StatusResponse> {
         model: "test-model".to_string(),
         skills: vec!["skill-a".to_string()],
         memory_entries: 10,
-        tailscale_ip: Some("100.64.0.1".to_string()),
+        tailscale_ip: Some("100.64.0.30".to_string()),
         config: None,
     })
 }
@@ -425,7 +425,7 @@ fn tailscale_ip_accepts_valid_range() {
         Ipv4Addr::new(100, 127, 255, 255)
     )));
     assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
-        Ipv4Addr::new(100, 100, 1, 1)
+        Ipv4Addr::new(100, 64, 0, 42)
     )));
 }
 
@@ -450,14 +450,14 @@ fn tailscale_ip_rejects_ipv6() {
 
 #[test]
 fn listen_targets_bind_localhost_and_tailscale() {
-    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1))));
+    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42))));
     let tailscale = plan.tailscale.expect("tailscale target");
 
     assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
     assert_eq!(plan.local.label, "local");
     assert_eq!(
         tailscale.addr,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1)), 8400)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42)), 8400)
     );
     assert_eq!(tailscale.label, "Tailscale");
 }
@@ -515,7 +515,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
+            addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
             label: "Tailscale",
         }),
         true,
@@ -523,7 +523,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
 
     assert_eq!(lines[0], "Fawx API listening on:");
     assert_eq!(lines[1], "  http://127.0.0.1:8400 (local)");
-    assert_eq!(lines[2], "  https://100.100.1.1:8400 (Tailscale)");
+    assert_eq!(lines[2], "  https://100.64.0.42:8400 (Tailscale)");
 }
 
 #[test]
@@ -534,14 +534,14 @@ fn startup_target_lines_use_http_for_tailscale_when_tls_disabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
+            addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
             label: "Tailscale",
         }),
         false,
     );
 
     assert_eq!(lines[0], "Fawx HTTP API listening on:");
-    assert_eq!(lines[2], "  http://100.100.1.1:8400 (Tailscale)");
+    assert_eq!(lines[2], "  http://100.64.0.42:8400 (Tailscale)");
 }
 
 #[tokio::test]
@@ -555,7 +555,7 @@ async fn tailscale_bind_failure_falls_back_to_localhost_server() {
         .expect("bind localhost");
     let local_addr = local_listener.local_addr().expect("local addr");
     let tailscale_target = ListenTarget {
-        addr: SocketAddr::from(([100, 100, 1, 1], 8400)),
+        addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
         label: "Tailscale",
     };
     let listeners = BoundListeners {
@@ -615,9 +615,9 @@ async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
 
 #[test]
 fn extract_ip_parses_ip_addr_output() {
-    let line = "4: tailscale0    inet 100.100.1.1/32 scope global tailscale0";
+    let line = "4: tailscale0    inet 100.64.0.42/32 scope global tailscale0";
     let ip = crate::tailscale::extract_ip_from_line(line);
-    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1))));
+    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42))));
 }
 
 #[test]
@@ -715,13 +715,13 @@ fn status_response_has_expected_fields() {
         model: "claude-3".to_string(),
         skills: vec!["read_file".to_string()],
         memory_entries: 42,
-        tailscale_ip: Some("100.100.1.1".to_string()),
+        tailscale_ip: Some("100.64.0.20".to_string()),
         config: None,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["tailscale_ip"], "100.100.1.1");
+    assert_eq!(json["tailscale_ip"], "100.64.0.20");
     assert_eq!(json["memory_entries"], 42);
     assert!(json["skills"].is_array());
 }
@@ -805,7 +805,7 @@ async fn status_endpoint_returns_ok() {
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["tailscale_ip"], "100.64.0.1");
+    assert_eq!(json["tailscale_ip"], "100.64.0.30");
     assert!(json["skills"].is_array());
 }
 
@@ -1050,6 +1050,19 @@ fn serialize_stream_event_serializes_error_event_payload() {
     assert!(frame.contains("\"category\":\"memory\""));
     assert!(frame.contains("\"message\":\"memory flush failed\""));
     assert!(frame.contains("\"recoverable\":true"));
+}
+
+#[test]
+fn serialize_stream_event_serializes_tool_error_payload() {
+    let frame = serialize_stream_event(StreamEvent::ToolError {
+        tool_name: "read_file".to_string(),
+        error: "permission denied".to_string(),
+    })
+    .expect("tool error frame");
+
+    assert!(frame.contains("event: tool_error"));
+    assert!(frame.contains("\"tool_name\":\"read_file\""));
+    assert!(frame.contains("\"error\":\"permission denied\""));
 }
 
 #[test]
@@ -1963,8 +1976,8 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_returns_device_list() {
         let mut devices = DeviceStore::new();
-        let (_, first) = devices.create_device("My MacBook");
-        let (_, second) = devices.create_device("My iPhone");
+        let (_, first) = devices.create_device("Example MacBook");
+        let (_, second) = devices.create_device("Example iPhone");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -1983,7 +1996,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_excludes_token_hash() {
         let mut devices = DeviceStore::new();
-        let _ = devices.create_device("My MacBook");
+        let _ = devices.create_device("Example MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -1998,7 +2011,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn delete_device_revokes_token() {
         let mut devices = DeviceStore::new();
-        let (raw_token, device) = devices.create_device("My MacBook");
+        let (raw_token, device) = devices.create_device("Example MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let before_delete = Request::builder()
@@ -2430,7 +2443,7 @@ allowed_chat_ids = [123]
         let temp = TempDir::new().expect("tempdir");
         let mut manager = FleetManager::init(temp.path()).expect("fleet init");
         let token = manager
-            .add_node("node-alpha", "10.0.0.2", 8400)
+            .add_node("node-a", "203.0.113.10", 8400)
             .expect("node should add");
         let app = build_router(
             test_state(None, Vec::new()),
@@ -2442,7 +2455,7 @@ allowed_chat_ids = [123]
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&fx_fleet::FleetRegistrationRequest {
-                    node_name: "node-alpha".to_string(),
+                    node_name: "node-a".to_string(),
                     bearer_token: token.secret,
                     capabilities: vec!["agentic_loop".to_string()],
                     rust_version: None,
@@ -3033,14 +3046,13 @@ allowed_chat_ids = [123]
     async fn get_session_memory_returns_stored_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-get");
-        let memory = SessionMemory {
-            project: Some("Phase 6".to_string()),
-            current_state: Some("Reviewing compaction UX".to_string()),
-            key_decisions: vec!["Use a subtle banner".to_string()],
-            active_files: vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()],
-            custom_context: vec!["Keep session memory user-editable".to_string()],
-            last_updated: 1_742_000_000,
-        };
+        let mut memory = SessionMemory::default();
+        memory.project = Some("Phase 6".to_string());
+        memory.current_state = Some("Reviewing compaction UX".to_string());
+        memory.key_decisions = vec!["Use a subtle banner".to_string()];
+        memory.active_files = vec!["app/Fawx/ViewModels/ChatViewModel.swift".to_string()];
+        memory.custom_context = vec!["Keep session memory user-editable".to_string()];
+        memory.last_updated = 1_742_000_000;
         registry
             .record_turn(&key, Vec::new(), memory.clone())
             .expect("seed memory");
@@ -3084,10 +3096,8 @@ allowed_chat_ids = [123]
     async fn put_session_memory_persists_and_updates_loaded_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-put");
-        let initial_loaded_memory = SessionMemory {
-            project: Some("Old loaded memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut initial_loaded_memory = SessionMemory::default();
+        initial_loaded_memory.project = Some("Old loaded memory".to_string());
         let (app, app_state) =
             session_memory_test_router(registry.clone(), initial_loaded_memory, Some(key.clone()));
 
@@ -3141,16 +3151,14 @@ allowed_chat_ids = [123]
     async fn put_session_memory_rejects_payloads_that_exceed_token_cap() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-too-large");
-        let seeded_memory = SessionMemory {
-            project: Some("Existing memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("Existing memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
         let app = build_router(test_state_with_sessions(registry.clone()), None);
 
-        let oversized_project = "memory ".repeat(2_200);
+        let oversized_project = "a ".repeat(8_100);
         let request_body = serde_json::json!({
             "project": oversized_project,
             "last_updated": 0
@@ -3179,14 +3187,10 @@ allowed_chat_ids = [123]
     async fn session_message_persists_updated_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-persist");
-        let seeded_memory = SessionMemory {
-            project: Some("persistent project".to_string()),
-            ..SessionMemory::default()
-        };
-        let restored_memory = SessionMemory {
-            project: Some("shared app memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("persistent project".to_string());
+        let mut restored_memory = SessionMemory::default();
+        restored_memory.project = Some("shared app memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");
@@ -3223,14 +3227,10 @@ allowed_chat_ids = [123]
     async fn session_message_stream_persists_updated_session_memory() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-memory-stream-persist");
-        let seeded_memory = SessionMemory {
-            project: Some("persistent project".to_string()),
-            ..SessionMemory::default()
-        };
-        let restored_memory = SessionMemory {
-            project: Some("shared app memory".to_string()),
-            ..SessionMemory::default()
-        };
+        let mut seeded_memory = SessionMemory::default();
+        seeded_memory.project = Some("persistent project".to_string());
+        let mut restored_memory = SessionMemory::default();
+        restored_memory.project = Some("shared app memory".to_string());
         registry
             .record_turn(&key, Vec::new(), seeded_memory.clone())
             .expect("seed memory");

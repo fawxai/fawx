@@ -4,7 +4,6 @@ use fx_llm::{ContentBlock, Message, MessageRole};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::sync::Arc;
 
 const COMPACTION_MARKER_PREFIX: &str = "[context compacted:";
 const SUMMARY_MARKER_PREFIX: &str = "[context summary]";
@@ -56,7 +55,9 @@ fn text_blocks(message: &Message) -> impl Iterator<Item = &str> {
 }
 
 fn message_contains_marker(message: &Message) -> bool {
-    text_blocks(message).any(|text| text.starts_with(COMPACTION_MARKER_PREFIX))
+    text_blocks(message).any(|text| {
+        text.starts_with(COMPACTION_MARKER_PREFIX) || text.starts_with(SUMMARY_MARKER_PREFIX)
+    })
 }
 
 fn message_is_system_like(message: &Message) -> bool {
@@ -69,7 +70,7 @@ fn message_is_system_like(message: &Message) -> bool {
 /// This can create adjacent assistant-role messages in the compacted window,
 /// which is acceptable in the current integration because message ordering is
 /// preserved and no role alternation invariant is enforced by providers.
-fn summary_message(summary: &str) -> Message {
+pub(crate) fn summary_message(summary: &str) -> Message {
     Message::assistant(format!("{SUMMARY_MARKER_PREFIX}\n{summary}"))
 }
 
@@ -469,6 +470,7 @@ fn sliding_compaction_result(
             compacted_count: 0,
             estimated_tokens: before_tokens,
             used_summarization: false,
+            summary: None,
             evicted_indices: Vec::new(),
         };
         debug_assert_tool_pair_integrity(&result.messages);
@@ -498,6 +500,7 @@ fn sliding_compaction_result(
         messages: compacted_messages,
         compacted_count,
         used_summarization: false,
+        summary: None,
         evicted_indices,
     };
     debug_assert_tool_pair_integrity(&result.messages);
@@ -517,6 +520,7 @@ pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> 
             compacted_count: 0,
             estimated_tokens: ConversationBudget::estimate_tokens(messages),
             used_summarization: false,
+            summary: None,
             evicted_indices,
         };
     }
@@ -529,6 +533,7 @@ pub fn emergency_compact(messages: &[Message], preserve_recent_turns: usize) -> 
         messages: result_messages,
         compacted_count,
         used_summarization: false,
+        summary: None,
         evicted_indices,
     }
 }
@@ -749,22 +754,6 @@ impl ConversationBudget {
     pub fn compaction_target(&self) -> usize {
         self.conversation_budget() / 2
     }
-
-    /// Target token count for summarizing compaction (Tier 3).
-    /// Returns 40% of conversation budget for headroom below summarize_threshold (80%).
-    pub fn summarize_target(&self) -> usize {
-        self.conversation_budget().saturating_mul(2) / 5
-    }
-}
-
-/// Strategy for compacting an oversized conversation history.
-#[async_trait]
-pub trait CompactionStrategy: Send + Sync + std::fmt::Debug {
-    async fn compact(
-        &self,
-        messages: &[Message],
-        target_tokens: usize,
-    ) -> Result<CompactionResult, CompactionError>;
 }
 
 /// Persists evicted message content before compaction drops them.
@@ -802,6 +791,7 @@ pub struct CompactionResult {
     pub(crate) compacted_count: usize,
     pub(crate) estimated_tokens: usize,
     pub(crate) used_summarization: bool,
+    pub(crate) summary: Option<String>,
     /// Indices into the original message slice for messages evicted by compaction.
     pub(crate) evicted_indices: Vec<usize>,
 }
@@ -818,11 +808,8 @@ impl SlidingWindowCompactor {
             preserve_recent_turns,
         }
     }
-}
 
-#[async_trait]
-impl CompactionStrategy for SlidingWindowCompactor {
-    async fn compact(
+    pub async fn compact(
         &self,
         messages: &[Message],
         target_tokens: usize,
@@ -831,87 +818,124 @@ impl CompactionStrategy for SlidingWindowCompactor {
     }
 }
 
-/// Summarizes older turns into structured context using an LLM call.
-#[derive(Debug)]
-pub struct SummarizingCompactor {
-    llm: Arc<dyn LlmProvider>,
-    preserve_recent_turns: usize,
-    max_summary_tokens: usize,
+pub const DEFAULT_MAX_SUMMARY_TOKENS: usize = 1_024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SlideSummarizationPlan {
+    bounds: ZoneBounds,
+    protected_middle: HashSet<usize>,
+    pub(crate) evicted_indices: Vec<usize>,
+    pub(crate) evicted_messages: Vec<Message>,
 }
 
-impl SummarizingCompactor {
-    pub const DEFAULT_MAX_SUMMARY_TOKENS: usize = 1_024;
+fn summarizable_indices(
+    bounds: &ZoneBounds,
+    protected_middle: &HashSet<usize>,
+) -> Result<Vec<usize>, CompactionError> {
+    let indices = summarizable_middle_indices(bounds, protected_middle);
+    if indices.is_empty() {
+        return Err(CompactionError::AllMessagesProtected);
+    }
+    Ok(indices)
+}
 
-    pub fn new(llm: Arc<dyn LlmProvider>, preserve_recent_turns: usize) -> Self {
-        Self::with_max_summary_tokens(llm, preserve_recent_turns, Self::DEFAULT_MAX_SUMMARY_TOKENS)
+pub(crate) fn slide_summarization_plan(
+    messages: &[Message],
+    preserve_recent_turns: usize,
+) -> Result<SlideSummarizationPlan, CompactionError> {
+    let bounds = zone_bounds(messages, preserve_recent_turns);
+    let protected_middle = protected_middle_indices(messages, &bounds);
+    let evicted_indices = summarizable_indices(&bounds, &protected_middle)?;
+    let evicted_messages = cloned_messages_at_indices(messages, &evicted_indices);
+    Ok(SlideSummarizationPlan {
+        bounds,
+        protected_middle,
+        evicted_indices,
+        evicted_messages,
+    })
+}
+
+pub async fn summarized_compaction_result(
+    llm: &dyn LlmProvider,
+    messages: &[Message],
+    preserve_recent_turns: usize,
+    max_summary_tokens: usize,
+    target_tokens: usize,
+) -> Result<CompactionResult, CompactionError> {
+    let before_tokens = ConversationBudget::estimate_tokens(messages);
+    if before_tokens <= target_tokens {
+        let result = CompactionResult {
+            messages: messages.to_vec(),
+            compacted_count: 0,
+            estimated_tokens: before_tokens,
+            used_summarization: false,
+            summary: None,
+            evicted_indices: Vec::new(),
+        };
+        debug_assert_tool_pair_integrity(&result.messages);
+        return Ok(result);
     }
 
-    pub fn with_max_summary_tokens(
-        llm: Arc<dyn LlmProvider>,
-        preserve_recent_turns: usize,
-        max_summary_tokens: usize,
-    ) -> Self {
-        Self {
-            llm,
-            preserve_recent_turns,
-            max_summary_tokens,
-        }
+    let plan = slide_summarization_plan(messages, preserve_recent_turns)?;
+    let summary = generate_summary(llm, &plan.evicted_messages, max_summary_tokens).await?;
+    let compacted_messages = assemble_summarized_messages(messages, &plan, &summary);
+    let estimated_tokens = ConversationBudget::estimate_tokens(&compacted_messages);
+    if estimated_tokens > target_tokens {
+        return Err(CompactionError::SummaryExceededTarget);
     }
 
-    fn summarizable_indices(
-        &self,
-        bounds: &ZoneBounds,
-        protected_middle: &HashSet<usize>,
-    ) -> Result<Vec<usize>, CompactionError> {
-        let indices = summarizable_middle_indices(bounds, protected_middle);
-        if indices.is_empty() {
-            return Err(CompactionError::AllMessagesProtected);
-        }
-        Ok(indices)
-    }
+    let result = CompactionResult {
+        messages: compacted_messages,
+        compacted_count: plan.evicted_messages.len(),
+        estimated_tokens,
+        used_summarization: true,
+        summary: Some(summary),
+        evicted_indices: plan.evicted_indices,
+    };
+    debug_assert_tool_pair_integrity(&result.messages);
+    Ok(result)
+}
 
-    async fn generate_summary(
-        &self,
-        summarizable_messages: &[Message],
-    ) -> Result<String, CompactionError> {
-        let prompt = Self::summary_prompt(summarizable_messages);
-        self.llm
-            .generate(&prompt, self.max_summary_tokens as u32)
-            .await
-            .map_err(|source| CompactionError::SummarizationFailed {
-                source: Box::new(source),
-            })
-    }
+pub(crate) async fn generate_summary(
+    llm: &dyn LlmProvider,
+    summarizable_messages: &[Message],
+    max_summary_tokens: usize,
+) -> Result<String, CompactionError> {
+    let prompt = summary_prompt(summarizable_messages);
+    llm.generate(&prompt, max_summary_tokens as u32)
+        .await
+        .map_err(|source| CompactionError::SummarizationFailed {
+            source: Box::new(source),
+        })
+}
 
-    fn assemble_summarized_messages(
-        &self,
-        messages: &[Message],
-        bounds: &ZoneBounds,
-        protected_middle: &HashSet<usize>,
-        summary: &str,
-    ) -> Vec<Message> {
-        let mut compacted_messages = Vec::new();
-        compacted_messages.extend_from_slice(&messages[..bounds.prefix_end]);
-        append_protected_middle_messages(
-            &mut compacted_messages,
-            messages,
-            bounds,
-            protected_middle,
-        );
-        compacted_messages.push(summary_message(summary));
-        compacted_messages.extend_from_slice(&messages[bounds.tail_start..]);
-        compacted_messages
-    }
+pub(crate) fn assemble_summarized_messages(
+    messages: &[Message],
+    plan: &SlideSummarizationPlan,
+    summary: &str,
+) -> Vec<Message> {
+    let mut compacted_messages = Vec::new();
+    compacted_messages.extend_from_slice(&messages[..plan.bounds.prefix_end]);
+    append_protected_middle_messages(
+        &mut compacted_messages,
+        messages,
+        &plan.bounds,
+        &plan.protected_middle,
+    );
+    compacted_messages.push(summary_message(summary));
+    compacted_messages.extend_from_slice(&messages[plan.bounds.tail_start..]);
+    compacted_messages
+}
 
-    fn summary_prompt(messages: &[Message]) -> String {
-        let conversation = messages
-            .iter()
-            .map(message_to_summary_line)
-            .collect::<Vec<_>>()
-            .join("\n");
+pub(crate) fn summary_prompt(messages: &[Message]) -> String {
+    let conversation = messages
+        .iter()
+        .map(message_to_summary_line)
+        .collect::<Vec<_>>()
+        .join("\n");
 
-        format!(
-            "Summarize the following conversation history.\n\
+    format!(
+        "Summarize the following conversation history.\n\
 Keep the summary factual and grounded in provided content only.\n\
 \nSections (required):\n\
 1. Decisions\n\
@@ -919,8 +943,7 @@ Keep the summary factual and grounded in provided content only.\n\
 3. Task state\n\
 4. Key context\n\
 \nConversation:\n{conversation}"
-        )
-    }
+    )
 }
 
 fn message_to_summary_line(message: &Message) -> String {
@@ -961,62 +984,16 @@ fn message_to_summary_line(message: &Message) -> String {
     format!("- {role}: {text}")
 }
 
-#[async_trait]
-impl CompactionStrategy for SummarizingCompactor {
-    async fn compact(
-        &self,
-        messages: &[Message],
-        target_tokens: usize,
-    ) -> Result<CompactionResult, CompactionError> {
-        let before_tokens = ConversationBudget::estimate_tokens(messages);
-        if before_tokens <= target_tokens {
-            let result = CompactionResult {
-                messages: messages.to_vec(),
-                compacted_count: 0,
-                estimated_tokens: before_tokens,
-                used_summarization: false,
-                evicted_indices: Vec::new(),
-            };
-            debug_assert_tool_pair_integrity(&result.messages);
-            return Ok(result);
-        }
-
-        let bounds = zone_bounds(messages, self.preserve_recent_turns);
-        let protected_middle = protected_middle_indices(messages, &bounds);
-        let summarizable_indices = self.summarizable_indices(&bounds, &protected_middle)?;
-        let summarizable_messages = cloned_messages_at_indices(messages, &summarizable_indices);
-        let summary = self.generate_summary(&summarizable_messages).await?;
-        let compacted_messages =
-            self.assemble_summarized_messages(messages, &bounds, &protected_middle, &summary);
-
-        let estimated_tokens = ConversationBudget::estimate_tokens(&compacted_messages);
-        if estimated_tokens > target_tokens {
-            return Err(CompactionError::SummaryExceededTarget);
-        }
-
-        let result = CompactionResult {
-            messages: compacted_messages,
-            compacted_count: summarizable_messages.len(),
-            estimated_tokens,
-            used_summarization: true,
-            evicted_indices: summarizable_indices,
-        };
-        debug_assert_tool_pair_integrity(&result.messages);
-        Ok(result)
-    }
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CompactionConfigError {
     #[error("threshold must be in (0.0, 1.0], got {0}")]
     InvalidThreshold(f32),
     #[error(
-        "thresholds must be strictly increasing: prune ({prune}) < slide ({slide}) < summarize ({summarize}) < emergency ({emergency})"
+        "thresholds must be strictly increasing: prune ({prune}) < slide ({slide}) < emergency ({emergency})"
     )]
     ThresholdsNotMonotonic {
         prune: f32,
         slide: f32,
-        summarize: f32,
         emergency: f32,
     },
     #[error("model_context_limit must be > 0")]
@@ -1046,7 +1023,9 @@ pub struct CompactionConfig {
     #[serde(alias = "compaction_threshold")]
     pub(crate) slide_threshold: f32,
     pub(crate) prune_threshold: f32,
-    pub(crate) summarize_threshold: f32,
+    /// Legacy field retained only for backward-compatible deserialization.
+    #[serde(alias = "summarize_threshold", default, skip_serializing)]
+    pub(crate) _legacy_summarize_threshold: f32,
     pub(crate) emergency_threshold: f32,
     pub(crate) preserve_recent_turns: usize,
     pub(crate) model_context_limit: usize,
@@ -1078,15 +1057,13 @@ impl CompactionConfig {
         for threshold in [
             self.prune_threshold,
             self.slide_threshold,
-            self.summarize_threshold,
             self.emergency_threshold,
         ] {
             validate_threshold(threshold)?;
         }
 
         if self.prune_threshold < self.slide_threshold
-            && self.slide_threshold < self.summarize_threshold
-            && self.summarize_threshold < self.emergency_threshold
+            && self.slide_threshold < self.emergency_threshold
         {
             return Ok(());
         }
@@ -1094,7 +1071,6 @@ impl CompactionConfig {
         Err(CompactionConfigError::ThresholdsNotMonotonic {
             prune: self.prune_threshold,
             slide: self.slide_threshold,
-            summarize: self.summarize_threshold,
             emergency: self.emergency_threshold,
         })
     }
@@ -1135,24 +1111,6 @@ impl CompactionConfig {
         }
         Ok(())
     }
-
-    pub fn build_strategy(&self, llm: Option<Arc<dyn LlmProvider>>) -> Box<dyn CompactionStrategy> {
-        if self.use_summarization {
-            if let Some(provider) = llm {
-                return Box::new(SummarizingCompactor::with_max_summary_tokens(
-                    provider,
-                    self.preserve_recent_turns,
-                    self.max_summary_tokens,
-                ));
-            }
-
-            tracing::info!(
-                "use_summarization=true but no llm provider available; falling back to SlidingWindowCompactor"
-            );
-        }
-
-        Box::new(SlidingWindowCompactor::new(self.preserve_recent_turns))
-    }
 }
 
 impl Default for CompactionConfig {
@@ -1160,14 +1118,14 @@ impl Default for CompactionConfig {
         Self {
             slide_threshold: 0.60,
             prune_threshold: 0.40,
-            summarize_threshold: 0.80,
+            _legacy_summarize_threshold: 0.80,
             emergency_threshold: 0.95,
-            preserve_recent_turns: 6,
+            preserve_recent_turns: 12,
             model_context_limit: 128_000,
             reserved_system_tokens: 2_000,
             recompact_cooldown_turns: 2,
             use_summarization: true,
-            max_summary_tokens: SummarizingCompactor::DEFAULT_MAX_SUMMARY_TOKENS,
+            max_summary_tokens: DEFAULT_MAX_SUMMARY_TOKENS,
             prune_tool_blocks: true,
             tool_block_summary_max_chars: 100,
         }
@@ -1181,7 +1139,7 @@ mod tests {
     use fx_core::error::LlmError as CoreLlmError;
     use fx_llm::{CompletionRequest, CompletionResponse, ProviderError, ToolCall};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     fn words(count: usize) -> String {
         std::iter::repeat_n("a", count)
@@ -1326,9 +1284,8 @@ mod tests {
         let config = CompactionConfig::default();
         assert_eq!(config.prune_threshold, 0.40);
         assert_eq!(config.slide_threshold, 0.60);
-        assert_eq!(config.summarize_threshold, 0.80);
         assert_eq!(config.emergency_threshold, 0.95);
-        assert_eq!(config.preserve_recent_turns, 6);
+        assert_eq!(config.preserve_recent_turns, 12);
         assert_eq!(config.model_context_limit, 128_000);
         assert_eq!(config.reserved_system_tokens, 2_000);
         assert_eq!(config.recompact_cooldown_turns, 2);
@@ -1355,15 +1312,6 @@ mod tests {
         assert!(!budget.at_tier(&[user(451)], 0.5));
         assert!(budget.at_tier(&[user(452)], 0.5));
         assert!(budget.at_tier(&[user(453)], 0.5));
-    }
-
-    #[test]
-    fn summarize_target_returns_two_fifths_of_budget() {
-        let budget = ConversationBudget::new(16_384, 0.8, 2_000);
-        assert_eq!(
-            budget.summarize_target(),
-            budget.conversation_budget() * 2 / 5
-        );
     }
 
     #[test]
@@ -1817,22 +1765,86 @@ mod tests {
         assert!(has_tool_result(&result.messages, "keep"));
     }
 
-    // 5.3 SummarizingCompactor tests
+    // 5.3 Summarization function tests
+
+    #[test]
+    fn summary_prompt_requests_required_sections() {
+        let prompt = summary_prompt(&[
+            user(20),
+            assistant(20),
+            tool_use("call-1"),
+            tool_result("call-1", 20),
+        ]);
+
+        assert!(prompt.contains("Sections (required):"));
+        assert!(prompt.contains("1. Decisions"));
+        assert!(prompt.contains("2. Files modified"));
+        assert!(prompt.contains("3. Task state"));
+        assert!(prompt.contains("4. Key context"));
+        assert!(prompt.contains("- assistant: [tool_use:read]"));
+        assert!(prompt.contains("- tool: [tool_result:call-1]"));
+    }
 
     #[tokio::test]
-    async fn summarize_produces_structured_output() {
+    async fn generate_summary_uses_llm_and_records_prompt() {
         let llm = Arc::new(MockSummaryLlm::new(vec![Ok(
             "Decisions:\n- keep\nFiles modified:\n- src/lib.rs\nTask state:\n- in progress\nKey context:\n- tests failing"
                 .to_string(),
         )]));
-        let compactor = SummarizingCompactor::new(llm, 2);
-        let messages = vec![user(40), assistant(40), user(30), assistant(30), user(20)];
+        let messages = vec![user(40), assistant(40), user(30)];
 
-        let result = compactor.compact(&messages, 120).await.expect("compact");
-        assert!(result.used_summarization);
+        let summary = generate_summary(llm.as_ref(), &messages, 256)
+            .await
+            .expect("summary");
+
+        assert!(summary.contains("Decisions:"));
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Sections (required):"));
+    }
+
+    #[tokio::test]
+    async fn generate_summary_returns_summarization_failed_on_llm_error() {
+        let llm = Arc::new(MockSummaryLlm::new(vec![Err(CoreLlmError::Inference(
+            "boom".to_string(),
+        ))]));
+        let messages = vec![user(40), assistant(40), user(30)];
+
+        let error = generate_summary(llm.as_ref(), &messages, 256)
+            .await
+            .expect_err("error");
+        assert!(matches!(error, CompactionError::SummarizationFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn generate_summary_returns_summarization_failed_on_timeout() {
+        let llm = Arc::new(MockSummaryLlm::new(vec![Err(CoreLlmError::ApiRequest(
+            "timeout".to_string(),
+        ))]));
+        let messages = vec![user(40), assistant(40), user(30)];
+
+        let error = generate_summary(llm.as_ref(), &messages, 256)
+            .await
+            .expect_err("error");
+        assert!(matches!(error, CompactionError::SummarizationFailed { .. }));
+    }
+
+    #[test]
+    fn assemble_summarized_messages_inserts_single_summary_marker() {
+        let messages = vec![
+            Message::system("system"),
+            user(40),
+            assistant(40),
+            user(30),
+            assistant(30),
+            user(20),
+        ];
+        let plan = slide_summarization_plan(&messages, 2).expect("summary plan");
+        let compacted = assemble_summarized_messages(&messages, &plan, "Decisions:\n- keep");
+
+        assert_eq!(compacted.first(), Some(&messages[0]));
         assert_eq!(
-            result
-                .messages
+            compacted
                 .iter()
                 .filter(|message| {
                     text_blocks(message).any(|text| text.starts_with(SUMMARY_MARKER_PREFIX))
@@ -1840,15 +1852,22 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(&compacted[compacted.len() - 2..], &messages[4..]);
+    }
+
+    #[test]
+    fn summary_markers_are_treated_as_system_like() {
+        assert!(message_is_system_like(&summary_message(
+            "Decisions:\n- keep"
+        )));
     }
 
     #[tokio::test]
-    async fn evicted_indices_populated_for_summarizing() {
+    async fn summarized_compaction_populates_evicted_indices() {
         let llm = Arc::new(MockSummaryLlm::new(vec![Ok(
             "Decisions:\n- keep\nFiles modified:\n- src/lib.rs\nTask state:\n- in progress\nKey context:\n- tests failing"
                 .to_string(),
         )]));
-        let compactor = SummarizingCompactor::new(llm, 2);
         let messages = vec![
             Message::system("system"),
             user(40),
@@ -1858,88 +1877,37 @@ mod tests {
             user(20),
         ];
 
-        let result = compactor.compact(&messages, 120).await.expect("compact");
+        let result = summarized_compaction_result(llm.as_ref(), &messages, 2, 256, 120)
+            .await
+            .expect("compact");
 
+        assert!(result.used_summarization);
         assert_eq!(result.evicted_indices, vec![1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn summarize_returns_summarization_failed_on_llm_error() {
-        let llm = Arc::new(MockSummaryLlm::new(vec![Err(CoreLlmError::Inference(
-            "boom".to_string(),
-        ))]));
-        let compactor = SummarizingCompactor::new(llm, 2);
-        let messages = vec![user(40), assistant(40), user(30), assistant(30), user(20)];
-
-        let error = compactor.compact(&messages, 120).await.expect_err("error");
-        assert!(matches!(error, CompactionError::SummarizationFailed { .. }));
-    }
-
-    #[tokio::test]
-    async fn summarize_returns_summarization_failed_on_timeout() {
-        let llm = Arc::new(MockSummaryLlm::new(vec![Err(CoreLlmError::ApiRequest(
-            "timeout".to_string(),
-        ))]));
-        let compactor = SummarizingCompactor::new(llm, 2);
-        let messages = vec![user(40), assistant(40), user(30), assistant(30), user(20)];
-
-        let error = compactor.compact(&messages, 120).await.expect_err("error");
-        assert!(matches!(error, CompactionError::SummarizationFailed { .. }));
-    }
-
-    #[tokio::test]
-    async fn summarize_returns_summary_exceeded_target_when_summary_too_large() {
+    async fn summarized_compaction_returns_summary_exceeded_target_when_summary_too_large() {
         let llm = Arc::new(MockSummaryLlm::new(vec![Ok(words(500))]));
-        let compactor = SummarizingCompactor::new(llm, 2);
         let messages = vec![user(40), assistant(40), user(30), assistant(30), user(20)];
 
-        let error = compactor.compact(&messages, 120).await.expect_err("error");
+        let error = summarized_compaction_result(llm.as_ref(), &messages, 2, 256, 120)
+            .await
+            .expect_err("error");
         assert!(matches!(error, CompactionError::SummaryExceededTarget));
     }
 
     #[tokio::test]
-    async fn summarize_respects_target_budget() {
+    async fn summarized_compaction_respects_target_budget() {
         let llm = Arc::new(MockSummaryLlm::new(vec![Ok(
             "Decisions:\n- x\nFiles modified:\n- y\nTask state:\n- z\nKey context:\n- q"
                 .to_string(),
         )]));
-        let compactor = SummarizingCompactor::new(llm, 2);
         let messages = vec![user(30), assistant(30), user(30), assistant(30), user(20)];
 
-        let result = compactor.compact(&messages, 110).await.expect("compact");
+        let result = summarized_compaction_result(llm.as_ref(), &messages, 2, 256, 110)
+            .await
+            .expect("compact");
         assert!(result.estimated_tokens <= 110);
-    }
-
-    #[tokio::test]
-    async fn summary_preserves_key_context_categories() {
-        let llm = Arc::new(MockSummaryLlm::new(vec![Ok(
-            "Decisions:\n- keep\nFiles modified:\n- src/main.rs\nTask state:\n- done\nKey context:\n- regression fixed"
-                .to_string(),
-        )]));
-        let provider: Arc<dyn LlmProvider> = llm.clone();
-        let compactor = SummarizingCompactor::new(provider, 2);
-        let messages = vec![user(35), assistant(35), user(30), assistant(30), user(20)];
-
-        let result = compactor.compact(&messages, 120).await.expect("compact");
-        let summary_text = text_blocks(
-            result
-                .messages
-                .iter()
-                .find(|message| {
-                    text_blocks(message).any(|text| text.starts_with(SUMMARY_MARKER_PREFIX))
-                })
-                .expect("summary"),
-        )
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        assert!(summary_text.contains("Decisions:"));
-        assert!(summary_text.contains("Files modified:"));
-        assert!(summary_text.contains("Task state:"));
-        assert!(summary_text.contains("Key context:"));
-
-        let prompts = llm.prompts();
-        assert!(prompts[0].contains("Sections (required):"));
     }
 
     // 5.6 CompactionConfig validation tests
@@ -1977,11 +1945,21 @@ mod tests {
     #[test]
     fn config_rejects_non_monotonic_thresholds() {
         let mut config = CompactionConfig::default();
-        config.summarize_threshold = config.slide_threshold;
+        config.emergency_threshold = config.slide_threshold;
         assert!(matches!(
             config.validate(),
             Err(CompactionConfigError::ThresholdsNotMonotonic { .. })
         ));
+    }
+
+    #[test]
+    fn legacy_summarize_threshold_is_ignored_during_validation() {
+        let mut config = CompactionConfig::default();
+        config._legacy_summarize_threshold = 0.01;
+
+        config
+            .validate()
+            .expect("legacy summarize threshold should be ignored");
     }
 
     #[test]
@@ -2004,13 +1982,17 @@ mod tests {
             CompactionConfig::default().prune_threshold
         );
         assert_eq!(
-            config.summarize_threshold,
-            CompactionConfig::default().summarize_threshold
-        );
-        assert_eq!(
             config.emergency_threshold,
             CompactionConfig::default().emergency_threshold
         );
+    }
+
+    #[test]
+    fn legacy_summarize_threshold_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(CompactionConfig::default()).expect("config should serialize");
+
+        assert!(serialized.get("summarize_threshold").is_none());
     }
 
     #[test]
@@ -2406,7 +2388,7 @@ mod tests {
         let config = CompactionConfig {
             slide_threshold: 0.80,
             prune_threshold: 0.40,
-            summarize_threshold: 0.90,
+            _legacy_summarize_threshold: 0.90,
             emergency_threshold: 0.95,
             preserve_recent_turns: 2,
             model_context_limit: 16_000,
@@ -2422,7 +2404,7 @@ mod tests {
             config.slide_threshold,
             config.reserved_system_tokens,
         );
-        let strategy = config.build_strategy(None);
+        let compactor = SlidingWindowCompactor::new(config.preserve_recent_turns);
         assert_eq!(budget.compaction_target(), budget.conversation_budget() / 2);
 
         // Build messages: a massive tool result in old window pushes tokens
@@ -2455,9 +2437,8 @@ mod tests {
             "pruned messages should be below slide threshold (tokens: {after_tokens})"
         );
 
-        // Verify the compaction strategy is never invoked (we'd get the pruned
-        // messages back without the compaction marker).
-        let result = strategy.compact(&pruned, budget.compaction_target()).await;
+        // Verify sliding compaction is a no-op once pruning has already reduced usage.
+        let result = compactor.compact(&pruned, budget.compaction_target()).await;
         match result {
             Ok(r) => assert_eq!(r.compacted_count, 0, "compaction should be a no-op"),
             Err(_) => panic!("compact should succeed on already-below-threshold messages"),

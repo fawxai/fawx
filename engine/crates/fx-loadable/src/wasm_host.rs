@@ -8,10 +8,29 @@ use fx_skills::host_api::HostApi;
 use fx_skills::live_host_api::{execute_http_request, CredentialProvider};
 use fx_skills::manifest::Capability;
 use fx_skills::storage::SkillStorage;
+use serde::Serialize;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Default storage quota per skill: 64 KiB.
 const DEFAULT_STORAGE_QUOTA: usize = 64 * 1024;
+const COMMAND_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
+const COMMAND_TIMEOUT_EXIT_CODE: i32 = -1;
+const COMMAND_FAILURE_EXIT_CODE: i32 = -2;
+const COMMAND_POLL_INTERVAL_MS: u64 = 10;
+
+#[derive(Serialize)]
+struct ShellCommandResult {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
 
 /// Live host API backed by real runtime services.
 ///
@@ -78,6 +97,10 @@ impl LiveHostApi {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
     }
+
+    fn has_capability(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
 }
 
 impl HostApi for LiveHostApi {
@@ -132,6 +155,30 @@ impl HostApi for LiveHostApi {
         execute_http_request(method, url, headers, body)
     }
 
+    fn exec_command(&self, command: &str, timeout_ms: u32) -> Option<String> {
+        if !self.has_capability(Capability::Shell) {
+            tracing::error!("exec_command denied: Shell capability not declared");
+            return None;
+        }
+        execute_shell_command(command, timeout_ms)
+    }
+
+    fn read_file(&self, path: &str) -> Option<String> {
+        if !self.has_capability(Capability::Filesystem) {
+            tracing::error!("read_file denied: Filesystem capability not declared");
+            return None;
+        }
+        read_utf8_file(path)
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> bool {
+        if !self.has_capability(Capability::Filesystem) {
+            tracing::error!("write_file denied: Filesystem capability not declared");
+            return false;
+        }
+        write_utf8_file(path, content)
+    }
+
     fn get_output(&self) -> String {
         self.output
             .lock()
@@ -141,6 +188,197 @@ impl HostApi for LiveHostApi {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn execute_shell_command(command: &str, timeout_ms: u32) -> Option<String> {
+    let mut child = spawn_shell(command)
+        .map_err(|error| {
+            tracing::error!("exec_command failed to spawn '{command}': {error}");
+            error
+        })
+        .ok()?;
+    let (stdout, stderr) = take_command_pipes(&mut child)?;
+    let stdout_handle = spawn_output_reader(stdout);
+    let stderr_handle = spawn_output_reader(stderr);
+    let exit_code = wait_for_command(&mut child, timeout_ms);
+    let stdout = join_output_reader(stdout_handle, "stdout")?;
+    let stderr = add_timeout_message(
+        join_output_reader(stderr_handle, "stderr")?,
+        exit_code,
+        timeout_ms,
+    );
+    serialize_command_result(stdout, stderr, exit_code)
+}
+
+fn spawn_shell(command: &str) -> std::io::Result<Child> {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_shell_process_group(&mut cmd);
+    cmd.spawn()
+}
+
+#[cfg(unix)]
+fn configure_shell_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(create_process_group);
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_shell_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn create_process_group() -> std::io::Result<()> {
+    if unsafe { libc::setpgid(0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn take_command_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
+    let stdout = child.stdout.take().or_else(|| {
+        tracing::error!("exec_command: stdout pipe missing");
+        None
+    })?;
+    let stderr = child.stderr.take().or_else(|| {
+        tracing::error!("exec_command: stderr pipe missing");
+        None
+    })?;
+    Some((stdout, stderr))
+}
+
+fn spawn_output_reader<R>(reader: R) -> JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || read_capped_output(reader))
+}
+
+fn read_capped_output<R>(reader: R) -> Vec<u8>
+where
+    R: Read,
+{
+    let mut output = Vec::new();
+    let mut limited_reader = reader.take(COMMAND_OUTPUT_LIMIT_BYTES as u64);
+    if let Err(error) = limited_reader.read_to_end(&mut output) {
+        tracing::error!("exec_command: failed to read process output: {error}");
+    }
+    output
+}
+
+fn wait_for_command(child: &mut Child, timeout_ms: u32) -> i32 {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(COMMAND_FAILURE_EXIT_CODE),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(COMMAND_POLL_INTERVAL_MS));
+            }
+            Ok(None) => return kill_timed_out_child(child),
+            Err(error) => {
+                tracing::error!("exec_command: failed to wait on child: {error}");
+                return COMMAND_FAILURE_EXIT_CODE;
+            }
+        }
+    }
+}
+
+fn kill_timed_out_child(child: &mut Child) -> i32 {
+    if let Err(error) = terminate_timed_out_child(child) {
+        tracing::error!("exec_command: failed to kill timed out child: {error}");
+        return COMMAND_FAILURE_EXIT_CODE;
+    }
+    if let Err(error) = child.wait() {
+        tracing::error!("exec_command: failed to reap timed out child: {error}");
+        return COMMAND_FAILURE_EXIT_CODE;
+    }
+    COMMAND_TIMEOUT_EXIT_CODE
+}
+
+#[cfg(unix)]
+fn terminate_timed_out_child(child: &mut Child) -> std::io::Result<()> {
+    if unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn terminate_timed_out_child(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+fn join_output_reader(handle: JoinHandle<Vec<u8>>, stream_name: &str) -> Option<String> {
+    match handle.join() {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => {
+            tracing::error!("exec_command: {stream_name} reader thread panicked");
+            None
+        }
+    }
+}
+
+fn add_timeout_message(mut stderr: String, exit_code: i32, timeout_ms: u32) -> String {
+    if exit_code == COMMAND_TIMEOUT_EXIT_CODE {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!("command timed out after {timeout_ms}ms"));
+    }
+    stderr
+}
+
+fn serialize_command_result(stdout: String, stderr: String, exit_code: i32) -> Option<String> {
+    serde_json::to_string(&ShellCommandResult {
+        stdout,
+        stderr,
+        exit_code,
+    })
+    .map_err(|error| {
+        tracing::error!("exec_command: failed to serialize result: {error}");
+        error
+    })
+    .ok()
+}
+
+fn read_utf8_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| {
+            tracing::error!("read_file failed for '{}': {}", path, error);
+            error
+        })
+        .ok()
+}
+
+fn write_utf8_file(path: &str, content: &str) -> bool {
+    let path = Path::new(path);
+    if let Err(error) = ensure_parent_directory(path) {
+        tracing::error!(
+            "write_file failed to create parent for '{}': {}",
+            path.display(),
+            error
+        );
+        return false;
+    }
+    if let Err(error) = std::fs::write(path, content) {
+        tracing::error!("write_file failed for '{}': {}", path.display(), error);
+        return false;
+    }
+    true
+}
+
+fn ensure_parent_directory(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
     }
 }
 
@@ -188,7 +426,11 @@ fn extract_host(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::collections::HashMap;
+    use std::env;
+    use std::io::Write;
+    use tempfile::TempDir;
     use zeroize::Zeroizing;
 
     fn make_config(input: &str) -> LiveHostApiConfig<'_> {
@@ -201,8 +443,32 @@ mod tests {
         }
     }
 
+    const STDIN_HELPER_ENV: &str = "FX_LOADABLE_STDIN_HELPER";
+
     fn make_api(input: &str) -> LiveHostApi {
         LiveHostApi::new(make_config(input))
+    }
+
+    fn make_shell_api() -> LiveHostApi {
+        LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Shell],
+            credential_provider: None,
+        })
+    }
+
+    fn parse_command_result(json: &str) -> Value {
+        serde_json::from_str(json).expect("parse command result")
+    }
+
+    fn run_shell_command(command: &str, timeout_ms: u32) -> Value {
+        let api = make_shell_api();
+        let json = api
+            .exec_command(command, timeout_ms)
+            .expect("shell command result");
+        parse_command_result(&json)
     }
 
     /// Mock credential provider for testing.
@@ -226,6 +492,57 @@ mod tests {
     impl CredentialProvider for MockCredentialProvider {
         fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
             self.credentials.get(key).map(|v| Zeroizing::new(v.clone()))
+        }
+    }
+
+    struct FailAfterLimitReader {
+        bytes_remaining: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for FailAfterLimitReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes_remaining == 0 {
+                panic!("reader was polled after hitting the output cap");
+            }
+            let bytes_to_read = self.bytes_remaining.min(self.chunk_size).min(buf.len());
+            buf[..bytes_to_read].fill(b'x');
+            self.bytes_remaining -= bytes_to_read;
+            Ok(bytes_to_read)
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_background_pid(pid_file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(pid) = std::fs::read_to_string(pid_file) {
+                return pid.trim().parse().expect("background pid");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for background pid at {}",
+            pid_file.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if !process_exists(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -336,6 +653,135 @@ mod tests {
         assert_eq!(
             api.kv_get("github_token"),
             Some("from_provider".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_command_denied_without_shell_capability() {
+        let api = make_api("");
+        assert_eq!(api.exec_command("printf hello", 1_000), None);
+    }
+
+    #[test]
+    fn exec_command_allowed_with_shell_capability() {
+        let result = run_shell_command("printf hello", 1_000);
+        assert_eq!(result["stdout"], "hello");
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    fn read_capped_output_stops_after_limit() {
+        let reader = FailAfterLimitReader {
+            bytes_remaining: COMMAND_OUTPUT_LIMIT_BYTES,
+            chunk_size: 8192,
+        };
+
+        let output = read_capped_output(reader);
+
+        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT_BYTES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_stdin_helper_reads_eof() {
+        if env::var_os(STDIN_HELPER_ENV).is_none() {
+            return;
+        }
+        let result = run_shell_command(
+            r#"if read value; then printf '%s' "$value"; else printf eof; fi"#,
+            1_000,
+        );
+        assert_eq!(result["stdout"], "eof");
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_does_not_inherit_parent_stdin() {
+        let exe = env::current_exe().expect("test binary path");
+        let mut child = Command::new(exe)
+            .arg("--exact")
+            .arg("exec_command_stdin_helper_reads_eof")
+            .env(STDIN_HELPER_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stdin helper");
+        child
+            .stdin
+            .take()
+            .expect("helper stdin")
+            .write_all(b"from-parent\n")
+            .expect("write helper stdin");
+        let output = child.wait_with_output().expect("helper output");
+        assert!(
+            output.status.success(),
+            "stdin helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_command_timeout_kills_background_process_group() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let pid_file = temp_dir.path().join("background.pid");
+        let command = format!("sleep 1 & echo $! > '{}' && wait", pid_file.display());
+        let started_at = Instant::now();
+
+        let result = run_shell_command(&command, 50);
+        let elapsed = started_at.elapsed();
+        let background_pid = read_background_pid(&pid_file);
+        wait_for_process_exit(background_pid);
+        if process_exists(background_pid) {
+            let _ = unsafe { libc::kill(background_pid, libc::SIGKILL) };
+        }
+
+        assert_eq!(result["exit_code"], COMMAND_TIMEOUT_EXIT_CODE);
+        assert!(elapsed < Duration::from_millis(500));
+        assert!(!process_exists(background_pid));
+    }
+
+    #[test]
+    fn read_file_denied_without_filesystem_capability() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("data.txt");
+        std::fs::write(&path, "hello").expect("write fixture");
+        let api = make_api("");
+
+        assert_eq!(api.read_file(path.to_str().expect("utf-8 path")), None);
+    }
+
+    #[test]
+    fn write_file_denied_without_filesystem_capability() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("data.txt");
+        let api = make_api("");
+
+        assert!(!api.write_file(path.to_str().expect("utf-8 path"), "hello"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_write_file_round_trip() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("nested").join("data.txt");
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Filesystem],
+            credential_provider: None,
+        });
+
+        assert!(api.write_file(path.to_str().expect("utf-8 path"), "hello"));
+        assert_eq!(
+            api.read_file(path.to_str().expect("utf-8 path")),
+            Some("hello".to_string())
         );
     }
 

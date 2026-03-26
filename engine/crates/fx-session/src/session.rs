@@ -228,12 +228,32 @@ pub struct ContentRenderOptions {
     pub include_tool_use_id: bool,
 }
 
-const SESSION_MEMORY_MAX_ITEMS: usize = 20;
-const SESSION_MEMORY_MAX_TOKENS: usize = 2_000;
+const DEFAULT_SESSION_MEMORY_MAX_ITEMS: usize = 40;
+const DEFAULT_SESSION_MEMORY_MAX_TOKENS: usize = 4_000;
+
+/// Compute the session memory token cap for a given model context window.
+#[must_use]
+pub fn max_memory_tokens(context_limit: usize) -> usize {
+    (context_limit / 50).clamp(2_000, 8_000)
+}
+
+/// Compute the per-list session memory item cap for a given model context window.
+#[must_use]
+pub fn max_memory_items(context_limit: usize) -> usize {
+    (context_limit / 5_000).clamp(20, 80)
+}
+
+fn default_session_memory_max_items() -> usize {
+    DEFAULT_SESSION_MEMORY_MAX_ITEMS
+}
+
+fn default_session_memory_max_tokens() -> usize {
+    DEFAULT_SESSION_MEMORY_MAX_TOKENS
+}
 
 /// Persistent session memory that survives conversation compaction.
 /// Contains key facts the agent extracted about the session's purpose and state.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMemory {
     /// What this session is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,21 +261,82 @@ pub struct SessionMemory {
     /// Current state of work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_state: Option<String>,
-    /// Key decisions made during this session (max 20).
+    /// Key decisions made during this session.
     #[serde(default)]
     pub key_decisions: Vec<String>,
     /// Files actively being worked on.
     #[serde(default)]
     pub active_files: Vec<String>,
-    /// Custom context the agent wants to remember (max 20).
+    /// Custom context the agent wants to remember.
     #[serde(default)]
     pub custom_context: Vec<String>,
     /// Unix epoch seconds of last update.
     #[serde(default)]
     pub last_updated: u64,
+    /// Runtime-only list cap applied to tracked memory collections.
+    #[serde(skip, default = "default_session_memory_max_items")]
+    max_items: usize,
+    /// Runtime-only token cap applied to rendered session memory.
+    #[serde(skip, default = "default_session_memory_max_tokens")]
+    max_tokens: usize,
 }
 
+impl Default for SessionMemory {
+    fn default() -> Self {
+        Self {
+            project: None,
+            current_state: None,
+            key_decisions: Vec::new(),
+            active_files: Vec::new(),
+            custom_context: Vec::new(),
+            last_updated: 0,
+            max_items: DEFAULT_SESSION_MEMORY_MAX_ITEMS,
+            max_tokens: DEFAULT_SESSION_MEMORY_MAX_TOKENS,
+        }
+    }
+}
+
+impl PartialEq for SessionMemory {
+    fn eq(&self, other: &Self) -> bool {
+        self.project == other.project
+            && self.current_state == other.current_state
+            && self.key_decisions == other.key_decisions
+            && self.active_files == other.active_files
+            && self.custom_context == other.custom_context
+            && self.last_updated == other.last_updated
+    }
+}
+
+impl Eq for SessionMemory {}
+
 impl SessionMemory {
+    /// Create empty session memory configured for a specific model context window.
+    #[must_use]
+    pub fn with_context_limit(context_limit: usize) -> Self {
+        let mut memory = Self::default();
+        memory.set_context_limit(context_limit);
+        memory
+    }
+
+    /// Recompute runtime caps for a new model context window.
+    pub fn set_context_limit(&mut self, context_limit: usize) {
+        self.max_items = max_memory_items(context_limit);
+        self.max_tokens = max_memory_tokens(context_limit);
+        self.trim_to_item_cap();
+    }
+
+    /// Return the current per-list item cap.
+    #[must_use]
+    pub fn item_cap(&self) -> usize {
+        self.max_items
+    }
+
+    /// Return the current token cap.
+    #[must_use]
+    pub fn token_cap(&self) -> usize {
+        self.max_tokens
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.project.is_none()
@@ -291,19 +372,20 @@ impl SessionMemory {
             candidate.current_state = Some(state);
         }
         if let Some(decisions) = update.key_decisions {
-            append_capped_items(&mut candidate.key_decisions, decisions);
+            append_capped_items(&mut candidate.key_decisions, decisions, candidate.max_items);
         }
         if let Some(files) = update.active_files {
             candidate.active_files = files;
+            trim_oldest_items(&mut candidate.active_files, candidate.max_items);
         }
         if let Some(context) = update.custom_context {
-            append_capped_items(&mut candidate.custom_context, context);
+            append_capped_items(&mut candidate.custom_context, context, candidate.max_items);
         }
         let estimated_tokens = candidate.estimated_tokens();
-        if estimated_tokens > SESSION_MEMORY_MAX_TOKENS {
+        if estimated_tokens > candidate.max_tokens {
             return Err(format!(
                 "Session memory would exceed {} token cap ({} estimated). Be more concise.",
-                SESSION_MEMORY_MAX_TOKENS, estimated_tokens
+                candidate.max_tokens, estimated_tokens
             ));
         }
         candidate.last_updated = current_epoch_secs();
@@ -328,6 +410,12 @@ impl SessionMemory {
         push_session_memory_items(&mut lines, "Context:", &self.custom_context);
         lines.join("\n")
     }
+
+    fn trim_to_item_cap(&mut self) {
+        trim_oldest_items(&mut self.key_decisions, self.max_items);
+        trim_oldest_items(&mut self.active_files, self.max_items);
+        trim_oldest_items(&mut self.custom_context, self.max_items);
+    }
 }
 
 /// Partial update to session memory from the agent's tool call.
@@ -340,13 +428,13 @@ pub struct SessionMemoryUpdate {
     pub custom_context: Option<Vec<String>>,
 }
 
-fn append_capped_items(items: &mut Vec<String>, incoming: Vec<String>) {
+fn append_capped_items(items: &mut Vec<String>, incoming: Vec<String>, max_items: usize) {
     items.extend(incoming);
-    trim_oldest_items(items);
+    trim_oldest_items(items, max_items);
 }
 
-fn trim_oldest_items(items: &mut Vec<String>) {
-    let excess = items.len().saturating_sub(SESSION_MEMORY_MAX_ITEMS);
+fn trim_oldest_items(items: &mut Vec<String>, max_items: usize) {
+    let excess = items.len().saturating_sub(max_items);
     if excess > 0 {
         items.drain(..excess);
     }
@@ -648,8 +736,33 @@ mod tests {
     }
 
     #[test]
-    fn session_memory_default_is_empty() {
-        assert!(SessionMemory::default().is_empty());
+    fn session_memory_default_is_empty_and_uses_default_caps() {
+        let memory = SessionMemory::default();
+
+        assert!(memory.is_empty());
+        assert_eq!(memory.token_cap(), DEFAULT_SESSION_MEMORY_MAX_TOKENS);
+        assert_eq!(memory.item_cap(), DEFAULT_SESSION_MEMORY_MAX_ITEMS);
+    }
+
+    #[test]
+    fn max_memory_tokens_scales_with_context_limit() {
+        assert_eq!(max_memory_tokens(32_000), 2_000);
+        assert_eq!(max_memory_tokens(200_000), 4_000);
+        assert_eq!(max_memory_tokens(300_000), 6_000);
+    }
+
+    #[test]
+    fn max_memory_items_scales_with_context_limit() {
+        assert_eq!(max_memory_items(32_000), 20);
+        assert_eq!(max_memory_items(200_000), 40);
+        assert_eq!(max_memory_items(300_000), 60);
+        assert_eq!(max_memory_items(500_000), 80);
+    }
+
+    #[test]
+    fn max_memory_tokens_clamps_at_boundaries() {
+        assert_eq!(max_memory_tokens(16_000), 2_000);
+        assert_eq!(max_memory_tokens(500_000), 8_000);
     }
 
     #[test]
@@ -661,6 +774,7 @@ mod tests {
             active_files: vec!["engine/crates/fx-session/src/session.rs".to_string()],
             custom_context: vec!["keep it concise".to_string()],
             last_updated: 123,
+            ..SessionMemory::default()
         };
 
         let json = serde_json::to_string(&memory).expect("serialize memory");
@@ -700,6 +814,11 @@ mod tests {
         let restored: Session = serde_json::from_value(value).expect("deserialize session");
 
         assert!(restored.memory.is_empty());
+        assert_eq!(
+            restored.memory.token_cap(),
+            DEFAULT_SESSION_MEMORY_MAX_TOKENS
+        );
+        assert_eq!(restored.memory.item_cap(), DEFAULT_SESSION_MEMORY_MAX_ITEMS);
     }
 
     #[test]
@@ -759,18 +878,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_update_caps_lists_at_twenty_items() {
-        let mut memory = SessionMemory::default();
+    fn apply_update_caps_lists_for_context_limit() {
+        let mut memory = SessionMemory::with_context_limit(32_000);
         let mut update = memory_update();
         update.key_decisions = Some((0..25).map(|i| format!("decision-{i}")).collect());
+        update.active_files = Some((0..22).map(|i| format!("file-{i}.rs")).collect());
         update.custom_context = Some((0..22).map(|i| format!("context-{i}")).collect());
         memory.apply_update(update).expect("capped update");
 
-        assert_eq!(memory.key_decisions.len(), SESSION_MEMORY_MAX_ITEMS);
-        assert_eq!(memory.custom_context.len(), SESSION_MEMORY_MAX_ITEMS);
+        assert_eq!(memory.key_decisions.len(), 20);
+        assert_eq!(memory.active_files.len(), 20);
+        assert_eq!(memory.custom_context.len(), 20);
         assert_eq!(
             memory.key_decisions.first().map(String::as_str),
             Some("decision-5")
+        );
+        assert_eq!(
+            memory.active_files.first().map(String::as_str),
+            Some("file-2.rs")
         );
         assert_eq!(
             memory.custom_context.first().map(String::as_str),
@@ -792,7 +917,7 @@ mod tests {
     fn session_memory_rejects_oversized_updates() {
         let mut memory = SessionMemory::default();
         let mut update = memory_update();
-        update.project = Some("x".repeat(SESSION_MEMORY_MAX_TOKENS * 8));
+        update.project = Some("x".repeat(DEFAULT_SESSION_MEMORY_MAX_TOKENS * 8));
 
         let error = memory
             .apply_update(update)

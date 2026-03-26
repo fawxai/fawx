@@ -9,6 +9,8 @@ members = [
     "engine/crates/fx-kernel",
     "engine/crates/fx-auth",
     "engine/crates/fx-loadable",
+    "engine/crates/fx-cloud-gpu",
+    "engine/crates/fx-python",
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
     "engine/crates/fx-security",
@@ -121,6 +123,7 @@ fx-auth = { path = "engine/crates/fx-auth" }
 fx-cli = { path = "engine/crates/fx-cli" }
 fx-conversation = { path = "engine/crates/fx-conversation" }
 fx-loadable = { path = "engine/crates/fx-loadable" }
+fx-python = { path = "engine/crates/fx-python" }
 fx-agent = { path = "engine/crates/fx-agent" }
 fx-security = { path = "engine/crates/fx-security" }
 fx-skills = { path = "engine/crates/fx-skills" }

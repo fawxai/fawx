@@ -36,12 +36,14 @@ use fx_kernel::{
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
+use fx_loadable::watcher::{ReloadEvent, SkillWatcher};
 use fx_loadable::{
     NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillRegistry,
     TransactionSkill,
 };
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_python::PythonSkill;
 use fx_ripcord::{resolve_tripwires, RipcordJournal, TripwireEvaluator};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
@@ -58,6 +60,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::Dispatch;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -934,7 +937,8 @@ fn build_skill_registry(
     }));
     ProcessRegistry::spawn_cleanup_task(&process_registry);
     let mut startup_warnings = Vec::new();
-    let executor = build_tool_executor(&options, tool_config, process_registry);
+    let executor = build_tool_executor(&options, tool_config, process_registry)
+        .with_protected_branches(config.git.protected_branches.clone());
     let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
         attach_memory_if_enabled(
             executor,
@@ -1005,6 +1009,8 @@ fn build_skill_registry(
     let session_memory = Arc::new(Mutex::new(fx_session::SessionMemory::default()));
     let session_memory_skill = SessionMemorySkill::new(Arc::clone(&session_memory));
     registry.register(Arc::new(session_memory_skill));
+    let python_skill = PythonSkill::new(data_dir);
+    registry.register(Arc::new(python_skill));
 
     if let Some(session_registry) = options.session_registry.clone() {
         let session_skill = SessionToolsSkill::new(session_registry);
@@ -1053,7 +1059,8 @@ fn build_skill_registry(
             std::sync::Arc::new(move || cp.get_credential("github_token"))
                 as std::sync::Arc<dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync>
         });
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn);
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn)
+        .with_protected_branches(config.git.protected_branches.clone());
     registry.register(Arc::new(git_skill));
 
     // Load WASM skills from ~/.fawx/skills/
@@ -1102,6 +1109,14 @@ fn build_skill_registry(
     };
 
     apply_skill_summaries(&runtime_info, registry.as_ref());
+    let skills_dir = data_dir.join("skills");
+    start_skill_watcher(
+        skills_dir,
+        Arc::clone(&registry),
+        Arc::clone(&runtime_info),
+        credential_provider.clone(),
+        signature_policy.clone(),
+    );
 
     SkillRegistryBundle {
         registry,
@@ -1118,6 +1133,80 @@ fn build_skill_registry(
         signature_policy,
         cron_store,
         startup_warnings,
+    }
+}
+
+fn start_skill_watcher(
+    skills_dir: PathBuf,
+    registry: Arc<SkillRegistry>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    signature_policy: SignaturePolicy,
+) {
+    if let Err(error) = fs::create_dir_all(&skills_dir) {
+        tracing::warn!(path = %skills_dir.display(), error = %error, "failed to create skills directory for watcher");
+        return;
+    }
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!(path = %skills_dir.display(), "skipping skill watcher startup without active tokio runtime");
+        return;
+    };
+
+    let (reload_event_tx, reload_event_rx) = mpsc::channel(32);
+    let mut skill_watcher = SkillWatcher::new(
+        skills_dir,
+        Arc::clone(&registry),
+        reload_event_tx,
+        credential_provider,
+        signature_policy,
+    );
+    skill_watcher.initialize_hashes();
+    handle.spawn(handle_skill_reload_events(
+        reload_event_rx,
+        runtime_info,
+        registry,
+    ));
+    handle.spawn(async move {
+        if let Err(error) = skill_watcher.run().await {
+            tracing::error!(error = %error, "skill watcher exited with error");
+        }
+    });
+}
+
+async fn handle_skill_reload_events(
+    mut reload_event_rx: mpsc::Receiver<ReloadEvent>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
+    registry: Arc<SkillRegistry>,
+) {
+    while let Some(event) = reload_event_rx.recv().await {
+        log_skill_reload_event(&event);
+        apply_skill_summaries(&runtime_info, registry.as_ref());
+    }
+}
+
+fn log_skill_reload_event(event: &ReloadEvent) {
+    match event {
+        ReloadEvent::Loaded {
+            skill_name,
+            version,
+        } => tracing::info!(skill = %skill_name, version = %version, "skill hot-loaded"),
+        ReloadEvent::Updated {
+            skill_name,
+            old_version,
+            new_version,
+        } => tracing::info!(
+            skill = %skill_name,
+            old_version = %old_version,
+            new_version = %new_version,
+            "skill hot-reloaded"
+        ),
+        ReloadEvent::Removed { skill_name } => {
+            tracing::info!(skill = %skill_name, "skill removed")
+        }
+        ReloadEvent::Error { skill_name, error } => {
+            tracing::warn!(skill = %skill_name, error = %error, "skill reload failed")
+        }
     }
 }
 
@@ -1910,6 +1999,7 @@ mod tests {
     use fx_config::manager::ConfigManager;
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::test_support::create_test_model_dir;
+    use fx_loadable::test_support::write_test_skill;
     use fx_subagent::test_support::StubSubagentControl;
     use std::cell::Cell;
     use std::io;
@@ -1917,6 +2007,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::writer::MakeWriter;
@@ -1930,15 +2021,46 @@ mod tests {
         (config, temp_dir)
     }
 
+    fn registry_has_skill(bundle: &LoopEngineBundle, name: &str) -> bool {
+        bundle
+            .skill_registry
+            .skill_summaries()
+            .iter()
+            .any(|(skill_name, _, _, _)| skill_name == name)
+    }
+
+    fn runtime_info_has_skill(bundle: &LoopEngineBundle, name: &str) -> bool {
+        bundle
+            .runtime_info
+            .read()
+            .expect("runtime info")
+            .skills
+            .iter()
+            .any(|skill| skill.name == name)
+    }
+
+    async fn wait_for_skill_registration(bundle: &LoopEngineBundle, name: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if registry_has_skill(bundle, name) && runtime_info_has_skill(bundle, name) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("skill watcher should register the new skill");
+    }
+
     fn test_fleet_node_config() -> fx_config::NodeConfig {
         fx_config::NodeConfig {
             id: "mac-mini".to_string(),
-            name: "Node Alpha".to_string(),
+            name: "Worker Node A".to_string(),
             endpoint: Some("https://10.0.0.5:8400".to_string()),
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
             address: Some("10.0.0.5".to_string()),
-            user: Some("admin".to_string()),
+            user: Some("builder".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
     }
@@ -2555,6 +2677,29 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[tokio::test]
+    async fn headless_bundle_starts_skill_watcher_for_runtime_installs() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let skills_dir = config
+            .general
+            .data_dir
+            .clone()
+            .expect("data dir")
+            .join("skills");
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+
+        assert!(
+            skills_dir.exists(),
+            "startup should create the skills directory"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        write_test_skill(&skills_dir, "runtimeinstallwatcher").expect("write test skill");
+        wait_for_skill_registration(&bundle, "runtimeinstallwatcher").await;
     }
 
     #[cfg(feature = "http")]

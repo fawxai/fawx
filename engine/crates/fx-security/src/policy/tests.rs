@@ -519,10 +519,10 @@ decision = "deny"
     #[test]
     fn test_condition_contact_target_partial_eq() {
         let cond1 = Condition::ContactTarget {
-            contact: "joe".to_string(),
+            contact: "owner".to_string(),
         };
         let cond2 = Condition::ContactTarget {
-            contact: "joe".to_string(),
+            contact: "owner".to_string(),
         };
         let cond3 = Condition::ContactTarget {
             contact: "alice".to_string(),

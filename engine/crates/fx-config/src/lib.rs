@@ -67,6 +67,9 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # search_exclude = ["vendor", "dist"]
 # max_read_size = 1048576
 
+[git]
+# protected_branches = ["main", "staging"]
+
 [memory]
 # max_entries = 1000
 # max_value_size = 10240
@@ -134,6 +137,8 @@ pub struct FawxConfig {
     pub model: ModelConfig,
     pub logging: LoggingConfig,
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub git: GitConfig,
     pub memory: MemoryConfig,
     pub security: SecurityConfig,
     pub self_modify: SelfModifyCliConfig,
@@ -195,6 +200,14 @@ impl Default for AgentBehaviorConfig {
 pub struct WorkspaceConfig {
     /// Root directory for workspace operations. Resolved to cwd at startup if None.
     pub root: Option<PathBuf>,
+}
+
+/// Git policy configuration for protected branch enforcement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GitConfig {
+    #[serde(default)]
+    pub protected_branches: Vec<String>,
 }
 
 /// Permission presets that define default agent autonomy levels.
@@ -1392,6 +1405,8 @@ log_dir = "~/.fawx/custom-logs"
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# verbosity = \"normal\""));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[workspace]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# root = \".\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[git]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# protected_branches = [\"main\", \"staging\"]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[permissions]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# preset = \"power\""));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[budget]"));
@@ -1420,11 +1435,48 @@ log_dir = "~/.fawx/custom-logs"
         assert_eq!(defaults.agent.behavior.verbosity, "normal");
         assert_eq!(defaults.logging, LoggingConfig::default());
         assert_eq!(defaults.tools.max_read_size, 1024 * 1024);
+        assert!(defaults.git.protected_branches.is_empty());
         assert_eq!(defaults.memory.max_entries, 1000);
         assert_eq!(defaults.memory.max_value_size, 10240);
         assert_eq!(defaults.memory.max_snapshot_chars, 2000);
         assert_eq!(defaults.memory.max_relevant_results, 5);
         assert!(defaults.memory.embeddings_enabled);
+    }
+
+    #[test]
+    fn config_parses_git_protected_branches() {
+        let config: FawxConfig = toml::from_str(
+            r#"[git]
+protected_branches = ["main", "staging"]
+"#,
+        )
+        .expect("deserialize git config");
+
+        assert_eq!(config.git.protected_branches, vec!["main", "staging"]);
+    }
+
+    #[test]
+    fn config_parses_empty_git_protected_branches() {
+        let config: FawxConfig = toml::from_str(
+            r#"[git]
+protected_branches = []
+"#,
+        )
+        .expect("deserialize empty git config");
+
+        assert!(config.git.protected_branches.is_empty());
+    }
+
+    #[test]
+    fn git_config_serde_round_trip() {
+        let original = GitConfig {
+            protected_branches: vec!["main".to_string(), "staging".to_string()],
+        };
+
+        let encoded = toml::to_string(&original).expect("serialize git config");
+        let decoded: GitConfig = toml::from_str(&encoded).expect("deserialize git config");
+
+        assert_eq!(decoded, original);
     }
 
     #[test]
@@ -1461,6 +1513,9 @@ log_dir = "~/.fawx/custom-logs"
                 working_dir: Some(PathBuf::from("/tmp/work")),
                 search_exclude: vec!["vendor".to_string()],
                 max_read_size: 2048,
+            },
+            git: GitConfig {
+                protected_branches: vec!["main".to_string(), "staging".to_string()],
             },
             memory: MemoryConfig {
                 max_entries: 4,
@@ -2002,9 +2057,9 @@ max_iterations = 10
 
     #[test]
     fn tilde_expansion_does_not_expand_tilde_user() {
-        let path = PathBuf::from("~joe/.config");
+        let path = PathBuf::from("~user/.config");
         let expanded = expand_tilde(&path);
-        assert_eq!(expanded, PathBuf::from("~joe/.config"));
+        assert_eq!(expanded, PathBuf::from("~user/.config"));
     }
 
     #[test]
@@ -2327,6 +2382,7 @@ working_dir = "/tmp/work"
         let config: FawxConfig =
             toml::from_str("[general]\nmax_iterations = 12\n").expect("deserialize old config");
         assert_eq!(config.workspace, WorkspaceConfig::default());
+        assert_eq!(config.git, GitConfig::default());
         assert_eq!(config.budget, BudgetConfig::default());
         assert_eq!(config.sandbox, SandboxConfig::default());
         assert_eq!(config.proposals, ProposalConfig::default());

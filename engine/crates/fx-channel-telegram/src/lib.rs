@@ -1043,7 +1043,7 @@ mod tests {
                 "message": {{
                     "message_id": 42,
                     "chat": {{ "id": {chat_id} }},
-                    "from": {{ "first_name": "Alice" }},
+                    "from": {{ "first_name": "Example" }},
                     "text": "{text}"
                 }}
             }}"#
@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(result.chat_id, 12345);
         assert_eq!(result.text, "hello bot");
         assert_eq!(result.message_id, 42);
-        assert_eq!(result.from_name.as_deref(), Some("Alice"));
+        assert_eq!(result.from_name.as_deref(), Some("Example"));
     }
 
     #[test]
@@ -1164,7 +1164,7 @@ mod tests {
             "message": {
                 "message_id": 44,
                 "chat": { "id": 12345 },
-                "from": { "first_name": "Alice" },
+                "from": { "first_name": "Example" },
                 "photo": [
                     {"file_id": "thumb", "width": 90, "height": 90},
                     {"file_id": "medium", "width": 320, "height": 240},

@@ -407,9 +407,9 @@ mod tests {
 
     #[test]
     fn remote_eval_target_parses_user_host_and_path() {
-        let target: RemoteEvalTarget = "user@example.com:/srv/fawx".parse().expect("target");
+        let target: RemoteEvalTarget = "builder@example.com:/srv/fawx".parse().expect("target");
 
-        assert_eq!(target.ssh_user, "user");
+        assert_eq!(target.ssh_user, "builder");
         assert_eq!(target.ssh_host, "example.com");
         assert_eq!(target.remote_project_dir, "/srv/fawx");
     }
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn ssh_command_format_builds_expected_args() {
-        let spec = ssh_command_spec("user", "10.0.0.1", "cd '/srv/fawx' && cargo test");
+        let spec = ssh_command_spec("builder", "203.0.113.20", "cd '/srv/fawx' && cargo test");
 
         assert_eq!(spec.program, "ssh");
         assert_eq!(
@@ -441,7 +441,7 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=3",
-                "user@10.0.0.1",
+                "builder@203.0.113.20",
                 "cd '/srv/fawx' && cargo test",
             ]
         );
@@ -450,8 +450,8 @@ mod tests {
     #[test]
     fn patch_application_builds_scp_and_git_apply_commands() {
         let scp = scp_command_spec(
-            "user",
-            "10.0.0.1",
+            "builder",
+            "203.0.113.20",
             Path::new("/tmp/local.patch"),
             "/tmp/remote.patch",
         );
@@ -468,7 +468,7 @@ mod tests {
                 "-o",
                 "ConnectTimeout=30",
                 "/tmp/local.patch",
-                "user@10.0.0.1:/tmp/remote.patch",
+                "builder@203.0.113.20:/tmp/remote.patch",
             ]
         );
         assert_eq!(

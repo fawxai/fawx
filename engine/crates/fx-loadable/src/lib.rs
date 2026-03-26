@@ -25,6 +25,8 @@ pub mod notify_skill;
 pub mod registry;
 pub mod session_memory_skill;
 pub mod skill;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod transaction_skill;
 pub mod wasm_host;
 pub mod wasm_skill;

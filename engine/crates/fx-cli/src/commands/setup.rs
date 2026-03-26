@@ -36,7 +36,7 @@ pub async fn run(force: bool) -> anyhow::Result<i32> {
 
     println!("🦊 Welcome to Fawx setup!\n");
 
-    let mut wizard = SetupWizard::new(force)?;
+    let mut wizard = SetupWizard::new(force, None)?;
     wizard.print_system_check();
     wizard.run_tailscale_phase();
     if !wizard.confirm_existing_config()? {
@@ -182,8 +182,8 @@ static SETUP_SKILLS: [SetupSkill; 7] = [
 ];
 
 impl SetupWizard {
-    fn new(force: bool) -> anyhow::Result<Self> {
-        let data_dir = fawx_data_dir();
+    fn new(force: bool, data_dir_override: Option<PathBuf>) -> anyhow::Result<Self> {
+        let data_dir = data_dir_override.unwrap_or_else(fawx_data_dir);
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let config_path = data_dir.join("config.toml");
@@ -1508,36 +1508,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    static TEST_HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct HomeGuard {
-        original_home: Option<String>,
-    }
-
-    impl HomeGuard {
-        fn set(temp_home: &TempDir) -> Self {
-            let original_home = std::env::var("HOME").ok();
-            unsafe {
-                std::env::set_var("HOME", temp_home.path());
-            }
-            Self { original_home }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            if let Some(home) = &self.original_home {
-                unsafe {
-                    std::env::set_var("HOME", home);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var("HOME");
-                }
-            }
-        }
-    }
-
     #[test]
     fn parse_chat_ids_accepts_blank_input() {
         assert!(parse_chat_ids("  ").expect("blank input").is_empty());
@@ -1738,21 +1708,14 @@ mod tests {
 
     #[test]
     fn setup_wizard_stores_skill_credentials_without_reopening_database() {
-        let _home_lock = TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp_home = TempDir::new().expect("temp home");
-        let _home = HomeGuard::set(&temp_home);
-        let mut wizard = SetupWizard::new(false).expect("setup wizard");
-        let data_dir = temp_home.path().join(".fawx");
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut wizard =
+            SetupWizard::new(false, Some(temp_dir.path().to_path_buf())).expect("setup wizard");
 
-        {
-            // Verify the wizard did not eagerly open credentials.db during construction.
-            // The handle is scoped so the redb file lock is released before the wizard
-            // lazily opens the same database below.
-            EncryptedFileCredentialStore::open(&data_dir)
-                .expect("wizard should not lock credential store during construction");
-        }
+        assert!(
+            wizard.skill_credential_store.is_none(),
+            "wizard should not eagerly open the skill credential store"
+        );
 
         wizard
             .store_skill_credential("brave_api_key", "brv-test")
