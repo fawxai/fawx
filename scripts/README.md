@@ -1,8 +1,27 @@
-# Scripts: H2.4 Spec Contract Validator
+# Scripts
 
-This directory contains the H2.4 spec contract validator and its mutation-heavy tests.
+This directory contains the public-promotion guard and the H2.4 spec contract validator.
 
-## Run Locally
+## Public Promotion Guard
+
+Use this from a promotion branch that is based on `public/main` after cherry-picking only OSS-safe commits.
+
+### Run Locally
+
+Python 3.11+ is required for the guard and its regression tests because `check_public_promotion.py` uses `tomllib`.
+
+- Fetch the public base ref if needed:
+  - `git fetch public main`
+- Run the guard:
+  - `scripts/check-public-promotion`
+- Run the guard regression tests:
+  - `python3 -m unittest scripts/tests/test_check_public_promotion.py`
+
+The guard compares the current branch against `public/main`, fails on blocked or non-allowlisted paths, scans added lines for private markers, and checks a few public invariants before you open a public PR.
+
+## H2.4 Spec Contract Validator
+
+### Run Locally
 
 - Validate the current spec contract:
   - `scripts/validate-h24-spec-contract.sh`
@@ -15,7 +34,7 @@ This directory contains the H2.4 spec contract validator and its mutation-heavy 
 - Run rename regression checks for CI workflow + validator literals:
   - `scripts/tests/test-rename-regressions.sh`
 
-Both scripts are plain Bash and can be run from repo root.
+Both validators can be run from repo root.
 
 ## What This Validator Intentionally Enforces
 
