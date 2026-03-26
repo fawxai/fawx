@@ -29,7 +29,7 @@ pub struct NodeInfo {
     pub node_id: String,
     /// Human-readable name.
     pub name: String,
-    /// HTTP API endpoint (e.g., "https://100.64.1.5:8400").
+    /// HTTP API endpoint (e.g., "https://192.0.2.5:8400").
     pub endpoint: String,
     /// Bearer token for authenticating with this node.
     pub auth_token: Option<String>,

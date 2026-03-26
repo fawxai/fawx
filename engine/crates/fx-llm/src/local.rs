@@ -8,7 +8,7 @@ use crate::{LlmProvider, LocalModelConfig};
 
 /// Local LLM provider using llama.cpp for on-device inference.
 ///
-/// This struct wraps the unsafe llama-cpp-sys FFI bindings and provides
+/// This struct wraps the unsafe local LLM FFI bindings and provides
 /// a safe, async Rust API.
 #[derive(Debug)]
 pub struct LocalModel {

@@ -503,7 +503,7 @@ mod tests {
         FleetTaskRequest {
             task_id: "exp-001".to_string(),
             task_type: FleetTaskType::GenerateAndEvaluate,
-            repo_url: "https://github.com/abbudjoe/fawx".to_string(),
+            repo_url: "https://github.com/fawxai/fawx".to_string(),
             branch: "dev".to_string(),
             git_token: Some("ghp_secret".to_string()),
             signal: json!({"prompt": "improve tests"}),
@@ -652,7 +652,7 @@ mod tests {
         let request = FleetTaskRequest {
             task_id: "exp-001".to_string(),
             task_type: FleetTaskType::Generate,
-            repo_url: "https://github.com/abbudjoe/fawx".to_string(),
+            repo_url: "https://github.com/fawxai/fawx".to_string(),
             branch: "dev".to_string(),
             git_token: Some("ghp_secret".to_string()),
             signal: json!({"prompt": "improve tests"}),
