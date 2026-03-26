@@ -701,7 +701,7 @@ mod tests {
         FleetTaskRequest {
             task_id: "task-1".to_string(),
             task_type: FleetTaskType::GenerateAndEvaluate,
-            repo_url: "https://github.com/abbudjoe/fawx".to_string(),
+            repo_url: "https://github.com/fawxai/fawx".to_string(),
             branch: "dev".to_string(),
             git_token: None,
             signal: json!({"prompt": "improve tests"}),

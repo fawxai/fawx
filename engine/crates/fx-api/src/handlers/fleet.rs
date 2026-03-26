@@ -157,7 +157,7 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "100.75.191.19", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
         TestFleet {
             _temp_dir: temp_dir,
