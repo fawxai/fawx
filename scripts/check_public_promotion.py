@@ -179,33 +179,60 @@ def collect_added_lines(
     diff_range: str,
     active_paths: Sequence[str],
 ) -> list[AddedLine]:
-    added_lines: list[AddedLine] = []
-    for path in active_paths:
-        diff_text = git_stdout(repo_root, ["diff", "--unified=0", "--no-color", diff_range, "--", path])
-        added_lines.extend(parse_added_lines(path, diff_text))
-    return added_lines
+    if not active_paths:
+        return []
+    diff_text = git_stdout(
+        repo_root,
+        ["diff", "--unified=0", "--no-color", diff_range, "--", *active_paths],
+    )
+    return parse_added_lines(diff_text, set(active_paths))
 
 
-def parse_added_lines(path: str, diff_text: str) -> list[AddedLine]:
+def parse_added_lines(diff_text: str, active_paths: set[str]) -> list[AddedLine]:
     findings: list[AddedLine] = []
+    current_path: str | None = None
     line_number: int | None = None
     for raw_line in diff_text.splitlines():
-        if raw_line.startswith(("+++ ", "--- ")):
+        if raw_line.startswith("diff --git "):
+            current_path = None
+            line_number = None
+            continue
+        path = parse_diff_path(raw_line, active_paths)
+        if path is not None:
+            current_path = path
+            line_number = None
             continue
         header = HUNK_HEADER_RE.match(raw_line)
         if header:
             line_number = int(header.group(1))
             continue
-        if line_number is None:
+        if raw_line == r"\ No newline at end of file":
+            continue
+        if current_path is None or line_number is None:
             continue
         if raw_line.startswith("+"):
-            findings.append(AddedLine(path, line_number, raw_line[1:]))
+            findings.append(AddedLine(current_path, line_number, raw_line[1:]))
             line_number += 1
             continue
         if raw_line.startswith("-"):
             continue
         line_number += 1
     return findings
+
+
+def parse_diff_path(raw_line: str, active_paths: set[str]) -> str | None:
+    if not raw_line.startswith("+++ "):
+        return None
+    path = strip_diff_prefix(raw_line[4:])
+    if path == "/dev/null" or path not in active_paths:
+        return None
+    return path
+
+
+def strip_diff_prefix(path: str) -> str:
+    if path.startswith(("a/", "b/")):
+        return path[2:]
+    return path
 
 
 def git_stdout(repo_root: Path, args: Sequence[str]) -> str:

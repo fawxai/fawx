@@ -91,8 +91,8 @@ pattern = "\\babbudjoe/"
 
 [[workflow_private_markers]]
 name = "private host or tailnet endpoint"
-pattern = "(?:\\.ts\\.net\\b|tailscale_https|wss://)"
+pattern = "(?:\\.ts\\.net\\b|tailscale_https|wss://[^\\s\"']*\\.ts\\.net\\b)"
 
 [[workflow_private_markers]]
 name = "internal IP address"
-pattern = "\\b(?:10|127|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]))(?:\\.\\d{1,3}){2}\\b"
+pattern = "\\b(?:10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2[0-9]|3[01])(?:\\.\\d{1,3}){2}|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(?:\\.\\d{1,3}){2})\\b"

@@ -6,7 +6,9 @@ This directory contains the public-promotion guard and the H2.4 spec contract va
 
 Use this from a promotion branch that is based on `public/main` after cherry-picking only OSS-safe commits.
 
-### Run locally
+### Run Locally
+
+Python 3.11+ is required for the guard and its regression tests because `check_public_promotion.py` uses `tomllib`.
 
 - Fetch the public base ref if needed:
   - `git fetch public main`
@@ -19,7 +21,7 @@ The guard compares the current branch against `public/main`, fails on blocked or
 
 ## H2.4 Spec Contract Validator
 
-## Run Locally
+### Run Locally
 
 - Validate the current spec contract:
   - `scripts/validate-h24-spec-contract.sh`
