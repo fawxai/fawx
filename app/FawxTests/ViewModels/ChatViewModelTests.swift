@@ -498,6 +498,65 @@ final class ChatViewModelTests: XCTestCase {
         )
     }
 
+    func testApplyFetchedMessagesReplacesOptimisticAssistantTailWithServerCompletedTurn() {
+        let sut = makeSUT()
+        let localUserMessage = SessionMessage(
+            role: .user,
+            content: "Research the X API v2 POST /2/tweets endpoint.",
+            timestamp: 11
+        )
+        let optimisticAssistant = SessionMessage(
+            role: .assistant,
+            content: "Relevant requirements for POST /2/tweets for the x-post skill...",
+            timestamp: 12
+        )
+
+        let fetchedUserMessage = SessionMessage(
+            role: .user,
+            content: localUserMessage.content,
+            timestamp: 21
+        )
+        let fetchedAssistantSummary = SessionMessage(
+            role: .assistant,
+            content: "I can't save the spec because the tool budget is exhausted.",
+            timestamp: 22
+        )
+        let fetchedAssistantDecomposition = SessionMessage(
+            role: .assistant,
+            content: "Task decomposition results:\n1. Research X API v2 POST /2/tweets => budget exhausted",
+            timestamp: 23
+        )
+
+        sut.cacheMessages([localUserMessage, optimisticAssistant], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(
+            [
+                fetchedUserMessage,
+                fetchedAssistantSummary,
+                fetchedAssistantDecomposition,
+            ],
+            sessionID: "session-a"
+        )
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            [
+                localUserMessage.content,
+                fetchedAssistantSummary.content,
+                fetchedAssistantDecomposition.content,
+            ]
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).map(\.content),
+            [
+                localUserMessage.content,
+                fetchedAssistantSummary.content,
+                fetchedAssistantDecomposition.content,
+            ]
+        )
+    }
+
     func testPrepareToDisplaySessionShowsLoadingStateWhenCacheIsMissing() {
         let sut = makeSUT()
 

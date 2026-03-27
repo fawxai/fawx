@@ -1100,10 +1100,59 @@ final class ChatViewModel {
             return fetchedMessages
         }
 
+        if let preferredFetchedMessages = replaceOptimisticAssistantTailIfServerCompletedTurn(
+            localMessages: existingMessages,
+            fetchedMessages: fetchedMessages
+        ) {
+            return preferredFetchedMessages
+        }
+
         return mergeFetchedMessagesPreservingRelativeOrder(
             localMessages: existingMessages,
             fetchedMessages: fetchedMessages
         )
+    }
+
+    private func replaceOptimisticAssistantTailIfServerCompletedTurn(
+        localMessages: [SessionMessage],
+        fetchedMessages: [SessionMessage]
+    ) -> [SessionMessage]? {
+        guard
+            let localLastUserIndex = localMessages.lastIndex(where: { $0.role == .user }),
+            let fetchedLastUserIndex = fetchedMessages.lastIndex(where: { $0.role == .user })
+        else {
+            return nil
+        }
+
+        let localPrefix = Array(localMessages.prefix(through: localLastUserIndex))
+        let fetchedPrefix = Array(fetchedMessages.prefix(through: fetchedLastUserIndex))
+        guard areEquivalentMessageSequences(localPrefix, fetchedPrefix) else {
+            return nil
+        }
+
+        let localTail = Array(localMessages.suffix(from: localMessages.index(after: localLastUserIndex)))
+        let fetchedTail = Array(fetchedMessages.suffix(from: fetchedMessages.index(after: fetchedLastUserIndex)))
+        guard !localTail.isEmpty, !fetchedTail.isEmpty else {
+            return nil
+        }
+
+        guard
+            localTail.allSatisfy(isPlainAssistantTailMessage),
+            fetchedTail.allSatisfy(isPlainAssistantTailMessage)
+        else {
+            return nil
+        }
+
+        return fetchedMessages
+    }
+
+    private func isPlainAssistantTailMessage(_ message: SessionMessage) -> Bool {
+        guard message.role == .assistant else {
+            return false
+        }
+
+        let displayText = message.transcriptDisplayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !displayText.isEmpty && toolCalls(from: message).isEmpty
     }
 
     private func mergeFetchedMessagesPreservingRelativeOrder(

@@ -265,6 +265,7 @@ pub struct HeadlessSubagentFactoryDeps {
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
     pub session_bus: Option<SessionBus>,
+    pub credential_store: Option<crate::startup::SharedCredentialStore>,
     pub token_broker: Option<SharedTokenBroker>,
 }
 
@@ -316,10 +317,6 @@ where
 
     fn model_name(&self) -> &str {
         self.inner.model_name()
-    }
-
-    fn loop_harness(&self) -> &'static dyn fx_llm::LoopHarness {
-        self.inner.loop_harness()
     }
 
     async fn complete(
@@ -2910,13 +2907,23 @@ impl HeadlessSubagentFactory {
         }
     }
 
+    fn subagent_build_options(
+        &self,
+        config: &SpawnConfig,
+        cancel_token: CancellationToken,
+    ) -> HeadlessLoopBuildOptions {
+        let mut options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        options.credential_store = self.deps.credential_store.clone();
+        options.token_broker = self.deps.token_broker.clone();
+        options
+    }
+
     fn build_app(
         &self,
         config: &SpawnConfig,
         cancel_token: CancellationToken,
     ) -> Result<HeadlessApp, SubagentError> {
-        let mut options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
-        options.token_broker = self.deps.token_broker.clone();
+        let options = self.subagent_build_options(config, cancel_token);
         let bundle = build_headless_loop_engine_bundle(
             &self.deps.config,
             self.deps.improvement_provider.clone(),
@@ -3262,9 +3269,6 @@ fn extract_response_text(result: &LoopResult) -> String {
                 BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
             }
         }
-        LoopResult::Incomplete {
-            partial_response, ..
-        } => partial_response.clone().unwrap_or_default(),
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
@@ -3276,9 +3280,6 @@ fn extract_result_kind(result: &LoopResult) -> ResultKind {
     match result {
         LoopResult::Complete { .. } => ResultKind::Complete,
         LoopResult::BudgetExhausted {
-            partial_response, ..
-        }
-        | LoopResult::Incomplete {
             partial_response, ..
         }
         | LoopResult::UserStopped {
@@ -3329,7 +3330,6 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     match result {
         LoopResult::Complete { iterations, .. }
         | LoopResult::BudgetExhausted { iterations, .. }
-        | LoopResult::Incomplete { iterations, .. }
         | LoopResult::UserStopped { iterations, .. } => *iterations,
         LoopResult::Error { .. } => 0,
     }
@@ -5029,19 +5029,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_response_from_incomplete_preserves_partial_response() {
-        let result = LoopResult::Incomplete {
-            partial_response: Some("need direction".to_string()),
-            iterations: 2,
-            signals: Vec::new(),
-        };
-
-        assert_eq!(extract_response_text(&result), "need direction");
-        assert_eq!(extract_iterations(&result), 2);
-        assert_eq!(extract_result_kind(&result), ResultKind::Partial);
-    }
-
-    #[test]
     fn finalize_cycle_sets_result_kind_for_each_variant() {
         let mut app = test_app();
         let signals = Vec::new();
@@ -5066,16 +5053,6 @@ mod tests {
             },
         );
         assert_eq!(partial.result_kind, ResultKind::Partial);
-
-        let incomplete = app.finalize_cycle(
-            "hello",
-            &LoopResult::Incomplete {
-                partial_response: Some("need direction".to_string()),
-                iterations: 1,
-                signals: signals.clone(),
-            },
-        );
-        assert_eq!(incomplete.result_kind, ResultKind::Partial);
 
         let error = app.finalize_cycle(
             "hello",
@@ -5355,6 +5332,7 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: Some(bus.clone()),
+            credential_store: None,
             token_broker: None,
         });
         let app = factory
@@ -5398,10 +5376,37 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: None,
+            credential_store: None,
             token_broker: None,
         };
         let factory = HeadlessSubagentFactory::new(deps);
         let debug = format!("{factory:?}");
         assert!(debug.contains("HeadlessSubagentFactory"));
+    }
+
+    #[test]
+    fn subagent_build_options_inherit_shared_credential_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let credential_store =
+            crate::startup::open_credential_store(&data_dir).expect("open shared credential store");
+        let factory = HeadlessSubagentFactory::new(HeadlessSubagentFactoryDeps {
+            router: shared_router(ModelRouter::new()),
+            config: FawxConfig::default(),
+            improvement_provider: None,
+            session_bus: None,
+            credential_store: Some(Arc::clone(&credential_store)),
+            token_broker: None,
+        });
+        let options = factory
+            .subagent_build_options(&SpawnConfig::new("check bridge"), CancellationToken::new());
+
+        let inherited = options
+            .credential_store
+            .as_ref()
+            .expect("credential store should be inherited");
+
+        assert!(Arc::ptr_eq(inherited, &credential_store));
     }
 }

@@ -59,6 +59,15 @@ pub enum ToolCacheability {
     SideEffect,
 }
 
+/// Classifies the effect of a specific tool invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallClassification {
+    /// The invocation only observes existing state.
+    Observation,
+    /// The invocation may mutate state or trigger side effects.
+    Mutation,
+}
+
 /// Cache counters exposed by caching-capable executors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolCacheStats {
@@ -140,6 +149,20 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         let _ = tool_name;
         ToolCacheability::NeverCache
+    }
+
+    /// Classifies the effect of an individual tool call.
+    ///
+    /// The default implementation derives from [`Self::cacheability`], but
+    /// executors with mixed-mode tools (for example `run_command`) should
+    /// override this and classify using the call arguments.
+    fn classify_call(&self, call: &fx_llm::ToolCall) -> ToolCallClassification {
+        match self.cacheability(&call.name) {
+            ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+            ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                ToolCallClassification::Observation
+            }
+        }
     }
 
     /// Clears any tool-result cache state for the current cycle.

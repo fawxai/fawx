@@ -187,6 +187,17 @@ pub struct TerminationConfig {
     /// stripped, forcing a text response.
     #[serde(default = "default_tool_round_strip_after_nudge")]
     pub tool_round_strip_after_nudge: u16,
+
+    /// Consecutive observation-only tool rounds before injecting a targeted
+    /// nudge telling the agent to stop researching and either implement or
+    /// return an incomplete response.
+    #[serde(default = "default_observation_only_round_nudge_after")]
+    pub observation_only_round_nudge_after: u16,
+
+    /// Additional observation-only rounds after the targeted nudge before the
+    /// loop strips observation-only tools, leaving only side-effecting tools.
+    #[serde(default = "default_observation_only_round_strip_after_nudge")]
+    pub observation_only_round_strip_after_nudge: u16,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -204,6 +215,12 @@ fn default_tool_round_nudge_after() -> u16 {
 fn default_tool_round_strip_after_nudge() -> u16 {
     2
 }
+fn default_observation_only_round_nudge_after() -> u16 {
+    2
+}
+fn default_observation_only_round_strip_after_nudge() -> u16 {
+    1
+}
 
 impl Default for TerminationConfig {
     fn default() -> Self {
@@ -213,6 +230,9 @@ impl Default for TerminationConfig {
             strip_tools_after_nudge: default_strip_tools_after_nudge(),
             tool_round_nudge_after: default_tool_round_nudge_after(),
             tool_round_strip_after_nudge: default_tool_round_strip_after_nudge(),
+            observation_only_round_nudge_after: default_observation_only_round_nudge_after(),
+            observation_only_round_strip_after_nudge:
+                default_observation_only_round_strip_after_nudge(),
         }
     }
 }
@@ -1301,7 +1321,6 @@ fn recipient_indices(skip_mask: &[bool]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_decompose::SubGoalContract;
     use std::collections::HashMap;
 
     fn test_config() -> BudgetConfig {
@@ -1363,15 +1382,15 @@ mod tests {
         required_tools: &[&str],
         hint: Option<ComplexityHint>,
     ) -> SubGoal {
-        SubGoal::new(
-            description.to_string(),
-            required_tools
+        SubGoal {
+            description: description.to_string(),
+            required_tools: required_tools
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
-            SubGoalContract::default(),
-            hint,
-        )
+            expected_output: None,
+            complexity_hint: hint,
+        }
     }
 
     fn sum_llm_calls(budgets: &[BudgetConfig]) -> u32 {

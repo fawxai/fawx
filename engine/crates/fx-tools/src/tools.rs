@@ -11,7 +11,7 @@ use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
-    ToolExecutor, ToolExecutorError, ToolResult,
+    ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -278,6 +278,19 @@ impl FawxToolExecutor {
             | "analyze_signals"
             | "propose_improvement" => ToolCacheability::NeverCache,
             _ => ToolCacheability::NeverCache,
+        }
+    }
+
+    fn classify_call_impl(call: &ToolCall) -> ToolCallClassification {
+        if call.name == "run_command" {
+            return classify_run_command_call(&call.arguments);
+        }
+
+        match Self::cacheability_for(&call.name) {
+            ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+            ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                ToolCallClassification::Observation
+            }
         }
     }
 
@@ -590,15 +603,10 @@ impl FawxToolExecutor {
     }
 
     fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let desired = requested
-            .map(expand_tilde)
-            .unwrap_or_else(|| self.working_dir.clone());
+        let desired = requested.unwrap_or_else(|| self.working_dir.to_str().unwrap_or("."));
         if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(&desired);
+            return canonicalize_existing_or_parent(Path::new(desired));
         }
-        let desired = desired
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         validate_path(&self.working_dir, desired)
     }
 
@@ -1422,6 +1430,10 @@ impl ToolExecutor for FawxToolExecutor {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         Self::cacheability_for(tool_name)
     }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        Self::classify_call_impl(call)
+    }
 }
 
 impl std::fmt::Debug for FawxToolExecutor {
@@ -1595,15 +1607,12 @@ pub fn fawx_tool_definitions(
         },
         ToolDefinition {
             name: "run_command".to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr. `working_dir` supports `~` to reference the home directory.".to_string(),
+            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "working_dir": {
-                        "type": "string",
-                        "description": "Optional working directory. Supports `~` to reference the home directory."
-                    },
+                    "working_dir": { "type": "string" },
                     "shell": { "type": "boolean" }
                 },
                 "required": ["command"]
@@ -1611,15 +1620,12 @@ pub fn fawx_tool_definitions(
         },
         ToolDefinition {
             name: "exec_background".to_string(),
-            description: "Start a command in the background and return a session ID for monitoring. `working_dir` supports `~` to reference the home directory.".to_string(),
+            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "working_dir": {
-                        "type": "string",
-                        "description": "Optional working directory. Supports `~` to reference the home directory."
-                    },
+                    "working_dir": { "type": "string" },
                     "label": { "type": "string" }
                 },
                 "required": ["command"]
@@ -2184,6 +2190,132 @@ fn format_command_output(output: std::process::Output, shell: bool) -> String {
         String::from_utf8_lossy(&output.stderr)
     ));
     lines.join("\n")
+}
+
+fn classify_run_command_call(args: &serde_json::Value) -> ToolCallClassification {
+    let Ok(parsed): Result<RunCommandArgs, _> = parse_args(args) else {
+        return ToolCallClassification::Mutation;
+    };
+
+    if is_observational_command(parsed.command.trim(), parsed.shell.unwrap_or(false)) {
+        ToolCallClassification::Observation
+    } else {
+        ToolCallClassification::Mutation
+    }
+}
+
+fn is_observational_command(command: &str, shell: bool) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
+    if contains_mutating_shell_syntax(command) {
+        return false;
+    }
+
+    if shell {
+        return shell_segments(command)
+            .into_iter()
+            .all(is_observational_shell_segment);
+    }
+
+    is_observational_program_and_args(
+        &command.split_whitespace().map(str::to_string).collect::<Vec<_>>(),
+    )
+}
+
+fn contains_mutating_shell_syntax(command: &str) -> bool {
+    let normalized = command.replace("\\>", "");
+    normalized.contains(">>")
+        || normalized.contains('>')
+        || normalized.contains("<<")
+        || normalized.contains("| tee")
+        || normalized.contains("|tee")
+}
+
+fn shell_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['\n', ';'])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .flat_map(|segment| segment.split('|'))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn is_observational_shell_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return true;
+    }
+
+    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+    if tokens.is_empty() {
+        return true;
+    }
+
+    if tokens[0] == "cd" {
+        return tokens.len() <= 2;
+    }
+
+    is_observational_program_and_args(&tokens)
+}
+
+fn is_observational_program_and_args(tokens: &[String]) -> bool {
+    let mut index = 0;
+    while index < tokens.len() && looks_like_env_assignment(&tokens[index]) {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return false;
+    }
+
+    let program = tokens[index].as_str();
+    let args = &tokens[index + 1..];
+    match program {
+        "cat" | "grep" | "rg" | "head" | "tail" | "ls" | "find" | "pwd" | "wc" | "which"
+        | "stat" | "file" | "cut" | "sort" | "uniq" | "jq" | "realpath" | "dirname"
+        | "basename" | "printenv" | "env" | "uname" | "date" => true,
+        "echo" => true,
+        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
+        "git" => is_observational_git_command(args),
+        "cargo" => is_observational_cargo_command(args),
+        _ => false,
+    }
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_observational_git_command(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+
+    match subcommand {
+        "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep" | "describe" => {
+            true
+        }
+        "branch" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "--list"),
+        "remote" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "-v"),
+        "config" => args.iter().skip(1).any(|arg| arg == "--get" || arg == "--get-all"),
+        _ => false,
+    }
+}
+
+fn is_observational_cargo_command(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+
+    matches!(subcommand, "metadata" | "tree" | "locate-project" | "help" | "search" | "version")
 }
 
 fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
@@ -3485,18 +3617,6 @@ three
     }
 
     #[tokio::test]
-    async fn run_command_expands_tilde_working_directory_override() {
-        let home = dirs::home_dir().expect("home dir");
-        let executor = test_executor(&home);
-        let output = executor
-            .handle_run_command(&serde_json::json!({"command": "pwd", "working_dir": "~"}))
-            .await
-            .expect("command");
-
-        assert!(output.contains(&format!("stdout:\n{}\n", home.display())));
-    }
-
-    #[tokio::test]
     async fn run_command_blocks_push_to_protected_branch() {
         let temp = TempDir::new().expect("temp");
         let executor = executor_with_protected_branches(temp.path(), &["main"]);
@@ -4086,6 +4206,63 @@ three
         assert_eq!(
             executor.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_read_only_run_command_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep -rn \"kv_get\" ./skills | head -20",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_mutating_run_command_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "cd ~/fawx && cargo run -- skill create x-post",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_redirected_echo_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "echo hello > notes.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
         );
     }
 
