@@ -2809,7 +2809,7 @@ impl LoopEngine {
                     .cloned()
                     .unwrap_or_else(|| self.zero_sub_goal_budget());
                 let execution = self
-                    .run_sub_goal(sub_goal, child_config, llm, context_messages)
+                    .run_sub_goal(sub_goal, child_config, llm, context_messages, &results)
                     .await;
                 self.budget.absorb_child_usage(&execution.budget);
                 self.roll_up_sub_goal_signals(&execution.result.signals);
@@ -2817,6 +2817,8 @@ impl LoopEngine {
             };
 
             let should_halt = should_halt_sub_goal_sequence(&result);
+            let exhausted_with_partial =
+                matches!(result.outcome, SubGoalOutcome::BudgetExhausted { .. }) && !should_halt;
             self.emit_sub_goal_completed(index, total, &result);
             results.push(result);
 
@@ -2828,6 +2830,13 @@ impl LoopEngine {
                     serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
                 );
                 break;
+            } else if exhausted_with_partial {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "continuing remaining sub-goals after partial budget exhaustion",
+                    serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
+                );
             }
         }
 
@@ -2889,7 +2898,7 @@ impl LoopEngine {
 
                 Some(async move {
                     let execution = self
-                        .run_sub_goal(&goal, child_config, llm, context_messages)
+                        .run_sub_goal(&goal, child_config, llm, context_messages, &[])
                         .await;
                     IndexedSubGoalExecution { index, execution }
                 })
@@ -2963,6 +2972,7 @@ impl LoopEngine {
         child_config: BudgetConfig,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        prior_results: &[SubGoalResult],
     ) -> SubGoalExecution {
         let timestamp_ms = current_time_ms();
         let child_budget =
@@ -2974,9 +2984,31 @@ impl LoopEngine {
             Ok(values) => values,
             Err(execution) => return execution,
         };
-        let snapshot = build_sub_goal_snapshot(sub_goal, compacted_context.as_ref(), timestamp_ms);
+        let snapshot = build_sub_goal_snapshot(
+            sub_goal,
+            prior_results,
+            compacted_context.as_ref(),
+            timestamp_ms,
+        );
 
         let result = match Box::pin(child.run_cycle(snapshot, llm)).await {
+            Ok(LoopResult::Complete {
+                response,
+                signals,
+                ..
+            }) => {
+                if let Some(message) =
+                    self.invalid_sub_goal_completion(sub_goal, &signals, &response)
+                {
+                    failed_sub_goal_result_with_signals(sub_goal.clone(), message, signals)
+                } else {
+                    SubGoalResult {
+                        goal: sub_goal.clone(),
+                        outcome: SubGoalOutcome::Completed(response),
+                        signals,
+                    }
+                }
+            }
             Ok(result) => sub_goal_result_from_loop(sub_goal.clone(), result),
             Err(error) => failed_sub_goal_result(sub_goal.clone(), error.reason),
         };
@@ -3046,6 +3078,50 @@ impl LoopEngine {
         let mut child = builder.build()?;
         child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
         Ok(child)
+    }
+
+    fn invalid_sub_goal_completion(
+        &self,
+        sub_goal: &SubGoal,
+        signals: &[Signal],
+        response: &str,
+    ) -> Option<String> {
+        let used_tools = successful_tool_names(signals);
+        let required_side_effect_tools: Vec<&str> = sub_goal
+            .required_tools
+            .iter()
+            .filter(|tool_name| {
+                self.tool_executor.cacheability(tool_name.as_str()) == ToolCacheability::SideEffect
+            })
+            .map(String::as_str)
+            .collect();
+
+        if !required_side_effect_tools.is_empty()
+            && required_side_effect_tools
+                .iter()
+                .all(|tool_name| !used_tools.contains(*tool_name))
+        {
+            return Some(format!(
+                "sub-goal ended without using any required side-effect tools ({}) despite returning a response: {}",
+                required_side_effect_tools.join(", "),
+                truncate_prompt_text(response, 180)
+            ));
+        }
+
+        if !sub_goal.required_tools.is_empty()
+            && sub_goal
+                .required_tools
+                .iter()
+                .all(|tool_name| !used_tools.contains(tool_name.as_str()))
+        {
+            return Some(format!(
+                "sub-goal ended without using any required tools ({}) despite returning a response: {}",
+                sub_goal.required_tools.join(", "),
+                truncate_prompt_text(response, 180)
+            ));
+        }
+
+        None
     }
 
     fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -4654,10 +4730,18 @@ fn child_max_iterations(max_iterations: u32) -> u32 {
 
 fn build_sub_goal_snapshot(
     sub_goal: &SubGoal,
+    prior_results: &[SubGoalResult],
     context_messages: &[Message],
     timestamp_ms: u64,
 ) -> PerceptionSnapshot {
     let description = sub_goal.description.clone();
+    let mut conversation_history = context_messages.to_vec();
+    if !prior_results.is_empty() {
+        conversation_history.push(Message::assistant(format!(
+            "Prior decomposition results for context only:\n{}",
+            aggregate_sub_goal_results(prior_results)
+        )));
+    }
     PerceptionSnapshot {
         timestamp_ms,
         screen: ScreenState {
@@ -4676,7 +4760,7 @@ fn build_sub_goal_snapshot(
             documents: Vec::new(),
         }),
         sensor_data: None,
-        conversation_history: context_messages.to_vec(),
+        conversation_history,
         steer_context: None,
     }
 }
@@ -4690,9 +4774,13 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             outcome: SubGoalOutcome::Completed(response),
             signals,
         },
-        LoopResult::BudgetExhausted { signals, .. } => SubGoalResult {
+        LoopResult::BudgetExhausted {
+            partial_response,
+            signals,
+            ..
+        } => SubGoalResult {
             goal,
-            outcome: SubGoalOutcome::BudgetExhausted,
+            outcome: SubGoalOutcome::BudgetExhausted { partial_response },
             signals,
         },
         LoopResult::Error {
@@ -4703,6 +4791,14 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             failed_sub_goal_result_with_signals(goal, message, signals)
         }
     }
+}
+
+fn successful_tool_names(signals: &[Signal]) -> std::collections::HashSet<&str> {
+    signals
+        .iter()
+        .filter(|signal| signal.step == LoopStep::Act && signal.kind == SignalKind::Success)
+        .filter_map(|signal| signal.message.strip_prefix("tool "))
+        .collect()
 }
 
 fn failed_sub_goal_execution(
@@ -4765,13 +4861,28 @@ fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
     match outcome {
         SubGoalOutcome::Completed(response) => format!("completed: {response}"),
         SubGoalOutcome::Failed(message) => format!("failed: {message}"),
-        SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
+        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                format!(
+                    "budget exhausted after partial: {}",
+                    truncate_prompt_text(text, 240)
+                )
+            })
+            .unwrap_or_else(|| "budget exhausted".to_string()),
         SubGoalOutcome::Skipped => "skipped (below floor)".to_string(),
     }
 }
 
 fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
-    matches!(result.outcome, SubGoalOutcome::BudgetExhausted)
+    match &result.outcome {
+        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty),
+        _ => false,
+    }
 }
 
 fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMode {
@@ -5555,7 +5666,9 @@ fn format_system_status_message(status: &LoopStatus) -> String {
 
 fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Vec<Message> {
     let mut continuation_messages = base_messages.to_vec();
-    continuation_messages.push(Message::assistant(full_text.to_string()));
+    if !full_text.trim().is_empty() {
+        continuation_messages.push(Message::assistant(full_text.to_string()));
+    }
     continuation_messages.push(Message::user(
         "Continue from exactly where you left off. Do not repeat prior text.",
     ));
@@ -7298,6 +7411,19 @@ mod phase2_tests {
         assert!(
             matches!(result, LoopResult::BudgetExhausted { .. }),
             "expected LoopResult::BudgetExhausted, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_continuation_messages_omits_empty_assistant_text() {
+        let base_messages = vec![Message::user("Start here")];
+        let messages = build_continuation_messages(&base_messages, "");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], Message::user("Start here"));
+        assert_eq!(
+            messages[1],
+            Message::user("Continue from exactly where you left off. Do not repeat prior text.")
         );
     }
 
@@ -12240,7 +12366,9 @@ mod decomposition_tests {
             complexity_hint: None,
         };
         let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
-        let execution = engine.run_sub_goal(&goal, child_budget, &llm, &[]).await;
+        let execution = engine
+            .run_sub_goal(&goal, child_budget, &llm, &[], &[])
+            .await;
 
         assert_eq!(execution.budget.depth(), 1);
         assert_eq!(execution.budget.config().max_recursion_depth, effective_cap);
@@ -12252,6 +12380,177 @@ mod decomposition_tests {
             format_sub_goal_outcome(&SubGoalOutcome::Skipped),
             "skipped (below floor)"
         );
+    }
+
+    #[test]
+    fn format_sub_goal_outcome_includes_budget_exhausted_partial_response() {
+        let outcome = SubGoalOutcome::BudgetExhausted {
+            partial_response: Some(
+                "I have enough from the search results to write a comprehensive spec.".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            format_sub_goal_outcome(&outcome),
+            "budget exhausted after partial: I have enough from the search results to write a comprehensive spec."
+        );
+    }
+
+    #[test]
+    fn sub_goal_result_from_loop_preserves_budget_exhausted_partial_response() {
+        let goal = SubGoal {
+            description: "Research X POST endpoint".to_string(),
+            required_tools: vec!["web_search".to_string()],
+            expected_output: Some("Endpoint summary".to_string()),
+            complexity_hint: None,
+        };
+
+        let result = sub_goal_result_from_loop(
+            goal.clone(),
+            LoopResult::BudgetExhausted {
+                partial_response: Some("Enough research to proceed with implementation.".into()),
+                iterations: 3,
+                signals: Vec::new(),
+            },
+        );
+
+        assert_eq!(result.goal, goal);
+        assert!(matches!(
+            result.outcome,
+            SubGoalOutcome::BudgetExhausted {
+                partial_response: Some(ref text)
+            } if text == "Enough research to proceed with implementation."
+        ));
+    }
+
+    #[test]
+    fn should_halt_sub_goal_sequence_allows_budget_exhausted_partial_response() {
+        let result = SubGoalResult {
+            goal: SubGoal {
+                description: "Research X API".to_string(),
+                required_tools: vec!["web_search".to_string()],
+                expected_output: Some("Endpoint summary".to_string()),
+                complexity_hint: None,
+            },
+            outcome: SubGoalOutcome::BudgetExhausted {
+                partial_response: Some("Enough research to scaffold the skill.".to_string()),
+            },
+            signals: Vec::new(),
+        };
+
+        assert!(
+            !should_halt_sub_goal_sequence(&result),
+            "useful partial output should allow later sub-goals to continue"
+        );
+    }
+
+    #[test]
+    fn build_sub_goal_snapshot_includes_prior_results_in_conversation_history() {
+        let sub_goal = SubGoal {
+            description: "Implement the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            expected_output: Some("Working skill".to_string()),
+            complexity_hint: None,
+        };
+        let prior_results = vec![SubGoalResult {
+            goal: SubGoal {
+                description: "Research X API".to_string(),
+                required_tools: vec!["web_search".to_string()],
+                expected_output: Some("Spec".to_string()),
+                complexity_hint: None,
+            },
+            outcome: SubGoalOutcome::BudgetExhausted {
+                partial_response: Some("Endpoint, auth, and rate-limit details confirmed.".into()),
+            },
+            signals: Vec::new(),
+        }];
+        let snapshot = build_sub_goal_snapshot(&sub_goal, &prior_results, &[], 42);
+
+        assert_eq!(
+            snapshot
+                .user_input
+                .as_ref()
+                .expect("user input")
+                .text,
+            "Implement the skill"
+        );
+        let last_message = snapshot
+            .conversation_history
+            .last()
+            .expect("prior results context message");
+        assert!(message_to_text(last_message).contains("Prior decomposition results for context only"));
+        assert!(message_to_text(last_message).contains("Research X API"));
+        assert!(message_to_text(last_message)
+            .contains("Endpoint, auth, and rate-limit details confirmed."));
+    }
+
+    #[tokio::test]
+    async fn sub_goal_complete_without_required_side_effect_tool_is_rejected() {
+        #[derive(Debug, Default)]
+        struct SideEffectToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for SideEffectToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]
+            }
+
+            fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+                match tool_name {
+                    "run_command" => crate::act::ToolCacheability::SideEffect,
+                    _ => crate::act::ToolCacheability::NeverCache,
+                }
+            }
+        }
+
+        let started_at_ms = current_time_ms();
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(budget_config(20, 6), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(SideEffectToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let goal = SubGoal {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            expected_output: Some("Scaffolded skill".to_string()),
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![Ok(text_response(
+            "Here's the complete implementation plan and code.",
+        ))]);
+
+        let execution = engine
+            .run_sub_goal(&goal, BudgetConfig::default(), &llm, &[], &[])
+            .await;
+
+        let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
+            panic!("expected failed sub-goal outcome")
+        };
+        assert!(message.contains("without using any required side-effect tools (run_command)"));
+        assert!(message.contains("complete implementation plan and code"));
     }
 
     #[tokio::test]
@@ -13341,7 +13640,7 @@ mod context_compaction_tests {
         let child_budget = BudgetConfig::default();
 
         let _execution = engine
-            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60))
+            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60), &[])
             .await;
 
         let requests = llm.requests();
@@ -13371,7 +13670,7 @@ mod context_compaction_tests {
         let child_budget = BudgetConfig::default();
 
         let execution = engine
-            .run_sub_goal(&goal, child_budget, &llm, &protected)
+            .run_sub_goal(&goal, child_budget, &llm, &protected, &[])
             .await;
         let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
             panic!("expected failed sub-goal outcome")

@@ -502,13 +502,15 @@ impl SessionTurnCollector {
         let mut messages = vec![user_session_message(
             user_text, images, documents, timestamp,
         )];
-        let assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
+        let mut assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
 
         if assistant_messages.is_empty() {
-            messages.push(fallback_assistant_message(fallback_response, timestamp));
-        } else {
-            messages.extend(assistant_messages);
+            assistant_messages.push(fallback_assistant_message(fallback_response, timestamp));
+        } else if should_append_terminal_assistant_message(&assistant_messages, fallback_response) {
+            assistant_messages.push(fallback_assistant_message(fallback_response, timestamp));
         }
+
+        messages.extend(assistant_messages);
 
         messages
     }
@@ -630,6 +632,35 @@ fn fallback_assistant_message(fallback_response: &str, timestamp: u64) -> Sessio
         timestamp,
         None,
     )
+}
+
+fn should_append_terminal_assistant_message(
+    assistant_messages: &[SessionMessage],
+    fallback_response: &str,
+) -> bool {
+    if !has_meaningful_response(Some(fallback_response)) {
+        return false;
+    }
+
+    let normalized_fallback = normalize_session_message_text(fallback_response);
+    assistant_messages
+        .iter()
+        .rev()
+        .find_map(last_visible_assistant_text)
+        .is_none_or(|existing| normalize_session_message_text(&existing) != normalized_fallback)
+}
+
+fn last_visible_assistant_text(message: &SessionMessage) -> Option<String> {
+    if message.role != SessionRecordRole::Assistant {
+        return None;
+    }
+
+    let text = message.render_text().trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn normalize_session_message_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn build_assistant_turn_messages(
@@ -3569,7 +3600,7 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         });
 
-        let messages = collector.session_messages_for_turn("open the readme", &[], &[], "fallback");
+        let messages = collector.session_messages_for_turn("open the readme", &[], &[], "Done.");
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, SessionRecordRole::User);
@@ -3650,9 +3681,14 @@ mod tests {
             is_error: false,
         });
 
-        let messages = collector.session_messages_for_turn("search rust", &[], &[], "fallback");
+        let messages = collector.session_messages_for_turn(
+            "search rust",
+            &[],
+            &[],
+            "Rust search results are ready.",
+        );
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
         assert_eq!(messages[1].token_count, Some(12));
         assert!(messages[1].content.iter().any(|block| matches!(
@@ -3664,6 +3700,8 @@ mod tests {
             block,
             SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
         )));
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[3].render_text(), "Rust search results are ready.");
     }
 
     #[test]
@@ -3688,10 +3726,14 @@ mod tests {
             stop_reason: Some("tool_use".to_string()),
         });
 
-        let messages =
-            collector.session_messages_for_turn("weather in denver", &[], &[], "fallback");
+        let messages = collector.session_messages_for_turn(
+            "weather in denver",
+            &[],
+            &[],
+            "Weather lookup requires executing the recorded tool call.",
+        );
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         let tool_use_blocks = messages[1]
             .content
             .iter()
@@ -3714,6 +3756,51 @@ mod tests {
                     && *name == "weather"
                     && **input == serde_json::json!({"location": "Denver, CO"})
         ));
+        assert_eq!(
+            messages[2].render_text(),
+            "Weather lookup requires executing the recorded tool call."
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_appends_terminal_summary_after_tool_only_history() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_4".to_string(),
+                provider_id: None,
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "X API POST /2/tweets"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_4".to_string(),
+            output: "search results".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "Research the X API",
+            &[],
+            &[],
+            "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation.",
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(
+            messages[3].render_text(),
+            "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation."
+        );
     }
 
     #[test]

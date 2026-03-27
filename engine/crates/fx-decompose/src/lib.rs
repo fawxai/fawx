@@ -409,7 +409,10 @@ pub enum SubGoalOutcome {
     Completed(String),
     Incomplete(String),
     Failed(String),
-    BudgetExhausted,
+    BudgetExhausted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_response: Option<String>,
+    },
     Skipped,
 }
 
@@ -510,7 +513,9 @@ mod tests {
         let completed = SubGoalOutcome::Completed("ok".to_string());
         let incomplete = SubGoalOutcome::Incomplete("needs more evidence".to_string());
         let failed = SubGoalOutcome::Failed("boom".to_string());
-        let exhausted = SubGoalOutcome::BudgetExhausted;
+        let exhausted = SubGoalOutcome::BudgetExhausted {
+            partial_response: Some("partial".to_string()),
+        };
         let skipped = SubGoalOutcome::Skipped;
 
         assert!(matches!(completed, SubGoalOutcome::Completed(text) if text == "ok"));
@@ -518,7 +523,12 @@ mod tests {
             matches!(incomplete, SubGoalOutcome::Incomplete(text) if text == "needs more evidence")
         );
         assert!(matches!(failed, SubGoalOutcome::Failed(text) if text == "boom"));
-        assert!(matches!(exhausted, SubGoalOutcome::BudgetExhausted));
+        assert!(
+            matches!(
+                exhausted,
+                SubGoalOutcome::BudgetExhausted { partial_response: Some(text) } if text == "partial"
+            )
+        );
         assert!(matches!(skipped, SubGoalOutcome::Skipped));
     }
 
@@ -671,5 +681,18 @@ mod tests {
             goal.classify("done"),
             SubGoalCompletionClassification::Completed
         );
+    }
+
+    #[test]
+    fn budget_exhausted_outcome_roundtrip_preserves_partial_response() {
+        let original = SubGoalOutcome::BudgetExhausted {
+            partial_response: Some("researched enough to write the spec".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&original).expect("serialize exhausted");
+        let decoded: SubGoalOutcome =
+            serde_json::from_str(&encoded).expect("deserialize exhausted");
+
+        assert_eq!(decoded, original);
     }
 }
