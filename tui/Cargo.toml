@@ -45,7 +45,9 @@ url = "2"
 
 [dev-dependencies]
 fx-config = { workspace = true, features = ["test-support"] }
+fx-core = { workspace = true }
 fx-llm = { workspace = true }
+fx-ripcord = { path = "../engine/crates/fx-ripcord" }
 fx-subagent = { workspace = true }
 insta = "1"
 itertools = "0.13"
