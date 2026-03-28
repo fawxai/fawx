@@ -29,6 +29,7 @@ struct OnboardingView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Color.fawxAccent)
+                    .accessibilityIdentifier("returnToLocalSetupButton")
                 }
 #endif
             }

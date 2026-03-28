@@ -61,6 +61,15 @@ actor AppStatePersistence {
             )
         }
 
+        if UITestLaunchOptions.isUITesting,
+           UITestLaunchOptions.defaultsSuiteOverride != nil || UITestLaunchOptions.keychainServiceOverride != nil
+        {
+            return AppStatePersistence(
+                defaultsSuiteName: UITestLaunchOptions.defaultsSuiteOverride,
+                keychainService: UITestLaunchOptions.keychainServiceOverride ?? KeychainHelper.defaultService
+            )
+        }
+
         return AppStatePersistence()
     }
 

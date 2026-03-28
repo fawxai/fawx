@@ -3,6 +3,52 @@ import XCTest
 @testable import Fawx
 
 final class LocalInstallConfigurationTests: XCTestCase {
+    func testUITestOverrideValueRequiresUITestingArgument() {
+        let environment = ["FAWX_TEST_LOCAL_CONFIG_PATH": "/tmp/fawx/config.toml"]
+
+        XCTAssertNil(
+            UITestLaunchOptions.overrideValue(
+                for: UITestLaunchOptions.localConfigPathEnvironmentKey,
+                environment: environment,
+                arguments: []
+            )
+        )
+        XCTAssertEqual(
+            UITestLaunchOptions.overrideValue(
+                for: UITestLaunchOptions.localConfigPathEnvironmentKey,
+                environment: environment,
+                arguments: [UITestLaunchOptions.uiTestingArgument]
+            ),
+            "/tmp/fawx/config.toml"
+        )
+    }
+
+    func testUITestFlagValueDistinguishesFalseFromUnknown() {
+        XCTAssertEqual(
+            UITestLaunchOptions.flagValue(
+                for: UITestLaunchOptions.disableLocalInstallEnvironmentKey,
+                environment: [UITestLaunchOptions.disableLocalInstallEnvironmentKey: "false"],
+                arguments: [UITestLaunchOptions.uiTestingArgument]
+            ),
+            false
+        )
+        XCTAssertEqual(
+            UITestLaunchOptions.flagValue(
+                for: UITestLaunchOptions.disableLocalInstallEnvironmentKey,
+                environment: [UITestLaunchOptions.disableLocalInstallEnvironmentKey: "true"],
+                arguments: [UITestLaunchOptions.uiTestingArgument]
+            ),
+            true
+        )
+        XCTAssertNil(
+            UITestLaunchOptions.flagValue(
+                for: UITestLaunchOptions.disableLocalInstallEnvironmentKey,
+                environment: [UITestLaunchOptions.disableLocalInstallEnvironmentKey: "maybe"],
+                arguments: [UITestLaunchOptions.uiTestingArgument]
+            )
+        )
+    }
+
     func testLoadFromParsesHTTPSection() async throws {
         let directoryURL = makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directoryURL) }

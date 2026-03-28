@@ -50,6 +50,17 @@
                ReferencedContainer = "container:Fawx.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "BC0A5A949F25CF46664C402D"
+               BuildableName = "FawxUITests-macOS.xctest"
+               BlueprintName = "FawxUITests-macOS"
+               ReferencedContainer = "container:Fawx.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>

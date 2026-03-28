@@ -70,6 +70,19 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.iosUITests
         TEST_TARGET_NAME: Fawx-iOS
+  FawxUITests-macOS:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: FawxUITests
+    dependencies:
+      - target: Fawx-macOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: ai.fawx.app.macUITests
+        TEST_TARGET_NAME: Fawx-macOS
   FawxTests-macOS:
     type: bundle.unit-test
     platform: macOS
@@ -108,6 +121,7 @@ schemes:
       config: Debug
       targets:
         - FawxTests-macOS
+        - FawxUITests-macOS
     run:
       config: Debug
   Fawx-iOS:
