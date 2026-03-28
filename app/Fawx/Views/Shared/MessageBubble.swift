@@ -15,21 +15,30 @@ struct MessageBubble: View {
     let content: String
     let timestamp: Int?
     let isStreaming: Bool
+    let footnoteText: String?
     private let contentBlocks: [SessionContentBlock]?
 
-    init(message: SessionMessage) {
+    init(message: SessionMessage, footnoteText: String? = nil) {
         self.role = message.role
         self.content = message.content
         self.timestamp = message.timestamp
         self.isStreaming = false
+        self.footnoteText = footnoteText
         self.contentBlocks = message.contentBlocks
     }
 
-    init(role: MessageRole, content: String, timestamp: Int? = nil, isStreaming: Bool = false) {
+    init(
+        role: MessageRole,
+        content: String,
+        timestamp: Int? = nil,
+        isStreaming: Bool = false,
+        footnoteText: String? = nil
+    ) {
         self.role = role
         self.content = content
         self.timestamp = timestamp
         self.isStreaming = isStreaming
+        self.footnoteText = footnoteText
         self.contentBlocks = nil
     }
 
@@ -62,11 +71,22 @@ struct MessageBubble: View {
                     .overlay(bubbleBorder)
                     .clipShape(RoundedRectangle(cornerRadius: bubbleCornerRadius))
 
-                if let timestamp {
-                    Text(timeString(timestamp))
-                        .font(FawxTypography.status)
-                        .foregroundStyle(Color.fawxTextSecondary)
-                        .monospacedDigit()
+                if timestamp != nil || footnoteText != nil {
+                    VStack(alignment: role == .user ? .trailing : .leading, spacing: 2) {
+                        if let timestamp {
+                            Text(timeString(timestamp))
+                                .font(FawxTypography.status)
+                                .foregroundStyle(Color.fawxTextSecondary)
+                                .monospacedDigit()
+                        }
+
+                        if let footnoteText, !footnoteText.isEmpty {
+                            Text(footnoteText)
+                                .font(FawxTypography.status)
+                                .foregroundStyle(Color.fawxTextSecondary)
+                                .monospacedDigit()
+                        }
+                    }
                 }
             }
             .frame(

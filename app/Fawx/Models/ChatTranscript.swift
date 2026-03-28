@@ -39,6 +39,7 @@ struct TranscriptMessage: Identifiable, Hashable, Sendable {
     let id: String
     let message: SessionMessage
     let displayText: String
+    let footnoteText: String?
 }
 
 enum ChatTranscriptItem: Identifiable, Hashable, Sendable {

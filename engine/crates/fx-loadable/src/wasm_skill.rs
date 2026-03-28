@@ -645,6 +645,37 @@ mod tests {
         assert_eq!(defs[0].parameters["required"], serde_json::json!(["query"]));
     }
 
+    #[tokio::test]
+    async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
+        let mut manifest = test_manifest("weather");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "weather".to_string(),
+            description: "Weather".to_string(),
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "location".to_string(),
+                kind: "string".to_string(),
+                description: "City or location".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let defs = skill.tool_definitions();
+        assert_eq!(defs[0].name, "weather");
+        assert!(defs[0].parameters["properties"].get("location").is_some());
+        assert!(defs[0].parameters["properties"].get("input").is_none());
+
+        let result = skill
+            .execute("weather", r#"{"location":"Denver, CO"}"#, None)
+            .await;
+        assert!(result.is_some());
+        assert!(result.expect("known tool").is_ok());
+    }
+
     #[test]
     fn wasm_skill_cacheability_is_never() {
         let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");

@@ -6,3 +6,19 @@ author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = ["network"]
 entry_point = "run"
+
+[[tools]]
+name = "weather"
+description = "Get current weather and a short forecast for a specific location"
+
+[[tools.parameters]]
+name = "location"
+type = "string"
+description = "City or location to check weather for"
+required = true
+
+[[tools.parameters]]
+name = "units"
+type = "string"
+description = "Optional units override: fahrenheit or celsius"
+required = false

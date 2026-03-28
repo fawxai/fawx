@@ -1014,7 +1014,32 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 114)))
         XCTAssertEqual(
             sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 195)),
-            "Active for 1m 35s"
+            "Worked for 1 minute 35 seconds"
+        )
+    }
+
+    func testCompletedStreamingFootnoteAttachesToFinalAssistantTranscriptItem() {
+        let sut = makeSUT()
+        let sessionID = "session-a"
+        let startedAt = Date(timeIntervalSince1970: 100)
+        let endedAt = Date(timeIntervalSince1970: 195)
+        let message = SessionMessage(role: .assistant, content: "done", timestamp: 195)
+
+        sut.recordCompletedStreamingFootnoteForTesting(
+            message,
+            sessionID: sessionID,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+
+        let items = sut.makeTranscriptItemsForTesting(sessionID: sessionID, messages: [message])
+        guard case let .message(transcriptMessage)? = items.first else {
+            return XCTFail("expected message transcript item")
+        }
+
+        XCTAssertEqual(
+            transcriptMessage.footnoteText,
+            "Worked for 1 minute 35 seconds"
         )
     }
 
