@@ -121,6 +121,10 @@ struct JsonOutput {
     response: String,
     model: String,
     iterations: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_errors: Vec<String>,
 }
 
 // ── CycleResult ─────────────────────────────────────────────────────────────
@@ -828,6 +832,49 @@ fn current_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn json_output_from_cycle(result: CycleResult, session_messages: &[SessionMessage]) -> JsonOutput {
+    JsonOutput {
+        response: result.response,
+        model: result.model,
+        iterations: result.iterations,
+        tool_calls: session_tool_calls(session_messages),
+        tool_errors: session_tool_errors(session_messages),
+    }
+}
+
+fn session_tool_calls(messages: &[SessionMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_tool_errors(messages: &[SessionMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolResult {
+                content,
+                is_error: Some(true),
+                ..
+            } => Some(session_tool_error_text(content)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_tool_error_text(content: &serde_json::Value) -> String {
+    content
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| content.to_string())
 }
 
 fn merge_stream_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
@@ -1696,11 +1743,7 @@ impl HeadlessApp {
     async fn process_input(&mut self, input: &str, json_mode: bool) -> Result<(), anyhow::Error> {
         let result = self.process_message(input).await?;
         if json_mode {
-            let output = JsonOutput {
-                response: result.response,
-                model: result.model,
-                iterations: result.iterations,
-            };
+            let output = json_output_from_cycle(result, &self.last_session_messages);
             let json = serde_json::to_string(&output)?;
             println!("{json}");
             io::stdout().flush()?;
@@ -4954,12 +4997,54 @@ mod tests {
             response: "hello".to_string(),
             model: "gpt-4".to_string(),
             iterations: 2,
+            tool_calls: vec!["read_file".to_string()],
+            tool_errors: vec!["missing file".to_string()],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
+        assert_eq!(json["tool_calls"], serde_json::json!(["read_file"]));
+        assert_eq!(json["tool_errors"], serde_json::json!(["missing file"]));
+    }
+
+    #[test]
+    fn json_output_collects_tool_metadata_from_session_messages() {
+        let result = CycleResult {
+            response: "done".to_string(),
+            model: "mock-model".to_string(),
+            iterations: 3,
+            tokens_used: TokenUsage::default(),
+            result_kind: ResultKind::Complete,
+        };
+        let messages = vec![
+            SessionMessage::structured(
+                SessionRecordRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                1,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionRecordRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("missing"),
+                    is_error: Some(true),
+                }],
+                2,
+                None,
+            ),
+        ];
+
+        let output = json_output_from_cycle(result, &messages);
+        assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert_eq!(output.tool_errors, vec!["missing"]);
     }
 
     #[test]
