@@ -2249,12 +2249,15 @@ fn is_observational_command(command: &str, shell: bool) -> bool {
     }
 
     is_observational_program_and_args(
-        &command.split_whitespace().map(str::to_string).collect::<Vec<_>>(),
+        &command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
     )
 }
 
 fn contains_mutating_shell_syntax(command: &str) -> bool {
-    let normalized = command.replace("\\>", "");
+    let normalized = strip_quoted_shell_strings(command).replace("\\>", "");
     normalized.contains(">>")
         || normalized.contains('>')
         || normalized.contains("<<")
@@ -2262,15 +2265,104 @@ fn contains_mutating_shell_syntax(command: &str) -> bool {
         || normalized.contains("|tee")
 }
 
+fn strip_quoted_shell_strings(command: &str) -> String {
+    let mut stripped = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut active_quote = None;
+
+    while let Some(ch) = chars.next() {
+        match active_quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    active_quote = None;
+                }
+            }
+            Some('"') => {
+                if ch == '\\' {
+                    let _ = chars.next();
+                } else if ch == '"' {
+                    active_quote = None;
+                }
+            }
+            Some('`') => {
+                if ch == '`' {
+                    active_quote = None;
+                }
+            }
+            Some(_) => {}
+            None => match ch {
+                '\'' | '"' | '`' => active_quote = Some(ch),
+                _ => stripped.push(ch),
+            },
+        }
+    }
+
+    stripped
+}
+
 fn shell_segments(command: &str) -> Vec<&str> {
-    command
-        .split(['\n', ';'])
-        .flat_map(|segment| segment.split("&&"))
-        .flat_map(|segment| segment.split("||"))
-        .flat_map(|segment| segment.split('|'))
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect()
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = command.char_indices().peekable();
+    let mut active_quote = None;
+
+    while let Some((index, ch)) = chars.next() {
+        match active_quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    active_quote = None;
+                }
+            }
+            Some('"') => {
+                if ch == '\\' {
+                    let _ = chars.next();
+                } else if ch == '"' {
+                    active_quote = None;
+                }
+            }
+            Some('`') => {
+                if ch == '`' {
+                    active_quote = None;
+                }
+            }
+            Some(_) => {}
+            None => {
+                if matches!(ch, '\'' | '"' | '`') {
+                    active_quote = Some(ch);
+                    continue;
+                }
+
+                let separator_len = match ch {
+                    '\n' | ';' | '|' => {
+                        if ch == '|' && matches!(chars.peek(), Some((_, '|'))) {
+                            let _ = chars.next();
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    '&' if matches!(chars.peek(), Some((_, '&'))) => {
+                        let _ = chars.next();
+                        2
+                    }
+                    _ => continue,
+                };
+
+                let segment = command[start..index].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                start = index + separator_len;
+            }
+        }
+    }
+
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        segments.push(tail);
+    }
+
+    segments
 }
 
 fn is_observational_shell_segment(segment: &str) -> bool {
@@ -2290,6 +2382,8 @@ fn is_observational_shell_segment(segment: &str) -> bool {
     is_observational_program_and_args(&tokens)
 }
 
+// TODO(#1639): replace this static shell allowlist with declarative
+// observation/mutation metadata owned by the tool or executor.
 fn is_observational_program_and_args(tokens: &[String]) -> bool {
     let mut index = 0;
     while index < tokens.len() && looks_like_env_assignment(&tokens[index]) {
@@ -2303,7 +2397,7 @@ fn is_observational_program_and_args(tokens: &[String]) -> bool {
     let args = &tokens[index + 1..];
     match program {
         "cat" | "grep" | "rg" | "head" | "tail" | "ls" | "find" | "pwd" | "wc" | "which"
-        | "stat" | "file" | "cut" | "sort" | "uniq" | "jq" | "realpath" | "dirname"
+        | "stat" | "file" | "cut" | "sort" | "uniq" | "jq" | "awk" | "realpath" | "dirname"
         | "basename" | "printenv" | "env" | "uname" | "date" => true,
         "echo" => true,
         "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
@@ -2329,12 +2423,13 @@ fn is_observational_git_command(args: &[String]) -> bool {
     };
 
     match subcommand {
-        "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep" | "describe" => {
-            true
-        }
+        "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep" | "describe" => true,
         "branch" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "--list"),
         "remote" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "-v"),
-        "config" => args.iter().skip(1).any(|arg| arg == "--get" || arg == "--get-all"),
+        "config" => args
+            .iter()
+            .skip(1)
+            .any(|arg| arg == "--get" || arg == "--get-all"),
         _ => false,
     }
 }
@@ -2344,7 +2439,10 @@ fn is_observational_cargo_command(args: &[String]) -> bool {
         return false;
     };
 
-    matches!(subcommand, "metadata" | "tree" | "locate-project" | "help" | "search" | "version")
+    matches!(
+        subcommand,
+        "metadata" | "tree" | "locate-project" | "help" | "search" | "version"
+    )
 }
 
 fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
@@ -4296,6 +4394,63 @@ three
     }
 
     #[test]
+    fn classify_call_treats_quoted_grep_gt_pattern_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep \"error > warning\" log.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_jq_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "jq '.items[] | select(.value > 5)' report.json",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_awk_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "awk '$1 > 100' metrics.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
     fn route_sub_goal_call_rejects_tools_with_required_arguments() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -4305,7 +4460,9 @@ three
         };
 
         assert!(
-            executor.route_sub_goal_call(&request, "decompose-gate-0").is_none(),
+            executor
+                .route_sub_goal_call(&request, "decompose-gate-0")
+                .is_none(),
             "run_command should not be direct-routed without a declared materializer"
         );
     }

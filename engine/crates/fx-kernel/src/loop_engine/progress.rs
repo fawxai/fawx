@@ -1,4 +1,14 @@
-use super::*;
+use super::{
+    direct_utility_progress, BoundedLocalPhase, CycleStream, LoopEngine, TurnExecutionProfile,
+    DECOMPOSE_TOOL_NAME,
+};
+use crate::act::{
+    ContinuationToolScope, ProceedUnderConstraints, ToolCacheability, ToolCallClassification,
+    ToolExecutor, TurnCommitment,
+};
+use crate::streaming::StreamEvent;
+use fx_core::message::{InternalMessage, ProgressKind};
+use fx_llm::ToolCall;
 
 impl LoopEngine {
     pub(super) fn emit_public_progress(

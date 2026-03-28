@@ -2,8 +2,7 @@
 
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    ProceedUnderConstraints, TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor,
-    ToolResult, TurnCommitment,
+    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
 };
 use crate::budget::{
     build_skip_mask, effective_max_depth, estimate_complexity, truncate_tool_result, ActionCost,
@@ -62,6 +61,8 @@ mod continuation;
 mod direct_utility;
 mod progress;
 
+#[cfg(test)]
+use crate::act::ProceedUnderConstraints;
 use bounded_local::{
     bounded_local_phase_label, bounded_local_terminal_partial_response,
     bounded_local_terminal_reason_label, bounded_local_terminal_reason_text,
@@ -73,10 +74,11 @@ use continuation::{
     tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
     turn_commitment_metadata,
 };
+#[cfg(test)]
+use direct_utility::DirectUtilityProfile;
 use direct_utility::{
     detect_direct_utility_profile, direct_utility_completion_response, direct_utility_directive,
     direct_utility_progress, direct_utility_terminal_response, direct_utility_tool_names,
-    DirectUtilityProfile,
 };
 use progress::json_string_arg;
 #[cfg(test)]
@@ -481,14 +483,12 @@ impl LoopResult {
                     .unwrap_or_else(|| "budget exhausted".to_string()),
             ),
             Self::Incomplete {
-                partial_response,
-                reason,
-                ..
+                partial_response, ..
             } => Some(
                 partial_response
                     .clone()
                     .filter(|text| !text.trim().is_empty())
-                    .unwrap_or_else(|| reason.clone()),
+                    .unwrap_or_else(|| INCOMPLETE_FALLBACK_RESPONSE.to_string()),
             ),
             Self::UserStopped {
                 partial_response, ..
@@ -1615,6 +1615,7 @@ Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
+const INCOMPLETE_FALLBACK_RESPONSE: &str = "I couldn't complete that run.";
 const TOOL_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
 const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several rounds without providing a response. Share your progress with the user now. If you have enough information to answer, do so immediately instead of calling more tools.";
 const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool rounds only gathering information. Stop doing more read-only research unless it is absolutely necessary. If you have enough context, switch to implementation-side tools now. Otherwise, respond with what you learned, what remains blocked, and what input you need.";
@@ -12037,6 +12038,26 @@ mod cancellation_tests {
             .iter()
             .any(|event| matches!(event, StreamEvent::Notification { .. })));
         assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_uses_polished_incomplete_fallback_when_no_partial_exists() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Incomplete {
+                partial_response: None,
+                reason: "iteration limit reached before a usable final response was produced"
+                    .to_string(),
+                iterations: 2,
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert_done_event(&events, INCOMPLETE_FALLBACK_RESPONSE);
     }
 
     #[tokio::test]

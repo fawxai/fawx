@@ -197,7 +197,7 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Result of the Act step.
+/// Terminal disposition for a single Act step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ActionTerminal {
     /// Act produced a final user-visible response.
@@ -209,7 +209,7 @@ pub enum ActionTerminal {
     },
 }
 
-/// Result of the Act step.
+/// Tool-surface restriction applied to the next root reasoning pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContinuationToolScope {
     /// Keep the full root tool surface available.
@@ -257,7 +257,7 @@ pub enum TurnCommitment {
     NeedsDirection(NeedsDirection),
 }
 
-/// Result of the Act step.
+/// Continuation payload for an Act step that needs another outer-loop pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionContinuation {
     /// Partial user-visible progress to preserve if the run is interrupted.
@@ -306,7 +306,7 @@ impl ActionContinuation {
     }
 }
 
-/// Result of the Act step.
+/// Explicit next-step disposition selected by the Act step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ActionNextStep {
     /// The outer loop should reason again with updated context.

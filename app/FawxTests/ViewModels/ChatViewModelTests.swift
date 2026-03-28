@@ -1014,7 +1014,7 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 114)))
         XCTAssertEqual(
             sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 195)),
-            "Worked for 1 minute 35 seconds"
+            "Worked for 1 minute, 35 seconds"
         )
     }
 
@@ -1039,7 +1039,26 @@ final class ChatViewModelTests: XCTestCase {
 
         XCTAssertEqual(
             transcriptMessage.footnoteText,
-            "Worked for 1 minute 35 seconds"
+            "Worked for 1 minute, 35 seconds"
+        )
+    }
+
+    func testAssistantMessageTimestampUsesStreamingStartTime() {
+        let sut = makeSUT()
+
+        XCTAssertEqual(
+            sut.assistantMessageTimestampForTesting(
+                startedAt: Date(timeIntervalSince1970: 100.9),
+                fallbackUnixTimestamp: 195
+            ),
+            100
+        )
+        XCTAssertEqual(
+            sut.assistantMessageTimestampForTesting(
+                startedAt: nil,
+                fallbackUnixTimestamp: 195
+            ),
+            195
         )
     }
 
@@ -2205,6 +2224,30 @@ final class ChatViewModelTests: XCTestCase {
             "local-gap-2",
             "anchor-3",
         ])
+    }
+
+    func testMergeFetchedMessagesDoesNotTreatSameContentWithDifferentRolesAsEquivalent() {
+        let sut = makeSUT()
+        let localMessages = [
+            SessionMessage(role: .assistant, content: "same", timestamp: 1)
+        ]
+        let fetchedMessages = [
+            SessionMessage(role: .user, content: "same", timestamp: 2)
+        ]
+
+        sut.cacheMessages(localMessages, for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(fetchedMessages, sessionID: "session-a")
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.role),
+            [.user]
+        )
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.timestamp),
+            [2]
+        )
     }
 
     private func waitForCompactionBannerToDismiss(on sut: ChatViewModel) async {

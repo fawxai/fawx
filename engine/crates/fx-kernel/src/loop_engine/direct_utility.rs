@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    DIRECT_CURRENT_TIME_PHASE_DIRECTIVE, DIRECT_TOOL_TASK_DIRECTIVE, DIRECT_WEATHER_PHASE_DIRECTIVE,
+};
+use crate::act::ToolResult;
+use fx_core::message::ProgressKind;
+use fx_llm::{CompletionResponse, ContentBlock, ToolCall, ToolDefinition};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DirectUtilityProfile {
@@ -6,6 +12,8 @@ pub(super) enum DirectUtilityProfile {
     CurrentTime,
 }
 
+// TODO(#1646): replace these hardcoded message heuristics with direct-utility
+// manifest metadata so the kernel routes only from declared tool contracts.
 pub(super) fn detect_direct_utility_profile(
     user_message: &str,
     available_tools: &[ToolDefinition],

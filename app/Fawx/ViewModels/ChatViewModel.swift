@@ -606,6 +606,15 @@ final class StreamingDisplayController {
 @MainActor
 @Observable
 final class ChatViewModel {
+    private static let elapsedDurationFormatter: DateComponentsFormatter = {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.maximumUnitCount = 2
+        formatter.unitsStyle = .full
+        formatter.zeroFormattingBehavior = [.dropAll]
+        return formatter
+    }()
+
     enum TranscriptScrollBehavior {
         case animated
         case snap
@@ -885,33 +894,8 @@ final class ChatViewModel {
     }
 
     private func streamingElapsedString(_ seconds: Int) -> String {
-        if seconds < 60 {
-            return localizedDurationUnit(seconds, singular: "second", plural: "seconds")
-        }
-
-        let minutes = seconds / 60
-        let remainingSeconds = seconds % 60
-        if minutes < 60 {
-            if remainingSeconds == 0 {
-                return localizedDurationUnit(minutes, singular: "minute", plural: "minutes")
-            }
-            return "\(localizedDurationUnit(minutes, singular: "minute", plural: "minutes")) \(localizedDurationUnit(remainingSeconds, singular: "second", plural: "seconds"))"
-        }
-
-        let hours = minutes / 60
-        let remainingMinutes = minutes % 60
-        if remainingMinutes == 0 {
-            return localizedDurationUnit(hours, singular: "hour", plural: "hours")
-        }
-        return "\(localizedDurationUnit(hours, singular: "hour", plural: "hours")) \(localizedDurationUnit(remainingMinutes, singular: "minute", plural: "minutes"))"
-    }
-
-    private func localizedDurationUnit(
-        _ value: Int,
-        singular: String,
-        plural: String
-    ) -> String {
-        "\(value) \(value == 1 ? singular : plural)"
+        Self.elapsedDurationFormatter.string(from: TimeInterval(seconds))
+            ?? "\(seconds) seconds"
     }
 
     private func streamingElapsedFootnoteText(
@@ -1820,15 +1804,32 @@ final class ChatViewModel {
         streamTasks[sessionID] = task
     }
 
+    private func assistantMessageTimestamp(startedAt: Date?, fallbackUnixTimestamp: Int) -> Int {
+        guard let startedAt else {
+            return fallbackUnixTimestamp
+        }
+
+        let startedTimestamp = Int(startedAt.timeIntervalSince1970.rounded(.down))
+        return startedTimestamp > 0 ? startedTimestamp : fallbackUnixTimestamp
+    }
+
     private func finalizeStream(timestamp: Int, finalResponse: String?, sessionID: String) async {
         streamingDisplayController(for: sessionID).streamDidEnd()
         let startedAt = streamStates[sessionID]?.startedAt
+        let endedAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let content = finalResponse ?? streamingText(for: sessionID)
         if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let assistantMessage = SessionMessage(role: .assistant, content: content, timestamp: timestamp)
+            let assistantMessage = SessionMessage(
+                role: .assistant,
+                content: content,
+                timestamp: assistantMessageTimestamp(
+                    startedAt: startedAt,
+                    fallbackUnixTimestamp: timestamp
+                )
+            )
             recordCompletedStreamingFootnote(
                 startedAt: startedAt,
-                endedAt: Date(timeIntervalSince1970: TimeInterval(timestamp)),
+                endedAt: endedAt,
                 for: assistantMessage,
                 sessionID: sessionID
             )
@@ -1851,13 +1852,21 @@ final class ChatViewModel {
     private func finalizeCancellation(timestamp: Int, sessionID: String) async {
         streamingDisplayController(for: sessionID).streamDidEnd()
         let startedAt = streamStates[sessionID]?.startedAt
+        let endedAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let currentStreamingText = streamingText(for: sessionID)
         if !currentStreamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let interrupted = currentStreamingText + "\n\n(interrupted)"
-            let assistantMessage = SessionMessage(role: .assistant, content: interrupted, timestamp: timestamp)
+            let assistantMessage = SessionMessage(
+                role: .assistant,
+                content: interrupted,
+                timestamp: assistantMessageTimestamp(
+                    startedAt: startedAt,
+                    fallbackUnixTimestamp: timestamp
+                )
+            )
             recordCompletedStreamingFootnote(
                 startedAt: startedAt,
-                endedAt: Date(timeIntervalSince1970: TimeInterval(timestamp)),
+                endedAt: endedAt,
                 for: assistantMessage,
                 sessionID: sessionID
             )
@@ -2807,6 +2816,16 @@ extension ChatViewModel {
             endedAt: endedAt,
             for: message,
             sessionID: sessionID
+        )
+    }
+
+    func assistantMessageTimestampForTesting(
+        startedAt: Date?,
+        fallbackUnixTimestamp: Int
+    ) -> Int {
+        assistantMessageTimestamp(
+            startedAt: startedAt,
+            fallbackUnixTimestamp: fallbackUnixTimestamp
         )
     }
 
