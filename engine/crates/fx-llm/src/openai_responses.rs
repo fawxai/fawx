@@ -20,9 +20,13 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use crate::document::document_text_fallback;
+use crate::openai::{
+    is_openai_chat_capable, openai_models_endpoint, OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
+};
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
-    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
+    bearer_auth_headers, insert_header_value, null_loop_harness,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
     LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch, LoopModelProfile,
     LoopPromptOverlayContext, LoopStreamingRecoveryStrategy, ProviderCapabilities,
     StaticLoopModelProfile,
@@ -119,10 +123,26 @@ fn openai_responses_loop_harness(model: &str) -> &'static dyn LoopHarness {
     resolve_loop_harness_from_profiles(&OPENAI_RESPONSES_LOOP_PROFILES, model, null_loop_harness())
 }
 
+fn responses_models_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.contains("chatgpt.com") {
+        return openai_models_endpoint("https://api.openai.com");
+    }
+    if base.ends_with("/responses") {
+        return format!(
+            "{}/models",
+            base.trim_end_matches("/responses")
+                .trim_end_matches("/codex")
+        );
+    }
+    openai_models_endpoint(base)
+}
+
 /// OpenAI Responses API provider for ChatGPT subscription auth.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesProvider {
     base_url: String,
+    models_endpoint: String,
     access_token: String,
     account_id: String,
     provider_name: String,
@@ -154,9 +174,11 @@ impl OpenAiResponsesProvider {
             .timeout(std::time::Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
+        let models_endpoint = responses_models_endpoint(DEFAULT_CODEX_BASE_URL);
 
         Ok(Self {
             base_url: DEFAULT_CODEX_BASE_URL.to_string(),
+            models_endpoint,
             access_token,
             account_id,
             provider_name: "openai".to_string(),
@@ -168,6 +190,7 @@ impl OpenAiResponsesProvider {
     /// Override the base URL (for testing or alternative endpoints).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self.models_endpoint = responses_models_endpoint(&self.base_url);
         self
     }
 
@@ -188,40 +211,15 @@ impl OpenAiResponsesProvider {
         }
     }
 
-    /// Model discovery endpoint.
-    ///
-    /// For `chatgpt.com` subscription flows, uses the canonical
-    /// `api.openai.com/v1/models` endpoint (the backend-api/models
-    /// path doesn't return all available models). For all other base
-    /// URLs (including api.openai.com and test servers), derives the
-    /// models path from the base.
-    fn models_endpoint(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.contains("chatgpt.com") {
-            return "https://api.openai.com/v1/models".to_string();
-        }
-        if base.ends_with("/responses") {
-            return format!(
-                "{}/models",
-                base.trim_end_matches("/responses")
-                    .trim_end_matches("/codex")
-            );
-        }
-        if base.ends_with("/v1") {
-            return format!("{base}/models");
-        }
-        format!("{base}/v1/models")
-    }
-
     async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
         let response = self
             .client
-            .get(self.models_endpoint())
+            .get(&self.models_endpoint)
             .bearer_auth(&self.access_token)
             .header("chatgpt-account-id", &self.account_id)
             .send()
             .await?;
-        parse_model_response(response, &self.supported_models).await
+        parse_model_response(response, self, &self.supported_models).await
     }
 
     /// Validate the OAuth token by performing a live model-catalog fetch.
@@ -1116,6 +1114,37 @@ impl LlmProvider for OpenAiResponsesProvider {
         }
     }
 
+    fn supported_thinking_levels(&self) -> &'static [&'static str] {
+        OPENAI_THINKING_LEVELS
+    }
+
+    fn models_endpoint(&self) -> Option<&str> {
+        Some(&self.models_endpoint)
+    }
+
+    fn catalog_auth_headers(
+        &self,
+        api_key: &str,
+        _auth_mode: &str,
+    ) -> Result<reqwest::header::HeaderMap, String> {
+        let mut headers = bearer_auth_headers(api_key)?;
+        insert_header_value(
+            &mut headers,
+            "chatgpt-account-id",
+            &self.account_id,
+            "account id",
+        )?;
+        Ok(headers)
+    }
+
+    fn is_chat_capable(&self, model_id: &str) -> bool {
+        is_openai_chat_capable(model_id)
+    }
+
+    fn fallback_models(&self) -> Vec<&'static str> {
+        OPENAI_FALLBACK_MODELS.to_vec()
+    }
+
     fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
         openai_responses_loop_harness(model)
     }
@@ -1123,6 +1152,7 @@ impl LlmProvider for OpenAiResponsesProvider {
 
 async fn parse_model_response(
     response: reqwest::Response,
+    provider: &OpenAiResponsesProvider,
     supported_models: &[String],
 ) -> Result<Vec<String>, LlmError> {
     let status = response.status();
@@ -1140,7 +1170,11 @@ async fn parse_model_response(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
-    Ok(filter_model_ids(parsed.data, supported_models))
+    Ok(filter_model_ids(
+        parsed.data,
+        supported_models,
+        |model_id| provider.is_chat_capable(model_id),
+    ))
 }
 
 // =====================================================================
@@ -1619,6 +1653,38 @@ mod tests {
         let models = provider.list_models().await.expect("list models");
 
         assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[test]
+    fn responses_catalog_metadata_matches_expected_contract() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123").unwrap();
+
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+    }
+
+    #[test]
+    fn responses_catalog_auth_headers_include_account_context() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123").unwrap();
+
+        let headers = provider
+            .catalog_auth_headers("oauth-token-123", "oauth")
+            .expect("headers");
+
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer oauth-token-123"
+        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
     }
 
     #[test]

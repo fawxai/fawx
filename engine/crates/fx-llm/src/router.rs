@@ -1240,7 +1240,6 @@ mod thinking_level_tests {
     use crate::provider::{
         CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
     };
-    use crate::supported_thinking_levels;
     use crate::types::{CompletionRequest, CompletionResponse, LlmError};
     use async_trait::async_trait;
 
@@ -1297,26 +1296,6 @@ mod thinking_level_tests {
         assert_eq!(
             router.provider_for_model("claude-sonnet-4-20250514"),
             Some("anthropic")
-        );
-    }
-
-    #[test]
-    fn supported_thinking_levels_anthropic() {
-        let levels = supported_thinking_levels("anthropic");
-        assert_eq!(levels, vec!["off", "low", "adaptive", "high"]);
-    }
-
-    #[test]
-    fn supported_thinking_levels_openai() {
-        let levels = supported_thinking_levels("openai");
-        assert_eq!(levels, vec!["off", "low", "high"]);
-    }
-
-    #[test]
-    fn supported_thinking_levels_falls_back_to_off_for_unknown_provider() {
-        assert_eq!(
-            supported_thinking_levels("mystery"),
-            vec!["off".to_string()]
         );
     }
 }

@@ -46,7 +46,7 @@ pub use provider::{
     LlmProvider as CompletionProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
     LoopModelProfile, LoopPromptOverlayContext, LoopResponseClassification,
     LoopResponseTextClassification, LoopStreamingRecoveryStrategy, LoopTextDeltaMode,
-    ProviderCapabilities, StaticLoopModelProfile,
+    ProviderCapabilities, ProviderCatalogFilters, StaticLoopModelProfile,
 };
 pub use router::{
     context_window_for_model, fetch_available_models_from_catalog, LlmRouter, ModelInfo,
@@ -120,18 +120,6 @@ fn normalize_trimmed_tool_history(history: &mut Vec<Message>) {
     }
 
     history.retain(|message| !message.content.is_empty());
-}
-
-/// Return the supported thinking levels for a given provider.
-pub fn supported_thinking_levels(provider: &str) -> Vec<String> {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "anthropic" => vec!["off", "low", "adaptive", "high"],
-        "openai" => vec!["off", "low", "high"],
-        _ => vec!["off"],
-    }
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
 }
 
 /// Legacy prompt-generation provider trait.

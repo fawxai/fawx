@@ -14,8 +14,9 @@ use std::time::Duration;
 use crate::document::document_text_fallback;
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
-    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
-    LoopHarness, LoopModelMatch, LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities,
+    bearer_auth_headers, insert_header_value, null_loop_harness,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
+    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, ProviderCatalogFilters,
     StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
@@ -90,11 +91,89 @@ fn openai_chat_loop_harness(model: &str) -> &'static dyn LoopHarness {
     resolve_loop_harness_from_profiles(&OPENAI_CHAT_LOOP_PROFILES, model, null_loop_harness())
 }
 
+pub(crate) const OPENAI_THINKING_LEVELS: &[&str] = &["off", "low", "high"];
+const OPENROUTER_THINKING_LEVELS: &[&str] = &["off"];
+pub(crate) const OPENAI_FALLBACK_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-4.1",
+    "o3",
+    "o4-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+];
+const OPENROUTER_FALLBACK_MODELS: &[&str] = &[
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-4o",
+    "x-ai/grok-3",
+    "qwen/qwen-2.5-72b-instruct",
+    "deepseek/deepseek-chat-v3",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiCatalogKind {
+    Compatible,
+    OpenAi,
+    OpenRouter,
+}
+
+impl OpenAiCatalogKind {
+    fn from_provider_name(provider_name: &str) -> Self {
+        match provider_name.trim().to_ascii_lowercase().as_str() {
+            "openai" => Self::OpenAi,
+            "openrouter" => Self::OpenRouter,
+            _ => Self::Compatible,
+        }
+    }
+}
+
+pub(crate) fn openai_models_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/models")
+    } else {
+        format!("{base_url}/v1/models")
+    }
+}
+
+pub(crate) fn is_openai_chat_capable(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    let includes = id.starts_with("gpt-")
+        || id.starts_with("gpt-5")
+        || id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("o4");
+    let excludes = id.contains("embedding")
+        || id.contains("tts")
+        || id.contains("whisper")
+        || id.contains("dall-e")
+        || id.contains("moderation")
+        || id.contains("audio")
+        || id.contains("realtime")
+        || id.contains("search")
+        || id.contains("instruct");
+    includes && !excludes
+}
+
+fn is_openrouter_chat_capable(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("claude")
+        || id.contains("gpt-")
+        || id.contains("o4")
+        || id.contains("grok")
+        || id.contains("qwen")
+        || id.contains("minimax")
+        || id.contains("liquidai")
+        || id.contains("lfm")
+        || id.contains("deepseek")
+}
+
 /// OpenAI-compatible provider implementation.
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     base_url: String,
+    models_endpoint: String,
     api_key: String,
+    catalog_kind: OpenAiCatalogKind,
     provider_name: String,
     supported_models: Vec<String>,
     /// ChatGPT account ID for subscription OAuth (sent as `chatgpt-account-id` header).
@@ -103,6 +182,14 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    pub const fn default_base_url() -> &'static str {
+        "https://api.openai.com"
+    }
+
+    pub const fn openrouter_base_url() -> &'static str {
+        "https://openrouter.ai/api"
+    }
+
     /// Create a new OpenAI-compatible provider.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
         let base_url = base_url.into();
@@ -120,10 +207,13 @@ impl OpenAiProvider {
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
+        let models_endpoint = openai_models_endpoint(&base_url);
 
         Ok(Self {
             base_url,
+            models_endpoint,
             api_key,
+            catalog_kind: OpenAiCatalogKind::Compatible,
             provider_name: "openai-compatible".to_string(),
             supported_models: Vec::new(),
             account_id: None,
@@ -133,7 +223,9 @@ impl OpenAiProvider {
 
     /// Override provider name for logs/metrics.
     pub fn with_name(mut self, provider_name: impl Into<String>) -> Self {
-        self.provider_name = provider_name.into();
+        let provider_name = provider_name.into();
+        self.catalog_kind = OpenAiCatalogKind::from_provider_name(&provider_name);
+        self.provider_name = provider_name;
         self
     }
 
@@ -158,23 +250,14 @@ impl OpenAiProvider {
         }
     }
 
-    fn models_endpoint(&self) -> String {
-        let base_url = self.base_url.trim_end_matches('/');
-        if base_url.ends_with("/v1") {
-            format!("{base_url}/models")
-        } else {
-            format!("{base_url}/v1/models")
-        }
-    }
-
     async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
         let response = self
             .client
-            .get(self.models_endpoint())
+            .get(&self.models_endpoint)
             .bearer_auth(&self.api_key)
             .send()
             .await?;
-        parse_model_response(response, &self.supported_models).await
+        parse_model_response(response, self, &self.supported_models).await
     }
 
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
@@ -548,6 +631,56 @@ impl LlmProvider for OpenAiProvider {
         }
     }
 
+    fn supported_thinking_levels(&self) -> &'static [&'static str] {
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => OPENROUTER_THINKING_LEVELS,
+            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => OPENAI_THINKING_LEVELS,
+        }
+    }
+
+    fn models_endpoint(&self) -> Option<&str> {
+        Some(&self.models_endpoint)
+    }
+
+    fn catalog_auth_headers(
+        &self,
+        api_key: &str,
+        _auth_mode: &str,
+    ) -> Result<reqwest::header::HeaderMap, String> {
+        let mut headers = bearer_auth_headers(api_key)?;
+        if let Some(account_id) = &self.account_id {
+            insert_header_value(&mut headers, "chatgpt-account-id", account_id, "account id")?;
+        }
+        Ok(headers)
+    }
+
+    fn is_chat_capable(&self, model_id: &str) -> bool {
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => is_openrouter_chat_capable(model_id),
+            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => {
+                is_openai_chat_capable(model_id)
+            }
+        }
+    }
+
+    fn fallback_models(&self) -> Vec<&'static str> {
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => OPENROUTER_FALLBACK_MODELS.to_vec(),
+            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => {
+                OPENAI_FALLBACK_MODELS.to_vec()
+            }
+        }
+    }
+
+    fn catalog_filters(&self) -> ProviderCatalogFilters {
+        ProviderCatalogFilters {
+            apply_recency_and_price_floor: matches!(
+                self.catalog_kind,
+                OpenAiCatalogKind::OpenRouter
+            ),
+        }
+    }
+
     fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
         openai_chat_loop_harness(model)
     }
@@ -555,6 +688,7 @@ impl LlmProvider for OpenAiProvider {
 
 async fn parse_model_response(
     response: reqwest::Response,
+    provider: &OpenAiProvider,
     supported_models: &[String],
 ) -> Result<Vec<String>, LlmError> {
     let status = response.status();
@@ -570,7 +704,11 @@ async fn parse_model_response(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
-    Ok(filter_model_ids(parsed.data, supported_models))
+    Ok(filter_model_ids(
+        parsed.data,
+        supported_models,
+        |model_id| provider.is_chat_capable(model_id),
+    ))
 }
 
 fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
@@ -1034,6 +1172,54 @@ mod tests {
             models,
             vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
         );
+    }
+
+    #[test]
+    fn openai_catalog_metadata_matches_expected_contract() {
+        let provider = OpenAiProvider::new(OpenAiProvider::default_base_url(), "test-key")
+            .unwrap()
+            .with_name("openai");
+
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+    }
+
+    #[test]
+    fn openai_catalog_auth_headers_use_bearer_auth() {
+        let provider = OpenAiProvider::new(OpenAiProvider::default_base_url(), "test-key")
+            .unwrap()
+            .with_name("openai");
+
+        let headers = provider
+            .catalog_auth_headers("oauth-token-123", "oauth")
+            .expect("headers");
+
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer oauth-token-123"
+        );
+    }
+
+    #[test]
+    fn openrouter_catalog_metadata_uses_openrouter_contract() {
+        let provider = OpenAiProvider::new(OpenAiProvider::openrouter_base_url(), "test-key")
+            .unwrap()
+            .with_name("openrouter");
+
+        assert_eq!(provider.supported_thinking_levels(), &["off"]);
+        assert!(provider.is_chat_capable("x-ai/grok-3"));
+        assert!(!provider.is_chat_capable("openai/text-embedding-3-large"));
+        assert_eq!(provider.fallback_models(), OPENROUTER_FALLBACK_MODELS);
+        assert!(provider.catalog_filters().apply_recency_and_price_floor);
     }
 
     #[test]

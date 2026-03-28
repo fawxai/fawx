@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use futures::Stream;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::collections::HashMap;
 use std::pin::Pin;
 
@@ -20,6 +21,13 @@ pub struct ProviderCapabilities {
     pub supports_temperature: bool,
     /// Whether this backend requires streaming to be used.
     pub requires_streaming: bool,
+}
+
+/// Provider-specific catalog filtering policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderCatalogFilters {
+    /// Apply the shared recency and price-floor filter used for OpenRouter catalogs.
+    pub apply_recency_and_price_floor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +288,38 @@ pub fn resolve_loop_harness_from_profiles(
         .unwrap_or(fallback)
 }
 
+fn authorization_header_value(api_key: &str) -> Result<HeaderValue, String> {
+    let bearer = format!("Bearer {api_key}");
+    HeaderValue::from_str(&bearer).map_err(|error| format!("invalid authorization header: {error}"))
+}
+
+pub(crate) fn insert_bearer_authorization(
+    headers: &mut HeaderMap,
+    api_key: &str,
+) -> Result<(), String> {
+    let value = authorization_header_value(api_key)?;
+    headers.insert(AUTHORIZATION, value);
+    Ok(())
+}
+
+pub(crate) fn insert_header_value(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+    label: &str,
+) -> Result<(), String> {
+    let header =
+        HeaderValue::from_str(value).map_err(|error| format!("invalid {label} header: {error}"))?;
+    headers.insert(name, header);
+    Ok(())
+}
+
+pub(crate) fn bearer_auth_headers(api_key: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    insert_bearer_authorization(&mut headers, api_key)?;
+    Ok(headers)
+}
+
 /// Shared provider interface for cloud LLM adapters.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -319,6 +359,36 @@ pub trait LlmProvider: Send + Sync {
 
     /// Provider feature support contract.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Thinking-effort levels accepted by this provider.
+    fn supported_thinking_levels(&self) -> &'static [&'static str] {
+        &["off"]
+    }
+
+    /// Optional models endpoint used for catalog fetches.
+    fn models_endpoint(&self) -> Option<&str> {
+        None
+    }
+
+    /// Authentication headers for model catalog requests.
+    fn catalog_auth_headers(&self, api_key: &str, _auth_mode: &str) -> Result<HeaderMap, String> {
+        bearer_auth_headers(api_key)
+    }
+
+    /// Provider-specific chat-model filter for catalog payloads.
+    fn is_chat_capable(&self, _model_id: &str) -> bool {
+        true
+    }
+
+    /// Provider-specific static catalog fallback.
+    fn fallback_models(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Provider-specific catalog filtering knobs.
+    fn catalog_filters(&self) -> ProviderCatalogFilters {
+        ProviderCatalogFilters::default()
+    }
 
     /// Provider-owned loop harness semantics for the given model.
     fn loop_harness(&self, _model: &str) -> &'static dyn LoopHarness {
