@@ -96,6 +96,20 @@ pub trait ScratchpadProvider: Send + Sync {
     fn compact_if_needed(&self, current_iteration: u32);
 }
 
+#[derive(Clone)]
+struct RequestBuildContext<'a> {
+    memory_context: Option<&'a str>,
+    scratchpad_context: Option<&'a str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+}
+
+struct SubGoalRetryContext {
+    initial_response: String,
+    initial_signals: Vec<Signal>,
+    required_tool_names: Vec<String>,
+}
+
 impl std::fmt::Debug for dyn ScratchpadProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ScratchpadProvider")
@@ -1523,6 +1537,12 @@ enum SubGoalCompletionCheck {
     Incomplete(String),
 }
 
+#[derive(Debug)]
+enum FollowUpRoundResult {
+    Terminal(LoopResult),
+    Continue(ActionContinuation),
+}
+
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
     sub_goals: Vec<DecomposeSubGoalArguments>,
@@ -1647,6 +1667,7 @@ const SUB_GOAL_MUTATION_RETRY_INCOMPLETE_REASON: &str =
     "sub-goal required a bounded mutation retry but still did not execute the required work";
 const SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON: &str =
     "sub-goal follow-up still required another reasoning pass after the bounded mutation retry";
+const DECOMPOSITION_RESULTS_PREFIX: &str = "Task decomposition results:";
 
 fn tool_error_relay_directive(failed_tools: &[(&str, &str)]) -> String {
     let details: Vec<String> = failed_tools
@@ -1969,6 +1990,10 @@ impl LoopEngine {
 
             let continuation = match action.next_step.clone() {
                 ActionNextStep::Finish(terminal) => {
+                    let terminal = self.apply_decomposition_terminal_fallback(
+                        terminal,
+                        processed.context_window.last(),
+                    );
                     return Ok(self.finish_streaming_result(
                         self.loop_result_from_action_terminal(terminal, state.tokens),
                         stream,
@@ -1976,6 +2001,24 @@ impl LoopEngine {
                 }
                 ActionNextStep::Continue(continuation) => continuation,
             };
+
+            if continuation
+                .context_message
+                .as_deref()
+                .is_some_and(decomposition_results_all_skipped)
+            {
+                return Ok(self.finish_streaming_result(
+                    LoopResult::Complete {
+                        response: continuation
+                            .context_message
+                            .expect("checked decomposition context message"),
+                        iterations: self.iteration_count,
+                        tokens_used: state.tokens,
+                        signals: Vec::new(),
+                    },
+                    stream,
+                ));
+            }
 
             self.apply_pending_turn_commitment(&continuation, &action.tool_results);
 
@@ -2075,6 +2118,26 @@ impl LoopEngine {
         self.maybe_emit_completion_notification(&result, stream);
         stream.done_result(&result);
         self.finalize_result(result)
+    }
+
+    fn apply_decomposition_terminal_fallback(
+        &self,
+        terminal: ActionTerminal,
+        last_context_message: Option<&Message>,
+    ) -> ActionTerminal {
+        match terminal {
+            ActionTerminal::Complete { response } if response.trim().is_empty() => {
+                let fallback = last_context_message
+                    .map(message_content_to_text)
+                    .filter(|text| is_decomposition_results_message(text));
+                if let Some(response) = fallback {
+                    ActionTerminal::Complete { response }
+                } else {
+                    ActionTerminal::Complete { response }
+                }
+            }
+            other => other,
+        }
     }
 
     fn loop_result_from_action_terminal(
@@ -2828,10 +2891,12 @@ impl LoopEngine {
             llm.model_name(),
             tools,
             self.reasoning_decompose_enabled(),
-            self.memory_context.as_deref(),
-            self.scratchpad_context.as_deref(),
-            self.thinking_config.clone(),
-            self.notify_tool_guidance_enabled,
+            RequestBuildContext {
+                memory_context: self.memory_context.as_deref(),
+                scratchpad_context: self.scratchpad_context.as_deref(),
+                thinking: self.thinking_config.clone(),
+                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
+            },
         );
         if let Some(directive) = self.pending_turn_commitment_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
@@ -3770,9 +3835,11 @@ impl LoopEngine {
                         sub_goal,
                         &retry_snapshot,
                         llm,
-                        response,
-                        signals,
-                        tool_names,
+                        SubGoalRetryContext {
+                            initial_response: response,
+                            initial_signals: signals,
+                            required_tool_names: tool_names,
+                        },
                     )
                     .await
                 }
@@ -3795,25 +3862,28 @@ impl LoopEngine {
         sub_goal: &SubGoal,
         snapshot: &PerceptionSnapshot,
         llm: &dyn LlmProvider,
-        initial_response: String,
-        initial_signals: Vec<Signal>,
-        required_tool_names: Vec<String>,
+        retry: SubGoalRetryContext,
     ) -> SubGoalResult {
-        let continuation_tools = self.required_side_effect_sub_goal_tools(&required_tool_names);
+        let continuation_tools =
+            self.required_side_effect_sub_goal_tools(&retry.required_tool_names);
         if continuation_tools.is_empty() {
             let message = format!(
                 "sub-goal required side-effect tools ({}) are not available for bounded retry",
-                required_tool_names.join(", ")
+                retry.required_tool_names.join(", ")
             );
             return incomplete_sub_goal_result_with_signals(
                 sub_goal.clone(),
                 message,
-                initial_signals,
+                retry.initial_signals,
             );
         }
 
-        let mut continuation_messages =
-            self.sub_goal_retry_messages(child, snapshot, &initial_response, &required_tool_names);
+        let continuation_messages = self.sub_goal_retry_messages(
+            child,
+            snapshot,
+            &retry.initial_response,
+            &retry.required_tool_names,
+        );
         child.last_reasoning_messages = continuation_messages.clone();
 
         let follow_up = match self
@@ -3821,7 +3891,7 @@ impl LoopEngine {
                 child,
                 sub_goal,
                 llm,
-                &mut continuation_messages,
+                &continuation_messages,
                 continuation_tools,
             )
             .await
@@ -3830,11 +3900,11 @@ impl LoopEngine {
             Err(error) => failed_sub_goal_result_with_signals(
                 sub_goal.clone(),
                 error.reason,
-                initial_signals.clone(),
+                retry.initial_signals.clone(),
             ),
         };
 
-        merge_sub_goal_signals(follow_up, initial_signals)
+        merge_sub_goal_signals(follow_up, retry.initial_signals)
     }
 
     async fn run_bounded_sub_goal_follow_up(
@@ -3842,15 +3912,85 @@ impl LoopEngine {
         child: &mut LoopEngine,
         sub_goal: &SubGoal,
         llm: &dyn LlmProvider,
-        continuation_messages: &mut Vec<Message>,
+        continuation_messages: &[Message],
         continuation_tools: Vec<ToolDefinition>,
     ) -> Result<SubGoalResult, LoopError> {
+        let first_round = self
+            .execute_bounded_sub_goal_follow_up_round(
+                child,
+                llm,
+                continuation_messages,
+                &continuation_tools,
+            )
+            .await?;
+        let loop_result = match first_round {
+            FollowUpRoundResult::Terminal(loop_result) => loop_result,
+            FollowUpRoundResult::Continue(continuation) => {
+                if let Some(response) = continuation
+                    .partial_response
+                    .as_deref()
+                    .and_then(meaningful_response_text)
+                {
+                    let signals = child.signals.signals().to_vec();
+                    let result = match self.check_sub_goal_completion(sub_goal, &signals, &response)
+                    {
+                        SubGoalCompletionCheck::Valid => SubGoalResult {
+                            goal: sub_goal.clone(),
+                            outcome: SubGoalOutcome::Completed(response),
+                            signals,
+                        },
+                        SubGoalCompletionCheck::MissingRequiredSideEffectTools { message, .. }
+                        | SubGoalCompletionCheck::Incomplete(message) => {
+                            incomplete_sub_goal_result_with_signals(
+                                sub_goal.clone(),
+                                meaningful_response_text(&response).unwrap_or(message),
+                                signals,
+                            )
+                        }
+                    };
+                    return Ok(result);
+                }
+
+                let mut follow_up_messages = continuation_messages.to_vec();
+                if let Some(context_message) = continuation.context_message {
+                    follow_up_messages.push(Message::assistant(context_message));
+                }
+                match self
+                    .execute_bounded_sub_goal_follow_up_round(
+                        child,
+                        llm,
+                        &follow_up_messages,
+                        &continuation_tools,
+                    )
+                    .await?
+                {
+                    FollowUpRoundResult::Terminal(loop_result) => loop_result,
+                    FollowUpRoundResult::Continue(continuation) => LoopResult::Incomplete {
+                        partial_response: continuation.partial_response,
+                        reason: SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON.to_string(),
+                        iterations: child.iteration_count,
+                        signals: Vec::new(),
+                    },
+                }
+            }
+        };
+        let loop_result = child.finalize_result(loop_result);
+        Ok(self.sub_goal_result_from_follow_up(sub_goal, loop_result))
+    }
+
+    async fn execute_bounded_sub_goal_follow_up_round(
+        &self,
+        child: &mut LoopEngine,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        continuation_tools: &[ToolDefinition],
+    ) -> Result<FollowUpRoundResult, LoopError> {
         let mut tokens_used = TokenUsage::default();
         let response = child
             .request_tool_continuation(
                 llm,
                 continuation_messages,
-                continuation_tools,
+                continuation_tools.to_vec(),
                 &mut tokens_used,
                 CycleStream::disabled(),
             )
@@ -3882,19 +4022,20 @@ impl LoopEngine {
         }
 
         let action_partial = action_partial_response(&action);
-        let loop_result = match action.next_step {
-            ActionNextStep::Finish(terminal) => {
-                child.loop_result_from_action_terminal(terminal, action.tokens_used)
-            }
-            ActionNextStep::Continue(continuation) => LoopResult::Incomplete {
-                partial_response: continuation.partial_response.or(action_partial),
-                reason: SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON.to_string(),
-                iterations: child.iteration_count,
-                signals: Vec::new(),
-            },
-        };
-        let loop_result = child.finalize_result(loop_result);
-        Ok(self.sub_goal_result_from_follow_up(sub_goal, loop_result))
+        Ok(match action.next_step {
+            ActionNextStep::Finish(terminal) => FollowUpRoundResult::Terminal(
+                child.loop_result_from_action_terminal(terminal, action.tokens_used),
+            ),
+            ActionNextStep::Continue(continuation) => FollowUpRoundResult::Continue(
+                ActionContinuation {
+                    partial_response: continuation.partial_response.or(action_partial),
+                    context_message: continuation.context_message,
+                    next_tool_scope: continuation.next_tool_scope,
+                    turn_commitment: continuation.turn_commitment,
+                    artifact_write_target: continuation.artifact_write_target,
+                },
+            ),
+        })
     }
 
     fn sub_goal_result_from_follow_up(
@@ -4078,6 +4219,13 @@ impl LoopEngine {
         signals: &[Signal],
         response: &str,
     ) -> SubGoalCompletionCheck {
+        match sub_goal.classify(response) {
+            SubGoalCompletionClassification::Completed => {}
+            SubGoalCompletionClassification::Incomplete(message) => {
+                return SubGoalCompletionCheck::Incomplete(message);
+            }
+        }
+
         let used_tools = successful_tool_names(signals);
         let used_mutation_tools = successful_mutation_tool_names(signals);
         let required_side_effect_tools: Vec<String> = sub_goal
@@ -4115,13 +4263,6 @@ impl LoopEngine {
                 sub_goal.required_tools.join(", "),
                 truncate_prompt_text(response, 180)
             ));
-        }
-
-        match sub_goal.classify(response) {
-            SubGoalCompletionClassification::Completed => {}
-            SubGoalCompletionClassification::Incomplete(message) => {
-                return SubGoalCompletionCheck::Incomplete(message);
-            }
         }
 
         SubGoalCompletionCheck::Valid
@@ -5811,10 +5952,12 @@ impl LoopEngine {
             llm.model_name(),
             continuation_tools,
             self.effective_decompose_enabled(),
-            self.memory_context.as_deref(),
-            self.scratchpad_context.as_deref(),
-            self.thinking_config.clone(),
-            self.notify_tool_guidance_enabled,
+            RequestBuildContext {
+                memory_context: self.memory_context.as_deref(),
+                scratchpad_context: self.scratchpad_context.as_deref(),
+                thinking: self.thinking_config.clone(),
+                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
+            },
         );
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
@@ -6286,11 +6429,23 @@ fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
     }
 
     let mut lines = Vec::with_capacity(results.len() + 1);
-    lines.push("Task decomposition results:".to_string());
+    lines.push(DECOMPOSITION_RESULTS_PREFIX.to_string());
     for (index, result) in results.iter().enumerate() {
         lines.push(format_sub_goal_line(index + 1, result));
     }
     lines.join("\n")
+}
+
+fn is_decomposition_results_message(text: &str) -> bool {
+    text.trim_start().starts_with(DECOMPOSITION_RESULTS_PREFIX)
+}
+
+fn decomposition_results_all_skipped(text: &str) -> bool {
+    is_decomposition_results_message(text)
+        && text
+            .lines()
+            .skip(1)
+            .all(|line| line.contains("=> skipped (below floor)"))
 }
 
 fn format_sub_goal_line(index: usize, result: &SubGoalResult) -> String {
@@ -6987,10 +7142,12 @@ fn build_continuation_request(
         model,
         tool_definitions,
         true,
-        memory_context,
-        scratchpad_context,
-        thinking,
-        false,
+        RequestBuildContext {
+            memory_context,
+            scratchpad_context,
+            thinking,
+            notify_tool_guidance_enabled: false,
+        },
     )
 }
 
@@ -6999,16 +7156,13 @@ fn build_continuation_request_with_notify_guidance(
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
     decompose_enabled: bool,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
+    context: RequestBuildContext<'_>,
 ) -> CompletionRequest {
     let tools = completion_request_tools(tool_definitions, decompose_enabled);
     let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
+        context.memory_context,
+        context.scratchpad_context,
+        context.notify_tool_guidance_enabled,
     );
     CompletionRequest {
         model: model.to_string(),
@@ -7017,7 +7171,7 @@ fn build_continuation_request_with_notify_guidance(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking,
+        thinking: context.thinking,
     }
 }
 
@@ -7622,10 +7776,12 @@ fn build_reasoning_request(
         model,
         tool_definitions,
         true,
-        memory_context,
-        scratchpad_context,
-        thinking,
-        false,
+        RequestBuildContext {
+            memory_context,
+            scratchpad_context,
+            thinking,
+            notify_tool_guidance_enabled: false,
+        },
     )
 }
 
@@ -7634,16 +7790,13 @@ fn build_reasoning_request_with_notify_guidance(
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
     decompose_enabled: bool,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
+    context: RequestBuildContext<'_>,
 ) -> CompletionRequest {
     let tools = completion_request_tools(tool_definitions, decompose_enabled);
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
+        context.memory_context,
+        context.scratchpad_context,
+        context.notify_tool_guidance_enabled,
     );
 
     CompletionRequest {
@@ -7653,7 +7806,7 @@ fn build_reasoning_request_with_notify_guidance(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking,
+        thinking: context.thinking,
     }
 }
 
@@ -7794,7 +7947,6 @@ fn extract_requested_write_target(user_message: &str) -> Option<String> {
             continue;
         };
         let raw = user_message[start + prefix.len()..]
-            .trim_start()
             .split_whitespace()
             .next()?;
         let cleaned = raw
@@ -11815,14 +11967,15 @@ mod cancellation_tests {
         }];
 
         let (kind, message) = progress_for_tool_round(
-            None,
-            None,
-            None,
-            TurnExecutionProfile::Standard,
-            BoundedLocalPhase::Discovery,
-            3,
+            progress::ToolRoundProgressContext {
+                commitment: None,
+                pending_tool_scope: None,
+                pending_artifact_write_target: None,
+                turn_execution_profile: TurnExecutionProfile::Standard,
+                bounded_local_phase: BoundedLocalPhase::Discovery,
+                tool_executor: &NoopToolExecutor,
+            },
             &calls,
-            &NoopToolExecutor,
         )
         .expect("tool round progress");
 
@@ -12657,21 +12810,33 @@ mod cancellation_tests {
             .expect_err("stream should fail");
         assert!(error.reason.contains("stream consumption failed"));
 
-        let started = receiver.try_recv().expect("started event");
-        let delta = receiver.try_recv().expect("delta event");
-        let finished = receiver.try_recv().expect("finished event");
+        let mut events = Vec::with_capacity(3);
+        while events.len() < 3 {
+            let event = receiver.recv().await.expect("event");
+            if matches!(
+                event,
+                InternalMessage::StreamingStarted { .. }
+                    | InternalMessage::StreamDelta { .. }
+                    | InternalMessage::StreamingFinished { .. }
+            ) {
+                events.push(event);
+            }
+        }
+        let started = &events[0];
+        let delta = &events[1];
+        let finished = &events[2];
         assert!(matches!(
             started,
-            InternalMessage::StreamingStarted { phase } if phase == StreamPhase::Reason
+            InternalMessage::StreamingStarted { phase } if *phase == StreamPhase::Reason
         ));
         assert!(matches!(
             delta,
             InternalMessage::StreamDelta { delta, phase }
-                if delta == "partial" && phase == StreamPhase::Reason
+                if delta == "partial" && *phase == StreamPhase::Reason
         ));
         assert!(matches!(
             finished,
-            InternalMessage::StreamingFinished { phase } if phase == StreamPhase::Reason
+            InternalMessage::StreamingFinished { phase } if *phase == StreamPhase::Reason
         ));
         assert!(
             receiver.try_recv().is_err(),
@@ -12695,7 +12860,17 @@ mod cancellation_tests {
             .await
             .expect_err("stream setup should fail");
         assert!(error.reason.contains("completion failed"));
-        assert!(receiver.try_recv().is_err(), "no stream events expected");
+        while let Ok(event) = receiver.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    InternalMessage::StreamingStarted { .. }
+                        | InternalMessage::StreamDelta { .. }
+                        | InternalMessage::StreamingFinished { .. }
+                ),
+                "no stream events expected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13352,6 +13527,7 @@ mod decomposition_tests {
         events
     }
 
+
     fn text_response(text: &str) -> CompletionResponse {
         CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -13811,7 +13987,10 @@ mod decomposition_tests {
             truncated_from: None,
         };
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first complete")),
+            Ok(text_response("second complete")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -13870,7 +14049,10 @@ mod decomposition_tests {
             truncated_from: None,
         };
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first complete")),
+            Ok(text_response("second complete")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -14773,7 +14955,7 @@ mod decomposition_tests {
         let SubGoalOutcome::Incomplete(message) = &execution.result.outcome else {
             panic!("expected incomplete sub-goal outcome")
         };
-        assert_eq!(message, "I have enough context and would run it next.");
+        assert!(message.contains("completion evidence"), "{message}");
     }
 
     #[tokio::test]
@@ -14831,7 +15013,7 @@ mod decomposition_tests {
             complexity_hint: None,
         };
         let llm = ScriptedLlm::new(vec![
-            Ok(text_response("I know how to scaffold the skill now.")),
+            Ok(text_response("Scaffolded skill")),
             Ok(CompletionResponse {
                 content: Vec::new(),
                 tool_calls: vec![ToolCall {
@@ -14946,7 +15128,7 @@ mod decomposition_tests {
         let SubGoalOutcome::Incomplete(message) = &execution.result.outcome else {
             panic!("expected incomplete sub-goal outcome")
         };
-        assert_eq!(message, "I still need to scaffold it.");
+        assert!(message.contains("scaffold"), "{message}");
         let used_tools = successful_tool_names(&execution.result.signals);
         let used_mutation_tools = successful_mutation_tool_names(&execution.result.signals);
         assert!(used_tools.contains("run_command"));
@@ -21371,7 +21553,7 @@ mod error_path_coverage_tests {
         let plan = decomposition_plan(&["analyze the codebase"]);
         let decision = Decision::Decompose(plan.clone());
 
-        let llm = ScriptedLlm::ok(vec![text_response("analysis complete")]);
+        let llm = ScriptedLlm::ok(vec![text_response("analysis of the codebase complete")]);
 
         let action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])

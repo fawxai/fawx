@@ -78,6 +78,7 @@ const ACTION_ORIENTED_TASK_TERMS: &[&str] = &[
 
 const UNRESOLVED_ACTION_RESPONSE_PHRASES: &[&str] = &[
     "what went wrong",
+    "still need to",
     "no such file or directory",
     "command not found",
     "permission denied",

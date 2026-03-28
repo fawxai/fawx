@@ -10,6 +10,16 @@ use crate::streaming::StreamEvent;
 use fx_core::message::{InternalMessage, ProgressKind};
 use fx_llm::ToolCall;
 
+#[derive(Clone, Copy)]
+pub(super) struct ToolRoundProgressContext<'a> {
+    pub commitment: Option<&'a TurnCommitment>,
+    pub pending_tool_scope: Option<&'a ContinuationToolScope>,
+    pub pending_artifact_write_target: Option<&'a str>,
+    pub turn_execution_profile: TurnExecutionProfile,
+    pub bounded_local_phase: BoundedLocalPhase,
+    pub tool_executor: &'a dyn ToolExecutor,
+}
+
 impl LoopEngine {
     pub(super) fn emit_public_progress(
         &mut self,
@@ -90,20 +100,19 @@ impl LoopEngine {
 
     pub(super) fn maybe_publish_tool_round_progress(
         &mut self,
-        round: usize,
+        _round: usize,
         calls: &[ToolCall],
         stream: CycleStream<'_>,
     ) {
-        let Some((kind, message)) = progress_for_tool_round(
-            self.pending_turn_commitment.as_ref(),
-            self.pending_tool_scope.as_ref(),
-            self.pending_artifact_write_target.as_deref(),
-            self.turn_execution_profile,
-            self.bounded_local_phase,
-            round,
-            calls,
-            self.tool_executor.as_ref(),
-        ) else {
+        let context = ToolRoundProgressContext {
+            commitment: self.pending_turn_commitment.as_ref(),
+            pending_tool_scope: self.pending_tool_scope.as_ref(),
+            pending_artifact_write_target: self.pending_artifact_write_target.as_deref(),
+            turn_execution_profile: self.turn_execution_profile,
+            bounded_local_phase: self.bounded_local_phase,
+            tool_executor: self.tool_executor.as_ref(),
+        };
+        let Some((kind, message)) = progress_for_tool_round(context, calls) else {
             return;
         };
         self.publish_activity_progress(kind, message, stream);
@@ -201,20 +210,14 @@ pub(super) fn progress_for_turn_state_with_profile(
 }
 
 pub(super) fn progress_for_tool_round(
-    commitment: Option<&TurnCommitment>,
-    pending_tool_scope: Option<&ContinuationToolScope>,
-    pending_artifact_write_target: Option<&str>,
-    turn_execution_profile: TurnExecutionProfile,
-    bounded_local_phase: BoundedLocalPhase,
-    _round: usize,
+    context: ToolRoundProgressContext<'_>,
     calls: &[ToolCall],
-    tool_executor: &dyn ToolExecutor,
 ) -> Option<(ProgressKind, String)> {
     if calls.is_empty() {
         return None;
     }
 
-    if let Some(path) = pending_artifact_write_target {
+    if let Some(path) = context.pending_artifact_write_target {
         return Some((
             ProgressKind::WritingArtifact,
             format!("Writing the requested artifact to {path}..."),
@@ -228,17 +231,19 @@ pub(super) fn progress_for_tool_round(
         ));
     }
 
-    if let Some((kind, detail)) = progress_for_round_activity(calls, commitment, tool_executor) {
+    if let Some((kind, detail)) =
+        progress_for_round_activity(calls, context.commitment, context.tool_executor)
+    {
         return Some((kind, detail));
     }
 
     let (kind, message) = progress_for_turn_state_with_profile(
-        commitment,
-        pending_tool_scope,
-        pending_artifact_write_target,
-        tool_executor,
-        turn_execution_profile,
-        bounded_local_phase,
+        context.commitment,
+        context.pending_tool_scope,
+        context.pending_artifact_write_target,
+        context.tool_executor,
+        context.turn_execution_profile,
+        context.bounded_local_phase,
     );
     Some((kind, message))
 }

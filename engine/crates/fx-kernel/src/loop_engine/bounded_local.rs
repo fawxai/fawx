@@ -523,7 +523,7 @@ fn shell_command_words(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn first_effective_command_word<'a>(words: &'a [String]) -> Option<&'a str> {
+fn first_effective_command_word(words: &[String]) -> Option<&str> {
     words.iter().map(String::as_str).find(|word| {
         !matches!(
             *word,

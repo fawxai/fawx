@@ -467,6 +467,14 @@ struct RecordedAssistantTurn {
     has_tool_use: bool,
 }
 
+struct FinalizeTurnContext<'a> {
+    images: &'a [ImageAttachment],
+    documents: &'a [DocumentAttachment],
+    collector: Option<&'a SessionTurnCollector>,
+    user_timestamp: u64,
+    assistant_timestamp: u64,
+}
+
 impl SessionTurnCollector {
     fn record_response(&self, response: &CompletionResponse) {
         match self.responses.lock() {
@@ -1737,18 +1745,24 @@ impl HeadlessApp {
     #[cfg(test)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
         let timestamp = current_epoch_secs();
-        self.finalize_cycle_with_turn_messages(input, &[], &[], result, None, timestamp, timestamp)
+        self.finalize_cycle_with_turn_messages(
+            input,
+            result,
+            FinalizeTurnContext {
+                images: &[],
+                documents: &[],
+                collector: None,
+                user_timestamp: timestamp,
+                assistant_timestamp: timestamp,
+            },
+        )
     }
 
     fn finalize_cycle_with_turn_messages(
         &mut self,
         input: &str,
-        images: &[ImageAttachment],
-        documents: &[DocumentAttachment],
         result: &LoopResult,
-        collector: Option<&SessionTurnCollector>,
-        user_timestamp: u64,
-        assistant_timestamp: u64,
+        context: FinalizeTurnContext<'_>,
     ) -> CycleResult {
         let response = extract_response_text(result);
         let result_kind = extract_result_kind(result);
@@ -1765,19 +1779,25 @@ impl HeadlessApp {
         self.last_signals = result.signals().to_vec();
         let signals = self.last_signals.clone();
         persist_headless_signals(self, &signals);
-        let session_messages = collector
+        let session_messages = context
+            .collector
             .map(|collector| {
                 collector.session_messages_for_turn(
                     input,
-                    images,
-                    documents,
+                    context.images,
+                    context.documents,
                     &response,
-                    user_timestamp,
-                    assistant_timestamp,
+                    context.user_timestamp,
+                    context.assistant_timestamp,
                 )
             })
             .unwrap_or_else(|| {
-                text_turn_messages(input, &response, user_timestamp, assistant_timestamp)
+                text_turn_messages(
+                    input,
+                    &response,
+                    context.user_timestamp,
+                    context.assistant_timestamp,
+                )
             });
         self.record_session_turn_messages(session_messages);
         CycleResult {
@@ -1826,12 +1846,14 @@ impl HeadlessApp {
         self.evaluate_canary(&result);
         Ok(self.finalize_cycle_with_turn_messages(
             input,
-            images,
-            documents,
             &result,
-            Some(&collector),
-            user_timestamp,
-            assistant_timestamp,
+            FinalizeTurnContext {
+                images,
+                documents,
+                collector: Some(&collector),
+                user_timestamp,
+                assistant_timestamp,
+            },
         ))
     }
 

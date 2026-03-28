@@ -99,7 +99,7 @@ impl ToolExecutor for ScopedToolExecutor {
                 allowed_indexed
                     .into_iter()
                     .map(|(index, _)| index)
-                    .zip(delegated.into_iter()),
+                    .zip(delegated),
             );
         }
 
