@@ -70,6 +70,7 @@ pub enum StreamEvent {
     },
     ToolResult {
         id: String,
+        tool_name: String,
         output: String,
         is_error: bool,
     },

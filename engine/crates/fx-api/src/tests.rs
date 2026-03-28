@@ -1053,6 +1053,23 @@ fn serialize_stream_event_serializes_error_event_payload() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_tool_result_payload() {
+    let frame = serialize_stream_event(StreamEvent::ToolResult {
+        id: "call-1".to_string(),
+        tool_name: "read_file".to_string(),
+        output: "file contents".to_string(),
+        is_error: false,
+    })
+    .expect("tool result frame");
+
+    assert!(frame.contains("event: tool_result"));
+    assert!(frame.contains("\"id\":\"call-1\""));
+    assert!(frame.contains("\"tool_name\":\"read_file\""));
+    assert!(frame.contains("\"output\":\"file contents\""));
+    assert!(frame.contains("\"is_error\":false"));
+}
+
+#[test]
 fn serialize_stream_event_serializes_tool_error_payload() {
     let frame = serialize_stream_event(StreamEvent::ToolError {
         tool_name: "read_file".to_string(),

@@ -61,12 +61,14 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         ),
         StreamEvent::ToolResult {
             id,
+            tool_name,
             output,
             is_error,
         } => sse_frame(
             "tool_result",
             serde_json::json!({
                 "id": id,
+                "tool_name": tool_name,
                 "output": output,
                 "is_error": is_error,
             }),

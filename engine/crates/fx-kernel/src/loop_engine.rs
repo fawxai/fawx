@@ -224,6 +224,7 @@ impl<'a> CycleStream<'a> {
     fn tool_result(self, result: &ToolResult) {
         self.emit(StreamEvent::ToolResult {
             id: result.tool_call_id.clone(),
+            tool_name: result.tool_name.clone(),
             output: result.output.clone(),
             is_error: !result.success,
         });
@@ -540,6 +541,12 @@ enum BoundedLocalPhase {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedLocalTerminalReason {
+    NeedsGroundedEditAfterRecovery,
+    RecoveryStepDidNotProduceTargetedContext,
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but context compaction
@@ -621,6 +628,8 @@ pub struct LoopEngine {
     bounded_local_recovery_used: bool,
     /// Failed mutation targets to revisit during a bounded local recovery round.
     bounded_local_recovery_focus: Vec<String>,
+    /// Kernel-authored terminal reason for bounded local runs, when they end before completion.
+    bounded_local_terminal_reason: Option<BoundedLocalTerminalReason>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
 }
@@ -668,6 +677,10 @@ impl std::fmt::Debug for LoopEngine {
             .field(
                 "bounded_local_recovery_focus",
                 &self.bounded_local_recovery_focus,
+            )
+            .field(
+                "bounded_local_terminal_reason",
+                &self.bounded_local_terminal_reason,
             )
             .finish_non_exhaustive()
     }
@@ -1096,6 +1109,7 @@ impl LoopEngineBuilder {
             bounded_local_phase: BoundedLocalPhase::Discovery,
             bounded_local_recovery_used: false,
             bounded_local_recovery_focus: Vec::new(),
+            bounded_local_terminal_reason: None,
             channel_registry: ChannelRegistry::new(),
         })
     }
@@ -1396,6 +1410,8 @@ enum ToolRoundOutcome {
     Cancelled,
     /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
     BudgetLow,
+    /// Bounded-local phase machine reached a typed terminal blocker.
+    BoundedLocalTerminal(BoundedLocalTerminalReason),
     /// Repeated observation-only rounds were blocked and could not be replanned.
     ObservationRestricted,
     /// Repeated observation-only rounds were blocked; request one mutation-only follow-up.
@@ -1601,7 +1617,7 @@ const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool ro
 const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls were blocked after repeated observation-only rounds. Do not request any more read-only tools. Use the remaining mutation/build/install tools now if you have enough context to proceed. If you still cannot proceed, answer with the current findings and the specific blocker.";
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
-const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. Gather just enough context in one pass, then move to the concrete code change.";
+const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. For code-edit tasks, do not move on to mutation until you have grounded the edit target by reading the most relevant file directly. Gather only the context needed to identify and read that file, then move to the concrete code change.";
 const BOUNDED_LOCAL_MUTATION_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: mutation.\nDo not do more discovery. Use `write_file` or `edit_file` now to make one concrete local code change. If you are blocked, state the precise blocker instead of reopening inspection.";
 const BOUNDED_LOCAL_RECOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: recovery.\nThe first concrete edit attempt failed. Use at most one tiny targeted `read_file` or `search_text` step to gather the exact context needed for the retry, then go straight back to the edit. Do not call `run_command` or reopen broad inspection.";
 const BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: verification.\nDo not reopen discovery. Use at most one focused verification step such as a targeted `run_command` test or a confirming `read_file`, then respond with the result.";
@@ -2298,6 +2314,7 @@ impl LoopEngine {
         self.bounded_local_phase = BoundedLocalPhase::Discovery;
         self.bounded_local_recovery_used = false;
         self.bounded_local_recovery_focus.clear();
+        self.bounded_local_terminal_reason = None;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -2333,7 +2350,15 @@ impl LoopEngine {
         let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
         let all_tools = self.tool_executor.tool_definitions();
 
-        if observation_nudge_threshold > 0 && observation_rounds == observation_nudge_threshold {
+        let bounded_local_owns_surface = matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        );
+
+        if !bounded_local_owns_surface
+            && observation_nudge_threshold > 0
+            && observation_rounds == observation_nudge_threshold
+        {
             continuation_messages.push(Message::system(
                 OBSERVATION_ONLY_TOOL_ROUND_NUDGE.to_string(),
             ));
@@ -2345,7 +2370,10 @@ impl LoopEngine {
             continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
         }
 
-        if observation_nudge_threshold > 0 && observation_rounds >= observation_strip_threshold {
+        if !bounded_local_owns_surface
+            && observation_nudge_threshold > 0
+            && observation_rounds >= observation_strip_threshold
+        {
             return self.side_effect_tool_definitions();
         }
 
@@ -2367,6 +2395,12 @@ impl LoopEngine {
     }
 
     fn apply_pending_tool_scope(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        ) {
+            return tools;
+        }
         match self.pending_tool_scope.as_ref() {
             None | Some(ContinuationToolScope::Full) => tools,
             Some(ContinuationToolScope::MutationOnly) => tools
@@ -2537,6 +2571,12 @@ impl LoopEngine {
         &self,
         state: &ToolRoundState,
     ) -> Option<ContinuationToolScope> {
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        ) {
+            return None;
+        }
         if state.used_observation_tools && !state.used_mutation_tools {
             let mutation_tools = self.side_effect_tool_definitions();
             if !mutation_tools.is_empty() {
@@ -2700,6 +2740,7 @@ impl LoopEngine {
         }
 
         let previous = self.bounded_local_phase;
+        let mut terminal_reason = None;
         let artifact_target = self
             .pending_artifact_write_target
             .as_deref()
@@ -2707,7 +2748,7 @@ impl LoopEngine {
         self.bounded_local_phase = match self.bounded_local_phase {
             BoundedLocalPhase::Discovery => {
                 self.bounded_local_recovery_focus.clear();
-                if bounded_local_discovery_round_completed(calls, results) {
+                if bounded_local_discovery_round_completed(calls, results, artifact_target) {
                     BoundedLocalPhase::Mutation
                 } else {
                     BoundedLocalPhase::Discovery
@@ -2724,6 +2765,8 @@ impl LoopEngine {
                 ) {
                     if self.bounded_local_recovery_used {
                         self.bounded_local_recovery_focus.clear();
+                        terminal_reason =
+                            Some(BoundedLocalTerminalReason::NeedsGroundedEditAfterRecovery);
                         BoundedLocalPhase::Terminal
                     } else {
                         self.bounded_local_recovery_used = true;
@@ -2741,6 +2784,8 @@ impl LoopEngine {
                     BoundedLocalPhase::Mutation
                 } else {
                     self.bounded_local_recovery_focus.clear();
+                    terminal_reason =
+                        Some(BoundedLocalTerminalReason::RecoveryStepDidNotProduceTargetedContext);
                     BoundedLocalPhase::Terminal
                 }
             }
@@ -2757,8 +2802,10 @@ impl LoopEngine {
                 BoundedLocalPhase::Terminal
             }
         };
+        self.bounded_local_terminal_reason = terminal_reason;
 
         if self.bounded_local_phase != previous {
+            self.pending_tool_scope = None;
             self.last_turn_state_progress = Some(self.current_turn_state_progress());
             self.emit_signal(
                 LoopStep::Act,
@@ -5235,6 +5282,36 @@ impl LoopEngine {
         }
     }
 
+    fn bounded_local_terminal_action_result(
+        &mut self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        tokens_used: TokenUsage,
+        reason: BoundedLocalTerminalReason,
+    ) -> ActionResult {
+        let partial_response = Some(bounded_local_terminal_partial_response(
+            reason,
+            &tool_results,
+        ));
+        let reason_text = bounded_local_terminal_reason_text(reason);
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            reason_text,
+            serde_json::json!({
+                "profile": "bounded_local",
+                "terminal_reason": bounded_local_terminal_reason_label(reason),
+            }),
+        );
+        self.incomplete_action_result(
+            decision,
+            tool_results,
+            partial_response,
+            reason_text,
+            tokens_used,
+        )
+    }
+
     fn cancellation_token_triggered(&self) -> bool {
         self.cancel_token
             .as_ref()
@@ -5371,6 +5448,14 @@ impl LoopEngine {
             {
                 ToolRoundOutcome::Cancelled => {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
+                }
+                ToolRoundOutcome::BoundedLocalTerminal(reason) => {
+                    return Ok(self.bounded_local_terminal_action_result(
+                        decision,
+                        state.all_tool_results,
+                        state.tokens_used,
+                        reason,
+                    ));
                 }
                 ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::ObservationRestrictedReplan => {
@@ -5661,7 +5746,10 @@ impl LoopEngine {
         continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
-        if self.observation_only_call_restriction_active()
+        if !matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        ) && self.observation_only_call_restriction_active()
             && calls_are_all_classification(
                 &state.current_calls,
                 self.tool_executor.as_ref(),
@@ -5738,6 +5826,11 @@ impl LoopEngine {
         state.all_tool_results.extend(results);
         self.record_tool_round_kind(&executed_calls);
         self.advance_bounded_local_phase_after_tool_round(&executed_calls, &round_results);
+        if let Some(reason) = self.bounded_local_terminal_reason.take() {
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            self.expire_activity_progress(stream);
+            return Ok(ToolRoundOutcome::BoundedLocalTerminal(reason));
+        }
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
@@ -5825,7 +5918,11 @@ impl LoopEngine {
         } else {
             phase_allowed
         };
-        let allowed = if self.observation_only_call_restriction_active() {
+        let allowed = if !matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        ) && self.observation_only_call_restriction_active()
+        {
             let (mutation_allowed, observation_blocked) = partition_by_call_classification(
                 &semantically_allowed,
                 self.tool_executor.as_ref(),
@@ -8589,10 +8686,28 @@ fn artifact_path_candidates(target: &str) -> Vec<String> {
     candidates
 }
 
-fn bounded_local_discovery_round_completed(calls: &[ToolCall], results: &[ToolResult]) -> bool {
-    calls
-        .iter()
-        .any(|call| successful_result_for_call(call, results).is_some())
+fn bounded_local_discovery_round_completed(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+    requested_artifact_target: Option<&str>,
+) -> bool {
+    if requested_artifact_target.is_some() {
+        return calls
+            .iter()
+            .any(|call| successful_result_for_call(call, results).is_some());
+    }
+
+    calls.iter().any(|call| {
+        successful_result_for_call(call, results)
+            .is_some_and(|_| bounded_local_discovery_call_grounds_edit_target(call))
+    })
+}
+
+fn bounded_local_discovery_call_grounds_edit_target(call: &ToolCall) -> bool {
+    match call.name.as_str() {
+        "read_file" => json_string_arg(&call.arguments, &["path"]).is_some(),
+        _ => false,
+    }
 }
 
 fn bounded_local_mutation_round_completed(
@@ -8622,15 +8737,14 @@ fn bounded_local_mutation_round_needs_recovery(
                 return true;
             }
 
-            bounded_local_mutation_call_is_meaningful(call, requested_artifact_target)
-                && {
-                    let output_lower = result.output.to_ascii_lowercase();
-                    !output_lower.contains("proposal created")
-                        && !output_lower.contains("was not modified")
-                        && !successful_result_for_call(call, results).is_some_and(|success| {
-                            bounded_local_mutation_result_confirms_real_change(call, success)
-                        })
-                }
+            bounded_local_mutation_call_is_meaningful(call, requested_artifact_target) && {
+                let output_lower = result.output.to_ascii_lowercase();
+                !output_lower.contains("proposal created")
+                    && !output_lower.contains("was not modified")
+                    && !successful_result_for_call(call, results).is_some_and(|success| {
+                        bounded_local_mutation_result_confirms_real_change(call, success)
+                    })
+            }
         })
     })
 }
@@ -8663,8 +8777,18 @@ fn bounded_local_mutation_call_is_meaningful(
     requested_artifact_target: Option<&str>,
 ) -> bool {
     match call.name.as_str() {
-        "edit_file" => json_string_arg(&call.arguments, &["path"])
-            .is_some_and(|path| !path_looks_like_bounded_local_scratch(path)),
+        "edit_file" => {
+            let Some(path) = json_string_arg(&call.arguments, &["path"]) else {
+                return false;
+            };
+            let old_text = call
+                .arguments
+                .get("old_text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            !path_looks_like_bounded_local_scratch(path) && !old_text.is_empty()
+        }
         "write_file" => {
             let Some(path) = json_string_arg(&call.arguments, &["path"]) else {
                 return false;
@@ -8719,13 +8843,18 @@ fn bounded_local_path_matches_requested_target(path: &str, target: &str) -> bool
 }
 
 fn path_looks_like_bounded_local_scratch(path: &str) -> bool {
+    let normalized = path.trim().to_ascii_lowercase();
     let file_name = path
         .rsplit('/')
         .next()
         .unwrap_or(path)
         .trim()
         .to_ascii_lowercase();
-    file_name.starts_with(".fawx_")
+    normalized.starts_with("/tmp/")
+        || normalized.starts_with("tmp/")
+        || file_name.starts_with(".fawx_")
+        || file_name.starts_with("tmp")
+        || file_name.starts_with("temp")
         || file_name.contains("noop")
         || file_name == "tmp"
         || file_name == "scratch"
@@ -8921,6 +9050,52 @@ fn bounded_local_phase_label(phase: BoundedLocalPhase) -> &'static str {
         BoundedLocalPhase::Verification => "verification",
         BoundedLocalPhase::Terminal => "terminal",
     }
+}
+
+fn bounded_local_terminal_reason_label(reason: BoundedLocalTerminalReason) -> &'static str {
+    match reason {
+        BoundedLocalTerminalReason::NeedsGroundedEditAfterRecovery => {
+            "needs_grounded_edit_after_recovery"
+        }
+        BoundedLocalTerminalReason::RecoveryStepDidNotProduceTargetedContext => {
+            "recovery_step_did_not_produce_targeted_context"
+        }
+    }
+}
+
+fn bounded_local_terminal_reason_text(reason: BoundedLocalTerminalReason) -> &'static str {
+    match reason {
+        BoundedLocalTerminalReason::NeedsGroundedEditAfterRecovery => {
+            "bounded local run exhausted its one recovery pass before a grounded edit could be made"
+        }
+        BoundedLocalTerminalReason::RecoveryStepDidNotProduceTargetedContext => {
+            "bounded local recovery did not produce the exact local context needed for a safe retry"
+        }
+    }
+}
+
+fn bounded_local_terminal_partial_response(
+    reason: BoundedLocalTerminalReason,
+    tool_results: &[ToolResult],
+) -> String {
+    let headline = match reason {
+        BoundedLocalTerminalReason::NeedsGroundedEditAfterRecovery => {
+            "Blocked: this bounded local run completed discovery and one targeted recovery pass, but it still did not have a grounded enough edit to apply safely."
+        }
+        BoundedLocalTerminalReason::RecoveryStepDidNotProduceTargetedContext => {
+            "Blocked: this bounded local run used its one targeted recovery pass, but that recovery step still did not produce the exact local context needed for a safe edit."
+        }
+    };
+    let access_note =
+        "File access was available during the run; it stopped because the bounded-local policy ends after one failed edit, one tiny recovery pass, and one retry.";
+    let tool_summary = summarize_tool_progress(tool_results)
+        .map(|summary| format!("Observed during the run: {summary}"))
+        .unwrap_or_else(|| {
+            "Observed during the run: no meaningful tool progress was recorded.".to_string()
+        });
+    let next_step =
+        "Next best step: point me to the exact file/function to edit, or give a more specific target for the code change so I can retry with grounded context.";
+    format!("{headline}\n\n{access_note}\n\n{tool_summary}\n\n{next_step}")
 }
 
 // Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
@@ -12832,6 +13007,7 @@ mod cancellation_tests {
         )));
         assert!(events.contains(&StreamEvent::ToolResult {
             id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
             output: "ok".to_string(),
             is_error: false,
         }));
@@ -19277,6 +19453,65 @@ mod loop_resilience_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingBoundedLocalEditExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingBoundedLocalEditExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: match call.name.as_str() {
+                        "edit_file" => "old_text not found in file".to_string(),
+                        "read_file" | "search_text" => "ok".to_string(),
+                        _ => "blocked".to_string(),
+                    },
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "search_text".to_string(),
+                    description: "Search text".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "edit_file".to_string(),
+                    description: "Edit a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "edit_file" | "write_file" => crate::act::ToolCacheability::SideEffect,
+                "read_file" | "search_text" => crate::act::ToolCacheability::Cacheable,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
     /// Tool executor that returns large outputs for truncation testing.
     #[derive(Debug)]
     struct LargeOutputToolExecutor {
@@ -20408,17 +20643,16 @@ mod loop_resilience_tests {
     }
 
     #[test]
-    fn bounded_local_profile_strips_observation_tools_after_one_round() {
+    fn bounded_local_profile_ignores_generic_observation_round_stripping() {
         let mut engine = mixed_tool_engine(BudgetConfig::default());
         engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
         engine.consecutive_observation_only_rounds = 1;
 
         let tools = engine.apply_tool_round_progress_policy(1, &mut Vec::new());
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert_eq!(
-            tool_names,
-            vec!["write_file"],
-            "bounded local tasks should switch to mutation-capable tools after one read-only round"
+        assert!(
+            tool_names.contains(&"read_file") && tool_names.contains(&"write_file"),
+            "bounded local phases should own tool surfaces instead of inheriting generic observation-only stripping"
         );
     }
 
@@ -20447,7 +20681,30 @@ mod loop_resilience_tests {
             BoundedLocalPhase::Recovery,
         );
         assert_eq!(kind, ProgressKind::Implementing);
-        assert_eq!(message, "Reading the exact local context needed to retry the edit...");
+        assert_eq!(
+            message,
+            "Reading the exact local context needed to retry the edit..."
+        );
+    }
+
+    #[test]
+    fn bounded_local_recovery_ignores_stale_mutation_only_scope() {
+        let mut engine = engine_with_budget(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Recovery;
+        engine.pending_tool_scope = Some(ContinuationToolScope::MutationOnly);
+
+        let tools = engine.current_reasoning_tool_definitions(false);
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"read_file"),
+            "recovery should still expose read_file even if a stale mutation scope exists"
+        );
+        assert!(
+            !names.contains(&"write_file"),
+            "recovery should remain phase-owned instead of falling back to mutation tools"
+        );
     }
 
     #[test]
@@ -20508,6 +20765,66 @@ mod loop_resilience_tests {
             std::slice::from_ref(&verify_result),
         );
         assert_eq!(engine.bounded_local_phase, BoundedLocalPhase::Terminal);
+    }
+
+    #[test]
+    fn bounded_local_discovery_does_not_advance_on_search_only_round() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Discovery;
+
+        let discovery_call = ToolCall {
+            id: "d1".to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({
+                "query": "streaming progress",
+                "root": "/Users/joseph/fawx"
+            }),
+        };
+        let discovery_result = ToolResult {
+            tool_call_id: "d1".to_string(),
+            tool_name: "search_text".to_string(),
+            success: true,
+            output: "found matches in loop_engine.rs".to_string(),
+        };
+
+        engine.advance_bounded_local_phase_after_tool_round(
+            std::slice::from_ref(&discovery_call),
+            std::slice::from_ref(&discovery_result),
+        );
+
+        assert_eq!(engine.bounded_local_phase, BoundedLocalPhase::Discovery);
+    }
+
+    #[test]
+    fn bounded_local_artifact_target_can_advance_after_non_read_discovery() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Discovery;
+        engine.requested_artifact_target =
+            Some("/Users/joseph/fawx/docs/debug/streaming-note.md".to_string());
+
+        let discovery_call = ToolCall {
+            id: "d1".to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({
+                "query": "streaming progress",
+                "root": "/Users/joseph/fawx"
+            }),
+        };
+        let discovery_result = ToolResult {
+            tool_call_id: "d1".to_string(),
+            tool_name: "search_text".to_string(),
+            success: true,
+            output: "found matches in ChatViewModel.swift".to_string(),
+        };
+
+        engine.advance_bounded_local_phase_after_tool_round(
+            std::slice::from_ref(&discovery_call),
+            std::slice::from_ref(&discovery_result),
+        );
+
+        assert_eq!(engine.bounded_local_phase, BoundedLocalPhase::Mutation);
     }
 
     #[tokio::test]
@@ -20583,6 +20900,66 @@ mod loop_resilience_tests {
         assert_eq!(engine.bounded_local_phase, BoundedLocalPhase::Terminal);
     }
 
+    #[tokio::test]
+    async fn bounded_local_terminal_blocker_is_kernel_authored() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(FailingBoundedLocalEditExecutor),
+        );
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Mutation;
+        engine.bounded_local_recovery_used = true;
+
+        let calls = vec![ToolCall {
+            id: "m1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "/Users/joseph/fawx/engine/crates/fx-kernel/src/loop_engine.rs",
+                "old_text": "missing old text",
+                "new_text": "replacement"
+            }),
+        }];
+        let decision = Decision::UseTools(calls.clone());
+        let llm = RecordingLlm::ok(vec![]);
+        let context_messages = vec![Message::user("make one concrete fix")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                &calls,
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert!(
+            llm.requests().is_empty(),
+            "terminal bounded-local blocker should not ask the LLM to synthesize a reason"
+        );
+        match action.next_step {
+            ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response: Some(ref partial_response),
+                ref reason,
+            }) => {
+                assert_eq!(
+                    reason,
+                    "bounded local run exhausted its one recovery pass before a grounded edit could be made"
+                );
+                assert!(
+                    partial_response.contains("File access was available during the run"),
+                    "{partial_response}"
+                );
+                assert!(
+                    partial_response.contains("old_text not found in file"),
+                    "{partial_response}"
+                );
+            }
+            other => panic!("expected incomplete terminal blocker, got {other:?}"),
+        }
+    }
+
     #[test]
     fn bounded_local_semantically_blocked_mutation_still_enters_recovery() {
         let mut engine = run_command_observation_engine(BudgetConfig::default());
@@ -20617,6 +20994,74 @@ mod loop_resilience_tests {
     }
 
     #[tokio::test]
+    async fn bounded_local_recovery_bypasses_generic_observation_only_restriction() {
+        let mut engine = engine_with_budget(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Recovery;
+        engine.consecutive_observation_only_rounds = 9;
+        engine.pending_tool_scope = Some(ContinuationToolScope::MutationOnly);
+
+        let call = ToolCall {
+            id: "r1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "/Users/joseph/fawx/Cargo.toml"
+            }),
+        };
+
+        let results = engine
+            .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].success,
+            "recovery read should not be blocked by observation-only stripping"
+        );
+        assert!(
+            !results[0]
+                .output
+                .contains(OBSERVATION_ONLY_CALL_BLOCK_REASON),
+            "recovery should not inherit the generic observation-only block reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_local_discovery_bypasses_generic_observation_only_restriction() {
+        let mut engine = engine_with_budget(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Discovery;
+        engine.consecutive_observation_only_rounds = 9;
+
+        let call = ToolCall {
+            id: "d1".to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({
+                "query": "streaming progress",
+                "root": "/Users/joseph/fawx"
+            }),
+        };
+
+        let results = engine
+            .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].success,
+            "discovery search should not be blocked by generic observation-only stripping"
+        );
+        assert!(
+            !results[0]
+                .output
+                .contains(OBSERVATION_ONLY_CALL_BLOCK_REASON),
+            "discovery should not inherit the generic observation-only block reason"
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_local_discovery_blocks_run_command_before_editing() {
         let mut engine = run_command_observation_engine(BudgetConfig::default());
         engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
@@ -20648,6 +21093,56 @@ mod loop_resilience_tests {
             arguments: serde_json::json!({
                 "path": "/Users/joseph/fawx/.fawx_noop",
                 "content": ""
+            }),
+        };
+
+        let results = engine
+            .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("meaningful repo-relevant edit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_local_mutation_blocks_tmp_scratch_edit() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Mutation;
+        let call = ToolCall {
+            id: "e1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "tmp/should_i_not_edit",
+                "old_text": "old",
+                "new_text": "new"
+            }),
+        };
+
+        let results = engine
+            .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+            .await
+            .expect("execute");
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("meaningful repo-relevant edit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_local_mutation_blocks_edit_without_old_text() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Mutation;
+        let call = ToolCall {
+            id: "e1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "/Users/joseph/fawx/engine/crates/fx-kernel/src/loop_engine.rs",
+                "old_text": "",
+                "new_text": "new"
             }),
         };
 

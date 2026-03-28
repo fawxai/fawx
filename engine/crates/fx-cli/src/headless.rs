@@ -532,6 +532,7 @@ impl SessionTurnCollector {
             }
             StreamEvent::ToolResult {
                 id,
+                tool_name: _,
                 output,
                 is_error,
             } => match self.pending_tool_results.lock() {
@@ -3680,6 +3681,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_1".to_string(),
+            tool_name: "read_file".to_string(),
             output: "file contents".to_string(),
             is_error: false,
         });
@@ -3772,6 +3774,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_err".to_string(),
+            tool_name: "read_file".to_string(),
             output: "missing".to_string(),
             is_error: true,
         });
@@ -3807,6 +3810,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_2".to_string(),
+            tool_name: "search".to_string(),
             output: "results".to_string(),
             is_error: false,
         });
@@ -3958,6 +3962,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_4".to_string(),
+            tool_name: "web_search".to_string(),
             output: "search results".to_string(),
             is_error: false,
         });
@@ -3998,6 +4003,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_a".to_string(),
+            tool_name: "read_file".to_string(),
             output: "spec contents".to_string(),
             is_error: false,
         });
@@ -4026,6 +4032,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_b".to_string(),
+            tool_name: "run_command".to_string(),
             output: "working directory is set there".to_string(),
             is_error: false,
         });
