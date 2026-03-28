@@ -5,12 +5,14 @@ actor LocalInstallConfigurationLoader {
 
     func loadDefault() async -> LocalInstallConfiguration? {
 #if os(macOS)
-        if let configPathOverride = UITestLaunchOptions.localConfigPathOverride {
-            return await load(from: URL(fileURLWithPath: configPathOverride, isDirectory: false))
-        }
+        if UITestLaunchOptions.isUITesting {
+            if let configPathOverride = UITestLaunchOptions.localConfigPathOverride {
+                return await load(from: URL(fileURLWithPath: configPathOverride, isDirectory: false))
+            }
 
-        if UITestLaunchOptions.shouldDisableLocalInstall {
-            return nil
+            if UITestLaunchOptions.shouldDisableLocalInstall {
+                return nil
+            }
         }
 
         let dataDir = FileManager.default.homeDirectoryForCurrentUser

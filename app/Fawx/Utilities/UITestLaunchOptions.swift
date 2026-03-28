@@ -44,11 +44,19 @@ enum UITestLaunchOptions {
     }
 
     static var shouldDisableLocalInstall: Bool {
-        flagValue(for: disableLocalInstallEnvironmentKey)
+        flagValue(for: disableLocalInstallEnvironmentKey) ?? false
     }
 
-    private static func overrideValue(for key: String) -> String? {
-        let value = ProcessInfo.processInfo.environment[key]?
+    static func overrideValue(
+        for key: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> String? {
+        guard arguments.contains(uiTestingArgument) else {
+            return nil
+        }
+
+        let value = environment[key]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let value, !value.isEmpty else {
@@ -58,16 +66,24 @@ enum UITestLaunchOptions {
         return value
     }
 
-    private static func flagValue(for key: String) -> Bool {
-        guard let value = overrideValue(for: key)?.lowercased() else {
-            return false
+    static func flagValue(
+        for key: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> Bool? {
+        guard let value = overrideValue(for: key, environment: environment, arguments: arguments)?
+            .lowercased()
+        else {
+            return nil
         }
 
         switch value {
         case "1", "true", "yes", "on":
             return true
-        default:
+        case "0", "false", "no", "off":
             return false
+        default:
+            return nil
         }
     }
 }

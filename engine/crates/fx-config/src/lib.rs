@@ -12,7 +12,14 @@ mod validation;
 
 pub use defaults::DEFAULT_CONFIG_TEMPLATE;
 pub use toml_io::{save_default_model, save_thinking_budget};
-pub use types::*;
+pub use types::{
+    AgentBehaviorConfig, AgentConfig, BorrowScope, BudgetConfig, CapabilityMode, FawxConfig,
+    FleetConfig, GeneralConfig, GitConfig, HttpConfig, ImprovementToolsConfig, LoggingConfig,
+    MemoryConfig, ModelConfig, NodeConfig, OrchestratorConfig, PermissionAction, PermissionPreset,
+    PermissionsConfig, PreprocessDedup, ProposalConfig, SandboxConfig, SecurityConfig,
+    SelfModifyCliConfig, SelfModifyPathsCliConfig, TelegramChannelConfig, ThinkingBudget,
+    ToolsConfig, WebhookChannelConfig, WebhookConfig, WorkspaceConfig,
+};
 pub use validation::{
     parse_log_level, validate_synthesis_instruction, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
