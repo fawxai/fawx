@@ -8,7 +8,7 @@ Split `engine/crates/fx-cli/src/headless.rs` (5,765 lines) into focused modules 
 
 ## Current State (codex/provider-owned-loop-refactor branch)
 
-File: `engine/crates/fx-cli/src/headless.rs` (5,765 lines)
+File: `engine/crates/fx-cli/src/headless.rs` (5,787 lines)
 
 ### Content inventory
 

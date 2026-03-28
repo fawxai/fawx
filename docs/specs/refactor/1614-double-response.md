@@ -8,11 +8,11 @@ When the model emits both text content AND tool calls in a single response, the 
 
 ## Current State (codex/provider-owned-loop-refactor branch)
 
-File: `engine/crates/fx-kernel/src/loop_engine.rs` (24,098 lines)
+File: `engine/crates/fx-kernel/src/loop_engine.rs` (24,282 lines)
 
 ### The bug path
 
-In `act_with_tools` (line 5175), tool rounds produce `ToolRoundOutcome::Response(response)`. The handler at the bottom of the function (around line 5340):
+In `act_with_tools` (line 5318), tool rounds produce `ToolRoundOutcome::Response(response)`. The handler (around line 5459):
 
 ```rust
 ToolRoundOutcome::Response(response) => {

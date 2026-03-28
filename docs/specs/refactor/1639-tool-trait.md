@@ -12,7 +12,7 @@ File: `engine/crates/fx-tools/src/tools.rs` (5,938 lines)
 
 ### The monolith
 
-**Main dispatch (line 305):**
+**Main dispatch (line 305, unchanged post-merge):**
 ```rust
 let output = match call.name.as_str() {
     "read_file" => self.read_file(call, cancel).await,

@@ -8,11 +8,11 @@ Eliminate all non-test uses of `tool_results.is_empty()` as a behavioral branch.
 
 ## Current State (codex/provider-owned-loop-refactor branch)
 
-File: `engine/crates/fx-kernel/src/loop_engine.rs` (24,098 lines)
+File: `engine/crates/fx-kernel/src/loop_engine.rs` (24,282 lines)
 
 ### Remaining `tool_results.is_empty()` behavioral branches
 
-**1. Budget accounting (line 1958)**
+**1. Budget accounting (line 1979)**
 ```rust
 if action.tool_results.is_empty() {
     let action_cost = self.action_cost_from_result(&action);
@@ -22,7 +22,7 @@ if action.tool_results.is_empty() {
 ```
 Fix: Add `ActionResult::has_tool_activity() -> bool` method. Or derive from `next_step`: a `Continue` always had tools, a `Finish` may or may not have.
 
-**2. Tool turn counter (line 2235)**
+**2. Tool turn counter (line 2298)**
 ```rust
 fn update_tool_turns(&mut self, action: &ActionResult) {
     if !action.tool_results.is_empty() {
@@ -34,7 +34,7 @@ fn update_tool_turns(&mut self, action: &ActionResult) {
 ```
 Fix: Same — use `action.has_tool_activity()` or match on `next_step`.
 
-**3. Sub-goal budget (line 3880)**
+**3. Sub-goal budget (line 4022)**
 ```rust
 if action.tool_results.is_empty() {
     child.budget.record(&child.action_cost_from_result(&action));
@@ -42,13 +42,13 @@ if action.tool_results.is_empty() {
 ```
 Fix: Same pattern.
 
-**4. Observation signals (line 4421)**
+**4. Observation signals (line 4564)**
 ```rust
 let has_tools = !action.tool_results.is_empty();
 ```
 This is used for observability signal emission (trace logging). It's a legitimate direct check on tool count — not a behavioral branch. Keep as-is but consider renaming to `tool_invocation_count`.
 
-**5. Decomposition merge (line 5163)**
+**5. Decomposition merge (line 5306)**
 ```rust
 if !prior_tool_results.is_empty() {
     let mut merged_tool_results = prior_tool_results;
@@ -57,7 +57,7 @@ if !prior_tool_results.is_empty() {
 ```
 This merges tool results from prior decomposition steps. It's checking the collection, not inferring behavior. Keep as-is.
 
-**6. Action cost accounting (line 6065-6069)**
+**6. Action cost accounting (line 6210-6214)**
 ```rust
 tool_invocations: action.tool_results.len() as u32,
 cost_cents: if action.tokens_used.total_tokens() > 0 {
