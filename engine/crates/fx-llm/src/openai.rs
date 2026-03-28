@@ -21,6 +21,7 @@ use crate::provider::{
 };
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
+use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
@@ -117,12 +118,8 @@ enum OpenAiCatalogKind {
 }
 
 impl OpenAiCatalogKind {
-    fn from_provider_name(provider_name: &str) -> Self {
-        match provider_name.trim().to_ascii_lowercase().as_str() {
-            "openai" => Self::OpenAi,
-            "openrouter" => Self::OpenRouter,
-            _ => Self::Compatible,
-        }
+    fn is_openrouter(self) -> bool {
+        matches!(self, Self::OpenRouter)
     }
 }
 
@@ -154,6 +151,24 @@ pub(crate) fn is_openai_chat_capable(model_id: &str) -> bool {
     includes && !excludes
 }
 
+pub(crate) fn openai_thinking_levels(model_id: &str) -> &'static [&'static str] {
+    valid_thinking_levels(model_id)
+}
+
+pub(crate) fn openai_context_window(model_id: &str) -> usize {
+    let id = model_id.to_ascii_lowercase();
+    if id.contains("claude-opus") || id.contains("claude-sonnet") || id.contains("claude-haiku") {
+        return 200_000;
+    }
+    if id.contains("deepseek") {
+        return 64_000;
+    }
+    if id.contains("gemini") {
+        return 1_000_000;
+    }
+    128_000
+}
+
 fn is_openrouter_chat_capable(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
     id.contains("claude")
@@ -174,6 +189,7 @@ pub struct OpenAiProvider {
     models_endpoint: String,
     api_key: String,
     catalog_kind: OpenAiCatalogKind,
+    auth_method: &'static str,
     provider_name: String,
     supported_models: Vec<String>,
     /// ChatGPT account ID for subscription OAuth (sent as `chatgpt-account-id` header).
@@ -192,9 +208,52 @@ impl OpenAiProvider {
 
     /// Create a new OpenAI-compatible provider.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
-        let base_url = base_url.into();
-        let api_key = api_key.into();
+        Self::compatible(base_url, api_key, "openai-compatible")
+    }
 
+    pub fn compatible(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        provider_name: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::Compatible,
+            provider_name.into(),
+        )
+    }
+
+    pub fn openai(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::OpenAi,
+            "openai".to_string(),
+        )
+    }
+
+    pub fn openrouter(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::OpenRouter,
+            "openrouter".to_string(),
+        )
+    }
+
+    fn build(
+        base_url: String,
+        api_key: String,
+        catalog_kind: OpenAiCatalogKind,
+        provider_name: String,
+    ) -> Result<Self, LlmError> {
         if base_url.trim().is_empty() {
             return Err(LlmError::Config("base_url cannot be empty".to_string()));
         }
@@ -213,19 +272,23 @@ impl OpenAiProvider {
             base_url,
             models_endpoint,
             api_key,
-            catalog_kind: OpenAiCatalogKind::Compatible,
-            provider_name: "openai-compatible".to_string(),
+            catalog_kind,
+            auth_method: "api_key",
+            provider_name,
             supported_models: Vec::new(),
             account_id: None,
             client,
         })
     }
 
-    /// Override provider name for logs/metrics.
+    /// Override provider name for logs/metrics without changing provider behavior.
     pub fn with_name(mut self, provider_name: impl Into<String>) -> Self {
-        let provider_name = provider_name.into();
-        self.catalog_kind = OpenAiCatalogKind::from_provider_name(&provider_name);
-        self.provider_name = provider_name;
+        self.provider_name = provider_name.into();
+        self
+    }
+
+    pub fn with_auth_method(mut self, auth_method: &'static str) -> Self {
+        self.auth_method = auth_method;
         self
     }
 
@@ -632,14 +695,27 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn supported_thinking_levels(&self) -> &'static [&'static str] {
-        match self.catalog_kind {
-            OpenAiCatalogKind::OpenRouter => OPENROUTER_THINKING_LEVELS,
-            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => OPENAI_THINKING_LEVELS,
+        if self.catalog_kind.is_openrouter() {
+            OPENROUTER_THINKING_LEVELS
+        } else {
+            OPENAI_THINKING_LEVELS
+        }
+    }
+
+    fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+        if self.catalog_kind.is_openrouter() {
+            OPENROUTER_THINKING_LEVELS
+        } else {
+            openai_thinking_levels(model)
         }
     }
 
     fn models_endpoint(&self) -> Option<&str> {
         Some(&self.models_endpoint)
+    }
+
+    fn auth_method(&self) -> &'static str {
+        self.auth_method
     }
 
     fn catalog_auth_headers(
@@ -655,30 +731,29 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn is_chat_capable(&self, model_id: &str) -> bool {
-        match self.catalog_kind {
-            OpenAiCatalogKind::OpenRouter => is_openrouter_chat_capable(model_id),
-            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => {
-                is_openai_chat_capable(model_id)
-            }
+        if self.catalog_kind.is_openrouter() {
+            is_openrouter_chat_capable(model_id)
+        } else {
+            is_openai_chat_capable(model_id)
         }
     }
 
     fn fallback_models(&self) -> Vec<&'static str> {
-        match self.catalog_kind {
-            OpenAiCatalogKind::OpenRouter => OPENROUTER_FALLBACK_MODELS.to_vec(),
-            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::OpenAi => {
-                OPENAI_FALLBACK_MODELS.to_vec()
-            }
+        if self.catalog_kind.is_openrouter() {
+            OPENROUTER_FALLBACK_MODELS.to_vec()
+        } else {
+            OPENAI_FALLBACK_MODELS.to_vec()
         }
     }
 
     fn catalog_filters(&self) -> ProviderCatalogFilters {
         ProviderCatalogFilters {
-            apply_recency_and_price_floor: matches!(
-                self.catalog_kind,
-                OpenAiCatalogKind::OpenRouter
-            ),
+            apply_recency_and_price_floor: self.catalog_kind.is_openrouter(),
         }
+    }
+
+    fn context_window(&self, model: &str) -> usize {
+        openai_context_window(model)
     }
 
     fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
@@ -1176,13 +1251,16 @@ mod tests {
 
     #[test]
     fn openai_catalog_metadata_matches_expected_contract() {
-        let provider = OpenAiProvider::new(OpenAiProvider::default_base_url(), "test-key")
-            .unwrap()
-            .with_name("openai");
+        let provider =
+            OpenAiProvider::openai(OpenAiProvider::default_base_url(), "test-key").unwrap();
 
         assert_eq!(
             provider.supported_thinking_levels(),
             &["off", "low", "high"]
+        );
+        assert_eq!(
+            provider.thinking_levels("gpt-5.4"),
+            &["none", "low", "medium", "high", "xhigh"]
         );
         assert_eq!(
             provider.models_endpoint(),
@@ -1191,13 +1269,13 @@ mod tests {
         assert!(provider.is_chat_capable("gpt-4o"));
         assert!(!provider.is_chat_capable("text-embedding-3-small"));
         assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(!provider.catalog_filters().apply_recency_and_price_floor);
     }
 
     #[test]
     fn openai_catalog_auth_headers_use_bearer_auth() {
-        let provider = OpenAiProvider::new(OpenAiProvider::default_base_url(), "test-key")
-            .unwrap()
-            .with_name("openai");
+        let provider =
+            OpenAiProvider::openai(OpenAiProvider::default_base_url(), "test-key").unwrap();
 
         let headers = provider
             .catalog_auth_headers("oauth-token-123", "oauth")
@@ -1211,11 +1289,18 @@ mod tests {
 
     #[test]
     fn openrouter_catalog_metadata_uses_openrouter_contract() {
-        let provider = OpenAiProvider::new(OpenAiProvider::openrouter_base_url(), "test-key")
-            .unwrap()
-            .with_name("openrouter");
+        let provider =
+            OpenAiProvider::openrouter(OpenAiProvider::openrouter_base_url(), "test-key").unwrap();
 
         assert_eq!(provider.supported_thinking_levels(), &["off"]);
+        assert_eq!(
+            provider.thinking_levels("anthropic/claude-sonnet-4"),
+            &["off"]
+        );
+        assert_eq!(
+            provider.context_window("anthropic/claude-sonnet-4"),
+            200_000
+        );
         assert!(provider.is_chat_capable("x-ai/grok-3"));
         assert!(!provider.is_chat_capable("openai/text-embedding-3-large"));
         assert_eq!(provider.fallback_models(), OPENROUTER_FALLBACK_MODELS);
@@ -1223,10 +1308,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_maps_messages_tools_and_system() {
+    fn compatible_provider_name_does_not_change_catalog_contract() {
         let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
             .unwrap()
-            .with_name("openrouter")
+            .with_name("openrouter");
+
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert_eq!(
+            provider.thinking_levels("gpt-5.4"),
+            &["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(!provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
+    fn test_build_request_body_maps_messages_tools_and_system() {
+        let provider = OpenAiProvider::openrouter("http://localhost:8080", "test-key")
+            .unwrap()
             .with_supported_models(vec!["gpt-4o-mini".to_string()]);
 
         let request = CompletionRequest {

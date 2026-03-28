@@ -1851,18 +1851,16 @@ fn register_keyed_provider(
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
             })?
             .with_supported_models(supported_models);
-        router.register_provider_with_auth(Arc::new(anthropic), auth_label);
+        router.register_provider(Box::new(anthropic));
         return Ok(());
     }
 
-    let provider_client = OpenAiProvider::new(base_url_for_provider(provider), key.to_string())
+    let provider_client = build_openai_provider(provider, key, auth_label, supported_models)
         .map_err(|error| {
             StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-        })?
-        .with_name(provider.to_string())
-        .with_supported_models(supported_models);
+        })?;
 
-    router.register_provider_with_auth(Arc::new(provider_client), auth_label);
+    router.register_provider(Box::new(provider_client));
     Ok(())
 }
 
@@ -1883,20 +1881,45 @@ fn register_oauth_provider(
                 })?
                 .with_supported_models(supported_models);
 
-        router.register_provider_with_auth(Arc::new(provider_client), "subscription");
+        router.register_provider(Box::new(provider_client));
         return Ok(());
     }
 
     let provider_client =
-        OpenAiProvider::new(base_url_for_provider(provider), access_token.to_string())
-            .map_err(|error| {
+        build_openai_provider(provider, access_token, "subscription", supported_models).map_err(
+            |error| {
                 StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-            })?
-            .with_name(provider.to_string())
-            .with_supported_models(supported_models);
+            },
+        )?;
 
-    router.register_provider_with_auth(Arc::new(provider_client), "subscription");
+    router.register_provider(Box::new(provider_client));
     Ok(())
+}
+
+fn build_openai_provider(
+    provider: &str,
+    credential: &str,
+    auth_method: &str,
+    supported_models: Vec<String>,
+) -> Result<OpenAiProvider, fx_llm::ProviderError> {
+    let base_url = base_url_for_provider(provider);
+    let provider = match provider {
+        "openai" => OpenAiProvider::openai(base_url, credential.to_string())?,
+        "openrouter" => OpenAiProvider::openrouter(base_url, credential.to_string())?,
+        _ => OpenAiProvider::compatible(base_url, credential.to_string(), provider.to_string())?,
+    };
+    Ok(provider
+        .with_auth_method(canonical_auth_method(auth_method))
+        .with_supported_models(supported_models))
+}
+
+fn canonical_auth_method(auth_method: &str) -> &'static str {
+    match auth_method {
+        "api_key" => "api_key",
+        "subscription" => "subscription",
+        "setup_token" => "setup_token",
+        _ => "api_key",
+    }
 }
 
 fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {

@@ -352,6 +352,8 @@ fn metadata_credential(credential: &str) -> &str {
     }
 }
 
+/// Provider-name matching is intentional here: this factory chooses which
+/// explicit provider contract type to instantiate for catalog operations.
 fn catalog_provider(
     provider_name: &str,
     credential: &str,
@@ -362,14 +364,14 @@ fn catalog_provider(
         "anthropic" => AnthropicProvider::new(AnthropicProvider::default_base_url(), credential)
             .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
             .map_err(|error| format!("failed to build provider metadata: {error}")),
-        "openai" => OpenAiProvider::new(OpenAiProvider::default_base_url(), credential)
-            .map(|provider| Box::new(provider.with_name("openai")) as Box<dyn CompletionProvider>)
+        "openai" => OpenAiProvider::openai(OpenAiProvider::default_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
             .map_err(|error| format!("failed to build provider metadata: {error}")),
-        "openrouter" => OpenAiProvider::new(OpenAiProvider::openrouter_base_url(), credential)
-            .map(|provider| {
-                Box::new(provider.with_name("openrouter")) as Box<dyn CompletionProvider>
-            })
-            .map_err(|error| format!("failed to build provider metadata: {error}")),
+        "openrouter" => {
+            OpenAiProvider::openrouter(OpenAiProvider::openrouter_base_url(), credential)
+                .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+                .map_err(|error| format!("failed to build provider metadata: {error}"))
+        }
         _ => Ok(Box::new(UnknownCatalogProvider::new(&provider_name))),
     }
 }

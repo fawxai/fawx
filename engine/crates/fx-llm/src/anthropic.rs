@@ -17,6 +17,7 @@ use crate::provider::{
 };
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
+use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
@@ -888,8 +889,19 @@ impl LlmProvider for AnthropicProvider {
         ANTHROPIC_THINKING_LEVELS
     }
 
+    fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+        valid_thinking_levels(model)
+    }
+
     fn models_endpoint(&self) -> Option<&str> {
         Some(&self.models_endpoint)
+    }
+
+    fn auth_method(&self) -> &'static str {
+        match self.auth_mode {
+            AnthropicAuthMode::ApiKey(_) => "api_key",
+            AnthropicAuthMode::SetupToken(_) => "setup_token",
+        }
     }
 
     fn catalog_auth_headers(
@@ -931,6 +943,10 @@ impl LlmProvider for AnthropicProvider {
 
     fn fallback_models(&self) -> Vec<&'static str> {
         ANTHROPIC_FALLBACK_MODELS.to_vec()
+    }
+
+    fn context_window(&self, _model: &str) -> usize {
+        200_000
     }
 
     fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
@@ -1397,6 +1413,12 @@ mod tests {
             provider.supported_thinking_levels(),
             &["off", "low", "adaptive", "high"]
         );
+        assert_eq!(
+            provider.thinking_levels("claude-opus-4-6"),
+            &["off", "adaptive", "low", "medium", "high", "max"]
+        );
+        assert_eq!(provider.auth_method(), "api_key");
+        assert_eq!(provider.context_window("claude-sonnet-4-6"), 200_000);
     }
 
     #[test]

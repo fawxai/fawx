@@ -21,7 +21,8 @@ use tokio_tungstenite::tungstenite::{
 
 use crate::document::document_text_fallback;
 use crate::openai::{
-    is_openai_chat_capable, openai_models_endpoint, OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
+    is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
+    OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
 };
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
@@ -1118,8 +1119,16 @@ impl LlmProvider for OpenAiResponsesProvider {
         OPENAI_THINKING_LEVELS
     }
 
+    fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+        openai_thinking_levels(model)
+    }
+
     fn models_endpoint(&self) -> Option<&str> {
         Some(&self.models_endpoint)
+    }
+
+    fn auth_method(&self) -> &'static str {
+        "subscription"
     }
 
     fn catalog_auth_headers(
@@ -1143,6 +1152,10 @@ impl LlmProvider for OpenAiResponsesProvider {
 
     fn fallback_models(&self) -> Vec<&'static str> {
         OPENAI_FALLBACK_MODELS.to_vec()
+    }
+
+    fn context_window(&self, model: &str) -> usize {
+        openai_context_window(model)
     }
 
     fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
@@ -1664,12 +1677,18 @@ mod tests {
             &["off", "low", "high"]
         );
         assert_eq!(
+            provider.thinking_levels("gpt-5.4"),
+            &["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
             provider.models_endpoint(),
             Some("https://api.openai.com/v1/models")
         );
         assert!(provider.is_chat_capable("gpt-4o"));
         assert!(!provider.is_chat_capable("text-embedding-3-small"));
         assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert_eq!(provider.auth_method(), "subscription");
+        assert_eq!(provider.context_window("gemini-2.5-pro"), 1_000_000);
     }
 
     #[test]

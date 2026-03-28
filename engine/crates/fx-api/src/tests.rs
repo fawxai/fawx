@@ -1308,6 +1308,17 @@ mod routing_and_status {
         models: Vec<&'static str>,
     }
 
+    fn static_provider_thinking_levels(name: &str, model: &str) -> &'static [&'static str] {
+        match (name, model) {
+            ("anthropic", "claude-opus-4-6") => {
+                &["off", "adaptive", "low", "medium", "high", "max"]
+            }
+            ("anthropic", "claude-sonnet-4-6") => &["off", "adaptive", "low", "medium", "high"],
+            ("openai", "gpt-5.4") => &["none", "low", "medium", "high", "xhigh"],
+            _ => &["off"],
+        }
+    }
+
     #[async_trait]
     impl CompletionProvider for StaticProvider {
         async fn complete(
@@ -1337,6 +1348,10 @@ mod routing_and_status {
                 supports_temperature: false,
                 requires_streaming: false,
             }
+        }
+
+        fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+            static_provider_thinking_levels(self.name, model)
         }
     }
 

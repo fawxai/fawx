@@ -27,6 +27,8 @@ pub struct ProviderCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProviderCatalogFilters {
     /// Apply the shared recency and price-floor filter used for OpenRouter catalogs.
+    /// More provider-specific catalog gates can be added here as metadata
+    /// contracts expand without proliferating ad hoc boolean methods.
     pub apply_recency_and_price_floor: bool,
 }
 
@@ -365,9 +367,19 @@ pub trait LlmProvider: Send + Sync {
         &["off"]
     }
 
+    /// User-facing thinking levels accepted for a specific model.
+    fn thinking_levels(&self, _model: &str) -> &'static [&'static str] {
+        self.supported_thinking_levels()
+    }
+
     /// Optional models endpoint used for catalog fetches.
     fn models_endpoint(&self) -> Option<&str> {
         None
+    }
+
+    /// Primary auth method label for models served by this provider instance.
+    fn auth_method(&self) -> &'static str {
+        "api_key"
     }
 
     /// Authentication headers for model catalog requests.
@@ -388,6 +400,11 @@ pub trait LlmProvider: Send + Sync {
     /// Provider-specific catalog filtering knobs.
     fn catalog_filters(&self) -> ProviderCatalogFilters {
         ProviderCatalogFilters::default()
+    }
+
+    /// Provider-owned context window lookup for a specific model.
+    fn context_window(&self, _model: &str) -> usize {
+        128_000
     }
 
     /// Provider-owned loop harness semantics for the given model.

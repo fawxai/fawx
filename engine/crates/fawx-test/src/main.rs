@@ -93,6 +93,8 @@ struct Expectations {
     #[serde(default)]
     tool_calls: Option<Vec<String>>,
     #[serde(default)]
+    tool_input_contains: Option<Vec<String>>,
+    #[serde(default)]
     output_contains: Option<Vec<String>>,
     #[serde(default)]
     output_not_contains: Option<Vec<String>>,
@@ -104,6 +106,7 @@ struct Expectations {
 #[derive(Debug, Default)]
 struct FawxOutput {
     tool_calls: Vec<String>,
+    tool_inputs: Vec<String>,
     response_text: String,
     tool_errors: Vec<String>,
 }
@@ -113,6 +116,8 @@ struct HeadlessJsonOutput {
     response: String,
     #[serde(default)]
     tool_calls: Vec<String>,
+    #[serde(default)]
+    tool_inputs: Vec<String>,
     #[serde(default)]
     tool_errors: Vec<String>,
 }
@@ -382,6 +387,7 @@ fn parse_fawx_output(raw: &str) -> Result<FawxOutput, TestError> {
     })?;
     Ok(FawxOutput {
         tool_calls: output.tool_calls,
+        tool_inputs: output.tool_inputs,
         response_text: output.response,
         tool_errors: output.tool_errors,
     })
@@ -393,6 +399,7 @@ fn check_expectations(output: &FawxOutput, expect: &Expectations) -> Vec<String>
     let mut failures = Vec::new();
 
     check_tool_calls(output, expect, &mut failures);
+    check_tool_input_contains(output, expect, &mut failures);
     check_output_contains(output, expect, &mut failures);
     check_output_not_contains(output, expect, &mut failures);
     check_no_tool_errors(output, expect, &mut failures);
@@ -408,6 +415,23 @@ fn check_tool_calls(output: &FawxOutput, expect: &Expectations, failures: &mut V
                 failures.push(format!(
                     "Expected tool_calls to include \"{tool}\", got: {:?}",
                     output.tool_calls
+                ));
+            }
+        }
+    }
+}
+
+fn check_tool_input_contains(
+    output: &FawxOutput,
+    expect: &Expectations,
+    failures: &mut Vec<String>,
+) {
+    if let Some(patterns) = &expect.tool_input_contains {
+        let joined_inputs = output.tool_inputs.join("\n").to_lowercase();
+        for pattern in patterns {
+            if !joined_inputs.contains(&pattern.to_lowercase()) {
+                failures.push(format!(
+                    "Expected tool inputs to contain \"{pattern}\", not found"
                 ));
             }
         }
@@ -724,12 +748,14 @@ prompt = ""
     fn check_expectations_passes_on_match() {
         let output = FawxOutput {
             tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
             response_text: "The file contains hello world".to_string(),
             tool_errors: vec![],
         };
 
         let expect = Expectations {
             tool_calls: Some(vec!["read_file".to_string()]),
+            tool_input_contains: Some(vec!["readme".to_string()]),
             output_contains: Some(vec!["hello world".to_string()]),
             output_not_contains: Some(vec!["error".to_string()]),
             no_tool_errors: Some(true),
@@ -746,19 +772,21 @@ prompt = ""
     fn check_expectations_fails_on_mismatch() {
         let output = FawxOutput {
             tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
             response_text: "Something went wrong".to_string(),
             tool_errors: vec!["file not found".to_string()],
         };
 
         let expect = Expectations {
             tool_calls: Some(vec!["memory_write".to_string()]),
+            tool_input_contains: Some(vec!["blue".to_string()]),
             output_contains: Some(vec!["hello".to_string()]),
             output_not_contains: Some(vec!["wrong".to_string()]),
             no_tool_errors: Some(true),
         };
 
         let failures = check_expectations(&output, &expect);
-        assert_eq!(failures.len(), 4);
+        assert_eq!(failures.len(), 5);
     }
 
     #[test]
@@ -789,12 +817,14 @@ prompt = ""
     fn output_contains_is_case_insensitive() {
         let output = FawxOutput {
             tool_calls: vec![],
+            tool_inputs: vec![],
             response_text: "Hello World".to_string(),
             tool_errors: vec![],
         };
 
         let expect = Expectations {
             tool_calls: None,
+            tool_input_contains: None,
             output_contains: Some(vec!["hello world".to_string()]),
             output_not_contains: None,
             no_tool_errors: None,
@@ -809,12 +839,14 @@ prompt = ""
         // Also check that uppercase pattern matches lowercase output
         let output2 = FawxOutput {
             tool_calls: vec![],
+            tool_inputs: vec![],
             response_text: "hello world".to_string(),
             tool_errors: vec![],
         };
 
         let expect2 = Expectations {
             tool_calls: None,
+            tool_input_contains: None,
             output_contains: Some(vec!["Hello World".to_string()]),
             output_not_contains: None,
             no_tool_errors: None,
@@ -835,6 +867,7 @@ prompt = ""
 
         assert_eq!(output.response_text, "hello");
         assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert!(output.tool_inputs.is_empty());
         assert_eq!(output.tool_errors, vec!["missing"]);
     }
 
@@ -861,6 +894,7 @@ prompt = ""
         let captured = fs::read_to_string(capture_path).unwrap();
 
         assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert!(output.tool_inputs.is_empty());
         assert_eq!(captured.trim(), r#"{"message":"hello world"}"#);
     }
 }

@@ -209,11 +209,7 @@ impl JsonFileMemory {
                 (key.clone(), entry.value.clone(), weight)
             })
             .collect();
-        entries.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        entries.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         entries
             .into_iter()
             .map(|(key, value, _)| (key, value))
