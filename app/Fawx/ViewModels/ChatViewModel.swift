@@ -606,6 +606,15 @@ final class StreamingDisplayController {
 @MainActor
 @Observable
 final class ChatViewModel {
+    private static let elapsedDurationFormatter: DateComponentsFormatter = {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.maximumUnitCount = 2
+        formatter.unitsStyle = .full
+        formatter.zeroFormattingBehavior = [.dropAll]
+        return formatter
+    }()
+
     enum TranscriptScrollBehavior {
         case animated
         case snap
@@ -658,6 +667,49 @@ final class ChatViewModel {
         }
     }
 
+    enum StreamingProgressKind: Sendable, Equatable {
+        case researching
+        case writingArtifact
+        case implementing
+        case awaitingDirection
+        case other(String)
+
+        init(rawValue: String) {
+            switch rawValue.lowercased() {
+            case "researching":
+                self = .researching
+            case "writing_artifact":
+                self = .writingArtifact
+            case "implementing":
+                self = .implementing
+            case "awaiting_direction":
+                self = .awaitingDirection
+            default:
+                self = .other(rawValue)
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .researching:
+                return "Researching"
+            case .writingArtifact:
+                return "Writing"
+            case .implementing:
+                return "Implementing"
+            case .awaitingDirection:
+                return "Awaiting Direction"
+            case .other(let rawValue):
+                return rawValue.capitalized
+            }
+        }
+    }
+
+    struct StreamingProgress: Sendable, Equatable {
+        let kind: StreamingProgressKind
+        let message: String
+    }
+
     struct CompactionBannerInfo: Equatable {
         let message: String
         let isEmergency: Bool
@@ -666,6 +718,8 @@ final class ChatViewModel {
     private struct SessionStreamingState {
         var text = ""
         var phase: StreamingPhase?
+        var progress: StreamingProgress?
+        var startedAt = Date()
     }
 
     private static let sessionLoadDebounceMs = 50
@@ -715,6 +769,7 @@ final class ChatViewModel {
     private var anonymousToolCallCountersBySession: [String: Int] = [:]
     private var queuedPermissionPrompts: [PermissionPrompt] = []
     private var streamStates: [String: SessionStreamingState] = [:]
+    private var completedStreamFootnotesBySession: [String: [String: String]] = [:]
     private var compactionBannerInfosBySession: [String: CompactionBannerInfo] = [:]
     @ObservationIgnored private var historyLoadSequence = 0
     @ObservationIgnored private var transcriptCache: [String: [SessionMessage]] = [:]
@@ -810,6 +865,52 @@ final class ChatViewModel {
         return streamStates[currentSessionID]?.phase
     }
 
+    var visibleProgress: StreamingProgress? {
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return nil
+        }
+
+        return streamStates[currentSessionID]?.progress
+    }
+
+    var visibleStreamingStartedAt: Date? {
+        guard let currentSessionID, isCurrentSessionStreaming else {
+            return nil
+        }
+
+        return streamStates[currentSessionID]?.startedAt
+    }
+
+    func visibleStreamingElapsedText(now: Date = Date()) -> String? {
+        guard let startedAt = visibleStreamingStartedAt else {
+            return nil
+        }
+
+        return streamingElapsedFootnoteText(
+            startedAt: startedAt,
+            endedAt: now,
+            minimumSeconds: 15
+        )
+    }
+
+    private func streamingElapsedString(_ seconds: Int) -> String {
+        Self.elapsedDurationFormatter.string(from: TimeInterval(seconds))
+            ?? "\(seconds) seconds"
+    }
+
+    private func streamingElapsedFootnoteText(
+        startedAt: Date,
+        endedAt: Date,
+        minimumSeconds: Int
+    ) -> String? {
+        let elapsed = max(0, Int(endedAt.timeIntervalSince(startedAt)))
+        guard elapsed >= minimumSeconds else {
+            return nil
+        }
+
+        return "Worked for \(streamingElapsedString(elapsed))"
+    }
+
     var shouldAutoScrollStreamingUpdates: Bool {
         guard let currentSessionID, isCurrentSessionStreaming else {
             return true
@@ -819,6 +920,10 @@ final class ChatViewModel {
     }
 
     var composerPhaseLabel: String? {
+        if let visibleProgress {
+            return visibleProgress.kind.label
+        }
+
         if let visibleCurrentPhase {
             return visibleCurrentPhase.composerLabel
         }
@@ -1100,10 +1205,59 @@ final class ChatViewModel {
             return fetchedMessages
         }
 
+        if let preferredFetchedMessages = replaceOptimisticAssistantTailIfServerCompletedTurn(
+            localMessages: existingMessages,
+            fetchedMessages: fetchedMessages
+        ) {
+            return preferredFetchedMessages
+        }
+
         return mergeFetchedMessagesPreservingRelativeOrder(
             localMessages: existingMessages,
             fetchedMessages: fetchedMessages
         )
+    }
+
+    private func replaceOptimisticAssistantTailIfServerCompletedTurn(
+        localMessages: [SessionMessage],
+        fetchedMessages: [SessionMessage]
+    ) -> [SessionMessage]? {
+        guard
+            let localLastUserIndex = localMessages.lastIndex(where: { $0.role == .user }),
+            let fetchedLastUserIndex = fetchedMessages.lastIndex(where: { $0.role == .user })
+        else {
+            return nil
+        }
+
+        let localPrefix = Array(localMessages.prefix(through: localLastUserIndex))
+        let fetchedPrefix = Array(fetchedMessages.prefix(through: fetchedLastUserIndex))
+        guard areEquivalentMessageSequences(localPrefix, fetchedPrefix) else {
+            return nil
+        }
+
+        let localTail = Array(localMessages.suffix(from: localMessages.index(after: localLastUserIndex)))
+        let fetchedTail = Array(fetchedMessages.suffix(from: fetchedMessages.index(after: fetchedLastUserIndex)))
+        guard !localTail.isEmpty, !fetchedTail.isEmpty else {
+            return nil
+        }
+
+        guard
+            localTail.allSatisfy(isPlainAssistantTailMessage),
+            fetchedTail.allSatisfy(isPlainAssistantTailMessage)
+        else {
+            return nil
+        }
+
+        return fetchedMessages
+    }
+
+    private func isPlainAssistantTailMessage(_ message: SessionMessage) -> Bool {
+        guard message.role == .assistant else {
+            return false
+        }
+
+        let displayText = message.transcriptDisplayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !displayText.isEmpty && toolCalls(from: message).isEmpty
     }
 
     private func mergeFetchedMessagesPreservingRelativeOrder(
@@ -1522,10 +1676,14 @@ final class ChatViewModel {
         retryAttachments: [PendingAttachment]
     ) {
         stopStreaming(sessionID: sessionID)
-        streamStates[sessionID] = SessionStreamingState(text: "", phase: nil)
+        streamStates[sessionID] = SessionStreamingState(
+            text: "",
+            phase: nil,
+            progress: nil,
+            startedAt: Date()
+        )
         streamingDisplayController(for: sessionID).reset(repinToBottom: true)
 
-        let assistantTimestamp = Int(Date().timeIntervalSince1970)
         let task = Task {
             var finalResponse: String?
             var streamFailed = false
@@ -1535,6 +1693,14 @@ final class ChatViewModel {
                     switch event {
                     case .textDelta(let text):
                         streamingDisplayController(for: sessionID).appendToken(text)
+                    case .progress(let kind, let message):
+                        setStreamingProgress(
+                            StreamingProgress(
+                                kind: StreamingProgressKind(rawValue: kind),
+                                message: message
+                            ),
+                            for: sessionID
+                        )
                     case .notification(let title, let body):
                         await NotificationService.shared.send(title: title, body: body)
                     case .toolCallStart(let id, let name):
@@ -1595,17 +1761,23 @@ final class ChatViewModel {
                             attachments: retryAttachments,
                             sessionID: sessionID
                         )
-                        await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                        await finalizeCancellation(
+                            timestamp: Int(Date().timeIntervalSince1970),
+                            sessionID: sessionID
+                        )
                     }
                 } else {
                     await finalizeStream(
-                        timestamp: assistantTimestamp,
+                        timestamp: Int(Date().timeIntervalSince1970),
                         finalResponse: finalResponse,
                         sessionID: sessionID
                     )
                 }
             } catch is CancellationError {
-                await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                await finalizeCancellation(
+                    timestamp: Int(Date().timeIntervalSince1970),
+                    sessionID: sessionID
+                )
             } catch {
                 handleStreamError("Response interrupted. \(error.localizedDescription)", sessionID: sessionID)
                 let recovered = await recoverInterruptedStream(
@@ -1621,7 +1793,10 @@ final class ChatViewModel {
                         attachments: retryAttachments,
                         sessionID: sessionID
                     )
-                    await finalizeCancellation(timestamp: assistantTimestamp, sessionID: sessionID)
+                    await finalizeCancellation(
+                        timestamp: Int(Date().timeIntervalSince1970),
+                        sessionID: sessionID
+                    )
                 }
             }
         }
@@ -1629,11 +1804,35 @@ final class ChatViewModel {
         streamTasks[sessionID] = task
     }
 
+    private func assistantMessageTimestamp(startedAt: Date?, fallbackUnixTimestamp: Int) -> Int {
+        guard let startedAt else {
+            return fallbackUnixTimestamp
+        }
+
+        let startedTimestamp = Int(startedAt.timeIntervalSince1970.rounded(.down))
+        return startedTimestamp > 0 ? startedTimestamp : fallbackUnixTimestamp
+    }
+
     private func finalizeStream(timestamp: Int, finalResponse: String?, sessionID: String) async {
         streamingDisplayController(for: sessionID).streamDidEnd()
+        let startedAt = streamStates[sessionID]?.startedAt
+        let endedAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let content = finalResponse ?? streamingText(for: sessionID)
         if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let assistantMessage = SessionMessage(role: .assistant, content: content, timestamp: timestamp)
+            let assistantMessage = SessionMessage(
+                role: .assistant,
+                content: content,
+                timestamp: assistantMessageTimestamp(
+                    startedAt: startedAt,
+                    fallbackUnixTimestamp: timestamp
+                )
+            )
+            recordCompletedStreamingFootnote(
+                startedAt: startedAt,
+                endedAt: endedAt,
+                for: assistantMessage,
+                sessionID: sessionID
+            )
             appendMessage(assistantMessage, for: sessionID)
             sessionViewModel.updatePreview(for: sessionID, text: content, model: appState.activeModel?.modelID)
         }
@@ -1652,10 +1851,25 @@ final class ChatViewModel {
 
     private func finalizeCancellation(timestamp: Int, sessionID: String) async {
         streamingDisplayController(for: sessionID).streamDidEnd()
+        let startedAt = streamStates[sessionID]?.startedAt
+        let endedAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let currentStreamingText = streamingText(for: sessionID)
         if !currentStreamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let interrupted = currentStreamingText + "\n\n(interrupted)"
-            let assistantMessage = SessionMessage(role: .assistant, content: interrupted, timestamp: timestamp)
+            let assistantMessage = SessionMessage(
+                role: .assistant,
+                content: interrupted,
+                timestamp: assistantMessageTimestamp(
+                    startedAt: startedAt,
+                    fallbackUnixTimestamp: timestamp
+                )
+            )
+            recordCompletedStreamingFootnote(
+                startedAt: startedAt,
+                endedAt: endedAt,
+                for: assistantMessage,
+                sessionID: sessionID
+            )
             appendMessage(assistantMessage, for: sessionID)
             sessionViewModel.updatePreview(for: sessionID, text: interrupted, model: appState.activeModel?.modelID)
         }
@@ -2063,6 +2277,14 @@ final class ChatViewModel {
         streamStates[sessionID]?.phase = phase
     }
 
+    private func setStreamingProgress(_ progress: StreamingProgress?, for sessionID: String) {
+        guard streamStates[sessionID] != nil else {
+            return
+        }
+
+        streamStates[sessionID]?.progress = progress
+    }
+
     private func appendStreamingText(_ text: String, for sessionID: String) {
         guard !text.isEmpty, streamStates[sessionID] != nil else {
             return
@@ -2102,13 +2324,27 @@ final class ChatViewModel {
 
                 let displayText = message.transcriptDisplayText
                 if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                    items.append(
+                        messageTranscriptItem(
+                            message,
+                            displayText: displayText,
+                            sessionID: sessionID,
+                            duplicateCounts: &duplicateCounts
+                        )
+                    )
                 }
                 pendingHistoricalGroupIndex = nil
             case .user, .assistant, .system:
                 let displayText = message.transcriptDisplayText
                 if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    items.append(messageTranscriptItem(message, displayText: displayText, duplicateCounts: &duplicateCounts))
+                    items.append(
+                        messageTranscriptItem(
+                            message,
+                            displayText: displayText,
+                            sessionID: sessionID,
+                            duplicateCounts: &duplicateCounts
+                        )
+                    )
                 }
 
                 let historicalToolCalls = toolCalls(from: message)
@@ -2137,13 +2373,21 @@ final class ChatViewModel {
     private func messageTranscriptItem(
         _ message: SessionMessage,
         displayText: String,
+        sessionID: String?,
         duplicateCounts: inout [String: Int]
     ) -> ChatTranscriptItem {
         let baseID = messageStableIDBase(for: message)
         let occurrence = duplicateCounts[baseID, default: 0]
         duplicateCounts[baseID] = occurrence + 1
         let id = occurrence == 0 ? baseID : "\(baseID)#\(occurrence)"
-        return .message(TranscriptMessage(id: id, message: message, displayText: displayText))
+        return .message(
+            TranscriptMessage(
+                id: id,
+                message: message,
+                displayText: displayText,
+                footnoteText: completedStreamingFootnote(for: message, sessionID: sessionID)
+            )
+        )
     }
 
     private func messageStableIDBase(for message: SessionMessage) -> String {
@@ -2152,6 +2396,40 @@ final class ChatViewModel {
             String(message.timestamp),
             Self.stableDigest(for: message.content)
         ].joined(separator: ":")
+    }
+
+    private func recordCompletedStreamingFootnote(
+        startedAt: Date?,
+        endedAt: Date,
+        for message: SessionMessage,
+        sessionID: String
+    ) {
+        guard
+            let startedAt,
+            let footnote = streamingElapsedFootnoteText(
+                startedAt: startedAt,
+                endedAt: endedAt,
+                minimumSeconds: 1
+            )
+        else {
+            return
+        }
+
+        let baseID = messageStableIDBase(for: message)
+        var footnotes = completedStreamFootnotesBySession[sessionID, default: [:]]
+        footnotes[baseID] = footnote
+        completedStreamFootnotesBySession[sessionID] = footnotes
+    }
+
+    private func completedStreamingFootnote(
+        for message: SessionMessage,
+        sessionID: String?
+    ) -> String? {
+        guard let sessionID else {
+            return nil
+        }
+
+        return completedStreamFootnotesBySession[sessionID]?[messageStableIDBase(for: message)]
     }
 
     static func stableDigest(for content: String) -> String {
@@ -2516,8 +2794,39 @@ extension ChatViewModel {
         makeTranscriptItems(for: currentSessionID, messages: messages)
     }
 
+    func makeTranscriptItemsForTesting(
+        sessionID: String?,
+        messages: [SessionMessage]
+    ) -> [ChatTranscriptItem] {
+        makeTranscriptItems(for: sessionID, messages: messages)
+    }
+
     func appendMessageForTesting(_ message: SessionMessage, sessionID: String) {
         appendMessage(message, for: sessionID)
+    }
+
+    func recordCompletedStreamingFootnoteForTesting(
+        _ message: SessionMessage,
+        sessionID: String,
+        startedAt: Date,
+        endedAt: Date
+    ) {
+        recordCompletedStreamingFootnote(
+            startedAt: startedAt,
+            endedAt: endedAt,
+            for: message,
+            sessionID: sessionID
+        )
+    }
+
+    func assistantMessageTimestampForTesting(
+        startedAt: Date?,
+        fallbackUnixTimestamp: Int
+    ) -> Int {
+        assistantMessageTimestamp(
+            startedAt: startedAt,
+            fallbackUnixTimestamp: fallbackUnixTimestamp
+        )
     }
 
     func handleStreamErrorForTesting(_ message: String, sessionID: String) {
@@ -2533,7 +2842,9 @@ extension ChatViewModel {
         currentSessionID: String?,
         streamingSessionID: String?,
         streamingText: String = "",
-        phase: StreamingPhase? = nil
+        phase: StreamingPhase? = nil,
+        progress: StreamingProgress? = nil,
+        startedAt: Date = Date()
     ) {
         self.currentSessionID = currentSessionID
         streamStates.removeAll()
@@ -2541,7 +2852,12 @@ extension ChatViewModel {
         streamingDisplayControllers.removeAll()
 
         if isStreaming, let streamingSessionID {
-            streamStates[streamingSessionID] = SessionStreamingState(text: streamingText, phase: phase)
+            streamStates[streamingSessionID] = SessionStreamingState(
+                text: streamingText,
+                phase: phase,
+                progress: progress,
+                startedAt: startedAt
+            )
             _ = streamingDisplayController(for: streamingSessionID)
         }
     }
@@ -2550,9 +2866,24 @@ extension ChatViewModel {
         _ sessions: [String: (text: String, phase: StreamingPhase?)],
         currentSessionID: String?
     ) {
+        setStreamingSessionsForTesting(
+            sessions.mapValues { (text: $0.text, phase: $0.phase, progress: nil) },
+            currentSessionID: currentSessionID
+        )
+    }
+
+    func setStreamingSessionsForTesting(
+        _ sessions: [String: (text: String, phase: StreamingPhase?, progress: StreamingProgress?)],
+        currentSessionID: String?
+    ) {
         self.currentSessionID = currentSessionID
         streamStates = sessions.reduce(into: [:]) { partialResult, entry in
-            partialResult[entry.key] = SessionStreamingState(text: entry.value.text, phase: entry.value.phase)
+            partialResult[entry.key] = SessionStreamingState(
+                text: entry.value.text,
+                phase: entry.value.phase,
+                progress: entry.value.progress,
+                startedAt: Date()
+            )
         }
         streamTasks.removeAll()
         streamingDisplayControllers.removeAll()

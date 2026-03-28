@@ -2,6 +2,7 @@ import Foundation
 
 enum SSEEvent: Sendable, Hashable {
     case textDelta(String)
+    case progress(kind: String, message: String)
     case notification(title: String, body: String)
     case toolCallStart(id: String?, name: String?)
     case toolCallDelta(id: String?, argumentsDelta: String)
@@ -83,6 +84,9 @@ struct SSEParser {
         case "text_delta":
             let payload = try decoder.decode(TextDeltaPayload.self, from: Data(data.utf8))
             return .textDelta(payload.text)
+        case "progress":
+            let payload = try decoder.decode(ProgressPayload.self, from: Data(data.utf8))
+            return .progress(kind: payload.kind, message: payload.message)
         case "notification":
             let payload = try decoder.decode(NotificationPayload.self, from: Data(data.utf8))
             return .notification(title: payload.title, body: payload.body)
@@ -150,6 +154,11 @@ private struct TextDeltaPayload: Decodable {
 private struct NotificationPayload: Decodable {
     let title: String
     let body: String
+}
+
+private struct ProgressPayload: Decodable {
+    let kind: String
+    let message: String
 }
 
 private struct ToolCallStartPayload: Decodable {

@@ -12,9 +12,6 @@ For judgment-based preferences, style conventions, and evolving design taste, se
 
 These principles are the foundation. Every rule below derives from them.
 
-### Everything Describes Itself
-Components declare their own behavior through traits. Systems discover components by iterating trait objects. No static registries, no name-to-behavior lookup tables, no string matching on component identities. If you're writing a match on a name, you're in the wrong layer. Full doctrine: `docs/doctrine.md`.
-
 ### YAGNI — You Aren't Gonna Need It
 Do not build functionality until it is necessary. Speculative code is dead weight that must be tested, maintained, and understood by everyone who touches the codebase. If a reviewer can say "we don't need this yet," the code gets removed.
 

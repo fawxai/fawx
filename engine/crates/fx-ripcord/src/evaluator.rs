@@ -2,8 +2,8 @@ use crate::config::TripwireConfig;
 use crate::journal::{JournalAction, RipcordJournal};
 use async_trait::async_trait;
 use fx_kernel::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolCallClassification, ToolExecutor,
+    ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -112,6 +112,10 @@ impl<T: ToolExecutor> ToolExecutor for TripwireEvaluator<T> {
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.inner.cacheability(tool_name)
+    }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.inner.classify_call(call)
     }
 
     fn clear_cache(&self) {

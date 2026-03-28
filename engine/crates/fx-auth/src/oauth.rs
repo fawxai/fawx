@@ -14,7 +14,8 @@ const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authoriz
 pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
-const DEFAULT_SCOPE: &str = "openid profile email offline_access";
+const DEFAULT_SCOPE: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 /// JWT claim path for extracting account ID from OpenAI access tokens.
 pub const OPENAI_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
@@ -433,6 +434,8 @@ mod tests {
         assert!(url.contains(&format!("state={}", percent_encode(flow.state()))));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope="));
+        assert!(url.contains(&percent_encode("api.connectors.read")));
+        assert!(url.contains(&percent_encode("api.connectors.invoke")));
         assert!(url.contains("originator=codex_cli_rs"));
     }
 

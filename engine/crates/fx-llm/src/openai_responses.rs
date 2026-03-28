@@ -21,7 +21,12 @@ use tokio_tungstenite::tungstenite::{
 
 use crate::document::document_text_fallback;
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
-use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::provider::{
+    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
+    LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch, LoopModelProfile,
+    LoopPromptOverlayContext, LoopStreamingRecoveryStrategy, ProviderCapabilities,
+    StaticLoopModelProfile,
+};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
@@ -32,6 +37,87 @@ use crate::validation::validate_tool_message_sequence;
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
 const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
+const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
+When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
+If the user names an exact command or workflow, execute that exact path before exploring alternatives unless you hit a concrete blocker. \
+If you are blocked, state the blocker plainly and ask for direction rather than ending on promise language like \"Let me...\" without taking the next action.";
+
+const GPT_TOOL_CONTINUATION_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
+After tool calls, turn the evidence into either a direct answer or an explicit blocker. \
+Do not emit planning-only text or future-tense promises unless you are also making the next tool call in the same response.";
+
+#[derive(Debug)]
+struct OpenAiResponsesLoopHarness {
+    use_reasoning_overlays: bool,
+}
+
+impl LoopHarness for OpenAiResponsesLoopHarness {
+    fn buffered_completion_strategy(&self) -> LoopBufferedCompletionStrategy {
+        LoopBufferedCompletionStrategy::SingleResponse
+    }
+
+    fn prompt_overlay(&self, context: LoopPromptOverlayContext) -> Option<&'static str> {
+        if !self.use_reasoning_overlays {
+            return None;
+        }
+
+        match context {
+            LoopPromptOverlayContext::Reasoning => Some(GPT_REASONING_OVERLAY),
+            LoopPromptOverlayContext::ToolContinuation => Some(GPT_TOOL_CONTINUATION_OVERLAY),
+        }
+    }
+
+    fn is_truncated(&self, stop_reason: Option<&str>) -> bool {
+        matches!(
+            stop_reason
+                .map(|reason| reason.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("length" | "incomplete")
+        )
+    }
+
+    fn streaming_recovery(
+        &self,
+        _error: &LlmError,
+        emitted_text: bool,
+    ) -> LoopStreamingRecoveryStrategy {
+        if emitted_text {
+            LoopStreamingRecoveryStrategy::Fail
+        } else {
+            LoopStreamingRecoveryStrategy::RetryWithSingleResponse
+        }
+    }
+}
+
+static OPENAI_RESPONSES_LOOP_HARNESS: OpenAiResponsesLoopHarness = OpenAiResponsesLoopHarness {
+    use_reasoning_overlays: false,
+};
+
+static OPENAI_REASONING_RESPONSES_LOOP_HARNESS: OpenAiResponsesLoopHarness =
+    OpenAiResponsesLoopHarness {
+        use_reasoning_overlays: true,
+    };
+
+static OPENAI_REASONING_RESPONSES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "openai_responses_reasoning",
+    matcher: LoopModelMatch::AnyPrefix(&["gpt-5.4", "gpt-5.2", "gpt-5", "codex-", "o1", "o3"]),
+    harness: &OPENAI_REASONING_RESPONSES_LOOP_HARNESS,
+};
+
+static OPENAI_DEFAULT_RESPONSES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "openai_responses_default",
+    matcher: LoopModelMatch::Any,
+    harness: &OPENAI_RESPONSES_LOOP_HARNESS,
+};
+
+static OPENAI_RESPONSES_LOOP_PROFILES: [&'static dyn LoopModelProfile; 2] = [
+    &OPENAI_REASONING_RESPONSES_LOOP_PROFILE,
+    &OPENAI_DEFAULT_RESPONSES_LOOP_PROFILE,
+];
+
+fn openai_responses_loop_harness(model: &str) -> &'static dyn LoopHarness {
+    resolve_loop_harness_from_profiles(&OPENAI_RESPONSES_LOOP_PROFILES, model, null_loop_harness())
+}
 
 /// OpenAI Responses API provider for ChatGPT subscription auth.
 #[derive(Debug, Clone)]
@@ -1028,6 +1114,10 @@ impl LlmProvider for OpenAiResponsesProvider {
             supports_temperature: false,
             requires_streaming: true,
         }
+    }
+
+    fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
+        openai_responses_loop_harness(model)
     }
 }
 

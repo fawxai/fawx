@@ -35,6 +35,10 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         StreamEvent::TextDelta { text } => {
             sse_frame("text_delta", serde_json::json!({ "text": text }))
         }
+        StreamEvent::Progress { kind, message } => sse_frame(
+            "progress",
+            serde_json::json!({ "kind": kind, "message": message }),
+        ),
         StreamEvent::Notification { title, body } => sse_frame(
             "notification",
             serde_json::json!({ "title": title, "body": body }),
@@ -57,12 +61,14 @@ pub fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         ),
         StreamEvent::ToolResult {
             id,
+            tool_name,
             output,
             is_error,
         } => sse_frame(
             "tool_result",
             serde_json::json!({
                 "id": id,
+                "tool_name": tool_name,
                 "output": output,
                 "is_error": is_error,
             }),
@@ -306,6 +312,20 @@ mod tests {
         assert_eq!(
             frame,
             "event: tool_error\ndata: {\"error\":\"permission denied\",\"tool_name\":\"read_file\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn progress_event_serializes() {
+        let frame = serialize_stream_event(StreamEvent::Progress {
+            kind: fx_core::message::ProgressKind::Implementing,
+            message: "Implementing the committed plan.".to_string(),
+        })
+        .expect("progress frame");
+
+        assert_eq!(
+            frame,
+            "event: progress\ndata: {\"kind\":\"implementing\",\"message\":\"Implementing the committed plan.\"}\n\n"
         );
     }
 
