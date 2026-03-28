@@ -401,11 +401,16 @@
       <span class="tag tag-partial">foundation laid</span>
     </div>
     <div class="issue-body">
-      PR #1648 built the full pipeline: <code>manifest.toml</code> → <code>ManifestTool.direct_utility</code> → <code>ToolDefinition.parameters["x-fawx-direct-utility"]</code> → kernel reads it via <code>direct_utility_metadata()</code>. Validated end-to-end with weather skill. But only 1 of N skills uses it. The <code>DirectUtilityProfile</code> enum still has hardcoded variants (Weather, CurrentTime) rather than being generic. Extending to new profiles still requires kernel code changes.
+      PR #1648 built the full metadata pipeline for 1 skill (weather). Three phases remain:
+      <ul>
+        <li><strong>Phase 1: Generalize profiles.</strong> Replace hardcoded <code>DirectUtilityProfile</code> enum (Weather, CurrentTime) with data-driven struct built from manifest metadata. Eliminate 5 match-arm functions. Add <code>is_structured_tool_schema()</code> guard against legacy wrappers.</li>
+        <li><strong>Phase 2: Migrate legacy skills.</strong> 3 of 8 skills (calculator, canvas, github) still use legacy <code>{"input": "string"}</code> wrapper. Add <code>[[tools]]</code> sections to their manifests. Update <code>encode_runtime_input()</code> for structured arg routing.</li>
+        <li><strong>Phase 3: Safety gate.</strong> Negative tests proving legacy-wrapped tools cannot activate direct utility routing.</li>
+      </ul>
     </div>
     <div class="deps"><strong>Depends on:</strong> #1639 (tool trait for skill-as-tool contract), #1171 (WASM tool definitions)</div>
     <div class="progress-bar"><div class="progress-fill yellow" style="width: 30%"></div></div>
-    <div class="progress-label">~30% — full metadata pipeline wired and validated for 1 skill. Profile enum is still hardcoded; generic routing pending.</div>
+    <div class="progress-label">~30% — metadata pipeline end-to-end for weather. Profile enum hardcoded, 3 legacy skills remain, no structured arg routing for manifest tools.</div>
   </div>
 
   <div class="issue">
@@ -415,11 +420,16 @@
       <span class="tag tag-open">not started</span>
     </div>
     <div class="issue-body">
-      Published and local dev skills need versioned activation, rollback, and hot-reload lifecycle management.
+      No revision tracking, source awareness, or activation management exists. Three phases:
+      <ul>
+        <li><strong>Phase 1: Revision tracking.</strong> <code>SkillSource</code> (Published/LocalDev/Builtin), <code>SkillRevision</code> (content hash, manifest hash, signature status, tool contracts), <code>SkillActivation</code> types. Compute hashes at load time.</li>
+        <li><strong>Phase 2: Lifecycle manager.</strong> <code>SkillLifecycleManager</code> with stage/activate/rollback. Wire through SkillWatcher. Stale-artifact detection warnings.</li>
+        <li><strong>Phase 3: Activation gates.</strong> Signature verification before activation. Events via event bus. <code>/skills status</code> command.</li>
+      </ul>
     </div>
-    <div class="deps"><strong>Depends on:</strong> #1646 (visible tool contracts), #1639 (tool trait)</div>
+    <div class="deps"><strong>Depends on:</strong> #1646 (visible tool contracts — tool contracts extracted per-revision), #1639 (tool trait)</div>
     <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0%</div>
+    <div class="progress-label">0% — no revision tracking, activation management, or source awareness exists</div>
   </div>
 </div>
 
