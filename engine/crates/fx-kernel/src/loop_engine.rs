@@ -1974,18 +1974,15 @@ impl LoopEngine {
 
             self.emit_action_observations(&action);
 
-            // Budget accounting for non-tool actions.
-
-            if action.tool_results.is_empty() {
-                let action_cost = self.action_cost_from_result(&action);
-                if let Some(result) = self.budget_terminal(action_cost, action_partial.clone()) {
-                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
-                }
-                self.budget.record(&action_cost);
-            } else if let Some(result) =
-                self.budget_terminal(ActionCost::default(), action_partial.clone())
-            {
+            let recorded_action_cost = self.recorded_action_cost(&action);
+            if let Some(result) = self.budget_terminal(
+                recorded_action_cost.unwrap_or_default(),
+                action_partial.clone(),
+            ) {
                 return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            }
+            if let Some(action_cost) = recorded_action_cost {
+                self.budget.record(&action_cost);
             }
 
             let continuation = match action.next_step.clone() {
@@ -2295,11 +2292,15 @@ impl LoopEngine {
     }
 
     fn update_tool_turns(&mut self, action: &ActionResult) {
-        if !action.tool_results.is_empty() {
+        if action.has_tool_activity() {
             self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
         } else {
             self.consecutive_tool_turns = 0;
         }
+    }
+
+    fn recorded_action_cost(&self, action: &ActionResult) -> Option<ActionCost> {
+        (!action.has_tool_activity()).then(|| self.action_cost_from_result(action))
     }
 
     /// Apply nudge/strip policy for the current tool continuation round.
@@ -4019,8 +4020,8 @@ impl LoopEngine {
         .await?;
         child.emit_action_observations(&action);
 
-        if action.tool_results.is_empty() {
-            child.budget.record(&child.action_cost_from_result(&action));
+        if let Some(action_cost) = child.recorded_action_cost(&action) {
+            child.budget.record(&action_cost);
         }
 
         let action_partial = action_partial_response(&action);
@@ -6211,10 +6212,10 @@ impl LoopEngine {
             tokens: action.tokens_used.total_tokens(),
             cost_cents: if action.tokens_used.total_tokens() > 0 {
                 DEFAULT_LLM_ACTION_COST_CENTS
-            } else if action.tool_results.is_empty() {
-                0
-            } else {
+            } else if action.has_tool_activity() {
                 1
+            } else {
+                0
             },
         }
     }
@@ -20000,6 +20001,41 @@ mod loop_resilience_tests {
         }
     }
 
+    fn tool_continuation_without_results_action(response_text: &str) -> ActionResult {
+        let normalized = normalize_response_text(response_text);
+        let partial_response = (!normalized.is_empty()).then_some(normalized.clone());
+        let context_message = partial_response
+            .clone()
+            .or_else(|| Some("Tool execution continues".to_string()));
+        ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: Vec::new(),
+            response_text: response_text.to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                partial_response,
+                context_message,
+            )),
+        }
+    }
+
+    fn decomposition_continue_action() -> ActionResult {
+        ActionResult {
+            decision: Decision::Decompose(fx_decompose::DecompositionPlan {
+                sub_goals: Vec::new(),
+                strategy: fx_decompose::AggregationStrategy::Sequential,
+                truncated_from: None,
+            }),
+            tool_results: Vec::new(),
+            response_text: "Task decomposition results: none".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                None,
+                Some("Task decomposition results: none".to_string()),
+            )),
+        }
+    }
+
     fn text_only_action(response_text: &str) -> ActionResult {
         ActionResult {
             decision: Decision::Respond(response_text.to_string()),
@@ -20305,6 +20341,25 @@ mod loop_resilience_tests {
     }
 
     #[test]
+    fn update_tool_turns_increments_on_tool_continuation_without_results() {
+        let mut engine = high_budget_engine();
+
+        engine.update_tool_turns(&tool_continuation_without_results_action("still working"));
+
+        assert_eq!(engine.consecutive_tool_turns, 1);
+    }
+
+    #[test]
+    fn update_tool_turns_resets_on_decomposition_continuation() {
+        let mut engine = high_budget_engine();
+        engine.consecutive_tool_turns = 2;
+
+        engine.update_tool_turns(&decomposition_continue_action());
+
+        assert_eq!(engine.consecutive_tool_turns, 0);
+    }
+
+    #[test]
     fn update_tool_turns_saturating_add() {
         let mut engine = high_budget_engine();
         engine.consecutive_tool_turns = u16::MAX;
@@ -20312,6 +20367,26 @@ mod loop_resilience_tests {
         engine.update_tool_turns(&tool_action("still working"));
 
         assert_eq!(engine.consecutive_tool_turns, u16::MAX);
+    }
+
+    #[test]
+    fn action_cost_from_result_charges_empty_tool_continuation() {
+        let engine = high_budget_engine();
+        let cost = engine
+            .action_cost_from_result(&tool_continuation_without_results_action("still working"));
+
+        assert_eq!(cost.llm_calls, 0);
+        assert_eq!(cost.tool_invocations, 0);
+        assert_eq!(cost.tokens, 0);
+        assert_eq!(cost.cost_cents, 1);
+    }
+
+    #[test]
+    fn action_cost_from_result_keeps_decomposition_continuation_free() {
+        let engine = high_budget_engine();
+        let cost = engine.action_cost_from_result(&decomposition_continue_action());
+
+        assert_eq!(cost.cost_cents, 0);
     }
 
     // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---

@@ -333,9 +333,23 @@ pub struct ActionResult {
     pub next_step: ActionNextStep,
 }
 
+impl ActionResult {
+    /// Returns true when this action reflects tool execution activity.
+    #[must_use]
+    pub fn has_tool_activity(&self) -> bool {
+        self.is_tool_continuation() || !self.tool_results.is_empty()
+    }
+
+    fn is_tool_continuation(&self) -> bool {
+        matches!(self.decision, Decision::UseTools(_))
+            && matches!(self.next_step, ActionNextStep::Continue(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_decompose::{AggregationStrategy, DecompositionPlan};
 
     #[test]
     fn concurrency_policy_default_is_unlimited() {
@@ -369,5 +383,56 @@ mod tests {
         assert_eq!(usage.input_tokens, 17);
         assert_eq!(usage.output_tokens, 23);
         assert_eq!(usage.total_tokens(), 40);
+    }
+
+    #[test]
+    fn tool_continuation_without_results_still_has_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                Some("Still working".to_string()),
+                Some("Tool execution continues".to_string()),
+            )),
+        };
+
+        assert!(action.has_tool_activity());
+    }
+
+    #[test]
+    fn decomposition_continuation_without_results_is_not_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::Decompose(DecompositionPlan {
+                sub_goals: Vec::new(),
+                strategy: AggregationStrategy::Sequential,
+                truncated_from: None,
+            }),
+            tool_results: Vec::new(),
+            response_text: "Task decomposition results: none".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                None,
+                Some("Task decomposition results: none".to_string()),
+            )),
+        };
+
+        assert!(!action.has_tool_activity());
+    }
+
+    #[test]
+    fn blocked_tool_decision_without_results_is_not_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: Vec::new(),
+            response_text: "tool dispatch was not executed".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: "tool dispatch was not executed".to_string(),
+            }),
+        };
+
+        assert!(!action.has_tool_activity());
     }
 }
