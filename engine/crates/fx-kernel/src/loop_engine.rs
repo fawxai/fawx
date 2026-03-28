@@ -3939,7 +3939,9 @@ impl LoopEngine {
                             outcome: SubGoalOutcome::Completed(response),
                             signals,
                         },
-                        SubGoalCompletionCheck::MissingRequiredSideEffectTools { message, .. }
+                        SubGoalCompletionCheck::MissingRequiredSideEffectTools {
+                            message, ..
+                        }
                         | SubGoalCompletionCheck::Incomplete(message) => {
                             incomplete_sub_goal_result_with_signals(
                                 sub_goal.clone(),
@@ -4026,15 +4028,15 @@ impl LoopEngine {
             ActionNextStep::Finish(terminal) => FollowUpRoundResult::Terminal(
                 child.loop_result_from_action_terminal(terminal, action.tokens_used),
             ),
-            ActionNextStep::Continue(continuation) => FollowUpRoundResult::Continue(
-                ActionContinuation {
+            ActionNextStep::Continue(continuation) => {
+                FollowUpRoundResult::Continue(ActionContinuation {
                     partial_response: continuation.partial_response.or(action_partial),
                     context_message: continuation.context_message,
                     next_tool_scope: continuation.next_tool_scope,
                     turn_commitment: continuation.turn_commitment,
                     artifact_write_target: continuation.artifact_write_target,
-                },
-            ),
+                })
+            }
         })
     }
 
@@ -13527,7 +13529,6 @@ mod decomposition_tests {
         events
     }
 
-
     fn text_response(text: &str) -> CompletionResponse {
         CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -19791,6 +19792,7 @@ mod loop_resilience_tests {
     #[tokio::test]
     async fn artifact_gate_clears_after_successful_write_and_preserves_broader_commitment() {
         let mut engine = run_command_observation_engine(BudgetConfig::default());
+        let home = std::env::var("HOME").expect("HOME");
         engine.apply_pending_turn_commitment(
             &ActionContinuation::new(
                 Some("The X skill spec is ready to materialize.".to_string()),
@@ -19825,7 +19827,7 @@ mod loop_resilience_tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "write_file".to_string(),
                 success: true,
-                output: "wrote 64 bytes to /Users/joseph/.fawx/x.md".to_string(),
+                output: format!("wrote 64 bytes to {home}/.fawx/x.md"),
             }],
         );
 
