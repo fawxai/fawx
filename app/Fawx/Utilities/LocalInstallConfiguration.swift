@@ -5,6 +5,14 @@ actor LocalInstallConfigurationLoader {
 
     func loadDefault() async -> LocalInstallConfiguration? {
 #if os(macOS)
+        if let configPathOverride = UITestLaunchOptions.localConfigPathOverride {
+            return await load(from: URL(fileURLWithPath: configPathOverride, isDirectory: false))
+        }
+
+        if UITestLaunchOptions.shouldDisableLocalInstall {
+            return nil
+        }
+
         let dataDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".fawx", isDirectory: true)
         return await load(from: dataDir.appendingPathComponent("config.toml", isDirectory: false))

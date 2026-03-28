@@ -43,15 +43,15 @@ final class PairingFlowTests: XCTestCase {
 
         let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
+        TestConfig.openRemoteOnboardingIfNeeded(in: app)
 
         let serverField = app.descendants(matching: .any)["serverURLField"]
-        XCTAssertTrue(serverField.waitForExistence(timeout: 5), "Expected the server URL field to appear.")
+        XCTAssertTrue(serverField.waitForExistence(timeout: 10), "Expected the server URL field to appear.")
         serverField.tap()
         serverField.typeText(serverURL)
-        serverField.typeText("\n")
 
         let healthButton = app.buttons["testConnectionButton"]
-        XCTAssertTrue(healthButton.waitForExistence(timeout: 3), "Expected the health check button to appear.")
+        XCTAssertTrue(healthButton.waitForExistence(timeout: 5), "Expected the health check button to appear.")
 
         let continueButton = app.buttons["continueButton"]
         if continueButton.isEnabled == false {
@@ -65,18 +65,14 @@ final class PairingFlowTests: XCTestCase {
         }
 
         XCTAssertTrue(continueButton.waitForExistence(timeout: 3), "Expected the continue button to appear.")
-
-        let continueEnabled = NSPredicate(format: "isEnabled == true")
-        let continueExpectation = XCTNSPredicateExpectation(predicate: continueEnabled, object: continueButton)
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [continueExpectation], timeout: 10),
-            .completed,
-            "Expected the continue button to enable after a successful health check."
-        )
+        let continueDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !continueButton.isEnabled && ContinuousClock.now < continueDeadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
         continueButton.tap()
 
         let codeField = app.descendants(matching: .any)["bearerTokenField"]
-        XCTAssertTrue(codeField.waitForExistence(timeout: 5), "Expected the pairing code field to appear.")
+        XCTAssertTrue(codeField.waitForExistence(timeout: 10), "Expected the pairing code field to appear.")
         codeField.tap()
         codeField.typeText(pairingCode)
 

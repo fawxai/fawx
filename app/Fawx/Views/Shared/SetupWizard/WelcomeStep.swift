@@ -45,6 +45,7 @@ struct WelcomeStep: View {
                     .buttonStyle(.plain)
                     .font(FawxTypography.chatBody)
                     .foregroundStyle(Color.fawxAccent)
+                    .accessibilityIdentifier("connectToRemoteOnboardingButton")
                 }
 
                 Text("Fawx stores all data locally on this Mac. No telemetry is collected.")

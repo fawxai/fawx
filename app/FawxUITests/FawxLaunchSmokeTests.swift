@@ -5,9 +5,11 @@ final class FawxLaunchSmokeTests: XCTestCase {
         continueAfterFailure = false
     }
 
+    @MainActor
     func testLaunchShowsOnboardingWhenStateIsReset() throws {
         let app = TestConfig.makeApp(resetState: true, includeCredentials: false)
         app.launch()
+        TestConfig.openRemoteOnboardingIfNeeded(in: app)
 
         let serverField = app.descendants(matching: .any)["serverURLField"]
         XCTAssertTrue(
