@@ -90,7 +90,7 @@ fn legacy_claude_budget(model_id: &str, level: &str) -> u32 {
 }
 
 /// Return valid thinking levels for a model.
-pub fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
+pub(crate) fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
     match classify_model_family(model_id) {
         ModelFamily::ClaudeOpus46 => CLAUDE_OPUS_46_LEVELS,
         ModelFamily::ClaudeSonnet46 => CLAUDE_SONNET_46_LEVELS,

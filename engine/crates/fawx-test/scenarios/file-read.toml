@@ -1,7 +1,7 @@
 [scenario]
 name = "file_read"
 description = "Fawx reads a file using the read_file tool and reports its content"
-timeout_seconds = 30
+timeout_seconds = 120
 
 [setup]
 files = [

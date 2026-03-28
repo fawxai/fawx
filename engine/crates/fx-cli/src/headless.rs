@@ -32,9 +32,9 @@ use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{
-    valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
-    DocumentAttachment, ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
-    StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall, ToolUseDelta, Usage,
+    CompletionRequest, CompletionResponse, CompletionStream, DocumentAttachment, ImageAttachment,
+    Message, ModelInfo, ModelRouter, ProviderError, StreamCallback as ProviderStreamCallback,
+    StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 use fx_memory::SignalStore;
 use fx_session::{
@@ -121,6 +121,12 @@ struct JsonOutput {
     response: String,
     model: String,
     iterations: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_errors: Vec<String>,
 }
 
 // ── CycleResult ─────────────────────────────────────────────────────────────
@@ -830,6 +836,61 @@ fn current_epoch_secs() -> u64 {
         .as_secs()
 }
 
+fn json_output_from_cycle(result: CycleResult, session_messages: &[SessionMessage]) -> JsonOutput {
+    JsonOutput {
+        response: result.response,
+        model: result.model,
+        iterations: result.iterations,
+        tool_calls: session_tool_calls(session_messages),
+        tool_inputs: session_tool_inputs(session_messages),
+        tool_errors: session_tool_errors(session_messages),
+    }
+}
+
+fn session_tool_calls(messages: &[SessionMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_tool_inputs(messages: &[SessionMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolUse { input, .. } => Some(input.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_tool_errors(messages: &[SessionMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolResult {
+                content,
+                is_error: Some(true),
+                ..
+            } => Some(session_tool_error_text(content)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_tool_error_text(content: &serde_json::Value) -> String {
+    content
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| content.to_string())
+}
+
 fn merge_stream_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
     if left.is_none() && right.is_none() {
         return None;
@@ -1103,8 +1164,7 @@ impl HeadlessApp {
         };
         app.seed_runtime_info();
         if !app.active_model.is_empty() {
-            app.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
+            update_context_limit_for_active_model(&mut app);
         }
         app.record_startup_warning_history();
         Ok(app)
@@ -1402,10 +1462,7 @@ impl HeadlessApp {
     }
 
     pub fn thinking_available_levels(&self) -> Vec<String> {
-        valid_thinking_levels(&self.active_model)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
+        active_model_thinking_levels(&self.router, &self.active_model)
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -1654,8 +1711,7 @@ impl HeadlessApp {
 
         if let Some(active_model) = active_model {
             self.active_model = active_model.clone();
-            self.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
+            update_context_limit_for_active_model(self);
             if self.config.model.default_model.is_none() {
                 self.config.model.default_model = Some(active_model);
             }
@@ -1674,8 +1730,7 @@ impl HeadlessApp {
         if let Some(active_model) = next_active_model {
             router.set_active(&active_model)?;
             self.active_model = active_model;
-            self.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
+            update_context_limit_for_active_model(self);
         } else {
             self.active_model.clear();
         }
@@ -1696,11 +1751,7 @@ impl HeadlessApp {
     async fn process_input(&mut self, input: &str, json_mode: bool) -> Result<(), anyhow::Error> {
         let result = self.process_message(input).await?;
         if json_mode {
-            let output = JsonOutput {
-                response: result.response,
-                model: result.model,
-                iterations: result.iterations,
-            };
+            let output = json_output_from_cycle(result, &self.last_session_messages);
             let json = serde_json::to_string(&output)?;
             println!("{json}");
             io::stdout().flush()?;
@@ -2776,8 +2827,27 @@ fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
         app.record_error(ErrorCategory::System, message, true);
     }
     app.active_model = model.to_string();
-    app.loop_engine
-        .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
+    update_context_limit_for_active_model(app);
+}
+
+fn update_context_limit_for_active_model(app: &mut HeadlessApp) {
+    let context_window = read_router(&app.router, |router| {
+        router
+            .context_window_for_model(&app.active_model)
+            .unwrap_or(128_000)
+    });
+    app.loop_engine.update_context_limit(context_window);
+}
+
+fn active_model_thinking_levels(router: &SharedModelRouter, model: &str) -> Vec<String> {
+    read_router(router, |shared_router| {
+        shared_router
+            .thinking_levels_for_model(model)
+            .unwrap_or(&["off"])
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect()
+    })
 }
 
 fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
@@ -4954,12 +5024,60 @@ mod tests {
             response: "hello".to_string(),
             model: "gpt-4".to_string(),
             iterations: 2,
+            tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
+            tool_errors: vec!["missing file".to_string()],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
+        assert_eq!(json["tool_calls"], serde_json::json!(["read_file"]));
+        assert_eq!(
+            json["tool_inputs"],
+            serde_json::json!([r#"{"path":"README.md"}"#])
+        );
+        assert_eq!(json["tool_errors"], serde_json::json!(["missing file"]));
+    }
+
+    #[test]
+    fn json_output_collects_tool_metadata_from_session_messages() {
+        let result = CycleResult {
+            response: "done".to_string(),
+            model: "mock-model".to_string(),
+            iterations: 3,
+            tokens_used: TokenUsage::default(),
+            result_kind: ResultKind::Complete,
+        };
+        let messages = vec![
+            SessionMessage::structured(
+                SessionRecordRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                1,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionRecordRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("missing"),
+                    is_error: Some(true),
+                }],
+                2,
+                None,
+            ),
+        ];
+
+        let output = json_output_from_cycle(result, &messages);
+        assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert_eq!(output.tool_inputs, vec![r#"{"path":"README.md"}"#]);
+        assert_eq!(output.tool_errors, vec!["missing"]);
     }
 
     #[test]

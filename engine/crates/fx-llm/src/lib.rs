@@ -24,7 +24,7 @@ mod router;
 mod routing;
 mod sse;
 pub mod streaming;
-pub use thinking::{default_thinking_level, thinking_config_for_model, valid_thinking_levels};
+pub use thinking::{default_thinking_level, thinking_config_for_model};
 
 #[cfg(test)]
 mod test_helpers;
@@ -46,11 +46,11 @@ pub use provider::{
     LlmProvider as CompletionProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
     LoopModelProfile, LoopPromptOverlayContext, LoopResponseClassification,
     LoopResponseTextClassification, LoopStreamingRecoveryStrategy, LoopTextDeltaMode,
-    ProviderCapabilities, StaticLoopModelProfile,
+    ProviderCapabilities, ProviderCatalogFilters, StaticLoopModelProfile,
 };
 pub use router::{
-    context_window_for_model, fetch_available_models_from_catalog, LlmRouter, ModelInfo,
-    ModelRouter, ProviderCatalogEntry, RouterError, RoutingStrategy,
+    fetch_available_models_from_catalog, LlmRouter, ModelInfo, ModelRouter, ProviderCatalogEntry,
+    RouterError, RoutingStrategy,
 };
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
@@ -120,18 +120,6 @@ fn normalize_trimmed_tool_history(history: &mut Vec<Message>) {
     }
 
     history.retain(|message| !message.content.is_empty());
-}
-
-/// Return the supported thinking levels for a given provider.
-pub fn supported_thinking_levels(provider: &str) -> Vec<String> {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "anthropic" => vec!["off", "low", "adaptive", "high"],
-        "openai" => vec!["off", "low", "high"],
-        _ => vec!["off"],
-    }
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
 }
 
 /// Legacy prompt-generation provider trait.

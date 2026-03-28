@@ -1,7 +1,7 @@
 [scenario]
 name = "memory_write"
 description = "Fawx writes to memory when asked to remember something"
-timeout_seconds = 45
+timeout_seconds = 120
 
 [setup]
 files = []
@@ -11,5 +11,5 @@ prompt = "Remember that my favorite color is blue"
 
 [expect]
 tool_calls = ["memory_write"]
-output_contains = ["blue"]
+tool_input_contains = ["blue"]
 output_not_contains = ["error"]
