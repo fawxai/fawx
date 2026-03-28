@@ -193,17 +193,33 @@
     <div class="label">Refactor Issues</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--green)">0</div>
-    <div class="label">Substantially Complete</div>
+    <div class="number" style="color: var(--green)">3</div>
+    <div class="label">Merged / In Review</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--yellow)">4</div>
     <div class="label">Foundation Laid</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--text-muted)">3</div>
+    <div class="number" style="color: var(--text-muted)">0</div>
     <div class="label">Not Started</div>
   </div>
+</div>
+
+<h2>Wave Status</h2>
+<div style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; font-size: 0.9rem;">
+  <strong style="color: var(--green)">Wave 1 — LANDING</strong><br>
+  <span style="color: var(--text-muted)">3 parallel tracks, all PRs open, reviews in progress:</span>
+  <ul style="margin-top: 0.5rem; padding-left: 1.25rem;">
+    <li><strong>#1650</strong> Action trait completion (Track A) — <span style="color: var(--green)">✅ MERGED to dev</span></li>
+    <li><strong>#1651</strong> Config decomposition (Track C) — <span style="color: var(--green)">✅ APPROVED R2, ready for merge</span></li>
+    <li><strong>#1652</strong> Provider metadata (Track B) — <span style="color: var(--yellow)">⏳ R1 REQUEST_CHANGES, fix cycle in progress</span></li>
+  </ul>
+  <br>
+  <strong style="color: var(--text-muted)">Wave 2 — NEXT (after Wave 1 merges)</strong><br>
+  <span style="color: var(--text-muted)">#1614 (double response), #1642 (headless decomp), #1639 (tool trait)</span><br><br>
+  <strong style="color: var(--text-muted)">Wave 3 — DEFERRED</strong><br>
+  <span style="color: var(--text-muted)">#1641 (loop decomposition) — after #1644, #1614, #1639 all merged</span>
 </div>
 
 <div class="legend">
@@ -226,19 +242,21 @@
     <div class="issue-header">
       <span class="issue-number">#1644</span>
       <span class="issue-title">Replace stringly-typed ActionStep with Action trait</span>
-      <span class="tag tag-partial">foundation laid</span>
+      <span class="tag tag-done">merged</span>
     </div>
     <div class="issue-body">
-      PR #1648 introduced typed action vocabulary:
+      <strong>PR #1650 merged to dev.</strong> Completed the action trait work:
       <ul>
-        <li><code>ActionNextStep::Continue(ActionContinuation)</code> / <code>Finish(ActionTerminal)</code> — act step owns its disposition</li>
-        <li><code>TurnCommitment</code> (ProceedUnderConstraints, NeedsDirection) — typed state across iterations</li>
-        <li><code>LoopResult::Incomplete</code> — explicit terminal for non-completion</li>
-        <li>Loop no longer infers continuation from tool presence</li>
+        <li><code>ActionResult::has_tool_activity()</code> — explicit behavioral contract replaces <code>tool_results.is_empty()</code> checks</li>
+        <li><code>is_tool_continuation()</code> — private helper for Continue+UseTools detection</li>
+        <li><code>recorded_action_cost()</code> — budget accounting uses the explicit contract</li>
+        <li>All loop-engine completion checks migrated to <code>has_tool_activity()</code></li>
+        <li>Regression tests for empty-tool_results/Continue, decomposition continuation, blocked tool decision</li>
+        <li>Embedded TUI smoke path restored (tool_name forwarding, metadata-only stream events)</li>
       </ul>
     </div>
-    <div class="progress-bar"><div class="progress-fill green" style="width: 75%"></div></div>
-    <div class="progress-label">~75% — ActionNextStep drives the main run_cycle. But 6+ code paths in act_with_tools still branch on <code>tool_results.is_empty()</code> for budget accounting, turn counting, and observation tracking. Those are secondary to the primary loop signal but still represent old-style implicit dispatch.</div>
+    <div class="progress-bar"><div class="progress-fill green" style="width: 100%"></div></div>
+    <div class="progress-label">✅ Complete — PR #1650 merged. Clean APPROVE on first review pass.</div>
   </div>
 
   <div class="issue">
@@ -348,39 +366,52 @@
     <div class="issue-header">
       <span class="issue-number">#1640</span>
       <span class="issue-title">Move provider metadata onto LlmProvider trait</span>
-      <span class="tag tag-open">not started</span>
+      <span class="tag tag-partial">in review</span>
     </div>
     <div class="issue-body">
-      Thinking levels, catalog endpoints, auth headers, base URLs are all matched on provider name strings externally. Should be trait methods on <code>LlmProvider</code>. No progress in #1648.
+      <strong>PR #1652 open, R1 REQUEST_CHANGES.</strong> Core migration done:
+      <ul>
+        <li>7 new trait methods on <code>CompletionProvider</code>: <code>models_endpoint()</code>, <code>catalog_auth_headers()</code>, <code>is_chat_capable()</code>, <code>fallback_models()</code>, <code>supported_thinking_levels()</code>, <code>catalog_filters()</code>, <code>loop_harness()</code></li>
+        <li>Old <code>supported_thinking_levels(provider_name)</code> function removed</li>
+        <li>Anthropic, OpenAI, OpenAI Responses providers implement all new methods</li>
+        <li><code>fawx-test</code> smoke harness repaired and passing (3/3 scenarios)</li>
+      </ul>
+      R1 found 3 residual string-dispatch patterns: <code>infer_auth_method</code>, <code>context_window_for_model</code>, and <code>OpenAiCatalogKind::from_provider_name</code>. Fix cycle in progress.
     </div>
-    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0%</div>
+    <div class="progress-bar"><div class="progress-fill green" style="width: 80%"></div></div>
+    <div class="progress-label">~80% — primary trait migration done, 3 residual string-dispatch sites flagged in review</div>
   </div>
 
   <div class="issue">
     <div class="issue-header">
       <span class="issue-number">#1643</span>
       <span class="issue-title">Decompose config/lib.rs into focused modules</span>
-      <span class="tag tag-open">not started</span>
+      <span class="tag tag-done">approved</span>
     </div>
     <div class="issue-body">
-      2,400-line config monolith. Not touched by PR #1648.
+      <strong>PR #1651 APPROVED R2, ready for merge.</strong> Clean decomposition:
+      <ul>
+        <li>Monolithic <code>lib.rs</code> split into 7 focused modules: <code>defaults.rs</code>, <code>display.rs</code>, <code>env.rs</code>, <code>presets.rs</code>, <code>toml_io.rs</code>, <code>types.rs</code>, <code>validation.rs</code></li>
+        <li>28 explicit re-exports (replaced wildcard)</li>
+        <li>Public crate API fully preserved</li>
+        <li>macOS UI test harness with state isolation (bonus)</li>
+      </ul>
     </div>
-    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0%</div>
+    <div class="progress-bar"><div class="progress-fill green" style="width: 95%"></div></div>
+    <div class="progress-label">~95% — approved, pending merge to dev</div>
   </div>
 
   <div class="issue">
     <div class="issue-header">
       <span class="issue-number">#1642</span>
       <span class="issue-title">Decompose headless.rs into command handlers</span>
-      <span class="tag tag-open">not started</span>
+      <span class="tag tag-open">wave 2</span>
     </div>
     <div class="issue-body">
-      5,300-line headless mode handler. Not touched by #1648.
+      5,300-line headless mode handler. Queued for Wave 2 after Wave 1 merges.
     </div>
     <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0%</div>
+    <div class="progress-label">0% — Wave 2</div>
   </div>
 </div>
 
@@ -462,28 +493,27 @@
 <h2>Dependency Graph</h2>
 
 <pre style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 0.85rem; overflow-x: auto; line-height: 1.8;">
-<span style="color: var(--yellow)">Phase 1 (active)</span>
-  <span style="color: var(--yellow)">#1644 Action trait ——————————75%——</span>┐
-  <span style="color: var(--yellow)">#1641 Loop decomposition ——15%——</span>──┤
-  <span style="color: var(--yellow)">#1614 Double response bug —20%——</span>──┘
+<span style="color: var(--green)">Wave 1 — LANDING</span>
+  <span style="color: var(--green)">#1644 Action trait ——————————100%—</span> ✅ MERGED (PR #1650)
+  <span style="color: var(--green)">#1643 Config decomposition ——95%——</span> ✅ APPROVED (PR #1651)
+  <span style="color: var(--yellow)">#1640 Provider metadata ————80%——</span> ⏳ R1 fixes (PR #1652)
 
-<span style="color: var(--yellow)">Phase 2 (next)</span>                          depends on Phase 1
-  <span style="color: var(--yellow)">#1639 Tool trait ——————————10%——</span>──┐
-  <span style="color: var(--yellow)">#1638 Static dispatch audit —5%—</span>──┤ (falls out of #1639)
-  #1515 Ripcord journal ——————————┘ (falls out of #1639)
-
-<span style="color: var(--text-muted)">Phase 3 (independent)</span>
-  #1640 Provider metadata ————————── independent
-  #1643 Config decomposition ————── independent
+<span style="color: var(--text-muted)">Wave 2 — NEXT (after Wave 1 merges)</span>
+  <span style="color: var(--yellow)">#1614 Double response bug —20%——</span>──┐ depends on #1644 ✅
+  <span style="color: var(--yellow)">#1639 Tool trait ——————————10%——</span>──┤
   #1642 Headless decomposition ——── independent
 
-<span style="color: var(--text-muted)">Phase 4 (depends on Phase 2)</span>
+<span style="color: var(--text-muted)">Wave 3 — DEFERRED</span>
+  <span style="color: var(--yellow)">#1641 Loop decomposition ——15%——</span>── depends on #1644 ✅, #1614, #1639
+  <span style="color: var(--yellow)">#1638 Static dispatch audit —5%—</span>── falls out of #1639
+
+<span style="color: var(--text-muted)">Phase 4 (depends on Wave 2-3)</span>
   <span style="color: var(--yellow)">#1646 Skill tool contracts 30%——</span>──┐
   #1647 Skill lifecycle ——————————──┘ depends on #1646, #1639
 </pre>
 
 <div class="timestamp">
-  Generated 2026-03-28 (v2, source-verified) · Based on PR #1648 source analysis + open issue audit · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-28 22:40 UTC (v3) · Wave 1 landing: #1650 merged, #1651 approved, #1652 in review · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
