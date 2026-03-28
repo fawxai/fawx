@@ -495,19 +495,29 @@ impl SessionTurnCollector {
         images: &[ImageAttachment],
         documents: &[DocumentAttachment],
         fallback_response: &str,
+        user_timestamp: u64,
+        assistant_timestamp: u64,
     ) -> Vec<SessionMessage> {
         self.flush_pending_tool_results();
+        let snapshot = self.snapshot();
 
-        let timestamp = current_epoch_secs();
         let mut messages = vec![user_session_message(
-            user_text, images, documents, timestamp,
+            user_text,
+            images,
+            documents,
+            user_timestamp,
         )];
-        let mut assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
-
-        if assistant_messages.is_empty() {
-            assistant_messages.push(fallback_assistant_message(fallback_response, timestamp));
-        } else if should_append_terminal_assistant_message(&assistant_messages, fallback_response) {
-            assistant_messages.push(fallback_assistant_message(fallback_response, timestamp));
+        let mut assistant_messages = build_assistant_turn_messages(
+            SessionTurnSnapshot {
+                responses: snapshot.responses.clone(),
+                tool_result_rounds: snapshot.tool_result_rounds,
+            },
+            assistant_timestamp,
+        );
+        if let Some(terminal_message) =
+            terminal_assistant_message(&snapshot.responses, fallback_response, assistant_timestamp)
+        {
+            assistant_messages.push(terminal_message);
         }
 
         messages.extend(assistant_messages);
@@ -541,6 +551,7 @@ impl SessionTurnCollector {
             }
             StreamEvent::ToolError { .. }
             | StreamEvent::TextDelta { .. }
+            | StreamEvent::Progress { .. }
             | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. }
@@ -634,20 +645,25 @@ fn fallback_assistant_message(fallback_response: &str, timestamp: u64) -> Sessio
     )
 }
 
-fn should_append_terminal_assistant_message(
-    assistant_messages: &[SessionMessage],
+fn fallback_assistant_message_from_template(
     fallback_response: &str,
-) -> bool {
-    if !has_meaningful_response(Some(fallback_response)) {
-        return false;
+    timestamp: u64,
+    template: Option<&SessionMessage>,
+) -> SessionMessage {
+    if let Some(template) = template {
+        return SessionMessage {
+            role: SessionRecordRole::Assistant,
+            content: vec![SessionContentBlock::Text {
+                text: fallback_response.to_string(),
+            }],
+            timestamp,
+            token_count: template.token_count,
+            input_token_count: template.input_token_count,
+            output_token_count: template.output_token_count,
+        };
     }
 
-    let normalized_fallback = normalize_session_message_text(fallback_response);
-    assistant_messages
-        .iter()
-        .rev()
-        .find_map(last_visible_assistant_text)
-        .is_none_or(|existing| normalize_session_message_text(&existing) != normalized_fallback)
+    fallback_assistant_message(fallback_response, timestamp)
 }
 
 fn last_visible_assistant_text(message: &SessionMessage) -> Option<String> {
@@ -675,13 +691,42 @@ fn build_assistant_turn_messages(
             continue;
         };
 
-        messages.push(recorded_turn.message);
-        if recorded_turn.has_tool_use {
-            append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
+        if !recorded_turn.has_tool_use {
+            continue;
         }
+
+        messages.push(recorded_turn.message);
+        append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
     }
 
     messages
+}
+
+fn terminal_assistant_message(
+    responses: &[CompletionResponse],
+    fallback_response: &str,
+    timestamp: u64,
+) -> Option<SessionMessage> {
+    let recorded_terminal = responses.iter().rev().find_map(|response| {
+        let recorded_turn = assistant_turn_from_response(response.clone(), timestamp)?;
+        (!recorded_turn.has_tool_use).then_some(recorded_turn.message)
+    });
+
+    if has_meaningful_response(Some(fallback_response)) {
+        let matching_terminal = recorded_terminal.as_ref().filter(|message| {
+            last_visible_assistant_text(message).is_some_and(|existing| {
+                normalize_session_message_text(&existing)
+                    == normalize_session_message_text(fallback_response)
+            })
+        });
+        return Some(fallback_assistant_message_from_template(
+            fallback_response,
+            timestamp,
+            matching_terminal,
+        ));
+    }
+
+    recorded_terminal
 }
 
 fn assistant_turn_from_response(
@@ -735,9 +780,12 @@ fn session_blocks_from_response(
         .into_iter()
         .filter_map(session_block_from_content)
         .collect::<Vec<_>>();
-    let has_tool_use_blocks = blocks
+    let mut has_tool_use_blocks = blocks
         .iter()
         .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    if has_tool_use_blocks {
+        blocks.retain(|block| !matches!(block, SessionContentBlock::Text { .. }));
+    }
     if !has_tool_use_blocks {
         blocks.extend(
             tool_calls
@@ -749,6 +797,12 @@ fn session_blocks_from_response(
                     input: call.arguments,
                 }),
         );
+        has_tool_use_blocks = blocks
+            .iter()
+            .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    }
+    if has_tool_use_blocks {
+        blocks.retain(|block| !matches!(block, SessionContentBlock::Text { .. }));
     }
     blocks
 }
@@ -1681,7 +1735,8 @@ impl HeadlessApp {
 
     #[cfg(test)]
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
-        self.finalize_cycle_with_turn_messages(input, &[], &[], result, None)
+        let timestamp = current_epoch_secs();
+        self.finalize_cycle_with_turn_messages(input, &[], &[], result, None, timestamp, timestamp)
     }
 
     fn finalize_cycle_with_turn_messages(
@@ -1691,6 +1746,8 @@ impl HeadlessApp {
         documents: &[DocumentAttachment],
         result: &LoopResult,
         collector: Option<&SessionTurnCollector>,
+        user_timestamp: u64,
+        assistant_timestamp: u64,
     ) -> CycleResult {
         let response = extract_response_text(result);
         let result_kind = extract_result_kind(result);
@@ -1709,9 +1766,18 @@ impl HeadlessApp {
         persist_headless_signals(self, &signals);
         let session_messages = collector
             .map(|collector| {
-                collector.session_messages_for_turn(input, images, documents, &response)
+                collector.session_messages_for_turn(
+                    input,
+                    images,
+                    documents,
+                    &response,
+                    user_timestamp,
+                    assistant_timestamp,
+                )
             })
-            .unwrap_or_else(|| text_turn_messages(input, &response));
+            .unwrap_or_else(|| {
+                text_turn_messages(input, &response, user_timestamp, assistant_timestamp)
+            });
         self.record_session_turn_messages(session_messages);
         CycleResult {
             response,
@@ -1731,6 +1797,7 @@ impl HeadlessApp {
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error> {
         self.last_session_messages.clear();
+        let user_timestamp = current_epoch_secs();
         let callback = callback.map(headless_stream_callback);
         let should_emit_startup_warnings = callback.is_some();
         let collector = SessionTurnCollector::default();
@@ -1753,6 +1820,7 @@ impl HeadlessApp {
             .run_cycle_streaming(snapshot, &llm, Some(combined_callback))
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        let assistant_timestamp = current_epoch_secs();
         self.set_stream_callback(None);
         self.evaluate_canary(&result);
         Ok(self.finalize_cycle_with_turn_messages(
@@ -1761,6 +1829,8 @@ impl HeadlessApp {
             documents,
             &result,
             Some(&collector),
+            user_timestamp,
+            assistant_timestamp,
         ))
     }
 
@@ -1870,7 +1940,13 @@ impl HeadlessApp {
 
     #[cfg(test)]
     fn record_turn(&mut self, user_text: &str, assistant_text: &str) {
-        self.record_session_turn_messages(text_turn_messages(user_text, assistant_text));
+        let timestamp = current_epoch_secs();
+        self.record_session_turn_messages(text_turn_messages(
+            user_text,
+            assistant_text,
+            timestamp,
+            timestamp,
+        ));
     }
 
     fn record_session_turn_messages(&mut self, session_messages: Vec<SessionMessage>) {
@@ -1931,13 +2007,17 @@ fn user_message_blocks(
     blocks
 }
 
-fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessage> {
-    let timestamp = current_epoch_secs();
+fn text_turn_messages(
+    user_text: &str,
+    assistant_text: &str,
+    user_timestamp: u64,
+    assistant_timestamp: u64,
+) -> Vec<SessionMessage> {
     vec![
         SessionMessage::structured(
             SessionRecordRole::User,
             user_message_blocks(user_text, &[], &[]),
-            timestamp,
+            user_timestamp,
             None,
         ),
         SessionMessage::structured(
@@ -1945,7 +2025,7 @@ fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessa
             vec![SessionContentBlock::Text {
                 text: assistant_text.to_string(),
             }],
-            timestamp,
+            assistant_timestamp,
             None,
         ),
     ]
@@ -3300,6 +3380,17 @@ fn extract_response_text(result: &LoopResult) -> String {
                 BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
             }
         }
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            ..
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                partial_response.clone().unwrap_or_default()
+            } else {
+                reason.clone()
+            }
+        }
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
@@ -3311,6 +3402,9 @@ fn extract_result_kind(result: &LoopResult) -> ResultKind {
     match result {
         LoopResult::Complete { .. } => ResultKind::Complete,
         LoopResult::BudgetExhausted {
+            partial_response, ..
+        }
+        | LoopResult::Incomplete {
             partial_response, ..
         }
         | LoopResult::UserStopped {
@@ -3361,6 +3455,7 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     match result {
         LoopResult::Complete { iterations, .. }
         | LoopResult::BudgetExhausted { iterations, .. }
+        | LoopResult::Incomplete { iterations, .. }
         | LoopResult::UserStopped { iterations, .. } => *iterations,
         LoopResult::Error { .. } => 0,
     }
@@ -3600,19 +3695,31 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         });
 
-        let messages = collector.session_messages_for_turn("open the readme", &[], &[], "Done.");
+        let messages =
+            collector.session_messages_for_turn("open the readme", &[], &[], "Done.", 10, 20);
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, SessionRecordRole::User);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
         assert_eq!(messages[2].role, SessionRecordRole::Tool);
         assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[0].timestamp, 10);
+        assert_eq!(messages[1].timestamp, 20);
+        assert_eq!(messages[2].timestamp, 20);
+        assert_eq!(messages[3].timestamp, 20);
         assert_eq!(messages[1].token_count, Some(15));
         assert_eq!(messages[1].input_token_count, Some(10));
         assert_eq!(messages[1].output_token_count, Some(5));
         assert_eq!(messages[3].token_count, Some(10));
         assert_eq!(messages[3].input_token_count, Some(7));
         assert_eq!(messages[3].output_token_count, Some(3));
+        assert!(
+            !messages[1]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::Text { .. })),
+            "mixed tool turns should not persist assistant narration text"
+        );
         assert!(messages[1].content.iter().any(
             |block| matches!(block, SessionContentBlock::ToolUse { id, .. } if id == "call_1")
         ));
@@ -3622,6 +3729,28 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "call_1" && *is_error == Some(false)))
         );
+    }
+
+    #[test]
+    fn session_turn_collector_preserves_distinct_user_and_assistant_timestamps() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages =
+            collector.session_messages_for_turn("open the readme", &[], &[], "Done.", 100, 700);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[0].timestamp, 100);
+        assert_eq!(messages[1].timestamp, 700);
     }
 
     #[test]
@@ -3647,7 +3776,8 @@ mod tests {
             is_error: true,
         });
 
-        let messages = collector.session_messages_for_turn("open missing", &[], &[], "fallback");
+        let messages =
+            collector.session_messages_for_turn("open missing", &[], &[], "fallback", 10, 20);
 
         assert!(
             messages[2]
@@ -3686,6 +3816,8 @@ mod tests {
             &[],
             &[],
             "Rust search results are ready.",
+            10,
+            20,
         );
 
         assert_eq!(messages.len(), 4);
@@ -3702,6 +3834,49 @@ mod tests {
         )));
         assert_eq!(messages[3].role, SessionRecordRole::Assistant);
         assert_eq!(messages[3].render_text(), "Rust search results are ready.");
+    }
+
+    #[test]
+    fn session_turn_collector_omits_text_when_tool_calls_are_reconstructed() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Let me search for that.".to_string(),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_legacy".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "x api"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 6,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "search the X API",
+            &[],
+            &[],
+            "Search results are ready.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert!(
+            messages[1]
+                .content
+                .iter()
+                .all(|block| { !matches!(block, SessionContentBlock::Text { .. }) }),
+            "reconstructed tool turns should not persist assistant narration text"
+        );
+        assert!(messages[1].content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ToolUse { id, name, .. } if id == "call_legacy" && name == "search"
+        )));
     }
 
     #[test]
@@ -3731,6 +3906,8 @@ mod tests {
             &[],
             &[],
             "Weather lookup requires executing the recorded tool call.",
+            10,
+            20,
         );
 
         assert_eq!(messages.len(), 3);
@@ -3790,6 +3967,8 @@ mod tests {
             &[],
             &[],
             "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation.",
+            10,
+            20,
         );
 
         assert_eq!(messages.len(), 4);
@@ -3800,6 +3979,86 @@ mod tests {
         assert_eq!(
             messages[3].render_text(),
             "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation."
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_omits_intermediate_text_only_synthesis_between_tool_rounds() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_a".to_string(),
+                provider_id: None,
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "~/.fawx/x.md"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_a".to_string(),
+            output: "spec contents".to_string(),
+            is_error: false,
+        });
+        collector.observe(&StreamEvent::ToolCallStart {
+            id: "call_b".to_string(),
+            name: "run_command".to_string(),
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Current state: the spec file already exists and is complete.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_b".to_string(),
+                provider_id: None,
+                name: "run_command".to_string(),
+                input: serde_json::json!({"command": "fawx skill create x-post"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_b".to_string(),
+            output: "working directory is set there".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "Research and implement the X skill",
+            &[],
+            &[],
+            "I can't complete the file creation from here because the required paths are outside my working directory.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 6);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == SessionRecordRole::Assistant)
+                .count(),
+            3,
+            "only tool-use assistant messages plus one terminal assistant message should persist",
+        );
+        assert!(
+            !messages.iter().any(|message| {
+                message.role == SessionRecordRole::Assistant
+                    && message
+                        .render_text()
+                        .contains("Current state: the spec file already exists")
+            }),
+            "intermediate text-only synthesis should remain internal to the turn",
+        );
+        assert!(
+            matches!(messages.last(), Some(message) if message.render_text().contains("outside my working directory"))
         );
     }
 

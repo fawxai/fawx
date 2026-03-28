@@ -123,9 +123,8 @@ enum SessionContentBlock: Codable, Sendable, Hashable {
     var displayText: String? {
         switch self {
         case .text(let text): return text
-        case .toolUse(_, let name, let input):
-            let renderedInput = input.chatDisplayText
-            return renderedInput.isEmpty ? "[\(name)]" : "[\(name)] \(renderedInput)"
+        case .toolUse:
+            return nil
         case .toolResult:
             return nil
         case .image: return "[image]"

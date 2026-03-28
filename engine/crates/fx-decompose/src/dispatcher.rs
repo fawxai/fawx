@@ -87,6 +87,7 @@ impl SubGoalDispatcher for SequentialDispatcher {
                         DecompositionEvent::SubGoalFailed {
                             index,
                             error: sub_goal_outcome_error(&result.outcome),
+                        }
                     } else {
                         DecompositionEvent::SubGoalCompleted { index }
                     };

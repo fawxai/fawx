@@ -972,6 +972,52 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(sut.visibleCurrentPhase, .act)
     }
 
+    func testVisibleProgressOverridesComposerLabelWhenStreaming() {
+        let sut = makeSUT()
+
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a",
+            progress: ChatViewModel.StreamingProgress(
+                kind: .implementing,
+                message: "Implementing the committed plan."
+            )
+        )
+
+        XCTAssertEqual(
+            sut.visibleProgress,
+            ChatViewModel.StreamingProgress(
+                kind: .implementing,
+                message: "Implementing the committed plan."
+            )
+        )
+        XCTAssertEqual(sut.composerPhaseLabel, "Implementing")
+        XCTAssertEqual(sut.visibleStreamingText, "")
+    }
+
+    func testVisibleStreamingElapsedTextAppearsAfterThreshold() {
+        let sut = makeSUT()
+        let startedAt = Date(timeIntervalSince1970: 100)
+
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a",
+            progress: ChatViewModel.StreamingProgress(
+                kind: .researching,
+                message: "Reading local files in skills/"
+            ),
+            startedAt: startedAt
+        )
+
+        XCTAssertNil(sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 114)))
+        XCTAssertEqual(
+            sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 195)),
+            "Active for 1m 35s"
+        )
+    }
+
     func testContextCompactedUpdatesVisibleSessionContextAndBanner() {
         let sut = makeSUT()
         sut.prepareToDisplaySession("session-a")

@@ -49,7 +49,7 @@ The `Skill` trait correctly models WASM skills as self-describing, polymorphic t
 
 ## Root Cause 3: Monoliths resist composition
 
-Large files that absorbed their children instead of composing them. Not string-matching violations, but they violate the fractal principle: same shape at every scale.
+Large files that absorbed their children instead of composing them. Not string-matching violations, but they violate the fractal principle: same shape at every scale. In classical pattern language, this is the Composite Pattern applied architecturally.
 
 | ID | Category | Instance | Location | Severity | Issue |
 |----|----------|----------|----------|----------|-------|

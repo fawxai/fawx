@@ -2,6 +2,8 @@
 
 ## Architecture Overview
 
+This simplification must preserve Fawx's Composite Pattern / fractal architecture. The top-level runner and a child sub-goal runner should have the same control shape, with child runners differing only by narrower budget and tool surface. No name-based special cases.
+
 ### Current Fawx Loop (7 steps, 2 nested loops)
 
 **Outer loop** (`run_cycle_streaming_inner`): Iterates up to `max_iterations`. Each iteration runs the full pipeline. `IterationStep::Progress` feeds back via `apply_iteration_outcome` which may re-perceive with a continuation directive. `IterationStep::Terminal` exits immediately.

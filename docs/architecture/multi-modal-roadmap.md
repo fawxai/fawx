@@ -9,6 +9,8 @@
 
 Fawx is not an LLM wrapper. It is a **self-improving execution kernel** that currently uses LLMs as its reasoning engine. The kernel's trait-based architecture (Skill, ToolExecutor, MemoryProvider) is modality-agnostic — the same loop, signal, and memory infrastructure that powers text reasoning can power vision, audio, and robotics.
 
+In classical pattern language, this is the Composite Pattern applied architecturally: a single skill/tool and a composed subsystem present the same contract to the layer above. At system scale, Fawx uses that rule fractally.
+
 Multi-modal capabilities are **additive, not architectural** — through Phase 6, you don't redesign Fawx, you load more skills. Phase 7+ (SuperFawx multi-kernel orchestration) requires kernel evolution at the code level, but the signal, memory, and self-improvement infrastructure established in Phases 1–5 remains unchanged.
 
 ---

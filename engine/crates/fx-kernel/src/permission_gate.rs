@@ -13,8 +13,10 @@ use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionP
 use crate::streaming::{StreamCallback, StreamEvent};
 use async_trait::async_trait;
 use fx_config::CapabilityMode;
+use fx_core::self_modify::classify_write_domain;
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,6 +97,7 @@ pub struct PermissionGateExecutor<T: ToolExecutor> {
     permissions: PermissionPolicy,
     prompt_state: Arc<PermissionPromptState>,
     stream_callback: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    working_dir: Option<PathBuf>,
 }
 
 impl<T: ToolExecutor> std::fmt::Debug for PermissionGateExecutor<T> {
@@ -114,7 +117,13 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             permissions,
             prompt_state,
             stream_callback: Arc::new(std::sync::Mutex::new(None)),
+            working_dir: None,
         }
+    }
+
+    pub fn with_working_dir(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = Some(working_dir);
+        self
     }
 
     /// Replace the shared callback slot used for SSE stream events.
@@ -231,7 +240,7 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
         call: &ToolCall,
         cancel: Option<&CancellationToken>,
     ) -> PermissionCheck {
-        let category = tool_to_action_category(&call.name);
+        let category = self.action_category_for_call(call);
 
         if !self.permissions.requires_asking(category) {
             return PermissionCheck::Allowed;
@@ -247,6 +256,21 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             }
             CapabilityMode::Prompt => self.ask_permission(call, category, cancel).await,
         }
+    }
+
+    fn action_category_for_call(&self, call: &ToolCall) -> &'static str {
+        if matches!(
+            call.name.as_str(),
+            "write_file" | "create_file" | "edit_file"
+        ) {
+            if let (Some(working_dir), Some(path)) =
+                (self.working_dir.as_deref(), extract_path_argument(call))
+            {
+                return classify_write_domain(Path::new(path), working_dir).permission_category();
+            }
+        }
+
+        tool_to_action_category(&call.name)
     }
 
     async fn ask_permission(
@@ -286,6 +310,12 @@ fn build_prompt(call: &ToolCall, category: &str) -> PermissionPrompt {
         session_scoped_allow_available: true,
         expires_at: unix_now() + PROMPT_TIMEOUT_SECONDS,
     }
+}
+
+fn extract_path_argument(call: &ToolCall) -> Option<&str> {
+    call.arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
 }
 
 fn emit_prompt(
@@ -490,6 +520,14 @@ mod tests {
             id: format!("call_{name}"),
             name: name.to_string(),
             arguments: serde_json::json!({}),
+        }
+    }
+
+    fn write_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "call_write_file".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": path, "content": "data"}),
         }
     }
 
@@ -736,6 +774,66 @@ mod tests {
         assert_eq!(tool_to_action_category("git"), "git");
         assert_eq!(tool_to_action_category("delete_file"), "file_delete");
         assert_eq!(tool_to_action_category("unknown_tool"), "unknown");
+    }
+
+    #[test]
+    fn action_category_for_write_call_uses_project_domain() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph"));
+
+        let category =
+            executor.action_category_for_call(&write_call("/Users/joseph/project/file.txt"));
+
+        assert_eq!(category, "file_write");
+    }
+
+    #[test]
+    fn action_category_for_write_call_uses_self_modify_domain() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph"));
+
+        let category = executor
+            .action_category_for_call(&write_call("/Users/joseph/.fawx/skills/demo/SKILL.md"));
+
+        assert_eq!(category, "self_modify");
+    }
+
+    #[test]
+    fn action_category_for_write_call_uses_kernel_modify_domain() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph"));
+
+        let category = executor.action_category_for_call(&write_call(
+            "/Users/joseph/fawx/engine/crates/fx-kernel/src/lib.rs",
+        ));
+
+        assert_eq!(category, "kernel_modify");
+    }
+
+    #[test]
+    fn action_category_for_write_call_uses_outside_workspace_domain() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph/workspace"));
+
+        let category = executor.action_category_for_call(&write_call("/etc/hosts"));
+
+        assert_eq!(category, "outside_workspace");
     }
 
     #[test]

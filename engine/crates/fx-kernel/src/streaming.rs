@@ -1,3 +1,4 @@
+use fx_core::message::ProgressKind;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -49,6 +50,10 @@ pub enum Phase {
 pub enum StreamEvent {
     TextDelta {
         text: String,
+    },
+    Progress {
+        kind: ProgressKind,
+        message: String,
     },
     Notification {
         title: String,
@@ -114,6 +119,18 @@ mod tests {
         let event = StreamEvent::Notification {
             title: "Fawx".to_string(),
             body: "Task complete".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn progress_event_serializes_correctly() {
+        let event = StreamEvent::Progress {
+            kind: ProgressKind::Researching,
+            message: "Researching the request.".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();

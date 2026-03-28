@@ -295,7 +295,6 @@ impl fx_llm::CompletionProvider for AnalysisCompletionProvider {
 pub(crate) struct RouterLoopLlmProvider {
     router: SharedModelRouter,
     active_model: String,
-    loop_harness: &'static dyn LoopHarness,
 }
 
 impl fmt::Debug for RouterLoopLlmProvider {
@@ -308,11 +307,10 @@ impl fmt::Debug for RouterLoopLlmProvider {
 
 impl RouterLoopLlmProvider {
     pub(crate) fn new(router: SharedModelRouter, active_model: String) -> Self {
-        let loop_harness = resolve_loop_harness(&router, &active_model);
+        let _ = resolve_loop_harness(&router, &active_model);
         Self {
             router,
             active_model,
-            loop_harness,
         }
     }
 
@@ -417,10 +415,6 @@ impl LoopLlmProvider for RouterLoopLlmProvider {
 
     fn model_name(&self) -> &str {
         &self.active_model
-    }
-
-    fn loop_harness(&self) -> &'static dyn LoopHarness {
-        self.loop_harness
     }
 }
 

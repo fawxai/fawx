@@ -303,11 +303,14 @@ struct ChatDetailView: View {
     }
 
     private var streamingBubble: some View {
-        MessageBubble(
-            role: .assistant,
-            content: streamingBubbleContent,
-            isStreaming: true
-        )
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            MessageBubble(
+                role: .assistant,
+                content: streamingBubbleContent(at: context.date),
+                isStreaming: true
+            )
+            .opacity(streamingBubblePulse(at: context.date))
+        }
         .id("streaming")
     }
 
@@ -1024,13 +1027,34 @@ struct ChatDetailView: View {
     }
 #endif
 
-    private var streamingBubbleContent: String {
+    private func streamingBubbleContent(at now: Date) -> String {
         let streamed = chatViewModel.visibleStreamingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !streamed.isEmpty {
             return chatViewModel.visibleStreamingText
         }
 
-        return chatViewModel.visibleCurrentPhase?.streamingPlaceholder ?? "..."
+        let progressMessage = chatViewModel.visibleProgress?.message.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let progressMessage, !progressMessage.isEmpty {
+            if let elapsed = chatViewModel.visibleStreamingElapsedText(now: now) {
+                return "\(progressMessage)\n\n_\(elapsed)_"
+            }
+            return progressMessage
+        }
+
+        let placeholder = chatViewModel.visibleCurrentPhase?.streamingPlaceholder ?? "..."
+        if let elapsed = chatViewModel.visibleStreamingElapsedText(now: now) {
+            return "\(placeholder)\n\n_\(elapsed)_"
+        }
+        return placeholder
+    }
+
+    private func streamingBubblePulse(at now: Date) -> Double {
+        let cycleSeconds = 1.8
+        let phase = now.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycleSeconds)
+        let normalized = phase / cycleSeconds
+        return 0.94 + ((sin(normalized * .pi * 2) + 1) * 0.03)
     }
 
     private var sessionScrollIdentity: String {

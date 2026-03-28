@@ -1434,6 +1434,35 @@ impl ToolExecutor for FawxToolExecutor {
     fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
         Self::classify_call_impl(call)
     }
+
+    fn route_sub_goal_call(
+        &self,
+        request: &fx_kernel::act::SubGoalToolRoutingRequest,
+        call_id: &str,
+    ) -> Option<ToolCall> {
+        let tool_name = request.required_tools.first()?;
+        let definition = self
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == *tool_name)?;
+        let required = definition
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)?;
+
+        // Generic direct routing is only safe for tools that declare no
+        // required arguments. Tools with required inputs must describe their
+        // own sub-goal materialization instead of relying on kernel guesses.
+        if required.is_empty() {
+            return Some(ToolCall {
+                id: call_id.to_string(),
+                name: tool_name.clone(),
+                arguments: serde_json::json!({}),
+            });
+        }
+
+        None
+    }
 }
 
 impl std::fmt::Debug for FawxToolExecutor {
@@ -4264,6 +4293,37 @@ three
             executor.classify_call(&call),
             ToolCallClassification::Mutation
         );
+    }
+
+    #[test]
+    fn route_sub_goal_call_rejects_tools_with_required_arguments() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+        };
+
+        assert!(
+            executor.route_sub_goal_call(&request, "decompose-gate-0").is_none(),
+            "run_command should not be direct-routed without a declared materializer"
+        );
+    }
+
+    #[test]
+    fn route_sub_goal_call_allows_zero_argument_tools() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Check the clock".to_string(),
+            required_tools: vec!["current_time".to_string()],
+        };
+
+        let call = executor
+            .route_sub_goal_call(&request, "decompose-gate-0")
+            .expect("current_time should be routable");
+        assert_eq!(call.name, "current_time");
+        assert_eq!(call.arguments, serde_json::json!({}));
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub mod process_registry;
 pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
+pub mod scoped_tool_executor;
 pub mod signals;
 pub mod streaming;
 pub mod system_prompt;

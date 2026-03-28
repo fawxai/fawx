@@ -28,9 +28,11 @@ A tool, a skill, a provider, a perception module: all satisfy the same structura
 
 `describe → execute → classify`
 
+If you prefer classical pattern names, this is the Composite Pattern applied architecturally. A single tool and a composite subsystem present the same interface to the layer above.
+
 The engine doesn't know which level it's talking to and doesn't need to. A single tool and an entire skill subsystem look the same from above. This is how Fawx stays extensible: new capabilities plug in at any level without changing the levels above or below.
 
-Fawx is built like a fractal. The same pattern repeats at every scale.
+Fawx is built like a fractal. The same pattern repeats at every scale. Composite is the local pattern; fractal architecture is the system-wide rule.
 
 ### 3. If you're matching on a name, you're in the wrong layer.
 

@@ -49,12 +49,47 @@ const META_ONLY_RESPONSE_PHRASES: &[&str] = &[
     "before i can finish",
     "can't proceed",
     "cannot proceed",
+    "if you want, i can",
     "not enough information",
     "need more information",
     "need follow-up",
     "still gathering",
     "still researching",
     "parallelize",
+    "would you like me to",
+];
+
+const ACTION_ORIENTED_TASK_TERMS: &[&str] = &[
+    "build",
+    "create",
+    "fix",
+    "generate",
+    "implement",
+    "install",
+    "modify",
+    "patch",
+    "post",
+    "publish",
+    "save",
+    "scaffold",
+    "update",
+    "write",
+];
+
+const UNRESOLVED_ACTION_RESPONSE_PHRASES: &[&str] = &[
+    "what went wrong",
+    "no such file or directory",
+    "command not found",
+    "permission denied",
+    "timed out",
+    "failed to",
+    "could not",
+    "couldn't",
+    "unable to",
+    "cannot",
+    "can't",
+    "unsupported",
+    "not found",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +170,7 @@ pub struct SubGoal {
 
 impl SubGoal {
     pub fn contract(&self) -> SubGoalContract {
-        self.completion_contract.clone()
+        self.completion_contract.prompt_contract(&self.description)
     }
 
     pub fn new(
@@ -203,7 +238,16 @@ impl ExecutionContract<str> for SubGoal {
     }
 
     fn classify(&self, evidence: &str) -> Self::Classification {
-        self.contract().classify(evidence)
+        let normalized = evidence.trim();
+        if looks_unresolved_action_response(&self.description, normalized) {
+            return SubGoalCompletionClassification::Incomplete(format!(
+                "sub-goal response reported unresolved execution blockers instead of completed work: {normalized}"
+            ));
+        }
+
+        self.completion_contract
+            .classification_contract(&self.description)
+            .classify(evidence)
     }
 }
 
@@ -269,6 +313,36 @@ impl SubGoalContract {
         merged
     }
 
+    fn prompt_contract(&self, description: &str) -> Self {
+        if self.definition_of_done.is_some() || !self.required_terms.is_empty() {
+            return self.clone();
+        }
+
+        self.with_task_terms(description)
+    }
+
+    fn classification_contract(&self, description: &str) -> Self {
+        self.with_task_terms(description)
+    }
+
+    fn with_task_terms(&self, description: &str) -> Self {
+        let task_terms = salient_terms(description);
+        if task_terms.is_empty() {
+            return self.clone();
+        }
+
+        let mut merged = self.clone();
+        for term in task_terms {
+            if !merged.required_terms.contains(&term) {
+                merged.required_terms.push(term);
+            }
+        }
+        if !merged.required_terms.is_empty() {
+            merged.require_substantive_text = true;
+        }
+        merged
+    }
+
     pub fn describe_with_task(&self, description: &str) -> SubGoalDescription {
         let mut prompt = description.trim().to_string();
 
@@ -321,10 +395,12 @@ impl ExecutionContract<str> for SubGoalContract {
             let matched = self
                 .required_terms
                 .iter()
-                .any(|term| response_matches_required_term(normalized, term));
-            if !matched {
+                .filter(|term| response_matches_required_term(normalized, term))
+                .count();
+            let required_matches = minimum_required_term_matches(self.required_terms.len());
+            if matched < required_matches {
                 return SubGoalCompletionClassification::Incomplete(format!(
-                    "sub-goal response did not include completion evidence markers [{}]: {normalized}",
+                    "sub-goal response did not include enough completion evidence markers (matched {matched}/{required_matches} needed from [{}]): {normalized}",
                     self.required_terms.join(", ")
                 ));
             }
@@ -380,6 +456,29 @@ fn response_matches_required_term(text: &str, term: &str) -> bool {
                 .count();
             shared_prefix >= 5
         })
+}
+
+fn minimum_required_term_matches(term_count: usize) -> usize {
+    term_count.min(2)
+}
+
+fn looks_unresolved_action_response(task: &str, response: &str) -> bool {
+    if response.is_empty() {
+        return false;
+    }
+
+    let normalized_task = task.trim().to_ascii_lowercase();
+    if !ACTION_ORIENTED_TASK_TERMS
+        .iter()
+        .any(|term| normalized_task.contains(term))
+    {
+        return false;
+    }
+
+    let normalized_response = response.trim().to_ascii_lowercase();
+    UNRESOLVED_ACTION_RESPONSE_PHRASES
+        .iter()
+        .any(|pattern| normalized_response.contains(pattern))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -523,12 +622,10 @@ mod tests {
             matches!(incomplete, SubGoalOutcome::Incomplete(text) if text == "needs more evidence")
         );
         assert!(matches!(failed, SubGoalOutcome::Failed(text) if text == "boom"));
-        assert!(
-            matches!(
-                exhausted,
-                SubGoalOutcome::BudgetExhausted { partial_response: Some(text) } if text == "partial"
-            )
-        );
+        assert!(matches!(
+            exhausted,
+            SubGoalOutcome::BudgetExhausted { partial_response: Some(text) } if text == "partial"
+        ));
         assert!(matches!(skipped, SubGoalOutcome::Skipped));
     }
 
@@ -667,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_goal_contract_omits_term_requirement_when_definition_is_missing() {
+    fn sub_goal_without_definition_backfills_task_evidence_terms() {
         let goal = SubGoal::new(
             "Summarize findings",
             Vec::new(),
@@ -676,11 +773,48 @@ mod tests {
         );
 
         let contract = goal.contract();
-        assert!(contract.required_terms.is_empty());
-        assert_eq!(
-            goal.classify("done"),
-            SubGoalCompletionClassification::Completed
+        assert!(contract.require_substantive_text);
+        assert!(contract.required_terms.contains(&"summarize".to_string()));
+        assert!(contract.required_terms.contains(&"findings".to_string()));
+
+        let SubGoalCompletionClassification::Incomplete(message) = goal.classify("done") else {
+            panic!("expected incomplete classification")
+        };
+        assert!(message.contains("completion evidence markers"));
+    }
+
+    #[test]
+    fn sub_goal_classification_requires_more_than_one_evidence_marker_when_available() {
+        let goal = SubGoal::new(
+            "Scaffold the skill",
+            Vec::new(),
+            SubGoalContract::from_definition_of_done(Some("Scaffolded skill")),
+            None,
         );
+
+        let SubGoalCompletionClassification::Incomplete(message) =
+            goal.classify("I inspected the skill directory.")
+        else {
+            panic!("expected incomplete classification")
+        };
+        assert!(message.contains("matched 1/2"));
+    }
+
+    #[test]
+    fn action_oriented_sub_goal_rejects_unresolved_blocker_response() {
+        let goal = SubGoal::new(
+            "Write the x-post spec and scaffold the skill",
+            Vec::new(),
+            SubGoalContract::from_definition_of_done(Some("Scaffolded skill")),
+            None,
+        );
+
+        let SubGoalCompletionClassification::Incomplete(message) =
+            goal.classify("I tried to scaffold the skill, but the command was not found.")
+        else {
+            panic!("expected incomplete classification")
+        };
+        assert!(message.contains("unresolved execution blockers"));
     }
 
     #[test]

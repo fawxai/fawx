@@ -5,6 +5,9 @@ use fx_decompose::{ComplexityHint, SubGoal};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+#[cfg(test)]
+use fx_decompose::SubGoalContract;
+
 /// Budget state for soft-ceiling awareness.
 ///
 /// Only two states. `Exhausted` is already handled by the existing
@@ -1388,7 +1391,7 @@ mod tests {
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: hint,
         }
     }
