@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx Refactor Roadmap</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --orange: #db6d28;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+    line-height: 1.6;
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--text-muted); margin-bottom: 2rem; font-size: 0.95rem; }
+  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; color: var(--accent); }
+  h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+
+  .doctrine {
+    background: var(--surface);
+    border-left: 3px solid var(--purple);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    border-radius: 0 6px 6px 0;
+    font-style: italic;
+    color: var(--text-muted);
+  }
+
+  .phase {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .phase-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  .phase-number {
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    font-size: 0.8rem;
+    padding: 0.15rem 0.6rem;
+    border-radius: 12px;
+    white-space: nowrap;
+  }
+  .phase-title { font-size: 1.15rem; font-weight: 600; }
+
+  .issue {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+  }
+  .issue-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
+  }
+  .issue-number {
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    font-size: 0.85rem;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .issue-title { font-weight: 600; font-size: 0.95rem; }
+  .issue-body { color: var(--text-muted); font-size: 0.9rem; margin-top: 0.4rem; }
+  .issue-body ul { padding-left: 1.25rem; margin-top: 0.3rem; }
+  .issue-body li { margin-bottom: 0.2rem; }
+
+  .tag {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 10px;
+    font-weight: 500;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+  .tag-done { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .tag-partial { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+  .tag-open { background: rgba(139,148,158,0.15); color: var(--text-muted); border: 1px solid rgba(139,148,158,0.3); }
+  .tag-critical { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .tag-enhancement { background: rgba(188,140,255,0.15); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
+
+  .deps {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border);
+  }
+  .deps strong { color: var(--text); }
+
+  .progress-bar {
+    display: flex;
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--border);
+    margin: 0.75rem 0 0.25rem;
+  }
+  .progress-fill {
+    height: 100%;
+    transition: width 0.3s;
+  }
+  .progress-fill.green { background: var(--green); }
+  .progress-fill.yellow { background: var(--yellow); }
+  .progress-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: right;
+  }
+
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+  .summary-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    text-align: center;
+  }
+  .summary-card .number { font-size: 2rem; font-weight: 700; }
+  .summary-card .label { font-size: 0.85rem; color: var(--text-muted); }
+
+  .legend {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.5rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+  }
+
+  .timestamp {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-align: right;
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>Fawx Refactor Roadmap</h1>
+<p class="subtitle">Architecture modernization: static dispatch to trait-based composition</p>
+
+<div class="doctrine">
+  "Components declare their own behavior through traits. No static registries, no string-matching dispatch, no name-to-behavior lookup tables."
+  <br>— docs/doctrine.md
+</div>
+
+<div class="summary-grid">
+  <div class="summary-card">
+    <div class="number" style="color: var(--accent)">7</div>
+    <div class="label">Refactor Issues</div>
+  </div>
+  <div class="summary-card">
+    <div class="number" style="color: var(--green)">1</div>
+    <div class="label">Substantially Complete</div>
+  </div>
+  <div class="summary-card">
+    <div class="number" style="color: var(--yellow)">3</div>
+    <div class="label">Foundation Laid</div>
+  </div>
+  <div class="summary-card">
+    <div class="number" style="color: var(--text-muted)">3</div>
+    <div class="label">Not Started</div>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background: var(--green)"></div> Complete / substantially complete</div>
+  <div class="legend-item"><div class="legend-dot" style="background: var(--yellow)"></div> Foundation laid (interfaces defined, implementation pending)</div>
+  <div class="legend-item"><div class="legend-dot" style="background: var(--text-muted)"></div> Not started</div>
+</div>
+
+<!-- PHASE 1 -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-number">PHASE 1</span>
+    <span class="phase-title">Loop Composition (Active)</span>
+  </div>
+  <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+    Replace implicit loop control flow with typed contracts. The loop asks components what to do instead of guessing from side effects.
+  </p>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1644</span>
+      <span class="issue-title">Replace stringly-typed ActionStep with Action trait</span>
+      <span class="tag tag-done">substantially complete</span>
+    </div>
+    <div class="issue-body">
+      PR #1648 introduced typed action vocabulary:
+      <ul>
+        <li><code>ActionNextStep::Continue(ActionContinuation)</code> / <code>Finish(ActionTerminal)</code> — act step owns its disposition</li>
+        <li><code>TurnCommitment</code> (ProceedUnderConstraints, NeedsDirection) — typed state across iterations</li>
+        <li><code>LoopResult::Incomplete</code> — explicit terminal for non-completion</li>
+        <li>Loop no longer infers continuation from tool presence</li>
+      </ul>
+    </div>
+    <div class="progress-bar"><div class="progress-fill green" style="width: 85%"></div></div>
+    <div class="progress-label">~85% — remaining: wire perception actions through the same typed path</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1641</span>
+      <span class="issue-title">Decompose loop_engine.rs into composable phase traits</span>
+      <span class="tag tag-partial">foundation laid</span>
+    </div>
+    <div class="issue-body">
+      PR #1648 extracted 4 modules with distinct responsibilities:
+      <ul>
+        <li><code>bounded_local.rs</code> — phase machine (Discovery → Mutation → Recovery → Verification → Terminal)</li>
+        <li><code>continuation.rs</code> — turn commitment rendering, tool scope resolution</li>
+        <li><code>direct_utility.rs</code> — manifest-driven direct utility routing</li>
+        <li><code>progress.rs</code> — progress event emission, turn state tracking</li>
+      </ul>
+      Main file grew with new orchestration logic. Composition improved; size reduction pending.
+    </div>
+    <div class="deps"><strong>Depends on:</strong> #1644 (action types used by phase modules)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 35%"></div></div>
+    <div class="progress-label">~35% — modules extracted, but core orchestration still monolithic</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1614</span>
+      <span class="issue-title">Bug: double response when model emits text + tool call in same turn</span>
+      <span class="tag tag-partial">foundation laid</span>
+    </div>
+    <div class="issue-body">
+      <code>ActionNextStep</code> provides the typed signal needed to fix this: the act step can now explicitly say "I have tool calls, continue" even when text is also present. The old heuristic (no tools = done) was the root cause.
+    </div>
+    <div class="deps"><strong>Depends on:</strong> #1644 (ActionNextStep)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 40%"></div></div>
+    <div class="progress-label">~40% — infrastructure ready, fix not yet wired</div>
+  </div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-number">PHASE 2</span>
+    <span class="phase-title">Tool Trait Decomposition</span>
+  </div>
+  <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+    Break the FawxToolExecutor monolith into individual Tool trait objects. Each tool self-describes its schema, cacheability, classification, and journal hints.
+  </p>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1639</span>
+      <span class="issue-title">Tool trait: replace FawxToolExecutor monolith with trait-based dispatch</span>
+      <span class="tag tag-partial">foundation laid</span>
+      <span class="tag tag-critical">highest impact</span>
+    </div>
+    <div class="issue-body">
+      PR #1648 added trait methods that define the future Tool contract:
+      <ul>
+        <li><code>classify_call()</code> — executor classifies its own tool invocations (observation vs mutation)</li>
+        <li><code>route_sub_goal_call()</code> — executor materializes direct tool calls from sub-goals</li>
+        <li><code>cacheability()</code> — already existed, now part of a richer trait surface</li>
+        <li><code>x-fawx-direct-utility</code> manifest metadata — skills declare routing to the kernel</li>
+      </ul>
+      The <em>contract</em> is defined. The <em>decomposition</em> (splitting 5,400 lines into individual Tool trait objects) is not started.
+    </div>
+    <div class="deps"><strong>Unlocks:</strong> #1638 (ripcord registries), #1515 (journal coverage), #1646 (visible skill tools), #1171 (WASM tool definitions)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 25%"></div></div>
+    <div class="progress-label">~25% — trait surface defined, monolith intact</div>
+    <div class="issue-body" style="margin-top: 0.75rem;">
+      <strong>Enhancement scope:</strong> Structured memory system (DeerFlow-style) attaches here. Memory becomes a trait-based tool with typed add/replace/remove actions.
+    </div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1638</span>
+      <span class="issue-title">Audit: replace static dispatch with trait-based polymorphism</span>
+      <span class="tag tag-partial">foundation laid</span>
+    </div>
+    <div class="issue-body">
+      Parent audit issue. PR #1648 moved classification from static kernel knowledge to executor-declared behavior and routing from kernel heuristics to manifest-declared metadata. Remaining instances:
+      <ul>
+        <li><code>extract_journal_action</code> in ripcord — static string registry</li>
+        <li><code>tool_to_action_category</code> in ripcord — parallel static registry</li>
+        <li><code>fawx_tool_definitions</code> — manual Vec assembly</li>
+        <li>Scattered <code>ToolDefinition</code> builders in git_skill.rs, session_tools.rs</li>
+      </ul>
+      These fall out naturally once #1639 lands.
+    </div>
+    <div class="deps"><strong>Depends on:</strong> #1639 (tool trait provides the polymorphic contract)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 20%"></div></div>
+    <div class="progress-label">~20% — audit done, pattern established, instances remain</div>
+  </div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-number">PHASE 3</span>
+    <span class="phase-title">Provider and Config Modernization</span>
+  </div>
+  <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+    Move provider metadata onto traits and decompose config into focused modules. Independent of Phases 1-2.
+  </p>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1640</span>
+      <span class="issue-title">Move provider metadata onto LlmProvider trait</span>
+      <span class="tag tag-open">not started</span>
+    </div>
+    <div class="issue-body">
+      Thinking levels, catalog endpoints, auth headers, base URLs are all matched on provider name strings externally. Should be trait methods on <code>LlmProvider</code>. No progress in #1648.
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
+    <div class="progress-label">0%</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1643</span>
+      <span class="issue-title">Decompose config/lib.rs into focused modules</span>
+      <span class="tag tag-open">not started</span>
+    </div>
+    <div class="issue-body">
+      2,400-line config monolith. New <code>effective_self_modify_config</code> in config_bridge.rs (PR #1648) adds capability-mode-aware policy, but the core file is untouched.
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
+    <div class="progress-label">0%</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1642</span>
+      <span class="issue-title">Decompose headless.rs into command handlers</span>
+      <span class="tag tag-open">not started</span>
+    </div>
+    <div class="issue-body">
+      5,300-line headless mode handler. Not touched by #1648.
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
+    <div class="progress-label">0%</div>
+  </div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-number">PHASE 4</span>
+    <span class="phase-title">Skill Ecosystem</span>
+  </div>
+  <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+    Leverages the trait-based architecture from Phases 1-2 to build a composable skill system.
+  </p>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1646</span>
+      <span class="issue-title">Direct utility routing and visible tool contracts for loadable skills</span>
+      <span class="tag tag-partial">foundation laid</span>
+    </div>
+    <div class="issue-body">
+      PR #1648 introduced <code>x-fawx-direct-utility</code> manifest metadata and <code>direct_utility_profile_for_tool()</code> that reads it. Weather skill manifest updated with <code>direct_utility = true</code> and <code>trigger_patterns</code>. Pattern is established for other skills.
+    </div>
+    <div class="deps"><strong>Depends on:</strong> #1639 (tool trait for skill-as-tool contract), #1171 (WASM tool definitions)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 40%"></div></div>
+    <div class="progress-label">~40% — metadata pattern proven, broader skill surface pending</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1647</span>
+      <span class="issue-title">Revisioned skill activation lifecycle</span>
+      <span class="tag tag-open">not started</span>
+    </div>
+    <div class="issue-body">
+      Published and local dev skills need versioned activation, rollback, and hot-reload lifecycle management.
+    </div>
+    <div class="deps"><strong>Depends on:</strong> #1646 (visible tool contracts), #1639 (tool trait)</div>
+    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
+    <div class="progress-label">0%</div>
+  </div>
+</div>
+
+<!-- Enhancement scopes -->
+<h2>Enhancement Scopes (attached to refactor issues)</h2>
+
+<div class="issue">
+  <div class="issue-header">
+    <span class="issue-title">Structured Memory System</span>
+    <span class="tag tag-enhancement">enhancement</span>
+  </div>
+  <div class="issue-body">
+    DeerFlow-style JSON memory with typed sections (workContext, topOfMind, recentMonths), confidence-scored facts, automatic post-session LLM summarization, and bounded capacity with pruning. Memory becomes a trait-based tool on #1639.
+  </div>
+  <div class="deps"><strong>Attaches to:</strong> #1639 (Tool trait)</div>
+</div>
+
+<div class="issue">
+  <div class="issue-header">
+    <span class="issue-title">Verdict/Output Validation Gate</span>
+    <span class="tag tag-enhancement">enhancement</span>
+  </div>
+  <div class="issue-body">
+    Runtime enforcement layer that parses structured output and validates invariants (e.g., APPROVE verdict with non-empty issue sections gets corrected to REQUEST_CHANGES). Post-action validation at the loop response boundary.
+  </div>
+  <div class="deps"><strong>Attaches to:</strong> #1641 (loop decomposition, response finalization path)</div>
+</div>
+
+<!-- Dependency graph -->
+<h2>Dependency Graph</h2>
+
+<pre style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 0.85rem; overflow-x: auto; line-height: 1.8;">
+<span style="color: var(--green)">Phase 1 (active)</span>
+  <span style="color: var(--green)">#1644 Action trait ——————————85%——</span>┐
+  <span style="color: var(--yellow)">#1641 Loop decomposition ——35%——</span>──┤
+  <span style="color: var(--yellow)">#1614 Double response bug —40%——</span>──┘
+
+<span style="color: var(--yellow)">Phase 2 (next)</span>                          depends on Phase 1
+  <span style="color: var(--yellow)">#1639 Tool trait ——————————25%——</span>──┐
+  <span style="color: var(--yellow)">#1638 Static dispatch audit 20%—</span>──┤ (falls out of #1639)
+  #1515 Ripcord journal ——————————┘ (falls out of #1639)
+
+<span style="color: var(--text-muted)">Phase 3 (independent)</span>
+  #1640 Provider metadata ————————── independent
+  #1643 Config decomposition ————── independent
+  #1642 Headless decomposition ——── independent
+
+<span style="color: var(--text-muted)">Phase 4 (depends on Phase 2)</span>
+  <span style="color: var(--yellow)">#1646 Skill tool contracts 40%——</span>──┐
+  #1647 Skill lifecycle ——————————──┘ depends on #1646, #1639
+</pre>
+
+<div class="timestamp">
+  Generated 2026-03-28 · Based on PR #1648 review + open issue audit · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+</div>
+
+</body>
+</html>
