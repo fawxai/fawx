@@ -1719,7 +1719,22 @@ pub fn fawx_tool_definitions(
             name: "current_time".to_string(),
             description: "Get the current date, time, timezone, and Unix epoch timestamp"
                 .to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "x-fawx-direct-utility": {
+                    "enabled": true,
+                    "profile": "current_time",
+                    "trigger_patterns": [
+                        "current time",
+                        "what time",
+                        "what's the time",
+                        "whats the time",
+                        "time is it"
+                    ]
+                }
+            }),
         },
     ];
     if include_experiment_tool {
@@ -2398,7 +2413,11 @@ fn is_observational_program_and_args(tokens: &[String]) -> bool {
     match program {
         "cat" | "grep" | "rg" | "head" | "tail" | "ls" | "find" | "pwd" | "wc" | "which"
         | "stat" | "file" | "cut" | "sort" | "uniq" | "jq" | "awk" | "realpath" | "dirname"
-        | "basename" | "printenv" | "env" | "uname" | "date" => true,
+        | "basename" | "printenv" | "env" | "uname" | "date" | "tree" | "df" | "du" | "id"
+        | "whoami" | "hostname" | "lsof" | "ps" => true,
+        "top" => args
+            .iter()
+            .any(|arg| arg == "-b" || arg == "-l" || arg.starts_with("-l")),
         "echo" => true,
         "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
         "git" => is_observational_git_command(args),
@@ -4440,6 +4459,44 @@ three
             name: "run_command".to_string(),
             arguments: serde_json::json!({
                 "command": "awk '$1 > 100' metrics.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_ps_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "ps aux",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_noninteractive_top_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "top -l 1",
                 "shell": true,
             }),
         };

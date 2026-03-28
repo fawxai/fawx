@@ -64,8 +64,6 @@ index 00000000..88e74233
 +
 +Restore an outer loop around `act`, but much simpler than the old verify/learn/should_continue:
 +
-+This outer loop should remain aligned with Fawx's Composite Pattern / fractal architecture: the same runner contract should apply whether we're executing the root task or a child sub-goal. Child execution should be a composed instance of the same loop with a narrower tool surface, not a bespoke wrapper path.
-+
 +```rust
 +loop {
 +    stream.phase(Phase::Act);

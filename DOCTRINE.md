@@ -64,7 +64,6 @@ Effective 2026-02-27. This file defines the immutable rules that the Fawx kernel
 - **N = Fawx (conductor):** User-facing. Delegates tasks. Does not write code.
 - **N+1 = Orchestrator:** Manages change lifecycle. Spawns typed workers. Decides composition.
 - **N+2 = Workers:** Execute specific tasks within their role permissions.
-- **Composition follows the same Composite Pattern / fractal rule as the rest of Fawx.** A worker and an orchestrated subtree must present the same control shape to the layer above; only permissions, budget, and available tools narrow by depth.
 - **Maximum nesting depth is enforced.** The kernel prevents deeper recursion than N+2.
 
 ### Typed Subagent Roles (Three Types, Locked Permissions)

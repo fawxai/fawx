@@ -21,9 +21,6 @@ The user can interact during execution: abort, steer, or queue input. User input
 ### Recursive by Observation
 The loop still recurses via Continue — but recursion is driven by observed signals (tool failure, partial results, user steering), not by comparing declared intent against actual outcomes.
 
-### Composite at Every Scale
-The loop should use the Composite Pattern as a local design rule: a single capability and a composed subsystem expose the same control contract to the layer above. System-wide, this is Fawx's fractal architecture: parent and child runners share the same phase shape, with only budgets, tool surfaces, and role constraints changing by depth.
-
 ---
 
 ## 1b. Doctrine Mapping

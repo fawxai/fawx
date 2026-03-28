@@ -103,6 +103,10 @@ pub struct SkillToolManifest {
     pub name: String,
     pub description: String,
     #[serde(default)]
+    pub direct_utility: bool,
+    #[serde(default)]
+    pub trigger_patterns: Vec<String>,
+    #[serde(default)]
     pub parameters: Vec<SkillToolParameterManifest>,
 }
 
@@ -206,6 +210,12 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
                 tool.name
             )));
         }
+        if tool.direct_utility && tool.trigger_patterns.is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "direct utility tool '{}' must declare at least one trigger pattern",
+                tool.name
+            )));
+        }
         if !seen_tool_names.insert(tool.name.clone()) {
             return Err(SkillError::InvalidManifest(format!(
                 "duplicate tool name '{}'",
@@ -284,6 +294,8 @@ entry_point = "run"
 [[tools]]
 name = "web_search"
 description = "Search the web"
+direct_utility = true
+trigger_patterns = ["search the web"]
 
 [[tools.parameters]]
 name = "query"
@@ -295,10 +307,44 @@ required = true
         let manifest = parse_manifest(toml).expect("Should parse manifest with tools");
         assert_eq!(manifest.tools.len(), 1);
         assert_eq!(manifest.tools[0].name, "web_search");
+        assert!(manifest.tools[0].direct_utility);
+        assert_eq!(
+            manifest.tools[0].trigger_patterns,
+            vec!["search the web".to_string()]
+        );
         assert_eq!(manifest.tools[0].parameters.len(), 1);
         assert_eq!(manifest.tools[0].parameters[0].name, "query");
         assert_eq!(manifest.tools[0].parameters[0].kind, "string");
         assert!(manifest.tools[0].parameters[0].required);
+    }
+
+    #[test]
+    fn test_validate_direct_utility_requires_trigger_patterns() {
+        let manifest = SkillManifest {
+            name: "weather".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Weather".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "weather".to_string(),
+                description: "Weather".to_string(),
+                direct_utility: true,
+                trigger_patterns: Vec::new(),
+                parameters: vec![SkillToolParameterManifest {
+                    name: "location".to_string(),
+                    kind: "string".to_string(),
+                    description: "Location".to_string(),
+                    required: true,
+                }],
+            }],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::InvalidManifest(_))));
     }
 
     #[test]
@@ -572,11 +618,15 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 SkillToolManifest {
                     name: "web_search".to_string(),
                     description: "Search".to_string(),
+                    direct_utility: false,
+                    trigger_patterns: Vec::new(),
                     parameters: vec![],
                 },
                 SkillToolManifest {
                     name: "web_search".to_string(),
                     description: "Duplicate".to_string(),
+                    direct_utility: false,
+                    trigger_patterns: Vec::new(),
                     parameters: vec![],
                 },
             ],
@@ -601,6 +651,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             tools: vec![SkillToolManifest {
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
                 parameters: vec![
                     SkillToolParameterManifest {
                         name: "query".to_string(),

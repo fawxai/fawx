@@ -129,14 +129,31 @@ impl WasmSkill {
             .map(|parameter| serde_json::Value::String(parameter.name.clone()))
             .collect::<Vec<_>>();
 
+        let mut parameters = serde_json::Map::new();
+        parameters.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        parameters.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(properties),
+        );
+        parameters.insert("required".to_string(), serde_json::Value::Array(required));
+        if tool.direct_utility {
+            parameters.insert(
+                "x-fawx-direct-utility".to_string(),
+                serde_json::json!({
+                    "enabled": true,
+                    "profile": tool.name,
+                    "trigger_patterns": tool.trigger_patterns,
+                }),
+            );
+        }
+
         ToolDefinition {
             name: tool.name.clone(),
             description: tool.description.clone(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            }),
+            parameters: serde_json::Value::Object(parameters),
         }
     }
 
@@ -619,6 +636,8 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                     name: "query".to_string(),
                     kind: "string".to_string(),
@@ -629,6 +648,8 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "web_fetch".to_string(),
                 description: "Fetch".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
                 parameters: vec![],
             },
         ];
@@ -651,6 +672,8 @@ mod tests {
         manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
             name: "weather".to_string(),
             description: "Weather".to_string(),
+            direct_utility: true,
+            trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                 name: "location".to_string(),
                 kind: "string".to_string(),
@@ -668,6 +691,10 @@ mod tests {
         assert_eq!(defs[0].name, "weather");
         assert!(defs[0].parameters["properties"].get("location").is_some());
         assert!(defs[0].parameters["properties"].get("input").is_none());
+        assert_eq!(
+            defs[0].parameters["x-fawx-direct-utility"]["trigger_patterns"],
+            serde_json::json!(["weather", "forecast"])
+        );
 
         let result = skill
             .execute("weather", r#"{"location":"Denver, CO"}"#, None)

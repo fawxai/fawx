@@ -12,29 +12,15 @@ pub(super) enum DirectUtilityProfile {
     CurrentTime,
 }
 
-// TODO(#1646): replace these hardcoded message heuristics with direct-utility
-// manifest metadata so the kernel routes only from declared tool contracts.
 pub(super) fn detect_direct_utility_profile(
     user_message: &str,
     available_tools: &[ToolDefinition],
 ) -> Option<DirectUtilityProfile> {
     let lower = user_message.to_lowercase();
 
-    if looks_like_weather_question(&lower) {
-        let weather_tool = available_tools.iter().find(|tool| tool.name == "weather")?;
-        weather_location_key(weather_tool)?;
-        return Some(DirectUtilityProfile::Weather);
-    }
-
-    if looks_like_current_time_question(&lower)
-        && available_tools.iter().any(|tool| {
-            tool.name == "current_time" && schema_accepts_empty_object(&tool.parameters)
-        })
-    {
-        return Some(DirectUtilityProfile::CurrentTime);
-    }
-
-    None
+    available_tools
+        .iter()
+        .find_map(|tool| direct_utility_profile_for_tool(tool, &lower))
 }
 
 pub(super) fn direct_utility_tool_names(profile: &DirectUtilityProfile) -> &'static [&'static str] {
@@ -153,22 +139,30 @@ fn build_direct_utility_call(
     }
 }
 
-fn looks_like_weather_question(lower: &str) -> bool {
-    let mentions_weather = lower.contains("weather") || lower.contains("forecast");
-    let questionish = lower.contains('?')
-        || lower.starts_with("what")
-        || lower.starts_with("how")
-        || lower.starts_with("is it")
-        || lower.starts_with("tell me");
-    mentions_weather && questionish
-}
+fn direct_utility_profile_for_tool(
+    tool: &ToolDefinition,
+    lower_user_message: &str,
+) -> Option<DirectUtilityProfile> {
+    let metadata = direct_utility_metadata(&tool.parameters)?;
+    if !metadata.enabled
+        || metadata.trigger_patterns.is_empty()
+        || !metadata
+            .trigger_patterns
+            .iter()
+            .any(|pattern| lower_user_message.contains(pattern))
+    {
+        return None;
+    }
 
-fn looks_like_current_time_question(lower: &str) -> bool {
-    lower.contains("current time")
-        || lower.contains("what time")
-        || lower.contains("what's the time")
-        || lower.contains("whats the time")
-        || lower.contains("time is it")
+    match metadata.profile.as_deref() {
+        Some("weather") if weather_location_key(tool).is_some() => {
+            Some(DirectUtilityProfile::Weather)
+        }
+        Some("current_time") if schema_accepts_empty_object(&tool.parameters) => {
+            Some(DirectUtilityProfile::CurrentTime)
+        }
+        _ => None,
+    }
 }
 
 fn extract_weather_location(user_message: &str) -> Option<String> {
@@ -231,6 +225,47 @@ fn required_property_names(schema: &serde_json::Value) -> HashSet<&str> {
         .flatten()
         .filter_map(serde_json::Value::as_str)
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectUtilityMetadata {
+    enabled: bool,
+    profile: Option<String>,
+    trigger_patterns: Vec<String>,
+}
+
+fn direct_utility_metadata(schema: &serde_json::Value) -> Option<DirectUtilityMetadata> {
+    let metadata = schema.get("x-fawx-direct-utility")?;
+    let enabled = metadata
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let profile = metadata
+        .get("profile")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let trigger_patterns = metadata
+        .get("trigger_patterns")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase())
+        .collect::<Vec<_>>();
+
+    Some(DirectUtilityMetadata {
+        enabled,
+        profile,
+        trigger_patterns,
+    })
 }
 
 fn extract_direct_utility_message(output: &str) -> String {

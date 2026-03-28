@@ -10,6 +10,8 @@ entry_point = "run"
 [[tools]]
 name = "weather"
 description = "Get current weather and a short forecast for a specific location"
+direct_utility = true
+trigger_patterns = ["weather", "forecast"]
 
 [[tools.parameters]]
 name = "location"

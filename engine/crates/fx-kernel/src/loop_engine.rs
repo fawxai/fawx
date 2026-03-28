@@ -18156,13 +18156,33 @@ mod loop_resilience_tests {
                                 "description": "Optional units override"
                             }
                         },
-                        "required": ["location"]
+                        "required": ["location"],
+                        "x-fawx-direct-utility": {
+                            "enabled": true,
+                            "profile": "weather",
+                            "trigger_patterns": ["weather", "forecast"]
+                        }
                     }),
                 },
                 ToolDefinition {
                     name: "current_time".to_string(),
                     description: "Get the current time".to_string(),
-                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{},
+                        "required": [],
+                        "x-fawx-direct-utility": {
+                            "enabled": true,
+                            "profile": "current_time",
+                            "trigger_patterns": [
+                                "current time",
+                                "what time",
+                                "what's the time",
+                                "whats the time",
+                                "time is it"
+                            ]
+                        }
+                    }),
                 },
                 ToolDefinition {
                     name: "web_search".to_string(),
@@ -18220,7 +18240,12 @@ mod loop_resilience_tests {
                             "description": "City or location to check weather for"
                         }
                     },
-                    "required": ["location"]
+                    "required": ["location"],
+                    "x-fawx-direct-utility": {
+                        "enabled": true,
+                        "profile": "weather",
+                        "trigger_patterns": ["weather", "forecast"]
+                    }
                 }),
             }]
         }
@@ -18235,6 +18260,9 @@ mod loop_resilience_tests {
 
     #[derive(Debug, Default)]
     struct LegacyWrappedWeatherExecutor;
+
+    #[derive(Debug, Default)]
+    struct UnannotatedStructuredWeatherExecutor;
 
     #[async_trait]
     impl ToolExecutor for LegacyWrappedWeatherExecutor {
@@ -18267,6 +18295,46 @@ mod loop_resilience_tests {
                         }
                     },
                     "required": ["input"]
+                }),
+            }]
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> crate::act::ToolCacheability {
+            crate::act::ToolCacheability::Cacheable
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for UnannotatedStructuredWeatherExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "weather".to_string(),
+                description: "Get the weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City or location to check weather for"
+                        }
+                    },
+                    "required": ["location"]
                 }),
             }]
         }
@@ -19244,6 +19312,23 @@ mod loop_resilience_tests {
         let mut engine = mixed_tool_engine_with_executor(
             BudgetConfig::default(),
             Arc::new(LegacyWrappedWeatherExecutor),
+        );
+        let _processed = engine
+            .perceive(&test_snapshot("What's the weather in Miami?"))
+            .await
+            .expect("perceive");
+
+        assert!(matches!(
+            engine.turn_execution_profile,
+            TurnExecutionProfile::Standard
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_weather_schema_without_direct_utility_metadata_does_not_trigger_profile() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(UnannotatedStructuredWeatherExecutor),
         );
         let _processed = engine
             .perceive(&test_snapshot("What's the weather in Miami?"))
