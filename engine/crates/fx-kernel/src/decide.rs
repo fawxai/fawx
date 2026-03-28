@@ -349,12 +349,12 @@ mod tests {
     #[test]
     fn decision_decompose_variant_constructs_with_plan() {
         let plan = DecompositionPlan {
-            sub_goals: vec![SubGoal {
-                description: "inspect logs".to_string(),
-                required_tools: vec!["read_file".to_string()],
-                expected_output: Some("log summary".to_string()),
-                complexity_hint: None,
-            }],
+            sub_goals: vec![SubGoal::with_definition_of_done(
+                "inspect logs",
+                vec!["read_file".to_string()],
+                Some("log summary"),
+                None,
+            )],
             strategy: AggregationStrategy::Sequential,
             truncated_from: None,
         };

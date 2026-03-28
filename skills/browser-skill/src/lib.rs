@@ -580,6 +580,7 @@ fn strip_html_comments(input: &str) -> String {
         let start = cursor + start_offset;
         result.push_str(&input[cursor..start]);
         let Some(end_offset) = input[start + 4..].find("-->") else {
+            result.push_str(&input[start..]);
             return result;
         };
         cursor = start + 4 + end_offset + 3;
@@ -596,8 +597,8 @@ fn strip_tag_block(input: &str, tag: &str) -> String {
     while let Some((start, open_end)) = find_opening_tag(input, tag, cursor) {
         result.push_str(&input[cursor..start]);
         let Some((_, close_end)) = find_closing_tag(input, tag, open_end + 1) else {
-            cursor = input.len();
-            break;
+            result.push_str(&input[start..]);
+            return result;
         };
         cursor = close_end + 1;
     }
@@ -1248,6 +1249,22 @@ mod tests {
             "<form>controls</form>",
             "<p>Visible</p>"
         );
+        let content = extract_content(html, OutputFormat::Text);
+
+        assert_eq!(content, "Visible");
+    }
+
+    #[test]
+    fn web_fetch_preserves_content_after_unterminated_html_comment() {
+        let html = "<!-- broken comment<p>Visible</p>";
+        let content = extract_content(html, OutputFormat::Text);
+
+        assert_eq!(content, "Visible");
+    }
+
+    #[test]
+    fn web_fetch_preserves_content_after_unclosed_noise_tag() {
+        let html = "<nav class=\"breadcrumbs\"><p>Visible</p>";
         let content = extract_content(html, OutputFormat::Text);
 
         assert_eq!(content, "Visible");

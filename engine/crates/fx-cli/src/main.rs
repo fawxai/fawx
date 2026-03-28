@@ -395,6 +395,7 @@ fn build_subagent_manager(
         config: config.clone(),
         improvement_provider,
         session_bus,
+        credential_store,
         token_broker,
     });
     Arc::new(fx_subagent::SubagentManager::new(

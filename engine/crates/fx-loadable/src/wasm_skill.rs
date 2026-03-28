@@ -1,9 +1,9 @@
 //! WASM skill adapter — bridges [`fx_skills::SkillRuntime`] into the
 //! [`Skill`] trait consumed by [`SkillRegistry`].
 //!
-//! Each installed WASM skill becomes a single tool whose name matches the
-//! skill's manifest name. The kernel dispatches tool calls to the adapter,
-//! which forwards them to the WASM runtime with a [`LiveHostApi`].
+//! Each installed WASM skill can expose one or more tools declared in its
+//! manifest. The kernel dispatches tool calls to the adapter, which forwards
+//! normalized JSON input to the WASM runtime with a [`LiveHostApi`].
 
 use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
@@ -13,7 +13,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
-use fx_skills::manifest::SkillManifest;
+use fx_skills::manifest::{SkillManifest, SkillToolManifest};
 use fx_skills::runtime::SkillRuntime;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -87,12 +87,11 @@ impl WasmSkill {
         &self.manifest.version
     }
 
-    /// Build a [`ToolDefinition`] from the skill manifest.
+    /// Build the legacy single-tool [`ToolDefinition`] from the skill manifest.
     ///
-    /// Each WASM skill exposes exactly one tool. The parameters schema
-    /// accepts a single `input` string — the raw JSON payload forwarded
-    /// to the WASM entry point via the host API.
-    fn build_tool_definition(&self) -> ToolDefinition {
+    /// Skills without manifest-declared tools still expose one compatibility
+    /// tool whose `input` string is forwarded directly to the WASM entrypoint.
+    fn build_legacy_tool_definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.manifest.name.clone(),
             description: self.manifest.description.clone(),
@@ -108,6 +107,155 @@ impl WasmSkill {
             }),
         }
     }
+
+    fn build_manifest_tool_definition(tool: &SkillToolManifest) -> ToolDefinition {
+        let properties = tool
+            .parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.name.clone(),
+                    serde_json::json!({
+                        "type": parameter.kind,
+                        "description": parameter.description,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        let required = tool
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.required)
+            .map(|parameter| serde_json::Value::String(parameter.name.clone()))
+            .collect::<Vec<_>>();
+
+        let mut parameters = serde_json::Map::new();
+        parameters.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        parameters.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(properties),
+        );
+        parameters.insert("required".to_string(), serde_json::Value::Array(required));
+        if tool.direct_utility {
+            parameters.insert(
+                "x-fawx-direct-utility".to_string(),
+                serde_json::json!({
+                    "enabled": true,
+                    "profile": tool.name,
+                    "trigger_patterns": tool.trigger_patterns,
+                }),
+            );
+        }
+
+        ToolDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: serde_json::Value::Object(parameters),
+        }
+    }
+
+    fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
+        if self.manifest.tools.is_empty() {
+            vec![self.build_legacy_tool_definition()]
+        } else {
+            self.manifest
+                .tools
+                .iter()
+                .map(Self::build_manifest_tool_definition)
+                .collect()
+        }
+    }
+
+    fn handles_tool(&self, tool_name: &str) -> bool {
+        tool_name == self.manifest.name
+            || self
+                .manifest
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_name)
+    }
+
+    fn encode_runtime_input(&self, tool_name: &str, arguments: &str) -> Result<String, SkillError> {
+        let value = serde_json::from_str::<serde_json::Value>(arguments)
+            .map_err(|error| format!("invalid arguments JSON: {error}"))?;
+
+        if self.manifest.tools.is_empty() {
+            return Ok(extract_legacy_input(value));
+        }
+
+        if tool_name == self.manifest.name {
+            return normalize_legacy_router_input(value);
+        }
+
+        let serde_json::Value::Object(mut object) = value else {
+            return Err("tool arguments must be a JSON object".to_string());
+        };
+        object.insert(
+            "tool".to_string(),
+            serde_json::Value::String(tool_name.to_string()),
+        );
+        Ok(serde_json::Value::Object(object).to_string())
+    }
+}
+
+fn extract_legacy_input(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(mut object) => match object.remove("input") {
+            Some(serde_json::Value::String(input)) => input,
+            Some(other) => other.to_string(),
+            None if object.is_empty() => String::new(),
+            None => serde_json::Value::Object(object).to_string(),
+        },
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_legacy_router_input(value: serde_json::Value) -> Result<String, SkillError> {
+    match value {
+        serde_json::Value::Object(mut object) => {
+            if let Some(input) = object.remove("input") {
+                normalize_legacy_router_payload(input)
+            } else {
+                normalize_legacy_router_payload(serde_json::Value::Object(object))
+            }
+        }
+        other => normalize_legacy_router_payload(other),
+    }
+}
+
+fn normalize_legacy_router_payload(value: serde_json::Value) -> Result<String, SkillError> {
+    match value {
+        serde_json::Value::String(raw) => {
+            if raw.trim().is_empty() {
+                Ok(raw)
+            } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                normalize_legacy_router_payload(parsed)
+            } else {
+                Ok(raw)
+            }
+        }
+        serde_json::Value::Object(mut object) => {
+            if !object.contains_key("tool") {
+                if let Some(action) = object.remove("action") {
+                    if let Some(action_name) = action.as_str() {
+                        object.insert(
+                            "tool".to_string(),
+                            serde_json::Value::String(action_name.to_string()),
+                        );
+                    } else {
+                        object.insert("action".to_string(), action);
+                    }
+                }
+            }
+            Ok(serde_json::Value::Object(object).to_string())
+        }
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 #[async_trait]
@@ -121,7 +269,7 @@ impl Skill for WasmSkill {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![self.build_tool_definition()]
+        self.build_tool_definitions()
     }
 
     fn capabilities(&self) -> Vec<String> {
@@ -151,18 +299,13 @@ impl Skill for WasmSkill {
         arguments: &str,
         _cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
-        if tool_name != self.manifest.name {
+        if !self.handles_tool(tool_name) {
             return None;
         }
 
-        // Extract the "input" field from the arguments JSON.
-        let input = match serde_json::from_str::<serde_json::Value>(arguments) {
-            Ok(val) => val
-                .get("input")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Err(e) => return Some(Err(format!("invalid arguments JSON: {e}"))),
+        let input = match self.encode_runtime_input(tool_name, arguments) {
+            Ok(input) => input,
+            Err(error) => return Some(Err(error)),
         };
 
         let skill_name = self.manifest.name.clone();
@@ -457,6 +600,7 @@ mod tests {
             author: "Test".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         }
     }
@@ -483,6 +627,80 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
         assert_eq!(defs[0].description, "echo skill");
+    }
+
+    #[test]
+    fn wasm_skill_exposes_manifest_declared_tools() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_search".to_string(),
+                description: "Search".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "query".to_string(),
+                    kind: "string".to_string(),
+                    description: "Search query".to_string(),
+                    required: true,
+                }],
+            },
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![],
+            },
+        ];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let defs = skill.tool_definitions();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "web_search");
+        assert_eq!(defs[1].name, "web_fetch");
+        assert_eq!(defs[0].parameters["required"], serde_json::json!(["query"]));
+    }
+
+    #[tokio::test]
+    async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
+        let mut manifest = test_manifest("weather");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "weather".to_string(),
+            description: "Weather".to_string(),
+            direct_utility: true,
+            trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "location".to_string(),
+                kind: "string".to_string(),
+                description: "City or location".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let defs = skill.tool_definitions();
+        assert_eq!(defs[0].name, "weather");
+        assert!(defs[0].parameters["properties"].get("location").is_some());
+        assert!(defs[0].parameters["properties"].get("input").is_none());
+        assert_eq!(
+            defs[0].parameters["x-fawx-direct-utility"]["trigger_patterns"],
+            serde_json::json!(["weather", "forecast"])
+        );
+
+        let result = skill
+            .execute("weather", r#"{"location":"Denver, CO"}"#, None)
+            .await;
+        assert!(result.is_some());
+        assert!(result.expect("known tool").is_ok());
     }
 
     #[test]
@@ -535,6 +753,43 @@ mod tests {
         let debug = format!("{skill:?}");
         assert!(debug.contains("echo"));
         assert!(debug.contains("1.0.0"));
+    }
+
+    #[test]
+    fn legacy_router_input_normalizes_nested_action_payload() {
+        let normalized = normalize_legacy_router_input(serde_json::json!({
+            "input": {
+                "action": "web_search",
+                "query": "rust async",
+                "count": "3"
+            }
+        }))
+        .expect("normalize");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).expect("json"),
+            serde_json::json!({
+                "tool": "web_search",
+                "query": "rust async",
+                "count": "3"
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_router_input_normalizes_embedded_json_string() {
+        let normalized = normalize_legacy_router_input(serde_json::json!({
+            "input": "{\"action\":\"web_fetch\",\"url\":\"https://example.com\"}"
+        }))
+        .expect("normalize");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).expect("json"),
+            serde_json::json!({
+                "tool": "web_fetch",
+                "url": "https://example.com"
+            })
+        );
     }
 
     #[test]

@@ -77,3 +77,8 @@ app/.derived/
 app/.derived-ios/
 app/.derived-macos/
 app/.swiftpm/
+
+# Xcode user-local workspace state
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+app/Fawx.xcodeproj/project.xcworkspace/xcuserdata/

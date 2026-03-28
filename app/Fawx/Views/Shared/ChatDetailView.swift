@@ -303,11 +303,29 @@ struct ChatDetailView: View {
     }
 
     private var streamingBubble: some View {
-        MessageBubble(
-            role: .assistant,
-            content: streamingBubbleContent,
-            isStreaming: true
-        )
+        TimelineView(.periodic(from: .now, by: 0.45)) { context in
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                StreamingStatusHeader(
+                    title: streamingStatusTitle,
+                    date: context.date
+                )
+
+                MessageBubble(
+                    role: .assistant,
+                    content: streamingBubbleContent,
+                    isStreaming: true
+                )
+
+                if let elapsed = chatViewModel.visibleStreamingElapsedText(now: context.date) {
+                    Text(elapsed)
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                        .monospacedDigit()
+                        .padding(.leading, FawxSpacing.paddingSM)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
         .id("streaming")
     }
 
@@ -666,7 +684,7 @@ struct ChatDetailView: View {
     private func transcriptItemView(_ item: ChatTranscriptItem) -> some View {
         switch item {
         case .message(let message):
-            MessageBubble(message: message.message)
+            MessageBubble(message: message.message, footnoteText: message.footnoteText)
         case .toolActivityGroup(let group):
             ToolActivityGroupCard(group: group)
         }
@@ -1024,10 +1042,29 @@ struct ChatDetailView: View {
     }
 #endif
 
+    private var streamingStatusTitle: String {
+        if let progress = chatViewModel.visibleProgress {
+            return progress.kind.label
+        }
+
+        if let phase = chatViewModel.visibleCurrentPhase {
+            return phase.composerLabel
+        }
+
+        return "Thinking"
+    }
+
     private var streamingBubbleContent: String {
         let streamed = chatViewModel.visibleStreamingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !streamed.isEmpty {
             return chatViewModel.visibleStreamingText
+        }
+
+        let progressMessage = chatViewModel.visibleProgress?.message.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let progressMessage, !progressMessage.isEmpty {
+            return progressMessage
         }
 
         return chatViewModel.visibleCurrentPhase?.streamingPlaceholder ?? "..."
@@ -1139,6 +1176,66 @@ struct ChatDetailView: View {
         NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
     }
 #endif
+}
+
+private struct StreamingStatusHeader: View {
+    let title: String
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            StreamingPulseDots(date: date)
+
+            Text(title)
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+        .padding(.horizontal, FawxSpacing.paddingSM)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.fawxSurfaceHover)
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.fawxBorder.opacity(FawxOpacity.borderMedium), lineWidth: 1)
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct StreamingPulseDots: View {
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle()
+                    .fill(Color.fawxAccent)
+                    .frame(width: 6, height: 6)
+                    .scaleEffect(scale(for: index))
+                    .opacity(opacity(for: index))
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func opacity(for index: Int) -> Double {
+        let phase = animationPhase(offset: Double(index) * 0.18)
+        return 0.28 + (phase * 0.72)
+    }
+
+    private func scale(for index: Int) -> CGFloat {
+        let phase = animationPhase(offset: Double(index) * 0.18)
+        return 0.78 + (phase * 0.42)
+    }
+
+    private func animationPhase(offset: Double) -> Double {
+        let cycleSeconds = 1.1
+        let base = date.timeIntervalSinceReferenceDate / cycleSeconds
+        let normalized = (base + offset).truncatingRemainder(dividingBy: 1)
+        return (sin(normalized * .pi * 2) + 1) / 2
+    }
 }
 
 #if os(iOS)

@@ -44,6 +44,23 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [])
     }
 
+    func testParseLineParsesProgressEvent() throws {
+        var parser = SSEParser()
+
+        XCTAssertEqual(try parser.parseLine("event: progress"), [])
+        XCTAssertEqual(
+            try parser.parseLine(#"data: {"kind":"implementing","message":"Implementing the committed plan."}"#),
+            []
+        )
+
+        let events = try parser.parseLine("")
+
+        XCTAssertEqual(
+            events,
+            [.progress(kind: "implementing", message: "Implementing the committed plan.")]
+        )
+    }
+
     func testFinishFlushesTrailingDoneEvent() throws {
         var parser = SSEParser()
 

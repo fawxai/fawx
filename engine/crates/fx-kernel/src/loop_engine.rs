@@ -1,10 +1,13 @@
 //! Agentic loop orchestrator.
 
-use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
+use crate::act::{
+    ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
+    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
+};
 use crate::budget::{
     build_skip_mask, effective_max_depth, estimate_complexity, truncate_tool_result, ActionCost,
     AllocationMode, AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState,
-    BudgetTracker, DepthMode, RetryPolicyConfig, DEFAULT_LLM_CALL_COST_CENTS,
+    BudgetTracker, DepthMode, RetryPolicyConfig, TerminationConfig, DEFAULT_LLM_CALL_COST_CENTS,
     DEFAULT_TOOL_INVOCATION_COST_CENTS,
 };
 use crate::cancellation::CancellationToken;
@@ -22,6 +25,7 @@ use crate::decide::Decision;
 use crate::input::{LoopCommand, LoopInputChannel};
 
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
+use crate::scoped_tool_executor::scope_tool_executor;
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
 use crate::streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 use crate::types::{
@@ -30,10 +34,11 @@ use crate::types::{
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use fx_core::message::{InternalMessage, StreamPhase};
+use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
-    AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
+    AggregationStrategy, ComplexityHint, DecompositionPlan, ExecutionContract, SubGoal,
+    SubGoalCompletionClassification, SubGoalOutcome, SubGoalResult,
 };
 use fx_llm::{
     emit_default_stream_response, CompletionRequest, CompletionResponse, CompletionStream,
@@ -48,6 +53,37 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use fx_decompose::SubGoalContract;
+
+mod bounded_local;
+mod continuation;
+mod direct_utility;
+mod progress;
+
+#[cfg(test)]
+use crate::act::ProceedUnderConstraints;
+use bounded_local::{
+    bounded_local_phase_label, bounded_local_terminal_partial_response,
+    bounded_local_terminal_reason_label, bounded_local_terminal_reason_text,
+    detect_turn_execution_profile, partition_by_bounded_local_phase_semantics, BoundedLocalPhase,
+    BoundedLocalTerminalReason, TurnExecutionProfile,
+};
+use continuation::{
+    commitment_tool_scope, render_turn_commitment_directive,
+    tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
+    turn_commitment_metadata,
+};
+#[cfg(test)]
+use direct_utility::DirectUtilityProfile;
+use direct_utility::{
+    detect_direct_utility_profile, direct_utility_completion_response, direct_utility_directive,
+    direct_utility_progress, direct_utility_terminal_response, direct_utility_tool_names,
+};
+use progress::json_string_arg;
+#[cfg(test)]
+use progress::{progress_for_tool_round, progress_for_turn_state_with_profile};
+
 /// Dynamic scratchpad context provider for iteration-boundary refresh.
 ///
 /// Implemented by the CLI layer to bridge `fx-scratchpad::Scratchpad` into the
@@ -58,6 +94,20 @@ pub trait ScratchpadProvider: Send + Sync {
     fn render_for_context(&self) -> String;
     /// Compact scratchpad if it exceeds size thresholds.
     fn compact_if_needed(&self, current_iteration: u32);
+}
+
+#[derive(Clone)]
+struct RequestBuildContext<'a> {
+    memory_context: Option<&'a str>,
+    scratchpad_context: Option<&'a str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
+    notify_tool_guidance_enabled: bool,
+}
+
+struct SubGoalRetryContext {
+    initial_response: String,
+    initial_signals: Vec<Signal>,
+    required_tool_names: Vec<String>,
 }
 
 impl std::fmt::Debug for dyn ScratchpadProvider {
@@ -215,6 +265,7 @@ impl<'a> CycleStream<'a> {
     fn tool_result(self, result: &ToolResult) {
         self.emit(StreamEvent::ToolResult {
             id: result.tool_call_id.clone(),
+            tool_name: result.tool_name.clone(),
             output: result.output.clone(),
             is_error: !result.success,
         });
@@ -260,6 +311,65 @@ fn build_user_message(snapshot: &PerceptionSnapshot, user_message: &str) -> Mess
     }
 }
 
+fn buffer_phase_text_until_response(phase: StreamPhase) -> bool {
+    matches!(phase, StreamPhase::Reason | StreamPhase::Synthesize)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextStreamVisibility {
+    Public,
+    Hidden,
+}
+
+fn emit_phase_text_delta(
+    callback: Option<&StreamCallback>,
+    event_bus: Option<&fx_core::EventBus>,
+    visibility: TextStreamVisibility,
+    phase: StreamPhase,
+    text: String,
+) {
+    if matches!(visibility, TextStreamVisibility::Hidden) {
+        return;
+    }
+    if let Some(bus) = event_bus {
+        let _ = bus.publish(InternalMessage::StreamDelta {
+            delta: text.clone(),
+            phase,
+        });
+    }
+    if let Some(callback) = callback {
+        callback(StreamEvent::TextDelta { text });
+    }
+}
+
+fn flush_phase_text_deltas(
+    buffered_deltas: &mut Vec<String>,
+    callback: Option<&StreamCallback>,
+    event_bus: Option<&fx_core::EventBus>,
+    visibility: TextStreamVisibility,
+    phase: StreamPhase,
+) {
+    for delta in buffered_deltas.drain(..) {
+        emit_phase_text_delta(callback, event_bus, visibility, phase, delta);
+    }
+}
+
+fn flush_shared_phase_text_deltas(
+    buffered_deltas: &Arc<Mutex<Vec<String>>>,
+    callback: Option<&StreamCallback>,
+    event_bus: Option<&fx_core::EventBus>,
+    visibility: TextStreamVisibility,
+    phase: StreamPhase,
+) {
+    let mut deltas = {
+        let mut guard = buffered_deltas
+            .lock()
+            .expect("buffered stream deltas lock poisoned");
+        std::mem::take(&mut *guard)
+    };
+    flush_phase_text_deltas(&mut deltas, callback, event_bus, visibility, phase);
+}
+
 fn build_processed_perception_message(perception: &ProcessedPerception, text: &str) -> Message {
     if perception.images.is_empty() && perception.documents.is_empty() {
         return Message::user(text);
@@ -274,17 +384,20 @@ fn build_processed_perception_message(perception: &ProcessedPerception, text: &s
 fn provider_stream_bridge(
     callback: StreamCallback,
     event_bus: Option<fx_core::EventBus>,
+    visibility: TextStreamVisibility,
     phase: StreamPhase,
+    buffered_deltas: Option<Arc<Mutex<Vec<String>>>>,
 ) -> ProviderStreamCallback {
     Arc::new(move |event| {
         if let ProviderStreamEvent::TextDelta { text } = event {
-            if let Some(bus) = &event_bus {
-                let _ = bus.publish(InternalMessage::StreamDelta {
-                    delta: text.clone(),
-                    phase,
-                });
+            if let Some(buffered_deltas) = &buffered_deltas {
+                buffered_deltas
+                    .lock()
+                    .expect("buffered stream deltas lock poisoned")
+                    .push(text);
+            } else {
+                emit_phase_text_delta(Some(&callback), event_bus.as_ref(), visibility, phase, text);
             }
-            callback(StreamEvent::TextDelta { text });
         }
     })
 }
@@ -331,6 +444,17 @@ pub enum LoopResult {
         /// Signals emitted during the cycle.
         signals: Vec<Signal>,
     },
+    /// Loop could not produce a usable terminal response, but may have partial progress.
+    Incomplete {
+        /// Optional best-effort partial response text.
+        partial_response: Option<String>,
+        /// Why the run is incomplete.
+        reason: String,
+        /// Iterations completed before the loop ended incomplete.
+        iterations: u32,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
+    },
     /// Loop was stopped by the user (stop, abort, or Ctrl+C).
     UserStopped {
         /// Best-effort partial response text.
@@ -356,6 +480,7 @@ impl LoopResult {
         match self {
             Self::Complete { signals, .. }
             | Self::BudgetExhausted { signals, .. }
+            | Self::Incomplete { signals, .. }
             | Self::UserStopped { signals, .. }
             | Self::Error { signals, .. } => signals,
         }
@@ -370,6 +495,14 @@ impl LoopResult {
                 partial_response
                     .clone()
                     .unwrap_or_else(|| "budget exhausted".to_string()),
+            ),
+            Self::Incomplete {
+                partial_response, ..
+            } => Some(
+                partial_response
+                    .clone()
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| INCOMPLETE_FALLBACK_RESPONSE.to_string()),
             ),
             Self::UserStopped {
                 partial_response, ..
@@ -423,6 +556,13 @@ impl CompactionTier {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ExecutionVisibility {
+    #[default]
+    Public,
+    Internal,
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but context compaction
@@ -446,6 +586,7 @@ pub struct LoopEngine {
     user_stop_requested: bool,
     pending_steer: Option<String>,
     event_bus: Option<fx_core::EventBus>,
+    execution_visibility: ExecutionVisibility,
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
     /// LLM for compaction-time memory extraction.
@@ -459,6 +600,8 @@ pub struct LoopEngine {
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
     consecutive_tool_turns: u16,
+    /// Consecutive tool rounds that used only non-side-effecting tools.
+    consecutive_observation_only_rounds: u16,
     /// Latest reasoning input messages for graceful budget-exhausted synthesis.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     last_reasoning_messages: Vec<Message>,
@@ -474,9 +617,35 @@ pub struct LoopEngine {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     /// Provider-specific tool output item identifiers keyed by stable tool call id.
     tool_call_provider_ids: HashMap<String, String>,
+    /// Optional scoped tool surface for the next root reasoning pass.
+    pending_tool_scope: Option<ContinuationToolScope>,
+    /// Optional typed turn commitment for the next root reasoning pass.
+    pending_turn_commitment: Option<TurnCommitment>,
+    /// Explicit artifact path requested by the user for this turn, if any.
+    requested_artifact_target: Option<String>,
+    /// Active gate requiring the next root pass to write the requested artifact first.
+    pending_artifact_write_target: Option<String>,
+    /// Last root-owned public progress update emitted during the current cycle.
+    last_turn_state_progress: Option<(ProgressKind, String)>,
+    /// Last ephemeral tool/activity progress update emitted during the current cycle.
+    last_activity_progress: Option<(ProgressKind, String)>,
+    /// Last public progress update actually emitted to the user.
+    last_emitted_public_progress: Option<(ProgressKind, String)>,
     error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    /// Whether this runner may expose and honor the kernel-level decompose tool.
+    decompose_enabled: bool,
+    /// Turn-scoped routing profile for bounded local work vs. general tasks.
+    turn_execution_profile: TurnExecutionProfile,
+    /// Current phase for bounded local code-edit execution.
+    bounded_local_phase: BoundedLocalPhase,
+    /// Whether the bounded local workflow has already consumed its one recovery round.
+    bounded_local_recovery_used: bool,
+    /// Failed mutation targets to revisit during a bounded local recovery round.
+    bounded_local_recovery_focus: Vec<String>,
+    /// Kernel-authored terminal reason for bounded local runs, when they end before completion.
+    bounded_local_terminal_reason: Option<BoundedLocalTerminalReason>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
 }
@@ -492,11 +661,42 @@ impl std::fmt::Debug for LoopEngine {
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("consecutive_tool_turns", &self.consecutive_tool_turns)
+            .field(
+                "consecutive_observation_only_rounds",
+                &self.consecutive_observation_only_rounds,
+            )
             .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
                 "notify_tool_guidance_enabled",
                 &self.notify_tool_guidance_enabled,
+            )
+            .field("pending_tool_scope", &self.pending_tool_scope)
+            .field("pending_turn_commitment", &self.pending_turn_commitment)
+            .field("requested_artifact_target", &self.requested_artifact_target)
+            .field(
+                "pending_artifact_write_target",
+                &self.pending_artifact_write_target,
+            )
+            .field("last_turn_state_progress", &self.last_turn_state_progress)
+            .field("last_activity_progress", &self.last_activity_progress)
+            .field(
+                "last_emitted_public_progress",
+                &self.last_emitted_public_progress,
+            )
+            .field("turn_execution_profile", &self.turn_execution_profile)
+            .field("bounded_local_phase", &self.bounded_local_phase)
+            .field(
+                "bounded_local_recovery_used",
+                &self.bounded_local_recovery_used,
+            )
+            .field(
+                "bounded_local_recovery_focus",
+                &self.bounded_local_recovery_focus,
+            )
+            .field(
+                "bounded_local_terminal_reason",
+                &self.bounded_local_terminal_reason,
             )
             .finish_non_exhaustive()
     }
@@ -716,6 +916,8 @@ pub struct LoopEngineBuilder {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    decompose_enabled: Option<bool>,
+    execution_visibility: ExecutionVisibility,
 }
 
 impl std::fmt::Debug for LoopEngineBuilder {
@@ -852,6 +1054,16 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn allow_decompose(mut self, enabled: bool) -> Self {
+        self.decompose_enabled = Some(enabled);
+        self
+    }
+
+    fn execution_visibility(mut self, visibility: ExecutionVisibility) -> Self {
+        self.execution_visibility = visibility;
+        self
+    }
+
     pub fn build(self) -> Result<LoopEngine, LoopError> {
         let budget = required_builder_field(self.budget, "budget")?;
         let context = required_builder_field(self.context, "context")?;
@@ -883,6 +1095,7 @@ impl LoopEngineBuilder {
             user_stop_requested: false,
             pending_steer: None,
             event_bus: self.event_bus,
+            execution_visibility: self.execution_visibility,
             compaction_config,
             conversation_budget,
             compaction_llm: compaction_llm_for_extraction,
@@ -890,6 +1103,7 @@ impl LoopEngineBuilder {
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             consecutive_tool_turns: 0,
+            consecutive_observation_only_rounds: 0,
             last_reasoning_messages: Vec::new(),
             tool_retry_tracker: ToolRetryTracker::default(),
             notify_called_this_cycle: false,
@@ -897,8 +1111,21 @@ impl LoopEngineBuilder {
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             tool_call_provider_ids: HashMap::new(),
+            pending_tool_scope: None,
+            pending_turn_commitment: None,
+            requested_artifact_target: None,
+            pending_artifact_write_target: None,
+            last_turn_state_progress: None,
+            last_activity_progress: None,
+            last_emitted_public_progress: None,
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
+            decompose_enabled: self.decompose_enabled.unwrap_or(true),
+            turn_execution_profile: TurnExecutionProfile::Standard,
+            bounded_local_phase: BoundedLocalPhase::Discovery,
+            bounded_local_recovery_used: false,
+            bounded_local_recovery_focus: Vec::new(),
+            bounded_local_terminal_reason: None,
             channel_registry: ChannelRegistry::new(),
         })
     }
@@ -1175,6 +1402,9 @@ struct ToolRoundState {
     current_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
     tokens_used: TokenUsage,
+    observation_replan_attempted: bool,
+    used_observation_tools: bool,
+    used_mutation_tools: bool,
 }
 
 impl ToolRoundState {
@@ -1184,6 +1414,9 @@ impl ToolRoundState {
             current_calls: calls.to_vec(),
             continuation_messages: context_messages.to_vec(),
             tokens_used: TokenUsage::default(),
+            observation_replan_attempted: false,
+            used_observation_tools: false,
+            used_mutation_tools: false,
         }
     }
 }
@@ -1193,6 +1426,14 @@ enum ToolRoundOutcome {
     Cancelled,
     /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
     BudgetLow,
+    /// Direct utility profile can answer immediately from tool output.
+    DirectUtilityAnswered(String),
+    /// Bounded-local phase machine reached a typed terminal blocker.
+    BoundedLocalTerminal(BoundedLocalTerminalReason),
+    /// Repeated observation-only rounds were blocked and could not be replanned.
+    ObservationRestricted,
+    /// Repeated observation-only rounds were blocked; request one mutation-only follow-up.
+    ObservationRestrictedReplan,
     Response(CompletionResponse),
 }
 
@@ -1286,6 +1527,22 @@ struct IndexedSubGoalExecution {
     execution: SubGoalExecution,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubGoalCompletionCheck {
+    Valid,
+    MissingRequiredSideEffectTools {
+        message: String,
+        tool_names: Vec<String>,
+    },
+    Incomplete(String),
+}
+
+#[derive(Debug)]
+enum FollowUpRoundResult {
+    Terminal(LoopResult),
+    Continue(ActionContinuation),
+}
+
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
     sub_goals: Vec<DecomposeSubGoalArguments>,
@@ -1306,12 +1563,12 @@ struct DecomposeSubGoalArguments {
 
 impl From<DecomposeSubGoalArguments> for SubGoal {
     fn from(value: DecomposeSubGoalArguments) -> Self {
-        Self {
-            description: value.description,
-            required_tools: value.required_tools,
-            expected_output: value.expected_output,
-            complexity_hint: value.complexity_hint,
-        }
+        SubGoal::with_definition_of_done(
+            value.description,
+            value.required_tools,
+            value.expected_output.as_deref(),
+            value.complexity_hint,
+        )
     }
 }
 
@@ -1322,7 +1579,6 @@ const REASONING_TEMPERATURE: f32 = 0.2;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 1024;
 const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
-const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
 const NOTIFY_TOOL_NAME: &str = "notify";
 const NOTIFICATION_DEFAULT_TITLE: &str = "Fawx";
@@ -1379,9 +1635,39 @@ Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
 const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
+const INCOMPLETE_FALLBACK_RESPONSE: &str = "I couldn't complete that run.";
 const TOOL_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
 const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several rounds without providing a response. Share your progress with the user now. If you have enough information to answer, do so immediately instead of calling more tools.";
+const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool rounds only gathering information. Stop doing more read-only research unless it is absolutely necessary. If you have enough context, switch to implementation-side tools now. Otherwise, respond with what you learned, what remains blocked, and what input you need.";
+const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls were blocked after repeated observation-only rounds. Do not request any more read-only tools. Use the remaining mutation/build/install tools now if you have enough context to proceed. If you still cannot proceed, answer with the current findings and the specific blocker.";
+const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
+const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
+const DIRECT_TOOL_TASK_DIRECTIVE: &str = "\n\nThis turn is a simple direct-tool request. Do not plan. Do not decompose. Use the one relevant utility tool immediately, then answer directly from its result. Do not call unrelated tools or do extra research unless the direct tool fails.";
+const DIRECT_WEATHER_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: weather.\nCall `weather` now with the user's requested location and answer directly from that result. Do not call `web_search` or `run_command` unless the `weather` tool fails or cannot answer the request.";
+const DIRECT_CURRENT_TIME_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: current_time.\nCall `current_time` now and answer directly from that result. Do not call other tools unless `current_time` fails.";
+const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. For code-edit tasks, do not move on to mutation until you have grounded the edit target by reading the most relevant file directly. Gather only the context needed to identify and read that file, then move to the concrete code change.";
+const BOUNDED_LOCAL_MUTATION_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: mutation.\nDo not do more discovery. Use `write_file` or `edit_file` now to make one concrete local code change. If you are blocked, state the precise blocker instead of reopening inspection.";
+const BOUNDED_LOCAL_RECOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: recovery.\nThe first concrete edit attempt failed. Use at most one tiny targeted `read_file` or `search_text` step to gather the exact context needed for the retry, then go straight back to the edit. Do not call `run_command` or reopen broad inspection.";
+const BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: verification.\nDo not reopen discovery. Use at most one focused verification step such as a targeted `run_command` test or a confirming `read_file`, then respond with the result.";
+const BOUNDED_LOCAL_TERMINAL_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: terminal.\nDo not call any tools. Summarize what changed, what you verified, and what remains blocked.";
+const BOUNDED_LOCAL_DISCOVERY_BLOCK_REASON: &str =
+    "bounded local discovery only allows search_text, read_file, or list_directory before editing";
+const BOUNDED_LOCAL_MUTATION_BLOCK_REASON: &str =
+    "bounded local mutation requires a concrete write/edit step before more inspection or verification";
+const BOUNDED_LOCAL_RECOVERY_BLOCK_REASON: &str =
+    "bounded local recovery only allows one tiny targeted read/search pass after a failed edit attempt";
+const BOUNDED_LOCAL_VERIFICATION_BLOCK_REASON: &str =
+    "bounded local verification allows only one focused test/read after a code change";
+const BOUNDED_LOCAL_MUTATION_NOOP_BLOCK_REASON: &str =
+    "bounded local mutation requires a meaningful repo-relevant edit; noop or scratch writes do not count";
+const BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON: &str =
+    "bounded local verification only allows focused confirmation commands; use read_file/search_text for repo inspection instead of shell discovery";
 const TOOL_ERROR_RELAY_PREFIX: &str = "The following tools failed. Report these errors to the user before continuing with additional tool calls:";
+const SUB_GOAL_MUTATION_RETRY_INCOMPLETE_REASON: &str =
+    "sub-goal required a bounded mutation retry but still did not execute the required work";
+const SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON: &str =
+    "sub-goal follow-up still required another reasoning pass after the bounded mutation retry";
+const DECOMPOSITION_RESULTS_PREFIX: &str = "Task decomposition results:";
 
 fn tool_error_relay_directive(failed_tools: &[(&str, &str)]) -> String {
     let details: Vec<String> = failed_tools
@@ -1389,6 +1675,13 @@ fn tool_error_relay_directive(failed_tools: &[(&str, &str)]) -> String {
         .map(|(name, error)| format!("- Tool '{}' failed with: {}", name, error))
         .collect();
     format!("{}\n{}", TOOL_ERROR_RELAY_PREFIX, details.join("\n"))
+}
+
+fn sub_goal_mutation_retry_directive(tool_names: &[String]) -> String {
+    format!(
+        "You already have enough context for this sub-goal. Do not describe next steps or restate the plan. Use one of these required side-effect tools now: {}. If you truly cannot execute, answer briefly with the concrete blocker.",
+        tool_names.join(", ")
+    )
 }
 /// Maximum time to wait for a best-effort summary during emergency compaction.
 const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1402,6 +1695,20 @@ impl LoopEngine {
     /// Attach an fx-core event bus for inter-component progress events.
     pub fn set_event_bus(&mut self, bus: fx_core::EventBus) {
         self.event_bus = Some(bus);
+    }
+
+    fn public_event_bus(&self) -> Option<&fx_core::EventBus> {
+        match self.execution_visibility {
+            ExecutionVisibility::Public => self.event_bus.as_ref(),
+            ExecutionVisibility::Internal => None,
+        }
+    }
+
+    fn public_event_bus_clone(&self) -> Option<fx_core::EventBus> {
+        match self.execution_visibility {
+            ExecutionVisibility::Public => self.event_bus.clone(),
+            ExecutionVisibility::Internal => None,
+        }
     }
 
     /// Attach a cancellation token for cooperative cancellation.
@@ -1656,37 +1963,55 @@ impl LoopEngine {
                 .act(&decision, llm, &processed.context_window, stream)
                 .await?;
 
-            // Budget accounting for non-tool actions.
-            if action.tool_results.is_empty() {
-                let action_cost = self.action_cost_from_result(&action);
-                if let Some(result) =
-                    self.budget_terminal(action_cost, Some(action.response_text.clone()))
-                {
-                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
-                }
-                self.budget.record(&action_cost);
-            } else if let Some(result) =
-                self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
-            {
-                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
-            }
+            let action_partial = action_partial_response(&action);
 
             state.tokens.accumulate(action.tokens_used);
             self.update_tool_turns(&action);
 
-            if let Some(result) = self.check_cancellation(Some(action.response_text.clone())) {
+            if let Some(result) = self.check_cancellation(action_partial.clone()) {
                 return Ok(self.finish_streaming_result(result, stream));
             }
 
             self.emit_action_observations(&action);
 
-            // CONTINUATION CHECK: if tools were used, the model may have more work.
-            // Re-prompt to let it decide. If no tools were used, it's done.
+            // Budget accounting for non-tool actions.
+
             if action.tool_results.is_empty() {
-                // Text-only response, no tools involved. Model is done.
+                let action_cost = self.action_cost_from_result(&action);
+                if let Some(result) = self.budget_terminal(action_cost, action_partial.clone()) {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
+                self.budget.record(&action_cost);
+            } else if let Some(result) =
+                self.budget_terminal(ActionCost::default(), action_partial.clone())
+            {
+                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            }
+
+            let continuation = match action.next_step.clone() {
+                ActionNextStep::Finish(terminal) => {
+                    let terminal = self.apply_decomposition_terminal_fallback(
+                        terminal,
+                        processed.context_window.last(),
+                    );
+                    return Ok(self.finish_streaming_result(
+                        self.loop_result_from_action_terminal(terminal, state.tokens),
+                        stream,
+                    ));
+                }
+                ActionNextStep::Continue(continuation) => continuation,
+            };
+
+            if continuation
+                .context_message
+                .as_deref()
+                .is_some_and(decomposition_results_all_skipped)
+            {
                 return Ok(self.finish_streaming_result(
                     LoopResult::Complete {
-                        response: action.response_text,
+                        response: continuation
+                            .context_message
+                            .expect("checked decomposition context message"),
                         iterations: self.iteration_count,
                         tokens_used: state.tokens,
                         signals: Vec::new(),
@@ -1695,19 +2020,22 @@ impl LoopEngine {
                 ));
             }
 
+            self.apply_pending_turn_commitment(&continuation, &action.tool_results);
+
             // Tools were used. Check max before incrementing so the
             // reported iteration count is accurate (not inflated by 1).
             if self.iteration_count >= self.max_iterations {
-                // Safety cap reached. Return what we have.
-                return Ok(self.finish_streaming_result(
-                    LoopResult::Complete {
-                        response: action.response_text,
-                        iterations: self.iteration_count,
-                        tokens_used: state.tokens,
-                        signals: Vec::new(),
-                    },
-                    stream,
-                ));
+                // Safety cap reached while the action still required follow-up.
+                // Treat this as an incomplete terminal state rather than
+                // inferring completion from any partial text.
+                let result = LoopResult::Incomplete {
+                    partial_response: action_partial.clone(),
+                    reason: "iteration limit reached before a usable final response was produced"
+                        .to_string(),
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                };
+                return Ok(self.finish_streaming_result(result, stream));
             }
             self.iteration_count += 1;
 
@@ -1724,32 +2052,14 @@ impl LoopEngine {
             // every tool call/result message, because act_with_tools may
             // have run multiple inner rounds with different call IDs that
             // don't map 1:1 to the original Decision::UseTools calls.
-            if !action.response_text.is_empty() {
+            if let Some(context_message) = continuation.context_message {
                 processed
                     .context_window
-                    .push(Message::assistant(action.response_text.clone()));
-            } else {
-                // Tools ran but no synthesis text — include tool names so the
-                // model knows which tools executed when deciding next steps.
-                let tool_names: Vec<&str> = action
-                    .tool_results
-                    .iter()
-                    .map(|r| r.tool_name.as_str())
-                    .collect();
-                let placeholder = if tool_names.is_empty() {
-                    "Tool execution completed.".to_string()
-                } else {
-                    format!("Tool execution completed: {}", tool_names.join(", "))
-                };
-                processed
-                    .context_window
-                    .push(Message::assistant(placeholder));
+                    .push(Message::assistant(context_message));
             }
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
-            if let Some(result) =
-                self.budget_terminal(reason_cost, Some(action.response_text.clone()))
-            {
+            if let Some(result) = self.budget_terminal(reason_cost, action_partial.clone()) {
                 return Ok(self.finish_budget_exhausted(result, llm, stream).await);
             }
 
@@ -1810,6 +2120,50 @@ impl LoopEngine {
         self.finalize_result(result)
     }
 
+    fn apply_decomposition_terminal_fallback(
+        &self,
+        terminal: ActionTerminal,
+        last_context_message: Option<&Message>,
+    ) -> ActionTerminal {
+        match terminal {
+            ActionTerminal::Complete { response } if response.trim().is_empty() => {
+                let fallback = last_context_message
+                    .map(message_content_to_text)
+                    .filter(|text| is_decomposition_results_message(text));
+                if let Some(response) = fallback {
+                    ActionTerminal::Complete { response }
+                } else {
+                    ActionTerminal::Complete { response }
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn loop_result_from_action_terminal(
+        &self,
+        terminal: ActionTerminal,
+        tokens_used: TokenUsage,
+    ) -> LoopResult {
+        match terminal {
+            ActionTerminal::Complete { response } => LoopResult::Complete {
+                response,
+                iterations: self.iteration_count,
+                tokens_used,
+                signals: Vec::new(),
+            },
+            ActionTerminal::Incomplete {
+                partial_response,
+                reason,
+            } => LoopResult::Incomplete {
+                partial_response,
+                reason,
+                iterations: self.iteration_count,
+                signals: Vec::new(),
+            },
+        }
+    }
+
     fn maybe_emit_completion_notification(&self, result: &LoopResult, stream: CycleStream<'_>) {
         let LoopResult::Complete { iterations, .. } = result else {
             return;
@@ -1854,7 +2208,9 @@ impl LoopEngine {
     }
 
     fn publish_system_status(&self) {
-        let Some(bus) = &self.event_bus else { return };
+        let Some(bus) = self.public_event_bus() else {
+            return;
+        };
         let status = self.status(current_time_ms());
         let message = format_system_status_message(&status);
         let _ = bus.publish(InternalMessage::SystemStatus { message });
@@ -1915,10 +2271,23 @@ impl LoopEngine {
         self.pending_steer = None;
         self.budget_low_signaled = false;
         self.consecutive_tool_turns = 0;
+        self.consecutive_observation_only_rounds = 0;
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
+        self.pending_tool_scope = None;
+        self.pending_turn_commitment = None;
+        self.requested_artifact_target = None;
+        self.pending_artifact_write_target = None;
+        self.last_turn_state_progress = None;
+        self.last_activity_progress = None;
+        self.last_emitted_public_progress = None;
+        self.turn_execution_profile = TurnExecutionProfile::Standard;
+        self.bounded_local_phase = BoundedLocalPhase::Discovery;
+        self.bounded_local_recovery_used = false;
+        self.bounded_local_recovery_focus.clear();
+        self.bounded_local_terminal_reason = None;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -1943,10 +2312,28 @@ impl LoopEngine {
         round: u32,
         continuation_messages: &mut Vec<Message>,
     ) -> Vec<ToolDefinition> {
-        let tc = &self.budget.config().termination;
+        let termination = self.current_termination_config();
+        let tc = termination.as_ref();
         let nudge_threshold = u32::from(tc.tool_round_nudge_after);
         let strip_threshold =
             nudge_threshold.saturating_add(u32::from(tc.tool_round_strip_after_nudge));
+        let observation_nudge_threshold = u32::from(tc.observation_only_round_nudge_after);
+        let observation_strip_threshold = observation_nudge_threshold
+            .saturating_add(u32::from(tc.observation_only_round_strip_after_nudge));
+        let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
+        let all_tools = self.tool_executor.tool_definitions();
+
+        let profile_owns_surface =
+            !matches!(self.turn_execution_profile, TurnExecutionProfile::Standard);
+
+        if !profile_owns_surface
+            && observation_nudge_threshold > 0
+            && observation_rounds == observation_nudge_threshold
+        {
+            continuation_messages.push(Message::system(
+                OBSERVATION_ONLY_TOOL_ROUND_NUDGE.to_string(),
+            ));
+        }
 
         // Fire nudge exactly once (at the threshold round) to avoid stacking
         // duplicate nudge messages in continuation_messages across rounds.
@@ -1954,10 +2341,312 @@ impl LoopEngine {
             continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
         }
 
+        if !profile_owns_surface
+            && observation_nudge_threshold > 0
+            && observation_rounds >= observation_strip_threshold
+        {
+            return self.side_effect_tool_definitions();
+        }
+
         if nudge_threshold > 0 && round >= strip_threshold {
-            Vec::new()
+            self.progress_limited_tool_definitions()
+        } else {
+            all_tools
+        }
+    }
+
+    fn side_effect_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tool_executor
+            .tool_definitions()
+            .into_iter()
+            .filter(|tool| {
+                self.tool_executor.cacheability(&tool.name) == ToolCacheability::SideEffect
+            })
+            .collect()
+    }
+
+    fn apply_pending_tool_scope(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal | TurnExecutionProfile::DirectUtility(_)
+        ) {
+            return tools;
+        }
+        match self.pending_tool_scope.as_ref() {
+            None | Some(ContinuationToolScope::Full) => tools,
+            Some(ContinuationToolScope::MutationOnly) => tools
+                .into_iter()
+                .filter(|tool| {
+                    self.tool_executor.cacheability(&tool.name) == ToolCacheability::SideEffect
+                })
+                .collect(),
+            Some(ContinuationToolScope::Only(names)) => {
+                let allowed: HashSet<&str> = names.iter().map(String::as_str).collect();
+                tools
+                    .into_iter()
+                    .filter(|tool| allowed.contains(tool.name.as_str()))
+                    .collect()
+            }
+        }
+    }
+
+    fn apply_pending_turn_commitment(
+        &mut self,
+        continuation: &ActionContinuation,
+        tool_results: &[ToolResult],
+    ) {
+        let previous_commitment = self.pending_turn_commitment.clone();
+        let previous_scope = self.pending_tool_scope.clone();
+        let previous_artifact_target = self.pending_artifact_write_target.clone();
+        let artifact_completed = previous_artifact_target
+            .as_deref()
+            .is_some_and(|target| artifact_write_completed(target, tool_results));
+        let next_commitment = continuation
+            .turn_commitment
+            .clone()
+            .or_else(|| previous_commitment.clone());
+        let next_scope = if let Some(scope) = continuation.next_tool_scope.clone() {
+            Some(scope)
+        } else if continuation.turn_commitment.is_some() {
+            commitment_tool_scope(next_commitment.as_ref())
+        } else {
+            commitment_tool_scope(next_commitment.as_ref()).or(previous_scope.clone())
+        };
+        let next_artifact_target = continuation.artifact_write_target.clone().or_else(|| {
+            if artifact_completed {
+                None
+            } else {
+                previous_artifact_target.clone()
+            }
+        });
+
+        self.pending_turn_commitment = next_commitment;
+        self.pending_tool_scope = next_scope;
+        self.pending_artifact_write_target = next_artifact_target;
+
+        if artifact_completed {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "requested artifact write completed; releasing artifact gate",
+                serde_json::json!({
+                    "path": previous_artifact_target,
+                }),
+            );
+        }
+
+        if self.pending_turn_commitment != previous_commitment {
+            if let Some(commitment) = &self.pending_turn_commitment {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "continuation committed next turn state",
+                    turn_commitment_metadata(commitment),
+                );
+            }
+        } else if self.pending_turn_commitment.is_some() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "continuation preserved committed next turn state",
+                serde_json::json!({
+                    "variant": "preserved",
+                }),
+            );
+        }
+
+        if self.pending_tool_scope != previous_scope {
+            if let Some(scope) = &self.pending_tool_scope {
+                let scope_metadata = match scope {
+                    ContinuationToolScope::Full => serde_json::json!({
+                        "mode": "full",
+                    }),
+                    ContinuationToolScope::MutationOnly => serde_json::json!({
+                        "mode": "mutation_only",
+                    }),
+                    ContinuationToolScope::Only(names) => serde_json::json!({
+                        "mode": "named",
+                        "tools": names,
+                    }),
+                };
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "continuation constrained the next tool surface",
+                    serde_json::json!({ "scope": scope_metadata }),
+                );
+            }
+        } else if let Some(scope) = &self.pending_tool_scope {
+            let scope_metadata = match scope {
+                ContinuationToolScope::Full => serde_json::json!({
+                    "mode": "full",
+                }),
+                ContinuationToolScope::MutationOnly => serde_json::json!({
+                    "mode": "mutation_only",
+                }),
+                ContinuationToolScope::Only(names) => serde_json::json!({
+                    "mode": "named",
+                    "tools": names,
+                }),
+            };
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "continuation preserved the next tool surface constraint",
+                serde_json::json!({ "scope": scope_metadata }),
+            );
+        }
+
+        if self.pending_artifact_write_target != previous_artifact_target {
+            if let Some(path) = &self.pending_artifact_write_target {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "continuation gated the next turn on an artifact write",
+                    serde_json::json!({
+                        "path": path,
+                    }),
+                );
+            }
+        } else if self.pending_artifact_write_target.is_some() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "continuation preserved the artifact write gate",
+                serde_json::json!({
+                    "path": self.pending_artifact_write_target,
+                }),
+            );
+        }
+    }
+
+    fn current_reasoning_tool_definitions(&self, should_strip_tools: bool) -> Vec<ToolDefinition> {
+        let base = if should_strip_tools {
+            let limited_tools = self.progress_limited_tool_definitions();
+            tracing::info!(
+                turns = self.consecutive_tool_turns,
+                preserved_mutation_tools = !limited_tools.is_empty(),
+                "limiting tools: agent exceeded nudge + grace threshold"
+            );
+            limited_tools
         } else {
             self.tool_executor.tool_definitions()
+        };
+
+        let scoped = self.apply_pending_tool_scope(base);
+        let phased = self.apply_turn_execution_profile_tool_surface(scoped);
+        self.apply_pending_artifact_gate(phased)
+    }
+
+    fn continuation_tool_scope_for_round(
+        &self,
+        state: &ToolRoundState,
+    ) -> Option<ContinuationToolScope> {
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal | TurnExecutionProfile::DirectUtility(_)
+        ) {
+            return None;
+        }
+        if state.used_observation_tools && !state.used_mutation_tools {
+            let mutation_tools = self.side_effect_tool_definitions();
+            if !mutation_tools.is_empty() {
+                return Some(ContinuationToolScope::MutationOnly);
+            }
+        }
+        None
+    }
+
+    fn pending_turn_commitment_directive(&self) -> Option<String> {
+        self.pending_turn_commitment
+            .as_ref()
+            .map(render_turn_commitment_directive)
+    }
+
+    fn pending_artifact_write_directive(&self) -> Option<String> {
+        self.pending_artifact_write_target.as_ref().map(|path| {
+            format!(
+                "Immediate next action: write the requested artifact to {path} using write_file. Do not do more observation, search, or shell inspection before attempting this write unless the write itself is blocked."
+            )
+        })
+    }
+
+    fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
+        let base = &self.budget.config().termination;
+        match self.turn_execution_profile {
+            TurnExecutionProfile::Standard => Cow::Borrowed(base),
+            TurnExecutionProfile::BoundedLocal => {
+                let mut tightened = base.clone();
+                tightened.nudge_after_tool_turns =
+                    tighten_or_default_threshold(tightened.nudge_after_tool_turns, 3);
+                tightened.strip_tools_after_nudge = tightened.strip_tools_after_nudge.min(1);
+                tightened.tool_round_nudge_after =
+                    tighten_or_default_threshold(tightened.tool_round_nudge_after, 2);
+                tightened.tool_round_strip_after_nudge =
+                    tightened.tool_round_strip_after_nudge.min(1);
+                tightened.observation_only_round_nudge_after = 1;
+                tightened.observation_only_round_strip_after_nudge = 0;
+                Cow::Owned(tightened)
+            }
+            TurnExecutionProfile::DirectUtility(_) => {
+                let mut tightened = base.clone();
+                tightened.nudge_after_tool_turns =
+                    tighten_or_default_threshold(tightened.nudge_after_tool_turns, 1);
+                tightened.strip_tools_after_nudge = 0;
+                tightened.tool_round_nudge_after =
+                    tighten_or_default_threshold(tightened.tool_round_nudge_after, 1);
+                tightened.tool_round_strip_after_nudge = 0;
+                tightened.observation_only_round_nudge_after = 0;
+                tightened.observation_only_round_strip_after_nudge = 0;
+                Cow::Owned(tightened)
+            }
+        }
+    }
+
+    fn apply_pending_artifact_gate(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+        if self.pending_artifact_write_target.is_none() {
+            return tools;
+        }
+        let write_tools: Vec<ToolDefinition> = tools
+            .into_iter()
+            .filter(|tool| tool.name == "write_file")
+            .collect();
+        if write_tools.is_empty() {
+            self.apply_pending_tool_scope(self.tool_executor.tool_definitions())
+        } else {
+            write_tools
+        }
+    }
+
+    fn progress_limited_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mutation_tools = self.side_effect_tool_definitions();
+        if mutation_tools.is_empty() {
+            Vec::new()
+        } else {
+            mutation_tools
+        }
+    }
+
+    fn observation_only_call_restriction_active(&self) -> bool {
+        let termination = self.current_termination_config();
+        let tc = termination.as_ref();
+        let nudge_threshold = u32::from(tc.observation_only_round_nudge_after);
+        let strip_threshold =
+            nudge_threshold.saturating_add(u32::from(tc.observation_only_round_strip_after_nudge));
+        nudge_threshold > 0
+            && u32::from(self.consecutive_observation_only_rounds) >= strip_threshold
+    }
+
+    fn record_tool_round_kind(&mut self, calls: &[ToolCall]) {
+        let observation_only = !calls.is_empty()
+            && calls.iter().all(|call| {
+                self.tool_executor.classify_call(call) == ToolCallClassification::Observation
+            });
+        if observation_only {
+            self.consecutive_observation_only_rounds =
+                self.consecutive_observation_only_rounds.saturating_add(1);
+        } else {
+            self.consecutive_observation_only_rounds = 0;
         }
     }
 
@@ -2002,20 +2691,13 @@ impl LoopEngine {
             return None;
         }
 
-        let mut synthesis_messages = messages.to_vec();
-        synthesis_messages.push(Message::system(
-            BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE.to_string(),
-        ));
-
-        let request = CompletionRequest {
-            model: llm.model_name().to_string(),
-            messages: synthesis_messages,
-            tools: vec![],
-            temperature: Some(0.3),
-            max_tokens: Some(2048),
-            system_prompt: None,
-            thinking: None,
-        };
+        let request = build_forced_synthesis_request_with_notify_guidance(
+            messages,
+            llm.model_name(),
+            self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
+            self.notify_tool_guidance_enabled,
+        );
 
         let remaining_wall_ms = self
             .budget
@@ -2123,7 +2805,7 @@ impl LoopEngine {
             context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
         }
 
-        let nudge_at = self.budget.config().termination.nudge_after_tool_turns;
+        let nudge_at = self.current_termination_config().nudge_after_tool_turns;
         if nudge_at > 0 && self.consecutive_tool_turns >= nudge_at {
             context_window.push(Message::system(TOOL_TURN_NUDGE.to_string()));
         }
@@ -2145,6 +2827,36 @@ impl LoopEngine {
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
         };
+        self.turn_execution_profile =
+            detect_turn_execution_profile(&user_message, &self.tool_executor.tool_definitions());
+        self.bounded_local_phase = BoundedLocalPhase::Discovery;
+        self.bounded_local_recovery_used = false;
+        self.bounded_local_recovery_focus.clear();
+        match self.turn_execution_profile {
+            TurnExecutionProfile::BoundedLocal => {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Trace,
+                    "selected bounded local execution profile",
+                    serde_json::json!({
+                        "profile": "bounded_local",
+                        "phase": bounded_local_phase_label(self.bounded_local_phase),
+                    }),
+                );
+            }
+            TurnExecutionProfile::DirectUtility(_) => {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Trace,
+                    "selected direct utility execution profile",
+                    serde_json::json!({
+                        "profile": "direct_utility",
+                    }),
+                );
+            }
+            TurnExecutionProfile::Standard => {}
+        }
+        self.requested_artifact_target = extract_requested_write_target(&user_message);
         self.last_reasoning_messages = build_reasoning_messages(&processed);
 
         Ok(processed)
@@ -2157,34 +2869,63 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let tc = &self.budget.config().termination;
+        self.maybe_publish_reason_progress(stream);
+        if let TurnExecutionProfile::DirectUtility(profile) = self.turn_execution_profile {
+            let direct_tools = self.current_reasoning_tool_definitions(false);
+            return Ok(direct_utility_completion_response(
+                profile,
+                &perception.user_message,
+                &direct_tools,
+            ));
+        }
+        let termination = self.current_termination_config();
+        let tc = termination.as_ref();
         let should_strip_tools = tc.nudge_after_tool_turns > 0
             && self.consecutive_tool_turns
                 >= tc
                     .nudge_after_tool_turns
                     .saturating_add(tc.strip_tools_after_nudge);
-        let tools = if should_strip_tools {
-            tracing::info!(
-                turns = self.consecutive_tool_turns,
-                "stripping tools: agent exceeded nudge + grace threshold"
-            );
-            vec![]
-        } else {
-            self.tool_executor.tool_definitions()
-        };
-        let request = build_reasoning_request_with_notify_guidance(
+        let tools = self.current_reasoning_tool_definitions(should_strip_tools);
+        let mut request = build_reasoning_request_with_notify_guidance(
             perception,
             llm.model_name(),
             tools,
-            self.memory_context.as_deref(),
-            self.scratchpad_context.as_deref(),
-            self.thinking_config.clone(),
-            self.notify_tool_guidance_enabled,
+            self.reasoning_decompose_enabled(),
+            RequestBuildContext {
+                memory_context: self.memory_context.as_deref(),
+                scratchpad_context: self.scratchpad_context.as_deref(),
+                thinking: self.thinking_config.clone(),
+                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
+            },
         );
+        if let Some(directive) = self.pending_turn_commitment_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTurn commitment:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.pending_artifact_write_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nArtifact gate:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.turn_execution_profile_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
         let response = self
-            .request_completion(llm, request, StreamPhase::Reason, "reason", stream)
+            .request_completion(
+                llm,
+                request,
+                StreamPhase::Reason,
+                "reason",
+                TextStreamVisibility::Public,
+                stream,
+            )
             .await?;
 
         let response = self
@@ -2219,15 +2960,23 @@ impl LoopEngine {
         request: CompletionRequest,
         phase: StreamPhase,
         stage: &str,
+        text_visibility: TextStreamVisibility,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         match stream.callback {
             Some(callback) => {
-                self.request_streaming_completion(llm, request, phase, stage, callback)
-                    .await
+                self.request_streaming_completion(
+                    llm,
+                    request,
+                    phase,
+                    stage,
+                    text_visibility,
+                    callback,
+                )
+                .await
             }
             None => {
-                self.request_buffered_completion(llm, request, phase, stage)
+                self.request_buffered_completion(llm, request, phase, stage, text_visibility)
                     .await
             }
         }
@@ -2239,6 +2988,7 @@ impl LoopEngine {
         request: CompletionRequest,
         phase: StreamPhase,
         stage: &str,
+        text_visibility: TextStreamVisibility,
     ) -> Result<CompletionResponse, LoopError> {
         let mut stream = llm.complete_stream(request).await.map_err(|error| {
             self.emit_background_error(
@@ -2249,7 +2999,8 @@ impl LoopEngine {
             loop_error(stage, &format!("completion failed: {error}"), true)
         })?;
         self.publish_stream_started(phase);
-        self.consume_stream_with_events(&mut stream, phase).await
+        self.consume_stream_with_events(&mut stream, phase, text_visibility)
+            .await
     }
 
     async fn request_streaming_completion(
@@ -2258,37 +3009,70 @@ impl LoopEngine {
         request: CompletionRequest,
         phase: StreamPhase,
         stage: &str,
+        text_visibility: TextStreamVisibility,
         callback: &StreamCallback,
     ) -> Result<CompletionResponse, LoopError> {
         self.publish_stream_started(phase);
-        let bridge = provider_stream_bridge(callback.clone(), self.event_bus.clone(), phase);
-        let result = llm.stream(request, bridge).await.map_err(|error| {
-            callback(StreamEvent::Error {
-                category: ErrorCategory::Provider,
-                message: format!("LLM streaming failed: {error}"),
-                recoverable: false,
-            });
-            loop_error(stage, &format!("completion failed: {error}"), true)
-        });
-        self.publish_stream_finished(phase);
-        result
+        let buffered_deltas =
+            buffer_phase_text_until_response(phase).then(|| Arc::new(Mutex::new(Vec::new())));
+        let bridge = provider_stream_bridge(
+            callback.clone(),
+            self.public_event_bus_clone(),
+            text_visibility,
+            phase,
+            buffered_deltas.clone(),
+        );
+
+        match llm.stream(request, bridge).await {
+            Ok(response) => {
+                if response.tool_calls.is_empty() {
+                    if let Some(buffered_deltas) = &buffered_deltas {
+                        flush_shared_phase_text_deltas(
+                            buffered_deltas,
+                            Some(callback),
+                            self.public_event_bus(),
+                            text_visibility,
+                            phase,
+                        );
+                    }
+                }
+                self.publish_stream_finished(phase);
+                Ok(response)
+            }
+            Err(error) => {
+                if let Some(buffered_deltas) = &buffered_deltas {
+                    flush_shared_phase_text_deltas(
+                        buffered_deltas,
+                        Some(callback),
+                        self.public_event_bus(),
+                        text_visibility,
+                        phase,
+                    );
+                }
+                callback(StreamEvent::Error {
+                    category: ErrorCategory::Provider,
+                    message: format!("LLM streaming failed: {error}"),
+                    recoverable: false,
+                });
+                self.publish_stream_finished(phase);
+                Err(loop_error(
+                    stage,
+                    &format!("completion failed: {error}"),
+                    true,
+                ))
+            }
+        }
     }
 
     fn publish_stream_started(&self, phase: StreamPhase) {
-        if let Some(bus) = &self.event_bus {
+        if let Some(bus) = self.public_event_bus() {
             let _ = bus.publish(InternalMessage::StreamingStarted { phase });
         }
     }
 
     fn publish_stream_finished(&self, phase: StreamPhase) {
-        if let Some(bus) = &self.event_bus {
+        if let Some(bus) = self.public_event_bus() {
             let _ = bus.publish(InternalMessage::StreamingFinished { phase });
-        }
-    }
-
-    fn publish_stream_delta(&self, delta: String, phase: StreamPhase) {
-        if let Some(bus) = &self.event_bus {
-            let _ = bus.publish(InternalMessage::StreamDelta { delta, phase });
         }
     }
 
@@ -2314,10 +3098,22 @@ impl LoopEngine {
         &mut self,
         stream: &mut CompletionStream,
         phase: StreamPhase,
+        text_visibility: TextStreamVisibility,
     ) -> Result<CompletionResponse, LoopError> {
         let mut state = StreamResponseState::default();
+        let mut buffered_deltas = Vec::new();
+        let should_buffer_deltas = buffer_phase_text_until_response(phase);
         while let Some(chunk_result) = stream.next().await {
             if self.stream_cancel_requested() {
+                if should_buffer_deltas {
+                    flush_phase_text_deltas(
+                        &mut buffered_deltas,
+                        None,
+                        self.public_event_bus(),
+                        text_visibility,
+                        phase,
+                    );
+                }
                 self.publish_stream_finished(phase);
                 return Ok(state.into_cancelled_response());
             }
@@ -2325,6 +3121,15 @@ impl LoopEngine {
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
                 Err(error) => {
+                    if should_buffer_deltas {
+                        flush_phase_text_deltas(
+                            &mut buffered_deltas,
+                            None,
+                            self.public_event_bus(),
+                            text_visibility,
+                            phase,
+                        );
+                    }
                     self.publish_stream_finished(phase);
                     self.emit_background_error(
                         ErrorCategory::Provider,
@@ -2340,18 +3145,47 @@ impl LoopEngine {
             };
 
             if let Some(delta) = chunk.delta_content.clone() {
-                self.publish_stream_delta(delta, phase);
+                if should_buffer_deltas {
+                    buffered_deltas.push(delta);
+                } else {
+                    emit_phase_text_delta(
+                        None,
+                        self.public_event_bus(),
+                        text_visibility,
+                        phase,
+                        delta,
+                    );
+                }
             }
             state.apply_chunk(chunk);
 
             if self.stream_cancel_requested() {
+                if should_buffer_deltas {
+                    flush_phase_text_deltas(
+                        &mut buffered_deltas,
+                        None,
+                        self.public_event_bus(),
+                        text_visibility,
+                        phase,
+                    );
+                }
                 self.publish_stream_finished(phase);
                 return Ok(state.into_cancelled_response());
             }
         }
 
+        let response = state.into_response();
+        if should_buffer_deltas && response.tool_calls.is_empty() {
+            flush_phase_text_deltas(
+                &mut buffered_deltas,
+                None,
+                self.public_event_bus(),
+                text_visibility,
+                phase,
+            );
+        }
         self.publish_stream_finished(phase);
-        Ok(state.into_response())
+        Ok(response)
     }
 
     fn emit_continuation_trace(&mut self, step: LoopStep, attempt: u32) {
@@ -2361,6 +3195,14 @@ impl LoopEngine {
             format!("response truncated, continuing ({attempt}/{MAX_CONTINUATION_ATTEMPTS})"),
             serde_json::json!({"attempt": attempt}),
         );
+    }
+
+    fn text_stream_visibility_for_step(step: LoopStep) -> TextStreamVisibility {
+        match step {
+            LoopStep::Reason => TextStreamVisibility::Public,
+            LoopStep::Act => TextStreamVisibility::Hidden,
+            _ => TextStreamVisibility::Public,
+        }
     }
 
     fn ensure_continuation_budget(
@@ -2391,16 +3233,24 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
-        let request = build_truncation_continuation_request_with_notify_guidance(
+        let continuation_tools =
+            self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+        let mut request = build_truncation_continuation_request_with_notify_guidance(
             llm.model_name(),
             continuation_messages,
-            self.tool_executor.tool_definitions(),
+            continuation_tools,
+            self.effective_decompose_enabled(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             step,
             self.thinking_config.clone(),
             self.notify_tool_guidance_enabled,
         );
+        if let Some(directive) = self.turn_execution_profile_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
         let request_messages = request.messages.clone();
         let response = self
             .request_completion(
@@ -2408,6 +3258,7 @@ impl LoopEngine {
                 request,
                 stream_phase_for_step(step),
                 step_stage(step),
+                Self::text_stream_visibility_for_step(step),
                 stream,
             )
             .await?;
@@ -2446,6 +3297,32 @@ impl LoopEngine {
         // Decompose takes priority over all other tool calls in the same response.
         // Other tool calls are intentionally discarded — the sub-goals will re-invoke tools as needed.
         if let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) {
+            if !self.effective_decompose_enabled() {
+                self.emit_signal(
+                    LoopStep::Decide,
+                    SignalKind::Trace,
+                    "dropping decompose tool call because decomposition is disabled",
+                    serde_json::json!({"tool_call_id": decompose_call.id}),
+                );
+                let non_decompose_calls: Vec<ToolCall> = response
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.name != DECOMPOSE_TOOL_NAME)
+                    .cloned()
+                    .collect();
+                if !non_decompose_calls.is_empty() {
+                    self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+                    let decision = Decision::UseTools(non_decompose_calls);
+                    self.emit_decision_signals(&decision);
+                    return Ok(decision);
+                }
+                self.tool_call_provider_ids.clear();
+                let raw = extract_response_text(response);
+                let text = extract_readable_text(&raw);
+                let decision = Decision::Respond(normalize_response_text(&text));
+                self.emit_decision_signals(&decision);
+                return Ok(decision);
+            }
             self.tool_call_provider_ids.clear();
             if response.tool_calls.len() > 1 {
                 self.emit_signal(
@@ -2471,7 +3348,7 @@ impl LoopEngine {
         self.tool_call_provider_ids.clear();
         let raw = extract_response_text(response);
         let text = extract_readable_text(&raw);
-        let decision = Decision::Respond(ensure_non_empty_response(&text));
+        let decision = Decision::Respond(normalize_response_text(&text));
         self.emit_decision_signals(&decision);
         Ok(decision)
     }
@@ -2494,7 +3371,7 @@ impl LoopEngine {
                 let action = self
                     .act_with_tools(decision, calls, llm, context_messages, stream)
                     .await?;
-                self.emit_action_signals(&action.tool_results);
+                self.emit_action_signals(calls, &action.tool_results);
                 Ok(action)
             }
             Decision::Decompose(plan) => {
@@ -2522,26 +3399,30 @@ impl LoopEngine {
         context_messages: &[Message],
     ) -> Option<Result<ActionResult, LoopError>> {
         if self.is_batch_plan(plan) {
-            self.emit_signal(
-                LoopStep::Act,
-                SignalKind::Trace,
-                "decompose_batch_detected",
-                serde_json::json!({
-                    "sub_goal_count": plan.sub_goals.len(),
-                    "common_tool": &plan.sub_goals[0].required_tools[0],
-                }),
-            );
-            return Some(self.route_as_tool_calls(plan, llm, context_messages).await);
+            if let Some(calls) = self.batch_to_tool_calls(plan) {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "decompose_batch_detected",
+                    serde_json::json!({
+                        "sub_goal_count": plan.sub_goals.len(),
+                        "common_tool": &plan.sub_goals[0].required_tools[0],
+                    }),
+                );
+                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+            }
         }
 
         if self.is_trivial_plan(plan) {
-            self.emit_signal(
-                LoopStep::Act,
-                SignalKind::Trace,
-                "decompose_complexity_floor",
-                serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
-            );
-            return Some(self.route_as_tool_calls(plan, llm, context_messages).await);
+            if let Some(calls) = self.batch_to_tool_calls(plan) {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "decompose_complexity_floor",
+                    serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
+                );
+                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+            }
         }
 
         self.evaluate_cost_gate(plan, decision)
@@ -2550,23 +3431,24 @@ impl LoopEngine {
     /// Convert plan sub-goals to tool calls and route through `act_with_tools`.
     async fn route_as_tool_calls(
         &mut self,
-        plan: &DecompositionPlan,
+        calls: Vec<ToolCall>,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        let calls = self.batch_to_tool_calls(plan);
         let decision = Decision::UseTools(calls);
         let calls_ref = match &decision {
             Decision::UseTools(c) => c,
             _ => unreachable!(),
         };
-        self.act_with_tools(
+        // Break the indirect async recursion cycle between act_with_tools ->
+        // follow-up decompose handling -> route_as_tool_calls -> act_with_tools.
+        Box::pin(self.act_with_tools(
             &decision,
             calls_ref,
             llm,
             context_messages,
             CycleStream::disabled(),
-        )
+        ))
         .await
     }
 
@@ -2636,19 +3518,28 @@ impl LoopEngine {
     /// Each sub-goal becomes a single tool call using its first required tool.
     /// Sub-goals with no required tools are filtered out — callers (batch
     /// detection & complexity floor) guarantee at least one tool per sub-goal.
-    fn batch_to_tool_calls(&self, plan: &DecompositionPlan) -> Vec<ToolCall> {
-        plan.sub_goals
+    fn batch_to_tool_calls(&self, plan: &DecompositionPlan) -> Option<Vec<ToolCall>> {
+        let mut calls = Vec::new();
+        for (index, sub_goal) in plan
+            .sub_goals
             .iter()
             .enumerate()
             .filter(|(_, sg)| !sg.required_tools.is_empty())
-            .map(|(index, sub_goal)| ToolCall {
-                id: format!("decompose-gate-{index}"),
-                name: sub_goal.required_tools[0].clone(),
-                arguments: serde_json::json!({
-                    "description": sub_goal.description,
-                }),
-            })
-            .collect()
+        {
+            let call_id = format!("decompose-gate-{index}");
+            let request = crate::act::SubGoalToolRoutingRequest {
+                description: sub_goal.description.clone(),
+                required_tools: sub_goal.required_tools.clone(),
+            };
+            let call = self.tool_executor.route_sub_goal_call(&request, &call_id)?;
+            calls.push(call);
+        }
+
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
     }
 
     async fn execute_decomposition(
@@ -2677,12 +3568,14 @@ impl LoopEngine {
         let results = self
             .execute_allocated_sub_goals(plan, &allocation, llm, context_messages)
             .await;
+        let aggregate = aggregate_sub_goal_results(&results);
 
         Ok(ActionResult {
             decision: decision.clone(),
             tool_results: Vec::new(),
-            response_text: aggregate_sub_goal_results(&results),
+            response_text: aggregate.clone(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(None, Some(aggregate))),
         })
     }
 
@@ -2744,7 +3637,7 @@ impl LoopEngine {
                     .cloned()
                     .unwrap_or_else(|| self.zero_sub_goal_budget());
                 let execution = self
-                    .run_sub_goal(sub_goal, child_config, llm, context_messages)
+                    .run_sub_goal(sub_goal, child_config, llm, context_messages, &results)
                     .await;
                 self.budget.absorb_child_usage(&execution.budget);
                 self.roll_up_sub_goal_signals(&execution.result.signals);
@@ -2752,6 +3645,8 @@ impl LoopEngine {
             };
 
             let should_halt = should_halt_sub_goal_sequence(&result);
+            let exhausted_with_partial =
+                matches!(result.outcome, SubGoalOutcome::BudgetExhausted { .. }) && !should_halt;
             self.emit_sub_goal_completed(index, total, &result);
             results.push(result);
 
@@ -2763,6 +3658,13 @@ impl LoopEngine {
                     serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
                 );
                 break;
+            } else if exhausted_with_partial {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "continuing remaining sub-goals after partial budget exhaustion",
+                    serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
+                );
             }
         }
 
@@ -2824,7 +3726,7 @@ impl LoopEngine {
 
                 Some(async move {
                     let execution = self
-                        .run_sub_goal(&goal, child_config, llm, context_messages)
+                        .run_sub_goal(&goal, child_config, llm, context_messages, &[])
                         .await;
                     IndexedSubGoalExecution { index, execution }
                 })
@@ -2883,7 +3785,7 @@ impl LoopEngine {
 
     fn emit_sub_goal_completed(&self, index: usize, total: usize, result: &SubGoalResult) {
         let success = matches!(result.outcome, SubGoalOutcome::Completed(_));
-        if let Some(bus) = &self.event_bus {
+        if let Some(bus) = self.public_event_bus() {
             let _ = bus.publish(fx_core::message::InternalMessage::SubGoalCompleted {
                 index,
                 total,
@@ -2898,6 +3800,7 @@ impl LoopEngine {
         child_config: BudgetConfig,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        prior_results: &[SubGoalResult],
     ) -> SubGoalExecution {
         let timestamp_ms = current_time_ms();
         let child_budget =
@@ -2909,15 +3812,287 @@ impl LoopEngine {
             Ok(values) => values,
             Err(execution) => return execution,
         };
-        let snapshot = build_sub_goal_snapshot(sub_goal, compacted_context.as_ref(), timestamp_ms);
+        let snapshot = build_sub_goal_snapshot(
+            sub_goal,
+            prior_results,
+            compacted_context.as_ref(),
+            timestamp_ms,
+        );
+        let retry_snapshot = snapshot.clone();
 
         let result = match Box::pin(child.run_cycle(snapshot, llm)).await {
+            Ok(LoopResult::Complete {
+                response, signals, ..
+            }) => match self.check_sub_goal_completion(sub_goal, &signals, &response) {
+                SubGoalCompletionCheck::Valid => SubGoalResult {
+                    goal: sub_goal.clone(),
+                    outcome: SubGoalOutcome::Completed(response),
+                    signals,
+                },
+                SubGoalCompletionCheck::MissingRequiredSideEffectTools { tool_names, .. } => {
+                    self.retry_sub_goal_required_side_effect_completion(
+                        &mut child,
+                        sub_goal,
+                        &retry_snapshot,
+                        llm,
+                        SubGoalRetryContext {
+                            initial_response: response,
+                            initial_signals: signals,
+                            required_tool_names: tool_names,
+                        },
+                    )
+                    .await
+                }
+                SubGoalCompletionCheck::Incomplete(message) => {
+                    incomplete_sub_goal_result_with_signals(sub_goal.clone(), message, signals)
+                }
+            },
             Ok(result) => sub_goal_result_from_loop(sub_goal.clone(), result),
             Err(error) => failed_sub_goal_result(sub_goal.clone(), error.reason),
         };
         SubGoalExecution {
             result,
             budget: child.budget,
+        }
+    }
+
+    async fn retry_sub_goal_required_side_effect_completion(
+        &self,
+        child: &mut LoopEngine,
+        sub_goal: &SubGoal,
+        snapshot: &PerceptionSnapshot,
+        llm: &dyn LlmProvider,
+        retry: SubGoalRetryContext,
+    ) -> SubGoalResult {
+        let continuation_tools =
+            self.required_side_effect_sub_goal_tools(&retry.required_tool_names);
+        if continuation_tools.is_empty() {
+            let message = format!(
+                "sub-goal required side-effect tools ({}) are not available for bounded retry",
+                retry.required_tool_names.join(", ")
+            );
+            return incomplete_sub_goal_result_with_signals(
+                sub_goal.clone(),
+                message,
+                retry.initial_signals,
+            );
+        }
+
+        let continuation_messages = self.sub_goal_retry_messages(
+            child,
+            snapshot,
+            &retry.initial_response,
+            &retry.required_tool_names,
+        );
+        child.last_reasoning_messages = continuation_messages.clone();
+
+        let follow_up = match self
+            .run_bounded_sub_goal_follow_up(
+                child,
+                sub_goal,
+                llm,
+                &continuation_messages,
+                continuation_tools,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => failed_sub_goal_result_with_signals(
+                sub_goal.clone(),
+                error.reason,
+                retry.initial_signals.clone(),
+            ),
+        };
+
+        merge_sub_goal_signals(follow_up, retry.initial_signals)
+    }
+
+    async fn run_bounded_sub_goal_follow_up(
+        &self,
+        child: &mut LoopEngine,
+        sub_goal: &SubGoal,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        continuation_tools: Vec<ToolDefinition>,
+    ) -> Result<SubGoalResult, LoopError> {
+        let first_round = self
+            .execute_bounded_sub_goal_follow_up_round(
+                child,
+                llm,
+                continuation_messages,
+                &continuation_tools,
+            )
+            .await?;
+        let loop_result = match first_round {
+            FollowUpRoundResult::Terminal(loop_result) => loop_result,
+            FollowUpRoundResult::Continue(continuation) => {
+                if let Some(response) = continuation
+                    .partial_response
+                    .as_deref()
+                    .and_then(meaningful_response_text)
+                {
+                    let signals = child.signals.signals().to_vec();
+                    let result = match self.check_sub_goal_completion(sub_goal, &signals, &response)
+                    {
+                        SubGoalCompletionCheck::Valid => SubGoalResult {
+                            goal: sub_goal.clone(),
+                            outcome: SubGoalOutcome::Completed(response),
+                            signals,
+                        },
+                        SubGoalCompletionCheck::MissingRequiredSideEffectTools {
+                            message, ..
+                        }
+                        | SubGoalCompletionCheck::Incomplete(message) => {
+                            incomplete_sub_goal_result_with_signals(
+                                sub_goal.clone(),
+                                meaningful_response_text(&response).unwrap_or(message),
+                                signals,
+                            )
+                        }
+                    };
+                    return Ok(result);
+                }
+
+                let mut follow_up_messages = continuation_messages.to_vec();
+                if let Some(context_message) = continuation.context_message {
+                    follow_up_messages.push(Message::assistant(context_message));
+                }
+                match self
+                    .execute_bounded_sub_goal_follow_up_round(
+                        child,
+                        llm,
+                        &follow_up_messages,
+                        &continuation_tools,
+                    )
+                    .await?
+                {
+                    FollowUpRoundResult::Terminal(loop_result) => loop_result,
+                    FollowUpRoundResult::Continue(continuation) => LoopResult::Incomplete {
+                        partial_response: continuation.partial_response,
+                        reason: SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON.to_string(),
+                        iterations: child.iteration_count,
+                        signals: Vec::new(),
+                    },
+                }
+            }
+        };
+        let loop_result = child.finalize_result(loop_result);
+        Ok(self.sub_goal_result_from_follow_up(sub_goal, loop_result))
+    }
+
+    async fn execute_bounded_sub_goal_follow_up_round(
+        &self,
+        child: &mut LoopEngine,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        continuation_tools: &[ToolDefinition],
+    ) -> Result<FollowUpRoundResult, LoopError> {
+        let mut tokens_used = TokenUsage::default();
+        let response = child
+            .request_tool_continuation(
+                llm,
+                continuation_messages,
+                continuation_tools.to_vec(),
+                &mut tokens_used,
+                CycleStream::disabled(),
+            )
+            .await?;
+        child.record_continuation_cost(&response, continuation_messages);
+
+        let response = child
+            .continue_truncated_response(
+                response,
+                continuation_messages,
+                llm,
+                LoopStep::Act,
+                CycleStream::disabled(),
+            )
+            .await?;
+
+        let decision = child.decide(&response).await?;
+        let action = Box::pin(child.act(
+            &decision,
+            llm,
+            continuation_messages,
+            CycleStream::disabled(),
+        ))
+        .await?;
+        child.emit_action_observations(&action);
+
+        if action.tool_results.is_empty() {
+            child.budget.record(&child.action_cost_from_result(&action));
+        }
+
+        let action_partial = action_partial_response(&action);
+        Ok(match action.next_step {
+            ActionNextStep::Finish(terminal) => FollowUpRoundResult::Terminal(
+                child.loop_result_from_action_terminal(terminal, action.tokens_used),
+            ),
+            ActionNextStep::Continue(continuation) => {
+                FollowUpRoundResult::Continue(ActionContinuation {
+                    partial_response: continuation.partial_response.or(action_partial),
+                    context_message: continuation.context_message,
+                    next_tool_scope: continuation.next_tool_scope,
+                    turn_commitment: continuation.turn_commitment,
+                    artifact_write_target: continuation.artifact_write_target,
+                })
+            }
+        })
+    }
+
+    fn sub_goal_result_from_follow_up(
+        &self,
+        sub_goal: &SubGoal,
+        result: LoopResult,
+    ) -> SubGoalResult {
+        match result {
+            LoopResult::Complete {
+                response, signals, ..
+            } => match self.check_sub_goal_completion(sub_goal, &signals, &response) {
+                SubGoalCompletionCheck::Valid => SubGoalResult {
+                    goal: sub_goal.clone(),
+                    outcome: SubGoalOutcome::Completed(response),
+                    signals,
+                },
+                SubGoalCompletionCheck::MissingRequiredSideEffectTools { message, .. }
+                | SubGoalCompletionCheck::Incomplete(message) => {
+                    let partial_response = meaningful_response_text(&response).or(Some(message));
+                    incomplete_sub_goal_result_with_signals(
+                        sub_goal.clone(),
+                        partial_response.unwrap_or_else(|| {
+                            SUB_GOAL_MUTATION_RETRY_INCOMPLETE_REASON.to_string()
+                        }),
+                        signals,
+                    )
+                }
+            },
+            LoopResult::Incomplete {
+                partial_response,
+                reason,
+                signals,
+                ..
+            } => incomplete_sub_goal_result_with_signals(
+                sub_goal.clone(),
+                partial_response.unwrap_or(reason),
+                signals,
+            ),
+            LoopResult::BudgetExhausted {
+                partial_response,
+                signals,
+                ..
+            } => SubGoalResult {
+                goal: sub_goal.clone(),
+                outcome: SubGoalOutcome::BudgetExhausted { partial_response },
+                signals,
+            },
+            LoopResult::Error {
+                message, signals, ..
+            } => failed_sub_goal_result_with_signals(sub_goal.clone(), message, signals),
+            LoopResult::UserStopped { signals, .. } => incomplete_sub_goal_result_with_signals(
+                sub_goal.clone(),
+                "sub-goal stopped before completion".to_string(),
+                signals,
+            ),
         }
     }
 
@@ -2944,19 +4119,30 @@ impl LoopEngine {
             })?;
 
         let child = self
-            .build_child_engine(child_budget.clone())
+            .build_child_engine(sub_goal, child_budget.clone())
             .map_err(|error| failed_sub_goal_execution(sub_goal, error.reason, child_budget))?;
         Ok((child, compacted_context))
     }
 
-    fn build_child_engine(&self, budget: BudgetTracker) -> Result<LoopEngine, LoopError> {
+    fn build_child_engine(
+        &self,
+        sub_goal: &SubGoal,
+        budget: BudgetTracker,
+    ) -> Result<LoopEngine, LoopError> {
+        let child_executor = if sub_goal.required_tools.is_empty() {
+            Arc::clone(&self.tool_executor)
+        } else {
+            scope_tool_executor(Arc::clone(&self.tool_executor), &sub_goal.required_tools)
+        };
         let mut builder = LoopEngine::builder()
             .budget(budget)
             .context(self.context.clone())
             .max_iterations(child_max_iterations(self.max_iterations))
-            .tool_executor(Arc::clone(&self.tool_executor))
+            .tool_executor(child_executor)
             .synthesis_instruction(self.synthesis_instruction.clone())
-            .compaction_config(self.compaction_config.clone());
+            .compaction_config(self.compaction_config.clone())
+            .allow_decompose(sub_goal.required_tools.is_empty())
+            .execution_visibility(ExecutionVisibility::Internal);
 
         if let Some(memory_context) = &self.memory_context {
             builder = builder.memory_context(memory_context.clone());
@@ -2981,6 +4167,107 @@ impl LoopEngine {
         let mut child = builder.build()?;
         child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
         Ok(child)
+    }
+
+    fn required_side_effect_sub_goal_tools(
+        &self,
+        required_tool_names: &[String],
+    ) -> Vec<ToolDefinition> {
+        let required_names: HashSet<&str> =
+            required_tool_names.iter().map(String::as_str).collect();
+        self.tool_executor
+            .tool_definitions()
+            .into_iter()
+            .filter(|tool| {
+                required_names.contains(tool.name.as_str())
+                    && self.tool_executor.cacheability(&tool.name) == ToolCacheability::SideEffect
+            })
+            .collect()
+    }
+
+    fn sub_goal_retry_messages(
+        &self,
+        child: &LoopEngine,
+        snapshot: &PerceptionSnapshot,
+        initial_response: &str,
+        required_tool_names: &[String],
+    ) -> Vec<Message> {
+        let mut messages = if child.last_reasoning_messages.is_empty() {
+            let mut rebuilt = snapshot.conversation_history.clone();
+            let user_message = extract_user_message(snapshot).unwrap_or_else(|_| {
+                snapshot
+                    .user_input
+                    .as_ref()
+                    .map(|input| input.text.clone())
+                    .unwrap_or_else(|| sub_goal_fallback_user_message(snapshot))
+            });
+            rebuilt.push(build_user_message(snapshot, &user_message));
+            rebuilt
+        } else {
+            child.last_reasoning_messages.clone()
+        };
+        if let Some(response) = meaningful_response_text(initial_response) {
+            messages.push(Message::assistant(response));
+        }
+        messages.push(Message::system(sub_goal_mutation_retry_directive(
+            required_tool_names,
+        )));
+        messages
+    }
+
+    fn check_sub_goal_completion(
+        &self,
+        sub_goal: &SubGoal,
+        signals: &[Signal],
+        response: &str,
+    ) -> SubGoalCompletionCheck {
+        match sub_goal.classify(response) {
+            SubGoalCompletionClassification::Completed => {}
+            SubGoalCompletionClassification::Incomplete(message) => {
+                return SubGoalCompletionCheck::Incomplete(message);
+            }
+        }
+
+        let used_tools = successful_tool_names(signals);
+        let used_mutation_tools = successful_mutation_tool_names(signals);
+        let required_side_effect_tools: Vec<String> = sub_goal
+            .required_tools
+            .iter()
+            .filter(|tool_name| {
+                self.tool_executor.cacheability(tool_name.as_str()) == ToolCacheability::SideEffect
+            })
+            .cloned()
+            .collect();
+
+        if !required_side_effect_tools.is_empty()
+            && required_side_effect_tools
+                .iter()
+                .all(|tool_name| !used_mutation_tools.contains(tool_name.as_str()))
+        {
+            return SubGoalCompletionCheck::MissingRequiredSideEffectTools {
+                message: format!(
+                    "sub-goal ended without using any required side-effect tools ({}) despite returning a response: {}",
+                    required_side_effect_tools.join(", "),
+                    truncate_prompt_text(response, 180)
+                ),
+                tool_names: required_side_effect_tools,
+            };
+        }
+
+        if !sub_goal.required_tools.is_empty()
+            && sub_goal
+                .required_tools
+                .iter()
+                .all(|tool_name| !used_tools.contains(tool_name.as_str()))
+        {
+            return SubGoalCompletionCheck::Incomplete(format!(
+                "sub-goal ended without using any required tools ({}) despite returning a response: {}",
+                sub_goal.required_tools.join(", "),
+                truncate_prompt_text(response, 180)
+            ));
+        }
+
+        SubGoalCompletionCheck::Valid
     }
 
     fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -3046,7 +4333,7 @@ impl LoopEngine {
                 "total": total,
             }),
         );
-        if let Some(bus) = &self.event_bus {
+        if let Some(bus) = self.public_event_bus() {
             let _ = bus.publish(fx_core::message::InternalMessage::SubGoalStarted {
                 index,
                 total,
@@ -3181,8 +4468,20 @@ impl LoopEngine {
         }
     }
 
-    fn emit_action_signals(&mut self, results: &[ToolResult]) {
+    fn emit_action_signals(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
         for result in results {
+            let classification = calls
+                .iter()
+                .find(|call| call.id == result.tool_call_id)
+                .map(|call| self.tool_executor.classify_call(call))
+                .unwrap_or_else(
+                    || match self.tool_executor.cacheability(&result.tool_name) {
+                        ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+                        ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                            ToolCallClassification::Observation
+                        }
+                    },
+                );
             let kind = if result.success {
                 SignalKind::Success
             } else {
@@ -3199,7 +4498,11 @@ impl LoopEngine {
                 LoopStep::Act,
                 kind,
                 format!("tool {}", result.tool_name),
-                serde_json::json!({"success": result.success, "output": truncated_output}),
+                serde_json::json!({
+                    "success": result.success,
+                    "output": truncated_output,
+                    "classification": tool_call_classification_label(classification),
+                }),
             );
         }
     }
@@ -3213,7 +4516,7 @@ impl LoopEngine {
     }
 
     fn publish_tool_use(&self, call: &ToolCall) {
-        let Some(bus) = &self.event_bus else {
+        let Some(bus) = self.public_event_bus() else {
             return;
         };
         let _ = bus.publish(InternalMessage::ToolUse {
@@ -3243,7 +4546,7 @@ impl LoopEngine {
         if result.success && result.tool_name == NOTIFY_TOOL_NAME {
             self.notify_called_this_cycle = true;
         }
-        let Some(bus) = &self.event_bus else {
+        let Some(bus) = self.public_event_bus() else {
             return;
         };
         let _ = bus.publish(InternalMessage::ToolResult {
@@ -3257,8 +4560,7 @@ impl LoopEngine {
     /// Emit observability signals summarizing the action result.
     fn emit_action_observations(&mut self, action: &ActionResult) {
         let has_tool_failure = action.tool_results.iter().any(|r| !r.success);
-        let has_response = !action.response_text.trim().is_empty()
-            && action.response_text != SAFE_FALLBACK_RESPONSE;
+        let has_response = !action.response_text.trim().is_empty();
         let has_tools = !action.tool_results.is_empty();
 
         if has_tool_failure && has_response {
@@ -3855,12 +5157,66 @@ impl LoopEngine {
     }
 
     fn text_action_result(&self, decision: &Decision, text: &str) -> ActionResult {
+        let response_text = normalize_response_text(text);
         ActionResult {
             decision: decision.clone(),
             tool_results: Vec::new(),
-            response_text: ensure_non_empty_response(text),
+            response_text: response_text.clone(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: response_text,
+            }),
         }
+    }
+
+    fn incomplete_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        partial_response: Option<String>,
+        reason: &str,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: String::new(),
+            tokens_used,
+            next_step: ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response,
+                reason: reason.to_string(),
+            }),
+        }
+    }
+
+    fn bounded_local_terminal_action_result(
+        &mut self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        tokens_used: TokenUsage,
+        reason: BoundedLocalTerminalReason,
+    ) -> ActionResult {
+        let partial_response = Some(bounded_local_terminal_partial_response(
+            reason,
+            &tool_results,
+        ));
+        let reason_text = bounded_local_terminal_reason_text(reason);
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            reason_text,
+            serde_json::json!({
+                "profile": "bounded_local",
+                "terminal_reason": bounded_local_terminal_reason_label(reason),
+            }),
+        );
+        self.incomplete_action_result(
+            decision,
+            tool_results,
+            partial_response,
+            reason_text,
+            tokens_used,
+        )
     }
 
     fn cancellation_token_triggered(&self) -> bool {
@@ -3889,11 +5245,13 @@ impl LoopEngine {
         tool_results: Vec<ToolResult>,
         tokens_used: TokenUsage,
     ) -> ActionResult {
+        let partial_response = summarize_tool_progress(&tool_results);
         ActionResult {
             decision: decision.clone(),
             tool_results,
-            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            response_text: String::new(),
             tokens_used,
+            next_step: ActionNextStep::Continue(ActionContinuation::new(partial_response, None)),
         }
     }
 
@@ -3903,6 +5261,55 @@ impl LoopEngine {
         state: ToolRoundState,
     ) -> ActionResult {
         self.cancelled_tool_action(decision, state.all_tool_results, state.tokens_used)
+    }
+
+    async fn handle_follow_up_decompose(
+        &mut self,
+        response: &CompletionResponse,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+        prior_tool_results: Vec<ToolResult>,
+        prior_tokens_used: TokenUsage,
+    ) -> Result<ActionResult, LoopError> {
+        let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) else {
+            return Err(loop_error(
+                "act",
+                "follow-up decompose handler called without a decompose tool call",
+                false,
+            ));
+        };
+
+        self.tool_call_provider_ids.clear();
+        if response.tool_calls.len() > 1 {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "decompose takes precedence; dropping other tool calls",
+                serde_json::json!({"dropped_count": response.tool_calls.len() - 1}),
+            );
+        }
+
+        let plan = parse_decomposition_plan(&decompose_call.arguments)?;
+        let decision = Decision::Decompose(plan.clone());
+        self.emit_decision_signals(&decision);
+
+        let mut action = if let Some(gate_result) = self
+            .evaluate_decompose_gates(&plan, &decision, llm, context_messages)
+            .await
+        {
+            gate_result?
+        } else {
+            self.execute_decomposition(&decision, &plan, llm, context_messages)
+                .await?
+        };
+
+        if !prior_tool_results.is_empty() {
+            let mut merged_tool_results = prior_tool_results;
+            merged_tool_results.extend(action.tool_results);
+            action.tool_results = merged_tool_results;
+        }
+        action.tokens_used.accumulate(prior_tokens_used);
+        Ok(action)
     }
 
     // Evaluated introducing a ToolActionContext wrapper here, but kept explicit
@@ -3949,9 +5356,120 @@ impl LoopEngine {
                 ToolRoundOutcome::Cancelled => {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
                 }
+                ToolRoundOutcome::DirectUtilityAnswered(response) => {
+                    return Ok(ActionResult {
+                        decision: decision.clone(),
+                        tool_results: state.all_tool_results,
+                        response_text: response.clone(),
+                        tokens_used: state.tokens_used,
+                        next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+                    });
+                }
+                ToolRoundOutcome::BoundedLocalTerminal(reason) => {
+                    return Ok(self.bounded_local_terminal_action_result(
+                        decision,
+                        state.all_tool_results,
+                        state.tokens_used,
+                        reason,
+                    ));
+                }
                 ToolRoundOutcome::BudgetLow => break,
+                ToolRoundOutcome::ObservationRestrictedReplan => {
+                    let mutation_tools = self.side_effect_tool_definitions();
+                    if mutation_tools.is_empty() {
+                        let partial = summarize_tool_progress(&state.all_tool_results);
+                        return Ok(self.incomplete_action_result(
+                            decision,
+                            state.all_tool_results,
+                            partial,
+                            OBSERVATION_ONLY_CALL_BLOCK_REASON,
+                            state.tokens_used,
+                        ));
+                    }
+
+                    stream.phase(Phase::Synthesize);
+                    let response = self
+                        .request_tool_continuation(
+                            llm,
+                            &state.continuation_messages,
+                            mutation_tools,
+                            &mut state.tokens_used,
+                            stream,
+                        )
+                        .await?;
+                    self.record_continuation_cost(&response, &state.continuation_messages);
+
+                    if !response.tool_calls.is_empty() {
+                        if find_decompose_tool_call(&response.tool_calls).is_some() {
+                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            return self
+                                .handle_follow_up_decompose(
+                                    &response,
+                                    llm,
+                                    &state.continuation_messages,
+                                    prior_tool_results,
+                                    state.tokens_used,
+                                )
+                                .await;
+                        }
+                        self.tool_call_provider_ids =
+                            extract_tool_use_provider_ids(&response.content);
+                        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
+                        self.append_deferred_tool_results(
+                            &mut state,
+                            &round_deferred,
+                            response.tool_calls.len(),
+                        );
+                        state.current_calls = capped;
+                        continue;
+                    }
+
+                    let response = self
+                        .continue_truncated_response(
+                            response,
+                            &state.continuation_messages,
+                            llm,
+                            LoopStep::Act,
+                            stream,
+                        )
+                        .await?;
+                    let text = extract_response_text(&response);
+                    let readable = extract_readable_text(&text);
+                    let partial = Some(normalize_response_text(&readable))
+                        .filter(|text| !text.is_empty())
+                        .or_else(|| summarize_tool_progress(&state.all_tool_results));
+                    return Ok(self.incomplete_action_result(
+                        decision,
+                        state.all_tool_results,
+                        partial,
+                        OBSERVATION_ONLY_CALL_BLOCK_REASON,
+                        state.tokens_used,
+                    ));
+                }
+                ToolRoundOutcome::ObservationRestricted => {
+                    let partial = summarize_tool_progress(&state.all_tool_results);
+                    return Ok(self.incomplete_action_result(
+                        decision,
+                        state.all_tool_results,
+                        partial,
+                        OBSERVATION_ONLY_CALL_BLOCK_REASON,
+                        state.tokens_used,
+                    ));
+                }
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
+                        if find_decompose_tool_call(&response.tool_calls).is_some() {
+                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            return self
+                                .handle_follow_up_decompose(
+                                    &response,
+                                    llm,
+                                    &state.continuation_messages,
+                                    prior_tool_results,
+                                    state.tokens_used,
+                                )
+                                .await;
+                        }
                         self.tool_call_provider_ids =
                             extract_tool_use_provider_ids(&response.content);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
@@ -3974,22 +5492,26 @@ impl LoopEngine {
                         )
                         .await?;
 
+                    let next_tool_scope = self.continuation_tool_scope_for_round(&state);
                     return Ok(self.finalize_tool_response(
                         decision,
                         state.all_tool_results,
                         &response,
                         state.tokens_used,
+                        next_tool_scope,
                     ));
                 }
             }
         }
 
+        let next_tool_scope = self.continuation_tool_scope_for_round(&state);
         self.synthesize_tool_fallback(
             decision,
             state.all_tool_results,
             state.tokens_used,
             llm,
             stream,
+            next_tool_scope,
         )
         .await
     }
@@ -4103,6 +5625,35 @@ impl LoopEngine {
         );
     }
 
+    fn record_successful_tool_classifications(
+        &self,
+        state: &mut ToolRoundState,
+        calls: &[ToolCall],
+        results: &[ToolResult],
+    ) {
+        for result in results.iter().filter(|result| result.success) {
+            let classification = calls
+                .iter()
+                .find(|call| call.id == result.tool_call_id)
+                .map(|call| self.tool_executor.classify_call(call))
+                .unwrap_or_else(
+                    || match self.tool_executor.cacheability(&result.tool_name) {
+                        ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+                        ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                            ToolCallClassification::Observation
+                        }
+                    },
+                );
+            match classification {
+                ToolCallClassification::Observation => state.used_observation_tools = true,
+                ToolCallClassification::Mutation => state.used_mutation_tools = true,
+            }
+            if state.used_observation_tools && state.used_mutation_tools {
+                break;
+            }
+        }
+    }
+
     async fn execute_tool_round(
         &mut self,
         round: u32,
@@ -4111,21 +5662,67 @@ impl LoopEngine {
         continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
+        if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+            && self.observation_only_call_restriction_active()
+            && calls_are_all_classification(
+                &state.current_calls,
+                self.tool_executor.as_ref(),
+                ToolCallClassification::Observation,
+            )
+        {
+            let blocked = build_uniform_blocked_calls(
+                &state.current_calls,
+                OBSERVATION_ONLY_CALL_BLOCK_REASON,
+            );
+            self.emit_blocked_tool_errors(&blocked, stream);
+            let blocked_results = build_blocked_tool_results(&blocked);
+            append_tool_round_messages(
+                &mut state.continuation_messages,
+                &state.current_calls,
+                &self.tool_call_provider_ids,
+                &blocked_results,
+            )?;
+            state.all_tool_results.extend(blocked_results);
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Blocked,
+                "observation-only rounds forced to wrap up",
+                serde_json::json!({
+                    "round": round,
+                    "blocked_calls": state.current_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                }),
+            );
+            if !state.observation_replan_attempted {
+                state.observation_replan_attempted = true;
+                state
+                    .continuation_messages
+                    .push(Message::system(OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE));
+                self.compact_tool_continuation(round, &mut state.continuation_messages)
+                    .await?;
+                self.last_reasoning_messages = state.continuation_messages.clone();
+                return Ok(ToolRoundOutcome::ObservationRestrictedReplan);
+            }
+            return Ok(ToolRoundOutcome::ObservationRestricted);
+        }
+
         let round_started = current_time_ms();
-        self.publish_tool_calls(&state.current_calls, stream);
+        let executed_calls = state.current_calls.clone();
+        self.maybe_publish_tool_round_progress(round as usize, &executed_calls, stream);
+        self.publish_tool_calls(&executed_calls, stream);
         let results = self
-            .execute_tool_calls_with_stream(&state.current_calls, stream)
+            .execute_tool_calls_with_stream(&executed_calls, stream)
             .await?;
         self.publish_tool_results(&results, stream);
         let has_tool_errors = self.emit_tool_errors(&results, stream);
         self.record_tool_execution_cost(results.len());
+        self.record_successful_tool_classifications(state, &executed_calls, &results);
 
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
         self.budget.record_result_bytes(round_result_bytes);
 
         append_tool_round_messages(
             &mut state.continuation_messages,
-            &state.current_calls,
+            &executed_calls,
             &self.tool_call_provider_ids,
             &results,
         )?;
@@ -4139,11 +5736,27 @@ impl LoopEngine {
                 .continuation_messages
                 .push(Message::system(tool_error_relay_directive(&failed)));
         }
+        let round_results = results.clone();
         state.all_tool_results.extend(results);
+        self.record_tool_round_kind(&executed_calls);
+        self.advance_bounded_local_phase_after_tool_round(&executed_calls, &round_results);
+        if let Some(reason) = self.bounded_local_terminal_reason.take() {
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            self.expire_activity_progress(stream);
+            return Ok(ToolRoundOutcome::BoundedLocalTerminal(reason));
+        }
+        if let TurnExecutionProfile::DirectUtility(profile) = self.turn_execution_profile {
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            self.expire_activity_progress(stream);
+            return Ok(ToolRoundOutcome::DirectUtilityAnswered(
+                direct_utility_terminal_response(profile, &state.all_tool_results),
+            ));
+        }
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
         self.last_reasoning_messages = state.continuation_messages.clone();
+        self.expire_activity_progress(stream);
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
@@ -4167,7 +5780,7 @@ impl LoopEngine {
         self.record_continuation_cost(&response, &state.continuation_messages);
         self.emit_tool_round_trace_and_perf(
             round,
-            state.current_calls.len(),
+            executed_calls.len(),
             &response,
             current_time_ms().saturating_sub(round_started),
         );
@@ -4194,8 +5807,52 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<Vec<ToolResult>, LoopError> {
         let retry_policy = self.budget.config().retry_policy();
-        let (allowed, blocked) =
+        let (retry_allowed, mut blocked) =
             partition_by_retry_policy(calls, &self.tool_retry_tracker, &retry_policy);
+        let phase_allowed = if let (Some(allowed_names), Some(reason)) = (
+            self.bounded_local_phase_tool_names(),
+            self.bounded_local_phase_block_reason(),
+        ) {
+            let (phase_allowed, phase_blocked) =
+                partition_by_allowed_tool_names(&retry_allowed, allowed_names, reason);
+            blocked.extend(phase_blocked);
+            phase_allowed
+        } else {
+            retry_allowed
+        };
+        let artifact_target = self
+            .pending_artifact_write_target
+            .as_deref()
+            .or(self.requested_artifact_target.as_deref());
+        let semantically_allowed = if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::BoundedLocal
+        ) {
+            let (semantically_allowed, semantic_blocked) =
+                partition_by_bounded_local_phase_semantics(
+                    &phase_allowed,
+                    self.bounded_local_phase,
+                    artifact_target,
+                );
+            blocked.extend(semantic_blocked);
+            semantically_allowed
+        } else {
+            phase_allowed
+        };
+        let allowed = if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+            && self.observation_only_call_restriction_active()
+        {
+            let (mutation_allowed, observation_blocked) = partition_by_call_classification(
+                &semantically_allowed,
+                self.tool_executor.as_ref(),
+                ToolCallClassification::Mutation,
+                OBSERVATION_ONLY_CALL_BLOCK_REASON,
+            );
+            blocked.extend(observation_blocked);
+            mutation_allowed
+        } else {
+            semantically_allowed
+        };
 
         self.emit_blocked_tool_errors(&blocked, stream);
         let mut results = self.execute_allowed_tool_calls(&allowed, stream).await?;
@@ -4291,18 +5948,34 @@ impl LoopEngine {
         tokens_used: &mut TokenUsage,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        let request = build_continuation_request_with_notify_guidance(
+        let continuation_tools = self.apply_turn_execution_profile_tool_surface(continuation_tools);
+        let mut request = build_continuation_request_with_notify_guidance(
             context_messages,
             llm.model_name(),
             continuation_tools,
-            self.memory_context.as_deref(),
-            self.scratchpad_context.as_deref(),
-            self.thinking_config.clone(),
-            self.notify_tool_guidance_enabled,
+            self.effective_decompose_enabled(),
+            RequestBuildContext {
+                memory_context: self.memory_context.as_deref(),
+                scratchpad_context: self.scratchpad_context.as_deref(),
+                thinking: self.thinking_config.clone(),
+                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
+            },
         );
+        if let Some(directive) = self.turn_execution_profile_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
 
         let response = self
-            .request_completion(llm, request, StreamPhase::Synthesize, "act", stream)
+            .request_completion(
+                llm,
+                request,
+                StreamPhase::Synthesize,
+                "act",
+                TextStreamVisibility::Hidden,
+                stream,
+            )
             .await?;
 
         tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
@@ -4315,25 +5988,39 @@ impl LoopEngine {
         tool_results: Vec<ToolResult>,
         response: &CompletionResponse,
         tokens_used: TokenUsage,
+        next_tool_scope: Option<ContinuationToolScope>,
     ) -> ActionResult {
         let text = extract_response_text(response);
         let readable = extract_readable_text(&text);
-        let (response_text, used_fallback) = ensure_non_empty_response_with_flag(&readable);
-        if used_fallback {
+        let response_text = normalize_response_text(&readable);
+        if response_text.is_empty() {
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Trace,
-                "tool continuation returned empty text; using safe fallback",
+                "tool continuation returned empty text",
                 serde_json::json!({
                     "tool_count": tool_results.len(),
                 }),
             );
         }
-        ActionResult {
-            decision: decision.clone(),
-            tool_results,
-            response_text,
-            tokens_used,
+        let final_response = meaningful_response_text(&response_text);
+        let tool_summary = summarize_tool_progress(&tool_results);
+        match final_response {
+            Some(response) => self.tool_continuation_action_result(
+                decision,
+                tool_results,
+                response_text,
+                response,
+                tokens_used,
+                next_tool_scope,
+            ),
+            None => self.incomplete_action_result(
+                decision,
+                tool_results,
+                tool_summary,
+                "tool continuation did not produce a usable final response",
+                tokens_used,
+            ),
         }
     }
 
@@ -4344,26 +6031,84 @@ impl LoopEngine {
         mut tokens_used: TokenUsage,
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
+        next_tool_scope: Option<ContinuationToolScope>,
     ) -> Result<ActionResult, LoopError> {
         let max_tokens = self.budget.config().max_synthesis_tokens;
         let evicted = evict_oldest_results(tool_results, max_tokens);
         let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
         stream.phase(Phase::Synthesize);
         let llm_text = self
-            .generate_tool_summary(&synthesis_prompt, llm, stream)
+            .generate_tool_summary(&synthesis_prompt, llm, stream, TextStreamVisibility::Hidden)
             .await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
-        Ok(ActionResult {
-            decision: decision.clone(),
-            // NB3: Evicted stubs intentionally replace original data here. This is the
-            // synthesis fallback path — tool results are consumed only by the synthesis
-            // prompt above, not by any downstream consumer. The `ActionResult` returned
-            // from this path carries the LLM-generated summary as `response_text`, so
-            // the stub-containing `tool_results` serve only as an audit/debug trace.
-            tool_results: evicted,
-            response_text: ensure_non_empty_response(&llm_text),
-            tokens_used,
+        let response_text = normalize_response_text(&llm_text);
+        let final_response = meaningful_response_text(&response_text);
+        let tool_summary = summarize_tool_progress(&evicted);
+        Ok(match final_response {
+            Some(response) => self.tool_continuation_action_result(
+                decision,
+                evicted,
+                response_text,
+                response,
+                tokens_used,
+                next_tool_scope,
+            ),
+            None => self.incomplete_action_result(
+                decision,
+                evicted,
+                tool_summary,
+                "tool synthesis did not produce a usable final response",
+                tokens_used,
+            ),
         })
+    }
+
+    fn tool_continuation_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        response_text: String,
+        response: String,
+        tokens_used: TokenUsage,
+        next_tool_scope: Option<ContinuationToolScope>,
+    ) -> ActionResult {
+        let turn_commitment = tool_continuation_turn_commitment(decision, next_tool_scope.as_ref());
+        let artifact_write_target = tool_continuation_artifact_write_target(
+            self.requested_artifact_target.as_deref(),
+            next_tool_scope.as_ref(),
+        );
+        let continuation = ActionContinuation::new(Some(response.clone()), Some(response.clone()));
+        let continuation = match next_tool_scope {
+            Some(scope) => continuation.with_tool_scope(scope),
+            None => continuation,
+        };
+        let continuation = match artifact_write_target {
+            Some(path) => continuation.with_artifact_write_target(path),
+            None => continuation,
+        };
+        let continuation = match turn_commitment {
+            Some(commitment) => continuation.with_turn_commitment(commitment),
+            None => continuation,
+        };
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::DirectUtility(_)
+        ) {
+            return ActionResult {
+                decision: decision.clone(),
+                tool_results,
+                response_text,
+                tokens_used,
+                next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+            };
+        }
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text,
+            tokens_used,
+            next_step: ActionNextStep::Continue(continuation),
+        }
     }
 
     async fn generate_tool_summary(
@@ -4371,6 +6116,7 @@ impl LoopEngine {
         synthesis_prompt: &str,
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
+        text_visibility: TextStreamVisibility,
     ) -> Result<String, LoopError> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback_chunks = Arc::clone(&chunks);
@@ -4379,8 +6125,10 @@ impl LoopEngine {
             if let Ok(mut guard) = callback_chunks.lock() {
                 guard.push(chunk.clone());
             }
-            if let Some(callback) = &stream_callback {
-                callback(StreamEvent::TextDelta { text: chunk });
+            if matches!(text_visibility, TextStreamVisibility::Public) {
+                if let Some(callback) = &stream_callback {
+                    callback(StreamEvent::TextDelta { text: chunk });
+                }
             }
         });
 
@@ -4512,10 +6260,18 @@ fn child_max_iterations(max_iterations: u32) -> u32 {
 
 fn build_sub_goal_snapshot(
     sub_goal: &SubGoal,
+    prior_results: &[SubGoalResult],
     context_messages: &[Message],
     timestamp_ms: u64,
 ) -> PerceptionSnapshot {
     let description = sub_goal.description.clone();
+    let mut conversation_history = context_messages.to_vec();
+    if !prior_results.is_empty() {
+        conversation_history.push(Message::assistant(format!(
+            "Prior decomposition results for context only:\n{}",
+            aggregate_sub_goal_results(prior_results)
+        )));
+    }
     PerceptionSnapshot {
         timestamp_ms,
         screen: ScreenState {
@@ -4534,9 +6290,13 @@ fn build_sub_goal_snapshot(
             documents: Vec::new(),
         }),
         sensor_data: None,
-        conversation_history: context_messages.to_vec(),
+        conversation_history,
         steer_context: None,
     }
+}
+
+fn sub_goal_fallback_user_message(snapshot: &PerceptionSnapshot) -> String {
+    snapshot.screen.text_content.trim().to_string()
 }
 
 fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult {
@@ -4548,9 +6308,25 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             outcome: SubGoalOutcome::Completed(response),
             signals,
         },
-        LoopResult::BudgetExhausted { signals, .. } => SubGoalResult {
+        LoopResult::BudgetExhausted {
+            partial_response,
+            signals,
+            ..
+        } => SubGoalResult {
             goal,
-            outcome: SubGoalOutcome::BudgetExhausted,
+            outcome: SubGoalOutcome::BudgetExhausted { partial_response },
+            signals,
+        },
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            signals,
+            ..
+        } => SubGoalResult {
+            goal,
+            outcome: SubGoalOutcome::BudgetExhausted {
+                partial_response: partial_response.or(Some(reason)),
+            },
             signals,
         },
         LoopResult::Error {
@@ -4560,6 +6336,36 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             let message = "sub-goal stopped before completion".to_string();
             failed_sub_goal_result_with_signals(goal, message, signals)
         }
+    }
+}
+
+fn successful_tool_names(signals: &[Signal]) -> std::collections::HashSet<&str> {
+    signals
+        .iter()
+        .filter(|signal| signal.step == LoopStep::Act && signal.kind == SignalKind::Success)
+        .filter_map(|signal| signal.message.strip_prefix("tool "))
+        .collect()
+}
+
+fn successful_mutation_tool_names(signals: &[Signal]) -> std::collections::HashSet<&str> {
+    signals
+        .iter()
+        .filter(|signal| signal.step == LoopStep::Act && signal.kind == SignalKind::Success)
+        .filter(|signal| {
+            signal
+                .metadata
+                .get("classification")
+                .and_then(serde_json::Value::as_str)
+                == Some("mutation")
+        })
+        .filter_map(|signal| signal.message.strip_prefix("tool "))
+        .collect()
+}
+
+fn tool_call_classification_label(classification: ToolCallClassification) -> &'static str {
+    match classification {
+        ToolCallClassification::Observation => "observation",
+        ToolCallClassification::Mutation => "mutation",
     }
 }
 
@@ -4576,6 +6382,18 @@ fn failed_sub_goal_execution(
 
 fn failed_sub_goal_result(goal: SubGoal, message: String) -> SubGoalResult {
     failed_sub_goal_result_with_signals(goal, message, Vec::new())
+}
+
+fn incomplete_sub_goal_result_with_signals(
+    goal: SubGoal,
+    message: String,
+    signals: Vec<Signal>,
+) -> SubGoalResult {
+    SubGoalResult {
+        goal,
+        outcome: SubGoalOutcome::Incomplete(message),
+        signals,
+    }
 }
 
 fn failed_sub_goal_result_with_signals(
@@ -4598,17 +6416,38 @@ fn skipped_sub_goal_result(goal: SubGoal) -> SubGoalResult {
     }
 }
 
+fn merge_sub_goal_signals(
+    mut result: SubGoalResult,
+    mut prior_signals: Vec<Signal>,
+) -> SubGoalResult {
+    prior_signals.extend(result.signals);
+    result.signals = prior_signals;
+    result
+}
+
 fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
     if results.is_empty() {
         return "Task decomposition contained no sub-goals.".to_string();
     }
 
     let mut lines = Vec::with_capacity(results.len() + 1);
-    lines.push("Task decomposition results:".to_string());
+    lines.push(DECOMPOSITION_RESULTS_PREFIX.to_string());
     for (index, result) in results.iter().enumerate() {
         lines.push(format_sub_goal_line(index + 1, result));
     }
     lines.join("\n")
+}
+
+fn is_decomposition_results_message(text: &str) -> bool {
+    text.trim_start().starts_with(DECOMPOSITION_RESULTS_PREFIX)
+}
+
+fn decomposition_results_all_skipped(text: &str) -> bool {
+    is_decomposition_results_message(text)
+        && text
+            .lines()
+            .skip(1)
+            .all(|line| line.contains("=> skipped (below floor)"))
 }
 
 fn format_sub_goal_line(index: usize, result: &SubGoalResult) -> String {
@@ -4622,14 +6461,30 @@ fn format_sub_goal_line(index: usize, result: &SubGoalResult) -> String {
 fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
     match outcome {
         SubGoalOutcome::Completed(response) => format!("completed: {response}"),
+        SubGoalOutcome::Incomplete(message) => format!("incomplete: {message}"),
         SubGoalOutcome::Failed(message) => format!("failed: {message}"),
-        SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
+        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                format!(
+                    "budget exhausted after partial: {}",
+                    truncate_prompt_text(text, 240)
+                )
+            })
+            .unwrap_or_else(|| "budget exhausted".to_string()),
         SubGoalOutcome::Skipped => "skipped (below floor)".to_string(),
     }
 }
 
 fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
-    matches!(result.outcome, SubGoalOutcome::BudgetExhausted)
+    match &result.outcome {
+        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty),
+        _ => false,
+    }
 }
 
 fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMode {
@@ -4753,6 +6608,17 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             ..
         } => LoopResult::BudgetExhausted {
             partial_response,
+            iterations,
+            signals,
+        },
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            iterations,
+            ..
+        } => LoopResult::Incomplete {
+            partial_response,
+            reason,
             iterations,
             signals,
         },
@@ -4899,6 +6765,70 @@ fn partition_by_retry_policy(
         }
     }
     (allowed, blocked)
+}
+
+fn partition_by_call_classification(
+    calls: &[ToolCall],
+    executor: &dyn ToolExecutor,
+    required: ToolCallClassification,
+    reason: &str,
+) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+    for call in calls {
+        if executor.classify_call(call) == required {
+            allowed.push(call.clone());
+        } else {
+            blocked.push(BlockedToolCall {
+                call: call.clone(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    (allowed, blocked)
+}
+
+fn partition_by_allowed_tool_names(
+    calls: &[ToolCall],
+    allowed_names: &[&str],
+    reason: &str,
+) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
+    let allowed_names: HashSet<&str> = allowed_names.iter().copied().collect();
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+    for call in calls {
+        if allowed_names.contains(call.name.as_str()) {
+            allowed.push(call.clone());
+        } else {
+            blocked.push(BlockedToolCall {
+                call: call.clone(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    (allowed, blocked)
+}
+
+fn calls_are_all_classification(
+    calls: &[ToolCall],
+    executor: &dyn ToolExecutor,
+    required: ToolCallClassification,
+) -> bool {
+    !calls.is_empty()
+        && calls
+            .iter()
+            .all(|call| executor.classify_call(call) == required)
+}
+
+fn build_uniform_blocked_calls(calls: &[ToolCall], reason: &str) -> Vec<BlockedToolCall> {
+    calls
+        .iter()
+        .cloned()
+        .map(|call| BlockedToolCall {
+            call,
+            reason: reason.to_string(),
+        })
+        .collect()
 }
 
 fn blocked_tool_message(tool_name: &str, reason: &str) -> String {
@@ -5142,11 +7072,16 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
     )
 }
 
-fn completion_request_tools(tool_definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+fn completion_request_tools(
+    tool_definitions: Vec<ToolDefinition>,
+    decompose_enabled: bool,
+) -> Vec<ToolDefinition> {
     if tool_definitions.is_empty() {
         Vec::new()
-    } else {
+    } else if decompose_enabled {
         tool_definitions_with_decompose(tool_definitions)
+    } else {
+        tool_definitions
     }
 }
 
@@ -5208,10 +7143,13 @@ fn build_continuation_request(
         context_messages,
         model,
         tool_definitions,
-        memory_context,
-        scratchpad_context,
-        thinking,
-        false,
+        true,
+        RequestBuildContext {
+            memory_context,
+            scratchpad_context,
+            thinking,
+            notify_tool_guidance_enabled: false,
+        },
     )
 }
 
@@ -5219,16 +7157,14 @@ fn build_continuation_request_with_notify_guidance(
     context_messages: &[Message],
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
+    decompose_enabled: bool,
+    context: RequestBuildContext<'_>,
 ) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions);
+    let tools = completion_request_tools(tool_definitions, decompose_enabled);
     let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
+        context.memory_context,
+        context.scratchpad_context,
+        context.notify_tool_guidance_enabled,
     );
     CompletionRequest {
         model: model.to_string(),
@@ -5237,7 +7173,32 @@ fn build_continuation_request_with_notify_guidance(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking,
+        thinking: context.thinking,
+    }
+}
+
+fn build_forced_synthesis_request_with_notify_guidance(
+    context_messages: &[Message],
+    model: &str,
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
+) -> CompletionRequest {
+    let system_prompt = build_forced_synthesis_system_prompt_with_notify_guidance(
+        context_messages,
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
+
+    CompletionRequest {
+        model: model.to_string(),
+        messages: strip_system_messages(context_messages),
+        tools: vec![],
+        temperature: Some(0.3),
+        max_tokens: Some(2048),
+        system_prompt: Some(system_prompt),
+        thinking: None,
     }
 }
 
@@ -5255,6 +7216,7 @@ fn build_truncation_continuation_request(
         model,
         continuation_messages,
         tool_definitions,
+        true,
         memory_context,
         scratchpad_context,
         step,
@@ -5269,13 +7231,14 @@ fn build_truncation_continuation_request_with_notify_guidance(
     model: &str,
     continuation_messages: &[Message],
     tool_definitions: Vec<ToolDefinition>,
+    decompose_enabled: bool,
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     step: LoopStep,
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
 ) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions);
+    let tools = completion_request_tools(tool_definitions, decompose_enabled);
     // Intentional: truncation continuations resume a cut-off response after context
     // overflow. They are not the post-tool-result path, so they keep the plain
     // reasoning prompt instead of the tool continuation directive.
@@ -5346,7 +7309,9 @@ fn format_system_status_message(status: &LoopStatus) -> String {
 
 fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Vec<Message> {
     let mut continuation_messages = base_messages.to_vec();
-    continuation_messages.push(Message::assistant(full_text.to_string()));
+    if !full_text.trim().is_empty() {
+        continuation_messages.push(Message::assistant(full_text.to_string()));
+    }
     continuation_messages.push(Message::user(
         "Continue from exactly where you left off. Do not repeat prior text.",
     ));
@@ -5726,7 +7691,13 @@ fn estimate_tokens(text: &str) -> u64 {
 
 fn message_to_text(message: &Message) -> String {
     let role = format!("{:?}", message.role);
-    let content = message
+    let content = message_content_to_text(message);
+
+    format!("{role}: {content}")
+}
+
+fn message_content_to_text(message: &Message) -> String {
+    message
         .content
         .iter()
         .map(|block| match block {
@@ -5746,9 +7717,25 @@ fn message_to_text(message: &Message) -> String {
                 .unwrap_or_else(|| format!("[document:{media_type}]")),
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
 
-    format!("{role}: {content}")
+fn strip_system_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|message| message.role != MessageRole::System)
+        .cloned()
+        .collect()
+}
+
+fn system_messages_to_prompt_directives(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::System)
+        .map(message_content_to_text)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 fn completion_request_to_prompt(request: &CompletionRequest) -> String {
@@ -5790,10 +7777,13 @@ fn build_reasoning_request(
         perception,
         model,
         tool_definitions,
-        memory_context,
-        scratchpad_context,
-        thinking,
-        false,
+        true,
+        RequestBuildContext {
+            memory_context,
+            scratchpad_context,
+            thinking,
+            notify_tool_guidance_enabled: false,
+        },
     )
 }
 
@@ -5801,16 +7791,14 @@ fn build_reasoning_request_with_notify_guidance(
     perception: &ProcessedPerception,
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
+    decompose_enabled: bool,
+    context: RequestBuildContext<'_>,
 ) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions);
+    let tools = completion_request_tools(tool_definitions, decompose_enabled);
     let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
+        context.memory_context,
+        context.scratchpad_context,
+        context.notify_tool_guidance_enabled,
     );
 
     CompletionRequest {
@@ -5820,7 +7808,7 @@ fn build_reasoning_request_with_notify_guidance(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking,
+        thinking: context.thinking,
     }
 }
 
@@ -5879,6 +7867,30 @@ fn build_reasoning_system_prompt_with_notify_guidance(
     )
 }
 
+fn build_forced_synthesis_system_prompt_with_notify_guidance(
+    context_messages: &[Message],
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+    notify_tool_guidance_enabled: bool,
+) -> String {
+    let mut system_prompt = build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        notify_tool_guidance_enabled,
+    );
+    let directives = system_messages_to_prompt_directives(context_messages);
+    if !directives.is_empty() {
+        system_prompt.push_str("\n\nAdditional runtime directives:\n");
+        for directive in directives {
+            system_prompt.push_str("- ");
+            system_prompt.push_str(&directive);
+            system_prompt.push('\n');
+        }
+    }
+    system_prompt.push_str(BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE);
+    system_prompt
+}
+
 #[cfg(test)]
 fn build_tool_continuation_system_prompt(
     memory_context: Option<&str>,
@@ -5927,6 +7939,65 @@ fn build_system_prompt(
         prompt.push_str(MEMORY_INSTRUCTION);
     }
     prompt
+}
+
+fn extract_requested_write_target(user_message: &str) -> Option<String> {
+    const PREFIXES: [&str; 4] = ["save it to ", "save to ", "write it to ", "write to "];
+    let lower = user_message.to_lowercase();
+    for prefix in PREFIXES {
+        let Some(start) = lower.find(prefix) else {
+            continue;
+        };
+        let raw = user_message[start + prefix.len()..]
+            .split_whitespace()
+            .next()?;
+        let cleaned = raw
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '>' | ',' | ';'))
+            .trim_end_matches('.')
+            .trim();
+        if looks_like_artifact_path(cleaned) {
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
+fn looks_like_artifact_path(path: &str) -> bool {
+    !path.is_empty()
+        && (path.contains('/') || path.starts_with("~/"))
+        && path
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.contains('.'))
+}
+
+fn artifact_write_completed(target: &str, tool_results: &[ToolResult]) -> bool {
+    let candidates = artifact_path_candidates(target);
+    tool_results.iter().any(|result| {
+        result.success
+            && result.tool_name == "write_file"
+            && candidates
+                .iter()
+                .any(|candidate| result.output.contains(candidate))
+    })
+}
+
+fn artifact_path_candidates(target: &str) -> Vec<String> {
+    let mut candidates = vec![target.to_string()];
+    if let Some(stripped) = target.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(format!("{home}/{stripped}"));
+        }
+    }
+    candidates
+}
+
+fn tighten_or_default_threshold(current: u16, ceiling: u16) -> u16 {
+    if current == 0 {
+        ceiling
+    } else {
+        current.min(ceiling)
+    }
 }
 
 // Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
@@ -5979,16 +8050,61 @@ fn extract_response_text(response: &CompletionResponse) -> String {
         .join("\n")
 }
 
-fn ensure_non_empty_response(text: &str) -> String {
-    ensure_non_empty_response_with_flag(text).0
+fn normalize_response_text(text: &str) -> String {
+    text.trim().to_string()
 }
 
-fn ensure_non_empty_response_with_flag(text: &str) -> (String, bool) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return (SAFE_FALLBACK_RESPONSE.to_string(), true);
+fn meaningful_response_text(text: &str) -> Option<String> {
+    let normalized = normalize_response_text(text);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn action_partial_response(action: &ActionResult) -> Option<String> {
+    match &action.next_step {
+        ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+            meaningful_response_text(&action.response_text)
+                .or_else(|| meaningful_response_text(response))
+        }
+        ActionNextStep::Finish(ActionTerminal::Incomplete {
+            partial_response, ..
+        }) => meaningful_response_text(&action.response_text).or_else(|| {
+            partial_response
+                .as_ref()
+                .and_then(|text| meaningful_response_text(text))
+        }),
+        ActionNextStep::Continue(continuation) => continuation
+            .partial_response
+            .as_ref()
+            .and_then(|text| meaningful_response_text(text)),
     }
-    (trimmed.to_string(), false)
+}
+
+fn summarize_tool_progress(results: &[ToolResult]) -> Option<String> {
+    let successes: Vec<_> = results.iter().filter(|result| result.success).collect();
+    let failures: Vec<_> = results.iter().filter(|result| !result.success).collect();
+
+    if successes.is_empty() && failures.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if !successes.is_empty() {
+        let names = successes
+            .iter()
+            .map(|result| result.tool_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("completed tool work: {names}"));
+    }
+    if !failures.is_empty() {
+        let latest = failures.last().expect("failures is non-empty");
+        parts.push(format!(
+            "latest blocker: {}",
+            truncate_prompt_text(&latest.output, 160)
+        ));
+    }
+
+    Some(parts.join(". "))
 }
 
 fn compaction_failed_error(scope: CompactionScope, error: CompactionError) -> LoopError {
@@ -6509,7 +8625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_no_tool_calls_returns_safe_fallback() {
+    async fn decide_no_tool_calls_returns_empty_response() {
         let mut engine = default_engine();
         let response = CompletionResponse {
             content: Vec::new(),
@@ -6518,7 +8634,7 @@ mod tests {
             stop_reason: None,
         };
         let decision = engine.decide(&response).await.expect("decision");
-        assert!(matches!(decision, Decision::Respond(text) if text == SAFE_FALLBACK_RESPONSE));
+        assert!(matches!(decision, Decision::Respond(text) if text.is_empty()));
     }
 }
 
@@ -6990,10 +9106,12 @@ mod phase2_tests {
                 iterations,
                 ..
             } => {
-                // iteration 1: tool call + synthesis, iteration 2: continuation text-only
+                // Tool failure synthesis now becomes internal continuation
+                // context, and the next root reasoning pass owns the final
+                // user-visible response.
                 assert_eq!(
                     iterations, 2,
-                    "expected two iterations (tool + continuation)"
+                    "expected root continuation after tool synthesis"
                 );
                 assert_eq!(
                     response,
@@ -7046,6 +9164,19 @@ mod phase2_tests {
         );
     }
 
+    #[test]
+    fn build_continuation_messages_omits_empty_assistant_text() {
+        let base_messages = vec![Message::user("Start here")];
+        let messages = build_continuation_messages(&base_messages, "");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], Message::user("Start here"));
+        assert_eq!(
+            messages[1],
+            Message::user("Continue from exactly where you left off. Do not repeat prior text.")
+        );
+    }
+
     #[tokio::test]
     async fn budget_exhaustion_emits_blocked_signal() {
         let zero_budget = crate::budget::BudgetConfig {
@@ -7084,6 +9215,7 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::Incomplete { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7116,6 +9248,7 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::Incomplete { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7231,6 +9364,7 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::Incomplete { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7299,6 +9433,7 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::Incomplete { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7368,6 +9503,7 @@ mod phase2_tests {
         let signals = match result {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::Incomplete { signals, .. }
             | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
@@ -7393,7 +9529,7 @@ mod phase2_tests {
     }
 
     #[tokio::test]
-    async fn empty_tool_continuation_emits_safe_fallback_trace() {
+    async fn empty_tool_continuation_emits_empty_text_trace() {
         let mut engine = test_engine();
         let llm = SequentialMockLlm::new(vec![
             CompletionResponse {
@@ -7415,7 +9551,7 @@ mod phase2_tests {
             // Outer loop continuation: text-only response ends the loop
             CompletionResponse {
                 content: vec![ContentBlock::Text {
-                    text: SAFE_FALLBACK_RESPONSE.to_string(),
+                    text: "done".to_string(),
                 }],
                 tool_calls: Vec::new(),
                 usage: None,
@@ -7428,18 +9564,28 @@ mod phase2_tests {
             .await
             .expect("run_cycle");
 
-        let (response, signals) = match result {
-            LoopResult::Complete {
-                response, signals, ..
-            } => (response, signals),
-            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        let (partial_response, reason, signals) = match result {
+            LoopResult::Incomplete {
+                partial_response,
+                reason,
+                signals,
+                ..
+            } => (partial_response, reason, signals),
+            other => panic!("expected LoopResult::Incomplete, got: {other:?}"),
         };
 
-        assert_eq!(response, SAFE_FALLBACK_RESPONSE);
+        assert_eq!(
+            partial_response.as_deref(),
+            Some("completed tool work: read_file")
+        );
+        assert_eq!(
+            reason,
+            "tool continuation did not produce a usable final response"
+        );
         assert!(signals.iter().any(|signal| {
             signal.step == LoopStep::Act
                 && signal.kind == SignalKind::Trace
-                && signal.message == "tool continuation returned empty text; using safe fallback"
+                && signal.message == "tool continuation returned empty text"
         }));
     }
 
@@ -7666,7 +9812,6 @@ mod phase2_tests {
             ),
             text_response("Tool answer part", Some("length"), None),
             text_response(" two", Some("stop"), None),
-            // Outer loop continuation: text-only response ends the loop
             text_response("Tool answer part two", None, None),
         ]);
 
@@ -7847,7 +9992,12 @@ mod phase2_tests {
         let llm = StreamingCaptureLlm::new("summary from stream");
 
         let summary = engine
-            .generate_tool_summary("summarize this", &llm, CycleStream::disabled())
+            .generate_tool_summary(
+                "summarize this",
+                &llm,
+                CycleStream::disabled(),
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("streaming synthesis should succeed");
 
@@ -7985,6 +10135,43 @@ mod phase4_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct Phase4NoDecomposeExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for Phase4NoDecomposeExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            if let Some(call) = calls.iter().find(|call| call.name == DECOMPOSE_TOOL_NAME) {
+                return Err(crate::act::ToolExecutorError {
+                    message: format!("decompose leaked to tool executor: {}", call.id),
+                    recoverable: false,
+                });
+            }
+
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
     #[derive(Debug)]
     struct Phase4MockLlm {
         responses: Mutex<VecDeque<CompletionResponse>>,
@@ -8094,11 +10281,19 @@ mod phase4_tests {
     }
 
     fn p4_engine_with_config(config: BudgetConfig, max_iterations: u32) -> LoopEngine {
+        p4_engine_with_executor(config, max_iterations, Arc::new(Phase4StubToolExecutor))
+    }
+
+    fn p4_engine_with_executor(
+        config: BudgetConfig,
+        max_iterations: u32,
+        tool_executor: Arc<dyn ToolExecutor>,
+    ) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(config, 0, 0))
             .context(ContextCompactor::new(2048, 256))
             .max_iterations(max_iterations)
-            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .tool_executor(tool_executor)
             .synthesis_instruction("Summarize tool output".to_string())
             .build()
             .expect("test engine build")
@@ -8153,6 +10348,14 @@ mod phase4_tests {
             id: id.to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": path}),
+        }
+    }
+
+    fn decompose_call(id: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: DECOMPOSE_TOOL_NAME.to_string(),
+            arguments,
         }
     }
 
@@ -8248,6 +10451,54 @@ mod phase4_tests {
         assert_eq!(action.tool_results[0].tool_call_id, "call-1");
         assert_eq!(action.tool_results[1].tool_call_id, "call-2");
         assert_eq!(action.response_text, "done after two rounds");
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_intercepts_follow_up_decompose_before_executor() {
+        let mut engine = p4_engine_with_executor(
+            BudgetConfig::default(),
+            3,
+            Arc::new(Phase4NoDecomposeExecutor),
+        );
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![decompose_call(
+                "decompose-1",
+                serde_json::json!({
+                    "sub_goals": [{
+                        "description": "summarize findings",
+                    }],
+                    "strategy": "Sequential"
+                }),
+            )]),
+            text_response("spec complete"),
+        ]);
+        let context_messages = vec![Message::user("read files, then break work down")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.tool_results.len(), 1);
+        assert_eq!(action.tool_results[0].tool_name, "read_file");
+        assert!(action
+            .tool_results
+            .iter()
+            .all(|result| result.tool_name != DECOMPOSE_TOOL_NAME));
+        assert!(
+            action
+                .response_text
+                .contains("summarize findings => skipped (below floor)"),
+            "{}",
+            action.response_text
+        );
     }
 
     #[tokio::test]
@@ -8471,6 +10722,51 @@ mod phase4_tests {
         let requests = llm.requests();
         assert_eq!(requests.len(), 2);
         assert!(!has_tool_round_progress_nudge(&requests[1].messages));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_synth() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                observation_only_round_nudge_after: 1,
+                observation_only_round_strip_after_nudge: 1,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = p4_engine_with_config(config, 6);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-1", "a.txt")]),
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+        ]);
+
+        let result = engine
+            .run_cycle(p4_snapshot("read files"), &llm)
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::Incomplete {
+                partial_response,
+                reason,
+                ..
+            } => {
+                let partial = partial_response.expect("partial response");
+                assert!(partial.contains("completed tool work"), "{partial}");
+                assert!(
+                    reason.contains("read-only inspection is disabled"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected incomplete result, got {other:?}"),
+        }
+
+        assert_eq!(
+            llm.requests().len(),
+            3,
+            "expected only initial reasoning + two continuation requests"
+        );
     }
 
     #[tokio::test]
@@ -9523,8 +11819,57 @@ mod cancellation_tests {
         assert!(events.contains(&StreamEvent::TextDelta {
             text: "done".to_string(),
         }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Progress { kind: ProgressKind::Researching, message }
+                if message == "Researching the request and planning the next step..."
+        )));
         assert!(
             matches!(events.last(), Some(StreamEvent::Done { response }) if response == "done")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_streaming_completion_suppresses_reason_text_when_tool_calls_present() {
+        let engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let llm = ScriptedLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "I know which file to edit.".to_string(),
+            }],
+            tool_calls: vec![read_file_call("call-1")],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }]);
+        let (callback, events) = stream_recorder();
+
+        let response = engine
+            .request_streaming_completion(
+                &llm,
+                CompletionRequest {
+                    model: "scripted".to_string(),
+                    messages: vec![Message::user("fix it")],
+                    tools: vec![read_file_definition()],
+                    temperature: None,
+                    max_tokens: None,
+                    system_prompt: None,
+                    thinking: None,
+                },
+                StreamPhase::Reason,
+                "reason",
+                TextStreamVisibility::Public,
+                &callback,
+            )
+            .await
+            .expect("streaming completion");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        let events = events.lock().expect("lock").clone();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { text } if text == "I know which file to edit."
+            )),
+            "streaming reason text should stay buffered when the final response contains tool calls"
         );
     }
 
@@ -9564,10 +11909,213 @@ mod cancellation_tests {
         )));
         assert!(events.contains(&StreamEvent::ToolResult {
             id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
             output: "ok".to_string(),
             is_error: false,
         }));
         assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn progress_for_turn_state_prioritizes_artifact_gate() {
+        let (kind, message) = progress_for_turn_state_with_profile(
+            None,
+            None,
+            Some("/tmp/x.md"),
+            &NoopToolExecutor,
+            TurnExecutionProfile::Standard,
+            BoundedLocalPhase::Discovery,
+        );
+
+        assert_eq!(kind, ProgressKind::WritingArtifact);
+        assert_eq!(message, "Writing the requested artifact to /tmp/x.md...");
+    }
+
+    #[test]
+    fn progress_for_turn_state_marks_mutation_commitment_as_implementing() {
+        let commitment = TurnCommitment::ProceedUnderConstraints(ProceedUnderConstraints {
+            goal: "Scaffold and implement the skill".to_string(),
+            success_target: Some("Write the skill files locally".to_string()),
+            unsupported_items: Vec::new(),
+            assumptions: Vec::new(),
+            allowed_tools: Some(ContinuationToolScope::MutationOnly),
+        });
+
+        let (kind, message) = progress_for_turn_state_with_profile(
+            Some(&commitment),
+            None,
+            None,
+            &NoopToolExecutor,
+            TurnExecutionProfile::Standard,
+            BoundedLocalPhase::Discovery,
+        );
+
+        assert_eq!(kind, ProgressKind::Implementing);
+        assert_eq!(
+            message,
+            "Implementing the committed plan: Write the skill files locally"
+        );
+    }
+
+    #[test]
+    fn progress_for_tool_round_describes_specific_workspace_search_activity() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "x-post",
+                "path": "skills/"
+            }),
+        }];
+
+        let (kind, message) = progress_for_tool_round(
+            progress::ToolRoundProgressContext {
+                commitment: None,
+                pending_tool_scope: None,
+                pending_artifact_write_target: None,
+                turn_execution_profile: TurnExecutionProfile::Standard,
+                bounded_local_phase: BoundedLocalPhase::Discovery,
+                tool_executor: &NoopToolExecutor,
+            },
+            &calls,
+        )
+        .expect("tool round progress");
+
+        assert_eq!(kind, ProgressKind::Researching);
+        assert_eq!(message, "Searching skills for x-post");
+    }
+
+    #[test]
+    fn activity_progress_expires_back_to_turn_state() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+        let stream = CycleStream::enabled(&callback);
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "search_text".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "x-post",
+                "path": "skills/"
+            }),
+        }];
+
+        engine.maybe_publish_reason_progress(stream);
+        engine.maybe_publish_tool_round_progress(3, &calls, stream);
+        engine.expire_activity_progress(stream);
+
+        let events = events.lock().expect("lock").clone();
+        let progress: Vec<(ProgressKind, String)> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::Progress { kind, message } => Some((kind, message)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            progress,
+            vec![
+                (
+                    ProgressKind::Researching,
+                    "Researching the request and planning the next step...".to_string()
+                ),
+                (
+                    ProgressKind::Researching,
+                    "Searching skills for x-post".to_string()
+                ),
+                (
+                    ProgressKind::Researching,
+                    "Researching the request and planning the next step...".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_local_phase_change_refreshes_turn_state_progress_before_activity_expires() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
+        engine.bounded_local_phase = BoundedLocalPhase::Discovery;
+        let (callback, events) = stream_recorder();
+        let stream = CycleStream::enabled(&callback);
+
+        engine.maybe_publish_reason_progress(stream);
+        engine.publish_activity_progress(
+            ProgressKind::Researching,
+            "Searching the local workspace...",
+            stream,
+        );
+
+        let discovery_call = ToolCall {
+            id: "d1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let discovery_result = ToolResult {
+            tool_call_id: "d1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        engine.advance_bounded_local_phase_after_tool_round(
+            std::slice::from_ref(&discovery_call),
+            std::slice::from_ref(&discovery_result),
+        );
+        engine.expire_activity_progress(stream);
+
+        let events = events.lock().expect("lock").clone();
+        let progress: Vec<(ProgressKind, String)> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::Progress { kind, message } => Some((kind, message)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            progress.last(),
+            Some(&(
+                ProgressKind::Implementing,
+                "Applying the local code change...".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_streaming_hides_internal_tool_synthesis_until_root_completion() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let llm = ScriptedLlm::new(vec![
+            tool_use_response("call-1"),
+            text_response("Internal tool synthesis"),
+            text_response("Final root answer"),
+        ]);
+        let (callback, events) = stream_recorder();
+
+        let result = engine
+            .run_cycle_streaming(test_snapshot("read file"), &llm, Some(callback))
+            .await
+            .expect("run_cycle_streaming");
+
+        let response = match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
+        };
+        let events = events.lock().expect("lock").clone();
+
+        assert_eq!(response, "Final root answer");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { text } if text == "Internal tool synthesis"
+            )),
+            "intermediate tool synthesis should remain internal"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { text } if text == "Final root answer"
+        )));
+        assert_done_event(&events, "Final root answer");
     }
 
     #[test]
@@ -9645,6 +12193,26 @@ mod cancellation_tests {
             .iter()
             .any(|event| matches!(event, StreamEvent::Notification { .. })));
         assert_done_event(&events, "done");
+    }
+
+    #[test]
+    fn finish_streaming_result_uses_polished_incomplete_fallback_when_no_partial_exists() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let _ = engine.finish_streaming_result(
+            LoopResult::Incomplete {
+                partial_response: None,
+                reason: "iteration limit reached before a usable final response was produced"
+                    .to_string(),
+                iterations: 2,
+                signals: Vec::new(),
+            },
+            CycleStream::enabled(&callback),
+        );
+
+        let events = events.lock().expect("lock").clone();
+        assert_done_event(&events, INCOMPLETE_FALLBACK_RESPONSE);
     }
 
     #[tokio::test]
@@ -9882,7 +12450,11 @@ mod cancellation_tests {
         ]));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -9934,7 +12506,11 @@ mod cancellation_tests {
         ]));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -9944,6 +12520,90 @@ mod cancellation_tests {
         assert_eq!(
             response.tool_calls[0].arguments,
             serde_json::json!({"path":"README.md"})
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_suppresses_synthesize_deltas_when_tool_calls_present() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
+                delta_content: Some("[web_search]".to_string()),
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    provider_id: None,
+                    name: Some("web_search".to_string()),
+                    arguments_delta: Some(r#"{"query":"x api"}"#.to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            })]));
+
+        let response = engine
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                InternalMessage::StreamDelta { phase, .. } if *phase == StreamPhase::Synthesize
+            )),
+            "synthesize stream should not publish text deltas when the final response contains tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_suppresses_reason_deltas_when_tool_calls_present() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
+                delta_content: Some("I'll inspect the repo first.".to_string()),
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    provider_id: None,
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some(r#"{"path":"README.md"}"#.to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            })]));
+
+        let response = engine
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                InternalMessage::StreamDelta { phase, .. } if *phase == StreamPhase::Reason
+            )),
+            "reason stream should not publish text deltas when the final response contains tool calls"
         );
     }
 
@@ -9965,7 +12625,11 @@ mod cancellation_tests {
             })]));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -10014,7 +12678,11 @@ mod cancellation_tests {
         ]));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -10045,7 +12713,11 @@ mod cancellation_tests {
         let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -10078,7 +12750,11 @@ mod cancellation_tests {
         let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -10107,7 +12783,11 @@ mod cancellation_tests {
         let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Synthesize,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -10132,21 +12812,33 @@ mod cancellation_tests {
             .expect_err("stream should fail");
         assert!(error.reason.contains("stream consumption failed"));
 
-        let started = receiver.try_recv().expect("started event");
-        let delta = receiver.try_recv().expect("delta event");
-        let finished = receiver.try_recv().expect("finished event");
+        let mut events = Vec::with_capacity(3);
+        while events.len() < 3 {
+            let event = receiver.recv().await.expect("event");
+            if matches!(
+                event,
+                InternalMessage::StreamingStarted { .. }
+                    | InternalMessage::StreamDelta { .. }
+                    | InternalMessage::StreamingFinished { .. }
+            ) {
+                events.push(event);
+            }
+        }
+        let started = &events[0];
+        let delta = &events[1];
+        let finished = &events[2];
         assert!(matches!(
             started,
-            InternalMessage::StreamingStarted { phase } if phase == StreamPhase::Reason
+            InternalMessage::StreamingStarted { phase } if *phase == StreamPhase::Reason
         ));
         assert!(matches!(
             delta,
             InternalMessage::StreamDelta { delta, phase }
-                if delta == "partial" && phase == StreamPhase::Reason
+                if delta == "partial" && *phase == StreamPhase::Reason
         ));
         assert!(matches!(
             finished,
-            InternalMessage::StreamingFinished { phase } if phase == StreamPhase::Reason
+            InternalMessage::StreamingFinished { phase } if *phase == StreamPhase::Reason
         ));
         assert!(
             receiver.try_recv().is_err(),
@@ -10170,7 +12862,17 @@ mod cancellation_tests {
             .await
             .expect_err("stream setup should fail");
         assert!(error.reason.contains("completion failed"));
-        assert!(receiver.try_recv().is_err(), "no stream events expected");
+        while let Ok(event) = receiver.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    InternalMessage::StreamingStarted { .. }
+                        | InternalMessage::StreamDelta { .. }
+                        | InternalMessage::StreamingFinished { .. }
+                ),
+                "no stream events expected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10340,7 +13042,11 @@ mod cancellation_tests {
         let mut stream: CompletionStream = Box::pin(delayed);
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
         cancel_task.await.expect("cancel task");
@@ -10545,6 +13251,10 @@ mod observation_signal_tests {
             }],
             response_text: "I couldn't find that file.".to_string(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                Some("I couldn't find that file.".to_string()),
+                Some("I couldn't find that file.".to_string()),
+            )),
         };
 
         engine.emit_action_observations(&action);
@@ -10571,6 +13281,9 @@ mod observation_signal_tests {
             tool_results: Vec::new(),
             response_text: String::new(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: String::new(),
+            }),
         };
 
         engine.emit_action_observations(&action);
@@ -10600,6 +13313,10 @@ mod observation_signal_tests {
             }],
             response_text: String::new(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                Some("Completed tool execution: read_file".to_string()),
+                Some("Tool execution completed: read_file".to_string()),
+            )),
         };
 
         engine.emit_action_observations(&action);
@@ -10618,13 +13335,16 @@ mod observation_signal_tests {
     }
 
     #[test]
-    fn safe_fallback_treated_as_no_response() {
+    fn empty_response_treated_as_no_response() {
         let mut engine = obs_test_engine();
         let action = ActionResult {
-            decision: Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string()),
+            decision: Decision::Respond(String::new()),
             tool_results: Vec::new(),
-            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            response_text: String::new(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: String::new(),
+            }),
         };
 
         engine.emit_action_observations(&action);
@@ -10634,11 +13354,7 @@ mod observation_signal_tests {
             .iter()
             .filter(|s| s.message == "empty_response")
             .collect();
-        assert_eq!(
-            obs.len(),
-            1,
-            "SAFE_FALLBACK_RESPONSE should be treated as empty"
-        );
+        assert_eq!(obs.len(), 1, "empty response should be treated as empty");
     }
 }
 
@@ -10676,6 +13392,20 @@ mod decomposition_tests {
                     output: "ok".to_string(),
                 })
                 .collect())
+        }
+
+        fn route_sub_goal_call(
+            &self,
+            request: &crate::act::SubGoalToolRoutingRequest,
+            call_id: &str,
+        ) -> Option<ToolCall> {
+            Some(ToolCall {
+                id: call_id.to_string(),
+                name: request.required_tools.first()?.clone(),
+                arguments: serde_json::json!({
+                    "description": request.description,
+                }),
+            })
         }
     }
 
@@ -10768,11 +13498,13 @@ mod decomposition_tests {
         DecompositionPlan {
             sub_goals: descriptions
                 .iter()
-                .map(|description| SubGoal {
-                    description: (*description).to_string(),
-                    required_tools: Vec::new(),
-                    expected_output: Some(format!("output for {description}")),
-                    complexity_hint: None,
+                .map(|description| {
+                    SubGoal::with_definition_of_done(
+                        (*description).to_string(),
+                        Vec::new(),
+                        Some(&format!("output for {description}")),
+                        None,
+                    )
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,
@@ -11018,6 +13750,53 @@ mod decomposition_tests {
         assert!(status.tokens_used > 0);
     }
 
+    #[tokio::test]
+    async fn execute_decomposition_continues_with_internal_result_context() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first-ok")),
+            Ok(text_response("second-ok")),
+        ]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        match action.next_step {
+            ActionNextStep::Continue(ActionContinuation {
+                partial_response,
+                context_message,
+                ..
+            }) => {
+                assert_eq!(partial_response, None);
+                let context_message = context_message.expect("context message");
+                assert!(context_message.contains("Task decomposition results:"));
+                assert!(context_message.contains("first => completed: first-ok"));
+                assert!(context_message.contains("second => completed: second-ok"));
+            }
+            other => panic!("expected continuation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continue_actions_do_not_treat_response_text_as_partial_output() {
+        let action = ActionResult {
+            decision: Decision::Respond("keep going".to_string()),
+            tool_results: Vec::new(),
+            response_text: "Task decomposition results:\n1. step => completed: ok".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                None,
+                Some("Task decomposition results:\n1. step => completed: ok".to_string()),
+            )),
+        };
+
+        assert_eq!(action_partial_response(&action), None);
+    }
+
     #[test]
     fn child_max_iterations_caps_at_three() {
         assert_eq!(child_max_iterations(10), 3);
@@ -11133,7 +13912,10 @@ mod decomposition_tests {
         let mut engine = decomposition_engine(budget_config(10, 6), 0);
         let plan = decomposition_plan(&["first", "second"]);
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("output for first")),
+            Ok(text_response("output for second")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -11171,7 +13953,10 @@ mod decomposition_tests {
         let mut engine = decomposition_engine(budget_config(10, 6), 0);
         let plan = concurrent_plan(&["signal-a", "signal-b"]);
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("output for first")),
+            Ok(text_response("output for second")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -11194,9 +13979,19 @@ mod decomposition_tests {
         let mut receiver = bus.subscribe();
         engine.set_event_bus(bus);
 
-        let plan = concurrent_plan(&["first", "second"]);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal::new("first", Vec::new(), SubGoalContract::default(), None),
+                SubGoal::new("second", Vec::new(), SubGoalContract::default(), None),
+            ],
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first complete")),
+            Ok(text_response("second complete")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -11211,26 +14006,32 @@ mod decomposition_tests {
         assert!(events.iter().any(|event| {
             matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                InternalMessage::SubGoalCompleted {
-                    index: 0,
-                    total: 2,
-                    success: true
-                }
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                InternalMessage::SubGoalCompleted {
-                    index: 1,
-                    total: 2,
-                    success: true
-                }
-            )
-        }));
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    InternalMessage::SubGoalCompleted {
+                        index: 0,
+                        total: 2,
+                        success: true
+                    }
+                )
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    InternalMessage::SubGoalCompleted {
+                        index: 1,
+                        total: 2,
+                        success: true
+                    }
+                )
+            }),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
@@ -11240,9 +14041,19 @@ mod decomposition_tests {
         let mut receiver = bus.subscribe();
         engine.set_event_bus(bus);
 
-        let plan = decomposition_plan(&["first", "second"]);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal::new("first", Vec::new(), SubGoalContract::default(), None),
+                SubGoal::new("second", Vec::new(), SubGoalContract::default(), None),
+            ],
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
         let decision = Decision::Decompose(plan.clone());
-        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first complete")),
+            Ok(text_response("second complete")),
+        ]);
 
         let _action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -11254,29 +14065,35 @@ mod decomposition_tests {
         assert!(events.iter().any(|event| {
             matches!(event, InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                InternalMessage::SubGoalCompleted {
-                    index: 0,
-                    total: 2,
-                    success: true
-                }
-            )
-        }));
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    InternalMessage::SubGoalCompleted {
+                        index: 0,
+                        total: 2,
+                        success: true
+                    }
+                )
+            }),
+            "{events:?}"
+        );
         assert!(events.iter().any(|event| {
             matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                InternalMessage::SubGoalCompleted {
-                    index: 1,
-                    total: 2,
-                    success: true
-                }
-            )
-        }));
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    InternalMessage::SubGoalCompleted {
+                        index: 1,
+                        total: 2,
+                        success: true
+                    }
+                )
+            }),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
@@ -11443,7 +14260,7 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals[0].description, "Inspect crate configuration");
                 assert_eq!(plan.sub_goals[0].required_tools, vec!["read_file"]);
                 assert_eq!(
-                    plan.sub_goals[0].expected_output,
+                    plan.sub_goals[0].completion_contract.definition_of_done,
                     Some("Cargo metadata".to_string())
                 );
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
@@ -11619,7 +14436,10 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals.len(), 1);
                 assert_eq!(plan.sub_goals[0].description, "Summarize findings");
                 assert!(plan.sub_goals[0].required_tools.is_empty());
-                assert_eq!(plan.sub_goals[0].expected_output, None);
+                assert_eq!(
+                    plan.sub_goals[0].completion_contract.definition_of_done,
+                    None
+                );
                 assert_eq!(plan.sub_goals[0].complexity_hint, None);
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
             }
@@ -11631,11 +14451,13 @@ mod decomposition_tests {
         DecompositionPlan {
             sub_goals: descriptions
                 .iter()
-                .map(|d| SubGoal {
-                    description: (*d).to_string(),
-                    required_tools: Vec::new(),
-                    expected_output: Some(format!("output for {d}")),
-                    complexity_hint: None,
+                .map(|d| {
+                    SubGoal::with_definition_of_done(
+                        (*d).to_string(),
+                        Vec::new(),
+                        Some(&format!("output for {d}")),
+                        None,
+                    )
                 })
                 .collect(),
             strategy: AggregationStrategy::Parallel,
@@ -11806,13 +14628,13 @@ mod decomposition_tests {
                 SubGoal {
                     description: "quick note".to_string(),
                     required_tools: Vec::new(),
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: Some(ComplexityHint::Trivial),
                 },
                 SubGoal {
                     description: "implement migration plan".to_string(),
                     required_tools: vec!["read_file".to_string(), "edit".to_string()],
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: Some(ComplexityHint::Complex),
                 },
             ],
@@ -11842,7 +14664,7 @@ mod decomposition_tests {
                 SubGoal {
                     description: "quick note".to_string(),
                     required_tools: Vec::new(),
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: Some(ComplexityHint::Trivial),
                 },
                 SubGoal {
@@ -11852,7 +14674,7 @@ mod decomposition_tests {
                         "edit".to_string(),
                         "test".to_string(),
                     ],
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: Some(ComplexityHint::Complex),
                 },
             ],
@@ -11942,11 +14764,13 @@ mod decomposition_tests {
         let goal = SubGoal {
             description: "child".to_string(),
             required_tools: Vec::new(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: None,
         };
         let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
-        let execution = engine.run_sub_goal(&goal, child_budget, &llm, &[]).await;
+        let execution = engine
+            .run_sub_goal(&goal, child_budget, &llm, &[], &[])
+            .await;
 
         assert_eq!(execution.budget.depth(), 1);
         assert_eq!(execution.budget.config().max_recursion_depth, effective_cap);
@@ -11957,6 +14781,361 @@ mod decomposition_tests {
         assert_eq!(
             format_sub_goal_outcome(&SubGoalOutcome::Skipped),
             "skipped (below floor)"
+        );
+    }
+
+    #[test]
+    fn format_sub_goal_outcome_includes_budget_exhausted_partial_response() {
+        let outcome = SubGoalOutcome::BudgetExhausted {
+            partial_response: Some(
+                "I have enough from the search results to write a comprehensive spec.".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            format_sub_goal_outcome(&outcome),
+            "budget exhausted after partial: I have enough from the search results to write a comprehensive spec."
+        );
+    }
+
+    #[test]
+    fn sub_goal_result_from_loop_preserves_budget_exhausted_partial_response() {
+        let goal = SubGoal {
+            description: "Research X POST endpoint".to_string(),
+            required_tools: vec!["web_search".to_string()],
+            completion_contract: SubGoalContract::from_definition_of_done(Some("Endpoint summary")),
+            complexity_hint: None,
+        };
+
+        let result = sub_goal_result_from_loop(
+            goal.clone(),
+            LoopResult::BudgetExhausted {
+                partial_response: Some("Enough research to proceed with implementation.".into()),
+                iterations: 3,
+                signals: Vec::new(),
+            },
+        );
+
+        assert_eq!(result.goal, goal);
+        assert!(matches!(
+            result.outcome,
+            SubGoalOutcome::BudgetExhausted {
+                partial_response: Some(ref text)
+            } if text == "Enough research to proceed with implementation."
+        ));
+    }
+
+    #[test]
+    fn should_halt_sub_goal_sequence_allows_budget_exhausted_partial_response() {
+        let result = SubGoalResult {
+            goal: SubGoal {
+                description: "Research X API".to_string(),
+                required_tools: vec!["web_search".to_string()],
+                completion_contract: SubGoalContract::from_definition_of_done(Some(
+                    "Endpoint summary",
+                )),
+                complexity_hint: None,
+            },
+            outcome: SubGoalOutcome::BudgetExhausted {
+                partial_response: Some("Enough research to scaffold the skill.".to_string()),
+            },
+            signals: Vec::new(),
+        };
+
+        assert!(
+            !should_halt_sub_goal_sequence(&result),
+            "useful partial output should allow later sub-goals to continue"
+        );
+    }
+
+    #[test]
+    fn build_sub_goal_snapshot_includes_prior_results_in_conversation_history() {
+        let sub_goal = SubGoal {
+            description: "Implement the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            completion_contract: SubGoalContract::from_definition_of_done(Some("Working skill")),
+            complexity_hint: None,
+        };
+        let prior_results = vec![SubGoalResult {
+            goal: SubGoal {
+                description: "Research X API".to_string(),
+                required_tools: vec!["web_search".to_string()],
+                completion_contract: SubGoalContract::from_definition_of_done(Some("Spec")),
+                complexity_hint: None,
+            },
+            outcome: SubGoalOutcome::BudgetExhausted {
+                partial_response: Some("Endpoint, auth, and rate-limit details confirmed.".into()),
+            },
+            signals: Vec::new(),
+        }];
+        let snapshot = build_sub_goal_snapshot(&sub_goal, &prior_results, &[], 42);
+
+        assert_eq!(
+            snapshot.user_input.as_ref().expect("user input").text,
+            "Implement the skill"
+        );
+        let last_message = snapshot
+            .conversation_history
+            .last()
+            .expect("prior results context message");
+        assert!(
+            message_to_text(last_message).contains("Prior decomposition results for context only")
+        );
+        assert!(message_to_text(last_message).contains("Research X API"));
+        assert!(message_to_text(last_message)
+            .contains("Endpoint, auth, and rate-limit details confirmed."));
+    }
+
+    #[tokio::test]
+    async fn sub_goal_complete_without_required_side_effect_tool_is_rejected() {
+        #[derive(Debug, Default)]
+        struct SideEffectToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for SideEffectToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]
+            }
+
+            fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+                match tool_name {
+                    "run_command" => crate::act::ToolCacheability::SideEffect,
+                    _ => crate::act::ToolCacheability::NeverCache,
+                }
+            }
+        }
+
+        let started_at_ms = current_time_ms();
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(budget_config(20, 6), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(SideEffectToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let goal = SubGoal {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            completion_contract: SubGoalContract::from_definition_of_done(Some("Scaffolded skill")),
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response(
+                "Here's the complete implementation plan and code.",
+            )),
+            Ok(text_response(
+                "I have enough context and would run it next.",
+            )),
+        ]);
+
+        let execution = engine
+            .run_sub_goal(&goal, BudgetConfig::default(), &llm, &[], &[])
+            .await;
+
+        let SubGoalOutcome::Incomplete(message) = &execution.result.outcome else {
+            panic!("expected incomplete sub-goal outcome")
+        };
+        assert!(message.contains("completion evidence"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn sub_goal_missing_required_side_effect_tool_gets_bounded_retry() {
+        #[derive(Debug, Default)]
+        struct SideEffectToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for SideEffectToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]
+            }
+
+            fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+                match tool_name {
+                    "run_command" => crate::act::ToolCacheability::SideEffect,
+                    _ => crate::act::ToolCacheability::NeverCache,
+                }
+            }
+        }
+
+        let started_at_ms = current_time_ms();
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(budget_config(20, 6), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(SideEffectToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let goal = SubGoal {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            completion_contract: SubGoalContract::from_definition_of_done(Some("Scaffolded skill")),
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("Scaffolded skill")),
+            Ok(CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: serde_json::json!({"command":"fawx skill create x-post"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+            Ok(text_response("Scaffolded skill")),
+        ]);
+
+        let execution = engine
+            .run_sub_goal(&goal, BudgetConfig::default(), &llm, &[], &[])
+            .await;
+
+        let SubGoalOutcome::Completed(response) = &execution.result.outcome else {
+            panic!("expected completed sub-goal outcome")
+        };
+        assert_eq!(response, "Scaffolded skill");
+        let used_tools = successful_tool_names(&execution.result.signals);
+        assert!(used_tools.contains("run_command"));
+    }
+
+    #[tokio::test]
+    async fn observation_only_run_command_does_not_satisfy_required_side_effect_tool() {
+        #[derive(Debug, Default)]
+        struct ClassifiedRunCommandExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for ClassifiedRunCommandExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }]
+            }
+
+            fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+                match tool_name {
+                    "run_command" => crate::act::ToolCacheability::SideEffect,
+                    _ => crate::act::ToolCacheability::NeverCache,
+                }
+            }
+
+            fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+                let command = call
+                    .arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if command.starts_with("ls ") || command.starts_with("cat ") {
+                    ToolCallClassification::Observation
+                } else {
+                    ToolCallClassification::Mutation
+                }
+            }
+        }
+
+        let started_at_ms = current_time_ms();
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(budget_config(20, 6), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(ClassifiedRunCommandExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let goal = SubGoal {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+            completion_contract: SubGoalContract::from_definition_of_done(Some("Scaffolded skill")),
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![
+            Ok(CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: serde_json::json!({"command":"ls ~/fawx/skills"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+            Ok(text_response("I inspected the skill directory.")),
+            Ok(text_response("I still need to scaffold it.")),
+        ]);
+
+        let execution = engine
+            .run_sub_goal(&goal, BudgetConfig::default(), &llm, &[], &[])
+            .await;
+
+        let SubGoalOutcome::Incomplete(message) = &execution.result.outcome else {
+            panic!("expected incomplete sub-goal outcome")
+        };
+        assert!(message.contains("scaffold"), "{message}");
+        let used_tools = successful_tool_names(&execution.result.signals);
+        let used_mutation_tools = successful_mutation_tool_names(&execution.result.signals);
+        assert!(used_tools.contains("run_command"));
+        assert!(
+            !used_mutation_tools.contains("run_command"),
+            "read-only run_command should not satisfy required mutation work"
         );
     }
 
@@ -11983,12 +15162,14 @@ mod decomposition_tests {
             .execute_decomposition(
                 &Decision::Decompose(plan.clone()),
                 &plan,
-                &ScriptedLlm::new(vec![Ok(text_response("ok"))]),
+                &ScriptedLlm::new(vec![Ok(text_response("Summary of findings"))]),
                 &[],
             )
             .await
             .expect("decomposition");
-        assert!(action.response_text.contains("completed: ok"));
+        assert!(action
+            .response_text
+            .contains("completed: Summary of findings"));
     }
 
     #[test]
@@ -12503,6 +15684,7 @@ mod context_compaction_tests {
         assert!(engine.cancel_token.is_none());
         assert!(engine.input_channel.is_none());
         assert!(engine.event_bus.is_none());
+        assert_eq!(engine.execution_visibility, ExecutionVisibility::Public);
         assert_eq!(
             engine.compaction_config.slide_threshold,
             defaults.slide_threshold
@@ -12626,6 +15808,7 @@ mod context_compaction_tests {
         assert!(engine.cancel_token.is_some());
         assert!(engine.input_channel.is_some());
         assert!(engine.event_bus.is_some());
+        assert_eq!(engine.execution_visibility, ExecutionVisibility::Public);
         assert_eq!(
             engine.conversation_budget.conversation_budget(),
             config.model_context_limit
@@ -13041,13 +16224,13 @@ mod context_compaction_tests {
         let goal = SubGoal {
             description: "child task".to_string(),
             required_tools: Vec::new(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: None,
         };
         let child_budget = BudgetConfig::default();
 
         let _execution = engine
-            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60))
+            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60), &[])
             .await;
 
         let requests = llm.requests();
@@ -13065,7 +16248,7 @@ mod context_compaction_tests {
         let goal = SubGoal {
             description: "child task".to_string(),
             required_tools: Vec::new(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: None,
         };
         let protected = vec![
@@ -13077,7 +16260,7 @@ mod context_compaction_tests {
         let child_budget = BudgetConfig::default();
 
         let execution = engine
-            .run_sub_goal(&goal, child_budget, &llm, &protected)
+            .run_sub_goal(&goal, child_budget, &llm, &protected, &[])
             .await;
         let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
             panic!("expected failed sub-goal outcome")
@@ -14270,13 +17453,13 @@ mod context_compaction_tests {
                 SubGoal {
                     description: "child-a".to_string(),
                     required_tools: Vec::new(),
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: None,
                 },
                 SubGoal {
                     description: "child-b".to_string(),
                     required_tools: Vec::new(),
-                    expected_output: None,
+                    completion_contract: SubGoalContract::from_definition_of_done(None),
                     complexity_hint: None,
                 },
             ],
@@ -14669,7 +17852,11 @@ mod r2_streaming_review_tests {
             })]));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
 
@@ -14718,7 +17905,11 @@ mod r2_streaming_review_tests {
         let mut stream: CompletionStream = Box::pin(delayed);
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("stream consumed");
         cancel_task.await.expect("cancel task");
@@ -14751,7 +17942,11 @@ mod r2_streaming_review_tests {
         let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
 
         let error = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect_err("stream should fail");
         assert!(error.reason.contains("stream consumption failed"));
@@ -14867,7 +18062,11 @@ mod r2_streaming_review_tests {
         >::new()));
 
         let response = engine
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .consume_stream_with_events(
+                &mut stream,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            )
             .await
             .expect("empty stream consumed");
 
@@ -15008,9 +18207,9 @@ mod r2_streaming_review_tests {
 
 #[cfg(test)]
 mod loop_resilience_tests {
-    use super::test_fixtures::RecordingLlm;
+    use super::test_fixtures::{text_response, tool_use_response, RecordingLlm};
     use super::*;
-    use crate::act::{ToolExecutor, ToolResult};
+    use crate::act::{ToolCallClassification, ToolExecutor, ToolResult};
     use crate::budget::{ActionCost, BudgetConfig, BudgetTracker, TerminationConfig};
     use crate::cancellation::CancellationToken;
     use crate::context_manager::ContextCompactor;
@@ -15050,6 +18249,444 @@ mod loop_resilience_tests {
                 description: "Read a file".to_string(),
                 parameters: serde_json::json!({"type":"object"}),
             }]
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ObservationMixedToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ObservationMixedToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "write_file" => crate::act::ToolCacheability::SideEffect,
+                "read_file" => crate::act::ToolCacheability::Cacheable,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DirectUtilityToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for DirectUtilityToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: match call.name.as_str() {
+                        "weather" => "Bradenton, Florida is sunny and about 66F.".to_string(),
+                        "current_time" => "2026-03-28T07:05:00-06:00".to_string(),
+                        other => format!("{other} ok"),
+                    },
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "weather".to_string(),
+                    description: "Get the weather for a location".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "City or location to check weather for"
+                            },
+                            "units": {
+                                "type": "string",
+                                "description": "Optional units override"
+                            }
+                        },
+                        "required": ["location"],
+                        "x-fawx-direct-utility": {
+                            "enabled": true,
+                            "profile": "weather",
+                            "trigger_patterns": ["weather", "forecast"]
+                        }
+                    }),
+                },
+                ToolDefinition {
+                    name: "current_time".to_string(),
+                    description: "Get the current time".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{},
+                        "required": [],
+                        "x-fawx-direct-utility": {
+                            "enabled": true,
+                            "profile": "current_time",
+                            "trigger_patterns": [
+                                "current time",
+                                "what time",
+                                "what's the time",
+                                "whats the time",
+                                "time is it"
+                            ]
+                        }
+                    }),
+                },
+                ToolDefinition {
+                    name: "web_search".to_string(),
+                    description: "Search the web".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a shell command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "run_command" => crate::act::ToolCacheability::SideEffect,
+                "weather" | "web_search" => crate::act::ToolCacheability::Cacheable,
+                "current_time" => crate::act::ToolCacheability::NeverCache,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingDirectWeatherExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingDirectWeatherExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: "No weather results found for 'Denver, CO'.".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "weather".to_string(),
+                description: "Get the weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City or location to check weather for"
+                        }
+                    },
+                    "required": ["location"],
+                    "x-fawx-direct-utility": {
+                        "enabled": true,
+                        "profile": "weather",
+                        "trigger_patterns": ["weather", "forecast"]
+                    }
+                }),
+            }]
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> crate::act::ToolCacheability {
+            crate::act::ToolCacheability::Cacheable
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ObservationMixedNoDecomposeExecutor;
+
+    #[derive(Debug, Default)]
+    struct LegacyWrappedWeatherExecutor;
+
+    #[derive(Debug, Default)]
+    struct UnannotatedStructuredWeatherExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for LegacyWrappedWeatherExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "weather".to_string(),
+                description: "Get the weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "JSON input for the WASM skill"
+                        }
+                    },
+                    "required": ["input"]
+                }),
+            }]
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> crate::act::ToolCacheability {
+            crate::act::ToolCacheability::Cacheable
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for UnannotatedStructuredWeatherExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "weather".to_string(),
+                description: "Get the weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City or location to check weather for"
+                        }
+                    },
+                    "required": ["location"]
+                }),
+            }]
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> crate::act::ToolCacheability {
+            crate::act::ToolCacheability::Cacheable
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ObservationMixedNoDecomposeExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            if let Some(call) = calls.iter().find(|call| call.name == DECOMPOSE_TOOL_NAME) {
+                return Err(crate::act::ToolExecutorError {
+                    message: format!("decompose leaked to tool executor: {}", call.id),
+                    recoverable: false,
+                });
+            }
+
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "write_file" => crate::act::ToolCacheability::SideEffect,
+                "read_file" => crate::act::ToolCacheability::Cacheable,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ObservationRunCommandExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ObservationRunCommandExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "run_command".to_string(),
+                    description: "Run a command".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "run_command" | "write_file" => crate::act::ToolCacheability::SideEffect,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+
+        fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+            if call.name == "run_command"
+                && call.arguments.get("command")
+                    == Some(&serde_json::Value::String("cat README.md".to_string()))
+            {
+                ToolCallClassification::Observation
+            } else {
+                ToolCallClassification::Mutation
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingBoundedLocalEditExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingBoundedLocalEditExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: match call.name.as_str() {
+                        "edit_file" => "old_text not found in file".to_string(),
+                        "read_file" | "search_text" => "ok".to_string(),
+                        _ => "blocked".to_string(),
+                    },
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "search_text".to_string(),
+                    description: "Search text".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "edit_file".to_string(),
+                    description: "Edit a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "edit_file" | "write_file" => crate::act::ToolCacheability::SideEffect,
+                "read_file" | "search_text" => crate::act::ToolCacheability::Cacheable,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
         }
     }
 
@@ -15137,6 +18774,35 @@ mod loop_resilience_tests {
             .context(ContextCompactor::new(2048, 256))
             .max_iterations(3)
             .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn mixed_tool_engine(config: BudgetConfig) -> LoopEngine {
+        mixed_tool_engine_with_executor(config, Arc::new(ObservationMixedToolExecutor))
+    }
+
+    fn mixed_tool_engine_with_executor(
+        config: BudgetConfig,
+        tool_executor: Arc<dyn ToolExecutor>,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn run_command_observation_engine(config: BudgetConfig) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(ObservationRunCommandExecutor))
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("build")
@@ -15270,7 +18936,7 @@ mod loop_resilience_tests {
             sub_goals: vec![fx_decompose::SubGoal {
                 description: "sub-goal".to_string(),
                 required_tools: vec![],
-                expected_output: None,
+                completion_contract: SubGoalContract::from_definition_of_done(None),
                 complexity_hint: None,
             }],
             strategy: fx_decompose::AggregationStrategy::Sequential,
@@ -15637,6 +19303,598 @@ mod loop_resilience_tests {
     }
 
     #[tokio::test]
+    async fn reason_strip_preserves_mutation_tools_when_available() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                nudge_after_tool_turns: 3,
+                strip_tools_after_nudge: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let mut engine = mixed_tool_engine(config);
+        engine.consecutive_tool_turns = 3;
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "ready to implement".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("Implement it now"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "write_file"),
+            "mutation tools should remain available after progress strip"
+        );
+        assert!(
+            !requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read_file"),
+            "read-only tools should be removed after progress strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_weather_profile_limits_reasoning_to_weather_and_disables_decompose() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(DirectUtilityToolExecutor),
+        );
+        let processed = engine
+            .perceive(&test_snapshot("What's the weather in Bradenton Florida?"))
+            .await
+            .expect("perceive");
+        assert!(matches!(
+            engine.turn_execution_profile,
+            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather)
+        ));
+
+        let llm = RecordingLlm::ok(Vec::new());
+
+        let response = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        assert!(
+            llm.requests().is_empty(),
+            "direct tool path should bypass the LLM"
+        );
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "weather");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"location":"Bradenton Florida"})
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_weather_tool_round_finishes_after_answering_from_results() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(DirectUtilityToolExecutor),
+        );
+        engine.turn_execution_profile =
+            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather);
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "weather-1".to_string(),
+            name: "weather".to_string(),
+            arguments: serde_json::json!({"location":"Bradenton, Florida"}),
+        }]);
+        let llm = RecordingLlm::ok(Vec::new());
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user("What's the weather in Bradenton Florida?")],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        match action.next_step {
+            ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+                assert_eq!(response, "Bradenton, Florida is sunny and about 66F.");
+            }
+            other => panic!("expected direct tool completion, got {other:?}"),
+        }
+        assert!(
+            llm.requests().is_empty(),
+            "direct tool answers should not need a follow-up completion request"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_weather_failure_returns_clean_kernel_authored_response() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(FailingDirectWeatherExecutor),
+        );
+        engine.turn_execution_profile =
+            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather);
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "weather-1".to_string(),
+            name: "weather".to_string(),
+            arguments: serde_json::json!({"location":"Denver, CO"}),
+        }]);
+        let llm = RecordingLlm::ok(Vec::new());
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user("What's the weather in Denver, CO?")],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        match action.next_step {
+            ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+                assert_eq!(
+                    response,
+                    "I couldn't get the weather right now: No weather results found for 'Denver, CO'."
+                );
+            }
+            other => panic!("expected direct tool completion, got {other:?}"),
+        }
+        assert!(
+            llm.requests().is_empty(),
+            "direct tool failures should not fall back into a follow-up completion request"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_weather_reason_asks_for_location_when_missing() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(DirectUtilityToolExecutor),
+        );
+        let processed = engine
+            .perceive(&test_snapshot("What's the weather?"))
+            .await
+            .expect("perceive");
+        let llm = RecordingLlm::ok(Vec::new());
+
+        let response = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        assert!(
+            llm.requests().is_empty(),
+            "direct tool path should bypass the LLM"
+        );
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            extract_response_text(&response),
+            "Please tell me the city or location you want weather for."
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_wrapped_weather_schema_does_not_trigger_direct_utility_profile() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(LegacyWrappedWeatherExecutor),
+        );
+        let _processed = engine
+            .perceive(&test_snapshot("What's the weather in Miami?"))
+            .await
+            .expect("perceive");
+
+        assert!(matches!(
+            engine.turn_execution_profile,
+            TurnExecutionProfile::Standard
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_weather_schema_without_direct_utility_metadata_does_not_trigger_profile() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(UnannotatedStructuredWeatherExecutor),
+        );
+        let _processed = engine
+            .perceive(&test_snapshot("What's the weather in Miami?"))
+            .await
+            .expect("perceive");
+
+        assert!(matches!(
+            engine.turn_execution_profile,
+            TurnExecutionProfile::Standard
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_tool_continuation_requests_mutation_only_next() {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]);
+        let llm = SequentialMockLlm::new(vec![text_response(
+            "I have enough context to implement it now.",
+        )]);
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user("Research first, then implement.")],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        match action.next_step {
+            ActionNextStep::Continue(continuation) => {
+                assert_eq!(
+                    continuation.next_tool_scope,
+                    Some(ContinuationToolScope::MutationOnly)
+                );
+                assert_eq!(
+                    continuation.turn_commitment,
+                    Some(TurnCommitment::ProceedUnderConstraints(
+                        ProceedUnderConstraints {
+                            goal: "Continue the active task with concrete execution using the selected tools: read_file".to_string(),
+                            success_target: Some(
+                                "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research.".to_string()
+                            ),
+                            unsupported_items: Vec::new(),
+                            assumptions: Vec::new(),
+                            allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                        }
+                    ))
+                );
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_mutation_only_scope_limits_next_reasoning_pass() {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("I have enough context to implement now.".to_string()),
+                Some("Proceed with implementation.".to_string()),
+            )
+            .with_tool_scope(ContinuationToolScope::MutationOnly)
+            .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Implement the committed local skill changes.".to_string(),
+                    success_target: Some(
+                        "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research.".to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen X API rate-limit research.".to_string()],
+                    assumptions: vec!["Current research is sufficient to begin implementation.".to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                },
+            )),
+            &[],
+        );
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "I'll implement it now.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("Keep going"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "write_file"),
+            "mutation tools should remain available under continuation scope"
+        );
+        assert!(
+            !requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read_file"),
+            "observation tools should be hidden under continuation scope"
+        );
+        let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+        assert!(system_prompt.contains("Turn commitment:"));
+        assert!(system_prompt.contains("committed constrained execution plan"));
+        assert!(system_prompt.contains("Implement the committed local skill changes."));
+        assert!(system_prompt.contains("Do not reopen X API rate-limit research."));
+    }
+
+    #[tokio::test]
+    async fn pending_turn_commitment_persists_when_later_continuation_omits_replacement() {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("Spec written.".to_string()),
+                Some("Proceed with local implementation.".to_string()),
+            )
+            .with_tool_scope(ContinuationToolScope::MutationOnly)
+            .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Implement the committed local skill changes.".to_string(),
+                    success_target: Some(
+                        "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research.".to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen web research.".to_string()],
+                    assumptions: vec!["The spec file already exists.".to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                },
+            )),
+            &[],
+        );
+
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("Wrote the spec file.".to_string()),
+                Some("Continuing into implementation.".to_string()),
+            ),
+            &[],
+        );
+
+        assert_eq!(
+            engine.pending_tool_scope,
+            Some(ContinuationToolScope::MutationOnly)
+        );
+        assert_eq!(
+            engine.pending_turn_commitment,
+            Some(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Implement the committed local skill changes.".to_string(),
+                    success_target: Some(
+                        "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research.".to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen web research.".to_string()],
+                    assumptions: vec!["The spec file already exists.".to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                }
+            ))
+        );
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Continuing implementation.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("Keep going"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "write_file"),
+            "mutation tools should still be available"
+        );
+        assert!(
+            !requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read_file"),
+            "observation tools should stay hidden while commitment is active"
+        );
+        let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+        assert!(system_prompt.contains("Implement the committed local skill changes."));
+        assert!(system_prompt.contains("Do not reopen web research."));
+    }
+
+    #[tokio::test]
+    async fn artifact_gate_limits_next_reasoning_pass_to_write_file() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("The X skill spec is ready to materialize.".to_string()),
+                Some("Write the requested spec file next.".to_string()),
+            )
+            .with_tool_scope(ContinuationToolScope::MutationOnly)
+            .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Write the requested X skill spec, then continue local implementation."
+                        .to_string(),
+                    success_target: Some(
+                        "Materialize the requested ~/.fawx/x.md spec before broader implementation work."
+                            .to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen web research before writing the spec."
+                        .to_string()],
+                    assumptions: vec!["Current research is sufficient to write the spec artifact."
+                        .to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                },
+            ))
+            .with_artifact_write_target("~/.fawx/x.md".to_string()),
+            &[],
+        );
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Writing the spec now.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("Keep going"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            tool_names,
+            vec!["write_file"],
+            "artifact gate should collapse the next public tool surface to write_file"
+        );
+        let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+        assert!(system_prompt.contains("Turn commitment:"));
+        assert!(system_prompt.contains("Artifact gate:"));
+        assert!(system_prompt.contains("~/.fawx/x.md"));
+        assert!(system_prompt.contains("Do not reopen web research before writing the spec."));
+    }
+
+    #[tokio::test]
+    async fn artifact_gate_clears_after_successful_write_and_preserves_broader_commitment() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        let home = std::env::var("HOME").expect("HOME");
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("The X skill spec is ready to materialize.".to_string()),
+                Some("Write the requested spec file next.".to_string()),
+            )
+            .with_tool_scope(ContinuationToolScope::MutationOnly)
+            .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Write the requested X skill spec, then continue local implementation."
+                        .to_string(),
+                    success_target: Some(
+                        "Materialize the requested ~/.fawx/x.md spec before broader implementation work."
+                            .to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen web research before writing the spec."
+                        .to_string()],
+                    assumptions: vec!["Current research is sufficient to write the spec artifact."
+                        .to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                },
+            ))
+            .with_artifact_write_target("~/.fawx/x.md".to_string()),
+            &[],
+        );
+
+        engine.apply_pending_turn_commitment(
+            &ActionContinuation::new(
+                Some("Spec written.".to_string()),
+                Some("Continue with local implementation.".to_string()),
+            ),
+            &[ToolResult {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write_file".to_string(),
+                success: true,
+                output: format!("wrote 64 bytes to {home}/.fawx/x.md"),
+            }],
+        );
+
+        assert!(engine.pending_artifact_write_target.is_none());
+        assert_eq!(
+            engine.pending_tool_scope,
+            Some(ContinuationToolScope::MutationOnly)
+        );
+        assert_eq!(
+            engine.pending_turn_commitment,
+            Some(TurnCommitment::ProceedUnderConstraints(
+                ProceedUnderConstraints {
+                    goal: "Write the requested X skill spec, then continue local implementation."
+                        .to_string(),
+                    success_target: Some(
+                        "Materialize the requested ~/.fawx/x.md spec before broader implementation work."
+                            .to_string(),
+                    ),
+                    unsupported_items: vec!["Do not reopen web research before writing the spec."
+                        .to_string()],
+                    assumptions: vec!["Current research is sufficient to write the spec artifact."
+                        .to_string()],
+                    allowed_tools: Some(ContinuationToolScope::MutationOnly),
+                }
+            ))
+        );
+
+        let llm = RecordingLlm::ok(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Continuing with local implementation.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let processed = engine
+            .perceive(&test_snapshot("Keep going"))
+            .await
+            .expect("perceive");
+        let _ = engine
+            .reason(&processed, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "write_file"),
+            "mutation tools should remain available after the artifact gate clears"
+        );
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "run_command"),
+            "the broader mutation-only commitment should survive after the artifact write"
+        );
+        let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+        assert!(system_prompt.contains("Turn commitment:"));
+        assert!(!system_prompt.contains("Artifact gate:"));
+    }
+
+    #[tokio::test]
     async fn tools_not_stripped_before_grace() {
         let config = BudgetConfig {
             termination: TerminationConfig {
@@ -15683,6 +19941,9 @@ mod loop_resilience_tests {
         );
     }
 
+    #[path = "bounded_local_tests.rs"]
+    mod bounded_local_tests;
+
     #[tokio::test]
     async fn synthesis_skipped_when_disabled() {
         let config = BudgetConfig {
@@ -15717,6 +19978,11 @@ mod loop_resilience_tests {
     }
 
     fn tool_action(response_text: &str) -> ActionResult {
+        let normalized = normalize_response_text(response_text);
+        let partial_response = (!normalized.is_empty()).then_some(normalized.clone());
+        let context_message = partial_response
+            .clone()
+            .or_else(|| Some("Tool execution completed: read_file".to_string()));
         ActionResult {
             decision: Decision::UseTools(Vec::new()),
             tool_results: vec![ToolResult {
@@ -15727,6 +19993,10 @@ mod loop_resilience_tests {
             }],
             response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                partial_response,
+                context_message,
+            )),
         }
     }
 
@@ -15736,6 +20006,9 @@ mod loop_resilience_tests {
             tool_results: Vec::new(),
             response_text: response_text.to_string(),
             tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: response_text.to_string(),
+            }),
         }
     }
 
@@ -15747,6 +20020,260 @@ mod loop_resilience_tests {
         assert_eq!(config.strip_tools_after_nudge, 3);
         assert_eq!(config.tool_round_nudge_after, 4);
         assert_eq!(config.tool_round_strip_after_nudge, 2);
+        assert_eq!(config.observation_only_round_nudge_after, 2);
+        assert_eq!(config.observation_only_round_strip_after_nudge, 1);
+    }
+
+    #[test]
+    fn observation_only_round_nudges_before_stripping() {
+        let config = BudgetConfig::default();
+        let mut engine = mixed_tool_engine(config);
+        engine.consecutive_observation_only_rounds = 2;
+        let mut continuation_messages = Vec::new();
+
+        let tools = engine.apply_tool_round_progress_policy(0, &mut continuation_messages);
+
+        assert_eq!(tools.len(), 2, "nudge threshold should not strip tools yet");
+        assert!(continuation_messages.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("Stop doing more read-only research"),
+                _ => false,
+            })
+        }));
+    }
+
+    #[test]
+    fn observation_only_rounds_strip_to_side_effect_tools() {
+        let config = BudgetConfig::default();
+        let mut engine = mixed_tool_engine(config);
+        engine.consecutive_observation_only_rounds = 3;
+        let mut continuation_messages = Vec::new();
+
+        let tools = engine.apply_tool_round_progress_policy(0, &mut continuation_messages);
+
+        assert_eq!(tools.len(), 1, "only side-effect tools should remain");
+        assert_eq!(tools[0].name, "write_file");
+    }
+
+    #[test]
+    fn tool_round_strip_preserves_mutation_tools_when_available() {
+        let config = BudgetConfig {
+            termination: TerminationConfig {
+                tool_round_nudge_after: 1,
+                tool_round_strip_after_nudge: 0,
+                ..TerminationConfig::default()
+            },
+            ..BudgetConfig::default()
+        };
+        let engine = mixed_tool_engine(config);
+        let mut continuation_messages = Vec::new();
+
+        let tools = engine.apply_tool_round_progress_policy(1, &mut continuation_messages);
+
+        assert_eq!(tools.len(), 1, "progress strip should keep mutation tools");
+        assert_eq!(tools[0].name, "write_file");
+    }
+
+    #[test]
+    fn record_tool_round_kind_resets_after_side_effect_round() {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        engine.consecutive_observation_only_rounds = 2;
+
+        engine.record_tool_round_kind(&[ToolCall {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path":"/tmp/out.txt","content":"hi"}),
+        }]);
+
+        assert_eq!(engine.consecutive_observation_only_rounds, 0);
+    }
+
+    #[test]
+    fn record_tool_round_kind_treats_read_only_run_command_as_observation() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+
+        engine.record_tool_round_kind(&[ToolCall {
+            id: "call-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command":"cat README.md"}),
+        }]);
+
+        assert_eq!(engine.consecutive_observation_only_rounds, 1);
+    }
+
+    #[tokio::test]
+    async fn observation_only_restriction_blocks_read_only_run_command_calls() {
+        let mut engine = run_command_observation_engine(BudgetConfig::default());
+        engine.consecutive_observation_only_rounds = 3;
+
+        let results = engine
+            .execute_tool_calls(&[
+                ToolCall {
+                    id: "call-1".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: serde_json::json!({"command":"cat README.md"}),
+                },
+                ToolCall {
+                    id: "call-2".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path":"/tmp/out.txt","content":"hi"}),
+                },
+            ])
+            .await
+            .expect("results");
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].success);
+        assert!(results[0]
+            .output
+            .contains("read-only inspection is disabled"));
+        assert!(results[1].success);
+    }
+
+    #[tokio::test]
+    async fn observation_only_restriction_returns_incomplete_after_replan_without_executing_tools()
+    {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        engine.consecutive_observation_only_rounds = 3;
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]);
+        let llm = SequentialMockLlm::new(vec![text_response(
+            "Current findings are enough to begin implementation.",
+        )]);
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user(
+                    "Research the API and summarize what you found",
+                )],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        assert_eq!(action.response_text, "");
+        assert_eq!(action.tool_results.len(), 1);
+        assert!(!action.tool_results[0].success);
+        assert!(action.tool_results[0]
+            .output
+            .contains("read-only inspection is disabled"));
+        match action.next_step {
+            ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response,
+                reason,
+            }) => {
+                assert_eq!(
+                    partial_response.as_deref(),
+                    Some("Current findings are enough to begin implementation.")
+                );
+                assert_eq!(reason, OBSERVATION_ONLY_CALL_BLOCK_REASON);
+            }
+            other => panic!("expected incomplete terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_only_restriction_replans_with_mutation_only_tools() {
+        let mut engine = mixed_tool_engine(BudgetConfig::default());
+        engine.consecutive_observation_only_rounds = 3;
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]);
+        let llm = RecordingLlm::ok(vec![
+            tool_use_response(vec![ToolCall {
+                id: "call-2".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"path":"x-post/README.md","content":"spec"}),
+            }]),
+            text_response("done after write"),
+        ]);
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user(
+                    "Research, then implement once you know enough.",
+                )],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        assert_eq!(action.response_text, "done after write");
+        assert_eq!(action.tool_results.len(), 2);
+        assert_eq!(action.tool_results[0].tool_name, "read_file");
+        assert!(!action.tool_results[0].success);
+        assert_eq!(action.tool_results[1].tool_name, "write_file");
+        assert!(action.tool_results[1].success);
+
+        let requests = llm.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().any(|request| {
+            request.tools.iter().any(|tool| tool.name == "write_file")
+                && !request.tools.iter().any(|tool| tool.name == "read_file")
+        }));
+    }
+
+    #[tokio::test]
+    async fn observation_only_replan_intercepts_follow_up_decompose_before_executor() {
+        let mut engine = mixed_tool_engine_with_executor(
+            BudgetConfig::default(),
+            Arc::new(ObservationMixedNoDecomposeExecutor),
+        );
+        engine.consecutive_observation_only_rounds = 3;
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]);
+        let llm = RecordingLlm::ok(vec![
+            tool_use_response(vec![ToolCall {
+                id: "decompose-1".to_string(),
+                name: DECOMPOSE_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({
+                    "sub_goals": [{
+                        "description": "implement the skill",
+                    }],
+                    "strategy": "Sequential"
+                }),
+            }]),
+            text_response("implementation ready"),
+        ]);
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user(
+                    "Research, then break implementation into sub-goals.",
+                )],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act should succeed");
+
+        assert_eq!(action.tool_results.len(), 1);
+        assert_eq!(action.tool_results[0].tool_name, "read_file");
+        assert!(!action.tool_results[0].success);
+        assert!(action
+            .tool_results
+            .iter()
+            .all(|result| result.tool_name != DECOMPOSE_TOOL_NAME));
+        assert!(
+            action
+                .response_text
+                .contains("implement the skill => skipped (below floor)"),
+            "{}",
+            action.response_text
+        );
     }
 
     #[test]
@@ -16709,11 +21236,13 @@ mod test_fixtures {
         DecompositionPlan {
             sub_goals: descriptions
                 .iter()
-                .map(|desc| SubGoal {
-                    description: (*desc).to_string(),
-                    required_tools: Vec::new(),
-                    expected_output: Some(format!("output for {desc}")),
-                    complexity_hint: None,
+                .map(|desc| {
+                    SubGoal::with_definition_of_done(
+                        (*desc).to_string(),
+                        Vec::new(),
+                        Some(&format!("output for {desc}")),
+                        None,
+                    )
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,
@@ -16946,13 +21475,45 @@ mod error_path_coverage_tests {
             "forced synthesis must strip tools"
         );
         assert!(
-            requests[0].messages.iter().any(|message| {
-                message.content.iter().any(|block| match block {
-                    ContentBlock::Text { text } => text.contains("Your tool budget is exhausted"),
-                    _ => false,
-                })
-            }),
-            "forced synthesis should append the budget-exhausted directive"
+            requests[0]
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("Your tool budget is exhausted")),
+            "forced synthesis should append the budget-exhausted directive to the system prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_synthesis_turn_hoists_system_messages_into_system_prompt() {
+        let engine = build_engine_with_executor(
+            Arc::new(StubToolExecutor),
+            budget_config_with_llm_calls(5, 2),
+            0,
+            3,
+        );
+        let llm = RecordingLlm::ok(vec![text_response("synthesized")]);
+        let messages = vec![
+            Message::system("Runtime note: summarize tool failures clearly."),
+            Message::user("hello"),
+        ];
+
+        let result = engine.forced_synthesis_turn(&llm, &messages).await;
+        let requests = llm.requests();
+
+        assert_eq!(result.as_deref(), Some("synthesized"));
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].system_prompt.as_deref().is_some_and(
+                |prompt| prompt.contains("Runtime note: summarize tool failures clearly.")
+            ),
+            "forced synthesis should hoist runtime system messages into the system prompt"
+        );
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::System),
+            "forced synthesis should strip system messages from the message list"
         );
     }
 
@@ -16994,7 +21555,7 @@ mod error_path_coverage_tests {
         let plan = decomposition_plan(&["analyze the codebase"]);
         let decision = Decision::Decompose(plan.clone());
 
-        let llm = ScriptedLlm::ok(vec![text_response("analysis complete")]);
+        let llm = ScriptedLlm::ok(vec![text_response("analysis of the codebase complete")]);
 
         let action = engine
             .execute_decomposition(&decision, &plan, &llm, &[])
@@ -17110,7 +21671,6 @@ mod error_path_coverage_tests {
         let llm = ScriptedLlm::ok(vec![
             tool_use_response(vec![read_file_call("call-1")]),
             text_response("I was unable to read the file due to an error."),
-            // Outer loop continuation: text-only response ends the loop
             text_response("I was unable to read the file due to an error."),
         ]);
 
@@ -17125,10 +21685,11 @@ mod error_path_coverage_tests {
                 iterations,
                 ..
             } => {
-                // iteration 1: tool call + synthesis, iteration 2: continuation text-only
+                // Tool failure synthesis now feeds the next root reasoning
+                // pass instead of finalizing directly.
                 assert_eq!(
                     *iterations, 2,
-                    "expected two iterations (tool + continuation): got {iterations}"
+                    "expected root continuation after tool synthesis: got {iterations}"
                 );
                 assert!(
                     response.contains("unable to read") || response.contains("error"),
@@ -18256,7 +22817,10 @@ mod decompose_gate_tests {
     use crate::budget::BudgetConfig;
     use async_trait::async_trait;
     use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
-    use fx_llm::{CompletionRequest, CompletionResponse, ContentBlock, ProviderError, ToolCall};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, ProviderError, ToolCall,
+        ToolDefinition,
+    };
 
     #[derive(Debug, Default)]
     struct PassiveToolExecutor;
@@ -18277,6 +22841,20 @@ mod decompose_gate_tests {
                     output: "ok".to_string(),
                 })
                 .collect())
+        }
+
+        fn route_sub_goal_call(
+            &self,
+            request: &crate::act::SubGoalToolRoutingRequest,
+            call_id: &str,
+        ) -> Option<ToolCall> {
+            Some(ToolCall {
+                id: call_id.to_string(),
+                name: request.required_tools.first()?.clone(),
+                arguments: serde_json::json!({
+                    "description": request.description,
+                }),
+            })
         }
     }
 
@@ -18331,11 +22909,45 @@ mod decompose_gate_tests {
             .expect("test engine build")
     }
 
+    fn unroutable_gate_engine(config: BudgetConfig) -> LoopEngine {
+        #[derive(Debug, Default)]
+        struct UnroutableToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for UnroutableToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+        }
+
+        let started_at_ms = current_time_ms();
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(UnroutableToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
+    }
+
     fn sub_goal(description: &str, tools: &[&str], hint: Option<ComplexityHint>) -> SubGoal {
         SubGoal {
             description: description.to_string(),
             required_tools: tools.iter().map(|t| (*t).to_string()).collect(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: hint,
         }
     }
@@ -18452,6 +23064,253 @@ mod decompose_gate_tests {
                 .iter()
                 .any(|s| s.message == "decompose_batch_detected"),
             "multi-tool sub-goals are not a batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_gate_skips_direct_route_when_executor_cannot_materialize_calls() {
+        let config = BudgetConfig::default();
+        let mut engine = unroutable_gate_engine(config);
+        let llm = TextLlm;
+        let p = plan(vec![
+            sub_goal(
+                "create skill a",
+                &["run_command"],
+                Some(ComplexityHint::Trivial),
+            ),
+            sub_goal(
+                "create skill b",
+                &["run_command"],
+                Some(ComplexityHint::Trivial),
+            ),
+        ]);
+        let decision = Decision::Decompose(p.clone());
+
+        let result = engine
+            .evaluate_decompose_gates(&p, &decision, &llm, &[])
+            .await;
+
+        assert!(
+            result.is_none(),
+            "unsupported direct-routing should fall back to normal decomposition"
+        );
+        let signals = engine.signals.drain_all();
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.message == "decompose_batch_detected"),
+            "batch gate should not short-circuit when calls cannot be materialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_engine_disables_decompose_when_sub_goal_declares_required_tools() {
+        let config = BudgetConfig::default();
+        let engine = gate_engine(config.clone());
+        let timestamp_ms = current_time_ms();
+        let budget = BudgetTracker::new(config, timestamp_ms, 0);
+        let required_tool_goal = sub_goal(
+            "research the API",
+            &["web_search", "web_fetch"],
+            Some(ComplexityHint::Moderate),
+        );
+        let free_form_goal = sub_goal(
+            "reason about next steps",
+            &[],
+            Some(ComplexityHint::Moderate),
+        );
+
+        let child = engine
+            .build_child_engine(&required_tool_goal, budget.clone())
+            .expect("child engine");
+        assert_eq!(child.execution_visibility, ExecutionVisibility::Internal);
+        assert!(
+            !child.decompose_enabled,
+            "sub-goals with required tools should not re-advertise decompose"
+        );
+
+        let free_form_child = engine
+            .build_child_engine(&free_form_goal, budget)
+            .expect("free-form child engine");
+        assert_eq!(
+            free_form_child.execution_visibility,
+            ExecutionVisibility::Internal
+        );
+        assert!(
+            free_form_child.decompose_enabled,
+            "sub-goals without required tools may still decompose"
+        );
+    }
+
+    #[test]
+    fn internal_child_suppresses_public_event_bus_messages() {
+        let config = BudgetConfig::default();
+        let bus = fx_core::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let started_at_ms = current_time_ms();
+        let parent = LoopEngine::builder()
+            .budget(BudgetTracker::new(config.clone(), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(PassiveToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .event_bus(bus)
+            .build()
+            .expect("test engine build");
+        let goal = sub_goal(
+            "reason about next steps",
+            &[],
+            Some(ComplexityHint::Moderate),
+        );
+        let budget = BudgetTracker::new(config, current_time_ms(), 0);
+        let mut child = parent
+            .build_child_engine(&goal, budget)
+            .expect("child engine");
+
+        child.publish_stream_started(StreamPhase::Reason);
+        child.publish_tool_use(&ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        });
+        child.publish_tool_result(&ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        });
+        child.publish_stream_finished(StreamPhase::Reason);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "internal child should be silent on the public bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_engine_scopes_tool_surface_to_required_tools() {
+        #[derive(Debug, Default)]
+        struct SurfaceToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for SurfaceToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![
+                    ToolDefinition {
+                        name: "search_text".to_string(),
+                        description: "Search repository text".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {"pattern": {"type": "string"}},
+                            "required": ["pattern"]
+                        }),
+                    },
+                    ToolDefinition {
+                        name: "current_time".to_string(),
+                        description: "Get the current time".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }),
+                    },
+                ]
+            }
+        }
+
+        let config = BudgetConfig::default();
+        let started_at_ms = current_time_ms();
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config.clone(), started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(SurfaceToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let child_budget = BudgetTracker::new(config, current_time_ms(), 0);
+        let goal = sub_goal(
+            "Search for X API endpoints",
+            &["search_text"],
+            Some(ComplexityHint::Moderate),
+        );
+
+        let child = engine
+            .build_child_engine(&goal, child_budget)
+            .expect("child engine");
+        let tool_names: Vec<String> = child
+            .tool_executor
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(tool_names, vec!["search_text"]);
+
+        let blocked = child
+            .tool_executor
+            .execute_tools(
+                &[ToolCall {
+                    id: "call-1".to_string(),
+                    name: "current_time".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                None,
+            )
+            .await
+            .expect("blocked result");
+        assert_eq!(blocked.len(), 1);
+        assert!(!blocked[0].success);
+        assert!(blocked[0].output.contains("search_text"));
+    }
+
+    #[tokio::test]
+    async fn decide_drops_disallowed_decompose_tool_call_to_text_response() {
+        let config = BudgetConfig::default();
+        let started_at_ms = current_time_ms();
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, started_at_ms, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(PassiveToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .allow_decompose(false)
+            .build()
+            .expect("test engine build");
+        let response = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Proceed with implementation.".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "decompose-1".to_string(),
+                name: DECOMPOSE_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({
+                    "sub_goals": [{"description": "nested"}]
+                }),
+            }],
+            usage: Default::default(),
+            stop_reason: None,
+        };
+
+        let decision = engine.decide(&response).await.expect("decision");
+        assert_eq!(
+            decision,
+            Decision::Respond("Proceed with implementation.".to_string())
         );
     }
 
@@ -19217,12 +24076,19 @@ mod kernel_loadable_boundary_tests {
     #[test]
     fn t11_tool_failure_emits_friction_signal() {
         let mut engine = build_engine();
-        engine.emit_action_signals(&[ToolResult {
-            tool_call_id: "call-1".into(),
-            tool_name: "dangerous_tool".into(),
-            success: false,
-            output: "permission denied".into(),
-        }]);
+        engine.emit_action_signals(
+            &[ToolCall {
+                id: "call-1".into(),
+                name: "dangerous_tool".into(),
+                arguments: serde_json::json!({}),
+            }],
+            &[ToolResult {
+                tool_call_id: "call-1".into(),
+                tool_name: "dangerous_tool".into(),
+                success: false,
+                output: "permission denied".into(),
+            }],
+        );
 
         let friction: Vec<_> = engine
             .signals
@@ -19238,12 +24104,19 @@ mod kernel_loadable_boundary_tests {
     #[test]
     fn t11_tool_success_emits_success_signal() {
         let mut engine = build_engine();
-        engine.emit_action_signals(&[ToolResult {
-            tool_call_id: "call-1".into(),
-            tool_name: "read_file".into(),
-            success: true,
-            output: "content".into(),
-        }]);
+        engine.emit_action_signals(
+            &[ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            &[ToolResult {
+                tool_call_id: "call-1".into(),
+                tool_name: "read_file".into(),
+                success: true,
+                output: "content".into(),
+            }],
+        );
 
         let success: Vec<_> = engine
             .signals
@@ -19253,6 +24126,7 @@ mod kernel_loadable_boundary_tests {
             .collect();
         assert_eq!(success.len(), 1);
         assert!(success[0].message.contains("read_file"));
+        assert_eq!(success[0].metadata["classification"], "observation");
     }
 
     // ── T-13: Decomposition depth limiting ──
@@ -19289,8 +24163,8 @@ mod kernel_loadable_boundary_tests {
             sub_goals: vec![fx_decompose::SubGoal {
                 description: "malicious sub-goal".into(),
                 required_tools: vec![],
+                completion_contract: SubGoalContract::from_definition_of_done(None),
                 complexity_hint: None,
-                expected_output: None,
             }],
             strategy: fx_decompose::AggregationStrategy::Sequential,
             truncated_from: None,

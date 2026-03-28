@@ -82,11 +82,11 @@ impl SubGoalDispatcher for SequentialDispatcher {
 
             match self.executor.execute(goal, experiment, &results).await {
                 Ok(result) => {
-                    let event = if matches!(result.outcome, SubGoalOutcome::Failed(_)) {
+                    let event = if sub_goal_outcome_is_terminal_failure(&result.outcome) {
                         failed = true;
                         DecompositionEvent::SubGoalFailed {
                             index,
-                            error: "execution returned failure".to_owned(),
+                            error: sub_goal_outcome_error(&result.outcome),
                         }
                     } else {
                         DecompositionEvent::SubGoalCompleted { index }
@@ -155,7 +155,7 @@ impl SubGoalDispatcher for ParallelDispatcher {
                 .map_err(|error| DecomposeError::DispatchFailed(error.to_string()))?;
             match result {
                 Ok(sub_goal_result) => {
-                    emit(progress, DecompositionEvent::SubGoalCompleted { index });
+                    emit(progress, progress_event_for_result(index, &sub_goal_result));
                     results[index] = Some(sub_goal_result);
                 }
                 Err(error) => {
@@ -231,7 +231,7 @@ impl SubGoalDispatcher for DagDispatcher {
                     .map_err(|error| DecomposeError::DispatchFailed(error.to_string()))?;
                 match result {
                     Ok(sub_goal_result) => {
-                        emit(progress, DecompositionEvent::SubGoalCompleted { index });
+                        emit(progress, progress_event_for_result(index, &sub_goal_result));
                         all_results[index] = Some(sub_goal_result);
                     }
                     Err(error) => {
@@ -319,6 +319,41 @@ fn failed_result(goal: &SubGoal, error: &str) -> SubGoalResult {
     }
 }
 
+fn progress_event_for_result(index: usize, result: &SubGoalResult) -> DecompositionEvent {
+    if sub_goal_outcome_is_terminal_failure(&result.outcome) {
+        DecompositionEvent::SubGoalFailed {
+            index,
+            error: sub_goal_outcome_error(&result.outcome),
+        }
+    } else {
+        DecompositionEvent::SubGoalCompleted { index }
+    }
+}
+
+fn sub_goal_outcome_is_terminal_failure(outcome: &SubGoalOutcome) -> bool {
+    matches!(
+        outcome,
+        SubGoalOutcome::Incomplete(_)
+            | SubGoalOutcome::Failed(_)
+            | SubGoalOutcome::BudgetExhausted { .. }
+    )
+}
+
+fn sub_goal_outcome_error(outcome: &SubGoalOutcome) -> String {
+    match outcome {
+        SubGoalOutcome::Incomplete(message) => {
+            format!("execution returned incomplete result: {message}")
+        }
+        SubGoalOutcome::Failed(message) => message.clone(),
+        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
+            .clone()
+            .unwrap_or_else(|| "budget exhausted".to_owned()),
+        SubGoalOutcome::Completed(_) | SubGoalOutcome::Skipped => {
+            "sub-goal did not complete successfully".to_owned()
+        }
+    }
+}
+
 fn emit(progress: Option<&DecompositionProgressCallback>, event: DecompositionEvent) {
     if let Some(callback) = progress {
         callback(&event);
@@ -328,7 +363,7 @@ fn emit(progress: Option<&DecompositionProgressCallback>, event: DecompositionEv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ComplexityHint;
+    use crate::{ComplexityHint, SubGoalContract};
 
     fn sample_experiment() -> Experiment {
         Experiment {
@@ -339,11 +374,13 @@ mod tests {
     fn plan(count: usize, strategy: AggregationStrategy) -> DecompositionPlan {
         DecompositionPlan {
             sub_goals: (0..count)
-                .map(|index| SubGoal {
-                    description: format!("Goal {index}"),
-                    required_tools: vec![],
-                    expected_output: None,
-                    complexity_hint: Some(ComplexityHint::Trivial),
+                .map(|index| {
+                    SubGoal::new(
+                        format!("Goal {index}"),
+                        vec![],
+                        SubGoalContract::default(),
+                        Some(ComplexityHint::Trivial),
+                    )
                 })
                 .collect(),
             strategy,
@@ -386,6 +423,32 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert!(matches!(results[0].outcome, SubGoalOutcome::Completed(_)));
         assert!(matches!(results[1].outcome, SubGoalOutcome::Failed(_)));
+        assert!(matches!(results[2].outcome, SubGoalOutcome::Skipped));
+    }
+
+    #[tokio::test]
+    async fn sequential_fail_fast_skips_after_budget_exhaustion() {
+        let executor = Arc::new(MockSubGoalExecutor::new(vec![
+            SubGoalOutcome::Completed("ok".to_owned()),
+            SubGoalOutcome::BudgetExhausted {
+                partial_response: Some("enough research for implementation".to_owned()),
+            },
+            SubGoalOutcome::Completed("ok".to_owned()),
+        ]));
+        let dispatcher = SequentialDispatcher::new(executor, true);
+        let plan = plan(3, AggregationStrategy::Sequential);
+
+        let results = dispatcher
+            .dispatch(&plan, &sample_experiment(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].outcome, SubGoalOutcome::Completed(_)));
+        assert!(matches!(
+            results[1].outcome,
+            SubGoalOutcome::BudgetExhausted { .. }
+        ));
         assert!(matches!(results[2].outcome, SubGoalOutcome::Skipped));
     }
 

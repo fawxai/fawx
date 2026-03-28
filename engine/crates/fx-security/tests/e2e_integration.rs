@@ -200,6 +200,7 @@ async fn test_skill_invocation_infrastructure() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![],
+        tools: vec![],
         entry_point: "run".to_string(),
     };
 
@@ -262,6 +263,7 @@ async fn test_skill_invocation_audit_trail() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![],
+        tools: vec![],
         entry_point: "run".to_string(),
     };
 
@@ -328,6 +330,7 @@ async fn test_skill_capability_manifest_verification() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![Capability::Network],
+        tools: vec![],
         entry_point: "main".to_string(),
     };
 
@@ -349,6 +352,7 @@ async fn test_skill_network_capability_denied() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![], // No Network capability
+        tools: vec![],
         entry_point: "main".to_string(),
     };
 

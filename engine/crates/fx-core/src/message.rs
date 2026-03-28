@@ -11,6 +11,16 @@ pub enum StreamPhase {
     Synthesize,
 }
 
+/// Root-owned public progress states for a streaming turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    Researching,
+    WritingArtifact,
+    Implementing,
+    AwaitingDirection,
+}
+
 /// Internal message sent between crates via the event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InternalMessage {
@@ -70,6 +80,14 @@ pub enum InternalMessage {
     StreamingFinished {
         /// Which phase finished streaming.
         phase: StreamPhase,
+    },
+
+    /// Root-owned public progress update for the current turn.
+    ProgressUpdate {
+        /// Typed progress state.
+        kind: ProgressKind,
+        /// Human-readable progress message for the UI.
+        message: String,
     },
 
     /// A tool call is about to be executed.
@@ -201,6 +219,23 @@ mod tests {
             InternalMessage::StreamingFinished {
                 phase: StreamPhase::Reason
             }
+        ));
+    }
+
+    #[test]
+    fn progress_update_roundtrip_serde() {
+        let msg = InternalMessage::ProgressUpdate {
+            kind: ProgressKind::Implementing,
+            message: "Implementing the committed plan.".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::ProgressUpdate {
+                kind: ProgressKind::Implementing,
+                message
+            } if message == "Implementing the committed plan."
         ));
     }
 

@@ -498,6 +498,65 @@ final class ChatViewModelTests: XCTestCase {
         )
     }
 
+    func testApplyFetchedMessagesReplacesOptimisticAssistantTailWithServerCompletedTurn() {
+        let sut = makeSUT()
+        let localUserMessage = SessionMessage(
+            role: .user,
+            content: "Research the X API v2 POST /2/tweets endpoint.",
+            timestamp: 11
+        )
+        let optimisticAssistant = SessionMessage(
+            role: .assistant,
+            content: "Relevant requirements for POST /2/tweets for the x-post skill...",
+            timestamp: 12
+        )
+
+        let fetchedUserMessage = SessionMessage(
+            role: .user,
+            content: localUserMessage.content,
+            timestamp: 21
+        )
+        let fetchedAssistantSummary = SessionMessage(
+            role: .assistant,
+            content: "I can't save the spec because the tool budget is exhausted.",
+            timestamp: 22
+        )
+        let fetchedAssistantDecomposition = SessionMessage(
+            role: .assistant,
+            content: "Task decomposition results:\n1. Research X API v2 POST /2/tweets => budget exhausted",
+            timestamp: 23
+        )
+
+        sut.cacheMessages([localUserMessage, optimisticAssistant], for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(
+            [
+                fetchedUserMessage,
+                fetchedAssistantSummary,
+                fetchedAssistantDecomposition,
+            ],
+            sessionID: "session-a"
+        )
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.content),
+            [
+                localUserMessage.content,
+                fetchedAssistantSummary.content,
+                fetchedAssistantDecomposition.content,
+            ]
+        )
+        XCTAssertEqual(
+            sut.transcriptItems.compactMap(\.sessionMessage).map(\.content),
+            [
+                localUserMessage.content,
+                fetchedAssistantSummary.content,
+                fetchedAssistantDecomposition.content,
+            ]
+        )
+    }
+
     func testPrepareToDisplaySessionShowsLoadingStateWhenCacheIsMissing() {
         let sut = makeSUT()
 
@@ -911,6 +970,96 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(sut.isStreamingInAnotherSession)
         XCTAssertEqual(sut.visibleStreamingText, "beta")
         XCTAssertEqual(sut.visibleCurrentPhase, .act)
+    }
+
+    func testVisibleProgressOverridesComposerLabelWhenStreaming() {
+        let sut = makeSUT()
+
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a",
+            progress: ChatViewModel.StreamingProgress(
+                kind: .implementing,
+                message: "Implementing the committed plan."
+            )
+        )
+
+        XCTAssertEqual(
+            sut.visibleProgress,
+            ChatViewModel.StreamingProgress(
+                kind: .implementing,
+                message: "Implementing the committed plan."
+            )
+        )
+        XCTAssertEqual(sut.composerPhaseLabel, "Implementing")
+        XCTAssertEqual(sut.visibleStreamingText, "")
+    }
+
+    func testVisibleStreamingElapsedTextAppearsAfterThreshold() {
+        let sut = makeSUT()
+        let startedAt = Date(timeIntervalSince1970: 100)
+
+        sut.setStreamingStateForTesting(
+            isStreaming: true,
+            currentSessionID: "session-a",
+            streamingSessionID: "session-a",
+            progress: ChatViewModel.StreamingProgress(
+                kind: .researching,
+                message: "Reading local files in skills/"
+            ),
+            startedAt: startedAt
+        )
+
+        XCTAssertNil(sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 114)))
+        XCTAssertEqual(
+            sut.visibleStreamingElapsedText(now: Date(timeIntervalSince1970: 195)),
+            "Worked for 1 minute, 35 seconds"
+        )
+    }
+
+    func testCompletedStreamingFootnoteAttachesToFinalAssistantTranscriptItem() {
+        let sut = makeSUT()
+        let sessionID = "session-a"
+        let startedAt = Date(timeIntervalSince1970: 100)
+        let endedAt = Date(timeIntervalSince1970: 195)
+        let message = SessionMessage(role: .assistant, content: "done", timestamp: 195)
+
+        sut.recordCompletedStreamingFootnoteForTesting(
+            message,
+            sessionID: sessionID,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+
+        let items = sut.makeTranscriptItemsForTesting(sessionID: sessionID, messages: [message])
+        guard case let .message(transcriptMessage)? = items.first else {
+            return XCTFail("expected message transcript item")
+        }
+
+        XCTAssertEqual(
+            transcriptMessage.footnoteText,
+            "Worked for 1 minute, 35 seconds"
+        )
+    }
+
+    func testAssistantMessageTimestampUsesStreamingStartTime() {
+        let sut = makeSUT()
+
+        XCTAssertEqual(
+            sut.assistantMessageTimestampForTesting(
+                startedAt: Date(timeIntervalSince1970: 100.9),
+                fallbackUnixTimestamp: 195
+            ),
+            100
+        )
+        XCTAssertEqual(
+            sut.assistantMessageTimestampForTesting(
+                startedAt: nil,
+                fallbackUnixTimestamp: 195
+            ),
+            195
+        )
     }
 
     func testContextCompactedUpdatesVisibleSessionContextAndBanner() {
@@ -2075,6 +2224,30 @@ final class ChatViewModelTests: XCTestCase {
             "local-gap-2",
             "anchor-3",
         ])
+    }
+
+    func testMergeFetchedMessagesDoesNotTreatSameContentWithDifferentRolesAsEquivalent() {
+        let sut = makeSUT()
+        let localMessages = [
+            SessionMessage(role: .assistant, content: "same", timestamp: 1)
+        ]
+        let fetchedMessages = [
+            SessionMessage(role: .user, content: "same", timestamp: 2)
+        ]
+
+        sut.cacheMessages(localMessages, for: "session-a")
+        sut.prepareToDisplaySession("session-a")
+
+        sut.applyFetchedMessagesForTesting(fetchedMessages, sessionID: "session-a")
+
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.role),
+            [.user]
+        )
+        XCTAssertEqual(
+            sut.cachedMessages(for: "session-a")?.map(\.timestamp),
+            [2]
+        )
     }
 
     private func waitForCompactionBannerToDismiss(on sut: ChatViewModel) async {

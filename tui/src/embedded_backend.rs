@@ -639,6 +639,7 @@ mod tests {
             &active_experiments,
             StreamEvent::ToolResult {
                 id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
                 output: "file contents".to_string(),
                 is_error: false,
             },
@@ -650,7 +651,7 @@ mod tests {
                 success,
                 content,
             } => {
-                assert!(name.is_none());
+                assert_eq!(name.as_deref(), Some("read_file"));
                 assert!(success);
                 assert_eq!(content, "file contents");
             }

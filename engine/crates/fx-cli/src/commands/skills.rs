@@ -349,12 +349,25 @@ impl CreateOptions {
 
 fn resolve_parent_dir(path: Option<&str>) -> Result<PathBuf> {
     match path {
-        Some(path) => Ok(PathBuf::from(path)),
+        Some(path) => Ok(expand_tilde(path)),
         None => {
             let cwd = std::env::current_dir().context("Failed to get current directory")?;
             Ok(cwd.join("skills"))
         }
     }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {
@@ -644,6 +657,15 @@ mod tests {
 
         assert_eq!(project_dir, custom_root.join("weather-skill"));
         assert!(project_dir.join("Cargo.toml").exists());
+    }
+
+    #[test]
+    fn create_with_tilde_path_expands_home() {
+        let home = dirs::home_dir().expect("home dir");
+        let options = CreateOptions::new("weather-skill", None, None, Some("~/fawx/skills"))
+            .expect("options");
+
+        assert_eq!(options.parent_dir, home.join("fawx").join("skills"));
     }
 
     #[test]

@@ -826,6 +826,7 @@ mod tests {
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         }
     }
@@ -1318,6 +1319,7 @@ mod tests {
             } else {
                 vec![]
             },
+            tools: vec![],
             entry_point: "run".to_string(),
         }
     }

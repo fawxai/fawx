@@ -543,7 +543,10 @@ fn build_loop_engine_with_options(
 
     // Build executor chain:
     // PermissionGateExecutor → TripwireEvaluator → ProposalGateExecutor → CachingExecutor → SkillRegistry
-    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let self_modify_config = crate::config_bridge::effective_self_modify_config(
+        &config.self_modify,
+        &config.permissions,
+    );
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
     let proposal_gate = ProposalGateExecutor::new(caching_registry, gate_state);
@@ -553,6 +556,7 @@ fn build_loop_engine_with_options(
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
     let permission_gate =
         PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state)
+            .with_working_dir(working_dir.clone())
             .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
     let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
         let snapshot_dir = data_dir.join("ripcord").join("snapshots");
@@ -948,7 +952,10 @@ fn build_skill_registry(
             &mut startup_warnings,
         );
 
-    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let self_modify_config = crate::config_bridge::effective_self_modify_config(
+        &config.self_modify,
+        &config.permissions,
+    );
     let sm = self_modify_config.enabled.then_some(self_modify_config);
     if let Some(ref smc) = sm {
         executor = executor.with_self_modify(smc.clone());

@@ -7,12 +7,14 @@
 //! executing; writes to allow-tier paths pass through.
 
 use crate::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolCallClassification, ToolExecutor,
+    ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
-use fx_core::self_modify::{classify_path, PathTier, SelfModifyConfig};
+use fx_core::self_modify::{
+    classify_path, classify_write_domain, PathTier, SelfModifyConfig, WriteDomain,
+};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use std::fs;
@@ -21,18 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tool names that represent write operations subject to gating.
 const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "git_checkpoint"];
-
-/// Tier 3 immutable paths — blocked regardless of configuration.
-/// These are compiled kernel invariants that cannot be overridden.
-const TIER3_PATHS: &[&str] = &[
-    "engine/crates/fx-kernel/",
-    "engine/crates/fx-auth/src/crypto/",
-    ".github/",
-    "fawx-ripcord/",
-    "tests/invariant/",
-    "prompt-ledger/",
-    "snapshots/",
-];
 
 /// Kernel-blind paths — blocked for agent read access when enforcement is on.
 /// These are compiled invariants and cannot be overridden.
@@ -126,10 +116,7 @@ fn is_write_tool(name: &str) -> bool {
 }
 
 pub fn is_tier3_path(relative_path: &str) -> bool {
-    let normalized = normalize_relative(relative_path);
-    TIER3_PATHS
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+    classify_write_domain(Path::new(relative_path), Path::new(".")) == WriteDomain::Sovereign
 }
 
 pub fn is_kernel_blind_path(relative_path: &str) -> bool {
@@ -431,9 +418,11 @@ fn classify_write_call(
         return GateDecision::PassThrough;
     };
 
-    // Tier 3 always blocked — compiled kernel invariant that cannot be
-    // disabled by config or overridden by active proposals.
-    if is_tier3_path(&path) {
+    let domain = classify_write_domain(Path::new(&path), working_dir);
+
+    // Sovereign paths always blocked — compiled kernel invariant that cannot
+    // be disabled by config or overridden by active proposals.
+    if domain == WriteDomain::Sovereign {
         return GateDecision::Block(blocked_result(
             call,
             &path,
@@ -533,6 +522,10 @@ impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.inner.cacheability(tool_name)
+    }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.inner.classify_call(call)
     }
 
     fn clear_cache(&self) {
@@ -799,22 +792,15 @@ mod tests {
         assert_eq!(result.output, "This file is not available.");
     }
 
-    // Test 1: Tier 3 path always blocked regardless of config
+    // Test 1: Sovereign path always blocked regardless of config
     #[tokio::test]
-    async fn tier3_path_always_blocked_regardless_of_config() {
+    async fn sovereign_path_always_blocked_regardless_of_config() {
         let mut config = enabled_config();
         config.allow_paths = vec!["**".to_string()];
         let (executor, probe) = make_executor(config);
 
         let results = executor
-            .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
-                None,
-            )
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
             .await
             .unwrap();
 
@@ -1335,21 +1321,14 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 7b: Tier 3 blocked even when config disabled (regression for bypass bug)
+    // Test 7b: Sovereign path blocked even when config disabled
     #[tokio::test]
-    async fn tier3_blocked_even_when_config_disabled() {
+    async fn sovereign_path_blocked_even_when_config_disabled() {
         let config = SelfModifyConfig::default(); // enabled=false
         let (executor, probe) = make_executor(config);
 
         let results = executor
-            .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
-                None,
-            )
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
             .await
             .unwrap();
 
@@ -1492,9 +1471,9 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 14: Tier 3 blocked even with active proposal
+    // Test 14: Sovereign path blocked even with active proposal
     #[tokio::test]
-    async fn tier3_blocked_even_with_active_proposal() {
+    async fn sovereign_path_blocked_even_with_active_proposal() {
         let inner = MockInner::new();
         let probe = inner.clone();
         let tmp = std::env::temp_dir().join(format!(
@@ -1504,11 +1483,29 @@ mod tests {
         let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
         state.set_active_proposal(ActiveProposal {
             id: "p-1".to_string(),
-            allowed_paths: vec![PathBuf::from("engine/crates/fx-kernel/src/lib.rs")],
+            allowed_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             approved_at: epoch_seconds(),
             expires_at: None,
         });
         let executor = ProposalGateExecutor::new(inner, state);
+
+        let results = executor
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
+            .await
+            .unwrap();
+
+        assert_operation_not_permitted(&results[0]);
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_source_path_is_not_tier3_when_config_allows_it() {
+        let config = SelfModifyConfig {
+            enabled: true,
+            allow_paths: vec!["**/engine/crates/fx-kernel/**".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let (executor, probe) = make_executor(config);
 
         let results = executor
             .execute_tools(
@@ -1522,22 +1519,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_operation_not_permitted(&results[0]);
-        assert_eq!(probe.call_count(), 0);
+        assert!(results[0].success);
+        assert_eq!(probe.call_count(), 1);
     }
 
-    // Test 15: Tier 3 caught via ../ path traversal
+    // Test 15: Sovereign path caught via ../ path traversal
     #[tokio::test]
-    async fn tier3_caught_via_dotdot_traversal() {
+    async fn sovereign_path_caught_via_dotdot_traversal() {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
             .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/../engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
+                &[write_call("1", "repo/../.github/workflows/ci.yml", "data")],
                 None,
             )
             .await
@@ -1547,18 +1540,14 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 16: Tier 3 caught via absolute path
+    // Test 16: Sovereign path caught via absolute path
     #[tokio::test]
-    async fn tier3_caught_via_absolute_path() {
+    async fn sovereign_path_caught_via_absolute_path() {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
             .execute_tools(
-                &[write_call(
-                    "1",
-                    "/engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
+                &[write_call("1", "/.github/workflows/ci.yml", "data")],
                 None,
             )
             .await

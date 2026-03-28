@@ -11,7 +11,7 @@ use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
-    ToolExecutor, ToolExecutorError, ToolResult,
+    ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -278,6 +278,19 @@ impl FawxToolExecutor {
             | "analyze_signals"
             | "propose_improvement" => ToolCacheability::NeverCache,
             _ => ToolCacheability::NeverCache,
+        }
+    }
+
+    fn classify_call_impl(call: &ToolCall) -> ToolCallClassification {
+        if call.name == "run_command" {
+            return classify_run_command_call(&call.arguments);
+        }
+
+        match Self::cacheability_for(&call.name) {
+            ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+            ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                ToolCallClassification::Observation
+            }
         }
     }
 
@@ -1417,6 +1430,39 @@ impl ToolExecutor for FawxToolExecutor {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         Self::cacheability_for(tool_name)
     }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        Self::classify_call_impl(call)
+    }
+
+    fn route_sub_goal_call(
+        &self,
+        request: &fx_kernel::act::SubGoalToolRoutingRequest,
+        call_id: &str,
+    ) -> Option<ToolCall> {
+        let tool_name = request.required_tools.first()?;
+        let definition = self
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == *tool_name)?;
+        let required = definition
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)?;
+
+        // Generic direct routing is only safe for tools that declare no
+        // required arguments. Tools with required inputs must describe their
+        // own sub-goal materialization instead of relying on kernel guesses.
+        if required.is_empty() {
+            return Some(ToolCall {
+                id: call_id.to_string(),
+                name: tool_name.clone(),
+                arguments: serde_json::json!({}),
+            });
+        }
+
+        None
+    }
 }
 
 impl std::fmt::Debug for FawxToolExecutor {
@@ -1673,7 +1719,22 @@ pub fn fawx_tool_definitions(
             name: "current_time".to_string(),
             description: "Get the current date, time, timezone, and Unix epoch timestamp"
                 .to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "x-fawx-direct-utility": {
+                    "enabled": true,
+                    "profile": "current_time",
+                    "trigger_patterns": [
+                        "current time",
+                        "what time",
+                        "what's the time",
+                        "whats the time",
+                        "time is it"
+                    ]
+                }
+            }),
         },
     ];
     if include_experiment_tool {
@@ -2173,6 +2234,234 @@ fn format_command_output(output: std::process::Output, shell: bool) -> String {
         String::from_utf8_lossy(&output.stderr)
     ));
     lines.join("\n")
+}
+
+fn classify_run_command_call(args: &serde_json::Value) -> ToolCallClassification {
+    let Ok(parsed): Result<RunCommandArgs, _> = parse_args(args) else {
+        return ToolCallClassification::Mutation;
+    };
+
+    if is_observational_command(parsed.command.trim(), parsed.shell.unwrap_or(false)) {
+        ToolCallClassification::Observation
+    } else {
+        ToolCallClassification::Mutation
+    }
+}
+
+fn is_observational_command(command: &str, shell: bool) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
+    if contains_mutating_shell_syntax(command) {
+        return false;
+    }
+
+    if shell {
+        return shell_segments(command)
+            .into_iter()
+            .all(is_observational_shell_segment);
+    }
+
+    is_observational_program_and_args(
+        &command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn contains_mutating_shell_syntax(command: &str) -> bool {
+    let normalized = strip_quoted_shell_strings(command).replace("\\>", "");
+    normalized.contains(">>")
+        || normalized.contains('>')
+        || normalized.contains("<<")
+        || normalized.contains("| tee")
+        || normalized.contains("|tee")
+}
+
+fn strip_quoted_shell_strings(command: &str) -> String {
+    let mut stripped = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut active_quote = None;
+
+    while let Some(ch) = chars.next() {
+        match active_quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    active_quote = None;
+                }
+            }
+            Some('"') => {
+                if ch == '\\' {
+                    let _ = chars.next();
+                } else if ch == '"' {
+                    active_quote = None;
+                }
+            }
+            Some('`') => {
+                if ch == '`' {
+                    active_quote = None;
+                }
+            }
+            Some(_) => {}
+            None => match ch {
+                '\'' | '"' | '`' => active_quote = Some(ch),
+                _ => stripped.push(ch),
+            },
+        }
+    }
+
+    stripped
+}
+
+fn shell_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = command.char_indices().peekable();
+    let mut active_quote = None;
+
+    while let Some((index, ch)) = chars.next() {
+        match active_quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    active_quote = None;
+                }
+            }
+            Some('"') => {
+                if ch == '\\' {
+                    let _ = chars.next();
+                } else if ch == '"' {
+                    active_quote = None;
+                }
+            }
+            Some('`') => {
+                if ch == '`' {
+                    active_quote = None;
+                }
+            }
+            Some(_) => {}
+            None => {
+                if matches!(ch, '\'' | '"' | '`') {
+                    active_quote = Some(ch);
+                    continue;
+                }
+
+                let separator_len = match ch {
+                    '\n' | ';' | '|' => {
+                        if ch == '|' && matches!(chars.peek(), Some((_, '|'))) {
+                            let _ = chars.next();
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    '&' if matches!(chars.peek(), Some((_, '&'))) => {
+                        let _ = chars.next();
+                        2
+                    }
+                    _ => continue,
+                };
+
+                let segment = command[start..index].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                start = index + separator_len;
+            }
+        }
+    }
+
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        segments.push(tail);
+    }
+
+    segments
+}
+
+fn is_observational_shell_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return true;
+    }
+
+    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+    if tokens.is_empty() {
+        return true;
+    }
+
+    if tokens[0] == "cd" {
+        return tokens.len() <= 2;
+    }
+
+    is_observational_program_and_args(&tokens)
+}
+
+// TODO(#1639): replace this static shell allowlist with declarative
+// observation/mutation metadata owned by the tool or executor.
+fn is_observational_program_and_args(tokens: &[String]) -> bool {
+    let mut index = 0;
+    while index < tokens.len() && looks_like_env_assignment(&tokens[index]) {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return false;
+    }
+
+    let program = tokens[index].as_str();
+    let args = &tokens[index + 1..];
+    match program {
+        "cat" | "grep" | "rg" | "head" | "tail" | "ls" | "find" | "pwd" | "wc" | "which"
+        | "stat" | "file" | "cut" | "sort" | "uniq" | "jq" | "awk" | "realpath" | "dirname"
+        | "basename" | "printenv" | "env" | "uname" | "date" | "tree" | "df" | "du" | "id"
+        | "whoami" | "hostname" | "lsof" | "ps" => true,
+        "top" => args
+            .iter()
+            .any(|arg| arg == "-b" || arg == "-l" || arg.starts_with("-l")),
+        "echo" => true,
+        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
+        "git" => is_observational_git_command(args),
+        "cargo" => is_observational_cargo_command(args),
+        _ => false,
+    }
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_observational_git_command(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+
+    match subcommand {
+        "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep" | "describe" => true,
+        "branch" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "--list"),
+        "remote" => args.len() == 1 || args.iter().skip(1).all(|arg| arg == "-v"),
+        "config" => args
+            .iter()
+            .skip(1)
+            .any(|arg| arg == "--get" || arg == "--get-all"),
+        _ => false,
+    }
+}
+
+fn is_observational_cargo_command(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+
+    matches!(
+        subcommand,
+        "metadata" | "tree" | "locate-project" | "help" | "search" | "version"
+    )
 }
 
 fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
@@ -4064,6 +4353,191 @@ three
             executor.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn classify_call_treats_read_only_run_command_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep -rn \"kv_get\" ./skills | head -20",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_mutating_run_command_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "cd ~/fawx && cargo run -- skill create x-post",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_redirected_echo_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "echo hello > notes.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_grep_gt_pattern_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep \"error > warning\" log.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_jq_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "jq '.items[] | select(.value > 5)' report.json",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_awk_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "awk '$1 > 100' metrics.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_ps_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "ps aux",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_noninteractive_top_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "top -l 1",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn route_sub_goal_call_rejects_tools_with_required_arguments() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+        };
+
+        assert!(
+            executor
+                .route_sub_goal_call(&request, "decompose-gate-0")
+                .is_none(),
+            "run_command should not be direct-routed without a declared materializer"
+        );
+    }
+
+    #[test]
+    fn route_sub_goal_call_allows_zero_argument_tools() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Check the clock".to_string(),
+            required_tools: vec!["current_time".to_string()],
+        };
+
+        let call = executor
+            .route_sub_goal_call(&request, "decompose-gate-0")
+            .expect("current_time should be routable");
+        assert_eq!(call.name, "current_time");
+        assert_eq!(call.arguments, serde_json::json!({}));
     }
 
     #[test]
