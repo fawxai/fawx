@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fawx Roadmap v4.1</title>
+<title>Fawx Roadmap v4.2</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -186,26 +186,26 @@
 </head>
 <body>
 
-<h1>Fawx Roadmap v4.1</h1>
-<p class="subtitle">Resequenced around strategic goals, not just code hygiene</p>
+<h1>Fawx Roadmap v4.2</h1>
+<p class="subtitle">Linear execution: #1654 merge → #1641 direct inspection fix → skill substrate → authority model</p>
 
 <div class="checkpoint">
-  <strong>Checkpoint (2026-03-28):</strong> Fawx is most credibly on track to be a local skill kernel. The biggest architectural crack is the lack of a unified authority model. Stop trying to advance all four goals at once. Make the skill substrate rock solid first, then capability boundaries, then ripcord coherence, then self-modification.
+  <strong>Checkpoint (2026-03-29):</strong> Parallel dev merges caused a hard-to-bisect regression. Switching to linear execution: one PR at a time on dev. The regression is an execution profile issue (#1641): the standard continuation policy forces MutationOnly scope after observation-only rounds, causing hallucinated permission denials on successful read-only tool results. Fixing it properly through typed direct-inspection profiles gives us the first concrete loop decomposition seam.
 </div>
 
 <div class="thesis">
-  "The danger is not that the vision is wrong. The danger is that you are trying to stand up the top of the stack before the lower layers are crisp enough."
+  "Deterministic requests should use deterministic paths. If a request is satisfiable from local observation alone, the engine should not force it through research-then-mutate continuation."
 </div>
 
 <!-- Status cards -->
 <div class="summary-grid">
   <div class="summary-card">
-    <div class="number" style="color: var(--green)">3</div>
+    <div class="number" style="color: var(--green)">5</div>
     <div class="label">Merged / Approved</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--accent)">2</div>
-    <div class="label">Active (Wave 2)</div>
+    <div class="label">Active (linear)</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--yellow)">3</div>
@@ -213,97 +213,74 @@
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--purple)">1</div>
-    <div class="label">Spec Complete (authority)</div>
+    <div class="label">Spec complete</div>
   </div>
 </div>
 
-<!-- Wave lineup -->
-<h2>Wave Lineup</h2>
+<!-- Execution sequence -->
+<h2>Execution Sequence (Linear)</h2>
 
 <div style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-bottom: 2rem;">
 
-  <!-- Wave 1: Landed -->
+  <!-- Landed -->
   <div class="sequence" style="border-left: 3px solid var(--green);">
-    <strong style="color: var(--green)">Wave 1 — LANDED ✅</strong><br>
-    <span style="color: var(--text-muted)">Hygiene + loop correctness. Complete.</span>
-    <div style="margin-top: 0.5rem; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem; font-size: 0.85rem;">
+    <strong style="color: var(--green)">✅ Landed</strong><br>
+    <span style="color: var(--text-muted)">Hygiene, loop correctness, and tool decomposition.</span>
+    <div style="margin-top: 0.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.85rem;">
       <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1644 Action trait
+        <span style="color: var(--green)">✅</span> #1644 Action trait — merged
       </div>
       <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1643 Config decomp
+        <span style="color: var(--green)">✅</span> #1643 Config decomp — approved
       </div>
       <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1640 Provider metadata
+        <span style="color: var(--green)">✅</span> #1640 Provider metadata — approved
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> #1614 Double response — merged (PR #1653)
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> #1639 Tool trait — R2 approved (PR #1654)
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> Authority model spec — complete
       </div>
     </div>
   </div>
 
-  <!-- Wave 2: Active -->
+  <!-- NOW: Linear sequence -->
   <div class="sequence" style="border-left: 3px solid var(--accent);">
-    <strong style="color: var(--accent)">Wave 2 — ACTIVE 🔵</strong><br>
-    <span style="color: var(--text-muted)">Two parallel tracks. No file overlap.</span>
-    <div style="margin-top: 0.75rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-      <div style="background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 0.75rem;">
-        <div style="font-size: 0.8rem; color: var(--accent); font-weight: 600; margin-bottom: 0.4rem;">TRACK A — Skill Substrate (critical path)</div>
-        <div style="font-size: 0.85rem;">
-          <span style="color: var(--accent)">🔵</span> <strong>#1639</strong> Tool trait <span style="color: var(--text-muted)">(fx-tools)</span><br>
-          <span style="color: var(--text-muted); font-size: 0.8rem;">→ unlocks #1646, #1647, #1638</span>
-        </div>
+    <strong style="color: var(--accent)">🔵 NOW — Linear (one PR at a time on dev)</strong><br>
+    <span style="color: var(--text-muted)">Each step merges before the next begins. No parallel dev branches.</span>
+    <div style="margin-top: 0.75rem; font-size: 0.9rem; line-height: 2.2;">
+      <div style="background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
+        <span style="color: var(--accent)">1.</span> <strong>#1639</strong> Tool trait merge to dev <span class="tag tag-active">awaiting merge</span> <span style="color: var(--text-muted)">(PR #1654 R2 APPROVE)</span>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem;">
-        <div style="font-size: 0.8rem; color: var(--yellow); font-weight: 600; margin-bottom: 0.4rem;">TRACK B — Bug Fix + Spec</div>
-        <div style="font-size: 0.85rem;">
-          <span style="color: var(--yellow)">⏳</span> <strong>#1614</strong> Double response <span style="color: var(--text-muted)">(fx-kernel)</span><br>
-          <span style="color: var(--green)">✅</span> <strong>Authority model spec</strong> <span style="color: var(--text-muted)">(docs only, complete)</span><br>
-          <span style="color: var(--text-muted); font-size: 0.8rem;">→ Track B finishes first, rejoins Track A</span>
-        </div>
+      <div style="background: var(--bg); border: 1px solid var(--red); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
+        <span style="color: var(--accent)">2.</span> <strong>#1641</strong> Direct inspection profile (4 phases) <span class="tag tag-bug">fixes regression</span><br>
+        <span style="color: var(--text-muted); font-size: 0.85rem; margin-left: 1.2rem;">Phase 1: detection → Phase 2: tool surface → Phase 3: terminal completion → Phase 4: boundary cleanup</span>
       </div>
-    </div>
-  </div>
-
-  <!-- Wave 3: Queued -->
-  <div class="sequence" style="border-left: 3px solid var(--yellow);">
-    <strong style="color: var(--yellow)">Wave 3 — QUEUED 🟡</strong><br>
-    <span style="color: var(--text-muted)">Skill substrate continued. Sequential, each depends on the prior.</span>
-    <div style="margin-top: 0.75rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem;">
-        <div style="font-size: 0.8rem; color: var(--yellow); font-weight: 600; margin-bottom: 0.4rem;">SEQUENTIAL — Skill Spine</div>
-        <div style="font-size: 0.85rem;">
-          🟡 <strong>#1646</strong> Skill tool contracts<br>
-          🟡 <strong>#1647</strong> Skill activation lifecycle<br>
-          <span style="color: var(--text-muted); font-size: 0.8rem;">Blocked on #1639</span>
-        </div>
+      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
+        <span style="color: var(--yellow)">3.</span> <strong>#1646</strong> Skill tool contracts <span class="tag tag-next">queued</span>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem;">
-        <div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; margin-bottom: 0.4rem;">PARALLEL SLOT — Hygiene (optional)</div>
-        <div style="font-size: 0.85rem;">
-          ⚪ <strong>#1642</strong> Headless decomp <span style="color: var(--text-muted)">(fx-cli, no overlap)</span><br>
-          <span style="color: var(--text-muted); font-size: 0.8rem;">Can run alongside #1646 if bandwidth allows</span>
-        </div>
+      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
+        <span style="color: var(--yellow)">4.</span> <strong>#1647</strong> Skill activation lifecycle <span class="tag tag-next">queued</span>
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--purple); border-radius: 6px; padding: 0.75rem;">
+        <span style="color: var(--purple)">5.</span> <strong>Authority model</strong> implementation (5 phases) <span class="tag tag-new">spec complete</span>
       </div>
     </div>
   </div>
 
-  <!-- Wave 4: Authority Model -->
-  <div class="sequence" style="border-left: 3px solid var(--purple);">
-    <strong style="color: var(--purple)">Wave 4 — AUTHORITY MODEL 🟣</strong><br>
-    <span style="color: var(--text-muted)">Unified capability/kernel boundary. After skill substrate is solid.</span>
-    <div style="margin-top: 0.75rem;">
-      <div style="background: var(--bg); border: 1px solid var(--purple); border-radius: 6px; padding: 0.75rem; font-size: 0.85rem;">
-        🟣 <strong>Authority model implementation</strong> (5 phases per spec)<br>
-        <span style="color: var(--text-muted); font-size: 0.8rem;">Spec complete and source-validated. Depends on #1639 for tool self-description. Phases 0-2 can start after #1639 lands.</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Wave 5: Runtime + Self-mod -->
+  <!-- LATER -->
   <div class="sequence" style="border-left: 3px solid var(--text-muted);">
-    <strong style="color: var(--text-muted)">Wave 5 — DEFERRED ⚪</strong><br>
-    <span style="color: var(--text-muted)">Self-hosting runtime and deep self-modification. Only after Goals 1-2.</span>
+    <strong style="color: var(--text-muted)">⚪ LATER</strong><br>
+    <span style="color: var(--text-muted)">After the linear sequence completes.</span>
     <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
-      ⚪ #1641 Loop decomposition · ⚪ #1638 Static dispatch audit (falls out of #1639)<br>
-      ⚪ Deep self-modification prerequisites
+      ⚪ #1641 Full loop decomposition (remaining slices beyond direct inspection)<br>
+      ⚪ #1642 Headless decomp<br>
+      ⚪ #1638 Static dispatch audit (falls out of #1639)<br>
+      ⚪ Deep self-modification (prerequisites: Goals 1-3)
     </div>
   </div>
 
@@ -323,22 +300,15 @@
     <div class="issue-header">
       <span class="issue-number">#1639</span>
       <span class="issue-title">Tool trait: replace FawxToolExecutor monolith</span>
-      <span class="tag tag-active">ACTIVE — critical path</span>
+      <span class="tag tag-done">PR #1654 R2 approved</span>
       <span class="tag tag-critical">highest impact</span>
     </div>
     <div class="issue-body">
-      Decompose <code>FawxToolExecutor</code> (5,938 lines, 27-arm match) into individual <code>Tool</code> trait objects with a registry-based executor. Each tool self-describes its name, schema, cacheability, classification, and journal hints. The executor becomes a registry that delegates to registered tools.
-      <ul>
-        <li><code>Tool</code> trait: name, definition, execute, cacheability, classify_call, journal_action, action_category</li>
-        <li><code>ToolContext</code> shared state struct</li>
-        <li>Tool implementations grouped by domain (filesystem, shell, web, session, git)</li>
-        <li>Registry-based dispatch replaces 27-arm string match</li>
-        <li>Deletes <code>cacheability_for()</code>, <code>classify_call_impl()</code>, <code>fawx_tool_definitions()</code> manual Vec</li>
-      </ul>
+      Decomposed <code>FawxToolExecutor</code> (5,938 lines, 27-arm match) into 27 <code>Tool</code> trait objects across 10 domain modules with registry-based dispatch. All trait methods consumed end-to-end. Awaiting merge to dev.
     </div>
     <div class="deps"><strong>Unlocks:</strong> #1646, #1647, #1638, structured memory tool, WASM/built-in unification</div>
-    <div class="progress-bar"><div class="progress-fill yellow" style="width: 10%"></div></div>
-    <div class="progress-label">~10% — 3 trait methods on monolithic executor. No Tool trait, no decomposition, 27-arm match intact.</div>
+    <div class="progress-bar"><div class="progress-fill green" style="width: 95%"></div></div>
+    <div class="progress-label">~95% — PR #1654 R2 APPROVE, awaiting merge to dev</div>
   </div>
 
   <div class="issue">
@@ -419,25 +389,33 @@
 <!-- GOAL 3: Self-hosting Runtime -->
 <div class="goal">
   <div class="goal-header">
-    <span class="goal-number" style="background: var(--orange); color: var(--bg)">GOAL 3</span>
+    <span class="goal-number" style="background: var(--accent); color: var(--bg)">GOAL 3</span>
     <span class="goal-title">Self-hosting Runtime with Ripcord/Tripwire</span>
   </div>
-  <div class="goal-verdict" style="color: var(--orange)">
-    Checkpoint verdict: <strong>plausible but not yet coherent</strong> — sovereign vs non-sovereign surface thinking is right, but the runtime doesn't consistently know what it can mutate, propose, or never touch.
+  <div class="goal-verdict" style="color: var(--accent)">
+    <strong>Promoted:</strong> Direct inspection profile slice is immediate priority after #1654 merge. Fixes regression where the standard continuation policy forces MutationOnly scope after observation-only rounds, causing hallucinated permission denials on successful read-only tool results.
   </div>
 
   <div class="issue">
     <div class="issue-header">
       <span class="issue-number">#1641</span>
-      <span class="issue-title">Loop decomposition: composable phase traits</span>
-      <span class="tag tag-deferred">LATER</span>
+      <span class="issue-title">Loop decomposition: direct inspection profile (first slice)</span>
+      <span class="tag tag-active">ACTIVE — next after #1654 merge</span>
+      <span class="tag tag-bug">fixes regression</span>
     </div>
     <div class="issue-body">
-      <code>LoopEngine</code> has 67 fields and 24K lines. Needs trait-based phase composition. But this is maintainability, not strategic. Deferred until the skill substrate and authority model are solid.
+      First concrete extraction from <code>loop_engine.rs</code> (24K lines). Adds typed <code>DirectInspection</code> execution profile to fix a regression where successful <code>read_file</code> results are discarded by the standard continuation policy (<code>MutationOnly</code> scope after observation-only rounds causes hallucinated permission denials).
+      <ul>
+        <li><strong>Phase 1:</strong> Typed direct-inspection profile detection and state ownership</li>
+        <li><strong>Phase 2:</strong> Profile-owned observation-only tool surface</li>
+        <li><strong>Phase 3:</strong> Terminal completion from tool evidence (no re-entering standard continuation)</li>
+        <li><strong>Phase 4:</strong> Standard/profile boundary cleanup and regression lock-in</li>
+      </ul>
+      Specs: <code>docs/specs/refactor/1641-direct-inspection-profile.md</code> + 4 phase sub-specs.
     </div>
-    <div class="deps"><strong>Depends on:</strong> #1644 ✅, #1614 ✅, #1639, unified authority model</div>
-    <div class="progress-bar"><div class="progress-fill yellow" style="width: 15%"></div></div>
-    <div class="progress-label">~15% — file-level organization done. Deferred.</div>
+    <div class="deps"><strong>Depends on:</strong> #1644 ✅, #1614 ✅, #1639 (PR #1654)</div>
+    <div class="progress-bar"><div class="progress-fill yellow" style="width: 5%"></div></div>
+    <div class="progress-label">~5% — specs written, regression root-caused. Implementation not started.</div>
   </div>
 </div>
 
@@ -494,14 +472,18 @@
     <div class="issue-header">
       <span class="issue-number">#1614</span>
       <span class="issue-title">Double response bug fix</span>
-      <span class="tag tag-active">in progress</span>
-      <span class="tag tag-bug">bug</span>
+      <span class="tag tag-done">merged</span>
     </div>
-    <div class="issue-body">
-      Bug confirmed on dev: <code>decide()</code> discards text content when a response has both text and tool calls. <code>Decision::UseTools</code> only carries tool calls. Spec written, diagnostic complete.
+    <div class="issue-body">PR #1653 merged. Mixed text preserved across tool rounds via separate accumulator. <code>FollowUpDecomposeContext</code> struct, whitespace/multi-block edge case tests.</div>
+  </div>
+
+  <div class="issue">
+    <div class="issue-header">
+      <span class="issue-number">#1639</span>
+      <span class="issue-title">Tool trait: FawxToolExecutor decomposition</span>
+      <span class="tag tag-done">R2 approved</span>
     </div>
-    <div class="progress-bar"><div class="progress-fill yellow" style="width: 20%"></div></div>
-    <div class="progress-label">~20% — diagnostic done, fix approach identified</div>
+    <div class="issue-body">PR #1654 R2 APPROVE. 27 tools across 10 domain modules. Registry dispatch, all trait methods consumed end-to-end. Awaiting merge to dev.</div>
   </div>
 </div>
 
@@ -512,44 +494,43 @@
   <ul style="margin-top: 0.5rem; padding-left: 1.25rem;">
     <li><strong>#1642</strong> Headless decomp — 5,787-line file into domain modules</li>
     <li><strong>#1638</strong> Static dispatch audit — falls out of #1639 automatically</li>
-    <li><strong>#1641</strong> Loop decomp — 67-field struct, 24K lines (listed under Goal 3 but primarily hygiene)</li>
+    <li><strong>#1641</strong> Loop decomp (remaining slices) — full phase-trait extraction after direct inspection profile lands</li>
   </ul>
 </div>
 
 <!-- Dependency graph -->
-<h2>Dependency Graph (with parallelism)</h2>
+<h2>Linear Execution Path</h2>
 
 <pre style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 0.85rem; overflow-x: auto; line-height: 2;">
-<span style="color: var(--green)">WAVE 1 ✅ LANDED</span>
-  <span style="color: var(--green)">✅ #1644 Action trait ————— merged</span>
-  <span style="color: var(--green)">✅ #1643 Config decomp ———— approved</span>
-  <span style="color: var(--green)">✅ #1640 Provider metadata — approved</span>
+<span style="color: var(--green)">LANDED ✅</span>
+  <span style="color: var(--green)">✅ #1644 Action trait ————————— merged</span>
+  <span style="color: var(--green)">✅ #1643 Config decomp ——————— approved</span>
+  <span style="color: var(--green)">✅ #1640 Provider metadata ———— approved</span>
+  <span style="color: var(--green)">✅ #1614 Double response ————— merged (PR #1653)</span>
+  <span style="color: var(--green)">✅ #1639 Tool trait ——————————— approved (PR #1654)</span>
 
-<span style="color: var(--accent)">WAVE 2 🔵 ACTIVE (parallel tracks)</span>
-  <span style="color: var(--accent)">Track A: 🔵 #1639 Tool trait ——————————</span> fx-tools  ──┐
-  <span style="color: var(--yellow)">Track B: ⏳ #1614 Double response ————</span> fx-kernel    │ parallel
-  <span style="color: var(--green)">Track B: ✅ Authority model spec ——————</span> complete   ──┘
+<span style="color: var(--accent)">NOW — LINEAR (one PR at a time on dev)</span>
+  <span style="color: var(--accent)">🔵 #1654 merge to dev</span>
+       ↓
+  <span style="color: var(--red)">🔴 #1641 Phase 1: direct inspection detection</span>       ← fixes regression
+  <span style="color: var(--red)">🔴 #1641 Phase 2: observation-only tool surface</span>
+  <span style="color: var(--red)">🔴 #1641 Phase 3: terminal completion from evidence</span>
+  <span style="color: var(--red)">🔴 #1641 Phase 4: standard/profile boundary cleanup</span>
+       ↓
+  <span style="color: var(--yellow)">🟡 #1646 Skill tool contracts</span>
+       ↓
+  <span style="color: var(--yellow)">🟡 #1647 Skill activation lifecycle</span>
+       ↓
+  <span style="color: var(--purple)">🟣 Authority model (5 phases, spec complete)</span>
 
-<span style="color: var(--yellow)">WAVE 3 🟡 QUEUED (sequential + optional parallel)</span>
-                                                      ┌── <span style="color: var(--text-muted)">⚪ #1642 Headless decomp (optional, fx-cli)</span>
-  <span style="color: var(--yellow)">🟡 #1646 Skill tool contracts ———————</span>──┤
-  <span style="color: var(--yellow)">🟡 #1647 Skill activation lifecycle ——</span>──┘   all depend on #1639
-
-<span style="color: var(--purple)">WAVE 4 🟣 AUTHORITY MODEL (phases 0-2 can start after #1639)</span>
-  <span style="color: var(--purple)">🟣 Phase 0: parity matrix + freeze tests</span>
-  <span style="color: var(--purple)">🟣 Phase 1: canonical request classification</span>
-  <span style="color: var(--purple)">🟣 Phase 2: shared resolver under wrappers</span>
-  <span style="color: var(--purple)">🟣 Phase 3: attribution + services</span>
-  <span style="color: var(--purple)">🟣 Phase 4: collapse wrappers + remove dupes</span>
-
-<span style="color: var(--text-muted)">WAVE 5 ⚪ DEFERRED</span>
-  <span style="color: var(--text-muted)">⚪ #1641 Loop decomposition</span>
-  <span style="color: var(--text-muted)">⚪ #1638 Static dispatch audit (falls out of #1639)</span>
-  <span style="color: var(--text-muted)">⚪ Deep self-modification (prerequisites: Goals 1-3)</span>
+<span style="color: var(--text-muted)">LATER ⚪</span>
+  <span style="color: var(--text-muted)">⚪ #1641 Full loop decomposition (remaining slices)</span>
+  <span style="color: var(--text-muted)">⚪ #1642 Headless decomp</span>
+  <span style="color: var(--text-muted)">⚪ #1638 Static dispatch audit</span>
 </pre>
 
 <div class="timestamp">
-  Updated 2026-03-29 00:49 UTC (v4.1) · Wave lineup with parallelism · Track A: #1639 ∥ Track B: #1614 + authority spec (✅ complete) · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-29 14:45 UTC (v4.2) · Linear: #1654 merge → #1641 direct inspection (4 phases) → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
