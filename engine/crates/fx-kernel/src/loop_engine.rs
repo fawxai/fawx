@@ -617,6 +617,8 @@ pub struct LoopEngine {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     /// Provider-specific tool output item identifiers keyed by stable tool call id.
     tool_call_provider_ids: HashMap<String, String>,
+    /// Mixed text emitted alongside tool calls before tool execution begins.
+    pending_tool_response_text: Option<String>,
     /// Optional scoped tool surface for the next root reasoning pass.
     pending_tool_scope: Option<ContinuationToolScope>,
     /// Optional typed turn commitment for the next root reasoning pass.
@@ -1111,6 +1113,7 @@ impl LoopEngineBuilder {
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             tool_call_provider_ids: HashMap::new(),
+            pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
             requested_artifact_target: None,
@@ -1401,6 +1404,7 @@ struct ToolRoundState {
     all_tool_results: Vec<ToolResult>,
     current_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
+    accumulated_text: Vec<String>,
     tokens_used: TokenUsage,
     observation_replan_attempted: bool,
     used_observation_tools: bool,
@@ -1408,17 +1412,25 @@ struct ToolRoundState {
 }
 
 impl ToolRoundState {
-    fn new(calls: &[ToolCall], context_messages: &[Message]) -> Self {
+    fn new(calls: &[ToolCall], context_messages: &[Message], initial_text: Option<String>) -> Self {
         Self {
             all_tool_results: Vec::new(),
             current_calls: calls.to_vec(),
             continuation_messages: context_messages.to_vec(),
+            accumulated_text: initial_text.into_iter().collect(),
             tokens_used: TokenUsage::default(),
             observation_replan_attempted: false,
             used_observation_tools: false,
             used_mutation_tools: false,
         }
     }
+}
+
+#[derive(Debug)]
+struct FollowUpDecomposeContext {
+    prior_tool_results: Vec<ToolResult>,
+    prior_tokens_used: TokenUsage,
+    accumulated_text: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2273,6 +2285,8 @@ impl LoopEngine {
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
+        self.tool_call_provider_ids.clear();
+        self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
         self.requested_artifact_target = None;
@@ -3293,6 +3307,25 @@ impl LoopEngine {
         Ok(combined)
     }
 
+    fn capture_tool_response_state(&mut self, response: &CompletionResponse) {
+        self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+        self.pending_tool_response_text = response_text_segment(response);
+    }
+
+    fn clear_tool_response_state(&mut self) {
+        self.tool_call_provider_ids.clear();
+        self.pending_tool_response_text = None;
+    }
+
+    fn record_tool_round_response_state(
+        &mut self,
+        state: &mut ToolRoundState,
+        response: &CompletionResponse,
+    ) {
+        self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+        push_response_segment(&mut state.accumulated_text, response_text_segment(response));
+    }
+
     /// Decide step.
     async fn decide(&mut self, response: &CompletionResponse) -> Result<Decision, LoopError> {
         // Decompose takes priority over all other tool calls in the same response.
@@ -3312,19 +3345,19 @@ impl LoopEngine {
                     .cloned()
                     .collect();
                 if !non_decompose_calls.is_empty() {
-                    self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+                    self.capture_tool_response_state(response);
                     let decision = Decision::UseTools(non_decompose_calls);
                     self.emit_decision_signals(&decision);
                     return Ok(decision);
                 }
-                self.tool_call_provider_ids.clear();
+                self.clear_tool_response_state();
                 let raw = extract_response_text(response);
                 let text = extract_readable_text(&raw);
                 let decision = Decision::Respond(normalize_response_text(&text));
                 self.emit_decision_signals(&decision);
                 return Ok(decision);
             }
-            self.tool_call_provider_ids.clear();
+            self.clear_tool_response_state();
             if response.tool_calls.len() > 1 {
                 self.emit_signal(
                     LoopStep::Decide,
@@ -3340,13 +3373,13 @@ impl LoopEngine {
         }
 
         if !response.tool_calls.is_empty() {
-            self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
+            self.capture_tool_response_state(response);
             let decision = Decision::UseTools(response.tool_calls.clone());
             self.emit_decision_signals(&decision);
             return Ok(decision);
         }
 
-        self.tool_call_provider_ids.clear();
+        self.clear_tool_response_state();
         let raw = extract_response_text(response);
         let text = extract_readable_text(&raw);
         let decision = Decision::Respond(normalize_response_text(&text));
@@ -3551,7 +3584,7 @@ impl LoopEngine {
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
         if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(decision, "decomposition"));
+            return Ok(self.budget_low_blocked_result(decision, "decomposition", &[]));
         }
 
         let timestamp_ms = current_time_ms();
@@ -5194,13 +5227,10 @@ impl LoopEngine {
         &mut self,
         decision: &Decision,
         tool_results: Vec<ToolResult>,
+        partial_response: Option<String>,
         tokens_used: TokenUsage,
         reason: BoundedLocalTerminalReason,
     ) -> ActionResult {
-        let partial_response = Some(bounded_local_terminal_partial_response(
-            reason,
-            &tool_results,
-        ));
         let reason_text = bounded_local_terminal_reason_text(reason);
         self.emit_signal(
             LoopStep::Act,
@@ -5244,9 +5274,9 @@ impl LoopEngine {
         &self,
         decision: &Decision,
         tool_results: Vec<ToolResult>,
+        partial_response: Option<String>,
         tokens_used: TokenUsage,
     ) -> ActionResult {
-        let partial_response = summarize_tool_progress(&tool_results);
         ActionResult {
             decision: decision.clone(),
             tool_results,
@@ -5261,7 +5291,16 @@ impl LoopEngine {
         decision: &Decision,
         state: ToolRoundState,
     ) -> ActionResult {
-        self.cancelled_tool_action(decision, state.all_tool_results, state.tokens_used)
+        let partial_response = stitched_response_text(
+            &state.accumulated_text,
+            summarize_tool_progress(&state.all_tool_results),
+        );
+        self.cancelled_tool_action(
+            decision,
+            state.all_tool_results,
+            partial_response,
+            state.tokens_used,
+        )
     }
 
     async fn handle_follow_up_decompose(
@@ -5269,9 +5308,13 @@ impl LoopEngine {
         response: &CompletionResponse,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
-        prior_tool_results: Vec<ToolResult>,
-        prior_tokens_used: TokenUsage,
+        context: FollowUpDecomposeContext,
     ) -> Result<ActionResult, LoopError> {
+        let FollowUpDecomposeContext {
+            prior_tool_results,
+            prior_tokens_used,
+            accumulated_text,
+        } = context;
         let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) else {
             return Err(loop_error(
                 "act",
@@ -5279,8 +5322,10 @@ impl LoopEngine {
                 false,
             ));
         };
+        let mut accumulated_text = accumulated_text;
+        push_response_segment(&mut accumulated_text, response_text_segment(response));
 
-        self.tool_call_provider_ids.clear();
+        self.clear_tool_response_state();
         if response.tool_calls.len() > 1 {
             self.emit_signal(
                 LoopStep::Act,
@@ -5310,7 +5355,10 @@ impl LoopEngine {
             action.tool_results = merged_tool_results;
         }
         action.tokens_used.accumulate(prior_tokens_used);
-        Ok(action)
+        Ok(prepend_accumulated_text_to_action(
+            action,
+            &accumulated_text,
+        ))
     }
 
     // Evaluated introducing a ToolActionContext wrapper here, but kept explicit
@@ -5324,12 +5372,18 @@ impl LoopEngine {
         context_messages: &[Message],
         stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
+        let initial_text = self.pending_tool_response_text.take();
+        let mut state = ToolRoundState::new(calls, context_messages, initial_text);
         if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(decision, "tool dispatch"));
+            return Ok(self.budget_low_blocked_result(
+                decision,
+                "tool dispatch",
+                &state.accumulated_text,
+            ));
         }
 
         let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
-        let mut state = ToolRoundState::new(&execute_calls, context_messages);
+        state.current_calls = execute_calls;
 
         // Inject deferred tool results immediately so they're present in
         // all_tool_results regardless of which return path the loop takes.
@@ -5358,6 +5412,8 @@ impl LoopEngine {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
                 }
                 ToolRoundOutcome::DirectUtilityAnswered(response) => {
+                    let response =
+                        stitch_response_segments(&state.accumulated_text, Some(response));
                     return Ok(ActionResult {
                         decision: decision.clone(),
                         tool_results: state.all_tool_results,
@@ -5367,9 +5423,17 @@ impl LoopEngine {
                     });
                 }
                 ToolRoundOutcome::BoundedLocalTerminal(reason) => {
+                    let partial_response = stitched_response_text(
+                        &state.accumulated_text,
+                        Some(bounded_local_terminal_partial_response(
+                            reason,
+                            &state.all_tool_results,
+                        )),
+                    );
                     return Ok(self.bounded_local_terminal_action_result(
                         decision,
                         state.all_tool_results,
+                        partial_response,
                         state.tokens_used,
                         reason,
                     ));
@@ -5378,7 +5442,10 @@ impl LoopEngine {
                 ToolRoundOutcome::ObservationRestrictedReplan => {
                     let mutation_tools = self.side_effect_tool_definitions();
                     if mutation_tools.is_empty() {
-                        let partial = summarize_tool_progress(&state.all_tool_results);
+                        let partial = stitched_response_text(
+                            &state.accumulated_text,
+                            summarize_tool_progress(&state.all_tool_results),
+                        );
                         return Ok(self.incomplete_action_result(
                             decision,
                             state.all_tool_results,
@@ -5402,19 +5469,21 @@ impl LoopEngine {
 
                     if !response.tool_calls.is_empty() {
                         if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            let context = FollowUpDecomposeContext {
+                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
+                                prior_tokens_used: state.tokens_used,
+                                accumulated_text: std::mem::take(&mut state.accumulated_text),
+                            };
                             return self
                                 .handle_follow_up_decompose(
                                     &response,
                                     llm,
                                     &state.continuation_messages,
-                                    prior_tool_results,
-                                    state.tokens_used,
+                                    context,
                                 )
                                 .await;
                         }
-                        self.tool_call_provider_ids =
-                            extract_tool_use_provider_ids(&response.content);
+                        self.record_tool_round_response_state(&mut state, &response);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
                         self.append_deferred_tool_results(
                             &mut state,
@@ -5434,11 +5503,11 @@ impl LoopEngine {
                             stream,
                         )
                         .await?;
-                    let text = extract_response_text(&response);
-                    let readable = extract_readable_text(&text);
-                    let partial = Some(normalize_response_text(&readable))
-                        .filter(|text| !text.is_empty())
-                        .or_else(|| summarize_tool_progress(&state.all_tool_results));
+                    let partial = stitched_response_text(
+                        &state.accumulated_text,
+                        response_text_segment(&response)
+                            .or_else(|| summarize_tool_progress(&state.all_tool_results)),
+                    );
                     return Ok(self.incomplete_action_result(
                         decision,
                         state.all_tool_results,
@@ -5448,7 +5517,10 @@ impl LoopEngine {
                     ));
                 }
                 ToolRoundOutcome::ObservationRestricted => {
-                    let partial = summarize_tool_progress(&state.all_tool_results);
+                    let partial = stitched_response_text(
+                        &state.accumulated_text,
+                        summarize_tool_progress(&state.all_tool_results),
+                    );
                     return Ok(self.incomplete_action_result(
                         decision,
                         state.all_tool_results,
@@ -5460,19 +5532,21 @@ impl LoopEngine {
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
                         if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            let context = FollowUpDecomposeContext {
+                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
+                                prior_tokens_used: state.tokens_used,
+                                accumulated_text: std::mem::take(&mut state.accumulated_text),
+                            };
                             return self
                                 .handle_follow_up_decompose(
                                     &response,
                                     llm,
                                     &state.continuation_messages,
-                                    prior_tool_results,
-                                    state.tokens_used,
+                                    context,
                                 )
                                 .await;
                         }
-                        self.tool_call_provider_ids =
-                            extract_tool_use_provider_ids(&response.content);
+                        self.record_tool_round_response_state(&mut state, &response);
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
                         self.append_deferred_tool_results(
                             &mut state,
@@ -5496,9 +5570,8 @@ impl LoopEngine {
                     let next_tool_scope = self.continuation_tool_scope_for_round(&state);
                     return Ok(self.finalize_tool_response(
                         decision,
-                        state.all_tool_results,
+                        state,
                         &response,
-                        state.tokens_used,
                         next_tool_scope,
                     ));
                 }
@@ -5506,15 +5579,8 @@ impl LoopEngine {
         }
 
         let next_tool_scope = self.continuation_tool_scope_for_round(&state);
-        self.synthesize_tool_fallback(
-            decision,
-            state.all_tool_results,
-            state.tokens_used,
-            llm,
-            stream,
-            next_tool_scope,
-        )
-        .await
+        self.synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
+            .await
     }
 
     fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
@@ -5572,6 +5638,7 @@ impl LoopEngine {
         &mut self,
         decision: &Decision,
         action_name: &str,
+        accumulated_text: &[String],
     ) -> ActionResult {
         self.emit_signal(
             LoopStep::Act,
@@ -5579,10 +5646,13 @@ impl LoopEngine {
             format!("{action_name} blocked: budget is low, wrapping up"),
             serde_json::json!({"reason": "budget_soft_ceiling"}),
         );
-        self.text_action_result(
-            decision,
-            &format!("{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."),
-        )
+        let response = stitch_response_segments(
+            accumulated_text,
+            Some(format!(
+                "{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."
+            )),
+        );
+        self.text_action_result(decision, &response)
     }
 
     fn record_tool_execution_cost(&mut self, tool_count: usize) {
@@ -5986,30 +6056,37 @@ impl LoopEngine {
     fn finalize_tool_response(
         &mut self,
         decision: &Decision,
-        tool_results: Vec<ToolResult>,
+        state: ToolRoundState,
         response: &CompletionResponse,
-        tokens_used: TokenUsage,
         next_tool_scope: Option<ContinuationToolScope>,
     ) -> ActionResult {
-        let text = extract_response_text(response);
-        let readable = extract_readable_text(&text);
-        let response_text = normalize_response_text(&readable);
+        let ToolRoundState {
+            all_tool_results,
+            accumulated_text,
+            tokens_used,
+            ..
+        } = state;
+        let response_text =
+            stitch_response_segments(&accumulated_text, response_text_segment(response));
         if response_text.is_empty() {
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Trace,
                 "tool continuation returned empty text",
                 serde_json::json!({
-                    "tool_count": tool_results.len(),
+                    "tool_count": all_tool_results.len(),
                 }),
             );
         }
         let final_response = meaningful_response_text(&response_text);
-        let tool_summary = summarize_tool_progress(&tool_results);
+        let tool_summary = stitched_response_text(
+            &accumulated_text,
+            summarize_tool_progress(&all_tool_results),
+        );
         match final_response {
             Some(response) => self.tool_continuation_action_result(
                 decision,
-                tool_results,
+                all_tool_results,
                 response_text,
                 response,
                 tokens_used,
@@ -6017,7 +6094,7 @@ impl LoopEngine {
             ),
             None => self.incomplete_action_result(
                 decision,
-                tool_results,
+                all_tool_results,
                 tool_summary,
                 "tool continuation did not produce a usable final response",
                 tokens_used,
@@ -6028,23 +6105,30 @@ impl LoopEngine {
     async fn synthesize_tool_fallback(
         &self,
         decision: &Decision,
-        tool_results: Vec<ToolResult>,
-        mut tokens_used: TokenUsage,
+        state: ToolRoundState,
         llm: &dyn LlmProvider,
         stream: CycleStream<'_>,
         next_tool_scope: Option<ContinuationToolScope>,
     ) -> Result<ActionResult, LoopError> {
+        let ToolRoundState {
+            all_tool_results,
+            accumulated_text,
+            mut tokens_used,
+            ..
+        } = state;
         let max_tokens = self.budget.config().max_synthesis_tokens;
-        let evicted = evict_oldest_results(tool_results, max_tokens);
+        let evicted = evict_oldest_results(all_tool_results, max_tokens);
         let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
         stream.phase(Phase::Synthesize);
         let llm_text = self
             .generate_tool_summary(&synthesis_prompt, llm, stream, TextStreamVisibility::Hidden)
             .await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
-        let response_text = normalize_response_text(&llm_text);
+        let response_text =
+            stitch_response_segments(&accumulated_text, meaningful_response_text(&llm_text));
         let final_response = meaningful_response_text(&response_text);
-        let tool_summary = summarize_tool_progress(&evicted);
+        let tool_summary =
+            stitched_response_text(&accumulated_text, summarize_tool_progress(&evicted));
         Ok(match final_response {
             Some(response) => self.tool_continuation_action_result(
                 decision,
@@ -8060,6 +8144,62 @@ fn meaningful_response_text(text: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+fn response_text_segment(response: &CompletionResponse) -> Option<String> {
+    let raw = extract_response_text(response);
+    let readable = extract_readable_text(&raw);
+    meaningful_response_text(&readable)
+}
+
+fn push_response_segment(segments: &mut Vec<String>, segment: Option<String>) {
+    if let Some(segment) = segment {
+        segments.push(segment);
+    }
+}
+
+fn stitch_response_segments(segments: &[String], tail: Option<String>) -> String {
+    segments
+        .iter()
+        .cloned()
+        .chain(tail)
+        .filter(|segment| !segment.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn stitched_response_text(segments: &[String], tail: Option<String>) -> Option<String> {
+    meaningful_response_text(&stitch_response_segments(segments, tail))
+}
+
+fn prepend_accumulated_text_to_action(
+    mut action: ActionResult,
+    accumulated_text: &[String],
+) -> ActionResult {
+    if accumulated_text.is_empty() {
+        return action;
+    }
+    action.response_text = stitch_response_segments(
+        accumulated_text,
+        meaningful_response_text(&action.response_text),
+    );
+    match &mut action.next_step {
+        ActionNextStep::Continue(continuation) => {
+            continuation.partial_response =
+                stitched_response_text(accumulated_text, continuation.partial_response.take());
+            continuation.context_message =
+                stitched_response_text(accumulated_text, continuation.context_message.take());
+        }
+        ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+            *response = stitch_response_segments(accumulated_text, Some(response.clone()));
+        }
+        ActionNextStep::Finish(ActionTerminal::Incomplete {
+            partial_response, ..
+        }) => {
+            *partial_response = stitched_response_text(accumulated_text, partial_response.take());
+        }
+    }
+    action
+}
+
 fn action_partial_response(action: &ActionResult) -> Option<String> {
     match &action.next_step {
         ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
@@ -8890,6 +9030,40 @@ mod phase2_tests {
         }
     }
 
+    fn mixed_tool_response_with_content(
+        content: Vec<ContentBlock>,
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionResponse {
+        CompletionResponse {
+            content,
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn mixed_tool_response(
+        text: &str,
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionResponse {
+        mixed_tool_response_with_content(
+            vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            id,
+            name,
+            arguments,
+        )
+    }
+
     fn expect_complete(result: LoopResult) -> (String, u32, Vec<Signal>) {
         match result {
             LoopResult::Complete {
@@ -9058,6 +9232,192 @@ mod phase2_tests {
             matches!(result, LoopResult::Complete { .. }),
             "expected LoopResult::Complete, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn act_preserves_mixed_text_in_partial_response() {
+        let mut engine = test_engine();
+        let response = mixed_tool_response(
+            "Initial findings",
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"README.md"}),
+        );
+        let decision = engine.decide(&response).await.expect("decision");
+        let llm = SequentialMockLlm::new(vec![text_response("Final answer", None, None)]);
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user("read the file")],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act");
+
+        assert_eq!(action.response_text, "Initial findings\n\nFinal answer");
+        match action.next_step {
+            ActionNextStep::Continue(ActionContinuation {
+                partial_response,
+                context_message,
+                ..
+            }) => {
+                assert_eq!(
+                    partial_response.as_deref(),
+                    Some("Initial findings\n\nFinal answer")
+                );
+                assert_eq!(
+                    context_message.as_deref(),
+                    Some("Initial findings\n\nFinal answer")
+                );
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cycle_preserves_mixed_text_in_final_output() {
+        let mut engine = test_engine();
+        let expected = "Initial findings\n\nFinal answer";
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response(
+                "Initial findings",
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response(expected, None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_accumulates_mixed_text_across_tool_rounds() {
+        let mut engine = test_engine();
+        let expected = "First note\n\nSecond note\n\nFinal answer";
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response(
+                "First note",
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            mixed_tool_response(
+                "Second note",
+                "call-2",
+                "read_file",
+                serde_json::json!({"path":"Cargo.toml"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response(expected, None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read both files"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_whitespace_only_mixed_text_is_unchanged() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response(
+                "   ",
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response("Final answer", None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, "Final answer");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_preserves_multiple_text_blocks_in_mixed_response() {
+        let mut engine = test_engine();
+        let expected = "First block\nSecond block\n\nFinal answer";
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response_with_content(
+                vec![
+                    ContentBlock::Text {
+                        text: "First block".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "Second block".to_string(),
+                    },
+                ],
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response(expected, None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_tool_only_response_is_unchanged() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Tool answer", None, None),
+            text_response("Tool answer", None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, "Tool answer");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_text_only_response_is_unchanged() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![text_response("Just text", None, None)]);
+
+        let result = engine
+            .run_cycle(test_snapshot("say hi"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, "Just text");
     }
 
     #[tokio::test]
@@ -16079,7 +16439,7 @@ mod context_compaction_tests {
         );
         let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
         let calls = vec![read_call("call-1")];
-        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70), None);
 
         let tools = engine.tool_executor.tool_definitions();
         let _ = engine
@@ -16100,7 +16460,7 @@ mod context_compaction_tests {
         );
         let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
         let calls = vec![read_call("call-1")];
-        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70), None);
 
         let tools = engine.tool_executor.tool_definitions();
         engine
@@ -16131,7 +16491,7 @@ mod context_compaction_tests {
         );
         let llm = RecordingLlm::ok(vec![text_response("done")]);
         let calls = vec![read_call("call-1")];
-        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")], None);
         let (callback, events) = stream_recorder();
 
         engine
@@ -16162,7 +16522,7 @@ mod context_compaction_tests {
         );
         let llm = RecordingLlm::ok(vec![text_response("done")]);
         let calls = vec![read_call("call-1")];
-        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")], None);
 
         engine
             .execute_tool_round(1, &llm, &mut state, Vec::new(), CycleStream::disabled())
@@ -16188,7 +16548,7 @@ mod context_compaction_tests {
         );
         let llm = RecordingLlm::ok(vec![text_response("done")]);
         let calls = vec![read_call("call-1")];
-        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")]);
+        let mut state = ToolRoundState::new(&calls, &[Message::user("read file")], None);
         let (callback, events) = stream_recorder();
 
         engine
