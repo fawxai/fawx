@@ -1,6 +1,6 @@
 use crate::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolCallClassification, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
@@ -419,6 +419,14 @@ impl<T: ToolExecutor> ToolExecutor for CachingExecutor<T> {
 
     fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
         self.inner.classify_call(call)
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.inner.action_category(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
     }
 
     fn clear_cache(&self) {

@@ -8,7 +8,6 @@ use fx_kernel::act::{
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Callback for notifying the user when a tripwire is crossed.
@@ -44,7 +43,7 @@ impl<T: ToolExecutor> TripwireEvaluator<T> {
     }
 
     async fn evaluate_call(&self, call: &ToolCall, result: &ToolResult) {
-        let category = tool_to_action_category(&call.name);
+        let category = self.inner.action_category(call);
         let path = extract_path(&call.arguments);
         let command = extract_command(&call.arguments);
         self.journal.increment_category(category).await;
@@ -82,7 +81,7 @@ impl<T: ToolExecutor> TripwireEvaluator<T> {
         if !self.journal.is_active().await {
             return;
         }
-        if let Some(action) = extract_journal_action(call, result) {
+        if let Some(action) = self.inner.journal_action(call, result) {
             self.journal.record(&call.name, &call.id, action).await;
         }
     }
@@ -118,6 +117,14 @@ impl<T: ToolExecutor> ToolExecutor for TripwireEvaluator<T> {
         self.inner.classify_call(call)
     }
 
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.inner.action_category(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
+    }
+
     fn clear_cache(&self) {
         self.inner.clear_cache();
     }
@@ -127,140 +134,16 @@ impl<T: ToolExecutor> ToolExecutor for TripwireEvaluator<T> {
     }
 }
 
-fn extract_journal_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    match call.name.as_str() {
-        "write_file" | "create_file" | "edit_file" => file_write_action(call),
-        "delete_file" | "remove_file" => file_delete_action(call),
-        "git_commit" => git_commit_action(call, result),
-        "git_push" => git_push_action(call, result),
-        "shell" | "bash" | "execute_command" => shell_action(call, result),
-        _ => None,
-    }
-}
-
-fn file_write_action(call: &ToolCall) -> Option<JournalAction> {
-    let path = extract_path_buf(&call.arguments)?;
-    let content = string_arg(&call.arguments, "content").unwrap_or_default();
-    let size_bytes = content.len() as u64;
-    Some(JournalAction::FileWrite {
-        path,
-        snapshot_hash: None,
-        size_bytes,
-        created: call.name == "create_file",
-    })
-}
-
-fn file_delete_action(call: &ToolCall) -> Option<JournalAction> {
-    let path = extract_path_buf(&call.arguments)?;
-    Some(JournalAction::FileDelete {
-        path,
-        snapshot_hash: "unknown".to_string(),
-    })
-}
-
-fn git_commit_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let repo = extract_repo(&call.arguments)?;
-    let commit_sha = string_arg(&call.arguments, "commit_sha")
-        .or_else(|| string_arg(&call.arguments, "hash"))
-        .or_else(|| first_word(&result.output))
-        .unwrap_or_else(|| "unknown".to_string());
-    let pre_ref = string_arg(&call.arguments, "pre_ref")
-        .or_else(|| string_arg(&call.arguments, "ref"))
-        .unwrap_or_else(|| "HEAD~1".to_string());
-    Some(JournalAction::GitCommit {
-        repo,
-        pre_ref,
-        commit_sha,
-    })
-}
-
-fn git_push_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let repo = extract_repo(&call.arguments)?;
-    let remote = string_arg(&call.arguments, "remote")
-        .or_else(|| find_json_string(&result.output, "remote"))
-        .unwrap_or_else(|| "origin".to_string());
-    let branch = string_arg(&call.arguments, "branch")
-        .or_else(|| find_json_string(&result.output, "branch"))
-        .unwrap_or_else(|| "HEAD".to_string());
-    let pre_ref = string_arg(&call.arguments, "pre_ref")
-        .or_else(|| string_arg(&call.arguments, "ref"))
-        .unwrap_or_else(|| "unknown".to_string());
-    Some(JournalAction::GitPush {
-        repo,
-        remote,
-        branch,
-        pre_ref,
-    })
-}
-
-fn shell_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let command = extract_command(&call.arguments)?;
-    Some(JournalAction::ShellCommand {
-        command,
-        exit_code: extract_exit_code(&result.output, result.success),
-    })
-}
-
 fn extract_path(arguments: &Value) -> Option<String> {
     string_arg(arguments, "path").or_else(|| string_arg(arguments, "file_path"))
-}
-
-fn extract_path_buf(arguments: &Value) -> Option<PathBuf> {
-    extract_path(arguments).map(PathBuf::from)
 }
 
 fn extract_command(arguments: &Value) -> Option<String> {
     string_arg(arguments, "command")
 }
 
-fn extract_repo(arguments: &Value) -> Option<PathBuf> {
-    string_arg(arguments, "repo")
-        .or_else(|| string_arg(arguments, "working_dir"))
-        .or_else(|| string_arg(arguments, "cwd"))
-        .or_else(|| string_arg(arguments, "path"))
-        .map(PathBuf::from)
-}
-
 fn string_arg(arguments: &Value, key: &str) -> Option<String> {
     arguments.get(key)?.as_str().map(ToString::to_string)
-}
-
-fn first_word(text: &str) -> Option<String> {
-    text.split_whitespace().next().map(ToString::to_string)
-}
-
-fn extract_exit_code(output: &str, success: bool) -> i32 {
-    parse_exit_code(output).unwrap_or(if success { 0 } else { -1 })
-}
-
-fn parse_exit_code(output: &str) -> Option<i32> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("exit_code: "))?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn find_json_string(output: &str, key: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(output).ok()?;
-    value.get(key)?.as_str().map(ToString::to_string)
-}
-
-fn tool_to_action_category(tool_name: &str) -> &'static str {
-    match tool_name {
-        "web_search" | "brave_search" => "web_search",
-        "web_fetch" | "fetch_url" => "web_fetch",
-        "read_file" | "search_text" | "list_directory" => "read_any",
-        "write_file" | "create_file" | "edit_file" => "file_write",
-        "shell" | "bash" | "execute_command" => "shell",
-        "git" | "git_status" | "git_diff" | "git_commit" | "git_push" => "git",
-        "delete_file" | "remove_file" => "file_delete",
-        "run_experiment" | "experiment" => "tool_call",
-        "subagent_spawn" | "subagent_status" | "subagent_cancel" => "tool_call",
-        "run_command" | "execute" => "code_execute",
-        _ => "unknown",
-    }
 }
 
 #[cfg(test)]
@@ -521,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_journal_action_builds_shell_entry() {
+    fn journal_action_builds_shell_entry() {
         let call = test_call("shell", serde_json::json!({"command": "echo hi"}));
         let result = ToolResult {
             tool_call_id: call.id.clone(),
@@ -529,8 +412,11 @@ mod tests {
             success: true,
             output: "exit_code: 0\nstdout:\nhi".into(),
         };
+        let executor = PassthroughExecutor::executed();
 
-        let action = extract_journal_action(&call, &result).expect("shell action");
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("shell action");
 
         assert!(matches!(
             action,

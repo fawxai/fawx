@@ -898,6 +898,18 @@ impl ToolExecutor for SharedSkillRegistry {
         self.registry.cacheability(tool_name)
     }
 
+    fn action_category(&self, call: &fx_llm::ToolCall) -> &'static str {
+        self.registry.action_category(call)
+    }
+
+    fn journal_action(
+        &self,
+        call: &fx_llm::ToolCall,
+        result: &fx_kernel::act::ToolResult,
+    ) -> Option<fx_kernel::act::JournalAction> {
+        self.registry.journal_action(call, result)
+    }
+
     fn cache_stats(&self) -> Option<fx_kernel::act::ToolCacheStats> {
         self.registry.cache_stats()
     }
