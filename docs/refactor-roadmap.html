@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fawx Roadmap v4</title>
+<title>Fawx Roadmap v4.1</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -186,7 +186,7 @@
 </head>
 <body>
 
-<h1>Fawx Roadmap v4</h1>
+<h1>Fawx Roadmap v4.1</h1>
 <p class="subtitle">Resequenced around strategic goals, not just code hygiene</p>
 
 <div class="checkpoint">
@@ -217,22 +217,96 @@
   </div>
 </div>
 
-<!-- Execution sequence -->
-<h2>Execution Sequence</h2>
-<div class="sequence">
-  <strong style="color: var(--green)">✅ Landed (Wave 1 hygiene)</strong><br>
-  <span style="color: var(--text-muted)">#1644 Action trait · #1643 Config decomp · #1640 Provider metadata · #1614 Double response bug</span><br><br>
+<!-- Wave lineup -->
+<h2>Wave Lineup</h2>
 
-  <strong style="color: var(--accent)">🔵 NOW — Skill Substrate Spine</strong><br>
-  <code>#1639</code> Tool trait → <code>#1646</code> Skill tool contracts → <code>#1647</code> Skill lifecycle<br>
-  <span style="color: var(--text-muted)">This is the critical path. Everything else waits.</span><br><br>
+<div style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-bottom: 2rem;">
 
-  <strong style="color: var(--yellow)">🟡 NEXT — Unified Authority Model</strong><br>
-  <code>NEW</code> Capability/kernel boundary spec → implementation<br>
-  <span style="color: var(--text-muted)">One canonical answer to: what surface? what policy? who decides?</span><br><br>
+  <!-- Wave 1: Landed -->
+  <div class="sequence" style="border-left: 3px solid var(--green);">
+    <strong style="color: var(--green)">Wave 1 — LANDED ✅</strong><br>
+    <span style="color: var(--text-muted)">Hygiene + loop correctness. Complete.</span>
+    <div style="margin-top: 0.5rem; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem; font-size: 0.85rem;">
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> #1644 Action trait
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> #1643 Config decomp
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
+        <span style="color: var(--green)">✅</span> #1640 Provider metadata
+      </div>
+    </div>
+  </div>
 
-  <strong style="color: var(--text-muted)">⚪ LATER — Hygiene & Decomposition</strong><br>
-  <span style="color: var(--text-muted)">#1642 Headless decomp · #1641 Loop decomp · #1638 Static dispatch audit (falls out of #1639)</span>
+  <!-- Wave 2: Active -->
+  <div class="sequence" style="border-left: 3px solid var(--accent);">
+    <strong style="color: var(--accent)">Wave 2 — ACTIVE 🔵</strong><br>
+    <span style="color: var(--text-muted)">Two parallel tracks. No file overlap.</span>
+    <div style="margin-top: 0.75rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+      <div style="background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 0.75rem;">
+        <div style="font-size: 0.8rem; color: var(--accent); font-weight: 600; margin-bottom: 0.4rem;">TRACK A — Skill Substrate (critical path)</div>
+        <div style="font-size: 0.85rem;">
+          <span style="color: var(--accent)">🔵</span> <strong>#1639</strong> Tool trait <span style="color: var(--text-muted)">(fx-tools)</span><br>
+          <span style="color: var(--text-muted); font-size: 0.8rem;">→ unlocks #1646, #1647, #1638</span>
+        </div>
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem;">
+        <div style="font-size: 0.8rem; color: var(--yellow); font-weight: 600; margin-bottom: 0.4rem;">TRACK B — Bug Fix + Spec</div>
+        <div style="font-size: 0.85rem;">
+          <span style="color: var(--yellow)">⏳</span> <strong>#1614</strong> Double response <span style="color: var(--text-muted)">(fx-kernel)</span><br>
+          <span style="color: var(--yellow)">⏳</span> <strong>NEW</strong> Authority model spec <span style="color: var(--text-muted)">(docs only)</span><br>
+          <span style="color: var(--text-muted); font-size: 0.8rem;">→ Track B finishes first, rejoins Track A</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wave 3: Queued -->
+  <div class="sequence" style="border-left: 3px solid var(--yellow);">
+    <strong style="color: var(--yellow)">Wave 3 — QUEUED 🟡</strong><br>
+    <span style="color: var(--text-muted)">Skill substrate continued. Sequential, each depends on the prior.</span>
+    <div style="margin-top: 0.75rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem;">
+        <div style="font-size: 0.8rem; color: var(--yellow); font-weight: 600; margin-bottom: 0.4rem;">SEQUENTIAL — Skill Spine</div>
+        <div style="font-size: 0.85rem;">
+          🟡 <strong>#1646</strong> Skill tool contracts<br>
+          🟡 <strong>#1647</strong> Skill activation lifecycle<br>
+          <span style="color: var(--text-muted); font-size: 0.8rem;">Blocked on #1639</span>
+        </div>
+      </div>
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem;">
+        <div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; margin-bottom: 0.4rem;">PARALLEL SLOT — Hygiene (optional)</div>
+        <div style="font-size: 0.85rem;">
+          ⚪ <strong>#1642</strong> Headless decomp <span style="color: var(--text-muted)">(fx-cli, no overlap)</span><br>
+          <span style="color: var(--text-muted); font-size: 0.8rem;">Can run alongside #1646 if bandwidth allows</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wave 4: Authority Model -->
+  <div class="sequence" style="border-left: 3px solid var(--purple);">
+    <strong style="color: var(--purple)">Wave 4 — AUTHORITY MODEL 🟣</strong><br>
+    <span style="color: var(--text-muted)">Unified capability/kernel boundary. After skill substrate is solid.</span>
+    <div style="margin-top: 0.75rem;">
+      <div style="background: var(--bg); border: 1px solid var(--purple); border-radius: 6px; padding: 0.75rem; font-size: 0.85rem;">
+        🟣 <strong>NEW</strong> Authority model implementation (5 phases per spec)<br>
+        <span style="color: var(--text-muted); font-size: 0.8rem;">Spec complete. Depends on #1639 for tool self-description. Phases 0-2 can start after #1639 lands.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wave 5: Runtime + Self-mod -->
+  <div class="sequence" style="border-left: 3px solid var(--text-muted);">
+    <strong style="color: var(--text-muted)">Wave 5 — DEFERRED ⚪</strong><br>
+    <span style="color: var(--text-muted)">Self-hosting runtime and deep self-modification. Only after Goals 1-2.</span>
+    <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
+      ⚪ #1641 Loop decomposition · ⚪ #1638 Static dispatch audit (falls out of #1639)<br>
+      ⚪ Deep self-modification prerequisites
+    </div>
+  </div>
+
 </div>
 
 <!-- GOAL 1: Skill Substrate -->
@@ -320,29 +394,25 @@
     <div class="issue-header">
       <span class="issue-number">NEW</span>
       <span class="issue-title">Unified capability/kernel boundary model</span>
-      <span class="tag tag-new">needs spec</span>
+      <span class="tag tag-active">spec complete</span>
     </div>
     <div class="issue-body">
-      Today, five systems can disagree about whether an action is allowed:
+      <strong>Spec: <code>docs/specs/refactor/unified-authority-model.md</code></strong> (refined against source code)<br><br>
+      Five overlapping control planes + duplicated tool-layer enforcement. 7 concrete conflict scenarios identified:
       <ul>
-        <li><code>CapabilityMode</code> (immediate denial vs prompt negotiation)</li>
-        <li><code>self_modify</code> / <code>kernel_modify</code> flags</li>
-        <li>Proposal gating (sovereign vs non-sovereign surfaces)</li>
-        <li>Path policy (tool-level path restrictions)</li>
-        <li>Ripcord/tripwire (runtime behavioral constraints)</li>
+        <li>Kernel-blind read: permission gate allows, proposal gate blocks</li>
+        <li>Shell-read: permission gate reasons about <code>shell</code>, proposal gate inspects command text</li>
+        <li><code>git_checkpoint</code>: unmapped in permission gate, mapped in proposal gate</li>
+        <li>Session approval keyed by tool name, not surface (approving one write blesses all writes)</li>
+        <li><code>CapabilityMode</code> mutates path policy via config_bridge, not just presentation</li>
+        <li>Tool-layer self-modify checks duplicate kernel enforcement</li>
+        <li>Delete surface advertised but not fully modeled</li>
       </ul>
-      Need one canonical model:
-      <ul>
-        <li>Every action targets exactly one <strong>surface</strong> (loadable, sovereign, external)</li>
-        <li>Each surface has exactly one <strong>policy authority</strong></li>
-        <li>The policy is communicated to both the loop and the user through a single mechanism</li>
-        <li>No two systems can contradict each other on the same action</li>
-      </ul>
-      This spec doesn't exist yet. It's the prerequisite for Goals 3 and 4.
+      5-phase implementation: parity matrix → canonical classification → shared resolver → attribution → wrapper collapse.
     </div>
-    <div class="deps"><strong>Benefits from:</strong> #1639 (tools self-describe their surface), #1647 (skills declare their scope)</div>
-    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0% — no spec, no issue. Overlapping control planes remain.</div>
+    <div class="deps"><strong>Benefits from:</strong> #1639 (tools self-describe their surface). Phases 0-2 can start after #1639 lands.</div>
+    <div class="progress-bar"><div class="progress-fill blue" style="width: 15%"></div></div>
+    <div class="progress-label">~15% — spec complete and source-validated. Implementation not started.</div>
   </div>
 </div>
 
@@ -447,36 +517,39 @@
 </div>
 
 <!-- Dependency graph -->
-<h2>Critical Path</h2>
+<h2>Dependency Graph (with parallelism)</h2>
 
 <pre style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 0.85rem; overflow-x: auto; line-height: 2;">
-<span style="color: var(--green)">LANDED</span>
+<span style="color: var(--green)">WAVE 1 ✅ LANDED</span>
   <span style="color: var(--green)">✅ #1644 Action trait ————— merged</span>
   <span style="color: var(--green)">✅ #1643 Config decomp ———— approved</span>
   <span style="color: var(--green)">✅ #1640 Provider metadata — approved</span>
-  <span style="color: var(--yellow)">⏳ #1614 Double response ——— in progress</span>
 
-<span style="color: var(--accent)">GOAL 1: SKILL SUBSTRATE (critical path)</span>
-  <span style="color: var(--accent)">🔵 #1639 Tool trait ————————————————</span>┐
-  <span style="color: var(--yellow)">🟡 #1646 Skill tool contracts ————</span>┤ sequential
-  <span style="color: var(--yellow)">🟡 #1647 Skill activation lifecycle</span>┘
+<span style="color: var(--accent)">WAVE 2 🔵 ACTIVE (parallel tracks)</span>
+  <span style="color: var(--accent)">Track A: 🔵 #1639 Tool trait ——————————</span> fx-tools  ──┐
+  <span style="color: var(--yellow)">Track B: ⏳ #1614 Double response ————</span> fx-kernel    │ parallel
+  <span style="color: var(--yellow)">Track B: ⏳ Authority model spec ——————</span> docs only  ──┘
 
-<span style="color: var(--yellow)">GOAL 2: AUTHORITY MODEL (after Goal 1)</span>
-  <span style="color: var(--purple)">🟣 NEW  Unified capability/kernel boundary spec</span>
+<span style="color: var(--yellow)">WAVE 3 🟡 QUEUED (sequential + optional parallel)</span>
+                                                      ┌── <span style="color: var(--text-muted)">⚪ #1642 Headless decomp (optional, fx-cli)</span>
+  <span style="color: var(--yellow)">🟡 #1646 Skill tool contracts ———————</span>──┤
+  <span style="color: var(--yellow)">🟡 #1647 Skill activation lifecycle ——</span>──┘   all depend on #1639
 
-<span style="color: var(--orange)">GOAL 3: SELF-HOSTING (after Goal 2)</span>
-  <span style="color: var(--text-muted)">⚪ #1641 Loop decomposition + ripcord coherence</span>
+<span style="color: var(--purple)">WAVE 4 🟣 AUTHORITY MODEL (phases 0-2 can start after #1639)</span>
+  <span style="color: var(--purple)">🟣 Phase 0: parity matrix + freeze tests</span>
+  <span style="color: var(--purple)">🟣 Phase 1: canonical request classification</span>
+  <span style="color: var(--purple)">🟣 Phase 2: shared resolver under wrappers</span>
+  <span style="color: var(--purple)">🟣 Phase 3: attribution + services</span>
+  <span style="color: var(--purple)">🟣 Phase 4: collapse wrappers + remove dupes</span>
 
-<span style="color: var(--text-muted)">GOAL 4: SELF-MODIFICATION (after Goals 1-3)</span>
-  <span style="color: var(--text-muted)">⚪ No active issues. Prerequisites not met.</span>
-
-<span style="color: var(--text-muted)">HYGIENE (anytime)</span>
-  <span style="color: var(--text-muted)">⚪ #1642 Headless decomp</span>
+<span style="color: var(--text-muted)">WAVE 5 ⚪ DEFERRED</span>
+  <span style="color: var(--text-muted)">⚪ #1641 Loop decomposition</span>
   <span style="color: var(--text-muted)">⚪ #1638 Static dispatch audit (falls out of #1639)</span>
+  <span style="color: var(--text-muted)">⚪ Deep self-modification (prerequisites: Goals 1-3)</span>
 </pre>
 
 <div class="timestamp">
-  Updated 2026-03-29 00:10 UTC (v4) · Resequenced per roadmap checkpoint · Critical path: #1639 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-29 00:44 UTC (v4.1) · Wave lineup with parallelism · Track A: #1639 (skill substrate) ∥ Track B: #1614 + authority spec · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
