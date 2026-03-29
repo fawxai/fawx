@@ -11,8 +11,8 @@ use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
-    ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, JournalAction,
+    ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -39,7 +39,6 @@ mod process;
 mod runtime;
 mod shell;
 mod subagent;
-mod web;
 
 #[cfg(test)]
 use self::filesystem::{is_builtin_ignored_directory, MAX_SEARCH_MATCHES};
@@ -93,10 +92,16 @@ impl ToolRegistry {
     {
         let tool: ToolRef = Arc::new(tool);
         let name = tool.name().to_string();
-        assert!(
-            self.by_name.insert(name, Arc::clone(&tool)).is_none(),
-            "duplicate tool registration"
-        );
+        match self.by_name.entry(name.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                tracing::error!(tool = %name, "duplicate tool registration");
+                debug_assert!(false, "duplicate tool registration: {name}");
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&tool));
+            }
+        }
         self.ordered.push(tool);
     }
 
@@ -493,6 +498,18 @@ impl ToolExecutor for FawxToolExecutor {
             })
     }
 
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.tools
+            .get(call.name.as_str())
+            .map_or("unknown", |tool| tool.action_category())
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.tools
+            .get(call.name.as_str())
+            .and_then(|tool| tool.journal_action(call, result))
+    }
+
     fn route_sub_goal_call(
         &self,
         request: &fx_kernel::act::SubGoalToolRoutingRequest,
@@ -627,7 +644,6 @@ fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
     shell::register_tools(&mut registry, context);
     process::register_tools(&mut registry, context);
     runtime::register_tools(&mut registry, context);
-    web::register_tools(&mut registry, context);
     subagent::register_tools(&mut registry, context);
     memory::register_tools(&mut registry, context);
     config::register_tools(&mut registry, context);
@@ -635,254 +651,6 @@ fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
     #[cfg(feature = "improvement")]
     improvement::register_tools(&mut registry, context);
     registry
-}
-
-#[cfg(test)]
-pub fn fawx_tool_definitions(
-    include_subagent_tools: bool,
-    include_experiment_tool: bool,
-) -> Vec<ToolDefinition> {
-    let mut definitions = vec![
-        ToolDefinition {
-            name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from disk. Supports `~` to reference the home directory."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Line number to start reading from (1-indexed)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of lines to return"
-                    }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "write_file".to_string(),
-            description: "Write UTF-8 content to a file on disk. Supports `~` to reference the home directory."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolDefinition {
-            name: "edit_file".to_string(),
-            description: "Replace exact text in a file. The old_text must match exactly (including whitespace and newlines). Use for precise, surgical edits."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "old_text": { "type": "string" },
-                    "new_text": { "type": "string" }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_directory".to_string(),
-            description:
-                "List files and directories, optionally recursively. Supports `~` to reference the home directory."
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "recursive": { "type": "boolean" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "run_command".to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
-                    "shell": { "type": "boolean" }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "exec_background".to_string(),
-            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
-                    "label": { "type": "string" }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "exec_status".to_string(),
-            description: "Check one background process or list all background processes.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "tail": { "type": "integer" }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "exec_kill".to_string(),
-            description: "Kill a background process by session ID.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "search_text".to_string(),
-            description:
-                "Search text in files and return file:line matches. Supports `~` to reference the home directory."
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "file_glob": { "type": "string" }
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDefinition {
-            name: "self_info".to_string(),
-            description:
-                "Inspect runtime state: active model, loaded skills, configuration, and version"
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "section": {
-                        "type": "string",
-                        "enum": ["model", "skills", "config", "all"],
-                        "description": "Filter to a specific section. Defaults to 'all'."
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current date, time, timezone, and Unix epoch timestamp"
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "x-fawx-direct-utility": {
-                    "enabled": true,
-                    "profile": "current_time",
-                    "trigger_patterns": [
-                        "current time",
-                        "what time",
-                        "what's the time",
-                        "whats the time",
-                        "time is it"
-                    ]
-                }
-            }),
-        },
-    ];
-    if include_experiment_tool {
-        definitions.insert(0, crate::experiment_tool::run_experiment_tool_definition());
-    }
-    if include_subagent_tools {
-        definitions.extend(subagent_tool_definitions());
-    }
-    definitions
-}
-
-#[cfg(test)]
-fn subagent_tool_definitions() -> Vec<ToolDefinition> {
-    vec![spawn_agent_definition(), subagent_status_definition()]
-}
-
-#[cfg(test)]
-fn spawn_agent_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "spawn_agent".to_string(),
-        description:
-            "Spawn an isolated subagent to handle a task. Returns a subagent ID for monitoring."
-                .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The task or prompt for the subagent"
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Human-readable label for identification"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["run", "session"],
-                    "description": "run = one-shot (default), session = persistent"
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "description": "Maximum execution time in seconds (default: 600)"
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the subagent"
-                }
-            },
-            "required": ["task"]
-        }),
-    }
-}
-
-#[cfg(test)]
-fn subagent_status_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "subagent_status".to_string(),
-        description: "Check status of a subagent, list all subagents, or cancel one.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["status", "list", "cancel", "send"],
-                    "description": "Action to perform"
-                },
-                "id": {
-                    "type": "string",
-                    "description": "Subagent ID (required for status/cancel/send)"
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Message to send (required for send action)"
-                }
-            },
-            "required": ["action"]
-        }),
-    }
 }
 
 pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
@@ -1161,6 +929,21 @@ mod tests {
             router: Arc::new(ModelRouter::new()),
             config: FawxConfig::default(),
         }
+    }
+
+    fn tool_definitions(
+        include_subagent_tools: bool,
+        include_experiment_tool: bool,
+    ) -> Vec<ToolDefinition> {
+        let temp = TempDir::new().expect("temp");
+        let mut executor = test_executor(temp.path());
+        if include_experiment_tool {
+            executor = executor.with_experiment(experiment_state(temp.path()));
+        }
+        if include_subagent_tools {
+            executor = executor.with_subagent_control(Arc::new(StubSubagentControl::new()));
+        }
+        executor.tool_definitions()
     }
 
     #[test]
@@ -2346,12 +2129,12 @@ three
 
     #[test]
     fn run_experiment_definition_only_appears_when_enabled() {
-        let without_experiment = fawx_tool_definitions(false, false);
+        let without_experiment = tool_definitions(false, false);
         assert!(!without_experiment
             .iter()
             .any(|tool| tool.name == "run_experiment"));
 
-        let with_experiment = fawx_tool_definitions(false, true);
+        let with_experiment = tool_definitions(false, true);
         assert!(with_experiment
             .iter()
             .any(|tool| tool.name == "run_experiment"));
@@ -2432,19 +2215,19 @@ three
 
     #[test]
     fn current_time_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
     #[test]
     fn edit_file_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]
     fn background_process_tools_appear_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions
             .iter()
             .any(|tool| tool.name == "exec_background"));
@@ -2454,7 +2237,7 @@ three
 
     #[test]
     fn read_file_definition_exposes_offset_and_limit() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         let read_file = definitions
             .iter()
             .find(|tool| tool.name == "read_file")
@@ -2524,6 +2307,53 @@ three
             executor.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn action_category_uses_registered_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = memory_executor(temp.path()).0;
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "memory_search".to_string(),
+            arguments: serde_json::json!({"query": "preferences"}),
+        };
+
+        assert_eq!(executor.action_category(&call), "tool_call");
+    }
+
+    #[test]
+    fn journal_action_uses_registered_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello"
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("file write action");
+
+        assert!(matches!(
+            action,
+            JournalAction::FileWrite {
+                path,
+                size_bytes: 5,
+                created: false,
+                ..
+            } if path == Path::new("notes.txt")
+        ));
     }
 
     #[test]
@@ -2860,7 +2690,10 @@ three
 
     #[test]
     fn spawn_agent_schema_omits_model_override() {
-        let definition = spawn_agent_definition();
+        let definition = tool_definitions(true, false)
+            .into_iter()
+            .find(|tool| tool.name == "spawn_agent")
+            .expect("spawn_agent definition");
         let properties = definition.parameters["properties"]
             .as_object()
             .expect("spawn properties object");
@@ -2975,7 +2808,7 @@ three
 
     #[test]
     fn self_info_appears_in_tool_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "self_info"));
     }
 

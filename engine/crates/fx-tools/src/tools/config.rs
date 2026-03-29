@@ -41,23 +41,45 @@ struct FawxRestartTool {
     context: Arc<ToolContext>,
 }
 
-macro_rules! config_tool_new {
-    ($name:ident) => {
-        impl $name {
-            fn new(context: &Arc<ToolContext>) -> Self {
-                Self {
-                    context: Arc::clone(context),
-                }
-            }
+impl ConfigGetTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
         }
-    };
+    }
 }
 
-config_tool_new!(ConfigGetTool);
-config_tool_new!(ConfigSetTool);
-config_tool_new!(FawxStatusTool);
-config_tool_new!(KernelManifestTool);
-config_tool_new!(FawxRestartTool);
+impl ConfigSetTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl FawxStatusTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl KernelManifestTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl FawxRestartTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ConfigGetTool {

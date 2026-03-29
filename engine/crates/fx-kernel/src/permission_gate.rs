@@ -5,8 +5,8 @@
 //! an SSE `permission_prompt` event, and wait for the user's response.
 
 use crate::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolCallClassification, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionPromptState};
@@ -191,6 +191,14 @@ impl<T: ToolExecutor> ToolExecutor for PermissionGateExecutor<T> {
         self.inner.classify_call(call)
     }
 
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.action_category_for_call(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
+    }
+
     fn clear_cache(&self) {
         self.inner.clear_cache();
     }
@@ -270,7 +278,7 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             }
         }
 
-        tool_to_action_category(&call.name)
+        self.inner.action_category(call)
     }
 
     async fn ask_permission(
@@ -384,23 +392,6 @@ fn assemble_results(
     indexed.extend(denied);
     indexed.sort_by_key(|(idx, _)| *idx);
     indexed.into_iter().map(|(_, result)| result).collect()
-}
-
-/// Map tool names to permission action categories.
-fn tool_to_action_category(tool_name: &str) -> &'static str {
-    match tool_name {
-        "web_search" | "brave_search" => "web_search",
-        "web_fetch" | "fetch_url" => "web_fetch",
-        "read_file" | "search_text" | "list_directory" => "read_any",
-        "write_file" | "create_file" | "edit_file" => "file_write",
-        "shell" | "bash" | "execute_command" => "shell",
-        "git" | "git_status" | "git_diff" | "git_commit" | "git_push" => "git",
-        "delete_file" | "remove_file" => "file_delete",
-        "run_experiment" | "experiment" => "tool_call",
-        "subagent_spawn" | "subagent_status" | "subagent_cancel" => "tool_call",
-        "run_command" | "execute" => "code_execute",
-        _ => "unknown",
-    }
 }
 
 fn capability_denied_result(call: &ToolCall, category: &str) -> ToolResult {
@@ -529,6 +520,18 @@ mod tests {
             name: "write_file".to_string(),
             arguments: serde_json::json!({"path": path, "content": "data"}),
         }
+    }
+
+    fn search_call() -> ToolCall {
+        test_call("web_search")
+    }
+
+    fn shell_call() -> ToolCall {
+        test_call("shell")
+    }
+
+    fn unknown_call() -> ToolCall {
+        test_call("unknown_tool")
     }
 
     fn capture_prompt_id() -> (Arc<std::sync::Mutex<Option<String>>>, StreamCallback) {
@@ -767,13 +770,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_to_action_category_maps_known_tools() {
-        assert_eq!(tool_to_action_category("web_search"), "web_search");
-        assert_eq!(tool_to_action_category("shell"), "shell");
-        assert_eq!(tool_to_action_category("write_file"), "file_write");
-        assert_eq!(tool_to_action_category("git"), "git");
-        assert_eq!(tool_to_action_category("delete_file"), "file_delete");
-        assert_eq!(tool_to_action_category("unknown_tool"), "unknown");
+    fn action_category_delegates_to_inner_executor() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        );
+
+        assert_eq!(executor.action_category(&search_call()), "web_search");
+        assert_eq!(executor.action_category(&shell_call()), "shell");
+        assert_eq!(
+            executor.action_category(&write_call("file.txt")),
+            "file_write"
+        );
+        assert_eq!(executor.action_category(&unknown_call()), "unknown");
     }
 
     #[test]

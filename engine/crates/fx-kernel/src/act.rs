@@ -5,6 +5,7 @@ use crate::decide::Decision;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 /// Token accounting for loop steps that call an LLM.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -88,6 +89,64 @@ pub struct ToolResult {
     pub success: bool,
     /// Human-readable tool output.
     pub output: String,
+}
+
+/// The specific tool action that should be journaled for ripcord.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalAction {
+    FileWrite {
+        path: PathBuf,
+        snapshot_hash: Option<String>,
+        size_bytes: u64,
+        created: bool,
+    },
+    FileDelete {
+        path: PathBuf,
+        snapshot_hash: String,
+    },
+    FileMove {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    GitCommit {
+        repo: PathBuf,
+        pre_ref: String,
+        commit_sha: String,
+    },
+    GitBranchCreate {
+        repo: PathBuf,
+        branch: String,
+    },
+    GitPush {
+        repo: PathBuf,
+        remote: String,
+        branch: String,
+        pre_ref: String,
+    },
+    ShellCommand {
+        command: String,
+        exit_code: i32,
+    },
+    NetworkRequest {
+        url: String,
+        method: String,
+        status_code: u16,
+    },
+}
+
+impl JournalAction {
+    /// Whether this action type can be mechanically reversed.
+    pub fn is_reversible(&self) -> bool {
+        matches!(
+            self,
+            Self::FileWrite { .. }
+                | Self::FileDelete { .. }
+                | Self::FileMove { .. }
+                | Self::GitCommit { .. }
+                | Self::GitBranchCreate { .. }
+        )
+    }
 }
 
 /// Executor-facing request to materialize a direct tool call from a sub-goal.
@@ -174,6 +233,20 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
         }
     }
 
+    /// Classifies the permission/ripcord action category for a tool call.
+    fn action_category(&self, call: &fx_llm::ToolCall) -> &'static str {
+        default_tool_action_category(&call.name)
+    }
+
+    /// Extracts a journal action for ripcord when the tool call is material.
+    fn journal_action(
+        &self,
+        call: &fx_llm::ToolCall,
+        result: &ToolResult,
+    ) -> Option<JournalAction> {
+        default_tool_journal_action(call, result)
+    }
+
     /// Materialize a direct tool call for a decomposed sub-goal when the
     /// executor can do so safely from the tool's declared contract.
     ///
@@ -195,6 +268,138 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     fn cache_stats(&self) -> Option<ToolCacheStats> {
         None
     }
+}
+
+fn default_tool_action_category(tool_name: &str) -> &'static str {
+    match tool_name {
+        "web_search" | "brave_search" => "web_search",
+        "web_fetch" | "fetch_url" => "web_fetch",
+        "read_file" | "search_text" | "list_directory" => "read_any",
+        "write_file" | "create_file" | "edit_file" => "file_write",
+        "shell" | "bash" | "execute_command" => "shell",
+        "git" | "git_status" | "git_diff" | "git_commit" | "git_push" => "git",
+        "delete_file" | "remove_file" => "file_delete",
+        "run_experiment" | "experiment" => "tool_call",
+        "subagent_spawn" | "subagent_status" | "subagent_cancel" => "tool_call",
+        "run_command" | "execute" => "code_execute",
+        _ => "unknown",
+    }
+}
+
+fn default_tool_journal_action(
+    call: &fx_llm::ToolCall,
+    result: &ToolResult,
+) -> Option<JournalAction> {
+    match call.name.as_str() {
+        "write_file" | "create_file" | "edit_file" => file_write_action(call),
+        "delete_file" | "remove_file" => file_delete_action(call),
+        "git_commit" => git_commit_action(call, result),
+        "git_push" => git_push_action(call, result),
+        "shell" | "bash" | "execute_command" => shell_action(call, result),
+        _ => None,
+    }
+}
+
+fn file_write_action(call: &fx_llm::ToolCall) -> Option<JournalAction> {
+    let path = path_argument(call)?;
+    let content = string_argument(call, "content").unwrap_or_default();
+    Some(JournalAction::FileWrite {
+        path,
+        snapshot_hash: None,
+        size_bytes: content.len() as u64,
+        created: call.name == "create_file",
+    })
+}
+
+fn file_delete_action(call: &fx_llm::ToolCall) -> Option<JournalAction> {
+    let path = path_argument(call)?;
+    Some(JournalAction::FileDelete {
+        path,
+        snapshot_hash: "unknown".to_string(),
+    })
+}
+
+fn git_commit_action(call: &fx_llm::ToolCall, result: &ToolResult) -> Option<JournalAction> {
+    let repo = repo_argument(call)?;
+    let commit_sha = string_argument(call, "commit_sha")
+        .or_else(|| string_argument(call, "hash"))
+        .or_else(|| first_word(&result.output))
+        .unwrap_or_else(|| "unknown".to_string());
+    let pre_ref = string_argument(call, "pre_ref")
+        .or_else(|| string_argument(call, "ref"))
+        .unwrap_or_else(|| "HEAD~1".to_string());
+    Some(JournalAction::GitCommit {
+        repo,
+        pre_ref,
+        commit_sha,
+    })
+}
+
+fn git_push_action(call: &fx_llm::ToolCall, result: &ToolResult) -> Option<JournalAction> {
+    let repo = repo_argument(call)?;
+    let remote = string_argument(call, "remote")
+        .or_else(|| find_json_string(&result.output, "remote"))
+        .unwrap_or_else(|| "origin".to_string());
+    let branch = string_argument(call, "branch")
+        .or_else(|| find_json_string(&result.output, "branch"))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let pre_ref = string_argument(call, "pre_ref")
+        .or_else(|| string_argument(call, "ref"))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(JournalAction::GitPush {
+        repo,
+        remote,
+        branch,
+        pre_ref,
+    })
+}
+
+fn shell_action(call: &fx_llm::ToolCall, result: &ToolResult) -> Option<JournalAction> {
+    let command = string_argument(call, "command")?;
+    Some(JournalAction::ShellCommand {
+        command,
+        exit_code: extract_exit_code(&result.output, result.success),
+    })
+}
+
+fn path_argument(call: &fx_llm::ToolCall) -> Option<PathBuf> {
+    string_argument(call, "path")
+        .or_else(|| string_argument(call, "file_path"))
+        .map(PathBuf::from)
+}
+
+fn repo_argument(call: &fx_llm::ToolCall) -> Option<PathBuf> {
+    string_argument(call, "repo")
+        .or_else(|| string_argument(call, "working_dir"))
+        .or_else(|| string_argument(call, "cwd"))
+        .or_else(|| string_argument(call, "path"))
+        .map(PathBuf::from)
+}
+
+fn string_argument(call: &fx_llm::ToolCall, key: &str) -> Option<String> {
+    call.arguments.get(key)?.as_str().map(ToString::to_string)
+}
+
+fn first_word(text: &str) -> Option<String> {
+    text.split_whitespace().next().map(ToString::to_string)
+}
+
+fn extract_exit_code(output: &str, success: bool) -> i32 {
+    parse_exit_code(output).unwrap_or(if success { 0 } else { -1 })
+}
+
+fn parse_exit_code(output: &str) -> Option<i32> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("exit_code: "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn find_json_string(output: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    value.get(key)?.as_str().map(ToString::to_string)
 }
 
 /// Terminal disposition for a single Act step.

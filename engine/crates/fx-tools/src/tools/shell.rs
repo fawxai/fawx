@@ -3,11 +3,10 @@ use super::{
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
-use fx_kernel::act::{ToolCacheability, ToolCallClassification, ToolResult};
+use fx_kernel::act::{JournalAction, ToolCacheability, ToolCallClassification, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
-use fx_ripcord::JournalAction;
 use serde::Deserialize;
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 use crate::act::{
-    ConcurrencyPolicy, SubGoalToolRoutingRequest, ToolCacheStats, ToolCacheability, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    ConcurrencyPolicy, JournalAction, SubGoalToolRoutingRequest, ToolCacheStats, ToolCacheability,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
@@ -135,6 +135,22 @@ impl ToolExecutor for ScopedToolExecutor {
             self.inner.classify_call(call)
         } else {
             crate::act::ToolCallClassification::Mutation
+        }
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        if self.allows(&call.name) {
+            self.inner.action_category(call)
+        } else {
+            "unknown"
+        }
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        if self.allows(&call.name) {
+            self.inner.journal_action(call, result)
+        } else {
+            None
         }
     }
 

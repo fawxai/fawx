@@ -37,23 +37,45 @@ struct MemorySearchTool {
     context: Arc<ToolContext>,
 }
 
-macro_rules! memory_tool_new {
-    ($name:ident) => {
-        impl $name {
-            fn new(context: &Arc<ToolContext>) -> Self {
-                Self {
-                    context: Arc::clone(context),
-                }
-            }
+impl MemoryWriteTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
         }
-    };
+    }
 }
 
-memory_tool_new!(MemoryWriteTool);
-memory_tool_new!(MemoryReadTool);
-memory_tool_new!(MemoryListTool);
-memory_tool_new!(MemoryDeleteTool);
-memory_tool_new!(MemorySearchTool);
+impl MemoryReadTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl MemoryListTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl MemoryDeleteTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
+
+impl MemorySearchTool {
+    fn new(context: &Arc<ToolContext>) -> Self {
+        Self {
+            context: Arc::clone(context),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for MemoryWriteTool {

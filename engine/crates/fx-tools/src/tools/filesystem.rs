@@ -5,11 +5,10 @@ use super::{
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
-use fx_kernel::act::{ToolCacheability, ToolResult};
+use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
-use fx_ripcord::JournalAction;
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;

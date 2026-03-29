@@ -6,14 +6,13 @@ use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
-    SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification, ToolResult,
+    JournalAction, SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ProcessRegistry;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
-use fx_ripcord::JournalAction;
 use fx_subagent::SubagentControl;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
