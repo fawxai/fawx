@@ -16,6 +16,53 @@ fn detect_turn_execution_profile_recognizes_bounded_local_requests() {
 }
 
 #[tokio::test]
+async fn perceive_routes_explicit_local_path_reads_to_direct_inspection() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let _processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath)
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_rejects_mutation_verbs_for_direct_inspection() {
+    let message = "Read ~/.zshrc and then update it with a new alias.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_requires_explicit_local_path_for_direct_inspection() {
+    let message = "Read this file and summarize it for me.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
+    let tools = DirectUtilityToolExecutor.tool_definitions();
+    let message = "Tell me the current time, then quote ~/notes/todo.md.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &tools),
+        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+    );
+}
+
+#[tokio::test]
 async fn bounded_local_prompt_disables_decompose_and_injects_fast_path_directive() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     let llm = RecordingLlm::ok(vec![CompletionResponse {

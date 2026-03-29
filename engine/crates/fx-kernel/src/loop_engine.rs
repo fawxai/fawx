@@ -58,6 +58,7 @@ use fx_decompose::SubGoalContract;
 
 mod bounded_local;
 mod continuation;
+mod direct_inspection;
 mod direct_utility;
 mod progress;
 
@@ -74,6 +75,9 @@ use continuation::{
     tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
     turn_commitment_metadata,
 };
+use direct_inspection::direct_inspection_profile_label;
+#[cfg(test)]
+use direct_inspection::DirectInspectionProfile;
 #[cfg(test)]
 use direct_utility::DirectUtilityProfile;
 use direct_utility::{
@@ -2338,8 +2342,7 @@ impl LoopEngine {
         let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
         let all_tools = self.tool_executor.tool_definitions();
 
-        let profile_owns_surface =
-            !matches!(self.turn_execution_profile, TurnExecutionProfile::Standard);
+        let profile_owns_surface = self.turn_execution_profile.owns_tool_surface();
 
         if !profile_owns_surface
             && observation_nudge_threshold > 0
@@ -2589,7 +2592,9 @@ impl LoopEngine {
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
         let base = &self.budget.config().termination;
         match self.turn_execution_profile {
-            TurnExecutionProfile::Standard => Cow::Borrowed(base),
+            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => {
+                Cow::Borrowed(base)
+            }
             TurnExecutionProfile::BoundedLocal => {
                 let mut tightened = base.clone();
                 tightened.nudge_after_tool_turns =
@@ -2856,6 +2861,17 @@ impl LoopEngine {
                     serde_json::json!({
                         "profile": "bounded_local",
                         "phase": bounded_local_phase_label(self.bounded_local_phase),
+                    }),
+                );
+            }
+            TurnExecutionProfile::DirectInspection(profile) => {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Trace,
+                    "selected direct inspection execution profile",
+                    serde_json::json!({
+                        "profile": "direct_inspection",
+                        "inspection_profile": direct_inspection_profile_label(profile),
                     }),
                 );
             }
@@ -5733,7 +5749,7 @@ impl LoopEngine {
         continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
-        if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+        if self.turn_execution_profile.borrows_standard_turn_contract()
             && self.observation_only_call_restriction_active()
             && calls_are_all_classification(
                 &state.current_calls,
@@ -5910,7 +5926,7 @@ impl LoopEngine {
         } else {
             phase_allowed
         };
-        let allowed = if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+        let allowed = if self.turn_execution_profile.borrows_standard_turn_contract()
             && self.observation_only_call_restriction_active()
         {
             let (mutation_allowed, observation_blocked) = partition_by_call_classification(

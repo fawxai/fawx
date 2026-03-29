@@ -9,6 +9,9 @@ use super::{
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
 };
 use crate::act::ToolResult;
+use crate::loop_engine::direct_inspection::{
+    detect_direct_inspection_profile, DirectInspectionProfile,
+};
 use crate::loop_engine::direct_utility::DirectUtilityProfile;
 use crate::signals::{LoopStep, SignalKind};
 use fx_llm::{ToolCall, ToolDefinition};
@@ -19,7 +22,18 @@ pub(super) enum TurnExecutionProfile {
     #[default]
     Standard,
     BoundedLocal,
+    DirectInspection(DirectInspectionProfile),
     DirectUtility(DirectUtilityProfile),
+}
+
+impl TurnExecutionProfile {
+    pub(super) fn borrows_standard_turn_contract(self) -> bool {
+        matches!(self, Self::Standard | Self::DirectInspection(_))
+    }
+
+    pub(super) fn owns_tool_surface(self) -> bool {
+        matches!(self, Self::BoundedLocal | Self::DirectUtility(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,7 +65,7 @@ impl LoopEngine {
             TurnExecutionProfile::DirectUtility(profile) => {
                 Some(direct_utility_tool_names(&profile))
             }
-            TurnExecutionProfile::Standard => None,
+            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => None,
         }
     }
 
@@ -70,13 +84,12 @@ impl LoopEngine {
     }
 
     pub(super) fn effective_decompose_enabled(&self) -> bool {
-        self.decompose_enabled
-            && matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+        self.decompose_enabled && self.turn_execution_profile.borrows_standard_turn_contract()
     }
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
         match self.turn_execution_profile {
-            TurnExecutionProfile::Standard => None,
+            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => None,
             TurnExecutionProfile::BoundedLocal => {
                 let phase_directive = match self.bounded_local_phase {
                     BoundedLocalPhase::Discovery => BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE,
@@ -538,6 +551,9 @@ pub(super) fn detect_turn_execution_profile(
 ) -> TurnExecutionProfile {
     if let Some(profile) = detect_direct_utility_profile(user_message, available_tools) {
         return TurnExecutionProfile::DirectUtility(profile);
+    }
+    if let Some(profile) = detect_direct_inspection_profile(user_message) {
+        return TurnExecutionProfile::DirectInspection(profile);
     }
 
     let lower = user_message.to_lowercase();
