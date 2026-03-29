@@ -1427,6 +1427,13 @@ impl ToolRoundState {
 }
 
 #[derive(Debug)]
+struct FollowUpDecomposeContext {
+    prior_tool_results: Vec<ToolResult>,
+    prior_tokens_used: TokenUsage,
+    accumulated_text: Vec<String>,
+}
+
+#[derive(Debug)]
 enum ToolRoundOutcome {
     Cancelled,
     /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
@@ -5301,10 +5308,13 @@ impl LoopEngine {
         response: &CompletionResponse,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
-        prior_tool_results: Vec<ToolResult>,
-        prior_tokens_used: TokenUsage,
-        accumulated_text: Vec<String>,
+        context: FollowUpDecomposeContext,
     ) -> Result<ActionResult, LoopError> {
+        let FollowUpDecomposeContext {
+            prior_tool_results,
+            prior_tokens_used,
+            accumulated_text,
+        } = context;
         let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) else {
             return Err(loop_error(
                 "act",
@@ -5459,16 +5469,17 @@ impl LoopEngine {
 
                     if !response.tool_calls.is_empty() {
                         if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let accumulated_text = std::mem::take(&mut state.accumulated_text);
-                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            let context = FollowUpDecomposeContext {
+                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
+                                prior_tokens_used: state.tokens_used,
+                                accumulated_text: std::mem::take(&mut state.accumulated_text),
+                            };
                             return self
                                 .handle_follow_up_decompose(
                                     &response,
                                     llm,
                                     &state.continuation_messages,
-                                    prior_tool_results,
-                                    state.tokens_used,
-                                    accumulated_text,
+                                    context,
                                 )
                                 .await;
                         }
@@ -5521,16 +5532,17 @@ impl LoopEngine {
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
                         if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let accumulated_text = std::mem::take(&mut state.accumulated_text);
-                            let prior_tool_results = std::mem::take(&mut state.all_tool_results);
+                            let context = FollowUpDecomposeContext {
+                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
+                                prior_tokens_used: state.tokens_used,
+                                accumulated_text: std::mem::take(&mut state.accumulated_text),
+                            };
                             return self
                                 .handle_follow_up_decompose(
                                     &response,
                                     llm,
                                     &state.continuation_messages,
-                                    prior_tool_results,
-                                    state.tokens_used,
-                                    accumulated_text,
+                                    context,
                                 )
                                 .await;
                         }
@@ -9018,16 +9030,14 @@ mod phase2_tests {
         }
     }
 
-    fn mixed_tool_response(
-        text: &str,
+    fn mixed_tool_response_with_content(
+        content: Vec<ContentBlock>,
         id: &str,
         name: &str,
         arguments: serde_json::Value,
     ) -> CompletionResponse {
         CompletionResponse {
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
+            content,
             tool_calls: vec![ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -9036,6 +9046,22 @@ mod phase2_tests {
             usage: None,
             stop_reason: Some("tool_use".to_string()),
         }
+    }
+
+    fn mixed_tool_response(
+        text: &str,
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionResponse {
+        mixed_tool_response_with_content(
+            vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            id,
+            name,
+            arguments,
+        )
     }
 
     fn expect_complete(result: LoopResult) -> (String, u32, Vec<Signal>) {
@@ -9297,6 +9323,60 @@ mod phase2_tests {
 
         let result = engine
             .run_cycle(test_snapshot("read both files"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_whitespace_only_mixed_text_is_unchanged() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response(
+                "   ",
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response("Final answer", None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, "Final answer");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_preserves_multiple_text_blocks_in_mixed_response() {
+        let mut engine = test_engine();
+        let expected = "First block\nSecond block\n\nFinal answer";
+        let llm = SequentialMockLlm::new(vec![
+            mixed_tool_response_with_content(
+                vec![
+                    ContentBlock::Text {
+                        text: "First block".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "Second block".to_string(),
+                    },
+                ],
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Final answer", None, None),
+            text_response(expected, None, None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
             .await
             .expect("run_cycle");
         let (response, _, _) = expect_complete(result);
