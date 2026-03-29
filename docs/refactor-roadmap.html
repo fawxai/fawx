@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fawx Roadmap v4.2</title>
+<title>Fawx Roadmap v4.3</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -25,32 +25,29 @@
     background: var(--bg);
     color: var(--text);
     padding: 2rem;
-    max-width: 1100px;
+    max-width: 1120px;
     margin: 0 auto;
     line-height: 1.6;
   }
-  h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
-  .subtitle { color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.95rem; }
-  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; color: var(--accent); }
+  h1 { font-size: 1.85rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.98rem; }
+  h2 { font-size: 1.25rem; margin: 2rem 0 1rem; color: var(--accent); }
+  h3 { font-size: 1rem; margin-bottom: 0.6rem; }
 
-  .checkpoint {
+  .checkpoint, .thesis {
     background: var(--surface);
-    border-left: 3px solid var(--red);
+    border-radius: 0 8px 8px 0;
     padding: 1rem 1.25rem;
-    margin-bottom: 1.5rem;
-    border-radius: 0 6px 6px 0;
-    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    font-size: 0.92rem;
   }
+  .checkpoint { border-left: 3px solid var(--red); }
   .checkpoint strong { color: var(--red); }
-
   .thesis {
-    background: var(--surface);
     border-left: 3px solid var(--purple);
-    padding: 1rem 1.25rem;
-    margin-bottom: 2rem;
-    border-radius: 0 6px 6px 0;
-    font-style: italic;
     color: var(--text-muted);
+    font-style: italic;
+    margin-bottom: 2rem;
   }
 
   .summary-grid {
@@ -69,43 +66,33 @@
   .summary-card .number { font-size: 1.6rem; font-weight: 700; }
   .summary-card .label { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem; }
 
-  .goal {
+  .panel {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 1.5rem;
+    padding: 1.25rem;
     margin-bottom: 1.5rem;
   }
-  .goal-header {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 0.75rem;
-  }
-  .goal-number {
-    font-weight: 700;
-    font-size: 0.8rem;
-    padding: 0.15rem 0.6rem;
-    border-radius: 12px;
-    white-space: nowrap;
-    color: var(--bg);
-  }
-  .goal-title { font-size: 1.15rem; font-weight: 600; }
-  .goal-verdict { font-size: 0.85rem; margin-bottom: 1rem; }
 
-  .issue {
+  .panel-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  .issue-card {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 1rem 1.25rem;
+    padding: 1rem 1.1rem;
     margin-bottom: 0.75rem;
   }
   .issue-header {
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
-    margin-bottom: 0.4rem;
     flex-wrap: wrap;
+    margin-bottom: 0.35rem;
   }
   .issue-number {
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
@@ -114,8 +101,8 @@
     white-space: nowrap;
   }
   .issue-title { font-weight: 600; font-size: 0.95rem; }
-  .issue-body { color: var(--text-muted); font-size: 0.9rem; margin-top: 0.4rem; }
-  .issue-body ul { padding-left: 1.25rem; margin-top: 0.3rem; }
+  .issue-body { color: var(--text-muted); font-size: 0.9rem; }
+  .issue-body ul { padding-left: 1.2rem; margin-top: 0.4rem; }
   .issue-body li { margin-bottom: 0.2rem; }
 
   .tag {
@@ -125,15 +112,13 @@
     border-radius: 10px;
     font-weight: 500;
     margin-left: 0.25rem;
-    vertical-align: middle;
   }
   .tag-done { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
   .tag-active { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid rgba(88,166,255,0.3); }
   .tag-next { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
-  .tag-deferred { background: rgba(139,148,158,0.15); color: var(--text-muted); border: 1px solid rgba(139,148,158,0.3); }
-  .tag-new { background: rgba(188,140,255,0.15); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
-  .tag-critical { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
-  .tag-bug { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .tag-risk { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .tag-later { background: rgba(139,148,158,0.15); color: var(--text-muted); border: 1px solid rgba(139,148,158,0.3); }
+  .tag-spec { background: rgba(188,140,255,0.15); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
 
   .progress-bar {
     display: flex;
@@ -143,34 +128,32 @@
     background: var(--border);
     margin: 0.75rem 0 0.25rem;
   }
-  .progress-fill { height: 100%; transition: width 0.3s; }
-  .progress-fill.green { background: var(--green); }
-  .progress-fill.yellow { background: var(--yellow); }
-  .progress-fill.blue { background: var(--accent); }
+  .progress-fill { height: 100%; }
+  .green { background: var(--green); }
+  .blue { background: var(--accent); }
+  .yellow { background: var(--yellow); }
+  .red { background: var(--red); }
+  .purple { background: var(--purple); }
   .progress-label {
     font-size: 0.8rem;
     color: var(--text-muted);
     text-align: right;
   }
 
-  .deps {
-    font-size: 0.85rem;
-    color: var(--text-muted);
-    margin-top: 0.5rem;
-    padding-top: 0.5rem;
-    border-top: 1px solid var(--border);
-  }
-  .deps strong { color: var(--text); }
-
-  .sequence {
-    background: var(--surface);
+  .sequence-step {
+    background: var(--bg);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1.25rem;
-    margin-bottom: 1.5rem;
-    font-size: 0.9rem;
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.6rem;
   }
+  .sequence-step strong { color: var(--text); }
+  .step-meta { color: var(--text-muted); font-size: 0.86rem; }
 
+  .gate-list li { margin-bottom: 0.35rem; }
+  .gate-list { padding-left: 1.2rem; color: var(--text-muted); font-size: 0.9rem; }
+
+  .small { font-size: 0.84rem; color: var(--text-muted); }
   .timestamp {
     color: var(--text-muted);
     font-size: 0.8rem;
@@ -179,358 +162,251 @@
     padding-top: 1rem;
     border-top: 1px solid var(--border);
   }
-
+  code {
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    font-size: 0.86em;
+    background: rgba(255,255,255,0.03);
+    padding: 0.1rem 0.25rem;
+    border-radius: 4px;
+  }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
 
-<h1>Fawx Roadmap v4.2</h1>
-<p class="subtitle">Linear execution: #1654 merge → #1641 direct inspection fix → skill substrate → authority model</p>
+<h1>Fawx Roadmap v4.3</h1>
+<p class="subtitle">Kernel contract stabilization first. One PR at a time on dev. New substrate and authority work resume only after the loop, transcript, and persistence contracts are trustworthy again.</p>
 
 <div class="checkpoint">
-  <strong>Checkpoint (2026-03-29):</strong> Parallel dev merges caused a hard-to-bisect regression. Switching to linear execution: one PR at a time on dev. The regression is an execution profile issue (#1641): the standard continuation policy forces MutationOnly scope after observation-only rounds, causing hallucinated permission denials on successful read-only tool results. Fixing it properly through typed direct-inspection profiles gives us the first concrete loop decomposition seam.
+  <strong>Checkpoint (2026-03-29):</strong> The issue set since <code>#1637</code> shows the real shape of the work. We are not in feature expansion mode. We are in kernel stabilization mode. <code>#1639</code> landed and gives us a better tool spine, but commit tracing split current instability into three separate runtime problems: <code>#1641</code> direct-inspection fake-permission failure, <code>#1658</code> runaway continuation reintroduced by <code>13376838</code>, and <code>#1656</code> post-turn unknown-tool / ordering corruption. The plan below treats those as first-class gates.
 </div>
 
 <div class="thesis">
-  "Deterministic requests should use deterministic paths. If a request is satisfiable from local observation alone, the engine should not force it through research-then-mutate continuation."
+  "Extensibility resumes after the runtime can finish a deterministic inspection turn, persist a clean tool history, and replay that history without inventing blockers or losing tool identity."
 </div>
 
-<!-- Status cards -->
 <div class="summary-grid">
   <div class="summary-card">
     <div class="number" style="color: var(--green)">5</div>
-    <div class="label">Merged / Approved</div>
+    <div class="label">Landed foundation items</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--accent)">2</div>
-    <div class="label">Active (linear)</div>
+    <div class="number" style="color: var(--red)">4</div>
+    <div class="label">Active stabilization items</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--yellow)">3</div>
-    <div class="label">Queued</div>
+    <div class="label">Queued architecture items</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--purple)">1</div>
-    <div class="label">Spec complete</div>
+    <div class="number" style="color: var(--text-muted)">1</div>
+    <div class="label">Deferred feature item</div>
   </div>
 </div>
 
-<!-- Execution sequence -->
-<h2>Execution Sequence (Linear)</h2>
-
-<div style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-bottom: 2rem;">
-
-  <!-- Landed -->
-  <div class="sequence" style="border-left: 3px solid var(--green);">
-    <strong style="color: var(--green)">✅ Landed</strong><br>
-    <span style="color: var(--text-muted)">Hygiene, loop correctness, and tool decomposition.</span>
-    <div style="margin-top: 0.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.85rem;">
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1644 Action trait — merged
+<h2>Review of issues #1637 through #1658</h2>
+<div class="panel">
+  <div class="panel-grid">
+    <div>
+      <h3>Foundation already landed</h3>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait completion</span><span class="tag tag-done">merged</span></div>
+        <div class="issue-body">Necessary cleanup. Reduced stringly action checks.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1643 Config decomp — approved
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1643</span><span class="issue-title">Config decomposition</span><span class="tag tag-done">merged</span></div>
+        <div class="issue-body">Good refactor. Not the center of current instability.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1640 Provider metadata — approved
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata on traits</span><span class="tag tag-done">merged</span></div>
+        <div class="issue-body">Good refactor. Removed provider-name dispatch.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1614 Double response — merged (PR #1653)
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1614</span><span class="issue-title">Mixed text preservation</span><span class="tag tag-done">merged</span></div>
+        <div class="issue-body">Feature goal landed, but <code>13376838</code> reintroduced runaway behavior tracked separately in <code>#1658</code>.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> #1639 Tool trait — R2 approved (PR #1654)
-      </div>
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem;">
-        <span style="color: var(--green)">✅</span> Authority model spec — complete
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1639</span><span class="issue-title">Tool trait / registry</span><span class="tag tag-done">merged to dev</span></div>
+        <div class="issue-body">Critical path refactor is now in dev. This unlocks later skill work, but it does not solve the runtime contract bugs.</div>
       </div>
     </div>
-  </div>
-
-  <!-- NOW: Linear sequence -->
-  <div class="sequence" style="border-left: 3px solid var(--accent);">
-    <strong style="color: var(--accent)">🔵 NOW — Linear (one PR at a time on dev)</strong><br>
-    <span style="color: var(--text-muted)">Each step merges before the next begins. No parallel dev branches.</span>
-    <div style="margin-top: 0.75rem; font-size: 0.9rem; line-height: 2.2;">
-      <div style="background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
-        <span style="color: var(--accent)">1.</span> <strong>#1639</strong> Tool trait merge to dev <span class="tag tag-active">awaiting merge</span> <span style="color: var(--text-muted)">(PR #1654 R2 APPROVE)</span>
+    <div>
+      <h3>Current stabilization tranche</h3>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Direct inspection profile</span><span class="tag tag-active">start here</span></div>
+        <div class="issue-body">Architectural fix for the fake-permission / outside-working-directory regression. Traced in <code>docs/fix/1641-direct-inspection-regression-trace.md</code>.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--red); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
-        <span style="color: var(--accent)">2.</span> <strong>#1641</strong> Direct inspection profile (4 phases) <span class="tag tag-bug">fixes regression</span><br>
-        <span style="color: var(--text-muted); font-size: 0.85rem; margin-left: 1.2rem;">Phase 1: detection → Phase 2: tool surface → Phase 3: terminal completion → Phase 4: boundary cleanup</span>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduced by 13376838</span><span class="tag tag-active">regression</span></div>
+        <div class="issue-body">Separate from the original <code>#1652</code> regression and separate from <code>#1641</code>. Traced in <code>docs/fix/1653-runaway-reintroduction-trace.md</code>.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
-        <span style="color: var(--yellow)">3.</span> <strong>#1646</strong> Skill tool contracts <span class="tag tag-next">queued</span>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Persisted tool ordering / unknown tool</span><span class="tag tag-active">correctness</span></div>
+        <div class="issue-body">Post-turn identity and ordering corruption. Traced in <code>docs/fix/1656-unknown-tool-post-turn-trace.md</code>.</div>
       </div>
-      <div style="background: var(--bg); border: 1px solid var(--yellow); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem;">
-        <span style="color: var(--yellow)">4.</span> <strong>#1647</strong> Skill activation lifecycle <span class="tag tag-next">queued</span>
-      </div>
-      <div style="background: var(--bg); border: 1px solid var(--purple); border-radius: 6px; padding: 0.75rem;">
-        <span style="color: var(--purple)">5.</span> <strong>Authority model</strong> implementation (5 phases) <span class="tag tag-new">spec complete</span>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">contract cleanup</span></div>
+        <div class="issue-body">Should follow <code>#1656</code>. Grouping only makes sense once ordering and tool identity are stable.</div>
       </div>
     </div>
-  </div>
-
-  <!-- LATER -->
-  <div class="sequence" style="border-left: 3px solid var(--text-muted);">
-    <strong style="color: var(--text-muted)">⚪ LATER</strong><br>
-    <span style="color: var(--text-muted)">After the linear sequence completes.</span>
-    <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
-      ⚪ #1641 Full loop decomposition (remaining slices beyond direct inspection)<br>
-      ⚪ #1642 Headless decomp<br>
-      ⚪ #1638 Static dispatch audit (falls out of #1639)<br>
-      ⚪ Deep self-modification (prerequisites: Goals 1-3)
-    </div>
-  </div>
-
-</div>
-
-<!-- GOAL 1: Skill Substrate -->
-<div class="goal">
-  <div class="goal-header">
-    <span class="goal-number" style="background: var(--green)">GOAL 1</span>
-    <span class="goal-title">Loadable Local Skill Substrate</span>
-  </div>
-  <div class="goal-verdict" style="color: var(--green)">
-    Checkpoint verdict: <strong>real and promising</strong> — strongest of the four goals. Prioritize making it rock solid.
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1639</span>
-      <span class="issue-title">Tool trait: replace FawxToolExecutor monolith</span>
-      <span class="tag tag-done">PR #1654 R2 approved</span>
-      <span class="tag tag-critical">highest impact</span>
-    </div>
-    <div class="issue-body">
-      Decomposed <code>FawxToolExecutor</code> (5,938 lines, 27-arm match) into 27 <code>Tool</code> trait objects across 10 domain modules with registry-based dispatch. All trait methods consumed end-to-end. Awaiting merge to dev.
-    </div>
-    <div class="deps"><strong>Unlocks:</strong> #1646, #1647, #1638, structured memory tool, WASM/built-in unification</div>
-    <div class="progress-bar"><div class="progress-fill green" style="width: 95%"></div></div>
-    <div class="progress-label">~95% — PR #1654 R2 APPROVE, awaiting merge to dev</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1646</span>
-      <span class="issue-title">Skill tool contracts: direct utility routing for loadable skills</span>
-      <span class="tag tag-next">NEXT after #1639</span>
-    </div>
-    <div class="issue-body">
-      Generalize the direct utility pipeline beyond the one hardcoded weather skill:
-      <ul>
-        <li>Replace <code>DirectUtilityProfile</code> enum with data-driven struct from manifest metadata</li>
-        <li>Migrate 3 legacy skills (calculator, canvas, github) from <code>{"input": "string"}</code> wrapper to structured <code>[[tools]]</code> manifests</li>
-        <li>Safety gate: negative tests proving legacy-wrapped tools cannot activate direct utility routing</li>
-      </ul>
-    </div>
-    <div class="deps"><strong>Depends on:</strong> #1639</div>
-    <div class="progress-bar"><div class="progress-fill yellow" style="width: 30%"></div></div>
-    <div class="progress-label">~30% — weather pipeline end-to-end. Profile enum hardcoded, 3 legacy skills remain.</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1647</span>
-      <span class="issue-title">Skill activation lifecycle: revision tracking, staging, rollback</span>
-      <span class="tag tag-next">NEXT after #1646</span>
-    </div>
-    <div class="issue-body">
-      Skills need source awareness, revision tracking, and activation management:
-      <ul>
-        <li><code>SkillSource</code> (Published/LocalDev/Builtin), <code>SkillRevision</code> (content hash, signature status, tool contracts)</li>
-        <li><code>SkillLifecycleManager</code> with stage/activate/rollback, wired through SkillWatcher</li>
-        <li>Signature verification gate before activation. Events via event bus. <code>/skills status</code> command.</li>
-      </ul>
-    </div>
-    <div class="deps"><strong>Depends on:</strong> #1646, #1639</div>
-    <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-    <div class="progress-label">0% — no revision tracking, activation management, or source awareness exists</div>
   </div>
 </div>
 
-<!-- GOAL 2: Authority Model -->
-<div class="goal">
-  <div class="goal-header">
-    <span class="goal-number" style="background: var(--yellow); color: var(--bg)">GOAL 2</span>
-    <span class="goal-title">Unified Authority Model</span>
+<h2>Linear plan we can begin now</h2>
+<div class="panel" style="border-left: 3px solid var(--accent);">
+  <div class="sequence-step">
+    <strong>Step 1. #1641 Phase 1: direct-inspection detection</strong>
+    <div class="step-meta">Route deterministic local inspection requests into typed profile state instead of <code>Standard</code>.</div>
   </div>
-  <div class="goal-verdict" style="color: var(--yellow)">
-    Checkpoint verdict: <strong>biggest architectural crack</strong> — no single authoritative answer to "what surface? what policy? who decides?" Multiple overlapping control planes can disagree.
+  <div class="sequence-step">
+    <strong>Step 2. #1641 Phase 2: observation-only tool surface</strong>
+    <div class="step-meta">Own the allowed tool set inside the profile. No inheritance from the broad standard continuation contract.</div>
   </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">NEW</span>
-      <span class="issue-title">Unified capability/kernel boundary model</span>
-      <span class="tag tag-active">spec complete</span>
-    </div>
-    <div class="issue-body">
-      <strong>Spec: <code>docs/specs/refactor/unified-authority-model.md</code></strong> (refined against source code)<br><br>
-      Five overlapping control planes + duplicated tool-layer enforcement. 7 concrete conflict scenarios identified:
-      <ul>
-        <li>Kernel-blind read: permission gate allows, proposal gate blocks</li>
-        <li>Shell-read: permission gate reasons about <code>shell</code>, proposal gate inspects command text</li>
-        <li><code>git_checkpoint</code>: unmapped in permission gate, mapped in proposal gate</li>
-        <li>Session approval keyed by tool name, not surface (approving one write blesses all writes)</li>
-        <li><code>CapabilityMode</code> mutates path policy via config_bridge, not just presentation</li>
-        <li>Tool-layer self-modify checks duplicate kernel enforcement</li>
-        <li>Delete surface advertised but not fully modeled</li>
-      </ul>
-      5-phase implementation: parity matrix → canonical classification → shared resolver → attribution → wrapper collapse.
-    </div>
-    <div class="deps"><strong>Benefits from:</strong> #1639 (tools self-describe their surface). Phases 0-2 can start after #1639 lands.</div>
-    <div class="progress-bar"><div class="progress-fill blue" style="width: 15%"></div></div>
-    <div class="progress-label">~15% — spec complete and source-validated. Implementation not started.</div>
+  <div class="sequence-step">
+    <strong>Step 3. #1641 Phase 3: terminal completion from evidence</strong>
+    <div class="step-meta">End the turn on the first usable post-tool answer. This is the key gate against both fake permission denial and direct-inspection flailing.</div>
   </div>
-</div>
-
-<!-- GOAL 3: Self-hosting Runtime -->
-<div class="goal">
-  <div class="goal-header">
-    <span class="goal-number" style="background: var(--accent); color: var(--bg)">GOAL 3</span>
-    <span class="goal-title">Self-hosting Runtime with Ripcord/Tripwire</span>
+  <div class="sequence-step">
+    <strong>Step 4. #1641 Phase 4: standard/profile boundary cleanup</strong>
+    <div class="step-meta">Remove remaining leakage between <code>Standard</code> and direct inspection. Lock the behavior in with regression tests.</div>
   </div>
-  <div class="goal-verdict" style="color: var(--accent)">
-    <strong>Promoted:</strong> Direct inspection profile slice is immediate priority after #1654 merge. Fixes regression where the standard continuation policy forces MutationOnly scope after observation-only rounds, causing hallucinated permission denials on successful read-only tool results.
+  <div class="sequence-step">
+    <strong>Step 5. #1658: mixed-text runaway follow-up</strong>
+    <div class="step-meta">Immediately retest after Step 4. If <code>#1641</code> fully subsumes the direct-inspection runaway, narrow this issue to remaining mixed-text cases. If not, fix the reintroduced continuation loop directly.</div>
   </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1641</span>
-      <span class="issue-title">Loop decomposition: direct inspection profile (first slice)</span>
-      <span class="tag tag-active">ACTIVE — next after #1654 merge</span>
-      <span class="tag tag-bug">fixes regression</span>
-    </div>
-    <div class="issue-body">
-      First concrete extraction from <code>loop_engine.rs</code> (24K lines). Adds typed <code>DirectInspection</code> execution profile to fix a regression where successful <code>read_file</code> results are discarded by the standard continuation policy (<code>MutationOnly</code> scope after observation-only rounds causes hallucinated permission denials).
-      <ul>
-        <li><strong>Phase 1:</strong> Typed direct-inspection profile detection and state ownership</li>
-        <li><strong>Phase 2:</strong> Profile-owned observation-only tool surface</li>
-        <li><strong>Phase 3:</strong> Terminal completion from tool evidence (no re-entering standard continuation)</li>
-        <li><strong>Phase 4:</strong> Standard/profile boundary cleanup and regression lock-in</li>
-      </ul>
-      Specs: <code>docs/specs/refactor/1641-direct-inspection-profile.md</code> + 4 phase sub-specs.
-    </div>
-    <div class="deps"><strong>Depends on:</strong> #1644 ✅, #1614 ✅, #1639 (PR #1654)</div>
-    <div class="progress-bar"><div class="progress-fill yellow" style="width: 5%"></div></div>
-    <div class="progress-label">~5% — specs written, regression root-caused. Implementation not started.</div>
+  <div class="sequence-step">
+    <strong>Step 6. #1656: enforce tool ordering and reject poisoned history</strong>
+    <div class="step-meta">Fix the session write boundary before doing any history UX cleanup.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 7. #1655: persist one grouped tool-history record per turn</strong>
+    <div class="step-meta">Turn-scoped transcript contract. This comes after <code>#1656</code>, not before.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 8. #1646: direct utility routing and visible tool contracts</strong>
+    <div class="step-meta">Resume substrate work once the runtime can finish and persist deterministic turns cleanly.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 9. #1647: revisioned skill activation lifecycle</strong>
+    <div class="step-meta">Build on <code>#1646</code> and the landed tool registry.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 10. Unified authority model implementation</strong>
+    <div class="step-meta">Spec is already written. Implementation begins after runtime and substrate contracts are stable.</div>
   </div>
 </div>
 
-<!-- GOAL 4: Deep Self-Modification -->
-<div class="goal">
-  <div class="goal-header">
-    <span class="goal-number" style="background: var(--text-muted); color: var(--bg)">GOAL 4</span>
-    <span class="goal-title">Deep Self-Modification Platform</span>
-  </div>
-  <div class="goal-verdict" style="color: var(--text-muted)">
-    Checkpoint verdict: <strong>earliest-stage, least proven</strong> — requires crisp ontology of code domains, loadable vs sovereign surfaces, restart/reload/rollback semantics, and persistent self-knowledge. Seeds exist, but no integrated model yet. Only pursue after Goals 1-3.
-  </div>
-
-  <div class="issue-body" style="color: var(--text-muted); padding: 0.5rem 0;">
-    No active issues. Prerequisites: unified authority model (Goal 2), composable loop (Goal 3), skill lifecycle (#1647). This goal becomes tractable once the lower layers are crisp.
-  </div>
-</div>
-
-<!-- Landed work -->
-<h2>✅ Landed (Wave 1)</h2>
-<div class="goal" style="border-color: rgba(63,185,80,0.3);">
-  <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
-    Code hygiene and loop correctness. Not directly strategic, but makes the codebase workable for the strategic work ahead.
-  </p>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1644</span>
-      <span class="issue-title">Action trait completion</span>
-      <span class="tag tag-done">merged</span>
-    </div>
-    <div class="issue-body">PR #1650 merged. <code>has_tool_activity()</code> replaces <code>tool_results.is_empty()</code> checks throughout the loop.</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1643</span>
-      <span class="issue-title">Config decomposition</span>
-      <span class="tag tag-done">approved R2</span>
-    </div>
-    <div class="issue-body">PR #1651 approved. 2,403-line <code>lib.rs</code> split into 7 focused modules with 28 explicit re-exports.</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1640</span>
-      <span class="issue-title">Provider metadata on traits</span>
-      <span class="tag tag-done">approved R2</span>
-    </div>
-    <div class="issue-body">PR #1652 approved. 7 new trait methods on <code>CompletionProvider</code>, all string dispatch eliminated.</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1614</span>
-      <span class="issue-title">Double response bug fix</span>
-      <span class="tag tag-done">merged</span>
-    </div>
-    <div class="issue-body">PR #1653 merged. Mixed text preserved across tool rounds via separate accumulator. <code>FollowUpDecomposeContext</code> struct, whitespace/multi-block edge case tests.</div>
-  </div>
-
-  <div class="issue">
-    <div class="issue-header">
-      <span class="issue-number">#1639</span>
-      <span class="issue-title">Tool trait: FawxToolExecutor decomposition</span>
-      <span class="tag tag-done">R2 approved</span>
-    </div>
-    <div class="issue-body">PR #1654 R2 APPROVE. 27 tools across 10 domain modules. Registry dispatch, all trait methods consumed end-to-end. Awaiting merge to dev.</div>
-  </div>
-</div>
-
-<!-- Hygiene backlog -->
-<h2>⚪ Hygiene Backlog (do when convenient)</h2>
-<div style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; font-size: 0.9rem; color: var(--text-muted);">
-  These are code organization improvements. Not blocking any strategic goal. Do them in gaps between strategic work.
-  <ul style="margin-top: 0.5rem; padding-left: 1.25rem;">
-    <li><strong>#1642</strong> Headless decomp — 5,787-line file into domain modules</li>
-    <li><strong>#1638</strong> Static dispatch audit — falls out of #1639 automatically</li>
-    <li><strong>#1641</strong> Loop decomp (remaining slices) — full phase-trait extraction after direct inspection profile lands</li>
+<h2>Execution gates for the stabilization tranche</h2>
+<div class="panel">
+  <ul class="gate-list">
+    <li><strong>Gate A:</strong> <code>Read the file at ~/.zshrc and explain what each line does</code> must not end in an outside-working-directory refusal once the file was successfully read.</li>
+    <li><strong>Gate B:</strong> that prompt must terminate without runaway continuation on the current direct-inspection path.</li>
+    <li><strong>Gate C:</strong> no post-turn <code>Unknown tool call</code> row for the traced prompt after completion.</li>
+    <li><strong>Gate D:</strong> persisted history must never store <code>tool_result</code> before matching <code>tool_use</code>.</li>
+    <li><strong>Gate E:</strong> one completed turn must replay as one grouped historical tool-activity unit.</li>
   </ul>
 </div>
 
-<!-- Dependency graph -->
-<h2>Linear Execution Path</h2>
+<h2>Current issue classification</h2>
+<div class="panel-grid">
+  <div class="panel">
+    <h3>True refactors, keep these as refactors</h3>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1639</span><span class="issue-title">Tool trait</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Good substrate refactor. Foundation for later work.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Good metadata refactor.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1643</span><span class="issue-title">Config decomposition</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Good cleanup, lower leverage than the current runtime contract bugs.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Good cleanup.</div>
+    </div>
+  </div>
 
-<pre style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 0.85rem; overflow-x: auto; line-height: 2;">
-<span style="color: var(--green)">LANDED ✅</span>
-  <span style="color: var(--green)">✅ #1644 Action trait ————————— merged</span>
-  <span style="color: var(--green)">✅ #1643 Config decomp ——————— approved</span>
-  <span style="color: var(--green)">✅ #1640 Provider metadata ———— approved</span>
-  <span style="color: var(--green)">✅ #1614 Double response ————— merged (PR #1653)</span>
-  <span style="color: var(--green)">✅ #1639 Tool trait ——————————— approved (PR #1654)</span>
+  <div class="panel">
+    <h3>Rewrite-in-place / contract work</h3>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Loop engine direct-inspection slice</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">This is not just file splitting. It changes execution semantics.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduction</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">Regression repair tied to mixed-text continuation semantics.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Tool ordering and identity integrity</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">Session write boundary and replay correctness.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">Backend transcript contract cleanup after ordering is fixed.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing</span><span class="tag tag-next">after stabilization</span></div>
+      <div class="issue-body">Kernel contract visibility for deterministic utility tools.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-next">after #1646</span></div>
+      <div class="issue-body">Revisioned activation model for published and local skills.</div>
+    </div>
+  </div>
+</div>
 
-<span style="color: var(--accent)">NOW — LINEAR (one PR at a time on dev)</span>
-  <span style="color: var(--accent)">🔵 #1654 merge to dev</span>
-       ↓
-  <span style="color: var(--red)">🔴 #1641 Phase 1: direct inspection detection</span>       ← fixes regression
-  <span style="color: var(--red)">🔴 #1641 Phase 2: observation-only tool surface</span>
-  <span style="color: var(--red)">🔴 #1641 Phase 3: terminal completion from evidence</span>
-  <span style="color: var(--red)">🔴 #1641 Phase 4: standard/profile boundary cleanup</span>
-       ↓
-  <span style="color: var(--yellow)">🟡 #1646 Skill tool contracts</span>
-       ↓
-  <span style="color: var(--yellow)">🟡 #1647 Skill activation lifecycle</span>
-       ↓
-  <span style="color: var(--purple)">🟣 Authority model (5 phases, spec complete)</span>
+<h2>Deferred items</h2>
+<div class="panel-grid">
+  <div class="panel">
+    <h3>Later hygiene</h3>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-later">later</span></div>
+      <div class="issue-body">Still valuable. Not on the critical path while runtime contracts are unstable.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-later">umbrella</span></div>
+      <div class="issue-body">Keep as an audit umbrella, not an active parallel workstream.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-later">later</span></div>
+      <div class="issue-body">Resume after the first stabilization slice lands.</div>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>Deferred feature work</h3>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / export</span><span class="tag tag-later">defer</span></div>
+      <div class="issue-body">Good product work. It sits on top of unstable session history semantics right now, so it should wait.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">NEW</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-spec">spec complete</span></div>
+      <div class="issue-body">Implementation remains important, but it should start after Steps 1 through 9, not during runtime instability.</div>
+    </div>
+  </div>
+</div>
 
-<span style="color: var(--text-muted)">LATER ⚪</span>
-  <span style="color: var(--text-muted)">⚪ #1641 Full loop decomposition (remaining slices)</span>
-  <span style="color: var(--text-muted)">⚪ #1642 Headless decomp</span>
-  <span style="color: var(--text-muted)">⚪ #1638 Static dispatch audit</span>
-</pre>
+<h2>Trace docs on dev</h2>
+<div class="panel">
+  <div class="issue-card">
+    <div class="issue-header"><span class="issue-number">docs/fix/1641-direct-inspection-regression-trace.md</span><span class="tag tag-risk">current evidence</span></div>
+    <div class="issue-body">Commit matrix for the fake-permission regression. Linked from <code>#1641</code>.</div>
+  </div>
+  <div class="issue-card">
+    <div class="issue-header"><span class="issue-number">docs/fix/1653-runaway-reintroduction-trace.md</span><span class="tag tag-risk">current evidence</span></div>
+    <div class="issue-body">Commit matrix for the runaway reintroduction. Linked from <code>#1658</code>.</div>
+  </div>
+  <div class="issue-card">
+    <div class="issue-header"><span class="issue-number">docs/fix/1656-unknown-tool-post-turn-trace.md</span><span class="tag tag-risk">current evidence</span></div>
+    <div class="issue-body">Post-turn unknown-tool trace. Linked from <code>#1656</code>.</div>
+  </div>
+</div>
 
 <div class="timestamp">
-  Updated 2026-03-29 14:45 UTC (v4.2) · Linear: #1654 merge → #1641 direct inspection (4 phases) → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-29 22:10 UTC (v4.3) · Linear stabilization sequence: #1641 → #1658 → #1656 → #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
