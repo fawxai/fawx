@@ -1672,8 +1672,6 @@ const DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE: &str =
     "Inspection completed but produced no summary.";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
 const DIRECT_TOOL_TASK_DIRECTIVE: &str = "\n\nThis turn is a simple direct-tool request. Do not plan. Do not decompose. Use the one relevant utility tool immediately, then answer directly from its result. Do not call unrelated tools or do extra research unless the direct tool fails.";
-const DIRECT_WEATHER_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: weather.\nCall `weather` now with the user's requested location and answer directly from that result. Do not call `web_search` or `run_command` unless the `weather` tool fails or cannot answer the request.";
-const DIRECT_CURRENT_TIME_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: current_time.\nCall `current_time` now and answer directly from that result. Do not call other tools unless `current_time` fails.";
 const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. For code-edit tasks, do not move on to mutation until you have grounded the edit target by reading the most relevant file directly. Gather only the context needed to identify and read that file, then move to the concrete code change.";
 const BOUNDED_LOCAL_MUTATION_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: mutation.\nDo not do more discovery. Use `write_file` or `edit_file` now to make one concrete local code change. If you are blocked, state the precise blocker instead of reopening inspection.";
 const BOUNDED_LOCAL_RECOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: recovery.\nThe first concrete edit attempt failed. Use at most one tiny targeted `read_file` or `search_text` step to gather the exact context needed for the retry, then go straight back to the edit. Do not call `run_command` or reopen broad inspection.";
@@ -2839,7 +2837,7 @@ impl LoopEngine {
         self.bounded_local_phase = BoundedLocalPhase::Discovery;
         self.bounded_local_recovery_used = false;
         self.bounded_local_recovery_focus.clear();
-        match self.turn_execution_profile {
+        match &self.turn_execution_profile {
             TurnExecutionProfile::BoundedLocal => {
                 self.emit_signal(
                     LoopStep::Perceive,
@@ -2858,17 +2856,18 @@ impl LoopEngine {
                     "selected direct inspection execution profile",
                     serde_json::json!({
                         "profile": "direct_inspection",
-                        "inspection_profile": direct_inspection_profile_label(profile),
+                        "inspection_profile": direct_inspection_profile_label(*profile),
                     }),
                 );
             }
-            TurnExecutionProfile::DirectUtility(_) => {
+            TurnExecutionProfile::DirectUtility(profile) => {
                 self.emit_signal(
                     LoopStep::Perceive,
                     SignalKind::Trace,
                     "selected direct utility execution profile",
                     serde_json::json!({
                         "profile": "direct_utility",
+                        "tool_name": &profile.tool_name,
                     }),
                 );
             }
@@ -2888,7 +2887,7 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.maybe_publish_reason_progress(stream);
-        if let TurnExecutionProfile::DirectUtility(profile) = self.turn_execution_profile {
+        if let TurnExecutionProfile::DirectUtility(profile) = &self.turn_execution_profile {
             let direct_tools = self.current_reasoning_tool_definitions(false);
             return Ok(direct_utility_completion_response(
                 profile,
@@ -5882,12 +5881,11 @@ impl LoopEngine {
         // before the continuation/synthesis path. DirectInspection still goes through
         // finalize_tool_response so the model can produce an evidence-backed answer and use
         // its single synthesis fallback when the immediate continuation comes back empty.
-        if let TurnExecutionProfile::DirectUtility(profile) = self.turn_execution_profile {
+        if let TurnExecutionProfile::DirectUtility(profile) = &self.turn_execution_profile {
+            let response = direct_utility_terminal_response(profile, &state.all_tool_results);
             self.last_reasoning_messages = state.continuation_messages.clone();
             self.expire_activity_progress(stream);
-            return Ok(ToolRoundOutcome::DirectUtilityAnswered(
-                direct_utility_terminal_response(profile, &state.all_tool_results),
-            ));
+            return Ok(ToolRoundOutcome::DirectUtilityAnswered(response));
         }
 
         self.compact_tool_continuation(round, &mut state.continuation_messages)
@@ -5951,7 +5949,7 @@ impl LoopEngine {
             self.turn_execution_profile_block_reason(),
         ) {
             let (phase_allowed, phase_blocked) =
-                partition_by_allowed_tool_names(&retry_allowed, allowed_names, reason);
+                partition_by_allowed_tool_names(&retry_allowed, &allowed_names, reason);
             blocked.extend(phase_blocked);
             phase_allowed
         } else {
@@ -5962,7 +5960,7 @@ impl LoopEngine {
             .as_deref()
             .or(self.requested_artifact_target.as_deref());
         let semantically_allowed = if matches!(
-            self.turn_execution_profile,
+            &self.turn_execution_profile,
             TurnExecutionProfile::BoundedLocal
         ) {
             let (semantically_allowed, semantic_blocked) =
@@ -6953,10 +6951,10 @@ fn partition_by_call_classification(
 
 fn partition_by_allowed_tool_names(
     calls: &[ToolCall],
-    allowed_names: &[&str],
+    allowed_names: &[String],
     reason: &str,
 ) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
-    let allowed_names: HashSet<&str> = allowed_names.iter().copied().collect();
+    let allowed_names: HashSet<&str> = allowed_names.iter().map(String::as_str).collect();
     let mut allowed = Vec::new();
     let mut blocked = Vec::new();
     for call in calls {
@@ -12445,7 +12443,7 @@ mod cancellation_tests {
             None,
             Some("/tmp/x.md"),
             &NoopToolExecutor,
-            TurnExecutionProfile::Standard,
+            &TurnExecutionProfile::Standard,
             BoundedLocalPhase::Discovery,
         );
 
@@ -12468,7 +12466,7 @@ mod cancellation_tests {
             None,
             None,
             &NoopToolExecutor,
-            TurnExecutionProfile::Standard,
+            &TurnExecutionProfile::Standard,
             BoundedLocalPhase::Discovery,
         );
 
@@ -12495,7 +12493,7 @@ mod cancellation_tests {
                 commitment: None,
                 pending_tool_scope: None,
                 pending_artifact_write_target: None,
-                turn_execution_profile: TurnExecutionProfile::Standard,
+                turn_execution_profile: &TurnExecutionProfile::Standard,
                 bounded_local_phase: BoundedLocalPhase::Discovery,
                 tool_executor: &NoopToolExecutor,
             },
@@ -18995,6 +18993,30 @@ mod loop_resilience_tests {
     #[derive(Debug, Default)]
     struct FailingDirectWeatherExecutor;
 
+    fn direct_weather_profile() -> DirectUtilityProfile {
+        DirectUtilityProfile::test_single_required_string(
+            "weather",
+            "Get the weather for a location",
+            "location",
+            "city or location",
+            &["weather", "forecast"],
+        )
+    }
+
+    fn direct_current_time_profile() -> DirectUtilityProfile {
+        DirectUtilityProfile::test_empty_object(
+            "current_time",
+            "Get the current time",
+            &[
+                "current time",
+                "what time",
+                "what's the time",
+                "whats the time",
+                "time is it",
+            ],
+        )
+    }
+
     #[async_trait]
     impl ToolExecutor for FailingDirectWeatherExecutor {
         async fn execute_tools(
@@ -19079,7 +19101,11 @@ mod loop_resilience_tests {
                             "description": "JSON input for the WASM skill"
                         }
                     },
-                    "required": ["input"]
+                    "required": ["input"],
+                    "x-fawx-direct-utility": {
+                        "enabled": true,
+                        "trigger_patterns": ["weather", "forecast"]
+                    }
                 }),
             }]
         }
@@ -19963,10 +19989,10 @@ mod loop_resilience_tests {
             .perceive(&test_snapshot("What's the weather in Bradenton Florida?"))
             .await
             .expect("perceive");
-        assert!(matches!(
+        assert_eq!(
             engine.turn_execution_profile,
-            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather)
-        ));
+            TurnExecutionProfile::DirectUtility(direct_weather_profile())
+        );
 
         let llm = RecordingLlm::ok(Vec::new());
 
@@ -19994,7 +20020,7 @@ mod loop_resilience_tests {
             Arc::new(DirectUtilityToolExecutor),
         );
         engine.turn_execution_profile =
-            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather);
+            TurnExecutionProfile::DirectUtility(direct_weather_profile());
         let decision = Decision::UseTools(vec![ToolCall {
             id: "weather-1".to_string(),
             name: "weather".to_string(),
@@ -20031,7 +20057,7 @@ mod loop_resilience_tests {
             Arc::new(FailingDirectWeatherExecutor),
         );
         engine.turn_execution_profile =
-            TurnExecutionProfile::DirectUtility(DirectUtilityProfile::Weather);
+            TurnExecutionProfile::DirectUtility(direct_weather_profile());
         let decision = Decision::UseTools(vec![ToolCall {
             id: "weather-1".to_string(),
             name: "weather".to_string(),
@@ -20088,12 +20114,12 @@ mod loop_resilience_tests {
         assert!(response.tool_calls.is_empty());
         assert_eq!(
             extract_response_text(&response),
-            "Please tell me the city or location you want weather for."
+            "Please tell me the city or location."
         );
     }
 
     #[tokio::test]
-    async fn legacy_wrapped_weather_schema_does_not_trigger_direct_utility_profile() {
+    async fn legacy_wrapped_weather_schema_with_direct_utility_metadata_does_not_trigger_profile() {
         let mut engine = mixed_tool_engine_with_executor(
             BudgetConfig::default(),
             Arc::new(LegacyWrappedWeatherExecutor),

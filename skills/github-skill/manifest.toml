@@ -5,3 +5,201 @@ author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = ["network", "storage"]
 entry_point = "run"
+
+[[tools]]
+name = "create_pr"
+description = "Create a GitHub pull request"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "title"
+type = "string"
+description = "Pull request title"
+required = true
+
+[[tools.parameters]]
+name = "head"
+type = "string"
+description = "Source branch name"
+required = true
+
+[[tools.parameters]]
+name = "body"
+type = "string"
+description = "Optional pull request body"
+required = false
+
+[[tools.parameters]]
+name = "base"
+type = "string"
+description = "Optional base branch override"
+required = false
+
+[[tools.parameters]]
+name = "draft"
+type = "boolean"
+description = "Whether to create the pull request as a draft"
+required = false
+
+[[tools]]
+name = "comment_pr"
+description = "Add a comment to a GitHub pull request"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "pr_number"
+type = "integer"
+description = "Pull request number"
+required = true
+
+[[tools.parameters]]
+name = "body"
+type = "string"
+description = "Comment body"
+required = true
+
+[[tools]]
+name = "list_prs"
+description = "List GitHub pull requests for a repository"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "state"
+type = "string"
+description = "Optional pull request state filter: open, closed, or all"
+required = false
+
+[[tools.parameters]]
+name = "per_page"
+type = "integer"
+description = "Optional maximum number of pull requests to return"
+required = false
+
+[[tools]]
+name = "view_pr"
+description = "View a GitHub pull request with details"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "pr_number"
+type = "integer"
+description = "Pull request number"
+required = true
+
+[[tools]]
+name = "list_issues"
+description = "List GitHub issues for a repository"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "state"
+type = "string"
+description = "Optional issue state filter: open, closed, or all"
+required = false
+
+[[tools.parameters]]
+name = "labels"
+type = "string"
+description = "Optional comma-separated label filter"
+required = false
+
+[[tools.parameters]]
+name = "per_page"
+type = "integer"
+description = "Optional maximum number of issues to return"
+required = false
+
+[[tools]]
+name = "create_issue"
+description = "Create a GitHub issue"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "title"
+type = "string"
+description = "Issue title"
+required = true
+
+[[tools.parameters]]
+name = "body"
+type = "string"
+description = "Optional issue body"
+required = false
+
+[[tools.parameters]]
+name = "labels"
+type = "array"
+description = "Optional list of labels to apply"
+required = false
+
+[[tools.parameters]]
+name = "assignees"
+type = "array"
+description = "Optional list of assignees"
+required = false

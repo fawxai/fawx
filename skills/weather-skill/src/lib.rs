@@ -67,7 +67,7 @@ struct GeocodeResult {
     longitude: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ResolvedLocation {
     latitude: f64,
     longitude: f64,
@@ -234,8 +234,17 @@ fn parse_query(input: &str) -> Result<RequestOptions, WeatherError> {
 fn parse_units(units: Option<&str>) -> Result<Units, WeatherError> {
     match units.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok(Units::Fahrenheit),
-        Some(value) if value.eq_ignore_ascii_case("celsius") => Ok(Units::Celsius),
-        Some(value) if value.eq_ignore_ascii_case("fahrenheit") => Ok(Units::Fahrenheit),
+        Some(value)
+            if value.eq_ignore_ascii_case("celsius") || value.eq_ignore_ascii_case("metric") =>
+        {
+            Ok(Units::Celsius)
+        }
+        Some(value)
+            if value.eq_ignore_ascii_case("fahrenheit")
+                || value.eq_ignore_ascii_case("imperial") =>
+        {
+            Ok(Units::Fahrenheit)
+        }
         Some(value) => Err(WeatherError::InvalidInput(format!(
             "Unsupported units '{value}'. Use 'celsius' or 'fahrenheit'."
         ))),
@@ -267,17 +276,56 @@ fn fetch_weather(options: &RequestOptions) -> Result<WeatherReport, WeatherError
 }
 
 fn resolve_location(location: &str) -> Result<ResolvedLocation, WeatherError> {
+    resolve_location_with_fetcher(location, fetch_resolved_location)
+}
+
+fn resolve_location_with_fetcher<F>(
+    location: &str,
+    mut fetch: F,
+) -> Result<ResolvedLocation, WeatherError>
+where
+    F: FnMut(&str) -> Result<Option<ResolvedLocation>, WeatherError>,
+{
+    for candidate in location_resolution_candidates(location) {
+        if let Some(result) = fetch(&candidate)? {
+            return Ok(result);
+        }
+    }
+    Err(no_weather_results_error(location))
+}
+
+fn fetch_resolved_location(location: &str) -> Result<Option<ResolvedLocation>, WeatherError> {
     let url = build_geocode_url(location);
     let response: GeocodeResponse = http_get_json(&url)?;
-    let result = response
+    Ok(response
         .results
         .and_then(|results| results.into_iter().next())
-        .ok_or_else(|| WeatherError::Api(format!("No weather results found for '{location}'.")))?;
+        .map(|result| ResolvedLocation {
+            latitude: result.latitude,
+            longitude: result.longitude,
+        }))
+}
 
-    Ok(ResolvedLocation {
-        latitude: result.latitude,
-        longitude: result.longitude,
-    })
+fn location_resolution_candidates(location: &str) -> Vec<String> {
+    let mut candidates = vec![location.trim().to_string()];
+    if let Some(city_only) = city_only_candidate(location) {
+        if !candidates.iter().any(|candidate| candidate == &city_only) {
+            candidates.push(city_only);
+        }
+    }
+    candidates
+}
+
+fn city_only_candidate(location: &str) -> Option<String> {
+    let city = location.split(',').next()?.trim();
+    if city.is_empty() || city == location.trim() {
+        return None;
+    }
+    Some(city.to_string())
+}
+
+fn no_weather_results_error(location: &str) -> WeatherError {
+    WeatherError::Api(format!("No weather results found for '{location}'."))
 }
 
 fn build_geocode_url(location: &str) -> String {
@@ -646,6 +694,18 @@ mod tests {
     }
 
     #[test]
+    fn unit_aliases_map_to_supported_values() {
+        assert_eq!(
+            parse_units(Some("metric")).expect("metric alias should parse"),
+            Units::Celsius
+        );
+        assert_eq!(
+            parse_units(Some("imperial")).expect("imperial alias should parse"),
+            Units::Fahrenheit
+        );
+    }
+
+    #[test]
     fn malformed_query_json_returns_friendly_error() {
         let error = parse_query("not json").expect_err("json should be rejected");
         assert!(error
@@ -779,6 +839,35 @@ mod tests {
             "Weather service request failed.".to_string(),
         ));
         assert_eq!(output, r#"{"error": "Weather service request failed."}"#);
+    }
+
+    #[test]
+    fn resolve_location_retries_with_city_only_candidate() {
+        let mut requested = Vec::new();
+        let resolved = resolve_location_with_fetcher("Denver, Colorado", |candidate| {
+            requested.push(candidate.to_string());
+            Ok(match candidate {
+                "Denver, Colorado" => None,
+                "Denver" => Some(ResolvedLocation {
+                    latitude: 39.7392,
+                    longitude: -104.9903,
+                }),
+                _ => None,
+            })
+        })
+        .expect("city-only fallback should resolve");
+
+        assert_eq!(
+            requested,
+            vec!["Denver, Colorado".to_string(), "Denver".to_string()]
+        );
+        assert_eq!(
+            resolved,
+            ResolvedLocation {
+                latitude: 39.7392,
+                longitude: -104.9903,
+            }
+        );
     }
 
     fn sample_weather_report() -> WeatherReport {

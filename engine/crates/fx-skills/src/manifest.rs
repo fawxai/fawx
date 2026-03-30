@@ -258,6 +258,8 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_valid_manifest() {
@@ -675,5 +677,38 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
         assert!(
             matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicate parameter"))
         );
+    }
+
+    #[test]
+    fn migrated_skill_manifests_expose_visible_structured_tools() {
+        for skill_dir in ["calculator-skill", "github-skill", "canvas-skill"] {
+            let manifest_path = repo_root()
+                .join("skills")
+                .join(skill_dir)
+                .join("manifest.toml");
+            let manifest_text = fs::read_to_string(&manifest_path).expect("read manifest");
+            let manifest = parse_manifest(&manifest_text).expect("parse manifest");
+
+            validate_manifest(&manifest).expect("validate manifest");
+            assert!(
+                !manifest.tools.is_empty(),
+                "{skill_dir} should expose manifest tools"
+            );
+            for tool in &manifest.tools {
+                assert!(
+                    tool.parameters
+                        .iter()
+                        .all(|parameter| parameter.name != "input"),
+                    "{skill_dir} should expose real structured parameters"
+                );
+            }
+        }
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root")
     }
 }

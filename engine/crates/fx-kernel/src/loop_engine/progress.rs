@@ -15,7 +15,7 @@ pub(super) struct ToolRoundProgressContext<'a> {
     pub commitment: Option<&'a TurnCommitment>,
     pub pending_tool_scope: Option<&'a ContinuationToolScope>,
     pub pending_artifact_write_target: Option<&'a str>,
-    pub turn_execution_profile: TurnExecutionProfile,
+    pub turn_execution_profile: &'a TurnExecutionProfile,
     pub bounded_local_phase: BoundedLocalPhase,
     pub tool_executor: &'a dyn ToolExecutor,
 }
@@ -88,7 +88,7 @@ impl LoopEngine {
             self.pending_tool_scope.as_ref(),
             self.pending_artifact_write_target.as_deref(),
             self.tool_executor.as_ref(),
-            self.turn_execution_profile,
+            &self.turn_execution_profile,
             self.bounded_local_phase,
         )
     }
@@ -108,7 +108,7 @@ impl LoopEngine {
             commitment: self.pending_turn_commitment.as_ref(),
             pending_tool_scope: self.pending_tool_scope.as_ref(),
             pending_artifact_write_target: self.pending_artifact_write_target.as_deref(),
-            turn_execution_profile: self.turn_execution_profile,
+            turn_execution_profile: &self.turn_execution_profile,
             bounded_local_phase: self.bounded_local_phase,
             tool_executor: self.tool_executor.as_ref(),
         };
@@ -124,7 +124,7 @@ pub(super) fn progress_for_turn_state_with_profile(
     pending_tool_scope: Option<&ContinuationToolScope>,
     pending_artifact_write_target: Option<&str>,
     tool_executor: &dyn ToolExecutor,
-    turn_execution_profile: TurnExecutionProfile,
+    turn_execution_profile: &TurnExecutionProfile,
     bounded_local_phase: BoundedLocalPhase,
 ) -> (ProgressKind, String) {
     if let Some(path) = pending_artifact_write_target {
@@ -134,15 +134,10 @@ pub(super) fn progress_for_turn_state_with_profile(
         );
     }
 
-    if matches!(
-        turn_execution_profile,
-        TurnExecutionProfile::DirectUtility(_)
-    ) && commitment.is_none()
-    {
-        return match turn_execution_profile {
-            TurnExecutionProfile::DirectUtility(profile) => direct_utility_progress(&profile),
-            _ => unreachable!("checked above"),
-        };
+    if let TurnExecutionProfile::DirectUtility(profile) = turn_execution_profile {
+        if commitment.is_none() {
+            return direct_utility_progress(profile);
+        }
     }
 
     if matches!(turn_execution_profile, TurnExecutionProfile::BoundedLocal) && commitment.is_none()
