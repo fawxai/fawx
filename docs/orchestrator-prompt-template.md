@@ -59,29 +59,79 @@ When spawning an implementer:
 
 ### Reviewers
 
-When spawning a reviewer:
+Use **Review Doctrine v2** for all important PRs. The canonical docs live in the repo and must be referenced in reviewer prompts:
 
-1. **Inline the diff summary** — don't make the reviewer read files. Summarize what changed: new files, modified files, key patterns.
-2. **Include verdict rules verbatim:**
+- `docs/review-doctrine.md`
+- `docs/review-triage-prompt-template.md`
+- `docs/review-authority-prompt-template.md`
+
+Default review model:
+1. **Triage review** — advisory, multi-lens, no verdict
+2. **Authority review** — final merge gate, binary verdict
+
+#### Triage reviewers
+
+When spawning a triage reviewer:
+
+1. **Read these docs first:**
+   ```
+   ENGINEERING.md
+   docs/doctrine.md
+   docs/review-doctrine.md
+   docs/review-triage-prompt-template.md
+   ```
+2. **Include the issue, spec path, and full diff summary.** The triage reviewer is spec-first, not diff-only.
+3. **Default to one Opus reviewer with three explicit sections**:
+   - Contract / Correctness
+   - Architecture / Reuse
+   - Efficiency / Hot Path
+   Only use multiple parallel specialist reviewers if the PR is unusually broad or Joe explicitly wants the heavier pass.
+4. **Keep triage internal by default.** Do not post the triage output to the PR unless explicitly asked. Save findings to a temp file or return them to the parent session for the fixer.
+5. **Require follow-up issue extraction** when the reviewer finds a distinct bug or debt pocket that should not be blurred into the current PR.
+6. Use `model: "anthropic/claude-opus-4-6"`, `thinking: "adaptive"`, `runTimeoutSeconds: 300`
+
+#### Authority reviewers
+
+When spawning an authority reviewer:
+
+1. **Read these docs first:**
+   ```
+   ENGINEERING.md
+   docs/doctrine.md
+   docs/review-doctrine.md
+   docs/review-authority-prompt-template.md
+   ```
+2. **Include the issue, spec path, full diff summary, and any triage findings.**
+3. **Include verdict rules verbatim:**
    ```
    APPROVE means ALL sections (blocking, non-blocking, nice-to-have) are empty.
    If ANY section has items, verdict MUST be REQUEST_CHANGES.
    We fix everything — no deferrals.
    ```
-3. **Specify focus areas** — what's security-sensitive, what's architecturally novel, what patterns to check.
-4. **Include the gh comment command:**
+4. **Require the authority output format:**
    ```
-   cat > /tmp/review.md << 'REVIEW_EOF'
-   ## Review: PR #<N> — <title>
    ### Verdict: [APPROVE or REQUEST_CHANGES]
+   ### Spec Compliance
    ### Blocking Issues
    ### Non-blocking Issues
    ### Nice-to-haves
+   ### Follow-up Issues to Split
+   ### Summary
+   ```
+5. **Include the gh comment command:**
+   ```
+   cat > /tmp/review.md << 'REVIEW_EOF'
+   ### Verdict: [APPROVE or REQUEST_CHANGES]
+   ### Spec Compliance
+   ### Blocking Issues
+   ### Non-blocking Issues
+   ### Nice-to-haves
+   ### Follow-up Issues to Split
    ### Summary
    REVIEW_EOF
    gh pr comment <N> --repo abbudjoe/fawx --body-file /tmp/review.md
    ```
-5. Use `model: "anthropic/claude-opus-4-6"`, `thinking: "adaptive"`, `runTimeoutSeconds: 300`
+6. Use `model: "anthropic/claude-opus-4-6"`, `thinking: "adaptive"`, `runTimeoutSeconds: 300`
 
 ### Fixers
 
@@ -117,18 +167,23 @@ Subagents frequently timeout during `cargo build` (10-min limit). The code is us
 
 Track each PR in exactly one state:
 - `IMPLEMENTING` → spawn implementer
-- `REVIEWING` → spawn reviewer
+- `TRIAGING` → spawn triage reviewer
 - `FIXING` → spawn fixer
-- `RE_REVIEWING` → spawn fresh reviewer
+- `AUTHORITY_REVIEWING` → spawn authority reviewer
 - `CLEAN` → merge to dev
 
 Transitions:
-- IMPLEMENTING + push confirmed → open PR → REVIEWING
-- REVIEWING + APPROVE (all sections empty) → CLEAN
-- REVIEWING + REQUEST_CHANGES → FIXING
-- FIXING + push confirmed → RE_REVIEWING
-- RE_REVIEWING + APPROVE → CLEAN
+- IMPLEMENTING + push confirmed → open PR → TRIAGING
+- TRIAGING + actionable findings → FIXING
+- TRIAGING + no actionable findings on a small/safe PR → AUTHORITY_REVIEWING
+- FIXING + push confirmed → AUTHORITY_REVIEWING
+- AUTHORITY_REVIEWING + APPROVE (all sections empty) → CLEAN
+- AUTHORITY_REVIEWING + REQUEST_CHANGES → FIXING
 - CLEAN → `gh pr merge <N> --repo abbudjoe/fawx --squash --delete-branch`
+
+Notes:
+- For important runtime or architectural PRs, always run triage before authority review.
+- Re-run triage after a fixer only when the diff changed substantially or the authority reviewer calls for a fresh architecture/correctness pass.
 
 ## Merge Rules
 
