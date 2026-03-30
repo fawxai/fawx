@@ -1632,9 +1632,7 @@ For multi-step tasks, use the decompose tool to break work into parallel sub-goa
 Each sub-goal gets its own execution budget. \
 Do not burn through your tool retry limit in a single sequential loop \
 ; decompose first, then execute. \
-Your file access is restricted to the working_dir set in config. \
-If a path is outside that directory, you cannot read or write it. \
-Do not retry blocked paths. Tell the user the path is outside your working directory and suggest alternatives.";
+";
 
 const TOOL_CONTINUATION_DIRECTIVE: &str = "\n\nYou are continuing after one or more tool calls. \
 Treat successful tool results as the primary evidence for your next response. \
