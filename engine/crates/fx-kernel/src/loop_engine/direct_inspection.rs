@@ -94,6 +94,14 @@ pub(super) fn direct_inspection_directive(profile: &DirectInspectionProfile) -> 
     }
 }
 
+pub(super) fn direct_inspection_block_reason(profile: &DirectInspectionProfile) -> &'static str {
+    match profile {
+        DirectInspectionProfile::ReadLocalPath => {
+            "direct inspection only allows observation tools for the requested local path"
+        }
+    }
+}
+
 impl DirectInspectionOwnership {
     pub(super) fn profile_for_turn(self, user_message: &str) -> Option<DirectInspectionProfile> {
         match self {

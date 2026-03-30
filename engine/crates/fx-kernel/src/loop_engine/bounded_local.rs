@@ -7,14 +7,13 @@ use super::{
     BOUNDED_LOCAL_RECOVERY_PHASE_DIRECTIVE, BOUNDED_LOCAL_TASK_DIRECTIVE,
     BOUNDED_LOCAL_TERMINAL_PHASE_DIRECTIVE, BOUNDED_LOCAL_VERIFICATION_BLOCK_REASON,
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
-    DIRECT_INSPECTION_BLOCK_REASON, DIRECT_UTILITY_BLOCK_REASON,
 };
 use crate::act::ToolResult;
 use crate::loop_engine::direct_inspection::{
-    direct_inspection_directive, direct_inspection_tool_names, DirectInspectionOwnership,
-    DirectInspectionProfile,
+    direct_inspection_block_reason, direct_inspection_directive, direct_inspection_tool_names,
+    DirectInspectionOwnership, DirectInspectionProfile,
 };
-use crate::loop_engine::direct_utility::DirectUtilityProfile;
+use crate::loop_engine::direct_utility::{direct_utility_block_reason, DirectUtilityProfile};
 use crate::signals::{LoopStep, SignalKind};
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
@@ -83,9 +82,13 @@ impl LoopEngine {
 
     pub(super) fn turn_execution_profile_block_reason(&self) -> Option<&'static str> {
         match self.turn_execution_profile {
-            TurnExecutionProfile::DirectInspection(_) => Some(DIRECT_INSPECTION_BLOCK_REASON),
-            TurnExecutionProfile::BoundedLocal => self.bounded_local_phase_block_reason(),
-            TurnExecutionProfile::DirectUtility(_) => Some(DIRECT_UTILITY_BLOCK_REASON),
+            TurnExecutionProfile::DirectInspection(profile) => {
+                Some(direct_inspection_block_reason(&profile))
+            }
+            TurnExecutionProfile::BoundedLocal => Some(self.bounded_local_phase_block_reason()),
+            TurnExecutionProfile::DirectUtility(profile) => {
+                Some(direct_utility_block_reason(&profile))
+            }
             TurnExecutionProfile::Standard => None,
         }
     }
@@ -142,14 +145,8 @@ impl LoopEngine {
         self.effective_decompose_enabled() && self.pending_artifact_write_target.is_none()
     }
 
-    pub(super) fn bounded_local_phase_block_reason(&self) -> Option<&'static str> {
-        if !matches!(
-            self.turn_execution_profile,
-            TurnExecutionProfile::BoundedLocal
-        ) {
-            return None;
-        }
-        Some(match self.bounded_local_phase {
+    pub(super) fn bounded_local_phase_block_reason(&self) -> &'static str {
+        match self.bounded_local_phase {
             BoundedLocalPhase::Discovery => BOUNDED_LOCAL_DISCOVERY_BLOCK_REASON,
             BoundedLocalPhase::Mutation => BOUNDED_LOCAL_MUTATION_BLOCK_REASON,
             BoundedLocalPhase::Recovery => BOUNDED_LOCAL_RECOVERY_BLOCK_REASON,
@@ -157,7 +154,7 @@ impl LoopEngine {
             BoundedLocalPhase::Terminal => {
                 "bounded local terminal phase does not allow further tools"
             }
-        })
+        }
     }
 
     pub(super) fn advance_bounded_local_phase_after_tool_round(

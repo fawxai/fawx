@@ -93,6 +93,37 @@ async fn direct_inspection_turns_own_profile_specific_tool_surface() {
     assert!(system_prompt.contains("Use `read_file`"));
 }
 
+#[tokio::test]
+async fn direct_inspection_blocks_hallucinated_mutation_tool_calls() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let _processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    let call = ToolCall {
+        id: "w1".to_string(),
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "/Users/joseph/fawx/.fawx_noop",
+            "content": ""
+        }),
+    };
+
+    let results = engine
+        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .await
+        .expect("execute");
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].success);
+    assert!(results[0]
+        .output
+        .contains("direct inspection only allows observation tools"));
+}
+
 #[test]
 fn detect_turn_execution_profile_supports_quoted_explicit_local_paths() {
     let message = "Inspect \"~/.zshrc\" and summarize it.";
