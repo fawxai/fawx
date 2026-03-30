@@ -21,26 +21,43 @@ const MUTATION_ACTION_WORDS: &[&str] = &[
     "update",
     "write",
 ];
-const NONLOCAL_SCOPE_WORDS: &[&str] =
-    &["browse", "internet", "latest", "online", "research", "web"];
+const EXTERNAL_CONTEXT_WORDS: &[&str] = &[
+    "against",
+    "browse",
+    "compare",
+    "comparison",
+    "guidance",
+    "internet",
+    "latest",
+    "online",
+    "research",
+    "web",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DirectInspectionProfile {
     ReadLocalPath,
 }
 
+#[derive(Debug)]
+struct InspectionRequestAnalysis {
+    explicit_local_path_count: usize,
+    words: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectionSatisfiability {
+    LocalObservationOnly,
+    RequiresExternalContext,
+    RequiresMutation,
+}
+
 pub(super) fn detect_direct_inspection_profile(
     user_message: &str,
 ) -> Option<DirectInspectionProfile> {
-    let words = message_words(user_message);
-    if !contains_any_word(&words, INSPECTION_ACTION_WORDS) {
-        return None;
-    }
-    if explicit_local_path_count(user_message) != 1 {
-        return None;
-    }
-    if contains_any_word(&words, MUTATION_ACTION_WORDS)
-        || contains_any_word(&words, NONLOCAL_SCOPE_WORDS)
+    let analysis = InspectionRequestAnalysis::from_user_message(user_message);
+    if !analysis.requests_read_local_path()
+        || analysis.satisfiability() != InspectionSatisfiability::LocalObservationOnly
     {
         return None;
     }
@@ -57,6 +74,30 @@ fn contains_any_word(words: &HashSet<String>, candidates: &[&str]) -> bool {
     candidates
         .iter()
         .any(|candidate| words.contains(*candidate))
+}
+
+impl InspectionRequestAnalysis {
+    fn from_user_message(user_message: &str) -> Self {
+        Self {
+            explicit_local_path_count: explicit_local_path_count(user_message),
+            words: message_words(user_message),
+        }
+    }
+
+    fn requests_read_local_path(&self) -> bool {
+        self.explicit_local_path_count == 1
+            && contains_any_word(&self.words, INSPECTION_ACTION_WORDS)
+    }
+
+    fn satisfiability(&self) -> InspectionSatisfiability {
+        if contains_any_word(&self.words, MUTATION_ACTION_WORDS) {
+            return InspectionSatisfiability::RequiresMutation;
+        }
+        if contains_any_word(&self.words, EXTERNAL_CONTEXT_WORDS) {
+            return InspectionSatisfiability::RequiresExternalContext;
+        }
+        InspectionSatisfiability::LocalObservationOnly
+    }
 }
 
 fn explicit_local_path_count(user_message: &str) -> usize {

@@ -32,6 +32,16 @@ async fn perceive_routes_explicit_local_path_reads_to_direct_inspection() {
 }
 
 #[test]
+fn detect_turn_execution_profile_supports_quoted_explicit_local_paths() {
+    let message = "Inspect \"~/.zshrc\" and summarize it.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath)
+    );
+}
+
+#[test]
 fn detect_turn_execution_profile_rejects_mutation_verbs_for_direct_inspection() {
     let message = "Read ~/.zshrc and then update it with a new alias.";
 
@@ -44,6 +54,16 @@ fn detect_turn_execution_profile_rejects_mutation_verbs_for_direct_inspection() 
 #[test]
 fn detect_turn_execution_profile_requires_explicit_local_path_for_direct_inspection() {
     let message = "Read this file and summarize it for me.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_rejects_mixed_local_and_online_guidance_requests() {
+    let message = "Read ~/.zshrc and compare it to the latest online guidance for zsh config.";
 
     assert_eq!(
         detect_turn_execution_profile(message, &[]),
