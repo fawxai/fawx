@@ -13,7 +13,8 @@ use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionP
 use crate::streaming::{StreamCallback, StreamEvent};
 use async_trait::async_trait;
 use fx_config::CapabilityMode;
-use fx_core::self_modify::classify_write_domain;
+use fx_core::path::expand_tilde;
+use fx_core::self_modify::{classify_write_domain, WriteDomain};
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -278,6 +279,19 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
             }
         }
 
+        if matches!(
+            call.name.as_str(),
+            "read_file" | "list_directory" | "search_text"
+        ) {
+            if let (Some(working_dir), Some(path)) =
+                (self.working_dir.as_deref(), extract_path_argument(call))
+            {
+                if observation_path_is_outside_workspace(path, working_dir) {
+                    return "outside_workspace";
+                }
+            }
+        }
+
         self.inner.action_category(call)
     }
 
@@ -324,6 +338,14 @@ fn extract_path_argument(call: &ToolCall) -> Option<&str> {
     call.arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
+}
+
+fn observation_path_is_outside_workspace(path: &str, working_dir: &Path) -> bool {
+    let expanded = expand_tilde(path);
+    matches!(
+        classify_write_domain(&expanded, working_dir),
+        WriteDomain::External
+    )
 }
 
 fn emit_prompt(
@@ -519,6 +541,14 @@ mod tests {
             id: "call_write_file".to_string(),
             name: "write_file".to_string(),
             arguments: serde_json::json!({"path": path, "content": "data"}),
+        }
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "call_read_file".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
         }
     }
 
@@ -844,6 +874,34 @@ mod tests {
         let category = executor.action_category_for_call(&write_call("/etc/hosts"));
 
         assert_eq!(category, "outside_workspace");
+    }
+
+    #[test]
+    fn action_category_for_read_call_uses_outside_workspace_domain() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph"));
+
+        let category = executor.action_category_for_call(&read_call("/etc/hosts"));
+
+        assert_eq!(category, "outside_workspace");
+    }
+
+    #[test]
+    fn action_category_for_read_call_preserves_inner_category_within_workspace() {
+        let executor = PermissionGateExecutor::new(
+            PassthroughExecutor,
+            PermissionPolicy::allow_all(),
+            Arc::new(PermissionPromptState::new()),
+        )
+        .with_working_dir(PathBuf::from("/Users/joseph"));
+
+        let category = executor.action_category_for_call(&read_call("~/notes.txt"));
+
+        assert_eq!(category, "read_any");
     }
 
     #[test]

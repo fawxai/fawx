@@ -45,20 +45,6 @@ use self::filesystem::{is_builtin_ignored_directory, MAX_SEARCH_MATCHES};
 #[cfg(test)]
 use self::runtime::{day_of_week_from_epoch, iso8601_utc_from_epoch};
 
-/// Expand a leading `~` or `~/` prefix to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(path)
-}
-
 fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
     Arc::new(ProcessRegistry::new(ProcessConfig {
         allowed_dirs: vec![working_dir.to_path_buf()],
@@ -1042,6 +1028,27 @@ mod tests {
         assert!(output.is_err());
     }
 
+    #[test]
+    fn read_file_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor.handle_read_file(&serde_json::json!({
+            "path": outside_file.to_string_lossy()
+        }));
+
+        assert_eq!(output.expect("read"), "secret");
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_file_rejects_symlink_pointing_outside_jail() {
@@ -1273,6 +1280,30 @@ three
         let result =
             executor.handle_write_file(&serde_json::json!({"path": "../x.txt", "content": "no"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_file_respects_jail_even_when_outside_workspace_reads_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("x.txt");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let result = executor.handle_write_file(&serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "no"
+        }));
+
+        assert!(matches!(
+            result,
+            Err(message) if message.contains("path escapes working directory")
+        ));
     }
 
     #[test]
@@ -1628,6 +1659,30 @@ three
         let executor = test_executor(temp.path());
         let output = executor.handle_list_directory(&serde_json::json!({"path": "../"}));
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn list_directory_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_dir = outside.path().join("secret-dir");
+        fs::create_dir_all(&outside_dir).expect("mkdir");
+        fs::write(outside_dir.join("secret.txt"), "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_list_directory(&serde_json::json!({
+                "path": outside_dir.to_string_lossy()
+            }))
+            .expect("list");
+
+        assert!(output.contains("[file] secret.txt"));
     }
 
     #[test]
@@ -3681,38 +3736,6 @@ three
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert!(results[0].output.contains("timed out"));
-    }
-
-    #[test]
-    fn expand_tilde_with_home() {
-        let result = expand_tilde("~/foo");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home.join("foo"));
-    }
-
-    #[test]
-    fn expand_tilde_bare() {
-        let result = expand_tilde("~");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home);
-    }
-
-    #[test]
-    fn expand_tilde_no_tilde() {
-        let result = expand_tilde("/absolute/path");
-        assert_eq!(result, PathBuf::from("/absolute/path"));
-    }
-
-    #[test]
-    fn expand_tilde_relative() {
-        let result = expand_tilde("relative/path");
-        assert_eq!(result, PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn expand_tilde_other_user_not_expanded() {
-        let result = expand_tilde("~otheruser/foo");
-        assert_eq!(result, PathBuf::from("~otheruser/foo"));
     }
 
     #[test]

@@ -942,9 +942,12 @@ fn build_skill_registry(
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     options: SkillRegistryBuildOptions,
 ) -> SkillRegistryBundle {
+    let permission_policy = permissions_to_policy(&config.permissions);
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
+        allow_outside_workspace_reads: permission_policy.unrestricted.contains("outside_workspace")
+            || permission_policy.ask_required.contains("outside_workspace"),
         ..ToolConfig::default()
     };
     let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {

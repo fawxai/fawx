@@ -1,9 +1,9 @@
 use super::{
-    canonicalize_existing_or_parent, expand_tilde, parse_args, to_tool_result, validate_path,
-    ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, to_tool_result, validate_path, ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
+use fx_core::path::expand_tilde;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
@@ -366,7 +366,7 @@ struct EditPlan {
 impl ToolContext {
     pub(crate) fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ReadFileArgs = parse_args(args)?;
-        let path = self.resolve_tool_path(&parsed.path)?;
+        let path = self.resolve_read_path(&parsed.path)?;
         let content = self.read_utf8_file(&path, Some(self.config.max_read_size))?;
         render_read_output(&content, parsed.offset, parsed.limit)
     }
@@ -405,11 +405,7 @@ impl ToolContext {
 
     pub(crate) fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ListDirectoryArgs = parse_args(args)?;
-        let expanded = expand_tilde(&parsed.path);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        let path = self.jailed_path(expanded_str)?;
+        let path = self.resolve_read_path(&parsed.path)?;
         if parsed.recursive.unwrap_or(false) {
             return self.list_recursive(&path, 0);
         }
@@ -435,6 +431,9 @@ impl ToolContext {
         if !self.config.jail_to_working_dir {
             return Ok(Some(path.to_path_buf()));
         }
+        if self.config.allow_outside_workspace_reads {
+            return canonicalize_existing_or_parent(path).map(Some);
+        }
         let requested = path.to_string_lossy().to_string();
         match validate_path(&self.working_dir, &requested) {
             Ok(validated) => Ok(Some(validated)),
@@ -448,6 +447,30 @@ impl ToolContext {
             .to_str()
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         self.jailed_path(expanded_str)
+    }
+
+    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf, String> {
+        let expanded = expand_tilde(requested);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        if !self.config.jail_to_working_dir {
+            return canonicalize_existing_or_parent(Path::new(expanded_str));
+        }
+        if self.config.allow_outside_workspace_reads {
+            return self.resolve_observation_path(expanded_str);
+        }
+        self.jailed_path(expanded_str)
+    }
+
+    fn resolve_observation_path(&self, requested: &str) -> Result<PathBuf, String> {
+        let requested_path = Path::new(requested);
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.working_dir.join(requested_path)
+        };
+        canonicalize_existing_or_parent(&candidate)
     }
 
     fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, String> {
@@ -568,6 +591,9 @@ impl ToolContext {
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(expanded_str));
+        }
+        if self.config.allow_outside_workspace_reads {
+            return self.resolve_observation_path(expanded_str);
         }
         validate_path(&self.working_dir, expanded_str)
     }

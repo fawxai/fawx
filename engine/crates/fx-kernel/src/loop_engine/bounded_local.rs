@@ -9,6 +9,7 @@ use super::{
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
 };
 use crate::act::ToolResult;
+use crate::budget::TerminationConfig;
 use crate::loop_engine::direct_inspection::{
     direct_inspection_block_reason, direct_inspection_directive, direct_inspection_tool_names,
     DirectInspectionOwnership, DirectInspectionProfile,
@@ -32,6 +33,39 @@ impl TurnExecutionProfile {
         matches!(self, Self::Standard)
     }
 
+    pub(super) fn completes_terminally(self) -> bool {
+        matches!(self, Self::DirectInspection(_) | Self::DirectUtility(_))
+    }
+
+    pub(super) fn tightened_termination_config(
+        self,
+        base: &TerminationConfig,
+    ) -> Option<TerminationConfig> {
+        match self {
+            Self::Standard => None,
+            Self::BoundedLocal => {
+                let mut tightened = base.clone();
+                tightened.nudge_after_tool_turns =
+                    tighten_or_default_threshold(tightened.nudge_after_tool_turns, 3);
+                tightened.strip_tools_after_nudge = tightened.strip_tools_after_nudge.min(1);
+                tightened.tool_round_nudge_after =
+                    tighten_or_default_threshold(tightened.tool_round_nudge_after, 2);
+                tightened.tool_round_strip_after_nudge =
+                    tightened.tool_round_strip_after_nudge.min(1);
+                tightened.observation_only_round_nudge_after = 1;
+                tightened.observation_only_round_strip_after_nudge = 0;
+                Some(tightened)
+            }
+            Self::DirectInspection(_) | Self::DirectUtility(_) => {
+                Some(tightened_direct_profile_termination(base))
+            }
+        }
+    }
+
+    pub(super) fn allows_synthesis_fallback(self) -> bool {
+        matches!(self, Self::DirectInspection(_))
+    }
+
     pub(super) fn direct_inspection_profile(self) -> Option<DirectInspectionProfile> {
         match self {
             Self::DirectInspection(profile) => Some(profile),
@@ -42,6 +76,27 @@ impl TurnExecutionProfile {
     pub(super) fn owns_tool_surface(self) -> bool {
         !matches!(self, Self::Standard)
     }
+}
+
+fn tighten_or_default_threshold(current: u16, ceiling: u16) -> u16 {
+    if current == 0 {
+        ceiling
+    } else {
+        current.min(ceiling)
+    }
+}
+
+fn tightened_direct_profile_termination(base: &TerminationConfig) -> TerminationConfig {
+    let mut tightened = base.clone();
+    tightened.nudge_after_tool_turns =
+        tighten_or_default_threshold(tightened.nudge_after_tool_turns, 1);
+    tightened.strip_tools_after_nudge = 0;
+    tightened.tool_round_nudge_after =
+        tighten_or_default_threshold(tightened.tool_round_nudge_after, 1);
+    tightened.tool_round_strip_after_nudge = 0;
+    tightened.observation_only_round_nudge_after = 0;
+    tightened.observation_only_round_strip_after_nudge = 0;
+    tightened
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
