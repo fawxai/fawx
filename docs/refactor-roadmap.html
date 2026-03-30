@@ -293,7 +293,27 @@
   </div>
   <div class="sequence-step">
     <strong>Step 10. Unified authority model implementation</strong>
-    <div class="step-meta">Spec is already written. Implementation begins after runtime and substrate contracts are stable.</div>
+    <div class="step-meta">Spec is already written. This is the next architectural milestone after <code>#1647</code>, not deferred feature work.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 11. #1638: static dispatch audit</strong>
+    <div class="step-meta">Audit the codebase for hidden registries, string-matched behavior, and doctrine violations after the authority model lands.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 12. #1642: headless decomposition</strong>
+    <div class="step-meta">Split headless responsibilities once lifecycle and authority seams are stable.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 13. Full loop decomposition beyond direct inspection</strong>
+    <div class="step-meta">Resume broader loop refactoring after authority model, audit, and headless cleanup reduce architectural risk.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 14. #1487: session archive / export backend</strong>
+    <div class="step-meta">Backend archive/export support that the Swift session browser and export flow depend on.</div>
+  </div>
+  <div class="sequence-step">
+    <strong>Step 15. #1637: Swift session archive / browser / export UI</strong>
+    <div class="step-meta">Product follow-on after the backend archive/export contract exists.</div>
   </div>
 </div>
 
@@ -359,32 +379,36 @@
   </div>
 </div>
 
-<h2>Deferred items</h2>
+<h2>Post-Step-10 queue</h2>
 <div class="panel-grid">
   <div class="panel">
-    <h3>Later hygiene</h3>
+    <h3>Architectural follow-through</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-later">later</span></div>
-      <div class="issue-body">Still valuable. Not on the critical path while runtime contracts are unstable.</div>
+      <div class="issue-header"><span class="issue-number">NEW</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-spec">step 10</span></div>
+      <div class="issue-body">This is the immediate post-#1647 architectural milestone. It belongs in the numbered sequence, not in deferred feature work.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-later">umbrella</span></div>
-      <div class="issue-body">Keep as an audit umbrella, not an active parallel workstream.</div>
+      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-next">step 11</span></div>
+      <div class="issue-body">Audit the codebase for doctrine drift after the authority model lands.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-later">later</span></div>
-      <div class="issue-body">Resume after the first stabilization slice lands.</div>
+      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-next">step 12</span></div>
+      <div class="issue-body">Still valuable. Better sequenced after authority and lifecycle seams are cleaner.</div>
+    </div>
+    <div class="issue-card">
+      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-next">step 13</span></div>
+      <div class="issue-body">Broader loop refactor after the direct-inspection stabilization tranche and architectural cleanup.</div>
     </div>
   </div>
   <div class="panel">
-    <h3>Deferred feature work</h3>
+    <h3>Archive / export follow-ons</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / export</span><span class="tag tag-later">defer</span></div>
-      <div class="issue-body">Good product work. It sits on top of unstable session history semantics right now, so it should wait.</div>
+      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-next">step 14</span></div>
+      <div class="issue-body">Backend archive/export contract for browsing, bulk actions, and export surfaces.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">NEW</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-spec">spec complete</span></div>
-      <div class="issue-body">Implementation remains important, but it should start after Steps 1 through 9, not during runtime instability.</div>
+      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">step 15</span></div>
+      <div class="issue-body">Swift UI follow-on that depends on the backend archive/export contract from <code>#1487</code>.</div>
     </div>
   </div>
 </div>
@@ -406,7 +430,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-30 22:47 UTC (v4.6) · #1655 + #1646 landed on dev · Next: #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-30 23:56 UTC (v4.7) · #1655 + #1646 landed on dev · Numbered queue extended through Step 15 · Next: #1647 → authority model → #1638 → #1642 → loop decomposition → #1487 → #1637 · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
