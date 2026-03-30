@@ -2596,24 +2596,12 @@ impl LoopEngine {
 
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
         let base = &self.budget.config().termination;
-        match self.turn_execution_profile {
-            TurnExecutionProfile::Standard => Cow::Borrowed(base),
-            TurnExecutionProfile::BoundedLocal => {
-                let mut tightened = base.clone();
-                tightened.nudge_after_tool_turns =
-                    tighten_or_default_threshold(tightened.nudge_after_tool_turns, 3);
-                tightened.strip_tools_after_nudge = tightened.strip_tools_after_nudge.min(1);
-                tightened.tool_round_nudge_after =
-                    tighten_or_default_threshold(tightened.tool_round_nudge_after, 2);
-                tightened.tool_round_strip_after_nudge =
-                    tightened.tool_round_strip_after_nudge.min(1);
-                tightened.observation_only_round_nudge_after = 1;
-                tightened.observation_only_round_strip_after_nudge = 0;
-                Cow::Owned(tightened)
-            }
-            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::DirectUtility(_) => {
-                Cow::Owned(tightened_direct_profile_termination(base))
-            }
+        match self
+            .turn_execution_profile
+            .tightened_termination_config(base)
+        {
+            Some(tightened) => Cow::Owned(tightened),
+            None => Cow::Borrowed(base),
         }
     }
 
@@ -5854,6 +5842,10 @@ impl LoopEngine {
             self.expire_activity_progress(stream);
             return Ok(ToolRoundOutcome::BoundedLocalTerminal(reason));
         }
+        // DirectUtility authors its final answer directly from tool results, so it exits
+        // before the continuation/synthesis path. DirectInspection still goes through
+        // finalize_tool_response so the model can produce an evidence-backed answer and use
+        // its single synthesis fallback when the immediate continuation comes back empty.
         if let TurnExecutionProfile::DirectUtility(profile) = self.turn_execution_profile {
             self.last_reasoning_messages = state.continuation_messages.clone();
             self.expire_activity_progress(stream);
@@ -6125,10 +6117,7 @@ impl LoopEngine {
             ));
         }
 
-        if matches!(
-            self.turn_execution_profile,
-            TurnExecutionProfile::DirectInspection(_)
-        ) {
+        if self.turn_execution_profile.allows_synthesis_fallback() {
             return self
                 .synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
                 .await;
@@ -6183,10 +6172,10 @@ impl LoopEngine {
                 tokens_used,
                 next_tool_scope,
             ),
-            None if matches!(
-                self.turn_execution_profile,
-                TurnExecutionProfile::DirectInspection(_)
-            ) =>
+            None if self
+                .turn_execution_profile
+                .direct_inspection_profile()
+                .is_some() =>
             {
                 self.direct_inspection_empty_summary_action_result(decision, evicted, tokens_used)
             }
@@ -6227,10 +6216,7 @@ impl LoopEngine {
             Some(commitment) => continuation.with_turn_commitment(commitment),
             None => continuation,
         };
-        if matches!(
-            self.turn_execution_profile,
-            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::DirectUtility(_)
-        ) {
+        if self.turn_execution_profile.completes_terminally() {
             return ActionResult {
                 decision: decision.clone(),
                 tool_results,
@@ -8127,27 +8113,6 @@ fn artifact_path_candidates(target: &str) -> Vec<String> {
         }
     }
     candidates
-}
-
-fn tighten_or_default_threshold(current: u16, ceiling: u16) -> u16 {
-    if current == 0 {
-        ceiling
-    } else {
-        current.min(ceiling)
-    }
-}
-
-fn tightened_direct_profile_termination(base: &TerminationConfig) -> TerminationConfig {
-    let mut tightened = base.clone();
-    tightened.nudge_after_tool_turns =
-        tighten_or_default_threshold(tightened.nudge_after_tool_turns, 1);
-    tightened.strip_tools_after_nudge = 0;
-    tightened.tool_round_nudge_after =
-        tighten_or_default_threshold(tightened.tool_round_nudge_after, 1);
-    tightened.tool_round_strip_after_nudge = 0;
-    tightened.observation_only_round_nudge_after = 0;
-    tightened.observation_only_round_strip_after_nudge = 0;
-    tightened
 }
 
 // Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
@@ -20372,6 +20337,9 @@ mod loop_resilience_tests {
 
     #[path = "bounded_local_tests.rs"]
     mod bounded_local_tests;
+
+    #[path = "profile_boundary_tests.rs"]
+    mod profile_boundary_tests;
 
     #[tokio::test]
     async fn synthesis_skipped_when_disabled() {
