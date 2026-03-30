@@ -7,7 +7,7 @@ use fx_llm::{ContentBlock, Message, Usage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A structured content block stored in session history.
@@ -226,6 +226,19 @@ impl SessionMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentRenderOptions {
     pub include_tool_use_id: bool,
+}
+
+/// Errors raised when session history violates tool ordering invariants.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionHistoryError {
+    #[error(
+        "invalid tool history: tool result '{tool_use_id}' at message {message_index} block {block_index} has no matching earlier tool_use"
+    )]
+    ToolResultBeforeToolUse {
+        tool_use_id: String,
+        message_index: usize,
+        block_index: usize,
+    },
 }
 
 const DEFAULT_SESSION_MEMORY_MAX_ITEMS: usize = 40;
@@ -492,14 +505,18 @@ impl Session {
     }
 
     /// Append a message and update the timestamp.
-    pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) {
+    pub fn add_message(
+        &mut self,
+        role: MessageRole,
+        content: impl Into<String>,
+    ) -> Result<(), SessionHistoryError> {
         self.add_message_blocks(
             role,
             vec![SessionContentBlock::Text {
                 text: content.into(),
             }],
             None,
-        );
+        )
     }
 
     /// Append a structured message and update the timestamp.
@@ -508,23 +525,37 @@ impl Session {
         role: MessageRole,
         content: Vec<SessionContentBlock>,
         token_count: Option<u32>,
-    ) {
+    ) -> Result<(), SessionHistoryError> {
         let now = current_epoch_secs();
-        self.messages
-            .push(SessionMessage::structured(role, content, now, token_count));
-        self.updated_at = now;
+        self.extend_messages([SessionMessage::structured(role, content, now, token_count)])
     }
 
     /// Append already-constructed messages and update the timestamp once.
-    pub fn extend_messages(&mut self, messages: impl IntoIterator<Item = SessionMessage>) {
-        let mut appended_any = false;
-        for message in messages {
-            self.messages.push(message);
-            appended_any = true;
+    pub fn extend_messages(
+        &mut self,
+        messages: impl IntoIterator<Item = SessionMessage>,
+    ) -> Result<(), SessionHistoryError> {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
         }
-        if appended_any {
-            self.updated_at = current_epoch_secs();
-        }
+
+        let mut seen_tool_uses = HashSet::new();
+        validate_tool_message_order_with_seen(
+            self.messages.iter().enumerate(),
+            &mut seen_tool_uses,
+        )?;
+        validate_tool_message_order_with_seen(
+            messages
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| (self.messages.len() + offset, message)),
+            &mut seen_tool_uses,
+        )?;
+
+        self.messages.extend(messages);
+        self.updated_at = current_epoch_secs();
+        Ok(())
     }
 
     pub fn set_memory(&mut self, memory: SessionMemory) {
@@ -572,6 +603,49 @@ impl Session {
             .last()
             .map(|message| truncate_text(&message.render_text(), 120))
     }
+
+    pub fn validate_history(&self) -> Result<(), SessionHistoryError> {
+        validate_tool_message_order(&self.messages)
+    }
+}
+
+/// Validate that each stored `ToolResult` references a matching earlier `ToolUse`.
+pub fn validate_tool_message_order(messages: &[SessionMessage]) -> Result<(), SessionHistoryError> {
+    let mut seen_tool_uses = HashSet::new();
+    validate_tool_message_order_with_seen(messages.iter().enumerate(), &mut seen_tool_uses)
+}
+
+fn validate_tool_message_order_with_seen<'a>(
+    messages: impl IntoIterator<Item = (usize, &'a SessionMessage)>,
+    seen_tool_uses: &mut HashSet<String>,
+) -> Result<(), SessionHistoryError> {
+    for (message_index, message) in messages {
+        for (block_index, block) in message.content.iter().enumerate() {
+            match block {
+                SessionContentBlock::ToolUse { id, .. } => {
+                    let trimmed = id.trim();
+                    if !trimmed.is_empty() {
+                        seen_tool_uses.insert(trimmed.to_string());
+                    }
+                }
+                SessionContentBlock::ToolResult { tool_use_id, .. } => {
+                    let trimmed = tool_use_id.trim();
+                    if !trimmed.is_empty() && !seen_tool_uses.contains(trimmed) {
+                        return Err(SessionHistoryError::ToolResultBeforeToolUse {
+                            tool_use_id: trimmed.to_string(),
+                            message_index,
+                            block_index,
+                        });
+                    }
+                }
+                SessionContentBlock::Text { .. }
+                | SessionContentBlock::Image { .. }
+                | SessionContentBlock::Document { .. } => {}
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -948,7 +1022,9 @@ mod tests {
             test_config(),
         );
         let before = session.updated_at;
-        session.add_message(MessageRole::User, "hello");
+        session
+            .add_message(MessageRole::User, "hello")
+            .expect("add message");
         assert_eq!(session.messages.len(), 1);
         assert!(session.updated_at >= before);
         assert_eq!(session.messages[0].role, MessageRole::User);
@@ -968,7 +1044,9 @@ mod tests {
             test_config(),
         );
         for i in 0..10 {
-            session.add_message(MessageRole::User, format!("msg-{i}"));
+            session
+                .add_message(MessageRole::User, format!("msg-{i}"))
+                .expect("add message");
         }
         let recent = session.recent_messages(3);
         assert_eq!(recent.len(), 3);
@@ -983,7 +1061,9 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::User, "only one");
+        session
+            .add_message(MessageRole::User, "only one")
+            .expect("add message");
         let recent = session.recent_messages(100);
         assert_eq!(recent.len(), 1);
     }
@@ -995,8 +1075,12 @@ mod tests {
             SessionKind::Channel,
             test_config(),
         );
-        session.add_message(MessageRole::User, "hi");
-        session.add_message(MessageRole::Assistant, "hello");
+        session
+            .add_message(MessageRole::User, "hi")
+            .expect("add user");
+        session
+            .add_message(MessageRole::Assistant, "hello")
+            .expect("add assistant");
         let info = session.info();
         assert_eq!(info.key, SessionKey::new("s5").unwrap());
         assert_eq!(info.kind, SessionKind::Channel);
@@ -1012,9 +1096,15 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::Assistant, "system ready");
-        session.add_message(MessageRole::User, "first user title");
-        session.add_message(MessageRole::User, "second user title");
+        session
+            .add_message(MessageRole::Assistant, "system ready")
+            .expect("add assistant");
+        session
+            .add_message(MessageRole::User, "first user title")
+            .expect("add first user");
+        session
+            .add_message(MessageRole::User, "second user title")
+            .expect("add second user");
 
         let info = session.info();
 
@@ -1028,8 +1118,12 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::User, "hello");
-        session.add_message(MessageRole::Assistant, "latest preview");
+        session
+            .add_message(MessageRole::User, "hello")
+            .expect("add user");
+        session
+            .add_message(MessageRole::Assistant, "latest preview")
+            .expect("add assistant");
 
         let info = session.info();
 
@@ -1069,7 +1163,9 @@ mod tests {
                 model: "claude".to_string(),
             },
         );
-        session.add_message(MessageRole::System, "init");
+        session
+            .add_message(MessageRole::System, "init")
+            .expect("add message");
         let json = serde_json::to_string(&session).expect("serialize");
         let restored: Session = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.key, session.key);
@@ -1219,15 +1315,98 @@ mod tests {
         );
         session.updated_at = 0;
 
-        session.extend_messages([
-            SessionMessage::text(MessageRole::User, "first", 1),
-            SessionMessage::text(MessageRole::Assistant, "second", 2),
-        ]);
+        session
+            .extend_messages([
+                SessionMessage::text(MessageRole::User, "first", 1),
+                SessionMessage::text(MessageRole::Assistant, "second", 2),
+            ])
+            .expect("extend messages");
 
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].render_text(), "first");
         assert_eq!(session.messages[1].render_text(), "second");
         assert!(session.updated_at > 0);
+    }
+
+    #[test]
+    fn validate_tool_message_order_rejects_result_before_matching_tool_use() {
+        let messages = vec![
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("missing"),
+                    is_error: Some(false),
+                }],
+                1,
+                None,
+            ),
+            SessionMessage::structured(
+                MessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "README.md"}),
+                }],
+                2,
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            validate_tool_message_order(&messages),
+            Err(SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_1".to_string(),
+                message_index: 0,
+                block_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn extend_messages_rejects_tool_result_before_matching_tool_use() {
+        let mut session = Session::new(
+            SessionKey::new("invalid-tool-order").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+
+        let error = session
+            .extend_messages([
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: json!("missing"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        provider_id: Some("fc_1".to_string()),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "README.md"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ])
+            .expect_err("invalid tool ordering should fail");
+
+        assert_eq!(
+            error,
+            SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_1".to_string(),
+                message_index: 0,
+                block_index: 0,
+            }
+        );
+        assert!(session.messages.is_empty());
     }
 
     #[test]

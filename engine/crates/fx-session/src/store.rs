@@ -93,7 +93,9 @@ mod tests {
     fn save_and_load_round_trips() {
         let store = test_store();
         let mut session = make_session("s1");
-        session.add_message(crate::types::MessageRole::User, "hello");
+        session
+            .add_message(crate::types::MessageRole::User, "hello")
+            .expect("add message");
 
         store.save(&session).expect("save");
         let loaded = store
@@ -171,7 +173,9 @@ mod tests {
         let mut session = make_session("overwrite");
         store.save(&session).expect("first save");
 
-        session.add_message(crate::types::MessageRole::User, "new message");
+        session
+            .add_message(crate::types::MessageRole::User, "new message")
+            .expect("add message");
         store.save(&session).expect("second save");
 
         let loaded = store
