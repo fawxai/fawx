@@ -1668,6 +1668,8 @@ const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls w
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
 const DIRECT_INSPECTION_TASK_DIRECTIVE: &str = "\n\nThis turn is a direct local inspection request. Do not plan. Do not decompose. Use only the provided observation tools to inspect the explicit local path the user named. If the tool results answer the request, answer directly from that evidence. Do not broaden the task into repo research, code modification, testing, command execution, or web work.";
 const DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE: &str = "\n\nDirect inspection focus: read_local_path.\nUse `read_file` to inspect the explicit local path the user requested. Do not call unrelated tools or reopen the task as general research.";
+const DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE: &str =
+    "Inspection completed but produced no summary.";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
 const DIRECT_TOOL_TASK_DIRECTIVE: &str = "\n\nThis turn is a simple direct-tool request. Do not plan. Do not decompose. Use the one relevant utility tool immediately, then answer directly from its result. Do not call unrelated tools or do extra research unless the direct tool fails.";
 const DIRECT_WEATHER_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: weather.\nCall `weather` now with the user's requested location and answer directly from that result. Do not call `web_search` or `run_command` unless the `weather` tool fails or cannot answer the request.";
@@ -2597,9 +2599,7 @@ impl LoopEngine {
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
         let base = &self.budget.config().termination;
         match self.turn_execution_profile {
-            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => {
-                Cow::Borrowed(base)
-            }
+            TurnExecutionProfile::Standard => Cow::Borrowed(base),
             TurnExecutionProfile::BoundedLocal => {
                 let mut tightened = base.clone();
                 tightened.nudge_after_tool_turns =
@@ -2613,17 +2613,8 @@ impl LoopEngine {
                 tightened.observation_only_round_strip_after_nudge = 0;
                 Cow::Owned(tightened)
             }
-            TurnExecutionProfile::DirectUtility(_) => {
-                let mut tightened = base.clone();
-                tightened.nudge_after_tool_turns =
-                    tighten_or_default_threshold(tightened.nudge_after_tool_turns, 1);
-                tightened.strip_tools_after_nudge = 0;
-                tightened.tool_round_nudge_after =
-                    tighten_or_default_threshold(tightened.tool_round_nudge_after, 1);
-                tightened.tool_round_strip_after_nudge = 0;
-                tightened.observation_only_round_nudge_after = 0;
-                tightened.observation_only_round_strip_after_nudge = 0;
-                Cow::Owned(tightened)
+            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::DirectUtility(_) => {
+                Cow::Owned(tightened_direct_profile_termination(base))
             }
         }
     }
@@ -5230,6 +5221,22 @@ impl LoopEngine {
         }
     }
 
+    fn direct_inspection_empty_summary_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        let response = DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE.to_string();
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: response.clone(),
+            tokens_used,
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+        }
+    }
+
     fn incomplete_action_result(
         &self,
         decision: &Decision,
@@ -5595,12 +5602,16 @@ impl LoopEngine {
                         .await?;
 
                     let next_tool_scope = self.continuation_tool_scope_for_round(&state);
-                    return Ok(self.finalize_tool_response(
-                        decision,
-                        state,
-                        &response,
-                        next_tool_scope,
-                    ));
+                    return self
+                        .finalize_tool_response(
+                            decision,
+                            state,
+                            &response,
+                            llm,
+                            stream,
+                            next_tool_scope,
+                        )
+                        .await;
                 }
             }
         }
@@ -6084,53 +6095,58 @@ impl LoopEngine {
         Ok(response)
     }
 
-    fn finalize_tool_response(
+    async fn finalize_tool_response(
         &mut self,
         decision: &Decision,
         state: ToolRoundState,
         response: &CompletionResponse,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
         next_tool_scope: Option<ContinuationToolScope>,
-    ) -> ActionResult {
-        let ToolRoundState {
-            all_tool_results,
-            accumulated_text,
-            tokens_used,
-            ..
-        } = state;
+    ) -> Result<ActionResult, LoopError> {
         let response_text =
-            stitch_response_segments(&accumulated_text, response_text_segment(response));
+            stitch_response_segments(&state.accumulated_text, response_text_segment(response));
         if response_text.is_empty() {
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Trace,
                 "tool continuation returned empty text",
                 serde_json::json!({
-                    "tool_count": all_tool_results.len(),
+                    "tool_count": state.all_tool_results.len(),
                 }),
             );
         }
-        let final_response = meaningful_response_text(&response_text);
-        let tool_summary = stitched_response_text(
-            &accumulated_text,
-            summarize_tool_progress(&all_tool_results),
-        );
-        match final_response {
-            Some(response) => self.tool_continuation_action_result(
+        if let Some(response) = meaningful_response_text(&response_text) {
+            return Ok(self.tool_continuation_action_result(
                 decision,
-                all_tool_results,
+                state.all_tool_results,
                 response_text,
                 response,
-                tokens_used,
+                state.tokens_used,
                 next_tool_scope,
-            ),
-            None => self.incomplete_action_result(
-                decision,
-                all_tool_results,
-                tool_summary,
-                "tool continuation did not produce a usable final response",
-                tokens_used,
-            ),
+            ));
         }
+
+        if matches!(
+            self.turn_execution_profile,
+            TurnExecutionProfile::DirectInspection(_)
+        ) {
+            return self
+                .synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
+                .await;
+        }
+
+        let tool_summary = stitched_response_text(
+            &state.accumulated_text,
+            summarize_tool_progress(&state.all_tool_results),
+        );
+        Ok(self.incomplete_action_result(
+            decision,
+            state.all_tool_results,
+            tool_summary,
+            "tool continuation did not produce a usable final response",
+            state.tokens_used,
+        ))
     }
 
     async fn synthesize_tool_fallback(
@@ -6169,6 +6185,13 @@ impl LoopEngine {
                 tokens_used,
                 next_tool_scope,
             ),
+            None if matches!(
+                self.turn_execution_profile,
+                TurnExecutionProfile::DirectInspection(_)
+            ) =>
+            {
+                self.direct_inspection_empty_summary_action_result(decision, evicted, tokens_used)
+            }
             None => self.incomplete_action_result(
                 decision,
                 evicted,
@@ -6208,7 +6231,7 @@ impl LoopEngine {
         };
         if matches!(
             self.turn_execution_profile,
-            TurnExecutionProfile::DirectUtility(_)
+            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::DirectUtility(_)
         ) {
             return ActionResult {
                 decision: decision.clone(),
@@ -8114,6 +8137,19 @@ fn tighten_or_default_threshold(current: u16, ceiling: u16) -> u16 {
     } else {
         current.min(ceiling)
     }
+}
+
+fn tightened_direct_profile_termination(base: &TerminationConfig) -> TerminationConfig {
+    let mut tightened = base.clone();
+    tightened.nudge_after_tool_turns =
+        tighten_or_default_threshold(tightened.nudge_after_tool_turns, 1);
+    tightened.strip_tools_after_nudge = 0;
+    tightened.tool_round_nudge_after =
+        tighten_or_default_threshold(tightened.tool_round_nudge_after, 1);
+    tightened.tool_round_strip_after_nudge = 0;
+    tightened.observation_only_round_nudge_after = 0;
+    tightened.observation_only_round_strip_after_nudge = 0;
+    tightened
 }
 
 // Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
@@ -20332,6 +20368,9 @@ mod loop_resilience_tests {
             "tools should still be present at turn 4, threshold 5"
         );
     }
+
+    #[path = "direct_inspection_tests.rs"]
+    mod direct_inspection_tests;
 
     #[path = "bounded_local_tests.rs"]
     mod bounded_local_tests;
