@@ -16,6 +16,161 @@ fn detect_turn_execution_profile_recognizes_bounded_local_requests() {
 }
 
 #[tokio::test]
+async fn perceive_routes_explicit_local_path_reads_to_direct_inspection() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let _processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath)
+    );
+}
+
+#[tokio::test]
+async fn direct_inspection_turns_disable_effective_decompose() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    assert!(!engine.effective_decompose_enabled());
+
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|tool| tool.name != DECOMPOSE_TOOL_NAME),
+        "direct inspection turns should not advertise decompose"
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_supports_quoted_explicit_local_paths() {
+    let message = "Inspect \"~/.zshrc\" and summarize it.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath)
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_rejects_mutation_verbs_for_direct_inspection() {
+    let message = "Read ~/.zshrc and then update it with a new alias.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_requires_explicit_local_path_for_direct_inspection() {
+    let message = "Read this file and summarize it for me.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_rejects_mixed_local_and_online_guidance_requests() {
+    let message = "Read ~/.zshrc and compare it to the latest online guidance for zsh config.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::Standard
+    );
+}
+
+#[tokio::test]
+async fn decomposition_sub_goal_cannot_promote_standard_turn_to_direct_inspection() {
+    let prompt = "Read ~/.zshrc and compare it to the latest online guidance for zsh config.";
+    let sub_goal = SubGoal::with_definition_of_done(
+        "Read the user's ~/.zshrc and summarize its structure, notable settings, plugins, aliases, PATH edits, and any unusual/possibly outdated patterns.".to_string(),
+        Vec::new(),
+        Some("inspection summary"),
+        None,
+    );
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let processed = engine
+        .perceive(&test_snapshot(prompt))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
+        TurnExecutionProfile::Standard
+    );
+
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let execution = engine
+        .run_sub_goal(
+            &sub_goal,
+            BudgetConfig::default(),
+            &llm,
+            &processed.context_window,
+            &[],
+        )
+        .await;
+
+    assert!(
+        execution
+            .result
+            .signals
+            .iter()
+            .any(|signal| signal.message == "processing user input"),
+        "child sub-goal should still execute a real perceive pass"
+    );
+    assert!(
+        execution
+            .result
+            .signals
+            .iter()
+            .all(|signal| signal.message != "selected direct inspection execution profile"),
+        "standard parent turns must not be promoted to direct inspection during decomposition"
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
+    let tools = DirectUtilityToolExecutor.tool_definitions();
+    let message = "Tell me the current time, then quote ~/notes/todo.md.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &tools),
+        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_preserves_bounded_local_precedence() {
+    let message = "Work only inside ~/fawx.\nDo not use web research.\n1. Inspect ~/fawx/engine/crates/fx-kernel/src/loop_engine.rs to find the issue.\n2. Make one concrete code change.\n3. Run one focused test.\n4. End with a concise summary.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::BoundedLocal
+    );
+}
+
+#[tokio::test]
 async fn bounded_local_prompt_disables_decompose_and_injects_fast_path_directive() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     let llm = RecordingLlm::ok(vec![CompletionResponse {
