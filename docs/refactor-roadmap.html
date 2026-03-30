@@ -246,16 +246,16 @@
         </div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduced by 13376838</span><span class="tag tag-active">regression</span></div>
-        <div class="issue-body">Separate from the original <code>#1652</code> regression and separate from <code>#1641</code>. Traced in <code>docs/fix/1653-runaway-reintroduction-trace.md</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduced by 13376838</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Separate from the original <code>#1652</code> regression and separate from <code>#1641</code>. Traced in <code>docs/fix/1653-runaway-reintroduction-trace.md</code>. Fixed on dev in PR <code>#1663</code>.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Persisted tool ordering / unknown tool</span><span class="tag tag-active">correctness</span></div>
-        <div class="issue-body">Post-turn identity and ordering corruption. Traced in <code>docs/fix/1656-unknown-tool-post-turn-trace.md</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Persisted tool ordering / unknown tool</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Post-turn identity and ordering corruption. Traced in <code>docs/fix/1656-unknown-tool-post-turn-trace.md</code>. Fixed on dev in PR <code>#1664</code>.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">contract cleanup</span></div>
-        <div class="issue-body">Should follow <code>#1656</code>. Grouping only makes sense once ordering and tool identity are stable.</div>
+        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">now</span></div>
+        <div class="issue-body">Now unblocked after <code>#1656</code>. Grouping only makes sense once ordering and tool identity are stable.</div>
       </div>
     </div>
   </div>
@@ -267,17 +267,17 @@
     <strong>✅ Steps 1-4. #1641 Phases 1-4: direct inspection profile (COMPLETE)</strong>
     <div class="step-meta">Detection → profile-owned tool surface → terminal completion → boundary consolidation. Four PRs merged (#1659, #1660, #1661, #1662). Gates A and B are clear.</div>
   </div>
-  <div class="sequence-step">
-    <strong>Step 5. #1658: mixed-text runaway follow-up</strong>
-    <div class="step-meta">Immediately retest after Step 4. If <code>#1641</code> fully subsumes the direct-inspection runaway, narrow this issue to remaining mixed-text cases. If not, fix the reintroduced continuation loop directly.</div>
+  <div class="sequence-step" style="border-left: 3px solid var(--green);">
+    <strong>✅ Step 5. #1658: mixed-text runaway follow-up (COMPLETE)</strong>
+    <div class="step-meta">Regression repaired in PR <code>#1663</code>. Continuation and termination decisions now key off fresh text from the current round or synthesis pass, preventing the mixed-text runaway reintroduction.</div>
   </div>
-  <div class="sequence-step">
-    <strong>Step 6. #1656: enforce tool ordering and reject poisoned history</strong>
-    <div class="step-meta">Fix the session write boundary before doing any history UX cleanup.</div>
+  <div class="sequence-step" style="border-left: 3px solid var(--green);">
+    <strong>✅ Step 6. #1656: enforce tool ordering and reject poisoned history (COMPLETE)</strong>
+    <div class="step-meta">Fixed in PR <code>#1664</code>. Session write ordering is enforced, poisoned stored history is rejected before replay, and provider/tool identity is preserved across persistence.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 7. #1655: persist one grouped tool-history record per turn</strong>
-    <div class="step-meta">Turn-scoped transcript contract. This comes after <code>#1656</code>, not before.</div>
+    <div class="step-meta">Turn-scoped transcript contract. This is now the active next step after <code>#1656</code>.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 8. #1646: direct utility routing and visible tool contracts</strong>
@@ -298,9 +298,9 @@
   <ul class="gate-list">
     <li><strong>Gate A:</strong> <span style="color: var(--green)">✅ CLEAR</span> <code>Read the file at ~/.zshrc and explain what each line does</code> must not end in an outside-working-directory refusal once the file was successfully read. <em>Fixed by #1641 Phase 3 (terminal completion) + working_dir prompt removal.</em></li>
     <li><strong>Gate B:</strong> <span style="color: var(--green)">✅ CLEAR</span> that prompt must terminate without runaway continuation on the current direct-inspection path. <em>Fixed by #1641 Phases 1-4 (profile-owned terminal completion, tightened termination config).</em></li>
-    <li><strong>Gate C:</strong> no post-turn <code>Unknown tool call</code> row for the traced prompt after completion.</li>
-    <li><strong>Gate D:</strong> persisted history must never store <code>tool_result</code> before matching <code>tool_use</code>.</li>
-    <li><strong>Gate E:</strong> one completed turn must replay as one grouped historical tool-activity unit.</li>
+    <li><strong>Gate C:</strong> <span style="color: var(--green)">✅ CLEAR</span> no post-turn <code>Unknown tool call</code> row for the traced prompt after completion. <em>Cleared by #1656 (PR #1664).</em></li>
+    <li><strong>Gate D:</strong> <span style="color: var(--green)">✅ CLEAR</span> persisted history must never store <code>tool_result</code> before matching <code>tool_use</code>. <em>Cleared by #1656 (PR #1664).</em></li>
+    <li><strong>Gate E:</strong> one completed turn must replay as one grouped historical tool-activity unit. <em>Targeted by #1655.</em></li>
   </ul>
 </div>
 
@@ -333,16 +333,16 @@
       <div class="issue-body">Four-phase implementation complete. Profile detection, owned tool surface, terminal completion, boundary consolidation.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduction</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Regression repair tied to mixed-text continuation semantics.</div>
+      <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduction</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1663</code>. Mixed-text continuation semantics are stable again.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Tool ordering and identity integrity</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Session write boundary and replay correctness.</div>
+      <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Tool ordering and identity integrity</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1664</code>. Session write boundary and replay correctness are now locked in.</div>
     </div>
     <div class="issue-card">
       <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Backend transcript contract cleanup after ordering is fixed.</div>
+      <div class="issue-body">Backend transcript contract cleanup after ordering is fixed. Current active step.</div>
     </div>
     <div class="issue-card">
       <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing</span><span class="tag tag-next">after stabilization</span></div>
@@ -402,7 +402,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-30 14:43 UTC (v4.4) · #1641 complete (4 phases landed) · Next: #1658 → #1656 → #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-30 20:12 UTC (v4.5) · #1658 + #1656 landed on dev · Next: #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
