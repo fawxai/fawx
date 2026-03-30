@@ -41,6 +41,14 @@ pub(super) fn direct_utility_directive(profile: &DirectUtilityProfile) -> String
     }
 }
 
+pub(super) fn direct_utility_block_reason(profile: &DirectUtilityProfile) -> &'static str {
+    match profile {
+        DirectUtilityProfile::Weather | DirectUtilityProfile::CurrentTime => {
+            "direct utility turns only allow their profile-owned tool surface"
+        }
+    }
+}
+
 pub(super) fn direct_utility_progress(profile: &DirectUtilityProfile) -> (ProgressKind, String) {
     match profile {
         DirectUtilityProfile::Weather => (
