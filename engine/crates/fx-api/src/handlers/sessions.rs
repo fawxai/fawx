@@ -28,7 +28,7 @@ use fx_session::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -363,37 +363,50 @@ pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Me
 }
 
 fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
-    let mut tool_use_ids = HashSet::new();
-    let mut tool_result_ids = HashSet::new();
-
+    let mut remaining_tool_results = HashMap::<String, usize>::new();
     for message in &messages {
         for block in &message.content {
-            match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    tool_use_ids.insert(id.clone());
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                let trimmed = tool_use_id.trim();
+                if !trimmed.is_empty() {
+                    *remaining_tool_results
+                        .entry(trimmed.to_string())
+                        .or_default() += 1;
                 }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    tool_result_ids.insert(tool_use_id.clone());
-                }
-                ContentBlock::Text { .. }
-                | ContentBlock::Image { .. }
-                | ContentBlock::Document { .. } => {}
             }
         }
     }
 
-    let unresolved_tool_use_ids = tool_use_ids
-        .iter()
-        .filter(|id| !tool_result_ids.contains(*id))
-        .cloned()
-        .collect::<HashSet<_>>();
+    let mut seen_tool_uses = HashSet::new();
 
     messages
         .into_iter()
         .filter_map(|mut message| {
             message.content.retain(|block| match block {
-                ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
-                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
+                ContentBlock::ToolUse { id, .. } => {
+                    let trimmed = id.trim();
+                    if trimmed.is_empty() {
+                        return true;
+                    }
+                    let has_future_result = remaining_tool_results
+                        .get(trimmed)
+                        .copied()
+                        .unwrap_or_default()
+                        > 0;
+                    if has_future_result {
+                        seen_tool_uses.insert(trimmed.to_string());
+                    }
+                    has_future_result
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    let trimmed = tool_use_id.trim();
+                    if trimmed.is_empty() {
+                        return true;
+                    }
+                    let keep = seen_tool_uses.contains(trimmed);
+                    decrement_remaining_tool_result(&mut remaining_tool_results, trimmed);
+                    keep
+                }
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
                 | ContentBlock::Document { .. } => true,
@@ -401,6 +414,21 @@ fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
             (!message.content.is_empty()).then_some(message)
         })
         .collect()
+}
+
+fn decrement_remaining_tool_result(
+    remaining_tool_results: &mut HashMap<String, usize>,
+    tool_use_id: &str,
+) {
+    let Some(count) = remaining_tool_results.get(tool_use_id).copied() else {
+        return;
+    };
+
+    if count <= 1 {
+        remaining_tool_results.remove(tool_use_id);
+    } else {
+        remaining_tool_results.insert(tool_use_id.to_string(), count - 1);
+    }
 }
 
 async fn stream_session_message_response(
@@ -745,6 +773,142 @@ mod tests {
                     ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
+    }
+
+    #[test]
+    fn provider_replay_validates_tool_ordering() {
+        let messages = vec![
+            SessionMessage::text(SessionMessageRole::User, "first", 1),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_bad".to_string(),
+                    content: serde_json::json!("bad"),
+                    is_error: Some(false),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                4,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                    is_error: Some(false),
+                }],
+                5,
+                None,
+            ),
+        ];
+
+        let context = session_messages_to_context(&messages);
+
+        assert!(context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolUse {
+                    id,
+                    provider_id,
+                    ..
+                } if id == "call_good" && provider_id.as_deref() == Some("fc_good")
+            )));
+        assert!(context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_good"
+            )));
+        assert!(!context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { id, .. } if id == "call_bad"
+            )));
+        assert!(!context
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_bad"
+            )));
+    }
+
+    #[test]
+    fn prune_unresolved_tool_context_handles_ordering_violation() {
+        let pruned = prune_unresolved_tool_context(vec![
+            Message {
+                role: fx_llm::MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_bad".to_string(),
+                    content: serde_json::json!("bad"),
+                }],
+            },
+            Message {
+                role: fx_llm::MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+            },
+            Message {
+                role: fx_llm::MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+            },
+            Message {
+                role: fx_llm::MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                }],
+            },
+        ]);
+
+        assert_eq!(pruned.len(), 2);
+        assert!(matches!(
+            pruned[0].content.as_slice(),
+            [ContentBlock::ToolUse {
+                id,
+                provider_id,
+                ..
+            }] if id == "call_good" && provider_id.as_deref() == Some("fc_good")
+        ));
+        assert!(matches!(
+            pruned[1].content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_good"
+        ));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Session registry: tracks all active sessions and delegates persistence.
 
-use crate::session::{Session, SessionContentBlock, SessionMemory, SessionMessage};
+use crate::session::{
+    Session, SessionContentBlock, SessionHistoryError, SessionMemory, SessionMessage,
+};
 use crate::store::SessionStore;
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
@@ -27,6 +29,10 @@ pub enum SessionError {
     /// Persistence or storage failure.
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+
+    /// Session history violated a causal ordering invariant.
+    #[error("invalid session history: {0}")]
+    InvalidHistory(#[from] SessionHistoryError),
 
     /// Internal lock poisoning.
     #[error("internal error: lock poisoned")]
@@ -169,7 +175,7 @@ impl SessionRegistry {
             let session = map
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
-            session.add_message_blocks(role, content, token_count);
+            session.add_message_blocks(role, content, token_count)?;
             session.clone()
         };
         self.store.save(&snapshot)?;
@@ -187,7 +193,7 @@ impl SessionRegistry {
             let session = map
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
-            session.extend_messages(messages);
+            session.extend_messages(messages)?;
             session.clone()
         };
         self.store.save(&snapshot)?;
@@ -216,7 +222,7 @@ impl SessionRegistry {
                 .get_mut(key)
                 .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
             if !messages.is_empty() {
-                session.extend_messages(messages);
+                session.extend_messages(messages)?;
             }
             session.set_memory(memory);
             session.clone()
@@ -285,6 +291,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_llm::ContentBlock;
     use fx_storage::Storage;
 
     fn test_registry() -> SessionRegistry {
@@ -490,6 +497,140 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].render_text(), "saved");
         assert_eq!(stored_memory, memory);
+    }
+
+    #[test]
+    fn session_persists_tool_activity_in_causal_order() {
+        let reg = test_registry();
+        let key = SessionKey::new("tool-order").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+
+        reg.record_turn(
+            &key,
+            vec![
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        provider_id: Some("fc_1".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: serde_json::json!("contents"),
+                        is_error: Some(false),
+                    }],
+                    2,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::Text {
+                        text: "Done.".to_string(),
+                    }],
+                    3,
+                    None,
+                ),
+            ],
+            SessionMemory::default(),
+        )
+        .expect("record turn");
+
+        let history = reg.history(&key, 10).expect("history");
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[0].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_1" && provider_id.as_deref() == Some("fc_1")
+        ));
+        assert!(matches!(
+            history[1].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_1"
+        ));
+        assert_eq!(history[2].render_text(), "Done.");
+    }
+
+    #[test]
+    fn session_rejects_tool_result_before_matching_tool_use() {
+        let reg = test_registry();
+        let key = SessionKey::new("invalid-tool-write").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+
+        let error = reg
+            .record_message_blocks(
+                &key,
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("missing"),
+                    is_error: Some(false),
+                }],
+                None,
+            )
+            .expect_err("invalid tool result should fail");
+
+        assert!(matches!(
+            error,
+            SessionError::InvalidHistory(SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id,
+                message_index: 0,
+                block_index: 0,
+            }) if tool_use_id == "call_1"
+        ));
+        assert!(
+            reg.history(&key, 10).expect("history").is_empty(),
+            "rejected writes must not poison stored history"
+        );
+    }
+
+    #[test]
+    fn provider_id_survives_session_roundtrip() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        let reg = SessionRegistry::new(store).expect("registry");
+        let key = SessionKey::new("provider-id").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+
+        reg.record_turn(
+            &key,
+            vec![SessionMessage::structured(
+                MessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_123".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                1,
+                None,
+            )],
+            SessionMemory::default(),
+        )
+        .expect("record turn");
+
+        let reg = SessionRegistry::new(SessionStore::new(storage)).expect("reopen registry");
+        let history = reg.history(&key, 10).expect("history");
+        let message = history.first().expect("stored tool use");
+        assert!(matches!(
+            message.content.as_slice(),
+            [SessionContentBlock::ToolUse { provider_id, .. }]
+                if provider_id.as_deref() == Some("fc_123")
+        ));
+        let llm_message = message.to_llm_message();
+        assert!(matches!(
+            llm_message.content.as_slice(),
+            [ContentBlock::ToolUse { provider_id, .. }]
+                if provider_id.as_deref() == Some("fc_123")
+        ));
     }
 
     #[test]

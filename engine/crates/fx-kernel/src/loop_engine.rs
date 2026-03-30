@@ -34,7 +34,9 @@ use crate::types::{
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
+use fx_core::message::{
+    InternalMessage, ProgressKind, StreamPhase, ToolRoundCall, ToolRoundResult,
+};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
     AggregationStrategy, ComplexityHint, DecompositionPlan, ExecutionContract, SubGoal,
@@ -4559,6 +4561,7 @@ impl LoopEngine {
         };
         let _ = bus.publish(InternalMessage::ToolUse {
             call_id: call.id.clone(),
+            provider_id: self.tool_call_provider_ids.get(&call.id).cloned(),
             name: call.name.clone(),
             arguments: call.arguments.clone(),
         });
@@ -4569,6 +4572,40 @@ impl LoopEngine {
             stream.tool_result(result);
             self.publish_tool_result(result);
         }
+    }
+
+    fn publish_tool_round(
+        &mut self,
+        calls: &[ToolCall],
+        results: &[ToolResult],
+        stream: CycleStream<'_>,
+    ) {
+        self.publish_tool_calls(calls, stream);
+        self.publish_tool_results(results, stream);
+
+        let Some(bus) = self.public_event_bus() else {
+            return;
+        };
+        let _ = bus.publish(InternalMessage::ToolRound {
+            calls: calls
+                .iter()
+                .map(|call| ToolRoundCall {
+                    call_id: call.id.clone(),
+                    provider_id: self.tool_call_provider_ids.get(&call.id).cloned(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+            results: results
+                .iter()
+                .map(|result| ToolRoundResult {
+                    call_id: result.tool_call_id.clone(),
+                    name: result.tool_name.clone(),
+                    success: result.success,
+                    content: result.output.clone(),
+                })
+                .collect(),
+        });
     }
 
     fn emit_tool_errors(&self, results: &[ToolResult], stream: CycleStream<'_>) -> bool {
@@ -5805,11 +5842,10 @@ impl LoopEngine {
         let round_started = current_time_ms();
         let executed_calls = state.current_calls.clone();
         self.maybe_publish_tool_round_progress(round as usize, &executed_calls, stream);
-        self.publish_tool_calls(&executed_calls, stream);
         let results = self
             .execute_tool_calls_with_stream(&executed_calls, stream)
             .await?;
-        self.publish_tool_results(&results, stream);
+        self.publish_tool_round(&executed_calls, &results, stream);
         let has_tool_errors = self.emit_tool_errors(&results, stream);
         self.record_tool_execution_cost(results.len());
         self.record_successful_tool_classifications(state, &executed_calls, &results);
@@ -15136,6 +15172,54 @@ mod decomposition_tests {
         }
         assert_eq!(started, 2);
         assert_eq!(completed, 2);
+    }
+
+    #[test]
+    fn publish_tool_round_emits_atomic_event_with_provider_ids() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+        engine
+            .tool_call_provider_ids
+            .insert("call-1".to_string(), "fc-1".to_string());
+
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        }];
+        let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        }];
+
+        engine.publish_tool_round(&calls, &results, CycleStream::disabled());
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InternalMessage::ToolUse {
+                call_id,
+                provider_id,
+                ..
+            } if call_id == "call-1" && provider_id.as_deref() == Some("fc-1")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InternalMessage::ToolResult { call_id, .. } if call_id == "call-1"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InternalMessage::ToolRound { calls, results }
+                if calls.len() == 1
+                    && results.len() == 1
+                    && calls[0].call_id == "call-1"
+                    && calls[0].provider_id.as_deref() == Some("fc-1")
+                    && results[0].call_id == "call-1"
+        )));
     }
 
     #[test]

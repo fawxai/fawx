@@ -698,20 +698,28 @@ fn build_assistant_turn_messages(
     snapshot: SessionTurnSnapshot,
     timestamp: u64,
 ) -> Vec<SessionMessage> {
+    let tool_turns = snapshot
+        .responses
+        .into_iter()
+        .filter_map(|response| assistant_turn_from_response(response, timestamp))
+        .filter(|turn| turn.has_tool_use)
+        .map(|turn| turn.message)
+        .collect::<Vec<_>>();
+    let tool_results_by_turn =
+        assign_tool_results_to_turns(&tool_turns, snapshot.tool_result_rounds);
     let mut messages = Vec::new();
-    let mut tool_result_rounds = snapshot.tool_result_rounds.into_iter();
 
-    for response in snapshot.responses {
-        let Some(recorded_turn) = assistant_turn_from_response(response, timestamp) else {
-            continue;
-        };
-
-        if !recorded_turn.has_tool_use {
+    for (message, tool_results) in tool_turns.into_iter().zip(tool_results_by_turn) {
+        messages.push(message);
+        if tool_results.is_empty() {
             continue;
         }
-
-        messages.push(recorded_turn.message);
-        append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
+        messages.push(SessionMessage::structured(
+            SessionRecordRole::Tool,
+            tool_results,
+            timestamp,
+            None,
+        ));
     }
 
     messages
@@ -767,24 +775,42 @@ fn assistant_turn_from_response(
     })
 }
 
-fn append_tool_result_round(
-    messages: &mut Vec<SessionMessage>,
-    tool_result_rounds: &mut impl Iterator<Item = Vec<SessionContentBlock>>,
-    timestamp: u64,
-) {
-    let Some(tool_results) = tool_result_rounds.next() else {
-        return;
-    };
-    if tool_results.is_empty() {
-        return;
+fn assign_tool_results_to_turns(
+    tool_turns: &[SessionMessage],
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+) -> Vec<Vec<SessionContentBlock>> {
+    let mut turn_indices = HashMap::new();
+    for (index, message) in tool_turns.iter().enumerate() {
+        for block in &message.content {
+            if let SessionContentBlock::ToolUse { id, .. } = block {
+                let trimmed = id.trim();
+                if !trimmed.is_empty() {
+                    turn_indices.entry(trimmed.to_string()).or_insert(index);
+                }
+            }
+        }
     }
 
-    messages.push(SessionMessage::structured(
-        SessionRecordRole::Tool,
-        tool_results,
-        timestamp,
-        None,
-    ));
+    let mut assigned = vec![Vec::new(); tool_turns.len()];
+    for block in tool_result_rounds.into_iter().flatten() {
+        let SessionContentBlock::ToolResult { tool_use_id, .. } = &block else {
+            continue;
+        };
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(index) = turn_indices.get(trimmed).copied() else {
+            tracing::warn!(
+                tool_use_id = trimmed,
+                "dropping orphaned session tool result without matching tool_use"
+            );
+            continue;
+        };
+        assigned[index].push(block);
+    }
+
+    assigned
 }
 
 fn session_blocks_from_response(
@@ -4159,6 +4185,109 @@ mod tests {
         assert!(
             matches!(messages.last(), Some(message) if message.render_text().contains("outside my working directory"))
         );
+    }
+
+    #[test]
+    fn build_assistant_turn_messages_reassigns_tool_results_by_tool_use_id() {
+        let snapshot = SessionTurnSnapshot {
+            responses: vec![
+                fx_llm::CompletionResponse {
+                    content: vec![fx_llm::ContentBlock::ToolUse {
+                        id: "call_a".to_string(),
+                        provider_id: Some("fc_a".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                },
+                fx_llm::CompletionResponse {
+                    content: vec![fx_llm::ContentBlock::ToolUse {
+                        id: "call_b".to_string(),
+                        provider_id: Some("fc_b".to_string()),
+                        name: "edit_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                },
+            ],
+            tool_result_rounds: vec![
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_b".to_string(),
+                    content: serde_json::Value::String("edit ok".to_string()),
+                    is_error: Some(false),
+                }],
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_a".to_string(),
+                    content: serde_json::Value::String("read ok".to_string()),
+                    is_error: Some(false),
+                }],
+            ],
+        };
+
+        let messages = build_assistant_turn_messages(snapshot, 20);
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_a" && provider_id.as_deref() == Some("fc_a")
+        ));
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_a"
+        ));
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_b" && provider_id.as_deref() == Some("fc_b")
+        ));
+        assert!(matches!(
+            messages[3].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_b"
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
+    }
+
+    #[test]
+    fn build_assistant_turn_messages_drops_orphaned_tool_results() {
+        let snapshot = SessionTurnSnapshot {
+            responses: vec![fx_llm::CompletionResponse {
+                content: vec![fx_llm::ContentBlock::ToolUse {
+                    id: "call_real".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }],
+            tool_result_rounds: vec![
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_real".to_string(),
+                    content: serde_json::Value::String("read ok".to_string()),
+                    is_error: Some(false),
+                }],
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_orphan".to_string(),
+                    content: serde_json::Value::String("orphan".to_string()),
+                    is_error: Some(false),
+                }],
+            ],
+        };
+
+        let messages = build_assistant_turn_messages(snapshot, 20);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_real"
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
     }
 
     #[test]

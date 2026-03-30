@@ -12,8 +12,8 @@ pub mod types;
 pub use registry::{SessionError, SessionRegistry};
 pub use session::{
     max_memory_items, max_memory_tokens, render_content_blocks, render_content_blocks_with_options,
-    ContentRenderOptions, Session, SessionContentBlock, SessionMemory, SessionMemoryUpdate,
-    SessionMessage,
+    validate_tool_message_order, ContentRenderOptions, Session, SessionContentBlock,
+    SessionHistoryError, SessionMemory, SessionMemoryUpdate, SessionMessage,
 };
 pub use store::SessionStore;
 pub use types::{
