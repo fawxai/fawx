@@ -22,7 +22,7 @@ fn standard_uses_mutation_only_escalation_after_observation() {
     assert_eq!(engine.continuation_tool_scope_for_round(&state), None);
 
     engine.turn_execution_profile =
-        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime);
+        TurnExecutionProfile::DirectUtility(direct_current_time_profile());
     assert_eq!(engine.continuation_tool_scope_for_round(&state), None);
 
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
@@ -39,7 +39,7 @@ fn direct_inspection_completes_terminally() {
 
 #[test]
 fn direct_utility_completes_terminally() {
-    let profile = TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime);
+    let profile = TurnExecutionProfile::DirectUtility(direct_current_time_profile());
 
     assert!(profile.completes_terminally());
     assert!(!profile.allows_synthesis_fallback());
@@ -79,7 +79,7 @@ fn tightened_termination_config_values_match_expected() {
         0
     );
 
-    let direct_utility = TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+    let direct_utility = TurnExecutionProfile::DirectUtility(direct_current_time_profile())
         .tightened_termination_config(&base)
         .expect("direct utility tightens termination");
     assert!(direct_utility.nudge_after_tool_turns <= 1);

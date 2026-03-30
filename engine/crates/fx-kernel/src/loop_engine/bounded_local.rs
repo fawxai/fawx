@@ -19,7 +19,7 @@ use crate::signals::{LoopStep, SignalKind};
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) enum TurnExecutionProfile {
     #[default]
     Standard,
@@ -29,16 +29,16 @@ pub(super) enum TurnExecutionProfile {
 }
 
 impl TurnExecutionProfile {
-    pub(super) fn uses_standard_observation_controls(self) -> bool {
+    pub(super) fn uses_standard_observation_controls(&self) -> bool {
         matches!(self, Self::Standard)
     }
 
-    pub(super) fn completes_terminally(self) -> bool {
+    pub(super) fn completes_terminally(&self) -> bool {
         matches!(self, Self::DirectInspection(_) | Self::DirectUtility(_))
     }
 
     pub(super) fn tightened_termination_config(
-        self,
+        &self,
         base: &TerminationConfig,
     ) -> Option<TerminationConfig> {
         match self {
@@ -62,18 +62,18 @@ impl TurnExecutionProfile {
         }
     }
 
-    pub(super) fn allows_synthesis_fallback(self) -> bool {
+    pub(super) fn allows_synthesis_fallback(&self) -> bool {
         matches!(self, Self::DirectInspection(_))
     }
 
-    pub(super) fn direct_inspection_profile(self) -> Option<DirectInspectionProfile> {
+    pub(super) fn direct_inspection_profile(&self) -> Option<DirectInspectionProfile> {
         match self {
-            Self::DirectInspection(profile) => Some(profile),
+            Self::DirectInspection(profile) => Some(*profile),
             Self::Standard | Self::BoundedLocal | Self::DirectUtility(_) => None,
         }
     }
 
-    pub(super) fn owns_tool_surface(self) -> bool {
+    pub(super) fn owns_tool_surface(&self) -> bool {
         !matches!(self, Self::Standard)
     }
 }
@@ -116,33 +116,48 @@ pub(super) enum BoundedLocalTerminalReason {
 }
 
 impl LoopEngine {
-    pub(super) fn turn_execution_profile_tool_names(&self) -> Option<&'static [&'static str]> {
-        match self.turn_execution_profile {
-            TurnExecutionProfile::DirectInspection(profile) => {
-                Some(direct_inspection_tool_names(&profile))
-            }
+    pub(super) fn turn_execution_profile_tool_names(&self) -> Option<Vec<String>> {
+        match &self.turn_execution_profile {
+            TurnExecutionProfile::DirectInspection(profile) => Some(
+                direct_inspection_tool_names(profile)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
             TurnExecutionProfile::BoundedLocal => Some(match self.bounded_local_phase {
-                BoundedLocalPhase::Discovery => &["search_text", "read_file", "list_directory"],
-                BoundedLocalPhase::Mutation => &["write_file", "edit_file"],
-                BoundedLocalPhase::Recovery => &["read_file", "search_text"],
-                BoundedLocalPhase::Verification => &["run_command", "read_file"],
-                BoundedLocalPhase::Terminal => &[],
+                BoundedLocalPhase::Discovery => ["search_text", "read_file", "list_directory"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                BoundedLocalPhase::Mutation => ["write_file", "edit_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                BoundedLocalPhase::Recovery => ["read_file", "search_text"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                BoundedLocalPhase::Verification => ["run_command", "read_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                BoundedLocalPhase::Terminal => Vec::new(),
             }),
             TurnExecutionProfile::DirectUtility(profile) => {
-                Some(direct_utility_tool_names(&profile))
+                Some(direct_utility_tool_names(profile))
             }
             TurnExecutionProfile::Standard => None,
         }
     }
 
     pub(super) fn turn_execution_profile_block_reason(&self) -> Option<&'static str> {
-        match self.turn_execution_profile {
+        match &self.turn_execution_profile {
             TurnExecutionProfile::DirectInspection(profile) => {
-                Some(direct_inspection_block_reason(&profile))
+                Some(direct_inspection_block_reason(profile))
             }
             TurnExecutionProfile::BoundedLocal => Some(self.bounded_local_phase_block_reason()),
             TurnExecutionProfile::DirectUtility(profile) => {
-                Some(direct_utility_block_reason(&profile))
+                Some(direct_utility_block_reason(profile))
             }
             TurnExecutionProfile::Standard => None,
         }
@@ -155,7 +170,7 @@ impl LoopEngine {
         let Some(allowed) = self.turn_execution_profile_tool_names() else {
             return tools;
         };
-        let allowed: HashSet<&str> = allowed.iter().copied().collect();
+        let allowed: HashSet<&str> = allowed.iter().map(String::as_str).collect();
         tools
             .into_iter()
             .filter(|tool| allowed.contains(tool.name.as_str()))
@@ -164,13 +179,13 @@ impl LoopEngine {
 
     pub(super) fn effective_decompose_enabled(&self) -> bool {
         self.decompose_enabled
-            && matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
+            && matches!(&self.turn_execution_profile, TurnExecutionProfile::Standard)
     }
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
-        match self.turn_execution_profile {
+        match &self.turn_execution_profile {
             TurnExecutionProfile::DirectInspection(profile) => {
-                Some(direct_inspection_directive(&profile))
+                Some(direct_inspection_directive(profile))
             }
             TurnExecutionProfile::Standard => None,
             TurnExecutionProfile::BoundedLocal => {
@@ -190,9 +205,7 @@ impl LoopEngine {
                 };
                 Some(format!("{BOUNDED_LOCAL_TASK_DIRECTIVE}{phase_directive}"))
             }
-            TurnExecutionProfile::DirectUtility(profile) => {
-                Some(direct_utility_directive(&profile))
-            }
+            TurnExecutionProfile::DirectUtility(profile) => Some(direct_utility_directive(profile)),
         }
     }
 
@@ -218,7 +231,7 @@ impl LoopEngine {
         results: &[ToolResult],
     ) {
         if !matches!(
-            self.turn_execution_profile,
+            &self.turn_execution_profile,
             TurnExecutionProfile::BoundedLocal
         ) {
             return;

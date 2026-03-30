@@ -178,6 +178,13 @@ impl WasmSkill {
                 .any(|tool| tool.name == tool_name)
     }
 
+    fn manifest_tool(&self, tool_name: &str) -> Option<&SkillToolManifest> {
+        self.manifest
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+    }
+
     fn encode_runtime_input(&self, tool_name: &str, arguments: &str) -> Result<String, SkillError> {
         let value = serde_json::from_str::<serde_json::Value>(arguments)
             .map_err(|error| format!("invalid arguments JSON: {error}"))?;
@@ -186,17 +193,38 @@ impl WasmSkill {
             return Ok(extract_legacy_input(value));
         }
 
-        if tool_name == self.manifest.name {
-            return normalize_legacy_router_input(value);
+        if let Some(tool) = self.manifest_tool(tool_name) {
+            return self.encode_manifest_tool_input(tool, value);
         }
 
+        if tool_name == self.manifest.name {
+            return self.encode_manifest_alias_input(value);
+        }
+
+        Err(format!("unknown manifest tool: {tool_name}"))
+    }
+
+    fn encode_manifest_alias_input(&self, value: serde_json::Value) -> Result<String, SkillError> {
+        match self.manifest.tools.as_slice() {
+            [tool] => self.encode_manifest_tool_input(tool, value),
+            _ => normalize_legacy_router_input(value),
+        }
+    }
+
+    fn encode_manifest_tool_input(
+        &self,
+        tool: &SkillToolManifest,
+        value: serde_json::Value,
+    ) -> Result<String, SkillError> {
         let serde_json::Value::Object(mut object) = value else {
             return Err("tool arguments must be a JSON object".to_string());
         };
-        object.insert(
-            "tool".to_string(),
-            serde_json::Value::String(tool_name.to_string()),
-        );
+        if self.manifest.tools.len() > 1 {
+            object.insert(
+                "tool".to_string(),
+                serde_json::Value::String(tool.name.clone()),
+            );
+        }
         Ok(serde_json::Value::Object(object).to_string())
     }
 }
@@ -701,6 +729,83 @@ mod tests {
             .await;
         assert!(result.is_some());
         assert!(result.expect("known tool").is_ok());
+    }
+
+    #[test]
+    fn single_manifest_tool_keeps_structured_arguments_without_tool_wrapper() {
+        let mut manifest = test_manifest("calculator");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "calculate".to_string(),
+            description: "Calculate".to_string(),
+            direct_utility: false,
+            trigger_patterns: Vec::new(),
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "expression".to_string(),
+                kind: "string".to_string(),
+                description: "Expression".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let encoded = skill
+            .encode_runtime_input("calculate", r#"{"expression":"2 + 2"}"#)
+            .expect("encode");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("json"),
+            serde_json::json!({"expression":"2 + 2"})
+        );
+    }
+
+    #[test]
+    fn multi_tool_manifest_inserts_explicit_tool_name_for_runtime_routing() {
+        let mut manifest = test_manifest("canvas");
+        manifest.tools = vec![
+            fx_skills::manifest::SkillToolManifest {
+                name: "render_table".to_string(),
+                description: "Render table".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "headers".to_string(),
+                    kind: "string".to_string(),
+                    description: "Headers".to_string(),
+                    required: true,
+                }],
+            },
+            fx_skills::manifest::SkillToolManifest {
+                name: "render_chart".to_string(),
+                description: "Render chart".to_string(),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "data".to_string(),
+                    kind: "string".to_string(),
+                    description: "Data".to_string(),
+                    required: true,
+                }],
+            },
+        ];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let encoded = skill
+            .encode_runtime_input("render_table", r#"{"headers":"Name,Score"}"#)
+            .expect("encode");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("json"),
+            serde_json::json!({
+                "tool": "render_table",
+                "headers": "Name,Score"
+            })
+        );
     }
 
     #[test]

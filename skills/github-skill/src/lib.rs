@@ -99,6 +99,18 @@ struct HttpReq<'a> {
     body: &'a str,
 }
 
+fn parse_input(raw: &str) -> Result<Input, serde_json::Error> {
+    let mut value = serde_json::from_str::<serde_json::Value>(raw)?;
+    if let Some(object) = value.as_object_mut() {
+        if !object.contains_key("action") {
+            if let Some(tool) = object.remove("tool") {
+                object.insert("action".to_string(), tool);
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
 // ── Data Types ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -992,12 +1004,12 @@ pub extern "C" fn run() {
     let raw = get_input();
     if raw.is_empty() {
         set_output(
-            r#"{"error":"No input provided. Expected JSON with 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'."}"#,
+            r#"{"error":"No input provided. Expected JSON with 'action' or 'tool': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'."}"#,
         );
         return;
     }
 
-    let result = match serde_json::from_str::<Input>(&raw) {
+    let result = match parse_input(&raw) {
         Ok(Input::CreatePr(input)) => handle_create_pr(input),
         Ok(Input::CommentPr(input)) => handle_comment_pr(input),
         Ok(Input::ListPrs(input)) => handle_list_prs(input),
@@ -1007,7 +1019,7 @@ pub extern "C" fn run() {
         Err(e) => {
             log(4, &format!("Failed to parse input: {e}"));
             serialize_output(&serde_json::json!({
-                "error": format!("Invalid input: {e}. Expected 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'.")
+                "error": format!("Invalid input: {e}. Expected 'action' or 'tool': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'.")
             }))
         }
     };
@@ -1033,7 +1045,7 @@ mod tests {
             "head": "feat/thing",
             "base": "staging"
         }"#;
-        let input: Input = serde_json::from_str(json).unwrap();
+        let input = parse_input(json).unwrap();
         match input {
             Input::CreatePr(pr) => {
                 assert_eq!(pr.owner, "acme");
@@ -1059,7 +1071,7 @@ mod tests {
             "body": "Some description",
             "draft": true
         }"#;
-        let input: Input = serde_json::from_str(json).unwrap();
+        let input = parse_input(json).unwrap();
         match input {
             Input::CreatePr(pr) => {
                 assert_eq!(pr.body.as_deref(), Some("Some description"));
@@ -1079,7 +1091,7 @@ mod tests {
             "pr_number": 42,
             "body": "LGTM"
         }"#;
-        let input: Input = serde_json::from_str(json).unwrap();
+        let input = parse_input(json).unwrap();
         match input {
             Input::CommentPr(c) => {
                 assert_eq!(c.owner, "acme");
@@ -1093,28 +1105,48 @@ mod tests {
 
     #[test]
     fn parse_empty_input_fails() {
-        let result = serde_json::from_str::<Input>("");
+        let result = parse_input("");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_malformed_json_fails() {
-        let result = serde_json::from_str::<Input>("{not json}");
+        let result = parse_input("{not json}");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_missing_action_fails() {
         let json = r#"{"owner": "acme", "repo": "widgets"}"#;
-        let result = serde_json::from_str::<Input>(json);
+        let result = parse_input(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_unknown_action_fails() {
         let json = r#"{"action": "delete_repo", "owner": "acme"}"#;
-        let result = serde_json::from_str::<Input>(json);
+        let result = parse_input(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_tool_alias_maps_to_action_contract() {
+        let json = r#"{
+            "tool": "list_prs",
+            "owner": "acme",
+            "repo": "widgets",
+            "state": "open"
+        }"#;
+        let input = parse_input(json).unwrap();
+
+        match input {
+            Input::ListPrs(prs) => {
+                assert_eq!(prs.owner, "acme");
+                assert_eq!(prs.repo, "widgets");
+                assert_eq!(prs.state.as_deref(), Some("open"));
+            }
+            _ => panic!("expected ListPrs variant"),
+        }
     }
 
     // ── Base Branch Validation ──────────────────────────────────────────

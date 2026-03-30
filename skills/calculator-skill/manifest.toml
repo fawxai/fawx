@@ -5,3 +5,13 @@ author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = []
 entry_point = "run"
+
+[[tools]]
+name = "calculate"
+description = "Evaluate a mathematical expression"
+
+[[tools.parameters]]
+name = "expression"
+type = "string"
+description = "Mathematical expression to evaluate (for example, '2 + 3 * 4')"
+required = true

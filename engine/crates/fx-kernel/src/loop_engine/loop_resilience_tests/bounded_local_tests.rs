@@ -220,7 +220,7 @@ fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
 
     assert_eq!(
         detect_turn_execution_profile(message, &tools),
-        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+        TurnExecutionProfile::DirectUtility(direct_current_time_profile())
     );
 }
 
@@ -239,7 +239,7 @@ async fn perceive_preserves_direct_utility_precedence_over_direct_inspection() {
 
     assert_eq!(
         engine.turn_execution_profile,
-        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+        TurnExecutionProfile::DirectUtility(direct_current_time_profile())
     );
 }
 
@@ -349,7 +349,7 @@ fn bounded_local_phase_progress_tracks_phase_specific_status() {
         None,
         None,
         &StubToolExecutor,
-        TurnExecutionProfile::BoundedLocal,
+        &TurnExecutionProfile::BoundedLocal,
         BoundedLocalPhase::Mutation,
     );
     assert_eq!(kind, ProgressKind::Implementing);
@@ -363,7 +363,7 @@ fn bounded_local_phase_progress_tracks_recovery_status() {
         None,
         None,
         &StubToolExecutor,
-        TurnExecutionProfile::BoundedLocal,
+        &TurnExecutionProfile::BoundedLocal,
         BoundedLocalPhase::Recovery,
     );
     assert_eq!(kind, ProgressKind::Implementing);

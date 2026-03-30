@@ -5,3 +5,87 @@ author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = ["storage"]
 entry_point = "run"
+
+[[tools]]
+name = "render_table"
+description = "Render a markdown table from structured input"
+
+[[tools.parameters]]
+name = "headers"
+type = "string"
+description = "Comma-separated column headers"
+required = true
+
+[[tools.parameters]]
+name = "rows"
+type = "string"
+description = "JSON array of row arrays"
+required = true
+
+[[tools.parameters]]
+name = "title"
+type = "string"
+description = "Optional table title"
+required = false
+
+[[tools.parameters]]
+name = "alignment"
+type = "string"
+description = "Optional comma-separated alignment values: left, center, or right"
+required = false
+
+[[tools]]
+name = "render_chart"
+description = "Render a text chart from structured input"
+
+[[tools.parameters]]
+name = "chart_type"
+type = "string"
+description = "Chart type: bar, line, pie, or scatter"
+required = true
+
+[[tools.parameters]]
+name = "data"
+type = "string"
+description = "JSON object containing chart labels and values"
+required = true
+
+[[tools.parameters]]
+name = "title"
+type = "string"
+description = "Optional chart title"
+required = false
+
+[[tools.parameters]]
+name = "x_label"
+type = "string"
+description = "Optional x-axis label"
+required = false
+
+[[tools.parameters]]
+name = "y_label"
+type = "string"
+description = "Optional y-axis label"
+required = false
+
+[[tools]]
+name = "render_document"
+description = "Render a markdown or canvas document from structured sections"
+
+[[tools.parameters]]
+name = "sections"
+type = "string"
+description = "JSON array of document sections"
+required = true
+
+[[tools.parameters]]
+name = "title"
+type = "string"
+description = "Optional document title"
+required = false
+
+[[tools.parameters]]
+name = "format"
+type = "string"
+description = "Optional output format: canvas or markdown"
+required = false
