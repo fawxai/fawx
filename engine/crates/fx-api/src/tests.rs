@@ -1234,9 +1234,9 @@ mod routing_and_status {
         ProviderCapabilities, ProviderError as LlmError,
     };
     use fx_session::{
-        MessageRole as SessionMessageRole, SessionConfig, SessionContentBlock, SessionError,
-        SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
-        SessionStore,
+        MessageRole as SessionMessageRole, Session, SessionConfig, SessionContentBlock,
+        SessionError, SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry,
+        SessionStatus, SessionStore,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
@@ -2364,6 +2364,15 @@ mod routing_and_status {
         SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
     }
 
+    fn make_poisoned_session_registry(key: &str) -> SessionRegistry {
+        let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        store
+            .save(&poisoned_session(key))
+            .expect("save poisoned session");
+        SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+    }
+
     fn make_session_bus() -> (SessionBus, BusStore) {
         let store =
             BusStore::new(fx_storage::Storage::open_in_memory().expect("in-memory storage"));
@@ -2392,6 +2401,42 @@ mod routing_and_status {
             .set_status(&key, SessionStatus::Idle)
             .expect("set idle");
         key
+    }
+
+    fn poisoned_session(key: &str) -> Session {
+        Session {
+            key: SessionKey::new(key).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "mock-model".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            messages: vec![
+                SessionMessage::structured(
+                    SessionMessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    SessionMessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
+        }
     }
 
     #[test]
@@ -2759,6 +2804,64 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
         assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn context_endpoint_rejects_poisoned_stored_history_before_replay() {
+        let key = "sess-poisoned-context";
+        let registry = make_poisoned_session_registry(key);
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/context"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            format!(
+                "corrupted session '{key}': invalid tool history: tool result 'call_bad' at message 0 block 0 has no matching earlier tool_use"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_poisoned_stored_history_before_provider_execution() {
+        let key = SessionKey::new("sess-poisoned-send").expect("session key");
+        let registry = make_poisoned_session_registry(key.as_str());
+        let (app, app_state) =
+            session_memory_test_router(registry, SessionMemory::default(), Some(key.clone()));
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                r#"{"message":"continue"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            format!(
+                "corrupted session '{key}': invalid tool history: tool result 'call_bad' at message 0 block 0 has no matching earlier tool_use"
+            )
+        );
+        assert!(
+            app_state
+                .lock()
+                .expect("state lock")
+                .loaded_memories
+                .is_empty(),
+            "provider execution must not start for poisoned sessions"
+        );
     }
 
     #[tokio::test]

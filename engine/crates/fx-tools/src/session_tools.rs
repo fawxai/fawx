@@ -232,7 +232,10 @@ struct SessionSendArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_session::{SessionConfig, SessionStore};
+    use fx_session::{
+        MessageRole, Session, SessionConfig, SessionContentBlock, SessionMemory, SessionMessage,
+        SessionStatus, SessionStore,
+    };
     use fx_storage::Storage;
 
     fn test_skill() -> SessionToolsSkill {
@@ -267,6 +270,52 @@ mod tests {
             )
             .expect("create sub");
         SessionToolsSkill::new(registry)
+    }
+
+    fn skill_with_poisoned_session() -> SessionToolsSkill {
+        let storage = Storage::open_in_memory().expect("storage");
+        let store = SessionStore::new(storage.clone());
+        store
+            .save(&poisoned_session("poisoned"))
+            .expect("save poisoned session");
+        let registry = SessionRegistry::new(SessionStore::new(storage)).expect("registry");
+        SessionToolsSkill::new(registry)
+    }
+
+    fn poisoned_session(id: &str) -> Session {
+        Session {
+            key: SessionKey::new(id).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "gpt-4".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            messages: vec![
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
+        }
     }
 
     #[test]
@@ -326,6 +375,16 @@ mod tests {
         let skill = test_skill();
         let result = skill.execute_tool("session_history", r#"{"session_key": "missing"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn history_rejects_corrupted_session_history() {
+        let skill = skill_with_poisoned_session();
+        let result = skill.execute_tool("session_history", r#"{"session_key": "poisoned"}"#);
+
+        let error = result.expect_err("corrupted history should fail");
+        assert!(error.contains("corrupted session 'poisoned'"));
+        assert!(error.contains("call_bad"));
     }
 
     #[test]

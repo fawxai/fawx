@@ -23,8 +23,8 @@ use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
 use fx_llm::{trim_conversation_history, ContentBlock, Message};
 use fx_session::{
-    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMemory,
-    SessionMessage, SessionRegistry, SessionStatus,
+    validate_tool_message_order, SessionConfig, SessionError, SessionHistoryError, SessionInfo,
+    SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -166,7 +166,8 @@ pub async fn handle_get_context(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let context = session_messages_to_context(&history);
+    let context = session_messages_to_context(&history)
+        .map_err(|error| map_session_history_error(&id, error))?;
     let app = state.app.lock().await;
     Ok(Json(app.context_info_for_messages(&context)).into_response())
 }
@@ -299,7 +300,8 @@ pub(crate) async fn handle_send_message_for_session(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let mut context = session_messages_to_context(&history);
+    let mut context = session_messages_to_context(&history)
+        .map_err(|error| map_session_history_error(&id, error))?;
     let max_history = {
         let app = state.app.lock().await;
         app.max_history()
@@ -343,7 +345,7 @@ pub(crate) async fn handle_send_message_for_session(
     .await
     .map_err(internal_error)?;
     persist_session_turn(&registry, &key, session_messages, session_memory)
-        .map_err(|error| internal_error(anyhow::Error::new(error)))?;
+        .map_err(|error| map_session_error(&id, error))?;
 
     Ok(Json(MessageResponse {
         response,
@@ -354,12 +356,15 @@ pub(crate) async fn handle_send_message_for_session(
     .into_response())
 }
 
-pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
+pub(crate) fn session_messages_to_context(
+    messages: &[SessionMessage],
+) -> Result<Vec<Message>, SessionHistoryError> {
+    validate_tool_message_order(messages)?;
     let context = messages
         .iter()
         .map(SessionMessage::to_llm_message)
         .collect();
-    prune_unresolved_tool_context(context)
+    Ok(prune_unresolved_tool_context(context))
 }
 
 fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
@@ -678,8 +683,17 @@ fn session_key(id: &str) -> Result<SessionKey, (StatusCode, Json<ErrorBody>)> {
 fn map_session_error(id: &str, error: SessionError) -> (StatusCode, Json<ErrorBody>) {
     match error {
         SessionError::NotFound(_) => session_not_found(id),
+        SessionError::Corrupted { source, .. } => corrupted_session(id, &source),
+        SessionError::InvalidHistory(source) => corrupted_session(id, &source),
         other => internal_error(anyhow::Error::new(other)),
     }
+}
+
+fn map_session_history_error(
+    id: &str,
+    error: SessionHistoryError,
+) -> (StatusCode, Json<ErrorBody>) {
+    corrupted_session(id, &error)
 }
 
 fn session_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
@@ -687,6 +701,15 @@ fn session_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::NOT_FOUND,
         Json(ErrorBody {
             error: format!("session not found: {id}"),
+        }),
+    )
+}
+
+fn corrupted_session(id: &str, error: &SessionHistoryError) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody {
+            error: format!("corrupted session '{id}': {error}"),
         }),
     )
 }
@@ -752,7 +775,7 @@ mod tests {
             ),
         ];
 
-        let context = session_messages_to_context(&messages);
+        let context = session_messages_to_context(&messages).expect("valid context");
 
         assert_eq!(context.len(), 3);
         assert!(context
@@ -776,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_replay_validates_tool_ordering() {
+    fn session_messages_to_context_rejects_poisoned_tool_ordering() {
         let messages = vec![
             SessionMessage::text(SessionMessageRole::User, "first", 1),
             SessionMessage::structured(
@@ -823,92 +846,14 @@ mod tests {
             ),
         ];
 
-        let context = session_messages_to_context(&messages);
-
-        assert!(context
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| matches!(
-                block,
-                ContentBlock::ToolUse {
-                    id,
-                    provider_id,
-                    ..
-                } if id == "call_good" && provider_id.as_deref() == Some("fc_good")
-            )));
-        assert!(context
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| matches!(
-                block,
-                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_good"
-            )));
-        assert!(!context
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| matches!(
-                block,
-                ContentBlock::ToolUse { id, .. } if id == "call_bad"
-            )));
-        assert!(!context
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| matches!(
-                block,
-                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_bad"
-            )));
-    }
-
-    #[test]
-    fn prune_unresolved_tool_context_handles_ordering_violation() {
-        let pruned = prune_unresolved_tool_context(vec![
-            Message {
-                role: fx_llm::MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_bad".to_string(),
-                    content: serde_json::json!("bad"),
-                }],
-            },
-            Message {
-                role: fx_llm::MessageRole::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call_bad".to_string(),
-                    provider_id: Some("fc_bad".to_string()),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "bad.txt"}),
-                }],
-            },
-            Message {
-                role: fx_llm::MessageRole::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call_good".to_string(),
-                    provider_id: Some("fc_good".to_string()),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "good.txt"}),
-                }],
-            },
-            Message {
-                role: fx_llm::MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_good".to_string(),
-                    content: serde_json::json!("ok"),
-                }],
-            },
-        ]);
-
-        assert_eq!(pruned.len(), 2);
-        assert!(matches!(
-            pruned[0].content.as_slice(),
-            [ContentBlock::ToolUse {
-                id,
-                provider_id,
-                ..
-            }] if id == "call_good" && provider_id.as_deref() == Some("fc_good")
-        ));
-        assert!(matches!(
-            pruned[1].content.as_slice(),
-            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_good"
-        ));
+        assert_eq!(
+            session_messages_to_context(&messages),
+            Err(SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_bad".to_string(),
+                message_index: 1,
+                block_index: 0,
+            })
+        );
     }
 
     #[test]

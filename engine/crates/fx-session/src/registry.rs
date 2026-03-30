@@ -34,9 +34,49 @@ pub enum SessionError {
     #[error("invalid session history: {0}")]
     InvalidHistory(#[from] SessionHistoryError),
 
+    /// Persisted session history is corrupted and cannot be replayed safely.
+    #[error("corrupted session '{key}': {source}")]
+    Corrupted {
+        key: SessionKey,
+        #[source]
+        source: SessionHistoryError,
+    },
+
     /// Internal lock poisoning.
     #[error("internal error: lock poisoned")]
     LockPoisoned,
+}
+
+#[derive(Debug, Clone)]
+struct CorruptedSession {
+    info: SessionInfo,
+    source: SessionHistoryError,
+}
+
+impl CorruptedSession {
+    fn from_session(session: Session, source: SessionHistoryError) -> Self {
+        Self {
+            info: session.info(),
+            source,
+        }
+    }
+
+    fn matches_kind(&self, filter: Option<SessionKind>) -> bool {
+        filter.is_none_or(|kind| self.info.kind == kind)
+    }
+
+    fn to_error(&self, key: &SessionKey) -> SessionError {
+        SessionError::Corrupted {
+            key: key.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HydratedSessions {
+    healthy: HashMap<SessionKey, Session>,
+    corrupted: HashMap<SessionKey, CorruptedSession>,
 }
 
 /// Manages all active sessions, backed by persistent storage.
@@ -49,6 +89,7 @@ pub enum SessionError {
 #[derive(Clone)]
 pub struct SessionRegistry {
     sessions: Arc<RwLock<HashMap<SessionKey, Session>>>,
+    corrupted_sessions: Arc<RwLock<HashMap<SessionKey, CorruptedSession>>>,
     store: SessionStore,
 }
 
@@ -62,13 +103,10 @@ impl SessionRegistry {
     /// Create a registry backed by the given store, loading any
     /// previously persisted sessions.
     pub fn new(store: SessionStore) -> Result<Self> {
-        let persisted = store.load_all()?;
-        let mut sessions = HashMap::with_capacity(persisted.len());
-        for session in persisted {
-            sessions.insert(session.key.clone(), session);
-        }
+        let hydrated = hydrate_sessions(store.load_all()?);
         Ok(Self {
-            sessions: Arc::new(RwLock::new(sessions)),
+            sessions: Arc::new(RwLock::new(hydrated.healthy)),
+            corrupted_sessions: Arc::new(RwLock::new(hydrated.corrupted)),
             store,
         })
     }
@@ -95,12 +133,16 @@ impl SessionRegistry {
     /// List sessions, optionally filtered by kind.
     pub fn list(&self, filter: Option<SessionKind>) -> Result<Vec<SessionInfo>> {
         let map = self.read()?;
-        let infos = map
+        let corrupted = self.read_corrupted()?;
+        let healthy_infos = map
             .values()
             .filter(|s| filter.is_none_or(|k| s.kind == k))
-            .map(Session::info)
-            .collect();
-        Ok(infos)
+            .map(Session::info);
+        let corrupted_infos = corrupted
+            .values()
+            .filter(|session| session.matches_kind(filter))
+            .map(|session| session.info.clone());
+        Ok(healthy_infos.chain(corrupted_infos).collect())
     }
 
     /// Create a new session. Returns its key.
@@ -114,6 +156,9 @@ impl SessionRegistry {
         kind: SessionKind,
         config: SessionConfig,
     ) -> Result<SessionKey> {
+        if self.corrupted_entry(&key)?.is_some() {
+            return Err(SessionError::AlreadyExists(key.as_str().to_string()));
+        }
         let session = Session::new(key.clone(), kind, config);
         let mut map = self.write()?;
         if map.contains_key(&key) {
@@ -129,11 +174,15 @@ impl SessionRegistry {
 
     /// Destroy a session by key.
     pub fn destroy(&self, key: &SessionKey) -> Result<()> {
-        let removed = {
+        let removed_healthy = {
             let mut map = self.write()?;
             map.remove(key)
         };
-        if removed.is_none() {
+        let removed_corrupted = {
+            let mut map = self.write_corrupted()?;
+            map.remove(key)
+        };
+        if removed_healthy.is_none() && removed_corrupted.is_none() {
             return Err(SessionError::NotFound(key.as_str().to_string()));
         }
         self.store.delete(key)?;
@@ -170,6 +219,7 @@ impl SessionRegistry {
         content: Vec<SessionContentBlock>,
         token_count: Option<u32>,
     ) -> Result<()> {
+        self.fail_if_corrupted(key)?;
         let snapshot = {
             let mut map = self.write()?;
             let session = map
@@ -188,6 +238,7 @@ impl SessionRegistry {
             return Ok(());
         }
 
+        self.fail_if_corrupted(key)?;
         let snapshot = {
             let mut map = self.write()?;
             let session = map
@@ -202,6 +253,7 @@ impl SessionRegistry {
 
     /// Read the persistent memory for a session.
     pub fn memory(&self, key: &SessionKey) -> Result<SessionMemory> {
+        self.fail_if_corrupted(key)?;
         let map = self.read()?;
         let session = map
             .get(key)
@@ -216,6 +268,7 @@ impl SessionRegistry {
         messages: Vec<SessionMessage>,
         memory: SessionMemory,
     ) -> Result<()> {
+        self.fail_if_corrupted(key)?;
         let snapshot = {
             let mut map = self.write()?;
             let session = map
@@ -233,6 +286,7 @@ impl SessionRegistry {
 
     /// Retrieve conversation history for a session (most recent `limit`).
     pub fn history(&self, key: &SessionKey, limit: usize) -> Result<Vec<SessionMessage>> {
+        self.fail_if_corrupted(key)?;
         let map = self.read()?;
         let session = map
             .get(key)
@@ -242,6 +296,7 @@ impl SessionRegistry {
 
     /// Clear the recorded message history for a session.
     pub fn clear(&self, key: &SessionKey) -> Result<()> {
+        self.fail_if_corrupted(key)?;
         let snapshot = {
             let mut map = self.write()?;
             let session = map
@@ -256,6 +311,7 @@ impl SessionRegistry {
 
     /// Update the status of a session.
     pub fn set_status(&self, key: &SessionKey, status: SessionStatus) -> Result<()> {
+        self.fail_if_corrupted(key)?;
         let snapshot = {
             let mut map = self.write()?;
             let session = map
@@ -270,6 +326,7 @@ impl SessionRegistry {
 
     /// Get a snapshot of a single session's info.
     pub fn get_info(&self, key: &SessionKey) -> Result<SessionInfo> {
+        self.fail_if_corrupted(key)?;
         let map = self.read()?;
         let session = map
             .get(key)
@@ -286,6 +343,63 @@ impl SessionRegistry {
             .write()
             .map_err(|_| SessionError::LockPoisoned)
     }
+
+    fn read_corrupted(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, HashMap<SessionKey, CorruptedSession>>> {
+        self.corrupted_sessions
+            .read()
+            .map_err(|_| SessionError::LockPoisoned)
+    }
+
+    fn write_corrupted(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<SessionKey, CorruptedSession>>> {
+        self.corrupted_sessions
+            .write()
+            .map_err(|_| SessionError::LockPoisoned)
+    }
+
+    fn corrupted_entry(&self, key: &SessionKey) -> Result<Option<CorruptedSession>> {
+        Ok(self.read_corrupted()?.get(key).cloned())
+    }
+
+    fn fail_if_corrupted(&self, key: &SessionKey) -> Result<()> {
+        if let Some(session) = self.corrupted_entry(key)? {
+            return Err(session.to_error(key));
+        }
+        Ok(())
+    }
+}
+
+fn hydrate_sessions(persisted: Vec<Session>) -> HydratedSessions {
+    let mut hydrated = HydratedSessions {
+        healthy: HashMap::with_capacity(persisted.len()),
+        corrupted: HashMap::new(),
+    };
+
+    for session in persisted {
+        match session.validate_history() {
+            Ok(()) => {
+                hydrated.healthy.insert(session.key.clone(), session);
+            }
+            Err(source) => record_corrupted_session(&mut hydrated, session, source),
+        }
+    }
+
+    hydrated
+}
+
+fn record_corrupted_session(
+    hydrated: &mut HydratedSessions,
+    session: Session,
+    source: SessionHistoryError,
+) {
+    let key = session.key.clone();
+    tracing::error!(session_key = %key, error = %source, "corrupted session history loaded from storage");
+    hydrated
+        .corrupted
+        .insert(key, CorruptedSession::from_session(session, source));
 }
 
 #[cfg(test)]
@@ -304,6 +418,42 @@ mod tests {
         SessionConfig {
             label: Some("test".to_string()),
             model: "gpt-4".to_string(),
+        }
+    }
+
+    fn poisoned_session(id: &str) -> Session {
+        Session {
+            key: SessionKey::new(id).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "gpt-4".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            messages: vec![
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
         }
     }
 
@@ -589,6 +739,47 @@ mod tests {
             reg.history(&key, 10).expect("history").is_empty(),
             "rejected writes must not poison stored history"
         );
+    }
+
+    #[test]
+    fn poisoned_loaded_history_is_rejected_before_replay() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let key = SessionKey::new("poisoned-history").expect("session key");
+        SessionStore::new(storage.clone())
+            .save(&poisoned_session(key.as_str()))
+            .expect("save poisoned session");
+
+        let reg = SessionRegistry::new(SessionStore::new(storage)).expect("registry");
+
+        assert!(matches!(
+            reg.history(&key, 10),
+            Err(SessionError::Corrupted {
+                key: corrupted_key,
+                source: SessionHistoryError::ToolResultBeforeToolUse { tool_use_id, .. },
+            }) if corrupted_key == key && tool_use_id == "call_bad"
+        ));
+    }
+
+    #[test]
+    fn poisoned_loaded_history_rejects_follow_up_writes() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let key = SessionKey::new("poisoned-follow-up").expect("session key");
+        SessionStore::new(storage.clone())
+            .save(&poisoned_session(key.as_str()))
+            .expect("save poisoned session");
+
+        let reg = SessionRegistry::new(SessionStore::new(storage)).expect("registry");
+        let error = reg
+            .send(&key, "hello again")
+            .expect_err("poisoned session should reject follow-up writes");
+
+        assert!(matches!(
+            error,
+            SessionError::Corrupted {
+                key: corrupted_key,
+                source: SessionHistoryError::ToolResultBeforeToolUse { tool_use_id, .. },
+            } if corrupted_key == key && tool_use_id == "call_bad"
+        ));
     }
 
     #[test]

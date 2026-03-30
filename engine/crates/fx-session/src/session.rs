@@ -603,6 +603,10 @@ impl Session {
             .last()
             .map(|message| truncate_text(&message.render_text(), 120))
     }
+
+    pub fn validate_history(&self) -> Result<(), SessionHistoryError> {
+        validate_tool_message_order(&self.messages)
+    }
 }
 
 /// Validate that each stored `ToolResult` references a matching earlier `ToolUse`.
