@@ -547,20 +547,20 @@ fn validate_signature_policy(
     }
 }
 
-/// Load all installed WASM skills from `~/.fawx/skills/` and return
-/// them as [`Arc<dyn Skill>`] trait objects ready for registry insertion.
+/// Load all installed WASM skills from `skills_dir` and return them as
+/// [`Arc<dyn Skill>`] trait objects ready for registry insertion.
 ///
 /// The optional `credential_provider` bridges the encrypted credential
 /// store so skills can retrieve secrets (e.g., GitHub PAT) via `kv_get`.
 ///
 /// Errors from individual skills are logged and skipped; only a
 /// directory-level failure propagates as an error.
-pub fn load_wasm_skills(
+pub fn load_wasm_skills_from(
+    skills_dir: &Path,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     policy: &SignaturePolicy,
 ) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
-    let skills_dir = skills_directory()?;
-    let entries = read_skill_directories(&skills_dir)?;
+    let entries = read_skill_directories(skills_dir)?;
 
     let mut skills: Vec<Arc<dyn Skill>> = Vec::new();
 
@@ -578,6 +578,16 @@ pub fn load_wasm_skills(
     }
 
     Ok(skills)
+}
+
+/// Load all installed WASM skills from `~/.fawx/skills/` and return
+/// them as [`Arc<dyn Skill>`] trait objects ready for registry insertion.
+pub fn load_wasm_skills(
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
+) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
+    let skills_dir = skills_directory()?;
+    load_wasm_skills_from(&skills_dir, credential_provider, policy)
 }
 
 /// Resolve the `~/.fawx/skills/` directory path.
@@ -899,9 +909,21 @@ mod tests {
 
     #[test]
     fn load_wasm_skills_empty_dir() {
-        // Default ~/.fawx/skills/ may be empty or have skills — just verify no panic
-        let result = load_wasm_skills(None, &SignaturePolicy::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = load_wasm_skills_from(tmp.path(), None, &SignaturePolicy::default());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_wasm_skills_from_reads_requested_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "dirskill");
+
+        let skills = load_wasm_skills_from(tmp.path(), None, &SignaturePolicy::default())
+            .expect("skills should load");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name(), "dirskill");
     }
 
     fn setup_skill_dir(dir: &std::path::Path, name: &str) {

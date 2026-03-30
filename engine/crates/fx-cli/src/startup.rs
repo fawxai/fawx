@@ -1085,17 +1085,22 @@ fn build_skill_registry(
         .with_protected_branches(config.git.protected_branches.clone());
     registry.register(Arc::new(git_skill));
 
-    // Load WASM skills from ~/.fawx/skills/
-    let trusted_keys = fx_loadable::wasm_skill::load_trusted_keys().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to load trusted keys");
-        vec![]
-    });
+    let skills_dir = data_dir.join("skills");
+    let trusted_keys =
+        fx_loadable::wasm_skill::load_trusted_keys_from(&data_dir.join("trusted_keys"))
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load trusted keys");
+                vec![]
+            });
     let signature_policy = SignaturePolicy {
         trusted_keys,
         require_signatures: config.security.require_signatures,
     };
-    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone(), &signature_policy)
-    {
+    match fx_loadable::wasm_skill::load_wasm_skills_from(
+        &skills_dir,
+        credential_provider.clone(),
+        &signature_policy,
+    ) {
         Ok(wasm_skills) => {
             for skill in wasm_skills {
                 registry.register(skill);
@@ -1131,7 +1136,6 @@ fn build_skill_registry(
     };
 
     apply_skill_summaries(&runtime_info, registry.as_ref());
-    let skills_dir = data_dir.join("skills");
     start_skill_watcher(
         skills_dir,
         Arc::clone(&registry),
@@ -2722,6 +2726,25 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_loads_wasm_skills_from_configured_data_dir() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let skills_dir = config
+            .general
+            .data_dir
+            .clone()
+            .expect("data dir")
+            .join("skills");
+        write_test_skill(&skills_dir, "configuredskill").expect("write test skill");
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        assert!(names.contains(&"configuredskill".to_string()));
     }
 
     #[tokio::test]
