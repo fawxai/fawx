@@ -8,7 +8,6 @@ use fx_config::manager::ConfigManager;
 use fx_consensus::ProgressCallback;
 use fx_core::kernel_manifest::BudgetSummary;
 use fx_core::memory::MemoryStore;
-use fx_core::path::expand_tilde;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
@@ -1660,6 +1659,30 @@ three
         let executor = test_executor(temp.path());
         let output = executor.handle_list_directory(&serde_json::json!({"path": "../"}));
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn list_directory_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_dir = outside.path().join("secret-dir");
+        fs::create_dir_all(&outside_dir).expect("mkdir");
+        fs::write(outside_dir.join("secret.txt"), "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_list_directory(&serde_json::json!({
+                "path": outside_dir.to_string_lossy()
+            }))
+            .expect("list");
+
+        assert!(output.contains("[file] secret.txt"));
     }
 
     #[test]
@@ -3713,38 +3736,6 @@ three
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert!(results[0].output.contains("timed out"));
-    }
-
-    #[test]
-    fn expand_tilde_with_home() {
-        let result = expand_tilde("~/foo");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home.join("foo"));
-    }
-
-    #[test]
-    fn expand_tilde_bare() {
-        let result = expand_tilde("~");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home);
-    }
-
-    #[test]
-    fn expand_tilde_no_tilde() {
-        let result = expand_tilde("/absolute/path");
-        assert_eq!(result, PathBuf::from("/absolute/path"));
-    }
-
-    #[test]
-    fn expand_tilde_relative() {
-        let result = expand_tilde("relative/path");
-        assert_eq!(result, PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn expand_tilde_other_user_not_expanded() {
-        let result = expand_tilde("~otheruser/foo");
-        assert_eq!(result, PathBuf::from("~otheruser/foo"));
     }
 
     #[test]

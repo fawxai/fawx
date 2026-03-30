@@ -215,10 +215,10 @@ SESSION_JSON=$(
     -H "Authorization: Bearer $DEVICE_TOKEN" \
     -H 'Content-Type: application/json' \
     -d '{"message": "Read ~/.zshrc and tell me exactly what it says."}' \
-    "http://127.0.0.1:$PORT/v1/chat"
+    "http://127.0.0.1:$PORT/message"
 )
 
-echo "$SESSION_JSON" | python -m json.tool
+echo "$SESSION_JSON" | python3 -m json.tool
 ```
 
 ### Check headless signals
@@ -226,7 +226,7 @@ echo "$SESSION_JSON" | python -m json.tool
 The server writes structured signals to the data dir. After a test message:
 
 ```bash
-cat "$DATA_DIR"/sessions/*/headless.jsonl | tail -20
+cat "$DATA_DIR"/signals/headless.jsonl | tail -20
 ```
 
 ### Example: Direct inspection regression test battery
@@ -239,8 +239,8 @@ run_test() {
     -H "Authorization: Bearer $DEVICE_TOKEN" \
     -H 'Content-Type: application/json' \
     -d "{\"message\": \"$prompt\"}" \
-    "http://127.0.0.1:$PORT/v1/chat")
-  echo "$RESULT" | python -c "
+    "http://127.0.0.1:$PORT/message")
+  echo "$RESULT" | python3 -c "
 import json, sys
 r = json.load(sys.stdin)
 print(f\"iterations: {r.get('iterations', '?')}\")
@@ -252,9 +252,11 @@ print()
 
 run_test "T1: inspect local file" "Read ~/.zshrc and tell me exactly what it says."
 run_test "T2: nonexistent file" "Read ~/.nonexistent_file_abc123 and show me the contents."
-run_test "T3: standard continuation" "Read the README then make a small improvement to it."
 run_test "T4: absolute path" "Read /etc/hosts and tell me what's in it."
+run_test "T3: standard continuation" "Read the README then make a small improvement to it."
 ```
+
+Keep `T3` last. It is the only multi-iteration standard-path turn in this battery, and it can leave provider tool state behind on some commits. If any test fails after a multi-iteration predecessor, rerun that test on a fresh port and data dir before classifying it as a code regression.
 
 ### Pass criteria
 

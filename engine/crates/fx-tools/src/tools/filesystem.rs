@@ -1,9 +1,9 @@
 use super::{
-    canonicalize_existing_or_parent, expand_tilde, parse_args, to_tool_result, validate_path,
-    ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, to_tool_result, validate_path, ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
+use fx_core::path::expand_tilde;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
@@ -405,11 +405,7 @@ impl ToolContext {
 
     pub(crate) fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ListDirectoryArgs = parse_args(args)?;
-        let expanded = expand_tilde(&parsed.path);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        let path = self.jailed_path(expanded_str)?;
+        let path = self.resolve_read_path(&parsed.path)?;
         if parsed.recursive.unwrap_or(false) {
             return self.list_recursive(&path, 0);
         }
