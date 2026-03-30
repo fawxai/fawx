@@ -31,6 +31,35 @@ async fn perceive_routes_explicit_local_path_reads_to_direct_inspection() {
     );
 }
 
+#[tokio::test]
+async fn direct_inspection_turns_disable_effective_decompose() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    assert!(!engine.effective_decompose_enabled());
+
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|tool| tool.name != DECOMPOSE_TOOL_NAME),
+        "direct inspection turns should not advertise decompose"
+    );
+}
+
 #[test]
 fn detect_turn_execution_profile_supports_quoted_explicit_local_paths() {
     let message = "Inspect \"~/.zshrc\" and summarize it.";
@@ -128,6 +157,16 @@ fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
     assert_eq!(
         detect_turn_execution_profile(message, &tools),
         TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+    );
+}
+
+#[test]
+fn detect_turn_execution_profile_preserves_bounded_local_precedence() {
+    let message = "Work only inside ~/fawx.\nDo not use web research.\n1. Inspect ~/fawx/engine/crates/fx-kernel/src/loop_engine.rs to find the issue.\n2. Make one concrete code change.\n3. Run one focused test.\n4. End with a concise summary.";
+
+    assert_eq!(
+        detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::BoundedLocal
     );
 }
 

@@ -89,7 +89,8 @@ impl LoopEngine {
     }
 
     pub(super) fn effective_decompose_enabled(&self) -> bool {
-        self.decompose_enabled && self.turn_execution_profile.borrows_standard_turn_contract()
+        self.decompose_enabled
+            && matches!(self.turn_execution_profile, TurnExecutionProfile::Standard)
     }
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
