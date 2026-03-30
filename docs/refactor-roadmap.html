@@ -254,8 +254,12 @@
         <div class="issue-body">Post-turn identity and ordering corruption. Traced in <code>docs/fix/1656-unknown-tool-post-turn-trace.md</code>. Fixed on dev in PR <code>#1664</code>.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">now</span></div>
-        <div class="issue-body">Now unblocked after <code>#1656</code>. Grouping only makes sense once ordering and tool identity are stable.</div>
+        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Turn-scoped transcript contract cleanup after ordering was fixed. Landed on dev in PR <code>#1665</code>.</div>
+      </div>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing and visible tool contracts</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Manifest-driven direct utility routing, visible structured tool contracts, and startup/data-dir contract alignment. Landed on dev in PR <code>#1666</code>.</div>
       </div>
     </div>
   </div>
@@ -275,17 +279,17 @@
     <strong>✅ Step 6. #1656: enforce tool ordering and reject poisoned history (COMPLETE)</strong>
     <div class="step-meta">Fixed in PR <code>#1664</code>. Session write ordering is enforced, poisoned stored history is rejected before replay, and provider/tool identity is preserved across persistence.</div>
   </div>
-  <div class="sequence-step">
-    <strong>Step 7. #1655: persist one grouped tool-history record per turn</strong>
-    <div class="step-meta">Turn-scoped transcript contract. This is now the active next step after <code>#1656</code>.</div>
+  <div class="sequence-step" style="border-left: 3px solid var(--green);">
+    <strong>✅ Step 7. #1655: persist one grouped tool-history record per turn (COMPLETE)</strong>
+    <div class="step-meta">Fixed in PR <code>#1665</code>. Multi-round turns now persist as one historical assistant tool-use aggregate, one tool-result aggregate, and one terminal assistant message.</div>
   </div>
-  <div class="sequence-step">
-    <strong>Step 8. #1646: direct utility routing and visible tool contracts</strong>
-    <div class="step-meta">Resume substrate work once the runtime can finish and persist deterministic turns cleanly.</div>
+  <div class="sequence-step" style="border-left: 3px solid var(--green);">
+    <strong>✅ Step 8. #1646: direct utility routing and visible tool contracts (COMPLETE)</strong>
+    <div class="step-meta">Fixed in PR <code>#1666</code>. Direct utility routing is manifest-driven, legacy wrapper contracts are excluded, and structured tool contracts are visible to the kernel.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 9. #1647: revisioned skill activation lifecycle</strong>
-    <div class="step-meta">Build on <code>#1646</code> and the landed tool registry.</div>
+    <div class="step-meta">This is now the active next step. Build on <code>#1646</code> and the landed tool registry.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 10. Unified authority model implementation</strong>
@@ -300,7 +304,7 @@
     <li><strong>Gate B:</strong> <span style="color: var(--green)">✅ CLEAR</span> that prompt must terminate without runaway continuation on the current direct-inspection path. <em>Fixed by #1641 Phases 1-4 (profile-owned terminal completion, tightened termination config).</em></li>
     <li><strong>Gate C:</strong> <span style="color: var(--green)">✅ CLEAR</span> no post-turn <code>Unknown tool call</code> row for the traced prompt after completion. <em>Cleared by #1656 (PR #1664).</em></li>
     <li><strong>Gate D:</strong> <span style="color: var(--green)">✅ CLEAR</span> persisted history must never store <code>tool_result</code> before matching <code>tool_use</code>. <em>Cleared by #1656 (PR #1664).</em></li>
-    <li><strong>Gate E:</strong> one completed turn must replay as one grouped historical tool-activity unit. <em>Targeted by #1655.</em></li>
+    <li><strong>Gate E:</strong> <span style="color: var(--green)">✅ CLEAR</span> one completed turn must replay as one grouped historical tool-activity unit. <em>Cleared by #1655 (PR #1665).</em></li>
   </ul>
 </div>
 
@@ -341,16 +345,16 @@
       <div class="issue-body">Fixed on dev in PR <code>#1664</code>. Session write boundary and replay correctness are now locked in.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Backend transcript contract cleanup after ordering is fixed. Current active step.</div>
+      <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1665</code>. Historical tool activity is now persisted per completed turn, not per round.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing</span><span class="tag tag-next">after stabilization</span></div>
-      <div class="issue-body">Kernel contract visibility for deterministic utility tools.</div>
+      <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1666</code>. Kernel contract visibility for deterministic utility tools is now manifest-driven.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-next">after #1646</span></div>
-      <div class="issue-body">Revisioned activation model for published and local skills.</div>
+      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">Revisioned activation model for published and local skills. Current active step.</div>
     </div>
   </div>
 </div>
@@ -402,7 +406,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-30 20:12 UTC (v4.5) · #1658 + #1656 landed on dev · Next: #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-30 22:47 UTC (v4.6) · #1655 + #1646 landed on dev · Next: #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
