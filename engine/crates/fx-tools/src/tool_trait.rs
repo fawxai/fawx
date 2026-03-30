@@ -32,6 +32,7 @@ pub struct ToolConfig {
     pub search_exclude: Vec<String>,
     pub command_timeout: Duration,
     pub jail_to_working_dir: bool,
+    pub allow_outside_workspace_reads: bool,
 }
 
 impl Default for ToolConfig {
@@ -42,6 +43,7 @@ impl Default for ToolConfig {
             search_exclude: Vec::new(),
             command_timeout: Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
             jail_to_working_dir: true,
+            allow_outside_workspace_reads: false,
         }
     }
 }

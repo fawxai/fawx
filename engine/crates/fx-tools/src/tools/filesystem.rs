@@ -428,12 +428,18 @@ impl ToolContext {
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(requested));
         }
+        if self.config.allow_outside_workspace_reads {
+            return self.resolve_observation_path(requested);
+        }
         validate_path(&self.working_dir, requested)
     }
 
     fn validated_existing_entry(&self, path: &Path) -> Result<Option<PathBuf>, String> {
         if !self.config.jail_to_working_dir {
             return Ok(Some(path.to_path_buf()));
+        }
+        if self.config.allow_outside_workspace_reads {
+            return canonicalize_existing_or_parent(path).map(Some);
         }
         let requested = path.to_string_lossy().to_string();
         match validate_path(&self.working_dir, &requested) {
@@ -448,6 +454,16 @@ impl ToolContext {
             .to_str()
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         self.jailed_path(expanded_str)
+    }
+
+    fn resolve_observation_path(&self, requested: &str) -> Result<PathBuf, String> {
+        let requested_path = Path::new(requested);
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.working_dir.join(requested_path)
+        };
+        canonicalize_existing_or_parent(&candidate)
     }
 
     fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, String> {
@@ -568,6 +584,9 @@ impl ToolContext {
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(expanded_str));
+        }
+        if self.config.allow_outside_workspace_reads {
+            return self.resolve_observation_path(expanded_str);
         }
         validate_path(&self.working_dir, expanded_str)
     }

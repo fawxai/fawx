@@ -1042,6 +1042,27 @@ mod tests {
         assert!(output.is_err());
     }
 
+    #[test]
+    fn read_file_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor.handle_read_file(&serde_json::json!({
+            "path": outside_file.to_string_lossy()
+        }));
+
+        assert_eq!(output.expect("read"), "secret");
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_file_rejects_symlink_pointing_outside_jail() {
