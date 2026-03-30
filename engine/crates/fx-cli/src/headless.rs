@@ -521,7 +521,7 @@ impl SessionTurnCollector {
             documents,
             user_timestamp,
         )];
-        let mut assistant_messages = build_assistant_turn_messages(
+        let mut assistant_messages = build_turn_tool_history_messages(
             SessionTurnSnapshot {
                 responses: snapshot.responses.clone(),
                 tool_result_rounds: snapshot.tool_result_rounds,
@@ -694,35 +694,103 @@ fn normalize_session_message_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn build_assistant_turn_messages(
+fn build_turn_tool_history_messages(
     snapshot: SessionTurnSnapshot,
     timestamp: u64,
 ) -> Vec<SessionMessage> {
-    let tool_turns = snapshot
-        .responses
+    let tool_turns = tool_turn_messages(snapshot.responses, timestamp);
+    let Some(tool_use_message) = aggregate_tool_use_message(&tool_turns, timestamp) else {
+        return Vec::new();
+    };
+    let tool_results = aggregate_tool_result_blocks(&tool_turns, snapshot.tool_result_rounds);
+    let mut messages = vec![tool_use_message];
+    if !tool_results.is_empty() {
+        messages.push(tool_result_message(tool_results, timestamp));
+    }
+    messages
+}
+
+fn tool_turn_messages(responses: Vec<CompletionResponse>, timestamp: u64) -> Vec<SessionMessage> {
+    responses
         .into_iter()
         .filter_map(|response| assistant_turn_from_response(response, timestamp))
         .filter(|turn| turn.has_tool_use)
         .map(|turn| turn.message)
-        .collect::<Vec<_>>();
-    let tool_results_by_turn =
-        assign_tool_results_to_turns(&tool_turns, snapshot.tool_result_rounds);
-    let mut messages = Vec::new();
+        .collect()
+}
 
-    for (message, tool_results) in tool_turns.into_iter().zip(tool_results_by_turn) {
-        messages.push(message);
-        if tool_results.is_empty() {
-            continue;
-        }
-        messages.push(SessionMessage::structured(
-            SessionRecordRole::Tool,
-            tool_results,
-            timestamp,
-            None,
-        ));
+fn aggregate_tool_use_message(
+    tool_turns: &[SessionMessage],
+    timestamp: u64,
+) -> Option<SessionMessage> {
+    let content = tool_turns
+        .iter()
+        .flat_map(|message| message.content.iter().cloned())
+        .collect::<Vec<_>>();
+    if content.is_empty() {
+        return None;
     }
 
-    messages
+    let mut message = SessionMessage::structured_with_usage(
+        SessionRecordRole::Assistant,
+        content,
+        timestamp,
+        aggregate_message_usage(tool_turns),
+    );
+    if message.token_count.is_none() {
+        message.token_count = aggregate_total_token_count(tool_turns);
+    }
+    Some(message)
+}
+
+fn aggregate_tool_result_blocks(
+    tool_turns: &[SessionMessage],
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+) -> Vec<SessionContentBlock> {
+    assign_tool_results_to_turns(tool_turns, tool_result_rounds)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn tool_result_message(content: Vec<SessionContentBlock>, timestamp: u64) -> SessionMessage {
+    SessionMessage::structured(SessionRecordRole::Tool, content, timestamp, None)
+}
+
+fn aggregate_message_usage(messages: &[SessionMessage]) -> Option<Usage> {
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
+    let mut saw_usage = false;
+
+    for message in messages {
+        let (Some(input), Some(output)) = (message.input_token_count, message.output_token_count)
+        else {
+            continue;
+        };
+        input_tokens = input_tokens.saturating_add(input);
+        output_tokens = output_tokens.saturating_add(output);
+        saw_usage = true;
+    }
+
+    saw_usage.then_some(Usage {
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn aggregate_total_token_count(messages: &[SessionMessage]) -> Option<u32> {
+    let mut total: u32 = 0;
+    let mut saw_tokens = false;
+
+    for message in messages {
+        let Some(message_total) = message.total_token_count() else {
+            continue;
+        };
+        total = total.saturating_add(message_total);
+        saw_tokens = true;
+    }
+
+    saw_tokens.then_some(total)
 }
 
 fn terminal_assistant_message(
@@ -4106,6 +4174,92 @@ mod tests {
     }
 
     #[test]
+    fn session_turn_collector_aggregates_multi_round_tool_history_into_single_group() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_a".to_string(),
+                provider_id: Some("fc_a".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 4,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_a".to_string(),
+            tool_name: "read_file".to_string(),
+            output: "first result".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_b".to_string(),
+                provider_id: Some("fc_b".to_string()),
+                name: "list_dir".to_string(),
+                input: serde_json::json!({"path": "."}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 5,
+                output_tokens: 3,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_b".to_string(),
+            tool_name: "list_dir".to_string(),
+            output: "second result".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 6,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages =
+            collector.session_messages_for_turn("inspect repo", &[], &[], "Done.", 10, 20);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(14));
+        assert_eq!(messages[1].input_token_count, Some(9));
+        assert_eq!(messages[1].output_token_count, Some(5));
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [
+                SessionContentBlock::ToolUse { id: first_id, provider_id: first_provider, .. },
+                SessionContentBlock::ToolUse { id: second_id, provider_id: second_provider, .. },
+            ] if first_id == "call_a"
+                && first_provider.as_deref() == Some("fc_a")
+                && second_id == "call_b"
+                && second_provider.as_deref() == Some("fc_b")
+        ));
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [
+                SessionContentBlock::ToolResult { tool_use_id: first_id, .. },
+                SessionContentBlock::ToolResult { tool_use_id: second_id, .. },
+            ] if first_id == "call_a" && second_id == "call_b"
+        ));
+        assert_eq!(messages[3].render_text(), "Done.");
+    }
+
+    #[test]
     fn session_turn_collector_omits_intermediate_text_only_synthesis_between_tool_rounds() {
         let collector = SessionTurnCollector::default();
         collector.record_response(&fx_llm::CompletionResponse {
@@ -4164,14 +4318,14 @@ mod tests {
             20,
         );
 
-        assert_eq!(messages.len(), 6);
+        assert_eq!(messages.len(), 4);
         assert_eq!(
             messages
                 .iter()
                 .filter(|message| message.role == SessionRecordRole::Assistant)
                 .count(),
-            3,
-            "only tool-use assistant messages plus one terminal assistant message should persist",
+            2,
+            "one aggregated tool-use assistant message plus one terminal assistant message should persist",
         );
         assert!(
             !messages.iter().any(|message| {
@@ -4188,7 +4342,7 @@ mod tests {
     }
 
     #[test]
-    fn build_assistant_turn_messages_reassigns_tool_results_by_tool_use_id() {
+    fn build_turn_tool_history_messages_reassigns_tool_results_by_tool_use_id() {
         let snapshot = SessionTurnSnapshot {
             responses: vec![
                 fx_llm::CompletionResponse {
@@ -4228,32 +4382,31 @@ mod tests {
             ],
         };
 
-        let messages = build_assistant_turn_messages(snapshot, 20);
+        let messages = build_turn_tool_history_messages(snapshot, 20);
 
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 2);
         assert!(matches!(
             messages[0].content.as_slice(),
-            [SessionContentBlock::ToolUse { id, provider_id, .. }]
-                if id == "call_a" && provider_id.as_deref() == Some("fc_a")
+            [
+                SessionContentBlock::ToolUse { id: first_id, provider_id: first_provider, .. },
+                SessionContentBlock::ToolUse { id: second_id, provider_id: second_provider, .. },
+            ] if first_id == "call_a"
+                && first_provider.as_deref() == Some("fc_a")
+                && second_id == "call_b"
+                && second_provider.as_deref() == Some("fc_b")
         ));
         assert!(matches!(
             messages[1].content.as_slice(),
-            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_a"
-        ));
-        assert!(matches!(
-            messages[2].content.as_slice(),
-            [SessionContentBlock::ToolUse { id, provider_id, .. }]
-                if id == "call_b" && provider_id.as_deref() == Some("fc_b")
-        ));
-        assert!(matches!(
-            messages[3].content.as_slice(),
-            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_b"
+            [
+                SessionContentBlock::ToolResult { tool_use_id: first_id, .. },
+                SessionContentBlock::ToolResult { tool_use_id: second_id, .. },
+            ] if first_id == "call_a" && second_id == "call_b"
         ));
         assert!(fx_session::validate_tool_message_order(&messages).is_ok());
     }
 
     #[test]
-    fn build_assistant_turn_messages_drops_orphaned_tool_results() {
+    fn build_turn_tool_history_messages_drops_orphaned_tool_results() {
         let snapshot = SessionTurnSnapshot {
             responses: vec![fx_llm::CompletionResponse {
                 content: vec![fx_llm::ContentBlock::ToolUse {
@@ -4280,9 +4433,13 @@ mod tests {
             ],
         };
 
-        let messages = build_assistant_turn_messages(snapshot, 20);
+        let messages = build_turn_tool_history_messages(snapshot, 20);
 
         assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, .. }] if id == "call_real"
+        ));
         assert!(matches!(
             messages[1].content.as_slice(),
             [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_real"

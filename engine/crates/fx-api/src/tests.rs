@@ -3009,6 +3009,93 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn get_session_messages_returns_turn_scoped_grouped_tool_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-grouped-history");
+        registry
+            .record_turn(
+                &key,
+                vec![
+                    SessionMessage::structured(
+                        SessionMessageRole::Assistant,
+                        vec![
+                            SessionContentBlock::ToolUse {
+                                id: "call_1".to_string(),
+                                provider_id: Some("fc_1".to_string()),
+                                name: "read_file".to_string(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            },
+                            SessionContentBlock::ToolUse {
+                                id: "call_2".to_string(),
+                                provider_id: Some("fc_2".to_string()),
+                                name: "list_dir".to_string(),
+                                input: serde_json::json!({"path": "."}),
+                            },
+                        ],
+                        1,
+                        Some(21),
+                    ),
+                    SessionMessage::structured(
+                        SessionMessageRole::Tool,
+                        vec![
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_1".to_string(),
+                                content: serde_json::json!("file contents"),
+                                is_error: Some(false),
+                            },
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_2".to_string(),
+                                content: serde_json::json!(["Cargo.toml"]),
+                                is_error: Some(false),
+                            },
+                        ],
+                        2,
+                        None,
+                    ),
+                    SessionMessage::text(SessionMessageRole::Assistant, "Done.", 3),
+                ],
+                SessionMemory::default(),
+            )
+            .expect("record turn");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(
+            json["messages"][0]["content"]
+                .as_array()
+                .expect("tool uses")
+                .len(),
+            2
+        );
+        assert_eq!(json["messages"][0]["content"][0]["provider_id"], "fc_1");
+        assert_eq!(json["messages"][0]["content"][1]["provider_id"], "fc_2");
+        assert_eq!(json["messages"][0]["token_count"], 21);
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(
+            json["messages"][1]["content"]
+                .as_array()
+                .expect("tool results")
+                .len(),
+            2
+        );
+        assert_eq!(json["messages"][2]["role"], "assistant");
+        assert_eq!(json["messages"][2]["content"][0]["text"], "Done.");
+    }
+
+    #[tokio::test]
     async fn session_message_records_history() {
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-history");
