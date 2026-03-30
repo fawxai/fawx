@@ -1666,8 +1666,14 @@ const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several r
 const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool rounds only gathering information. Stop doing more read-only research unless it is absolutely necessary. If you have enough context, switch to implementation-side tools now. Otherwise, respond with what you learned, what remains blocked, and what input you need.";
 const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls were blocked after repeated observation-only rounds. Do not request any more read-only tools. Use the remaining mutation/build/install tools now if you have enough context to proceed. If you still cannot proceed, answer with the current findings and the specific blocker.";
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
+const DIRECT_INSPECTION_TASK_DIRECTIVE: &str = "\n\nThis turn is a direct local inspection request. Do not plan. Do not decompose. Use only the provided observation tools to inspect the explicit local path the user named. If the tool results answer the request, answer directly from that evidence. Do not broaden the task into repo research, code modification, testing, command execution, or web work.";
+const DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE: &str = "\n\nDirect inspection focus: read_local_path.\nUse `read_file` to inspect the explicit local path the user requested. Do not call unrelated tools or reopen the task as general research.";
+const DIRECT_INSPECTION_BLOCK_REASON: &str =
+    "direct inspection only allows observation tools for the requested local path";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
 const DIRECT_TOOL_TASK_DIRECTIVE: &str = "\n\nThis turn is a simple direct-tool request. Do not plan. Do not decompose. Use the one relevant utility tool immediately, then answer directly from its result. Do not call unrelated tools or do extra research unless the direct tool fails.";
+const DIRECT_UTILITY_BLOCK_REASON: &str =
+    "direct utility turns only allow their profile-owned tool surface";
 const DIRECT_WEATHER_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: weather.\nCall `weather` now with the user's requested location and answer directly from that result. Do not call `web_search` or `run_command` unless the `weather` tool fails or cannot answer the request.";
 const DIRECT_CURRENT_TIME_PHASE_DIRECTIVE: &str = "\n\nDirect tool focus: current_time.\nCall `current_time` now and answer directly from that result. Do not call other tools unless `current_time` fails.";
 const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. For code-edit tasks, do not move on to mutation until you have grounded the edit target by reading the most relevant file directly. Gather only the context needed to identify and read that file, then move to the concrete code change.";
@@ -2393,10 +2399,7 @@ impl LoopEngine {
     }
 
     fn apply_pending_tool_scope(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
-        if matches!(
-            self.turn_execution_profile,
-            TurnExecutionProfile::BoundedLocal | TurnExecutionProfile::DirectUtility(_)
-        ) {
+        if self.turn_execution_profile.owns_tool_surface() {
             return tools;
         }
         match self.pending_tool_scope.as_ref() {
@@ -2569,10 +2572,7 @@ impl LoopEngine {
         &self,
         state: &ToolRoundState,
     ) -> Option<ContinuationToolScope> {
-        if matches!(
-            self.turn_execution_profile,
-            TurnExecutionProfile::BoundedLocal | TurnExecutionProfile::DirectUtility(_)
-        ) {
+        if self.turn_execution_profile.owns_tool_surface() {
             return None;
         }
         if state.used_observation_tools && !state.used_mutation_tools {
@@ -5764,7 +5764,9 @@ impl LoopEngine {
         continuation_tools: Vec<ToolDefinition>,
         stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
-        if self.turn_execution_profile.borrows_standard_turn_contract()
+        if self
+            .turn_execution_profile
+            .uses_standard_observation_controls()
             && self.observation_only_call_restriction_active()
             && calls_are_all_classification(
                 &state.current_calls,
@@ -5912,8 +5914,8 @@ impl LoopEngine {
         let (retry_allowed, mut blocked) =
             partition_by_retry_policy(calls, &self.tool_retry_tracker, &retry_policy);
         let phase_allowed = if let (Some(allowed_names), Some(reason)) = (
-            self.bounded_local_phase_tool_names(),
-            self.bounded_local_phase_block_reason(),
+            self.turn_execution_profile_tool_names(),
+            self.turn_execution_profile_block_reason(),
         ) {
             let (phase_allowed, phase_blocked) =
                 partition_by_allowed_tool_names(&retry_allowed, allowed_names, reason);
@@ -5941,7 +5943,9 @@ impl LoopEngine {
         } else {
             phase_allowed
         };
-        let allowed = if self.turn_execution_profile.borrows_standard_turn_contract()
+        let allowed = if self
+            .turn_execution_profile
+            .uses_standard_observation_controls()
             && self.observation_only_call_restriction_active()
         {
             let (mutation_allowed, observation_blocked) = partition_by_call_classification(

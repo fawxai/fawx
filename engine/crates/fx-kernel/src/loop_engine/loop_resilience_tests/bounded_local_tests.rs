@@ -1,5 +1,13 @@
 use super::*;
 
+fn request_tool_names(request: &CompletionRequest) -> Vec<&str> {
+    request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect()
+}
+
 #[test]
 fn detect_turn_execution_profile_recognizes_bounded_local_requests() {
     let bounded = "Work only inside /Users/joseph/fawx.\nDo not use web research.\n1. Read the files needed to find the issue.\n2. Make one concrete code change.\n3. Run one focused test.\n4. End with a concise summary.";
@@ -58,6 +66,31 @@ async fn direct_inspection_turns_disable_effective_decompose() {
             .all(|tool| tool.name != DECOMPOSE_TOOL_NAME),
         "direct inspection turns should not advertise decompose"
     );
+}
+
+#[tokio::test]
+async fn direct_inspection_turns_own_profile_specific_tool_surface() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.pending_tool_scope = Some(ContinuationToolScope::MutationOnly);
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let processed = engine
+        .perceive(&test_snapshot(
+            "Read ~/.zshrc and tell me exactly what it says.",
+        ))
+        .await
+        .expect("perceive");
+
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(request_tool_names(&requests[0]), vec!["read_file"]);
+    let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+    assert!(system_prompt.contains("direct local inspection request"));
+    assert!(system_prompt.contains("Use `read_file`"));
 }
 
 #[test]
@@ -160,12 +193,46 @@ fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
     );
 }
 
+#[tokio::test]
+async fn perceive_preserves_direct_utility_precedence_over_direct_inspection() {
+    let mut engine = mixed_tool_engine_with_executor(
+        BudgetConfig::default(),
+        Arc::new(DirectUtilityToolExecutor),
+    );
+    let _processed = engine
+        .perceive(&test_snapshot(
+            "Tell me the current time, then quote ~/notes/todo.md.",
+        ))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
+        TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+    );
+}
+
 #[test]
 fn detect_turn_execution_profile_preserves_bounded_local_precedence() {
     let message = "Work only inside ~/fawx.\nDo not use web research.\n1. Inspect ~/fawx/engine/crates/fx-kernel/src/loop_engine.rs to find the issue.\n2. Make one concrete code change.\n3. Run one focused test.\n4. End with a concise summary.";
 
     assert_eq!(
         detect_turn_execution_profile(message, &[]),
+        TurnExecutionProfile::BoundedLocal
+    );
+}
+
+#[tokio::test]
+async fn perceive_preserves_bounded_local_precedence_over_direct_inspection() {
+    let message = "Work only inside ~/fawx.\nDo not use web research.\n1. Inspect ~/fawx/engine/crates/fx-kernel/src/loop_engine.rs to find the issue.\n2. Make one concrete code change.\n3. Run one focused test.\n4. End with a concise summary.";
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let _processed = engine
+        .perceive(&test_snapshot(message))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
         TurnExecutionProfile::BoundedLocal
     );
 }
@@ -206,6 +273,28 @@ async fn bounded_local_prompt_disables_decompose_and_injects_fast_path_directive
         system_prompt.contains("bounded local workspace task"),
         "bounded local tasks should carry a direct-execution directive"
     );
+}
+
+#[tokio::test]
+async fn standard_turns_keep_their_normal_tool_surface() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let processed = engine
+        .perceive(&test_snapshot("Implement it now."))
+        .await
+        .expect("perceive");
+
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    let tool_names = request_tool_names(&requests[0]);
+    assert!(tool_names.contains(&"read_file"));
+    assert!(tool_names.contains(&"write_file"));
+    assert!(tool_names.contains(&DECOMPOSE_TOOL_NAME));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use super::{DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE, DIRECT_INSPECTION_TASK_DIRECTIVE};
 use std::collections::HashSet;
 
 const INSPECTION_ACTION_WORDS: &[&str] = &["inspect", "quote", "read", "summarize", "summarise"];
@@ -74,6 +75,22 @@ pub(super) fn detect_direct_inspection_profile(
 pub(super) fn direct_inspection_profile_label(profile: DirectInspectionProfile) -> &'static str {
     match profile {
         DirectInspectionProfile::ReadLocalPath => "read_local_path",
+    }
+}
+
+pub(super) fn direct_inspection_tool_names(
+    profile: &DirectInspectionProfile,
+) -> &'static [&'static str] {
+    match profile {
+        DirectInspectionProfile::ReadLocalPath => &["read_file"],
+    }
+}
+
+pub(super) fn direct_inspection_directive(profile: &DirectInspectionProfile) -> String {
+    match profile {
+        DirectInspectionProfile::ReadLocalPath => format!(
+            "{DIRECT_INSPECTION_TASK_DIRECTIVE}{DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE}"
+        ),
     }
 }
 

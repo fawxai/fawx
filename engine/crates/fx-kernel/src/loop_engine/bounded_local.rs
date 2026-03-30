@@ -7,9 +7,13 @@ use super::{
     BOUNDED_LOCAL_RECOVERY_PHASE_DIRECTIVE, BOUNDED_LOCAL_TASK_DIRECTIVE,
     BOUNDED_LOCAL_TERMINAL_PHASE_DIRECTIVE, BOUNDED_LOCAL_VERIFICATION_BLOCK_REASON,
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
+    DIRECT_INSPECTION_BLOCK_REASON, DIRECT_UTILITY_BLOCK_REASON,
 };
 use crate::act::ToolResult;
-use crate::loop_engine::direct_inspection::{DirectInspectionOwnership, DirectInspectionProfile};
+use crate::loop_engine::direct_inspection::{
+    direct_inspection_directive, direct_inspection_tool_names, DirectInspectionOwnership,
+    DirectInspectionProfile,
+};
 use crate::loop_engine::direct_utility::DirectUtilityProfile;
 use crate::signals::{LoopStep, SignalKind};
 use fx_llm::{ToolCall, ToolDefinition};
@@ -25,8 +29,8 @@ pub(super) enum TurnExecutionProfile {
 }
 
 impl TurnExecutionProfile {
-    pub(super) fn borrows_standard_turn_contract(self) -> bool {
-        matches!(self, Self::Standard | Self::DirectInspection(_))
+    pub(super) fn uses_standard_observation_controls(self) -> bool {
+        matches!(self, Self::Standard)
     }
 
     pub(super) fn direct_inspection_profile(self) -> Option<DirectInspectionProfile> {
@@ -37,7 +41,7 @@ impl TurnExecutionProfile {
     }
 
     pub(super) fn owns_tool_surface(self) -> bool {
-        matches!(self, Self::BoundedLocal | Self::DirectUtility(_))
+        !matches!(self, Self::Standard)
     }
 }
 
@@ -58,8 +62,11 @@ pub(super) enum BoundedLocalTerminalReason {
 }
 
 impl LoopEngine {
-    pub(super) fn bounded_local_phase_tool_names(&self) -> Option<&'static [&'static str]> {
+    pub(super) fn turn_execution_profile_tool_names(&self) -> Option<&'static [&'static str]> {
         match self.turn_execution_profile {
+            TurnExecutionProfile::DirectInspection(profile) => {
+                Some(direct_inspection_tool_names(&profile))
+            }
             TurnExecutionProfile::BoundedLocal => Some(match self.bounded_local_phase {
                 BoundedLocalPhase::Discovery => &["search_text", "read_file", "list_directory"],
                 BoundedLocalPhase::Mutation => &["write_file", "edit_file"],
@@ -70,7 +77,16 @@ impl LoopEngine {
             TurnExecutionProfile::DirectUtility(profile) => {
                 Some(direct_utility_tool_names(&profile))
             }
-            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => None,
+            TurnExecutionProfile::Standard => None,
+        }
+    }
+
+    pub(super) fn turn_execution_profile_block_reason(&self) -> Option<&'static str> {
+        match self.turn_execution_profile {
+            TurnExecutionProfile::DirectInspection(_) => Some(DIRECT_INSPECTION_BLOCK_REASON),
+            TurnExecutionProfile::BoundedLocal => self.bounded_local_phase_block_reason(),
+            TurnExecutionProfile::DirectUtility(_) => Some(DIRECT_UTILITY_BLOCK_REASON),
+            TurnExecutionProfile::Standard => None,
         }
     }
 
@@ -78,7 +94,7 @@ impl LoopEngine {
         &self,
         tools: Vec<ToolDefinition>,
     ) -> Vec<ToolDefinition> {
-        let Some(allowed) = self.bounded_local_phase_tool_names() else {
+        let Some(allowed) = self.turn_execution_profile_tool_names() else {
             return tools;
         };
         let allowed: HashSet<&str> = allowed.iter().copied().collect();
@@ -95,7 +111,10 @@ impl LoopEngine {
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
         match self.turn_execution_profile {
-            TurnExecutionProfile::DirectInspection(_) | TurnExecutionProfile::Standard => None,
+            TurnExecutionProfile::DirectInspection(profile) => {
+                Some(direct_inspection_directive(&profile))
+            }
+            TurnExecutionProfile::Standard => None,
             TurnExecutionProfile::BoundedLocal => {
                 let phase_directive = match self.bounded_local_phase {
                     BoundedLocalPhase::Discovery => BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE,
