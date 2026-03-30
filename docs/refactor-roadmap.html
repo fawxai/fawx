@@ -175,11 +175,11 @@
 </head>
 <body>
 
-<h1>Fawx Roadmap v4.3</h1>
+<h1>Fawx Roadmap v4.4</h1>
 <p class="subtitle">Kernel contract stabilization first. One PR at a time on dev. New substrate and authority work resume only after the loop, transcript, and persistence contracts are trustworthy again.</p>
 
 <div class="checkpoint">
-  <strong>Checkpoint (2026-03-29):</strong> The issue set since <code>#1637</code> shows the real shape of the work. We are not in feature expansion mode. We are in kernel stabilization mode. <code>#1639</code> landed and gives us a better tool spine, but commit tracing split current instability into three separate runtime problems: <code>#1641</code> direct-inspection fake-permission failure, <code>#1658</code> runaway continuation reintroduced by <code>13376838</code>, and <code>#1656</code> post-turn unknown-tool / ordering corruption. The plan below treats those as first-class gates.
+  <strong>Checkpoint (2026-03-30):</strong> <code>#1641</code> direct-inspection profile is fully landed across four phases. The fake-permission regression is fixed, direct inspection completes terminally from evidence, profile boundaries are consolidated with regression lock-in, and the redundant prompt-level working_dir restriction is removed. Gates A and B are clear. Next: <code>#1658</code> runaway continuation, then <code>#1656</code> tool ordering.
 </div>
 
 <div class="thesis">
@@ -188,11 +188,11 @@
 
 <div class="summary-grid">
   <div class="summary-card">
-    <div class="number" style="color: var(--green)">5</div>
+    <div class="number" style="color: var(--green)">6</div>
     <div class="label">Landed foundation items</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--red)">4</div>
+    <div class="number" style="color: var(--red)">3</div>
     <div class="label">Active stabilization items</div>
   </div>
   <div class="summary-card">
@@ -234,8 +234,16 @@
     <div>
       <h3>Current stabilization tranche</h3>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Direct inspection profile</span><span class="tag tag-active">start here</span></div>
-        <div class="issue-body">Architectural fix for the fake-permission / outside-working-directory regression. Traced in <code>docs/fix/1641-direct-inspection-regression-trace.md</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Direct inspection profile</span><span class="tag tag-done">landed (4 phases)</span></div>
+        <div class="issue-body">Architectural fix for the fake-permission / outside-working-directory regression. Four phases merged to dev:
+          <ul>
+            <li><strong>Phase 1</strong> (#1659): detection and profile routing</li>
+            <li><strong>Phase 2</strong> (#1660): profile-owned tool surface, directives, block reasons</li>
+            <li><strong>Phase 3</strong> (#1661): terminal completion from evidence + working_dir prompt removal</li>
+            <li><strong>Phase 4</strong> (#1662): profile boundary consolidation, outside-workspace read fix, regression lock-in</li>
+          </ul>
+          Also shipped: <code>fx-core::path::expand_tilde</code> extraction, <code>resolve_read_path</code> / <code>jailed_path</code> write-safety split, cross-profile boundary tests, updated bisect lane runbook with headless API + macOS app modes.
+        </div>
       </div>
       <div class="issue-card">
         <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduced by 13376838</span><span class="tag tag-active">regression</span></div>
@@ -255,21 +263,9 @@
 
 <h2>Linear plan we can begin now</h2>
 <div class="panel" style="border-left: 3px solid var(--accent);">
-  <div class="sequence-step">
-    <strong>Step 1. #1641 Phase 1: direct-inspection detection</strong>
-    <div class="step-meta">Route deterministic local inspection requests into typed profile state instead of <code>Standard</code>.</div>
-  </div>
-  <div class="sequence-step">
-    <strong>Step 2. #1641 Phase 2: observation-only tool surface</strong>
-    <div class="step-meta">Own the allowed tool set inside the profile. No inheritance from the broad standard continuation contract.</div>
-  </div>
-  <div class="sequence-step">
-    <strong>Step 3. #1641 Phase 3: terminal completion from evidence</strong>
-    <div class="step-meta">End the turn on the first usable post-tool answer. This is the key gate against both fake permission denial and direct-inspection flailing.</div>
-  </div>
-  <div class="sequence-step">
-    <strong>Step 4. #1641 Phase 4: standard/profile boundary cleanup</strong>
-    <div class="step-meta">Remove remaining leakage between <code>Standard</code> and direct inspection. Lock the behavior in with regression tests.</div>
+  <div class="sequence-step" style="border-left: 3px solid var(--green);">
+    <strong>✅ Steps 1-4. #1641 Phases 1-4: direct inspection profile (COMPLETE)</strong>
+    <div class="step-meta">Detection → profile-owned tool surface → terminal completion → boundary consolidation. Four PRs merged (#1659, #1660, #1661, #1662). Gates A and B are clear.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 5. #1658: mixed-text runaway follow-up</strong>
@@ -300,8 +296,8 @@
 <h2>Execution gates for the stabilization tranche</h2>
 <div class="panel">
   <ul class="gate-list">
-    <li><strong>Gate A:</strong> <code>Read the file at ~/.zshrc and explain what each line does</code> must not end in an outside-working-directory refusal once the file was successfully read.</li>
-    <li><strong>Gate B:</strong> that prompt must terminate without runaway continuation on the current direct-inspection path.</li>
+    <li><strong>Gate A:</strong> <span style="color: var(--green)">✅ CLEAR</span> <code>Read the file at ~/.zshrc and explain what each line does</code> must not end in an outside-working-directory refusal once the file was successfully read. <em>Fixed by #1641 Phase 3 (terminal completion) + working_dir prompt removal.</em></li>
+    <li><strong>Gate B:</strong> <span style="color: var(--green)">✅ CLEAR</span> that prompt must terminate without runaway continuation on the current direct-inspection path. <em>Fixed by #1641 Phases 1-4 (profile-owned terminal completion, tightened termination config).</em></li>
     <li><strong>Gate C:</strong> no post-turn <code>Unknown tool call</code> row for the traced prompt after completion.</li>
     <li><strong>Gate D:</strong> persisted history must never store <code>tool_result</code> before matching <code>tool_use</code>.</li>
     <li><strong>Gate E:</strong> one completed turn must replay as one grouped historical tool-activity unit.</li>
@@ -333,8 +329,8 @@
   <div class="panel">
     <h3>Rewrite-in-place / contract work</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Loop engine direct-inspection slice</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">This is not just file splitting. It changes execution semantics.</div>
+      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Loop engine direct-inspection slice</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Four-phase implementation complete. Profile detection, owned tool surface, terminal completion, boundary consolidation.</div>
     </div>
     <div class="issue-card">
       <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduction</span><span class="tag tag-active">now</span></div>
@@ -406,7 +402,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-29 22:10 UTC (v4.3) · Linear stabilization sequence: #1641 → #1658 → #1656 → #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-30 14:43 UTC (v4.4) · #1641 complete (4 phases landed) · Next: #1658 → #1656 → #1655 → #1646 → #1647 → authority model · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
