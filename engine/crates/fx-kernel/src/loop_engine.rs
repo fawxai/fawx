@@ -6094,8 +6094,9 @@ impl LoopEngine {
         stream: CycleStream<'_>,
         next_tool_scope: Option<ContinuationToolScope>,
     ) -> Result<ActionResult, LoopError> {
+        let current_round_text = response_text_segment(response);
         let response_text =
-            stitch_response_segments(&state.accumulated_text, response_text_segment(response));
+            stitch_response_segments(&state.accumulated_text, current_round_text.clone());
         if response_text.is_empty() {
             self.emit_signal(
                 LoopStep::Act,
@@ -6106,7 +6107,9 @@ impl LoopEngine {
                 }),
             );
         }
-        if let Some(response) = meaningful_response_text(&response_text) {
+        if current_round_text.is_some() {
+            let response = meaningful_response_text(&response_text)
+                .expect("stitched response should be meaningful when the current round has text");
             return Ok(self.tool_continuation_action_result(
                 decision,
                 state.all_tool_results,
@@ -6158,17 +6161,18 @@ impl LoopEngine {
             .generate_tool_summary(&synthesis_prompt, llm, stream, TextStreamVisibility::Hidden)
             .await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
-        let response_text =
-            stitch_response_segments(&accumulated_text, meaningful_response_text(&llm_text));
+        let synthesized_text = meaningful_response_text(&llm_text);
+        let response_text = stitch_response_segments(&accumulated_text, synthesized_text.clone());
         let final_response = meaningful_response_text(&response_text);
         let tool_summary =
             stitched_response_text(&accumulated_text, summarize_tool_progress(&evicted));
-        Ok(match final_response {
-            Some(response) => self.tool_continuation_action_result(
+        Ok(match synthesized_text {
+            Some(_) => self.tool_continuation_action_result(
                 decision,
                 evicted,
                 response_text,
-                response,
+                final_response
+                    .expect("stitched response should be meaningful when synthesis has text"),
                 tokens_used,
                 next_tool_scope,
             ),
@@ -8207,16 +8211,19 @@ fn prepend_accumulated_text_to_action(
     if accumulated_text.is_empty() {
         return action;
     }
-    action.response_text = stitch_response_segments(
-        accumulated_text,
-        meaningful_response_text(&action.response_text),
-    );
+    if let Some(response_text) = meaningful_response_text(&action.response_text) {
+        action.response_text = stitch_response_segments(accumulated_text, Some(response_text));
+    }
     match &mut action.next_step {
         ActionNextStep::Continue(continuation) => {
-            continuation.partial_response =
-                stitched_response_text(accumulated_text, continuation.partial_response.take());
-            continuation.context_message =
-                stitched_response_text(accumulated_text, continuation.context_message.take());
+            continuation.partial_response = continuation.partial_response.take().and_then(|text| {
+                meaningful_response_text(&text)
+                    .and_then(|text| stitched_response_text(accumulated_text, Some(text)))
+            });
+            continuation.context_message = continuation.context_message.take().and_then(|text| {
+                meaningful_response_text(&text)
+                    .and_then(|text| stitched_response_text(accumulated_text, Some(text)))
+            });
         }
         ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
             *response = stitch_response_segments(accumulated_text, Some(response.clone()));
@@ -8224,7 +8231,10 @@ fn prepend_accumulated_text_to_action(
         ActionNextStep::Finish(ActionTerminal::Incomplete {
             partial_response, ..
         }) => {
-            *partial_response = stitched_response_text(accumulated_text, partial_response.take());
+            *partial_response = partial_response.take().and_then(|text| {
+                meaningful_response_text(&text)
+                    .and_then(|text| stitched_response_text(accumulated_text, Some(text)))
+            });
         }
     }
     action
@@ -9331,7 +9341,7 @@ mod phase2_tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_accumulates_mixed_text_across_tool_rounds() {
+    async fn mixed_text_with_tool_calls_preserves_text_fragments() {
         let mut engine = test_engine();
         let expected = "First note\n\nSecond note\n\nFinal answer";
         let llm = SequentialMockLlm::new(vec![
@@ -9358,6 +9368,91 @@ mod phase2_tests {
         let (response, _, _) = expect_complete(result);
 
         assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn empty_current_round_does_not_continue_from_accumulated_text() {
+        let mut engine = test_engine();
+        let response = mixed_tool_response(
+            "Initial findings",
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"README.md"}),
+        );
+        let decision = engine.decide(&response).await.expect("decision");
+        let llm = test_fixtures::RecordingLlm::with_generated_summary(
+            vec![Ok(text_response("", None, None))],
+            String::new(),
+        );
+
+        let action = engine
+            .act(
+                &decision,
+                &llm,
+                &[Message::user("read the file")],
+                CycleStream::disabled(),
+            )
+            .await
+            .expect("act");
+
+        assert!(
+            action.response_text.is_empty(),
+            "empty rounds should not become response text via accumulated fragments"
+        );
+        match action.next_step {
+            ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response,
+                reason,
+            }) => {
+                assert!(reason.contains("did not produce a usable final response"));
+                assert!(partial_response
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Initial findings")));
+            }
+            other => panic!("expected terminal incomplete action, got {other:?}"),
+        }
+        assert_eq!(llm.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn standard_turn_with_mixed_text_terminates_normally() {
+        let prompt = "Read the README then make a small improvement to it.";
+        let mut engine = test_engine();
+        let llm = test_fixtures::RecordingLlm::with_generated_summary(
+            vec![
+                Ok::<CompletionResponse, ProviderError>(mixed_tool_response(
+                    "I am reading the README first.",
+                    "call-1",
+                    "read_file",
+                    serde_json::json!({"path":"README.md"}),
+                )),
+                Ok(text_response("", None, None)),
+                Err(ProviderError::Provider(
+                    "unexpected continuation after an empty tool round".to_string(),
+                )),
+            ],
+            String::new(),
+        );
+
+        let result = engine
+            .run_cycle(test_snapshot(prompt), &llm)
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::Incomplete {
+                partial_response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(iterations, 1);
+                assert!(partial_response
+                    .as_deref()
+                    .is_some_and(|text| text.contains("I am reading the README first.")));
+            }
+            other => panic!("expected incomplete termination, got {other:?}"),
+        }
+        assert_eq!(llm.requests().len(), 2);
     }
 
     #[tokio::test]
@@ -14186,6 +14281,38 @@ mod decomposition_tests {
         };
 
         assert_eq!(action_partial_response(&action), None);
+    }
+
+    #[test]
+    fn prepend_accumulated_text_to_action_does_not_invent_partial_response() {
+        let action = ActionResult {
+            decision: Decision::Respond("keep going".to_string()),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                None,
+                Some("Task decomposition results:\n1. step => completed: ok".to_string()),
+            )),
+        };
+
+        let stitched = prepend_accumulated_text_to_action(action, &[String::from("Earlier note")]);
+
+        assert!(stitched.response_text.is_empty());
+        match stitched.next_step {
+            ActionNextStep::Continue(ActionContinuation {
+                partial_response,
+                context_message,
+                ..
+            }) => {
+                assert_eq!(partial_response, None);
+                assert_eq!(
+                    context_message.as_deref(),
+                    Some("Earlier note\n\nTask decomposition results:\n1. step => completed: ok")
+                );
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
     }
 
     #[test]
