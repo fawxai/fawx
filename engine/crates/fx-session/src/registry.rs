@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn session_persists_tool_activity_in_causal_order() {
+    fn session_persists_turn_scoped_grouped_tool_history() {
         let reg = test_registry();
         let key = SessionKey::new("tool-order").unwrap();
         reg.create(key.clone(), SessionKind::Main, default_config())
@@ -661,22 +661,37 @@ mod tests {
             vec![
                 SessionMessage::structured(
                     MessageRole::Assistant,
-                    vec![SessionContentBlock::ToolUse {
-                        id: "call_1".to_string(),
-                        provider_id: Some("fc_1".to_string()),
-                        name: "read_file".to_string(),
-                        input: serde_json::json!({"path": "README.md"}),
-                    }],
+                    vec![
+                        SessionContentBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            provider_id: Some("fc_1".to_string()),
+                            name: "read_file".to_string(),
+                            input: serde_json::json!({"path": "README.md"}),
+                        },
+                        SessionContentBlock::ToolUse {
+                            id: "call_2".to_string(),
+                            provider_id: Some("fc_2".to_string()),
+                            name: "list_dir".to_string(),
+                            input: serde_json::json!({"path": "."}),
+                        },
+                    ],
                     1,
                     None,
                 ),
                 SessionMessage::structured(
                     MessageRole::Tool,
-                    vec![SessionContentBlock::ToolResult {
-                        tool_use_id: "call_1".to_string(),
-                        content: serde_json::json!("contents"),
-                        is_error: Some(false),
-                    }],
+                    vec![
+                        SessionContentBlock::ToolResult {
+                            tool_use_id: "call_1".to_string(),
+                            content: serde_json::json!("contents"),
+                            is_error: Some(false),
+                        },
+                        SessionContentBlock::ToolResult {
+                            tool_use_id: "call_2".to_string(),
+                            content: serde_json::json!(["Cargo.toml", "README.md"]),
+                            is_error: Some(false),
+                        },
+                    ],
                     2,
                     None,
                 ),
@@ -697,12 +712,20 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert!(matches!(
             history[0].content.as_slice(),
-            [SessionContentBlock::ToolUse { id, provider_id, .. }]
-                if id == "call_1" && provider_id.as_deref() == Some("fc_1")
+            [
+                SessionContentBlock::ToolUse { id: first_id, provider_id: first_provider, .. },
+                SessionContentBlock::ToolUse { id: second_id, provider_id: second_provider, .. },
+            ] if first_id == "call_1"
+                && first_provider.as_deref() == Some("fc_1")
+                && second_id == "call_2"
+                && second_provider.as_deref() == Some("fc_2")
         ));
         assert!(matches!(
             history[1].content.as_slice(),
-            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_1"
+            [
+                SessionContentBlock::ToolResult { tool_use_id: first_id, .. },
+                SessionContentBlock::ToolResult { tool_use_id: second_id, .. },
+            ] if first_id == "call_1" && second_id == "call_2"
         ));
         assert_eq!(history[2].render_text(), "Done.");
     }
