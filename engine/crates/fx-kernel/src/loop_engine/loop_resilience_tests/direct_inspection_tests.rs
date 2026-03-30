@@ -98,6 +98,48 @@ async fn direct_inspection_successful_read_file_completes_terminally() {
 }
 
 #[tokio::test]
+async fn direct_inspection_with_mixed_text_terminates_terminally() {
+    let prompt = "Read ~/.zshrc and explain what each line does.";
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Here is what I found so far.".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"~/.zshrc"}),
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        },
+        text_response("Line 1 configures the shell environment."),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot(prompt), &llm)
+        .await
+        .expect("run_cycle should succeed");
+
+    match result {
+        LoopResult::Complete {
+            response,
+            iterations,
+            ..
+        } => {
+            assert_eq!(iterations, 1);
+            assert_eq!(
+                response,
+                "Here is what I found so far.\n\nLine 1 configures the shell environment."
+            );
+        }
+        other => panic!("expected terminal completion, got {other:?}"),
+    }
+    assert_eq!(llm.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn direct_inspection_does_not_request_mutation_only_scope_after_observation() {
     let prompt = "Read ~/.zshrc and tell me exactly what it says.";
     let mut engine = mixed_tool_engine(BudgetConfig::default());
