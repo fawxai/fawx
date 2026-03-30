@@ -71,6 +71,55 @@ fn detect_turn_execution_profile_rejects_mixed_local_and_online_guidance_request
     );
 }
 
+#[tokio::test]
+async fn decomposition_sub_goal_cannot_promote_standard_turn_to_direct_inspection() {
+    let prompt = "Read ~/.zshrc and compare it to the latest online guidance for zsh config.";
+    let sub_goal = SubGoal::with_definition_of_done(
+        "Read the user's ~/.zshrc and summarize its structure, notable settings, plugins, aliases, PATH edits, and any unusual/possibly outdated patterns.".to_string(),
+        Vec::new(),
+        Some("inspection summary"),
+        None,
+    );
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let processed = engine
+        .perceive(&test_snapshot(prompt))
+        .await
+        .expect("perceive");
+
+    assert_eq!(
+        engine.turn_execution_profile,
+        TurnExecutionProfile::Standard
+    );
+
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+    let execution = engine
+        .run_sub_goal(
+            &sub_goal,
+            BudgetConfig::default(),
+            &llm,
+            &processed.context_window,
+            &[],
+        )
+        .await;
+
+    assert!(
+        execution
+            .result
+            .signals
+            .iter()
+            .any(|signal| signal.message == "processing user input"),
+        "child sub-goal should still execute a real perceive pass"
+    );
+    assert!(
+        execution
+            .result
+            .signals
+            .iter()
+            .all(|signal| signal.message != "selected direct inspection execution profile"),
+        "standard parent turns must not be promoted to direct inspection during decomposition"
+    );
+}
+
 #[test]
 fn detect_turn_execution_profile_preserves_direct_utility_precedence() {
     let tools = DirectUtilityToolExecutor.tool_definitions();

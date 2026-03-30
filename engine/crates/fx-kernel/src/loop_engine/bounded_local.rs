@@ -9,9 +9,7 @@ use super::{
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
 };
 use crate::act::ToolResult;
-use crate::loop_engine::direct_inspection::{
-    detect_direct_inspection_profile, DirectInspectionProfile,
-};
+use crate::loop_engine::direct_inspection::{DirectInspectionOwnership, DirectInspectionProfile};
 use crate::loop_engine::direct_utility::DirectUtilityProfile;
 use crate::signals::{LoopStep, SignalKind};
 use fx_llm::{ToolCall, ToolDefinition};
@@ -29,6 +27,13 @@ pub(super) enum TurnExecutionProfile {
 impl TurnExecutionProfile {
     pub(super) fn borrows_standard_turn_contract(self) -> bool {
         matches!(self, Self::Standard | Self::DirectInspection(_))
+    }
+
+    pub(super) fn direct_inspection_profile(self) -> Option<DirectInspectionProfile> {
+        match self {
+            Self::DirectInspection(profile) => Some(profile),
+            Self::Standard | Self::BoundedLocal | Self::DirectUtility(_) => None,
+        }
     }
 
     pub(super) fn owns_tool_surface(self) -> bool {
@@ -545,14 +550,27 @@ fn first_effective_command_word(words: &[String]) -> Option<&str> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn detect_turn_execution_profile(
     user_message: &str,
     available_tools: &[ToolDefinition],
 ) -> TurnExecutionProfile {
+    detect_turn_execution_profile_for_ownership(
+        user_message,
+        available_tools,
+        DirectInspectionOwnership::DetectFromTurn,
+    )
+}
+
+pub(super) fn detect_turn_execution_profile_for_ownership(
+    user_message: &str,
+    available_tools: &[ToolDefinition],
+    direct_inspection_ownership: DirectInspectionOwnership,
+) -> TurnExecutionProfile {
     if let Some(profile) = detect_direct_utility_profile(user_message, available_tools) {
         return TurnExecutionProfile::DirectUtility(profile);
     }
-    if let Some(profile) = detect_direct_inspection_profile(user_message) {
+    if let Some(profile) = direct_inspection_ownership.profile_for_turn(user_message) {
         return TurnExecutionProfile::DirectInspection(profile);
     }
 

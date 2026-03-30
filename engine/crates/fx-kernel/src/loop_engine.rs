@@ -64,20 +64,22 @@ mod progress;
 
 #[cfg(test)]
 use crate::act::ProceedUnderConstraints;
+#[cfg(test)]
+use bounded_local::detect_turn_execution_profile;
 use bounded_local::{
     bounded_local_phase_label, bounded_local_terminal_partial_response,
     bounded_local_terminal_reason_label, bounded_local_terminal_reason_text,
-    detect_turn_execution_profile, partition_by_bounded_local_phase_semantics, BoundedLocalPhase,
-    BoundedLocalTerminalReason, TurnExecutionProfile,
+    detect_turn_execution_profile_for_ownership, partition_by_bounded_local_phase_semantics,
+    BoundedLocalPhase, BoundedLocalTerminalReason, TurnExecutionProfile,
 };
 use continuation::{
     commitment_tool_scope, render_turn_commitment_directive,
     tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
     turn_commitment_metadata,
 };
-use direct_inspection::direct_inspection_profile_label;
 #[cfg(test)]
 use direct_inspection::DirectInspectionProfile;
+use direct_inspection::{direct_inspection_profile_label, DirectInspectionOwnership};
 #[cfg(test)]
 use direct_utility::DirectUtilityProfile;
 use direct_utility::{
@@ -642,6 +644,8 @@ pub struct LoopEngine {
     thinking_config: Option<fx_llm::ThinkingConfig>,
     /// Whether this runner may expose and honor the kernel-level decompose tool.
     decompose_enabled: bool,
+    /// Root-turn ownership for direct-inspection classification during decomposition.
+    direct_inspection_ownership: DirectInspectionOwnership,
     /// Turn-scoped routing profile for bounded local work vs. general tasks.
     turn_execution_profile: TurnExecutionProfile,
     /// Current phase for bounded local code-edit execution.
@@ -689,6 +693,10 @@ impl std::fmt::Debug for LoopEngine {
             .field(
                 "last_emitted_public_progress",
                 &self.last_emitted_public_progress,
+            )
+            .field(
+                "direct_inspection_ownership",
+                &self.direct_inspection_ownership,
             )
             .field("turn_execution_profile", &self.turn_execution_profile)
             .field("bounded_local_phase", &self.bounded_local_phase)
@@ -1128,6 +1136,7 @@ impl LoopEngineBuilder {
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             decompose_enabled: self.decompose_enabled.unwrap_or(true),
+            direct_inspection_ownership: DirectInspectionOwnership::DetectFromTurn,
             turn_execution_profile: TurnExecutionProfile::Standard,
             bounded_local_phase: BoundedLocalPhase::Discovery,
             bounded_local_recovery_used: false,
@@ -2847,8 +2856,11 @@ impl LoopEngine {
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
         };
-        self.turn_execution_profile =
-            detect_turn_execution_profile(&user_message, &self.tool_executor.tool_definitions());
+        self.turn_execution_profile = detect_turn_execution_profile_for_ownership(
+            &user_message,
+            &self.tool_executor.tool_definitions(),
+            self.direct_inspection_ownership,
+        );
         self.bounded_local_phase = BoundedLocalPhase::Discovery;
         self.bounded_local_recovery_used = false;
         self.bounded_local_recovery_focus.clear();
@@ -4216,6 +4228,9 @@ impl LoopEngine {
 
         let mut child = builder.build()?;
         child.notify_tool_guidance_enabled = self.notify_tool_guidance_enabled;
+        child.direct_inspection_ownership = DirectInspectionOwnership::PreserveParent(
+            self.turn_execution_profile.direct_inspection_profile(),
+        );
         Ok(child)
     }
 

@@ -39,6 +39,13 @@ pub(super) enum DirectInspectionProfile {
     ReadLocalPath,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DirectInspectionOwnership {
+    #[default]
+    DetectFromTurn,
+    PreserveParent(Option<DirectInspectionProfile>),
+}
+
 #[derive(Debug)]
 struct InspectionRequestAnalysis {
     explicit_local_path_count: usize,
@@ -67,6 +74,15 @@ pub(super) fn detect_direct_inspection_profile(
 pub(super) fn direct_inspection_profile_label(profile: DirectInspectionProfile) -> &'static str {
     match profile {
         DirectInspectionProfile::ReadLocalPath => "read_local_path",
+    }
+}
+
+impl DirectInspectionOwnership {
+    pub(super) fn profile_for_turn(self, user_message: &str) -> Option<DirectInspectionProfile> {
+        match self {
+            Self::DetectFromTurn => detect_direct_inspection_profile(user_message),
+            Self::PreserveParent(profile) => profile,
+        }
     }
 }
 
