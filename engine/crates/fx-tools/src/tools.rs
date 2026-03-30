@@ -8,6 +8,7 @@ use fx_config::manager::ConfigManager;
 use fx_consensus::ProgressCallback;
 use fx_core::kernel_manifest::BudgetSummary;
 use fx_core::memory::MemoryStore;
+use fx_core::path::expand_tilde;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
@@ -44,20 +45,6 @@ mod subagent;
 use self::filesystem::{is_builtin_ignored_directory, MAX_SEARCH_MATCHES};
 #[cfg(test)]
 use self::runtime::{day_of_week_from_epoch, iso8601_utc_from_epoch};
-
-/// Expand a leading `~` or `~/` prefix to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(path)
-}
 
 fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
     Arc::new(ProcessRegistry::new(ProcessConfig {
@@ -1294,6 +1281,30 @@ three
         let result =
             executor.handle_write_file(&serde_json::json!({"path": "../x.txt", "content": "no"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_file_respects_jail_even_when_outside_workspace_reads_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("x.txt");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let result = executor.handle_write_file(&serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "no"
+        }));
+
+        assert!(matches!(
+            result,
+            Err(message) if message.contains("path escapes working directory")
+        ));
     }
 
     #[test]

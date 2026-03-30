@@ -1,4 +1,5 @@
 use super::*;
+use crate::budget::TerminationConfig;
 
 #[test]
 fn standard_uses_mutation_only_escalation_after_observation() {
@@ -42,6 +43,56 @@ fn direct_utility_completes_terminally() {
 
     assert!(profile.completes_terminally());
     assert!(!profile.allows_synthesis_fallback());
+}
+
+#[test]
+fn tightened_termination_config_values_match_expected() {
+    let base = TerminationConfig {
+        synthesize_on_exhaustion: true,
+        nudge_after_tool_turns: 100,
+        strip_tools_after_nudge: 100,
+        tool_round_nudge_after: 100,
+        tool_round_strip_after_nudge: 100,
+        observation_only_round_nudge_after: 100,
+        observation_only_round_strip_after_nudge: 100,
+    };
+
+    let bounded = TurnExecutionProfile::BoundedLocal
+        .tightened_termination_config(&base)
+        .expect("bounded local tightens termination");
+    assert!(bounded.nudge_after_tool_turns <= 3);
+    assert!(bounded.tool_round_nudge_after <= 2);
+    assert_eq!(bounded.observation_only_round_nudge_after, 1);
+    assert_eq!(bounded.observation_only_round_strip_after_nudge, 0);
+
+    let direct_inspection =
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath)
+            .tightened_termination_config(&base)
+            .expect("direct inspection tightens termination");
+    assert!(direct_inspection.nudge_after_tool_turns <= 1);
+    assert_eq!(direct_inspection.strip_tools_after_nudge, 0);
+    assert!(direct_inspection.tool_round_nudge_after <= 1);
+    assert_eq!(direct_inspection.tool_round_strip_after_nudge, 0);
+    assert_eq!(direct_inspection.observation_only_round_nudge_after, 0);
+    assert_eq!(
+        direct_inspection.observation_only_round_strip_after_nudge,
+        0
+    );
+
+    let direct_utility = TurnExecutionProfile::DirectUtility(DirectUtilityProfile::CurrentTime)
+        .tightened_termination_config(&base)
+        .expect("direct utility tightens termination");
+    assert!(direct_utility.nudge_after_tool_turns <= 1);
+    assert_eq!(direct_utility.strip_tools_after_nudge, 0);
+    assert!(direct_utility.tool_round_nudge_after <= 1);
+    assert_eq!(direct_utility.tool_round_strip_after_nudge, 0);
+    assert_eq!(direct_utility.observation_only_round_nudge_after, 0);
+    assert_eq!(direct_utility.observation_only_round_strip_after_nudge, 0);
+
+    assert_eq!(
+        TurnExecutionProfile::Standard.tightened_termination_config(&base),
+        None
+    );
 }
 
 #[tokio::test]

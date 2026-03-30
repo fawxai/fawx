@@ -13,6 +13,7 @@ use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionP
 use crate::streaming::{StreamCallback, StreamEvent};
 use async_trait::async_trait;
 use fx_config::CapabilityMode;
+use fx_core::path::expand_tilde;
 use fx_core::self_modify::{classify_write_domain, WriteDomain};
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
@@ -345,20 +346,6 @@ fn observation_path_is_outside_workspace(path: &str, working_dir: &Path) -> bool
         classify_write_domain(&expanded, working_dir),
         WriteDomain::External
     )
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return std::env::var("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|_| PathBuf::from(path));
-    }
-    PathBuf::from(path)
 }
 
 fn emit_prompt(

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use fx_author::{BuildConfig, BuildResult};
+use fx_core::path::expand_tilde;
 use fx_skills::manifest::{
     validate_skill_name as validate_manifest_skill_name, Capability, ALL_CAPABILITIES,
 };
@@ -355,19 +356,6 @@ fn resolve_parent_dir(path: Option<&str>) -> Result<PathBuf> {
             Ok(cwd.join("skills"))
         }
     }
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {

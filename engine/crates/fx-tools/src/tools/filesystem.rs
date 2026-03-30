@@ -366,7 +366,7 @@ struct EditPlan {
 impl ToolContext {
     pub(crate) fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ReadFileArgs = parse_args(args)?;
-        let path = self.resolve_tool_path(&parsed.path)?;
+        let path = self.resolve_read_path(&parsed.path)?;
         let content = self.read_utf8_file(&path, Some(self.config.max_read_size))?;
         render_read_output(&content, parsed.offset, parsed.limit)
     }
@@ -428,9 +428,6 @@ impl ToolContext {
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(requested));
         }
-        if self.config.allow_outside_workspace_reads {
-            return self.resolve_observation_path(requested);
-        }
         validate_path(&self.working_dir, requested)
     }
 
@@ -453,6 +450,20 @@ impl ToolContext {
         let expanded_str = expanded
             .to_str()
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        self.jailed_path(expanded_str)
+    }
+
+    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf, String> {
+        let expanded = expand_tilde(requested);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        if !self.config.jail_to_working_dir {
+            return canonicalize_existing_or_parent(Path::new(expanded_str));
+        }
+        if self.config.allow_outside_workspace_reads {
+            return self.resolve_observation_path(expanded_str);
+        }
         self.jailed_path(expanded_str)
     }
 
