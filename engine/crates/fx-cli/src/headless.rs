@@ -1728,9 +1728,9 @@ impl HeadlessApp {
         ContextInfoDto::from_snapshot(&self.context_info_snapshot())
     }
 
-    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
+    pub fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         match self.runtime_info.read() {
-            Ok(info) => runtime_skill_summaries(&info),
+            Ok(info) => runtime_skill_summary_dtos(&info),
             Err(error) => {
                 tracing::warn!(error = %error, "runtime info lock poisoned");
                 Vec::new()
@@ -2295,9 +2295,6 @@ impl AppEngine for HeadlessApp {
 
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         HeadlessApp::skill_summaries(self)
-            .into_iter()
-            .map(SkillSummaryDto::from)
-            .collect()
     }
 
     fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
@@ -2643,16 +2640,20 @@ fn auth_provider_statuses(
     statuses.into_values().collect()
 }
 
-fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>, Vec<String>)> {
+fn runtime_skill_summary_dtos(info: &RuntimeInfo) -> Vec<SkillSummaryDto> {
     info.skills
         .iter()
-        .map(|skill| {
-            (
-                skill.name.clone(),
-                skill.description.clone().unwrap_or_default(),
-                skill.tool_names.clone(),
-                skill.capabilities.clone(),
-            )
+        .map(|skill| SkillSummaryDto {
+            name: skill.name.clone(),
+            description: skill.description.clone().unwrap_or_default(),
+            tools: skill.tool_names.clone(),
+            capabilities: skill.capabilities.clone(),
+            version: skill.version.clone(),
+            source: skill.source.clone(),
+            revision_hash: skill.revision_hash.clone(),
+            activated_at_ms: skill.activated_at_ms,
+            signature_status: skill.signature_status.clone(),
+            stale_source: skill.stale_source.clone(),
         })
         .collect()
 }

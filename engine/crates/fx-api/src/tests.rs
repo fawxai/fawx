@@ -196,7 +196,18 @@ impl AppEngine for HeadlessApp {
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         HeadlessApp::skill_summaries(self)
             .into_iter()
-            .map(SkillSummaryDto::from)
+            .map(|summary| SkillSummaryDto {
+                name: summary.name,
+                description: summary.description,
+                tools: summary.tools,
+                capabilities: summary.capabilities,
+                version: summary.version,
+                source: summary.source,
+                revision_hash: summary.revision_hash,
+                activated_at_ms: summary.activated_at_ms,
+                signature_status: summary.signature_status,
+                stale_source: summary.stale_source,
+            })
             .collect()
     }
 
@@ -1693,6 +1704,13 @@ mod routing_and_status {
                     description: (*description).map(ToString::to_string),
                     tool_names: tools.iter().map(ToString::to_string).collect(),
                     capabilities: Vec::new(),
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
                 },
             )
             .collect();

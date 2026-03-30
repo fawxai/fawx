@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::startup;
+use fx_loadable::{write_source_metadata, SkillSource};
 use fx_marketplace::{InstalledSkill, SkillEntry};
 
 /// Resolve the Fawx data directory.
@@ -79,6 +80,16 @@ pub fn search_output(query: &str) -> anyhow::Result<String> {
 pub fn install_output(name: &str) -> anyhow::Result<String> {
     let config = build_config()?;
     let result = fx_marketplace::install(&config, name)?;
+    let publisher = fx_marketplace::search(&config, name)?
+        .into_iter()
+        .find(|entry| entry.name == result.name)
+        .map(|entry| entry.author)
+        .unwrap_or_else(|| "unknown".to_string());
+    let source = SkillSource::Published {
+        publisher,
+        registry_url: config.registry_url.clone(),
+    };
+    write_source_metadata(&result.install_path, &source).map_err(anyhow::Error::msg)?;
     Ok(format!(
         "Installing {name}...\n  Downloaded: {} KB\n  Signature: verified ✓\n  Installed to: {}",
         result.size_bytes / 1024,

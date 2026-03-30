@@ -299,7 +299,11 @@ enum AuditCommands {
 #[derive(Subcommand)]
 enum SkillCommands {
     /// List installed skills
-    List,
+    List {
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 
     /// Search the skill registry
     Search {
@@ -311,12 +315,18 @@ enum SkillCommands {
     Install {
         /// Skill name or path to WASM file
         name_or_path: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Remove a skill
     Remove {
         /// Skill name
         name: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Build a skill from source (compile, sign, install)
@@ -329,6 +339,25 @@ enum SkillCommands {
         /// Build only, don't install to ~/.fawx/skills/
         #[arg(long)]
         no_install: bool,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Show active skill lifecycle metadata
+    Status {
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Prepare a rollback to the previous active revision
+    Rollback {
+        /// Skill name
+        name: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Scaffold a new skill project
@@ -916,9 +945,12 @@ fn looks_like_local_skill_path(name_or_path: &str) -> bool {
     name_or_path.contains('/') || name_or_path.contains('\\') || name_or_path.ends_with(".wasm")
 }
 
-async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
+async fn dispatch_skill_install(
+    name_or_path: &str,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<i32> {
     if looks_like_local_skill_path(name_or_path) {
-        commands::skills::install(name_or_path).await?;
+        commands::skills::install(name_or_path, data_dir).await?;
     } else {
         println!("{}", commands::marketplace::install_output(name_or_path)?);
     }
@@ -927,8 +959,8 @@ async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
 
 async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     match command {
-        SkillCommands::List => {
-            println!("{}", commands::marketplace::list_output()?);
+        SkillCommands::List { data_dir } => {
+            commands::skills::list(data_dir.as_deref()).await?;
             Ok(0)
         }
         SkillCommands::Search { query } => {
@@ -938,17 +970,32 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
             );
             Ok(0)
         }
-        SkillCommands::Install { name_or_path } => dispatch_skill_install(&name_or_path).await,
-        SkillCommands::Remove { name } => {
-            commands::skills::remove(&name).await?;
+        SkillCommands::Install {
+            name_or_path,
+            data_dir,
+        } => dispatch_skill_install(&name_or_path, data_dir.as_deref()).await,
+        SkillCommands::Remove { name, data_dir } => {
+            commands::skills::remove(&name, data_dir.as_deref()).await?;
             Ok(0)
         }
         SkillCommands::Build {
             path,
             no_sign,
             no_install,
+            data_dir,
         } => {
-            commands::skills::build(&path, no_sign, no_install)?;
+            commands::skills::build(&path, no_sign, no_install, data_dir.as_deref())?;
+            Ok(0)
+        }
+        SkillCommands::Status { data_dir } => {
+            println!("{}", commands::skills::status_output(data_dir.as_deref())?);
+            Ok(0)
+        }
+        SkillCommands::Rollback { name, data_dir } => {
+            println!(
+                "{}",
+                commands::skills::rollback(&name, data_dir.as_deref())?
+            );
             Ok(0)
         }
         SkillCommands::Create {
@@ -1395,7 +1442,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Skill {
-                command: SkillCommands::Install { name_or_path }
+                command: SkillCommands::Install { name_or_path, .. }
             }) if name_or_path == "github"
         ));
     }

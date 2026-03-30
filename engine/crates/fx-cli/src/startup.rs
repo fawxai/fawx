@@ -38,8 +38,8 @@ use fx_llm::{
 };
 use fx_loadable::watcher::{ReloadEvent, SkillWatcher};
 use fx_loadable::{
-    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillRegistry,
-    TransactionSkill,
+    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillLifecycleConfig,
+    SkillLifecycleManager, SkillRegistry, TransactionSkill,
 };
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
@@ -1096,19 +1096,20 @@ fn build_skill_registry(
         trusted_keys,
         require_signatures: config.security.require_signatures,
     };
-    match fx_loadable::wasm_skill::load_wasm_skills_from(
-        &skills_dir,
-        credential_provider.clone(),
-        &signature_policy,
-    ) {
-        Ok(wasm_skills) => {
-            for skill in wasm_skills {
-                registry.register(skill);
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: failed to load WASM skills: {e}");
-        }
+    let lifecycle = Arc::new(Mutex::new(SkillLifecycleManager::new(
+        SkillLifecycleConfig {
+            skills_dir: skills_dir.clone(),
+            registry: Arc::clone(&registry),
+            credential_provider: credential_provider.clone(),
+            signature_policy: signature_policy.clone(),
+        },
+    )));
+    if let Err(error) = lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .load_startup_skills()
+    {
+        eprintln!("warning: failed to load WASM skills: {error}");
     }
 
     // Register cron/scheduler skill.
@@ -1139,9 +1140,8 @@ fn build_skill_registry(
     start_skill_watcher(
         skills_dir,
         Arc::clone(&registry),
+        lifecycle,
         Arc::clone(&runtime_info),
-        credential_provider.clone(),
-        signature_policy.clone(),
     );
 
     SkillRegistryBundle {
@@ -1165,9 +1165,8 @@ fn build_skill_registry(
 fn start_skill_watcher(
     skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
+    lifecycle: Arc<Mutex<SkillLifecycleManager>>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
-    signature_policy: SignaturePolicy,
 ) {
     if let Err(error) = fs::create_dir_all(&skills_dir) {
         tracing::warn!(path = %skills_dir.display(), error = %error, "failed to create skills directory for watcher");
@@ -1180,13 +1179,7 @@ fn start_skill_watcher(
     };
 
     let (reload_event_tx, reload_event_rx) = mpsc::channel(32);
-    let mut skill_watcher = SkillWatcher::new(
-        skills_dir,
-        Arc::clone(&registry),
-        reload_event_tx,
-        credential_provider,
-        signature_policy,
-    );
+    let mut skill_watcher = SkillWatcher::new(skills_dir, lifecycle, reload_event_tx);
     skill_watcher.initialize_hashes();
     handle.spawn(handle_skill_reload_events(
         reload_event_rx,
@@ -1216,15 +1209,27 @@ fn log_skill_reload_event(event: &ReloadEvent) {
         ReloadEvent::Loaded {
             skill_name,
             version,
-        } => tracing::info!(skill = %skill_name, version = %version, "skill hot-loaded"),
+            revision,
+            source,
+        } => tracing::info!(
+            skill = %skill_name,
+            version = %version,
+            revision = %revision,
+            source = %source,
+            "skill hot-loaded"
+        ),
         ReloadEvent::Updated {
             skill_name,
             old_version,
             new_version,
+            revision,
+            source,
         } => tracing::info!(
             skill = %skill_name,
             old_version = %old_version,
             new_version = %new_version,
+            revision = %revision,
+            source = %source,
             "skill hot-reloaded"
         ),
         ReloadEvent::Removed { skill_name } => {
@@ -1552,13 +1557,20 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
 
 fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &SkillRegistry) {
     let skills = registry
-        .skill_summaries()
+        .skill_statuses()
         .into_iter()
-        .map(|(name, description, tool_names, capabilities)| SkillInfo {
-            name,
-            description: Some(description),
-            tool_names,
-            capabilities,
+        .map(|status| SkillInfo {
+            name: status.name,
+            description: Some(status.description),
+            tool_names: status.tool_names,
+            capabilities: status.capabilities,
+            version: Some(status.activation.revision.version),
+            source: Some(status.activation.source.display()),
+            revision_hash: Some(status.activation.revision.content_hash),
+            manifest_hash: Some(status.activation.revision.manifest_hash),
+            activated_at_ms: Some(status.activation.activated_at),
+            signature_status: Some(status.activation.revision.signature.display()),
+            stale_source: status.source_drift.map(|drift| drift.to_string()),
         })
         .collect::<Vec<_>>();
 

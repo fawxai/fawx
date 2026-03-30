@@ -18,6 +18,20 @@ pub struct SkillInfo {
     pub tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
