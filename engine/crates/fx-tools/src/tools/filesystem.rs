@@ -4,17 +4,14 @@ use super::{
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
 use fx_core::path::expand_tilde;
-use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RECURSION_DEPTH: usize = 5;
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
@@ -482,17 +479,9 @@ impl ToolContext {
         String::from_utf8(bytes).map_err(|_| "file appears to be binary".to_string())
     }
 
-    fn apply_write_policy(&self, path: &Path, content: &str) -> Result<Option<String>, String> {
+    fn apply_write_policy(&self, _path: &Path, content: &str) -> Result<Option<String>, String> {
         self.check_max_file_size(content.len())?;
-        let Some(ref config) = self.self_modify else {
-            return Ok(None);
-        };
-        let tier = classify_path(path, &self.working_dir, config);
-        match tier {
-            PathTier::Deny => Err(deny_tier_message(path, tier)),
-            PathTier::Propose => self.write_proposal(path, content, config).map(Some),
-            PathTier::Allow => Ok(None),
-        }
+        Ok(None)
     }
 
     fn check_max_file_size(&self, len: usize) -> Result<(), String> {
@@ -500,39 +489,6 @@ impl ToolContext {
             return Err("content exceeds maximum allowed size".to_string());
         }
         Ok(())
-    }
-
-    fn write_proposal(
-        &self,
-        path: &Path,
-        content: &str,
-        config: &SelfModifyConfig,
-    ) -> Result<String, String> {
-        let proposal = self.build_proposal(path, content)?;
-        let writer = ProposalWriter::new(config.proposals_dir.clone());
-        let proposal_path = writer.write(&proposal).map_err(|error| error.to_string())?;
-        Ok(format!(
-            "Proposal created at {}. The target file '{}' was NOT modified. \
-             A human must review and approve this proposal.",
-            proposal_path.display(),
-            path.display()
-        ))
-    }
-
-    fn build_proposal(&self, path: &Path, content: &str) -> Result<Proposal, String> {
-        let filename = proposal_filename(path);
-        let action = proposal_action(path);
-        let file_hash = current_file_hash(&self.working_dir, path)
-            .map_err(|error| format!("failed to inspect target file: {error}"))?;
-        Ok(Proposal {
-            title: format!("Modify {filename}"),
-            description: proposal_description(path, content.len(), action),
-            target_path: path.to_path_buf(),
-            proposed_content: build_proposed_content(path, content),
-            risk: proposal_risk(),
-            timestamp: proposal_timestamp()?,
-            file_hash,
-        })
     }
 
     fn list_flat(&self, path: &Path) -> Result<String, String> {
@@ -677,63 +633,11 @@ impl ToolContext {
     }
 }
 
-fn build_proposed_content(path: &Path, content: &str) -> String {
-    let original = if path.exists() {
-        Some(fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string()))
-    } else {
-        None
-    };
-    build_proposal_content(original.as_deref(), content)
-}
-
-fn proposal_timestamp() -> Result<u64, String> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system time error: {error}"))
-        .map(|duration| duration.as_secs())
-}
-
-fn proposal_filename(path: &Path) -> &str {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-}
-
-fn proposal_action(path: &Path) -> &'static str {
-    if path.exists() {
-        "replace"
-    } else {
-        "create"
-    }
-}
-
-fn proposal_description(path: &Path, content_len: usize, action: &str) -> String {
-    format!(
-        "Agent attempted to {} propose-tier path: {} ({} bytes)",
-        action,
-        path.display(),
-        content_len
-    )
-}
-
-fn proposal_risk() -> String {
-    "This path is classified as propose-tier under self-modification policy.".to_string()
-}
-
 fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(path, content.as_bytes()).map_err(|error| error.to_string())
-}
-
-fn deny_tier_message(path: &Path, tier: PathTier) -> String {
-    format_tier_violation(path, tier).unwrap_or_else(|| {
-        format!(
-            "Self-modify policy violation [deny]: {}. This path cannot be modified.",
-            path.display()
-        )
-    })
 }
 
 fn validate_edit_args(args: &EditFileArgs) -> Result<(), String> {

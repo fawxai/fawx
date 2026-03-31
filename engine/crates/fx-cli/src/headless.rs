@@ -4814,6 +4814,7 @@ mod tests {
                 max_history: 20,
                 memory_enabled: false,
             },
+            authority: None,
             version: "test".to_string(),
         }))
     }

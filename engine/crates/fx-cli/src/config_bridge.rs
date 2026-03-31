@@ -1,7 +1,7 @@
 //! Bridge between fx-config CLI types and fx-core domain types.
 
-use fx_config::{CapabilityMode, PermissionAction, PermissionsConfig, SelfModifyCliConfig};
-use fx_core::self_modify::{SelfModifyConfig, KERNEL_SOURCE_PATH_PATTERNS};
+use fx_config::{PermissionsConfig, SelfModifyCliConfig};
+use fx_core::self_modify::SelfModifyConfig;
 
 pub fn to_core_self_modify(cli: &SelfModifyCliConfig) -> SelfModifyConfig {
     SelfModifyConfig {
@@ -20,54 +20,20 @@ pub fn to_core_self_modify(cli: &SelfModifyCliConfig) -> SelfModifyConfig {
 
 /// Build the effective self-modify policy for the current session.
 ///
-/// In capability mode, the action-level permissions are the source of truth for
-/// whether self-modification is allowed. The standalone `[self_modify]` toggle
-/// and path tiers should not silently narrow an explicitly granted
-/// `self_modify` capability. Sovereign runtime protections remain enforced by
-/// compiled proposal-gate invariants (Tier 3 / kernel-blind), not by this
-/// config bridge.
+/// The self-modify config is the canonical source of path-policy truth.
+/// Presentation mode and granted capabilities may change how the user is asked,
+/// but they must not silently rewrite the path tiers the resolver evaluates.
 pub fn effective_self_modify_config(
     cli: &SelfModifyCliConfig,
-    permissions: &PermissionsConfig,
+    _permissions: &PermissionsConfig,
 ) -> SelfModifyConfig {
-    let mut core = to_core_self_modify(cli);
-
-    if permissions.mode != CapabilityMode::Capability {
-        return core;
-    }
-
-    if permissions
-        .unrestricted
-        .contains(&PermissionAction::SelfModify)
-    {
-        core.enabled = true;
-        core.allow_paths = vec!["**".to_string()];
-        core.propose_paths.clear();
-        return core;
-    }
-
-    if permissions
-        .unrestricted
-        .contains(&PermissionAction::KernelModify)
-    {
-        core.enabled = true;
-        for pattern in KERNEL_SOURCE_PATH_PATTERNS {
-            let pattern = (*pattern).to_string();
-            if !core.allow_paths.contains(&pattern) {
-                core.allow_paths.push(pattern);
-            }
-        }
-        core.propose_paths
-            .retain(|pattern| !KERNEL_SOURCE_PATH_PATTERNS.contains(&pattern.as_str()));
-    }
-
-    core
+    to_core_self_modify(cli)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_config::{PermissionsConfig, SelfModifyPathsCliConfig};
+    use fx_config::{CapabilityMode, PermissionsConfig, SelfModifyPathsCliConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -108,18 +74,18 @@ mod tests {
     }
 
     #[test]
-    fn capability_mode_unrestricted_self_modify_overrides_disabled_cli_toggle() {
+    fn effective_self_modify_config_preserves_disabled_cli_toggle() {
         let cli = SelfModifyCliConfig::default();
 
         let core = effective_self_modify_config(&cli, &PermissionsConfig::power());
 
-        assert!(core.enabled);
-        assert_eq!(core.allow_paths, vec!["**"]);
+        assert!(!core.enabled);
+        assert!(core.allow_paths.is_empty());
         assert!(core.propose_paths.is_empty());
     }
 
     #[test]
-    fn capability_mode_unrestricted_self_modify_does_not_keep_path_narrowing() {
+    fn effective_self_modify_config_preserves_explicit_path_policy_in_capability_mode() {
         let cli = SelfModifyCliConfig {
             enabled: true,
             paths: SelfModifyPathsCliConfig {
@@ -133,8 +99,8 @@ mod tests {
         let core = effective_self_modify_config(&cli, &PermissionsConfig::power());
 
         assert!(core.enabled);
-        assert_eq!(core.allow_paths, vec!["**"]);
-        assert!(core.propose_paths.is_empty());
+        assert_eq!(core.allow_paths, vec!["skills/**"]);
+        assert_eq!(core.propose_paths, vec!["engine/**"]);
         assert_eq!(core.deny_paths, vec![".git/**"]);
     }
 
@@ -161,25 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn capability_mode_kernel_modify_does_not_widen_self_modify_surface() {
+    fn capability_mode_and_prompt_mode_share_the_same_path_policy_truth() {
         let cli = SelfModifyCliConfig::default();
-        let mut permissions = PermissionsConfig {
-            preset: fx_config::PermissionPreset::Custom,
-            unrestricted: Vec::new(),
-            proposal_required: Vec::new(),
-            ..PermissionsConfig::default()
-        };
-        permissions.mode = CapabilityMode::Capability;
-        permissions.unrestricted = vec![PermissionAction::KernelModify];
+        let capability = effective_self_modify_config(&cli, &PermissionsConfig::power());
+        let mut prompt_permissions = PermissionsConfig::power();
+        prompt_permissions.mode = CapabilityMode::Prompt;
+        let prompt = effective_self_modify_config(&cli, &prompt_permissions);
 
-        let core = effective_self_modify_config(&cli, &permissions);
-
-        assert!(core.enabled);
-        assert!(core
-            .allow_paths
-            .iter()
-            .any(|p| p == "**/engine/crates/fx-kernel/**"));
-        assert!(!core.allow_paths.iter().any(|p| p == "**"));
-        assert!(core.propose_paths.is_empty());
+        assert_eq!(capability, prompt);
     }
 }

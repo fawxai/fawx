@@ -858,8 +858,35 @@ mod tests {
                 max_history: 128,
                 memory_enabled: true,
             },
+            authority: None,
             version: "0.1.0".to_string(),
         }))
+    }
+
+    fn sample_runtime_info_with_authority(model: &str) -> Arc<RwLock<RuntimeInfo>> {
+        let runtime = sample_runtime_info(model);
+        runtime.write().expect("runtime lock").authority =
+            Some(fx_core::runtime_info::AuthorityRuntimeInfo {
+                resolver: "unified".to_string(),
+                approval_scope: "classified_request_identity".to_string(),
+                path_policy_source: "self_modify_config".to_string(),
+                capability_mode_mutates_path_policy: false,
+                kernel_blind_enabled: true,
+                sovereign_boundary_enforced: true,
+                active_session_approvals: 1,
+                active_proposal_override: Some("proposal-1".to_string()),
+                recent_decisions: vec![fx_core::runtime_info::AuthorityDecisionInfo {
+                    tool_name: "write_file".to_string(),
+                    capability: "file_write".to_string(),
+                    effect: "write".to_string(),
+                    target_kind: "path".to_string(),
+                    domain: "project".to_string(),
+                    target_summary: "README.md".to_string(),
+                    verdict: "prompt".to_string(),
+                    reason: "approval required by permission policy".to_string(),
+                }],
+            });
+        runtime
     }
 
     fn parse_json_output(output: &str) -> serde_json::Value {
@@ -1580,7 +1607,7 @@ three
     }
 
     #[test]
-    fn edit_file_denied_by_self_modify() {
+    fn edit_file_does_not_self_enforce_authority_policy() {
         let temp = TempDir::new().expect("temp");
         fs::write(temp.path().join("secret.txt"), "alpha").expect("write");
         let config = SelfModifyConfig {
@@ -1591,18 +1618,22 @@ three
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_self_modify(config);
 
-        let error = executor
+        let result = executor
             .handle_edit_file(&serde_json::json!({
                 "path": "secret.txt",
                 "old_text": "alpha",
                 "new_text": "beta"
             }))
-            .expect_err("edit should fail");
-        assert!(error.contains("Self-modify policy violation [deny]"));
+            .expect("edit should succeed");
+        assert!(result.contains("Successfully edited"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("secret.txt")).expect("read"),
+            "beta"
+        );
     }
 
     #[test]
-    fn edit_file_propose_tier_creates_proposal_without_modifying_target() {
+    fn edit_file_does_not_create_proposal_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -1628,14 +1659,14 @@ three
                 "old_text": "old",
                 "new_text": "new"
             }))
-            .expect("proposal");
-        assert!(message.contains("Proposal created"));
+            .expect("edit should succeed");
+        assert!(message.contains("Successfully edited"));
         assert_eq!(
             fs::read_to_string(kernel_dir.join("loop.rs")).expect("read"),
-            "fn old() {}
+            "fn new() {}
 "
         );
-        assert!(proposals_dir.exists());
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
@@ -3370,7 +3401,7 @@ three
     }
 
     #[test]
-    fn write_file_denied_by_self_modify() {
+    fn write_file_does_not_self_enforce_authority_policy() {
         let temp = TempDir::new().expect("temp");
         let config = SelfModifyConfig {
             enabled: true,
@@ -3381,14 +3412,15 @@ three
             .with_self_modify(config);
         let result = executor
             .handle_write_file(&serde_json::json!({"path": "secret.txt", "content": "data"}));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Self-modify policy violation [deny]"));
+        assert!(result.is_ok());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("secret.txt")).expect("read"),
+            "data"
+        );
     }
 
     #[test]
-    fn write_file_propose_tier_creates_markdown_and_sidecar() {
+    fn write_file_does_not_create_proposal_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -3404,26 +3436,17 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn tick() {}"}),
             )
-            .expect("propose tier should create proposal");
-        assert!(message.contains("Proposal created"));
-        assert!(message.contains("NOT modified"));
-        assert!(proposals_dir.exists());
-
-        let proposal_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
-            .expect("markdown proposal");
-        let content = fs::read_to_string(&proposal_path).expect("read proposal");
-        assert!(content.contains("# Proposal:"));
-        assert!(content.contains("fn tick() {}"));
-        assert!(content.contains("kernel/loop.rs") || content.contains("loop.rs"));
-        assert!(proposal_path.with_extension("json").exists());
+            .expect("write should succeed");
+        assert!(message.contains("wrote"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("kernel/loop.rs")).expect("read"),
+            "fn tick() {}"
+        );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
-    fn write_file_propose_tier_includes_original_in_proposal() {
+    fn write_file_updates_target_instead_of_writing_proposal_payload() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -3441,34 +3464,16 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
             )
-            .expect("propose should succeed");
-        let proposal_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .next()
-            .expect("entry")
-            .expect("entry read")
-            .path();
-        let proposal = fs::read_to_string(proposal_path).expect("read proposal");
-        assert!(
-            proposal.contains("fn old() {}"),
-            "missing original: {proposal}"
+            .expect("write should succeed");
+        assert_eq!(
+            fs::read_to_string(kernel_dir.join("loop.rs")).expect("read target"),
+            "fn new() {}"
         );
-        assert!(
-            proposal.contains("fn new() {}"),
-            "missing proposed: {proposal}"
-        );
-        assert!(
-            proposal.contains("original"),
-            "missing original label: {proposal}"
-        );
-        assert!(
-            proposal.contains("proposed"),
-            "missing proposed label: {proposal}"
-        );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
-    fn write_file_propose_tier_records_target_hash_in_sidecar() {
+    fn write_file_does_not_emit_sidecar_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -3488,34 +3493,23 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
             )
-            .expect("propose should succeed");
+            .expect("write should succeed");
 
-        let sidecar_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .expect("sidecar proposal");
-        let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar");
-        let value: serde_json::Value = serde_json::from_str(&sidecar).expect("parse sidecar");
-
+        assert!(!proposals_dir.exists());
         assert_eq!(
-            value["file_hash_at_creation"],
-            serde_json::Value::String(format!(
-                "sha256:{}",
-                fx_propose::sha256_hex(b"fn old() {}\n")
-            ))
+            fs::read_to_string(&target).expect("read target"),
+            "fn new() {}"
         );
     }
 
     #[test]
-    fn write_file_propose_tier_does_not_modify_target() {
+    fn write_file_updates_target_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
             enabled: true,
             propose_paths: vec!["kernel/**".to_string()],
-            proposals_dir,
+            proposals_dir: proposals_dir.clone(),
             ..SelfModifyConfig::default()
         };
 
@@ -3533,9 +3527,10 @@ three
 
         let actual = fs::read_to_string(kernel_dir.join("loop.rs")).expect("read target");
         assert_eq!(
-            actual, "original content",
-            "target file should NOT be modified"
+            actual, "new content",
+            "target file should be updated directly when no kernel gate is present"
         );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
@@ -3905,6 +3900,25 @@ three
         assert_eq!(json["skills_loaded"], 1);
     }
 
+    #[test]
+    fn fawx_status_includes_authority_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec =
+            test_executor(temp.path()).with_runtime_info(sample_runtime_info_with_authority("m"));
+        let result = exec.handle_fawx_status().expect("status");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+
+        assert_eq!(json["authority"]["resolver"], "unified");
+        assert_eq!(
+            json["authority"]["approval_scope"],
+            "classified_request_identity"
+        );
+        assert_eq!(
+            json["authority"]["recent_decisions"][0]["verdict"],
+            "prompt"
+        );
+    }
+
     // ── kernel_manifest tests ─────────────────────────────────────────
 
     #[test]
@@ -3924,6 +3938,30 @@ three
         assert!(json["budget"]["max_llm_calls"].is_number());
         assert!(json.get("tripwire").is_none(), "must not expose tripwires");
         assert!(json.get("ripcord").is_none(), "must not expose ripcord");
+    }
+
+    #[test]
+    fn kernel_manifest_includes_authority_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = FawxConfig::default();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let manager = fx_config::manager::ConfigManager::from_config(config, config_path);
+        let exec = test_executor(temp.path())
+            .with_runtime_info(sample_runtime_info_with_authority("gpt-5.4"))
+            .with_config_manager(Arc::new(Mutex::new(manager)));
+        let result = exec.handle_kernel_manifest().expect("manifest");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+
+        assert_eq!(json["authority"]["resolver"], "unified");
+        assert_eq!(
+            json["authority"]["path_policy_source"],
+            "self_modify_config"
+        );
+        assert_eq!(
+            json["authority"]["recent_decisions"][0]["tool_name"],
+            "write_file"
+        );
     }
 
     #[test]

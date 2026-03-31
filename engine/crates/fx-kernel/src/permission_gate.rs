@@ -8,16 +8,14 @@ use crate::act::{
     ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
     ToolExecutor, ToolExecutorError, ToolResult,
 };
+use crate::authority::{AuthorityCoordinator, AuthorityDecision, AuthorityVerdict};
 use crate::cancellation::CancellationToken;
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionPromptState};
 use crate::streaming::{StreamCallback, StreamEvent};
 use async_trait::async_trait;
 use fx_config::CapabilityMode;
-use fx_core::path::expand_tilde;
-use fx_core::self_modify::{classify_write_domain, WriteDomain};
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -76,7 +74,7 @@ impl PermissionPolicy {
         }
     }
 
-    fn requires_asking(&self, category: &str) -> bool {
+    pub(crate) fn requires_asking(&self, category: &str) -> bool {
         if self.unrestricted.contains(category) {
             return false;
         }
@@ -95,10 +93,9 @@ fn to_set(items: &[&str]) -> HashSet<String> {
 /// Executor wrapper that checks action-level permissions before tool execution.
 pub struct PermissionGateExecutor<T: ToolExecutor> {
     inner: T,
-    permissions: PermissionPolicy,
+    authority: Arc<AuthorityCoordinator>,
     prompt_state: Arc<PermissionPromptState>,
     stream_callback: Arc<std::sync::Mutex<Option<StreamCallback>>>,
-    working_dir: Option<PathBuf>,
 }
 
 impl<T: ToolExecutor> std::fmt::Debug for PermissionGateExecutor<T> {
@@ -110,21 +107,15 @@ impl<T: ToolExecutor> std::fmt::Debug for PermissionGateExecutor<T> {
 impl<T: ToolExecutor> PermissionGateExecutor<T> {
     pub fn new(
         inner: T,
-        permissions: PermissionPolicy,
+        authority: Arc<AuthorityCoordinator>,
         prompt_state: Arc<PermissionPromptState>,
     ) -> Self {
         Self {
             inner,
-            permissions,
+            authority,
             prompt_state,
             stream_callback: Arc::new(std::sync::Mutex::new(None)),
-            working_dir: None,
         }
-    }
-
-    pub fn with_working_dir(mut self, working_dir: PathBuf) -> Self {
-        self.working_dir = Some(working_dir);
-        self
     }
 
     /// Replace the shared callback slot used for SSE stream events.
@@ -193,7 +184,7 @@ impl<T: ToolExecutor> ToolExecutor for PermissionGateExecutor<T> {
     }
 
     fn action_category(&self, call: &ToolCall) -> &'static str {
-        self.action_category_for_call(call)
+        self.inner.action_category(call)
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
@@ -249,71 +240,60 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
         call: &ToolCall,
         cancel: Option<&CancellationToken>,
     ) -> PermissionCheck {
-        let category = self.action_category_for_call(call);
-
-        if !self.permissions.requires_asking(category) {
-            return PermissionCheck::Allowed;
-        }
-
-        if self.prompt_state.is_session_allowed(&call.name) {
-            return PermissionCheck::Allowed;
-        }
-
-        match self.permissions.mode {
-            CapabilityMode::Capability => {
-                PermissionCheck::Denied(capability_denied_result(call, category))
+        let decision = self.authority_decision(call);
+        match decision.verdict {
+            AuthorityVerdict::Allow | AuthorityVerdict::Propose => {
+                self.authority.cache_decision(&call.id, decision, false);
+                PermissionCheck::Allowed
             }
-            CapabilityMode::Prompt => self.ask_permission(call, category, cancel).await,
+            AuthorityVerdict::Deny => {
+                PermissionCheck::Denied(capability_denied_result(call, &decision))
+            }
+            AuthorityVerdict::Prompt => self.ask_permission(call, decision, cancel).await,
         }
     }
 
-    fn action_category_for_call(&self, call: &ToolCall) -> &'static str {
-        if matches!(
-            call.name.as_str(),
-            "write_file" | "create_file" | "edit_file"
-        ) {
-            if let (Some(working_dir), Some(path)) =
-                (self.working_dir.as_deref(), extract_path_argument(call))
-            {
-                return classify_write_domain(Path::new(path), working_dir).permission_category();
-            }
-        }
-
-        if matches!(
-            call.name.as_str(),
-            "read_file" | "list_directory" | "search_text"
-        ) {
-            if let (Some(working_dir), Some(path)) =
-                (self.working_dir.as_deref(), extract_path_argument(call))
-            {
-                if observation_path_is_outside_workspace(path, working_dir) {
-                    return "outside_workspace";
-                }
-            }
-        }
-
-        self.inner.action_category(call)
+    fn authority_decision(&self, call: &ToolCall) -> AuthorityDecision {
+        let fallback = self.inner.action_category(call);
+        let request = self.authority.classify_call(call, fallback);
+        let session_approved = self
+            .prompt_state
+            .is_session_allowed(&request.approval_scope());
+        let decision = self.authority.resolve_request(request, session_approved);
+        self.authority
+            .publish_runtime_info(self.prompt_state.session_override_count());
+        decision
     }
 
     async fn ask_permission(
         &self,
         call: &ToolCall,
-        category: &str,
+        decision: AuthorityDecision,
         cancel: Option<&CancellationToken>,
     ) -> PermissionCheck {
-        let prompt = build_prompt(call, category);
+        let prompt = build_prompt(call, &decision);
         let prompt_id = prompt.id.clone();
+        let scope = decision.request.approval_scope();
 
-        let receiver = match self.prompt_state.register(prompt_id, call.name.clone()) {
+        let receiver = match self
+            .prompt_state
+            .register(prompt_id, scope, call.name.clone())
+        {
             Ok(Some(rx)) => rx,
-            Ok(None) => return PermissionCheck::Allowed,
+            Ok(None) => {
+                self.authority.cache_decision(&call.id, decision, true);
+                return PermissionCheck::Allowed;
+            }
             Err(_) => {
                 return PermissionCheck::Denied(denied_result(call, "Permission system error"))
             }
         };
 
         emit_prompt(&self.stream_callback, prompt);
-        await_decision(call, receiver, cancel).await
+        let result = await_decision(call, receiver, cancel, &self.authority, decision).await;
+        self.authority
+            .publish_runtime_info(self.prompt_state.session_override_count());
+        result
     }
 }
 
@@ -322,30 +302,16 @@ enum PermissionCheck {
     Denied(ToolResult),
 }
 
-fn build_prompt(call: &ToolCall, category: &str) -> PermissionPrompt {
+fn build_prompt(call: &ToolCall, decision: &AuthorityDecision) -> PermissionPrompt {
     PermissionPrompt {
         id: generate_prompt_id(),
         tool: call.name.clone(),
-        title: format!("Allow {category}"),
+        title: format!("Allow {}", decision.request.capability),
         reason: extract_reason(call),
         request_summary: extract_summary(call),
         session_scoped_allow_available: true,
         expires_at: unix_now() + PROMPT_TIMEOUT_SECONDS,
     }
-}
-
-fn extract_path_argument(call: &ToolCall) -> Option<&str> {
-    call.arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-}
-
-fn observation_path_is_outside_workspace(path: &str, working_dir: &Path) -> bool {
-    let expanded = expand_tilde(path);
-    matches!(
-        classify_write_domain(&expanded, working_dir),
-        WriteDomain::External
-    )
 }
 
 fn emit_prompt(
@@ -366,6 +332,8 @@ async fn await_decision(
     call: &ToolCall,
     receiver: tokio::sync::oneshot::Receiver<PermissionDecision>,
     cancel: Option<&CancellationToken>,
+    authority: &Arc<AuthorityCoordinator>,
+    decision: AuthorityDecision,
 ) -> PermissionCheck {
     let timeout = Duration::from_secs(PROMPT_TIMEOUT_SECONDS);
     let result = match cancel {
@@ -389,6 +357,7 @@ async fn await_decision(
 
     match result {
         Ok(PermissionDecision::Allow | PermissionDecision::AllowSession) => {
+            authority.cache_decision(&call.id, decision, true);
             PermissionCheck::Allowed
         }
         Ok(PermissionDecision::Deny) => {
@@ -416,8 +385,13 @@ fn assemble_results(
     indexed.into_iter().map(|(_, result)| result).collect()
 }
 
-fn capability_denied_result(call: &ToolCall, category: &str) -> ToolResult {
-    let message = match category {
+fn capability_denied_result(call: &ToolCall, decision: &AuthorityDecision) -> ToolResult {
+    let message = match decision.reason.as_str() {
+        "kernel blind invariant" => "DENIED: This file is not available.",
+        "sovereign write boundary" => {
+            "DENIED: This action requires elevated privileges not available in this session."
+        }
+        _ => match decision.request.capability.as_str() {
         "network_listen" | "outbound_message" => {
             "DENIED: This action is not available in this session. Request a capability grant or use an alternative approach."
         }
@@ -428,6 +402,7 @@ fn capability_denied_result(call: &ToolCall, category: &str) -> ToolResult {
             "DENIED: This action is outside the current session's permitted scope."
         }
         _ => "DENIED: This action is not permitted in the current session configuration.",
+        },
     };
     ToolResult {
         tool_call_id: call.id.clone(),
@@ -487,6 +462,10 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::AuthorityRequest;
+    use crate::proposal_gate::ProposalGateState;
+    use fx_core::self_modify::SelfModifyConfig;
+    use std::path::PathBuf;
 
     #[derive(Debug)]
     struct PassthroughExecutor;
@@ -599,10 +578,31 @@ mod tests {
         }
     }
 
+    fn test_authority(policy: PermissionPolicy, working_dir: &str) -> Arc<AuthorityCoordinator> {
+        Arc::new(AuthorityCoordinator::new(
+            policy,
+            ProposalGateState::new(
+                SelfModifyConfig::default(),
+                PathBuf::from(working_dir),
+                PathBuf::from("/tmp/fawx-proposals"),
+            ),
+        ))
+    }
+
+    fn test_executor(
+        policy: PermissionPolicy,
+        prompt_state: Arc<PermissionPromptState>,
+    ) -> PermissionGateExecutor<PassthroughExecutor> {
+        PermissionGateExecutor::new(
+            PassthroughExecutor,
+            test_authority(policy, "/Users/joseph"),
+            prompt_state,
+        )
+    }
+
     #[tokio::test]
     async fn unrestricted_tool_passes_through() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
+        let executor = test_executor(
             PermissionPolicy::allow_all(),
             Arc::new(PermissionPromptState::new()),
         );
@@ -620,8 +620,7 @@ mod tests {
     #[tokio::test]
     async fn capability_mode_silently_denies_restricted_tool() {
         let (captured_id, callback) = capture_prompt_id();
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
+        let executor = test_executor(
             cautious_policy(CapabilityMode::Capability),
             Arc::new(PermissionPromptState::new()),
         )
@@ -640,8 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn capability_mode_allows_unrestricted_tool() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
+        let executor = test_executor(
             cautious_policy(CapabilityMode::Capability),
             Arc::new(PermissionPromptState::new()),
         );
@@ -659,11 +657,7 @@ mod tests {
     async fn capability_mode_with_default_ask_disabled_allows_unknown_tool() {
         let mut policy = cautious_policy(CapabilityMode::Capability);
         policy.default_ask = false;
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            policy,
-            Arc::new(PermissionPromptState::new()),
-        );
+        let executor = test_executor(policy, Arc::new(PermissionPromptState::new()));
 
         let results = executor
             .execute_tools(&[test_call("current_time")], None)
@@ -677,9 +671,12 @@ mod tests {
 
     #[tokio::test]
     async fn capability_mode_session_override_still_works() {
+        let authority =
+            test_authority(cautious_policy(CapabilityMode::Capability), "/Users/joseph");
         let prompt_state = Arc::new(PermissionPromptState::new());
+        let request = authority.classify_call(&test_call("shell"), "shell");
         let receiver = prompt_state
-            .register("setup".into(), "shell".into())
+            .register("setup".into(), request.approval_scope(), "shell".into())
             .expect("register")
             .expect("receiver");
         prompt_state
@@ -687,11 +684,7 @@ mod tests {
             .expect("resolve");
         drop(receiver);
 
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            cautious_policy(CapabilityMode::Capability),
-            prompt_state,
-        );
+        let executor = PermissionGateExecutor::new(PassthroughExecutor, authority, prompt_state);
 
         let results = executor
             .execute_tools(&[test_call("shell")], None)
@@ -711,12 +704,8 @@ mod tests {
             Arc::clone(&captured_id),
             PermissionDecision::Allow,
         );
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            cautious_policy(CapabilityMode::Prompt),
-            prompt_state,
-        )
-        .with_stream_callback(callback);
+        let executor = test_executor(cautious_policy(CapabilityMode::Prompt), prompt_state)
+            .with_stream_callback(callback);
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
@@ -741,12 +730,8 @@ mod tests {
             Arc::clone(&captured_id),
             PermissionDecision::Deny,
         );
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            cautious_policy(CapabilityMode::Prompt),
-            prompt_state,
-        )
-        .with_stream_callback(callback);
+        let executor = test_executor(cautious_policy(CapabilityMode::Prompt), prompt_state)
+            .with_stream_callback(callback);
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
@@ -778,12 +763,8 @@ mod tests {
                 }
             }
         });
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            cautious_policy(CapabilityMode::Prompt),
-            prompt_state,
-        )
-        .with_stream_callback(callback);
+        let executor = test_executor(cautious_policy(CapabilityMode::Prompt), prompt_state)
+            .with_stream_callback(callback);
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
@@ -801,8 +782,7 @@ mod tests {
 
     #[test]
     fn action_category_delegates_to_inner_executor() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
+        let executor = test_executor(
             PermissionPolicy::allow_all(),
             Arc::new(PermissionPromptState::new()),
         );
@@ -817,91 +797,58 @@ mod tests {
     }
 
     #[test]
-    fn action_category_for_write_call_uses_project_domain() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph"));
+    fn authority_request_uses_project_write_capability() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
+        let request =
+            authority.classify_call(&write_call("/Users/joseph/project/file.txt"), "file_write");
 
-        let category =
-            executor.action_category_for_call(&write_call("/Users/joseph/project/file.txt"));
-
-        assert_eq!(category, "file_write");
+        assert_eq!(request.capability, "file_write");
     }
 
     #[test]
-    fn action_category_for_write_call_uses_self_modify_domain() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph"));
+    fn authority_request_uses_self_modify_capability() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
+        let request = authority.classify_call(
+            &write_call("/Users/joseph/.fawx/skills/demo/SKILL.md"),
+            "file_write",
+        );
 
-        let category = executor
-            .action_category_for_call(&write_call("/Users/joseph/.fawx/skills/demo/SKILL.md"));
-
-        assert_eq!(category, "self_modify");
+        assert_eq!(request.capability, "self_modify");
     }
 
     #[test]
-    fn action_category_for_write_call_uses_kernel_modify_domain() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph"));
+    fn authority_request_uses_kernel_modify_capability() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
+        let request = authority.classify_call(
+            &write_call("/Users/joseph/fawx/engine/crates/fx-kernel/src/lib.rs"),
+            "file_write",
+        );
 
-        let category = executor.action_category_for_call(&write_call(
-            "/Users/joseph/fawx/engine/crates/fx-kernel/src/lib.rs",
-        ));
-
-        assert_eq!(category, "kernel_modify");
+        assert_eq!(request.capability, "kernel_modify");
     }
 
     #[test]
-    fn action_category_for_write_call_uses_outside_workspace_domain() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph/workspace"));
+    fn authority_request_uses_outside_workspace_capability_for_write() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph/workspace");
+        let request = authority.classify_call(&write_call("/etc/hosts"), "file_write");
 
-        let category = executor.action_category_for_call(&write_call("/etc/hosts"));
-
-        assert_eq!(category, "outside_workspace");
+        assert_eq!(request.capability, "outside_workspace");
     }
 
     #[test]
-    fn action_category_for_read_call_uses_outside_workspace_domain() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph"));
+    fn authority_request_uses_outside_workspace_capability_for_read() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
+        let request = authority.classify_call(&read_call("/etc/hosts"), "read_any");
 
-        let category = executor.action_category_for_call(&read_call("/etc/hosts"));
-
-        assert_eq!(category, "outside_workspace");
+        assert_eq!(request.capability, "outside_workspace");
     }
 
     #[test]
-    fn action_category_for_read_call_preserves_inner_category_within_workspace() {
-        let executor = PermissionGateExecutor::new(
-            PassthroughExecutor,
-            PermissionPolicy::allow_all(),
-            Arc::new(PermissionPromptState::new()),
-        )
-        .with_working_dir(PathBuf::from("/Users/joseph"));
+    fn authority_request_preserves_inner_category_for_workspace_read() {
+        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
+        let request = authority.classify_call(&read_call("~/notes.txt"), "read_any");
 
-        let category = executor.action_category_for_call(&read_call("~/notes.txt"));
-
-        assert_eq!(category, "read_any");
+        assert_eq!(request.capability, "read_any");
     }
 
     #[test]
@@ -917,7 +864,23 @@ mod tests {
     #[test]
     fn capability_denied_result_contains_category() {
         let call = test_call("delete_file");
-        let result = capability_denied_result(&call, "file_delete");
+        let decision = AuthorityDecision {
+            request: AuthorityRequest {
+                tool_name: "delete_file".to_string(),
+                capability: "file_delete".to_string(),
+                effect: crate::authority::AuthorityEffect::Delete,
+                target_kind: crate::authority::AuthorityTargetKind::Path,
+                domain: crate::authority::AuthorityDomain::Project,
+                target_summary: "README.md".to_string(),
+                target_identity: "README.md".to_string(),
+                paths: vec!["README.md".to_string()],
+                command: None,
+                invariant: None,
+            },
+            verdict: AuthorityVerdict::Deny,
+            reason: "capability mode denied restricted request".to_string(),
+        };
+        let result = capability_denied_result(&call, &decision);
 
         assert!(!result.success);
         assert!(result.output.contains("DENIED"));

@@ -275,6 +275,7 @@ fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
             max_history: 20,
             memory_enabled: false,
         },
+        authority: None,
         version: "test".to_string(),
     }))
 }

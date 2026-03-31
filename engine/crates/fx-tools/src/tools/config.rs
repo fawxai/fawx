@@ -303,6 +303,10 @@ impl ToolContext {
     }
 
     pub(crate) fn handle_fawx_status(&self) -> Result<String, String> {
+        let authority = self
+            .runtime_info
+            .as_ref()
+            .and_then(|info| info.read().ok().and_then(|guard| guard.authority.clone()));
         let status = serde_json::json!({
             "status": "running",
             "uptime_seconds": self.start_time.elapsed().as_secs(),
@@ -310,6 +314,7 @@ impl ToolContext {
             "memory_entries": self.memory_entry_count(),
             "skills_loaded": self.skills_loaded_count(),
             "sessions": self.active_session_count(),
+            "authority": authority,
         });
         serde_json::to_string_pretty(&status)
             .map_err(|error| format!("failed to format status: {error}"))
@@ -336,6 +341,7 @@ impl ToolContext {
             provider: &runtime.provider,
             preset: Some(config.permissions.preset.as_str()),
             permissions: &config.permissions,
+            authority: runtime.authority.as_ref(),
             budget: &budget,
             sandbox: &config.sandbox,
             self_modify_enabled: sm_enabled,

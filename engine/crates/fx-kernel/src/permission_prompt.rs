@@ -1,3 +1,4 @@
+use crate::authority::ApprovalScope;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -31,13 +32,14 @@ pub enum PermissionDecision {
 pub struct PermissionPromptState {
     pending: std::sync::Mutex<HashMap<String, PendingPrompt>>,
     resolved: std::sync::Mutex<HashMap<String, ResolvedEntry>>,
-    session_overrides: std::sync::Mutex<HashSet<String>>,
+    session_overrides: std::sync::Mutex<HashSet<ApprovalScope>>,
 }
 
 struct PendingPrompt {
     sender: oneshot::Sender<PermissionDecision>,
     created_at: Instant,
     tool: String,
+    scope: ApprovalScope,
 }
 
 struct ResolvedEntry {
@@ -59,13 +61,14 @@ impl PermissionPromptState {
     pub fn register(
         &self,
         id: String,
+        scope: ApprovalScope,
         tool: String,
     ) -> Result<Option<oneshot::Receiver<PermissionDecision>>, PromptError> {
         let overrides = self
             .session_overrides
             .lock()
             .map_err(|_| PromptError::Internal)?;
-        if overrides.contains(&tool) {
+        if overrides.contains(&scope) {
             return Ok(None);
         }
         drop(overrides);
@@ -79,6 +82,7 @@ impl PermissionPromptState {
                 sender,
                 created_at: Instant::now(),
                 tool,
+                scope,
             },
         );
         Ok(Some(receiver))
@@ -103,10 +107,11 @@ impl PermissionPromptState {
             return Err(PromptError::Expired);
         }
 
-        self.apply_session_override(&prompt.tool, decision)?;
+        self.apply_session_override(&prompt.scope, decision)?;
         let result = ResolveResult {
             decision,
             tool: prompt.tool.clone(),
+            scope: prompt.scope.clone(),
             session_override_applied: decision == PermissionDecision::AllowSession,
         };
         let _ = prompt.sender.send(decision);
@@ -115,11 +120,18 @@ impl PermissionPromptState {
     }
 
     /// Check if a tool is session-overridden.
-    pub fn is_session_allowed(&self, tool: &str) -> bool {
+    pub fn is_session_allowed(&self, scope: &ApprovalScope) -> bool {
         self.session_overrides
             .lock()
-            .map(|overrides| overrides.contains(tool))
+            .map(|overrides| overrides.contains(scope))
             .unwrap_or(false)
+    }
+
+    pub fn session_override_count(&self) -> usize {
+        self.session_overrides
+            .lock()
+            .map(|overrides| overrides.len())
+            .unwrap_or(0)
     }
 
     /// Clear all session overrides (call on session end).
@@ -136,7 +148,7 @@ impl PermissionPromptState {
 
     fn apply_session_override(
         &self,
-        tool: &str,
+        scope: &ApprovalScope,
         decision: PermissionDecision,
     ) -> Result<(), PromptError> {
         if decision != PermissionDecision::AllowSession {
@@ -147,7 +159,7 @@ impl PermissionPromptState {
             .session_overrides
             .lock()
             .map_err(|_| PromptError::Internal)?;
-        overrides.insert(tool.to_string());
+        overrides.insert(scope.clone());
         Ok(())
     }
 
@@ -189,6 +201,7 @@ impl Default for PermissionPromptState {
 pub struct ResolveResult {
     pub decision: PermissionDecision,
     pub tool: String,
+    pub scope: ApprovalScope,
     pub session_override_applied: bool,
 }
 
@@ -214,6 +227,18 @@ impl std::error::Error for PromptError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::{ApprovalScope, AuthorityDomain, AuthorityEffect, AuthorityTargetKind};
+
+    fn scope(identity: &str) -> ApprovalScope {
+        ApprovalScope {
+            tool_name: "shell".to_string(),
+            capability: "shell".to_string(),
+            effect: AuthorityEffect::Execute,
+            target_kind: AuthorityTargetKind::Command,
+            domain: AuthorityDomain::None,
+            target_identity: identity.to_string(),
+        }
+    }
 
     #[test]
     fn decision_serializes_as_snake_case() {
@@ -251,7 +276,7 @@ mod tests {
     fn state_register_and_resolve() {
         let state = PermissionPromptState::new();
         let receiver = state
-            .register("prompt-1".to_string(), "shell".to_string())
+            .register("prompt-1".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt")
             .expect("pending prompt");
 
@@ -261,6 +286,7 @@ mod tests {
 
         assert_eq!(result.decision, PermissionDecision::Allow);
         assert_eq!(result.tool, "shell");
+        assert_eq!(result.scope.target_identity, "ls");
         assert!(!result.session_override_applied);
         assert_eq!(receiver.blocking_recv(), Ok(PermissionDecision::Allow));
     }
@@ -269,7 +295,7 @@ mod tests {
     fn state_resolve_is_idempotent() {
         let state = PermissionPromptState::new();
         let _receiver = state
-            .register("p1".into(), "web_search".into())
+            .register("p1".into(), scope("web-search"), "web_search".into())
             .unwrap()
             .unwrap();
 
@@ -291,7 +317,7 @@ mod tests {
         .join();
 
         let error = state
-            .register("prompt-1".to_string(), "shell".to_string())
+            .register("prompt-1".to_string(), scope("ls"), "shell".to_string())
             .expect_err("poisoned pending lock should fail");
         assert_eq!(error, PromptError::Internal);
     }
@@ -309,7 +335,7 @@ mod tests {
     fn state_session_override_auto_allows() {
         let state = PermissionPromptState::new();
         let receiver = state
-            .register("prompt-1".to_string(), "shell".to_string())
+            .register("prompt-1".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt")
             .expect("pending prompt");
 
@@ -319,33 +345,59 @@ mod tests {
 
         assert_eq!(result.decision, PermissionDecision::AllowSession);
         assert!(result.session_override_applied);
-        assert!(state.is_session_allowed("shell"));
+        assert!(state.is_session_allowed(&scope("ls")));
         assert_eq!(
             receiver.blocking_recv(),
             Ok(PermissionDecision::AllowSession)
         );
         assert!(state
-            .register("prompt-2".to_string(), "shell".to_string())
+            .register("prompt-2".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt")
             .is_none());
+    }
+
+    #[test]
+    fn state_session_override_does_not_cover_different_request_identity() {
+        let state = PermissionPromptState::new();
+        let approved = scope("ls");
+        let different = scope("cat /etc/hosts");
+
+        let _receiver = state
+            .register(
+                "prompt-1".to_string(),
+                approved.clone(),
+                "shell".to_string(),
+            )
+            .expect("register prompt")
+            .expect("pending prompt");
+        state
+            .resolve("prompt-1", PermissionDecision::AllowSession)
+            .expect("resolve prompt");
+
+        assert!(state.is_session_allowed(&approved));
+        assert!(!state.is_session_allowed(&different));
+        assert!(state
+            .register("prompt-2".to_string(), different, "shell".to_string())
+            .expect("register prompt")
+            .is_some());
     }
 
     #[test]
     fn state_clear_session_overrides() {
         let state = PermissionPromptState::new();
         let _ = state
-            .register("prompt-1".to_string(), "shell".to_string())
+            .register("prompt-1".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt");
         state
             .resolve("prompt-1", PermissionDecision::AllowSession)
             .expect("resolve prompt");
-        assert!(state.is_session_allowed("shell"));
+        assert!(state.is_session_allowed(&scope("ls")));
 
         state.clear_session_overrides();
 
-        assert!(!state.is_session_allowed("shell"));
+        assert!(!state.is_session_allowed(&scope("ls")));
         assert!(state
-            .register("prompt-2".to_string(), "shell".to_string())
+            .register("prompt-2".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt")
             .is_some());
     }
@@ -354,7 +406,7 @@ mod tests {
     fn state_resolve_expired_returns_expired_and_sends_deny() {
         let state = PermissionPromptState::new();
         let receiver = state
-            .register("prompt-1".to_string(), "shell".to_string())
+            .register("prompt-1".to_string(), scope("ls"), "shell".to_string())
             .expect("register prompt")
             .expect("pending prompt");
         let mut pending = state.pending.lock().expect("lock pending");
