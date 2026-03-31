@@ -93,7 +93,7 @@ impl SkillWatcher {
             self.hashes.insert(
                 status.name,
                 SkillState {
-                    hash: status.activation.revision.content_hash,
+                    hash: status.activation.revision.revision_hash(),
                     version: status.activation.revision.version,
                 },
             );
@@ -230,7 +230,7 @@ impl SkillWatcher {
             return;
         }
 
-        let revision = current.revision.content_hash.clone();
+        let revision = current.revision.revision_hash();
         let source = current.source.display();
         let new_version = current.revision.version.clone();
         let event = if let Some(old) = previous {
@@ -564,7 +564,7 @@ mod tests {
         )
         .unwrap()
         .revision
-        .content_hash;
+        .revision_hash();
         assert_eq!(watcher.hashes.get("test_hash").unwrap().hash, expected);
     }
 
@@ -578,6 +578,28 @@ mod tests {
 
         watcher.initialize_hashes();
         assert_eq!(watcher.hashes.get("versioned").unwrap().version, "2.5.0");
+    }
+
+    #[test]
+    fn initialize_hashes_uses_reconciled_offline_revision_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        write_versioned_test_skill(tmp.path(), "weather", "1.0.0").unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        let lifecycle = new_lifecycle(tmp.path(), Arc::clone(&registry));
+        load_startup_skills(&lifecycle);
+
+        fs::write(
+            tmp.path().join("weather").join("manifest.toml"),
+            versioned_manifest_toml("weather", "2.0.0"),
+        )
+        .unwrap();
+
+        let (_registry, lifecycle, mut watcher, _rx) = new_watcher(tmp.path());
+        load_startup_skills(&lifecycle);
+
+        watcher.initialize_hashes();
+        assert_eq!(watcher.hashes.get("weather").unwrap().version, "2.0.0");
     }
 
     #[test]
@@ -730,6 +752,41 @@ mod tests {
             }
             other => panic!("expected Updated, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn process_skill_change_manifest_only_update_changes_revision_identity() {
+        let tmp = TempDir::new().unwrap();
+        write_versioned_test_skill(tmp.path(), "manifestonly", "1.0.0").unwrap();
+
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
+
+        watcher.process_skill_change("manifestonly").await;
+        let _ = rx.try_recv();
+        let old_hash = watcher.hashes.get("manifestonly").unwrap().hash.clone();
+
+        fs::write(
+            tmp.path().join("manifestonly").join("manifest.toml"),
+            versioned_manifest_toml("manifestonly", "2.0.0"),
+        )
+        .unwrap();
+
+        watcher.process_skill_change("manifestonly").await;
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            ReloadEvent::Updated {
+                new_version,
+                revision,
+                ..
+            } => {
+                assert_eq!(new_version, "2.0.0");
+                assert_ne!(revision, old_hash);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        assert_eq!(watcher.hashes.get("manifestonly").unwrap().version, "2.0.0");
+        assert_ne!(watcher.hashes.get("manifestonly").unwrap().hash, old_hash);
     }
 
     #[tokio::test]

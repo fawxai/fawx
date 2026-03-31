@@ -84,6 +84,18 @@ pub struct SkillRevision {
     pub staged_at: u64,
 }
 
+impl SkillRevision {
+    #[must_use]
+    pub fn revision_hash(&self) -> String {
+        hash_string(&format!(
+            "{}:{}:{}",
+            self.content_hash,
+            self.manifest_hash,
+            self.signature.display()
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillActivation {
     pub revision: SkillRevision,
@@ -170,13 +182,9 @@ impl SkillLifecycleManager {
         let skill_name = skill_dir_name(skill_dir)?;
         if let Some(active) = self.load_existing_activation(skill_dir)? {
             self.log_loaded_activation(&skill_name, &active.activation);
-            self.active.insert(skill_name, active);
-            return Ok(());
+            self.active.insert(skill_name.clone(), active);
         }
-
-        self.stage_from_source(skill_dir)?;
-        let _ = self.activate(skill_dir_name(skill_dir)?.as_str())?;
-        Ok(())
+        self.reconcile_startup_skill(skill_dir, &skill_name)
     }
 
     fn load_existing_activation(
@@ -187,7 +195,8 @@ impl SkillLifecycleManager {
         let Some(activation) = read_activation_record(&self.skills_dir, &skill_name)? else {
             return Ok(None);
         };
-        let revision_dir = revision_dir(&self.skills_dir, &skill_name, &activation.revision)?;
+        let revision_dir =
+            existing_revision_dir(&self.skills_dir, &skill_name, &activation.revision);
         let staged = load_revision_skill(
             &revision_dir,
             activation.source.clone(),
@@ -197,6 +206,28 @@ impl SkillLifecycleManager {
         self.registry
             .upsert_with_activation(skill_name.as_str(), staged.skill, activation.clone());
         Ok(Some(ActiveSkill { activation }))
+    }
+
+    fn reconcile_startup_skill(
+        &mut self,
+        skill_dir: &Path,
+        skill_name: &str,
+    ) -> Result<(), LifecycleError> {
+        match self.stage_from_source(skill_dir) {
+            Ok(_) => {
+                let _ = self.activate(skill_name)?;
+                Ok(())
+            }
+            Err(error) if self.active.contains_key(skill_name) => {
+                tracing::warn!(
+                    skill = %skill_name,
+                    error = %error,
+                    "failed to stage installed artifact on startup; continuing with persisted activation"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn stage_from_source(&mut self, skill_dir: &Path) -> Result<SkillRevision, LifecycleError> {
@@ -241,7 +272,7 @@ impl SkillLifecycleManager {
         let Some(previous) = current.activation.previous.clone() else {
             return Err(format!("skill '{name}' has no previous revision"));
         };
-        let previous_dir = revision_dir(&self.skills_dir, name, previous.as_ref())?;
+        let previous_dir = existing_revision_dir(&self.skills_dir, name, previous.as_ref());
         let source = read_revision_source(&previous_dir)?;
         let staged = load_revision_skill(
             &previous_dir,
@@ -280,8 +311,7 @@ impl SkillLifecycleManager {
 
     fn active_matches(&self, name: &str, staged: &StagedSkill) -> bool {
         self.active.get(name).is_some_and(|active| {
-            active.activation.revision.content_hash == staged.revision.content_hash
-                && active.activation.revision.manifest_hash == staged.revision.manifest_hash
+            active.activation.revision.revision_hash() == staged.revision.revision_hash()
                 && active.activation.source == staged.source
         })
     }
@@ -315,7 +345,7 @@ impl SkillLifecycleManager {
             skill = %name,
             source = %activation.source.display(),
             version = %activation.revision.version,
-            revision = %short_hash(&activation.revision.content_hash),
+            revision = %short_hash(&activation.revision.revision_hash()),
             signature = %activation.revision.signature.display(),
             "loaded active skill revision"
         );
@@ -392,7 +422,21 @@ pub fn revision_snapshot_dir(
 ) -> PathBuf {
     lifecycle_skill_dir(skills_dir, skill_name)
         .join(REVISIONS_DIR)
-        .join(revision.content_hash.clone())
+        .join(revision.revision_hash())
+}
+
+#[must_use]
+pub fn find_revision_snapshot_dir(
+    skills_dir: &Path,
+    skill_name: &str,
+    revision: &SkillRevision,
+) -> Option<PathBuf> {
+    let current = revision_snapshot_dir(skills_dir, skill_name, revision);
+    if current.exists() {
+        return Some(current);
+    }
+    let legacy = legacy_revision_snapshot_dir(skills_dir, skill_name, revision);
+    legacy.exists().then_some(legacy)
 }
 
 pub fn read_revision_source_metadata(revision_dir: &Path) -> Result<SkillSource, LifecycleError> {
@@ -455,7 +499,7 @@ fn load_source_skill(
 ) -> Result<StagedSkill, LifecycleError> {
     let artifact = load_wasm_artifact_from_dir(skill_dir, credential_provider, signature_policy)?;
     let name = artifact.skill.name().to_string();
-    let revision_dir = revision_dir(skills_dir, &name, &artifact.revision)?;
+    let revision_dir = revision_snapshot_dir(skills_dir, &name, &artifact.revision);
     persist_artifact_files(&revision_dir, &name, &artifact)?;
     Ok(StagedSkill {
         skill: Arc::new(artifact.skill),
@@ -581,14 +625,19 @@ fn is_lifecycle_dir(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(LIFECYCLE_DIR)
 }
 
-fn revision_dir(
+fn existing_revision_dir(skills_dir: &Path, skill_name: &str, revision: &SkillRevision) -> PathBuf {
+    find_revision_snapshot_dir(skills_dir, skill_name, revision)
+        .unwrap_or_else(|| revision_snapshot_dir(skills_dir, skill_name, revision))
+}
+
+fn legacy_revision_snapshot_dir(
     skills_dir: &Path,
     skill_name: &str,
     revision: &SkillRevision,
-) -> Result<PathBuf, LifecycleError> {
-    Ok(lifecycle_skill_dir(skills_dir, skill_name)
+) -> PathBuf {
+    lifecycle_skill_dir(skills_dir, skill_name)
         .join(REVISIONS_DIR)
-        .join(revision.content_hash.clone()))
+        .join(revision.content_hash.clone())
 }
 
 fn activation_path(skills_dir: &Path, skill_name: &str) -> PathBuf {
@@ -670,9 +719,22 @@ fn nibble_to_hex(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{invocable_wasm_bytes, test_manifest_toml, versioned_manifest_toml};
+    use crate::test_support::{
+        invocable_wasm_bytes, test_manifest_toml, versioned_manifest_toml, write_test_skill,
+        write_versioned_test_skill,
+    };
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn new_manager(skills_dir: &Path) -> SkillLifecycleManager {
+        SkillLifecycleManager::new(SkillLifecycleConfig {
+            skills_dir: skills_dir.to_path_buf(),
+            registry: Arc::new(SkillRegistry::new()),
+            credential_provider: None,
+            signature_policy: SignaturePolicy::default(),
+        })
+    }
 
     #[test]
     fn hash_string_is_deterministic() {
@@ -741,8 +803,55 @@ mod tests {
             staged_at: 10,
         };
 
-        let path = revision_dir(Path::new("/tmp/skills"), "weather", &revision).expect("dir");
-        assert!(path.ends_with(revision.content_hash));
+        let path = revision_snapshot_dir(Path::new("/tmp/skills"), "weather", &revision);
+        assert!(path.ends_with(revision.revision_hash()));
+    }
+
+    #[test]
+    fn revision_snapshot_dir_changes_when_manifest_changes() {
+        let original = SkillRevision {
+            content_hash: hash_string("content"),
+            manifest_hash: hash_string("manifest-a"),
+            version: "1.0.0".to_string(),
+            signature: SignatureStatus::Unsigned,
+            tool_contracts: Vec::new(),
+            staged_at: 10,
+        };
+        let updated = SkillRevision {
+            manifest_hash: hash_string("manifest-b"),
+            ..original.clone()
+        };
+
+        assert_ne!(original.revision_hash(), updated.revision_hash());
+        assert_ne!(
+            revision_snapshot_dir(Path::new("/tmp/skills"), "weather", &original),
+            revision_snapshot_dir(Path::new("/tmp/skills"), "weather", &updated)
+        );
+    }
+
+    #[test]
+    fn find_revision_snapshot_dir_supports_legacy_content_hash_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let revision = SkillRevision {
+            content_hash: hash_string("content"),
+            manifest_hash: hash_string("manifest"),
+            version: "1.0.0".to_string(),
+            signature: SignatureStatus::Unsigned,
+            tool_contracts: Vec::new(),
+            staged_at: 10,
+        };
+        let legacy_dir = tmp
+            .path()
+            .join(".fawx-lifecycle")
+            .join("weather")
+            .join("revisions")
+            .join(revision.content_hash.clone());
+        fs::create_dir_all(&legacy_dir).expect("create legacy dir");
+
+        let found = find_revision_snapshot_dir(tmp.path(), "weather", &revision)
+            .expect("expected legacy revision dir");
+
+        assert_eq!(found, legacy_dir);
     }
 
     #[test]
@@ -780,5 +889,108 @@ mod tests {
         assert!(revision_dir.join("manifest.toml").exists());
         assert!(revision_dir.join("weather.wasm").exists());
         assert!(revision_dir.join("weather.wasm.sig").exists());
+    }
+
+    #[test]
+    fn load_startup_skills_reconciles_offline_installed_updates() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_test_skill(tmp.path(), "weather").expect("write initial skill");
+
+        let initial = {
+            let mut manager = new_manager(tmp.path());
+            manager.load_startup_skills().expect("initial startup");
+            manager
+                .active("weather")
+                .cloned()
+                .expect("initial activation")
+        };
+
+        fs::write(
+            tmp.path().join("weather").join("manifest.toml"),
+            versioned_manifest_toml("weather", "2.0.0"),
+        )
+        .expect("write updated manifest");
+
+        let mut restarted = new_manager(tmp.path());
+        restarted.load_startup_skills().expect("restarted startup");
+        let active = restarted.active("weather").expect("reconciled activation");
+
+        assert_eq!(active.revision.version, "2.0.0");
+        assert_ne!(
+            active.revision.manifest_hash,
+            initial.revision.manifest_hash
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_preserves_lifecycle_metadata_after_offline_update() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_test_skill(tmp.path(), "weather").expect("write initial skill");
+
+        let initial = {
+            let mut manager = new_manager(tmp.path());
+            manager.load_startup_skills().expect("initial startup");
+            manager
+                .active("weather")
+                .cloned()
+                .expect("initial activation")
+        };
+
+        fs::write(
+            tmp.path().join("weather").join("manifest.toml"),
+            versioned_manifest_toml("weather", "2.0.0"),
+        )
+        .expect("write updated manifest");
+
+        let mut restarted = new_manager(tmp.path());
+        restarted.load_startup_skills().expect("restarted startup");
+        let active = restarted
+            .active("weather")
+            .cloned()
+            .expect("active weather");
+        let persisted = read_activation_record(tmp.path(), "weather")
+            .expect("read activation")
+            .expect("persisted activation");
+
+        assert_eq!(
+            active.source,
+            SkillSource::Installed {
+                artifact_path: tmp.path().join("weather"),
+            }
+        );
+        assert_eq!(active.previous.as_deref(), Some(&initial.revision));
+        assert_eq!(persisted, active);
+    }
+
+    #[test]
+    fn rollback_restores_previous_revision_after_offline_startup_reconciliation() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_versioned_test_skill(tmp.path(), "weather", "1.0.0").expect("write initial skill");
+
+        let initial = {
+            let mut manager = new_manager(tmp.path());
+            manager.load_startup_skills().expect("initial startup");
+            manager
+                .active("weather")
+                .cloned()
+                .expect("initial activation")
+        };
+
+        fs::write(
+            tmp.path().join("weather").join("manifest.toml"),
+            versioned_manifest_toml("weather", "2.0.0"),
+        )
+        .expect("write updated manifest");
+
+        let mut restarted = new_manager(tmp.path());
+        restarted.load_startup_skills().expect("restarted startup");
+        assert!(restarted.rollback("weather").expect("rollback result"));
+
+        let rolled_back = restarted.active("weather").expect("rolled back activation");
+        assert_eq!(rolled_back.revision.version, "1.0.0");
+        assert_eq!(
+            rolled_back.revision.revision_hash(),
+            initial.revision.revision_hash()
+        );
     }
 }

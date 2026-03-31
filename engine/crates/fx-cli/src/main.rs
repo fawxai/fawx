@@ -952,7 +952,10 @@ async fn dispatch_skill_install(
     if looks_like_local_skill_path(name_or_path) {
         commands::skills::install(name_or_path, data_dir).await?;
     } else {
-        println!("{}", commands::marketplace::install_output(name_or_path)?);
+        println!(
+            "{}",
+            commands::marketplace::install_output(name_or_path, data_dir)?
+        );
     }
     Ok(0)
 }
@@ -1130,7 +1133,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             Ok(0)
         }
         Commands::Install { name } => {
-            println!("{}", commands::marketplace::install_output(&name)?);
+            println!("{}", commands::marketplace::install_output(&name, None)?);
             Ok(0)
         }
         Commands::List => {
@@ -1256,10 +1259,10 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        cleanup_stale_pid_file_at, dispatch_command, ensure_headless_chat_model_available,
-        fawx_tui_binary_name, find_fawx_tui_binary_from, looks_like_local_skill_path,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SessionsCommands,
-        SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        cleanup_stale_pid_file_at, dispatch_command, dispatch_skill_install,
+        ensure_headless_chat_model_available, fawx_tui_binary_name, find_fawx_tui_binary_from,
+        looks_like_local_skill_path, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
+        SessionsCommands, SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1445,6 +1448,22 @@ mod tests {
                 command: SkillCommands::Install { name_or_path, .. }
             }) if name_or_path == "github"
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_skill_install_forwards_data_dir_to_marketplace_installs() {
+        crate::commands::marketplace::set_test_install_output(Some("installed".to_string()));
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+
+        let exit_code = dispatch_skill_install("weather", Some(temp_dir.path()))
+            .await
+            .expect("dispatch");
+        let request =
+            crate::commands::marketplace::take_last_install_request().expect("install request");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(request.0, "weather");
+        assert_eq!(request.1, Some(temp_dir.path().to_path_buf()));
     }
 
     #[test]

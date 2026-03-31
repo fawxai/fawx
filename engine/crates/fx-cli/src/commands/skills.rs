@@ -5,8 +5,8 @@ use chrono::{TimeZone, Utc};
 use fx_author::{BuildConfig, BuildResult};
 use fx_core::path::expand_tilde;
 use fx_loadable::{
-    read_revision_source_metadata, read_skill_statuses, revision_snapshot_dir,
-    write_source_metadata, SkillSource,
+    find_revision_snapshot_dir, read_revision_source_metadata, read_skill_statuses,
+    revision_snapshot_dir, write_source_metadata, SkillSource,
 };
 use fx_skills::manifest::{
     validate_skill_name as validate_manifest_skill_name, Capability, ALL_CAPABILITIES,
@@ -578,7 +578,7 @@ pub fn status_output(data_dir: Option<&Path>) -> Result<String> {
         ));
         lines.push(format!(
             "    revision: {}",
-            status.activation.revision.content_hash
+            status.activation.revision.revision_hash()
         ));
         lines.push(format!(
             "    manifest: {}",
@@ -608,7 +608,8 @@ pub fn rollback(name: &str, data_dir: Option<&Path>) -> Result<String> {
         .previous
         .as_deref()
         .context("No previous revision available for rollback")?;
-    let revision_dir = revision_snapshot_dir(&skills_dir, name, previous);
+    let revision_dir = find_revision_snapshot_dir(&skills_dir, name, previous)
+        .unwrap_or_else(|| revision_snapshot_dir(&skills_dir, name, previous));
     let skill_dir = skills_dir.join(name);
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("Failed to create skill directory: {}", skill_dir.display()))?;
@@ -625,7 +626,7 @@ pub fn rollback(name: &str, data_dir: Option<&Path>) -> Result<String> {
     write_source_metadata(&skill_dir, &source).map_err(anyhow::Error::msg)?;
     Ok(format!(
         "Prepared rollback for {name} to revision {}. The running watcher will activate it on the next reload event.",
-        previous.content_hash
+        previous.revision_hash()
     ))
 }
 

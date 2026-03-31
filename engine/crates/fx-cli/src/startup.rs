@@ -1559,18 +1559,25 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
     let skills = registry
         .skill_statuses()
         .into_iter()
-        .map(|status| SkillInfo {
-            name: status.name,
-            description: Some(status.description),
-            tool_names: status.tool_names,
-            capabilities: status.capabilities,
-            version: Some(status.activation.revision.version),
-            source: Some(status.activation.source.display()),
-            revision_hash: Some(status.activation.revision.content_hash),
-            manifest_hash: Some(status.activation.revision.manifest_hash),
-            activated_at_ms: Some(status.activation.activated_at),
-            signature_status: Some(status.activation.revision.signature.display()),
-            stale_source: status.source_drift.map(|drift| drift.to_string()),
+        .map(|status| {
+            let revision_hash = status.activation.revision.revision_hash();
+            let version = status.activation.revision.version.clone();
+            let manifest_hash = status.activation.revision.manifest_hash.clone();
+            let signature_status = status.activation.revision.signature.display();
+
+            SkillInfo {
+                name: status.name,
+                description: Some(status.description),
+                tool_names: status.tool_names,
+                capabilities: status.capabilities,
+                version: Some(version),
+                source: Some(status.activation.source.display()),
+                revision_hash: Some(revision_hash),
+                manifest_hash: Some(manifest_hash),
+                activated_at_ms: Some(status.activation.activated_at),
+                signature_status: Some(signature_status),
+                stale_source: status.source_drift.map(|drift| drift.to_string()),
+            }
         })
         .collect::<Vec<_>>();
 

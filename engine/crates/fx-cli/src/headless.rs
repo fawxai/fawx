@@ -2489,7 +2489,8 @@ impl CommandHost for HeadlessApp {
     }
 
     fn install_skill(&self, name: &str) -> anyhow::Result<String> {
-        crate::commands::marketplace::install_output(name)
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        crate::commands::marketplace::install_output(name, Some(&data_dir))
     }
 
     fn search_skills(&self, query: &str) -> anyhow::Result<String> {
