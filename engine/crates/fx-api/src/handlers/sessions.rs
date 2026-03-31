@@ -21,14 +21,14 @@ use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
-use fx_llm::{trim_conversation_history, ContentBlock, Message};
+use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
-    validate_tool_message_order, SessionConfig, SessionError, SessionHistoryError, SessionInfo,
-    SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
+    prune_unresolved_tool_history, validate_tool_message_order, SessionConfig, SessionError,
+    SessionHistoryError, SessionInfo, SessionKey, SessionKind, SessionMemory, SessionMessage,
+    SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -360,80 +360,12 @@ pub(crate) fn session_messages_to_context(
     messages: &[SessionMessage],
 ) -> Result<Vec<Message>, SessionHistoryError> {
     validate_tool_message_order(messages)?;
-    let context = messages
+    let replay_safe = prune_unresolved_tool_history(messages);
+    let context = replay_safe
         .iter()
         .map(SessionMessage::to_llm_message)
         .collect();
-    Ok(prune_unresolved_tool_context(context))
-}
-
-fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
-    let mut remaining_tool_results = HashMap::<String, usize>::new();
-    for message in &messages {
-        for block in &message.content {
-            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                let trimmed = tool_use_id.trim();
-                if !trimmed.is_empty() {
-                    *remaining_tool_results
-                        .entry(trimmed.to_string())
-                        .or_default() += 1;
-                }
-            }
-        }
-    }
-
-    let mut seen_tool_uses = HashSet::new();
-
-    messages
-        .into_iter()
-        .filter_map(|mut message| {
-            message.content.retain(|block| match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    let trimmed = id.trim();
-                    if trimmed.is_empty() {
-                        return true;
-                    }
-                    let has_future_result = remaining_tool_results
-                        .get(trimmed)
-                        .copied()
-                        .unwrap_or_default()
-                        > 0;
-                    if has_future_result {
-                        seen_tool_uses.insert(trimmed.to_string());
-                    }
-                    has_future_result
-                }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    let trimmed = tool_use_id.trim();
-                    if trimmed.is_empty() {
-                        return true;
-                    }
-                    let keep = seen_tool_uses.contains(trimmed);
-                    decrement_remaining_tool_result(&mut remaining_tool_results, trimmed);
-                    keep
-                }
-                ContentBlock::Text { .. }
-                | ContentBlock::Image { .. }
-                | ContentBlock::Document { .. } => true,
-            });
-            (!message.content.is_empty()).then_some(message)
-        })
-        .collect()
-}
-
-fn decrement_remaining_tool_result(
-    remaining_tool_results: &mut HashMap<String, usize>,
-    tool_use_id: &str,
-) {
-    let Some(count) = remaining_tool_results.get(tool_use_id).copied() else {
-        return;
-    };
-
-    if count <= 1 {
-        remaining_tool_results.remove(tool_use_id);
-    } else {
-        remaining_tool_results.insert(tool_use_id.to_string(), count - 1);
-    }
+    Ok(context)
 }
 
 async fn stream_session_message_response(
@@ -784,7 +716,7 @@ mod tests {
             .any(|block| {
                 matches!(
                     block,
-                    ContentBlock::ToolUse { id, .. } if id == "call_good"
+                    fx_llm::ContentBlock::ToolUse { id, .. } if id == "call_good"
                 )
             }));
         assert!(!context
@@ -793,7 +725,7 @@ mod tests {
             .any(|block| {
                 matches!(
                     block,
-                    ContentBlock::ToolUse { id, .. } if id == "call_bad"
+                    fx_llm::ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
     }
