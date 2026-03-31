@@ -1,5 +1,6 @@
 //! Act-step execution result types.
 
+use crate::authority::ToolAuthoritySurface;
 use crate::cancellation::CancellationToken;
 use crate::decide::Decision;
 use async_trait::async_trait;
@@ -237,6 +238,12 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     fn action_category(&self, call: &fx_llm::ToolCall) -> &'static str {
         let _ = call;
         "unknown"
+    }
+
+    /// Declares the authority-relevant surface for a tool call.
+    fn authority_surface(&self, call: &fx_llm::ToolCall) -> ToolAuthoritySurface {
+        let _ = call;
+        ToolAuthoritySurface::Other
     }
 
     /// Extracts a journal action for ripcord when the tool call is material.

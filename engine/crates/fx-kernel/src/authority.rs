@@ -279,9 +279,14 @@ impl AuthorityCoordinator {
     }
 
     #[must_use]
-    pub fn classify_call(&self, call: &ToolCall, fallback_capability: &str) -> AuthorityRequest {
+    pub fn classify_call(
+        &self,
+        call: &ToolCall,
+        fallback_capability: &str,
+        surface: ToolAuthoritySurface,
+    ) -> AuthorityRequest {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        classify_call(call, fallback_capability, state.working_dir())
+        classify_call(call, fallback_capability, state.working_dir(), surface)
     }
 
     #[must_use]
@@ -442,19 +447,23 @@ fn classify_call(
     call: &ToolCall,
     fallback_capability: &str,
     working_dir: &Path,
+    surface: ToolAuthoritySurface,
 ) -> AuthorityRequest {
-    let surface = CallSurface::from_tool_name(&call.name);
     let capability = capability_for_call(call, fallback_capability, working_dir, surface);
     match surface {
-        CallSurface::PathRead | CallSurface::PathWrite | CallSurface::PathDelete => {
+        ToolAuthoritySurface::PathRead
+        | ToolAuthoritySurface::PathWrite
+        | ToolAuthoritySurface::PathDelete => {
             classify_path_request(call, capability, surface.effect(), working_dir)
         }
-        CallSurface::GitCheckpoint => {
+        ToolAuthoritySurface::GitCheckpoint => {
             classify_git_checkpoint_request(call, capability, working_dir)
         }
-        CallSurface::Command => classify_command_request(call, capability),
-        CallSurface::Network => classify_network_request(call, capability, surface.effect()),
-        CallSurface::Other => classify_none_request(call, capability, surface.effect()),
+        ToolAuthoritySurface::Command => classify_command_request(call, capability),
+        ToolAuthoritySurface::Network => {
+            classify_network_request(call, capability, surface.effect())
+        }
+        ToolAuthoritySurface::Other => classify_none_request(call, capability, surface.effect()),
     }
 }
 
@@ -462,16 +471,20 @@ fn capability_for_call(
     call: &ToolCall,
     fallback_capability: &str,
     working_dir: &Path,
-    surface: CallSurface,
+    surface: ToolAuthoritySurface,
 ) -> String {
-    if matches!(surface, CallSurface::PathWrite | CallSurface::PathDelete) {
+    if matches!(
+        surface,
+        ToolAuthoritySurface::PathWrite | ToolAuthoritySurface::PathDelete
+    ) {
         return path_capability(call, working_dir);
     }
-    if matches!(surface, CallSurface::PathRead) && read_targets_outside_workspace(call, working_dir)
+    if matches!(surface, ToolAuthoritySurface::PathRead)
+        && read_targets_outside_workspace(call, working_dir)
     {
         return "outside_workspace".to_string();
     }
-    if matches!(surface, CallSurface::GitCheckpoint) {
+    if matches!(surface, ToolAuthoritySurface::GitCheckpoint) {
         return "git".to_string();
     }
     fallback_capability.to_string()
@@ -897,8 +910,8 @@ fn current_epoch_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy)]
-enum CallSurface {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolAuthoritySurface {
     PathRead,
     PathWrite,
     PathDelete,
@@ -908,19 +921,7 @@ enum CallSurface {
     Other,
 }
 
-impl CallSurface {
-    fn from_tool_name(tool_name: &str) -> Self {
-        match tool_name {
-            "read_file" | "search_text" | "list_directory" => Self::PathRead,
-            "write_file" | "create_file" | "edit_file" => Self::PathWrite,
-            "delete_file" | "remove_file" => Self::PathDelete,
-            "git_checkpoint" => Self::GitCheckpoint,
-            "run_command" | "shell" | "bash" | "execute_command" => Self::Command,
-            "web_search" | "brave_search" | "web_fetch" | "fetch_url" => Self::Network,
-            _ => Self::Other,
-        }
-    }
-
+impl ToolAuthoritySurface {
     const fn effect(self) -> AuthorityEffect {
         match self {
             Self::PathRead => AuthorityEffect::Read,
@@ -998,6 +999,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         assert_eq!(request.capability, "file_write");
@@ -1016,6 +1018,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         let decision = coordinator.resolve_request(request, false);
@@ -1033,6 +1036,7 @@ mod tests {
                 serde_json::json!({"path":"engine/crates/fx-kernel/src/lib.rs","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         let decision = coordinator.resolve_request(request, false);
@@ -1052,6 +1056,7 @@ mod tests {
                 serde_json::json!({"path":"engine/crates/fx-kernel/src/lib.rs"}),
             ),
             "read_any",
+            ToolAuthoritySurface::PathRead,
         );
 
         let decision = resolve_request(request, &permissions, &proposal_state, false, true);
@@ -1069,6 +1074,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         let decision = coordinator.resolve_request(request.clone(), true);
@@ -1089,6 +1095,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
         let kernel = coordinator.classify_call(
             &call(
@@ -1096,11 +1103,46 @@ mod tests {
                 serde_json::json!({"path":"engine/crates/fx-kernel/src/lib.rs","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         assert_ne!(project.approval_scope(), kernel.approval_scope());
         assert_eq!(project.capability, "file_write");
         assert_eq!(kernel.capability, "kernel_modify");
+    }
+
+    #[test]
+    fn classifies_path_write_from_declared_surface_not_tool_name() {
+        let coordinator = AuthorityCoordinator::new(policy(CapabilityMode::Prompt), state());
+        let request = coordinator.classify_call(
+            &call(
+                "custom_writer",
+                serde_json::json!({"path":"README.md","content":"x"}),
+            ),
+            "file_write",
+            ToolAuthoritySurface::PathWrite,
+        );
+
+        assert_eq!(request.effect, AuthorityEffect::Write);
+        assert_eq!(request.target_kind, AuthorityTargetKind::Path);
+        assert_eq!(request.target_identity, "README.md");
+    }
+
+    #[test]
+    fn ignores_matching_tool_name_when_declared_surface_is_other() {
+        let coordinator = AuthorityCoordinator::new(policy(CapabilityMode::Prompt), state());
+        let request = coordinator.classify_call(
+            &call(
+                "write_file",
+                serde_json::json!({"path":"README.md","content":"x"}),
+            ),
+            "file_write",
+            ToolAuthoritySurface::Other,
+        );
+
+        assert_eq!(request.effect, AuthorityEffect::None);
+        assert_eq!(request.target_kind, AuthorityTargetKind::None);
+        assert!(request.paths.is_empty());
     }
 
     #[test]
@@ -1121,6 +1163,7 @@ mod tests {
                 serde_json::json!({"command":"rg TODO engine/crates/fx-kernel/src"}),
             ),
             "code_execute",
+            ToolAuthoritySurface::Command,
         );
 
         assert_eq!(
@@ -1139,6 +1182,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
         let _ = coordinator.resolve_request(request, false);
 
@@ -1175,6 +1219,7 @@ mod tests {
                 serde_json::json!({"path":"README.md","content":"x"}),
             ),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
         let _ = coordinator.resolve_request(request, false);
 

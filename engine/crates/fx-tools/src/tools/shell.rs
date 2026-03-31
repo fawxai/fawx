@@ -5,6 +5,7 @@ use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolCallClassification, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
 use serde::Deserialize;
@@ -80,6 +81,10 @@ impl Tool for RunCommandTool {
 
     fn action_category(&self) -> &'static str {
         "code_execute"
+    }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::Command
     }
 }
 

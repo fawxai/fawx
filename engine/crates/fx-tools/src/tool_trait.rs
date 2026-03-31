@@ -11,6 +11,7 @@ use fx_kernel::act::{
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ProcessRegistry;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_subagent::SubagentControl;
@@ -103,6 +104,11 @@ pub trait Tool: Send + Sync {
 
     fn action_category(&self) -> &'static str {
         "unknown"
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        let _ = call;
+        ToolAuthoritySurface::Other
     }
 
     fn route_sub_goal(

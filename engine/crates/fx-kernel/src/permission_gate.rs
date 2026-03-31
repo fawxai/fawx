@@ -8,7 +8,9 @@ use crate::act::{
     ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
     ToolExecutor, ToolExecutorError, ToolResult,
 };
-use crate::authority::{AuthorityCoordinator, AuthorityDecision, AuthorityVerdict};
+use crate::authority::{
+    AuthorityCoordinator, AuthorityDecision, AuthorityVerdict, ToolAuthoritySurface,
+};
 use crate::cancellation::CancellationToken;
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt, PermissionPromptState};
 use crate::streaming::{StreamCallback, StreamEvent};
@@ -187,6 +189,10 @@ impl<T: ToolExecutor> ToolExecutor for PermissionGateExecutor<T> {
         self.inner.action_category(call)
     }
 
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.inner.authority_surface(call)
+    }
+
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
         self.inner.journal_action(call, result)
     }
@@ -255,7 +261,8 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
 
     fn authority_decision(&self, call: &ToolCall) -> AuthorityDecision {
         let fallback = self.inner.action_category(call);
-        let request = self.authority.classify_call(call, fallback);
+        let surface = self.inner.authority_surface(call);
+        let request = self.authority.classify_call(call, fallback, surface);
         let session_approved = self
             .prompt_state
             .is_session_allowed(&request.approval_scope());
@@ -462,7 +469,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::AuthorityRequest;
+    use crate::authority::{AuthorityRequest, ToolAuthoritySurface};
     use crate::proposal_gate::ProposalGateState;
     use fx_core::self_modify::SelfModifyConfig;
     use std::path::PathBuf;
@@ -502,6 +509,16 @@ mod tests {
                 "shell" => "shell",
                 "write_file" => "file_write",
                 _ => "unknown",
+            }
+        }
+
+        fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+            match call.name.as_str() {
+                "web_search" => ToolAuthoritySurface::Network,
+                "shell" => ToolAuthoritySurface::Command,
+                "write_file" => ToolAuthoritySurface::PathWrite,
+                "read_file" => ToolAuthoritySurface::PathRead,
+                _ => ToolAuthoritySurface::Other,
             }
         }
 
@@ -683,7 +700,8 @@ mod tests {
         let authority =
             test_authority(cautious_policy(CapabilityMode::Capability), "/Users/joseph");
         let prompt_state = Arc::new(PermissionPromptState::new());
-        let request = authority.classify_call(&test_call("shell"), "shell");
+        let request =
+            authority.classify_call(&test_call("shell"), "shell", ToolAuthoritySurface::Command);
         let receiver = prompt_state
             .register("setup".into(), request.approval_scope(), "shell".into())
             .expect("register")
@@ -808,8 +826,11 @@ mod tests {
     #[test]
     fn authority_request_uses_project_write_capability() {
         let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
-        let request =
-            authority.classify_call(&write_call("/Users/joseph/project/file.txt"), "file_write");
+        let request = authority.classify_call(
+            &write_call("/Users/joseph/project/file.txt"),
+            "file_write",
+            ToolAuthoritySurface::PathWrite,
+        );
 
         assert_eq!(request.capability, "file_write");
     }
@@ -820,6 +841,7 @@ mod tests {
         let request = authority.classify_call(
             &write_call("/Users/joseph/.fawx/skills/demo/SKILL.md"),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         assert_eq!(request.capability, "self_modify");
@@ -831,6 +853,7 @@ mod tests {
         let request = authority.classify_call(
             &write_call("/Users/joseph/fawx/engine/crates/fx-kernel/src/lib.rs"),
             "file_write",
+            ToolAuthoritySurface::PathWrite,
         );
 
         assert_eq!(request.capability, "kernel_modify");
@@ -839,7 +862,11 @@ mod tests {
     #[test]
     fn authority_request_uses_outside_workspace_capability_for_write() {
         let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph/workspace");
-        let request = authority.classify_call(&write_call("/etc/hosts"), "file_write");
+        let request = authority.classify_call(
+            &write_call("/etc/hosts"),
+            "file_write",
+            ToolAuthoritySurface::PathWrite,
+        );
 
         assert_eq!(request.capability, "outside_workspace");
     }
@@ -847,7 +874,11 @@ mod tests {
     #[test]
     fn authority_request_uses_outside_workspace_capability_for_read() {
         let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
-        let request = authority.classify_call(&read_call("/etc/hosts"), "read_any");
+        let request = authority.classify_call(
+            &read_call("/etc/hosts"),
+            "read_any",
+            ToolAuthoritySurface::PathRead,
+        );
 
         assert_eq!(request.capability, "outside_workspace");
     }
@@ -859,7 +890,11 @@ mod tests {
         let workspace_str = workspace.to_string_lossy().into_owned();
         let note_path_str = note_path.to_string_lossy().into_owned();
         let authority = test_authority(PermissionPolicy::allow_all(), &workspace_str);
-        let request = authority.classify_call(&read_call(&note_path_str), "read_any");
+        let request = authority.classify_call(
+            &read_call(&note_path_str),
+            "read_any",
+            ToolAuthoritySurface::PathRead,
+        );
 
         assert_eq!(request.capability, "read_any");
     }

@@ -11,10 +11,11 @@ use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
 use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
-use fx_llm::ToolDefinition;
+use fx_kernel::ToolAuthoritySurface;
+use fx_llm::{ToolCall, ToolDefinition};
 use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
-use fx_skills::manifest::{SkillManifest, SkillToolManifest};
+use fx_skills::manifest::{SkillManifest, SkillToolAuthoritySurface, SkillToolManifest};
 use fx_skills::runtime::SkillRuntime;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -194,6 +195,13 @@ impl WasmSkill {
             .find(|tool| tool.name == tool_name)
     }
 
+    fn authority_surface_for_tool(&self, tool_name: &str) -> ToolAuthoritySurface {
+        self.manifest_tool(tool_name)
+            .and_then(|tool| tool.authority_surface.clone())
+            .map(map_manifest_authority_surface)
+            .unwrap_or(ToolAuthoritySurface::Other)
+    }
+
     fn encode_runtime_input(&self, tool_name: &str, arguments: &str) -> Result<String, SkillError> {
         let value = serde_json::from_str::<serde_json::Value>(arguments)
             .map_err(|error| format!("invalid arguments JSON: {error}"))?;
@@ -322,6 +330,10 @@ impl Skill for WasmSkill {
         ToolCacheability::NeverCache
     }
 
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.authority_surface_for_tool(&call.name)
+    }
+
     /// Execute the WASM skill via `spawn_blocking` to avoid blocking the
     /// async executor during potentially long-running WASM computation.
     ///
@@ -373,6 +385,18 @@ impl Skill for WasmSkill {
         };
 
         Some(mapped)
+    }
+}
+
+fn map_manifest_authority_surface(surface: SkillToolAuthoritySurface) -> ToolAuthoritySurface {
+    match surface {
+        SkillToolAuthoritySurface::PathRead => ToolAuthoritySurface::PathRead,
+        SkillToolAuthoritySurface::PathWrite => ToolAuthoritySurface::PathWrite,
+        SkillToolAuthoritySurface::PathDelete => ToolAuthoritySurface::PathDelete,
+        SkillToolAuthoritySurface::GitCheckpoint => ToolAuthoritySurface::GitCheckpoint,
+        SkillToolAuthoritySurface::Command => ToolAuthoritySurface::Command,
+        SkillToolAuthoritySurface::Network => ToolAuthoritySurface::Network,
+        SkillToolAuthoritySurface::Other => ToolAuthoritySurface::Other,
     }
 }
 
@@ -790,6 +814,7 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
                 direct_utility: false,
                 trigger_patterns: Vec::new(),
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -802,6 +827,7 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "web_fetch".to_string(),
                 description: "Fetch".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
                 direct_utility: false,
                 trigger_patterns: Vec::new(),
                 parameters: vec![],
@@ -820,12 +846,46 @@ mod tests {
         assert_eq!(defs[0].parameters["required"], serde_json::json!(["query"]));
     }
 
+    #[test]
+    fn wasm_skill_reports_manifest_authority_surface() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "web_search".to_string(),
+            description: "Search".to_string(),
+            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+            direct_utility: false,
+            trigger_patterns: Vec::new(),
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "query".to_string(),
+                kind: "string".to_string(),
+                description: "Search query".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "web_search".to_string(),
+            arguments: serde_json::json!({"query":"rust"}),
+        };
+
+        assert_eq!(
+            skill.authority_surface(&call),
+            ToolAuthoritySurface::Network
+        );
+    }
+
     #[tokio::test]
     async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
         let mut manifest = test_manifest("weather");
         manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
             name: "weather".to_string(),
             description: "Weather".to_string(),
+            authority_surface: None,
             direct_utility: true,
             trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -863,6 +923,7 @@ mod tests {
         manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
             name: "calculate".to_string(),
             description: "Calculate".to_string(),
+            authority_surface: None,
             direct_utility: false,
             trigger_patterns: Vec::new(),
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -894,6 +955,7 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "render_table".to_string(),
                 description: "Render table".to_string(),
+                authority_surface: None,
                 direct_utility: false,
                 trigger_patterns: Vec::new(),
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -906,6 +968,7 @@ mod tests {
             fx_skills::manifest::SkillToolManifest {
                 name: "render_chart".to_string(),
                 description: "Render chart".to_string(),
+                authority_surface: None,
                 direct_utility: false,
                 trigger_patterns: Vec::new(),
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {

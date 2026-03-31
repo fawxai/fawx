@@ -67,6 +67,19 @@ impl FromStr for Capability {
     }
 }
 
+/// Authority-relevant tool surface declared by a manifest-defined tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillToolAuthoritySurface {
+    PathRead,
+    PathWrite,
+    PathDelete,
+    GitCheckpoint,
+    Command,
+    Network,
+    Other,
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -102,6 +115,8 @@ pub struct SkillManifest {
 pub struct SkillToolManifest {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub authority_surface: Option<SkillToolAuthoritySurface>,
     #[serde(default)]
     pub direct_utility: bool,
     #[serde(default)]
@@ -296,6 +311,7 @@ entry_point = "run"
 [[tools]]
 name = "web_search"
 description = "Search the web"
+authority_surface = "network"
 direct_utility = true
 trigger_patterns = ["search the web"]
 
@@ -309,6 +325,10 @@ required = true
         let manifest = parse_manifest(toml).expect("Should parse manifest with tools");
         assert_eq!(manifest.tools.len(), 1);
         assert_eq!(manifest.tools[0].name, "web_search");
+        assert_eq!(
+            manifest.tools[0].authority_surface,
+            Some(SkillToolAuthoritySurface::Network)
+        );
         assert!(manifest.tools[0].direct_utility);
         assert_eq!(
             manifest.tools[0].trigger_patterns,
@@ -332,6 +352,7 @@ required = true
             tools: vec![SkillToolManifest {
                 name: "weather".to_string(),
                 description: "Weather".to_string(),
+                authority_surface: None,
                 direct_utility: true,
                 trigger_patterns: Vec::new(),
                 parameters: vec![SkillToolParameterManifest {
@@ -620,6 +641,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 SkillToolManifest {
                     name: "web_search".to_string(),
                     description: "Search".to_string(),
+                    authority_surface: None,
                     direct_utility: false,
                     trigger_patterns: Vec::new(),
                     parameters: vec![],
@@ -627,6 +649,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 SkillToolManifest {
                     name: "web_search".to_string(),
                     description: "Duplicate".to_string(),
+                    authority_surface: None,
                     direct_utility: false,
                     trigger_patterns: Vec::new(),
                     parameters: vec![],
@@ -653,6 +676,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             tools: vec![SkillToolManifest {
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
+                authority_surface: None,
                 direct_utility: false,
                 trigger_patterns: Vec::new(),
                 parameters: vec![

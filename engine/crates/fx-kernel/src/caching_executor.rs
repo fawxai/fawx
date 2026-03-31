@@ -3,6 +3,7 @@ use crate::act::{
     ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
+use crate::ToolAuthoritySurface;
 use async_trait::async_trait;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde_json::Value;
@@ -423,6 +424,10 @@ impl<T: ToolExecutor> ToolExecutor for CachingExecutor<T> {
 
     fn action_category(&self, call: &ToolCall) -> &'static str {
         self.inner.action_category(call)
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.inner.authority_surface(call)
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
