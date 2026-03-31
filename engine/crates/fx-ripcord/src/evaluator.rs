@@ -149,6 +149,8 @@ fn string_arg(arguments: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_loadable::{Skill, SkillError, SkillRegistry};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -187,6 +189,14 @@ mod tests {
             ToolCacheability::NeverCache
         }
 
+        fn action_category(&self, call: &ToolCall) -> &'static str {
+            test_action_category(&call.name)
+        }
+
+        fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+            test_journal_action(call, result)
+        }
+
         fn clear_cache(&self) {}
 
         fn cache_stats(&self) -> Option<ToolCacheStats> {
@@ -198,12 +208,79 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RegistryMetadataSkill;
+
+    #[async_trait]
+    impl Skill for RegistryMetadataSkill {
+        fn name(&self) -> &str {
+            "registry-metadata"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            ["shell", "write_file", "delete_file"]
+                .into_iter()
+                .map(|name| ToolDefinition {
+                    name: name.to_string(),
+                    description: format!("test/{name}"),
+                    parameters: serde_json::json!({"type": "object"}),
+                })
+                .collect()
+        }
+
+        fn action_category(&self, tool_name: &str) -> &'static str {
+            test_action_category(tool_name)
+        }
+
+        fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+            test_journal_action(call, result)
+        }
+
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, SkillError>> {
+            match tool_name {
+                "shell" | "write_file" | "delete_file" => Some(Ok("executed".to_string())),
+                _ => None,
+            }
+        }
+    }
+
     fn executed_result(call: &ToolCall) -> ToolResult {
         ToolResult {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             success: true,
             output: "executed".to_string(),
+        }
+    }
+
+    fn test_action_category(tool_name: &str) -> &'static str {
+        match tool_name {
+            "shell" => "shell",
+            "write_file" => "file_write",
+            "delete_file" => "file_delete",
+            _ => "unknown",
+        }
+    }
+
+    fn test_journal_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        match call.name.as_str() {
+            "shell" => Some(JournalAction::ShellCommand {
+                command: extract_command(&call.arguments).unwrap_or_default(),
+                exit_code: if result.success { 0 } else { 1 },
+            }),
+            "write_file" => Some(JournalAction::FileWrite {
+                path: PathBuf::from(extract_path(&call.arguments)?),
+                snapshot_hash: None,
+                size_bytes: string_arg(&call.arguments, "content")
+                    .map_or(0, |content| content.len() as u64),
+                created: false,
+            }),
+            _ => None,
         }
     }
 
@@ -242,6 +319,12 @@ mod tests {
     fn test_journal() -> Arc<RipcordJournal> {
         let temp_dir = TempDir::new().expect("temp dir");
         Arc::new(RipcordJournal::new(temp_dir.path()))
+    }
+
+    fn registry_executor() -> SkillRegistry {
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(RegistryMetadataSkill));
+        registry
     }
 
     #[tokio::test]
@@ -375,6 +458,56 @@ mod tests {
         let status = journal.status().await;
         assert!(status.active);
         assert_eq!(status.tripwire_id.as_deref(), Some("bulk_delete"));
+    }
+
+    #[tokio::test]
+    async fn registry_path_tripwire_activates_ripcord_on_match() {
+        let journal = test_journal();
+        let executor = TripwireEvaluator::new(
+            registry_executor(),
+            vec![action_tripwire()],
+            Arc::clone(&journal),
+        );
+        let call = test_call("shell", serde_json::json!({"command": "rm -rf tmp"}));
+
+        executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("execute");
+
+        assert!(journal.is_active().await);
+    }
+
+    #[tokio::test]
+    async fn registry_path_records_action_when_active() {
+        let journal = test_journal();
+        journal.activate("manual", "already active").await;
+        let executor = TripwireEvaluator::new(
+            registry_executor(),
+            vec![action_tripwire()],
+            Arc::clone(&journal),
+        );
+        let call = test_call(
+            "write_file",
+            serde_json::json!({"path": "/tmp/notes.txt", "content": "hello"}),
+        );
+
+        executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("execute");
+
+        let entries = journal.entries().await;
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].action,
+            JournalAction::FileWrite {
+                path,
+                size_bytes: 5,
+                created: false,
+                ..
+            } if path == Path::new("/tmp/notes.txt")
+        ));
     }
 
     #[tokio::test]

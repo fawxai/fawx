@@ -11,8 +11,8 @@
 
 use async_trait::async_trait;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ToolCacheability, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, JournalAction, ToolCacheability,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -199,6 +199,21 @@ impl SkillRegistry {
         self.find_skill(tool_name)
             .map(|skill| skill.cacheability(tool_name))
             .unwrap_or(ToolCacheability::NeverCache)
+    }
+
+    fn owning_skill_action_category(&self, tool_name: &str) -> &'static str {
+        self.find_skill(tool_name)
+            .map(|skill| skill.action_category(tool_name))
+            .unwrap_or("unknown")
+    }
+
+    fn owning_skill_journal_action(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Option<JournalAction> {
+        self.find_skill(&call.name)
+            .and_then(|skill| skill.journal_action(call, result))
     }
 
     /// Execute a single tool call: read lock → find skill → clone Arc → drop
@@ -426,13 +441,21 @@ impl ToolExecutor for SkillRegistry {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.owning_skill_cacheability(tool_name)
     }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.owning_skill_action_category(&call.name)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.owning_skill_journal_action(call, result)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skill::Skill;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     /// A deterministic mock skill for testing.
     #[derive(Debug)]
@@ -441,6 +464,8 @@ mod tests {
         description: String,
         tools: Vec<ToolDefinition>,
         cacheability: ToolCacheability,
+        action_category: &'static str,
+        journal_action: Option<JournalAction>,
     }
 
     impl MockSkill {
@@ -466,7 +491,21 @@ mod tests {
                 description: format!("{name} skill"),
                 tools,
                 cacheability,
+                action_category: "unknown",
+                journal_action: None,
             }
+        }
+
+        fn with_metadata(
+            name: &str,
+            tool_names: &[&str],
+            action_category: &'static str,
+            journal_action: JournalAction,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.action_category = action_category;
+            skill.journal_action = Some(journal_action);
+            skill
         }
     }
 
@@ -486,6 +525,14 @@ mod tests {
 
         fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
             self.cacheability
+        }
+
+        fn action_category(&self, _tool_name: &str) -> &'static str {
+            self.action_category
+        }
+
+        fn journal_action(&self, _call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+            self.journal_action.clone()
         }
 
         async fn execute(
@@ -775,6 +822,49 @@ mod tests {
             reg.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn skill_registry_action_category_delegates_to_owner() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_metadata(
+            "git",
+            &["create_branch"],
+            "metadata_owned",
+            JournalAction::GitBranchCreate {
+                repo: PathBuf::from("."),
+                branch: "feature/test".to_string(),
+            },
+        )));
+
+        assert_eq!(
+            reg.action_category(&make_tool_call("create_branch")),
+            "metadata_owned"
+        );
+    }
+
+    #[test]
+    fn skill_registry_journal_action_delegates_to_owner() {
+        let reg = SkillRegistry::new();
+        let expected = JournalAction::GitBranchCreate {
+            repo: PathBuf::from("."),
+            branch: "feature/test".to_string(),
+        };
+        reg.register(Arc::new(MockSkill::with_metadata(
+            "git",
+            &["create_branch"],
+            "metadata_owned",
+            expected.clone(),
+        )));
+        let call = make_tool_call("create_branch");
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        assert_eq!(reg.journal_action(&call, &result), Some(expected));
     }
 
     #[test]
