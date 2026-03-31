@@ -74,7 +74,7 @@ const SOVEREIGN_WRITE_PATH_PATTERNS: &[&str] = &[
 ];
 
 /// Default deny patterns shared between core and CLI configs.
-pub const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
+pub use fx_config::DEFAULT_DENY_PATHS;
 
 /// Paths that always require proposal+approval, regardless of `self_modify.enabled`.
 /// These are security-sensitive data files that the agent should never modify freely.
@@ -723,6 +723,21 @@ mod tests {
         let config = SelfModifyConfig::default();
         let result = validate_glob_patterns(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_deny_paths_are_shared_with_cli_defaults() {
+        let expected: Vec<String> = fx_config::DEFAULT_DENY_PATHS
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect();
+
+        assert_eq!(DEFAULT_DENY_PATHS, fx_config::DEFAULT_DENY_PATHS);
+        assert_eq!(SelfModifyConfig::default().deny_paths, expected);
+        assert_eq!(
+            fx_config::SelfModifyPathsCliConfig::default().deny,
+            expected
+        );
     }
 
     #[test]
