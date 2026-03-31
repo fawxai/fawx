@@ -289,19 +289,19 @@
   </div>
   <div class="sequence-step">
     <strong>Step 9. #1647: revisioned skill activation lifecycle</strong>
-    <div class="step-meta">This is now the active next step. Build on <code>#1646</code> and the landed tool registry.</div>
+    <div class="step-meta">Fixed in PR <code>#1667</code>. Revisioned activation and lifecycle seams now sit on top of the landed tool registry.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 10. Unified authority model implementation</strong>
-    <div class="step-meta">Spec is already written. This is the next architectural milestone after <code>#1647</code>, not deferred feature work.</div>
+    <div class="step-meta">Fixed in PR <code>#1668</code>. Authority resolution, prompt-state sharing, and unified proposal / deny routing landed on dev.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 11. #1638: static dispatch audit</strong>
-    <div class="step-meta">Audit the codebase for hidden registries, string-matched behavior, and doctrine violations after the authority model lands.</div>
+    <div class="step-meta">Completed via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>. Canonical defaults, tool-owned action/journal metadata, and authority-surface contracts now replace the highest-leverage static dispatch drift.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 12. #1642: headless decomposition</strong>
-    <div class="step-meta">Split headless responsibilities once lifecycle and authority seams are stable.</div>
+    <div class="step-meta">This is now the active next step. Split headless responsibilities once lifecycle, authority, and dispatch seams are stable.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 13. Full loop decomposition beyond direct inspection</strong>
@@ -373,27 +373,27 @@
       <div class="issue-body">Fixed on dev in PR <code>#1666</code>. Kernel contract visibility for deterministic utility tools is now manifest-driven.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Revisioned activation model for published and local skills. Current active step.</div>
+      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1667</code>. Revisioned activation now owns published and local skill lifecycle seams.</div>
     </div>
   </div>
 </div>
 
-<h2>Post-Step-10 queue</h2>
+<h2>Post-Step-11 queue</h2>
 <div class="panel-grid">
   <div class="panel">
     <h3>Architectural follow-through</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">NEW</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-spec">step 10</span></div>
-      <div class="issue-body">This is the immediate post-#1647 architectural milestone. It belongs in the numbered sequence, not in deferred feature work.</div>
+      <div class="issue-header"><span class="issue-number">STEP 10</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Fixed on dev in PR <code>#1668</code>. Unified authority resolution, shared prompt ownership, and coherent proposal / deny routing are now in the kernel path.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-next">step 11</span></div>
-      <div class="issue-body">Audit the codebase for doctrine drift after the authority model lands.</div>
+      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Completed on dev via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>. Canonical deny defaults, tool-owned action / journal metadata, and authority-surface contracts replaced the highest-leverage static dispatch drift.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-next">step 12</span></div>
-      <div class="issue-body">Still valuable. Better sequenced after authority and lifecycle seams are cleaner.</div>
+      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-active">now</span></div>
+      <div class="issue-body">Now the active next step. Headless responsibilities can split cleanly after lifecycle, authority, and static-dispatch seams landed.</div>
     </div>
     <div class="issue-card">
       <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-next">step 13</span></div>
@@ -430,7 +430,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-30 23:56 UTC (v4.7) · #1655 + #1646 landed on dev · Numbered queue extended through Step 15 · Next: #1647 → authority model → #1638 → #1642 → loop decomposition → #1487 → #1637 · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-03-31 21:41 UTC (v4.8) · #1667 + #1668 + #1669 + #1670 + #1672 landed on dev · Step 11 static-dispatch cleanup complete · Next: #1642 → loop decomposition → #1487 → #1637 · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
