@@ -845,8 +845,12 @@ mod tests {
 
     #[test]
     fn authority_request_preserves_inner_category_for_workspace_read() {
-        let authority = test_authority(PermissionPolicy::allow_all(), "/Users/joseph");
-        let request = authority.classify_call(&read_call("~/notes.txt"), "read_any");
+        let workspace = std::env::temp_dir().join("fx-kernel-authority-workspace");
+        let note_path = workspace.join("notes.txt");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let note_path_str = note_path.to_string_lossy().into_owned();
+        let authority = test_authority(PermissionPolicy::allow_all(), &workspace_str);
+        let request = authority.classify_call(&read_call(&note_path_str), "read_any");
 
         assert_eq!(request.capability, "read_any");
     }
