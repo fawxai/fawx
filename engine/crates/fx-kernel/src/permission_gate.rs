@@ -496,6 +496,15 @@ mod tests {
             ToolCacheability::NeverCache
         }
 
+        fn action_category(&self, call: &ToolCall) -> &'static str {
+            match call.name.as_str() {
+                "web_search" => "web_search",
+                "shell" => "shell",
+                "write_file" => "file_write",
+                _ => "unknown",
+            }
+        }
+
         fn clear_cache(&self) {}
 
         fn cache_stats(&self) -> Option<ToolCacheStats> {

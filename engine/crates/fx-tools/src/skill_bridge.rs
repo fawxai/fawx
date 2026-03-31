@@ -1,6 +1,6 @@
 use crate::tools::FawxToolExecutor;
 use async_trait::async_trait;
-use fx_kernel::act::{ToolCacheability, ToolExecutor};
+use fx_kernel::act::{JournalAction, ToolCacheability, ToolExecutor, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolCall;
 #[cfg(test)]
@@ -43,6 +43,14 @@ impl BuiltinToolsSkill {
             arguments: parsed_args,
         })
     }
+
+    fn metadata_call(tool_name: &str) -> ToolCall {
+        ToolCall {
+            id: String::new(),
+            name: tool_name.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
 }
 
 #[async_trait]
@@ -57,6 +65,21 @@ impl Skill for BuiltinToolsSkill {
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.executor.cacheability(tool_name)
+    }
+
+    fn action_category(&self, tool_name: &str) -> &'static str {
+        if !self.handles_tool(tool_name) {
+            return "unknown";
+        }
+        self.executor
+            .action_category(&Self::metadata_call(tool_name))
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        if !self.handles_tool(&call.name) {
+            return None;
+        }
+        self.executor.journal_action(call, result)
     }
 
     async fn execute(
@@ -137,6 +160,52 @@ mod tests {
         assert_eq!(
             skill.cacheability("current_time"),
             ToolCacheability::NeverCache
+        );
+    }
+
+    #[test]
+    fn builtin_tools_skill_delegates_action_category() {
+        let temp = TempDir::new().expect("tempdir");
+        let executor = build_memory_executor(&temp);
+        let skill = BuiltinToolsSkill::new(executor.clone());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello"
+            }),
+        };
+
+        assert_eq!(
+            skill.action_category(&call.name),
+            executor.action_category(&call)
+        );
+    }
+
+    #[test]
+    fn builtin_tools_skill_delegates_journal_action() {
+        let temp = TempDir::new().expect("tempdir");
+        let executor = build_memory_executor(&temp);
+        let skill = BuiltinToolsSkill::new(executor.clone());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello"
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        assert_eq!(
+            skill.journal_action(&call, &result),
+            executor.journal_action(&call, &result)
         );
     }
 

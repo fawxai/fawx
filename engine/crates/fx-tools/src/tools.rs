@@ -807,12 +807,73 @@ mod tests {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
     }
 
+    fn executor_with_tool<T>(root: &Path, tool: T) -> FawxToolExecutor
+    where
+        T: Tool + 'static,
+    {
+        let mut executor = test_executor(root);
+        let mut registry = ToolRegistry::default();
+        registry.register(tool);
+        executor.tools = Arc::new(registry);
+        executor
+    }
+
     fn memory_executor(root: &Path) -> (FawxToolExecutor, Arc<Mutex<fx_memory::JsonFileMemory>>) {
         let memory = Arc::new(Mutex::new(
             fx_memory::JsonFileMemory::new(root).expect("memory"),
         ));
         let executor = test_executor(root).with_memory(memory.clone());
         (executor, memory)
+    }
+
+    struct MetadataOnlyTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MetadataOnlyTool {
+        fn name(&self) -> &'static str {
+            "metadata_probe"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "probe metadata ownership".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string" },
+                        "branch": { "type": "string" }
+                    },
+                    "required": ["repo", "branch"]
+                }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _cancel: Option<&CancellationToken>,
+        ) -> ToolResult {
+            ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: "ok".to_string(),
+            }
+        }
+
+        fn journal_action(&self, call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+            let repo = call.arguments.get("repo")?.as_str()?;
+            let branch = call.arguments.get("branch")?.as_str()?;
+            Some(JournalAction::GitBranchCreate {
+                repo: PathBuf::from(repo),
+                branch: branch.to_string(),
+            })
+        }
+
+        fn action_category(&self) -> &'static str {
+            "metadata_owned"
+        }
     }
 
     fn embedding_executor(
@@ -2416,6 +2477,22 @@ three
     }
 
     #[test]
+    fn action_category_uses_custom_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_tool(temp.path(), MetadataOnlyTool);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "metadata_probe".to_string(),
+            arguments: serde_json::json!({
+                "repo": ".",
+                "branch": "feature/custom-metadata"
+            }),
+        };
+
+        assert_eq!(executor.action_category(&call), "metadata_owned");
+    }
+
+    #[test]
     fn journal_action_uses_registered_tool_metadata() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -2446,6 +2523,36 @@ three
                 created: false,
                 ..
             } if path == Path::new("notes.txt")
+        ));
+    }
+
+    #[test]
+    fn journal_action_uses_custom_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_tool(temp.path(), MetadataOnlyTool);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "metadata_probe".to_string(),
+            arguments: serde_json::json!({
+                "repo": ".",
+                "branch": "feature/custom-metadata"
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("metadata-owned journal action");
+
+        assert!(matches!(
+            action,
+            JournalAction::GitBranchCreate { repo, branch }
+            if repo == Path::new(".") && branch == "feature/custom-metadata"
         ));
     }
 
