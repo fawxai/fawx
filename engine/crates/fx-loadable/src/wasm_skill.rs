@@ -5,6 +5,7 @@
 //! manifest. The kernel dispatches tool calls to the adapter, which forwards
 //! normalized JSON input to the WASM runtime with a [`LiveHostApi`].
 
+use crate::lifecycle::{current_time_millis, hash_string, SignatureStatus, SkillRevision};
 use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
@@ -48,6 +49,14 @@ pub struct WasmSkill {
     manifest: SkillManifest,
     runtime: Arc<Mutex<SkillRuntime>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+}
+
+pub struct LoadedWasmArtifact {
+    pub skill: WasmSkill,
+    pub revision: SkillRevision,
+    pub manifest_toml: String,
+    pub wasm_bytes: Vec<u8>,
+    pub signature_bytes: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -380,14 +389,25 @@ pub fn load_wasm_skill_from_dir(
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     policy: &SignaturePolicy,
 ) -> Result<(WasmSkill, [u8; 32]), SkillError> {
-    let manifest = read_manifest(skill_dir)?;
+    let artifact = load_wasm_artifact_from_dir(skill_dir, credential_provider, policy)?;
+    let hash = compute_wasm_hash(&artifact.wasm_bytes);
+    Ok((artifact.skill, hash))
+}
+
+pub fn load_wasm_artifact_from_dir(
+    skill_dir: &Path,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
+) -> Result<LoadedWasmArtifact, SkillError> {
+    let manifest_toml = read_manifest_toml(skill_dir)?;
+    let manifest = fx_skills::manifest::parse_manifest(&manifest_toml)
+        .map_err(|error| format!("invalid manifest in {}: {error}", skill_dir.display()))?;
     let wasm_bytes = read_wasm_bytes(skill_dir, &manifest.name)?;
-    let hash = compute_wasm_hash(&wasm_bytes);
     let signature = read_signature_file(skill_dir, &manifest.name)?;
-    validate_signature_policy(&signature, policy, &manifest.name)?;
-    // Only pass signature to the loader when we actually have keys to verify against.
-    // validate_signature_policy already warned if signature is present but no keys.
+    let signature = normalize_signature_status(&wasm_bytes, &signature, policy);
+    validate_signature_policy(&signature.bytes, policy, &manifest.name)?;
     let effective_signature = signature
+        .bytes
         .as_deref()
         .filter(|_| !policy.trusted_keys.is_empty());
     let loaded = compile_skill(
@@ -396,21 +416,38 @@ pub fn load_wasm_skill_from_dir(
         effective_signature,
         &policy.trusted_keys,
     )?;
-    let wasm_skill = WasmSkill::new(loaded, credential_provider)?;
-    Ok((wasm_skill, hash))
+    let skill = WasmSkill::new(loaded, credential_provider)?;
+    let revision = build_revision(
+        &skill,
+        &manifest,
+        &manifest_toml,
+        signature.status,
+        &wasm_bytes,
+    );
+    Ok(LoadedWasmArtifact {
+        skill,
+        revision,
+        manifest_toml,
+        wasm_bytes,
+        signature_bytes: signature.bytes,
+    })
 }
 
 /// Read and parse `manifest.toml` from a skill directory.
 pub(crate) fn read_manifest(skill_dir: &Path) -> Result<SkillManifest, SkillError> {
-    let manifest_path = skill_dir.join("manifest.toml");
-    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        format!(
-            "failed to read manifest at {}: {e}",
-            manifest_path.display()
-        )
-    })?;
+    let content = read_manifest_toml(skill_dir)?;
     fx_skills::manifest::parse_manifest(&content)
         .map_err(|e| format!("invalid manifest in {}: {e}", skill_dir.display()))
+}
+
+pub(crate) fn read_manifest_toml(skill_dir: &Path) -> Result<String, SkillError> {
+    let manifest_path = skill_dir.join("manifest.toml");
+    std::fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "failed to read manifest at {}: {error}",
+            manifest_path.display()
+        )
+    })
 }
 
 /// Read `{name}.wasm` from a skill directory.
@@ -425,6 +462,43 @@ pub fn compute_wasm_hash(wasm_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(wasm_bytes);
     hasher.finalize().into()
+}
+
+fn build_revision(
+    skill: &WasmSkill,
+    manifest: &SkillManifest,
+    manifest_toml: &str,
+    signature: SignatureStatus,
+    wasm_bytes: &[u8],
+) -> SkillRevision {
+    SkillRevision {
+        content_hash: hash_wasm_bytes(wasm_bytes),
+        manifest_hash: hash_string(manifest_toml),
+        version: manifest.version.clone(),
+        signature,
+        tool_contracts: skill.tool_definitions(),
+        staged_at: current_time_millis(),
+    }
+}
+
+fn hash_wasm_bytes(wasm_bytes: &[u8]) -> String {
+    encode_hash_bytes(&compute_wasm_hash(wasm_bytes))
+}
+
+fn encode_hash_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(nibble_to_hex(byte >> 4));
+        output.push(nibble_to_hex(byte & 0x0f));
+    }
+    output
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + (value - 10)) as char,
+    }
 }
 
 /// Compile a WASM skill from bytes and manifest, with optional signature verification.
@@ -451,6 +525,11 @@ fn read_signature_file(skill_dir: &Path, name: &str) -> Result<Option<Vec<u8>>, 
             sig_path.display()
         )),
     }
+}
+
+struct NormalizedSignature {
+    bytes: Option<Vec<u8>>,
+    status: SignatureStatus,
 }
 
 /// Load Ed25519 public keys from `~/.fawx/trusted_keys/*.pub`.
@@ -544,6 +623,43 @@ fn validate_signature_policy(
             tracing::warn!(skill = %skill_name, "loading unsigned WASM skill");
             Ok(())
         }
+    }
+}
+
+fn normalize_signature_status(
+    wasm_bytes: &[u8],
+    signature: &Option<Vec<u8>>,
+    policy: &SignaturePolicy,
+) -> NormalizedSignature {
+    let Some(bytes) = signature.clone() else {
+        return NormalizedSignature {
+            bytes: None,
+            status: SignatureStatus::Unsigned,
+        };
+    };
+    let status = matching_signer(wasm_bytes, &bytes, &policy.trusted_keys)
+        .map(|signer| SignatureStatus::Valid { signer })
+        .unwrap_or(SignatureStatus::Invalid);
+    NormalizedSignature {
+        bytes: Some(bytes),
+        status,
+    }
+}
+
+fn matching_signer(
+    wasm_bytes: &[u8],
+    signature: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Option<String> {
+    trusted_keys
+        .iter()
+        .find_map(|key| signature_matches(wasm_bytes, signature, key))
+}
+
+fn signature_matches(wasm_bytes: &[u8], signature: &[u8], key: &[u8]) -> Option<String> {
+    match fx_skills::signing::verify_skill(wasm_bytes, signature, key) {
+        Ok(true) => Some(format!("ed25519:{}", encode_hash_bytes(key))),
+        Ok(false) | Err(_) => None,
     }
 }
 

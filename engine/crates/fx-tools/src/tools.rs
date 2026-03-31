@@ -845,6 +845,13 @@ mod tests {
                 description: Some("Built-in runtime tools".to_string()),
                 tool_names: vec!["read_file".to_string(), "self_info".to_string()],
                 capabilities: Vec::new(),
+                version: None,
+                source: None,
+                revision_hash: None,
+                manifest_hash: None,
+                activated_at_ms: None,
+                signature_status: None,
+                stale_source: None,
             }],
             config_summary: fx_core::runtime_info::ConfigSummary {
                 max_iterations: 6,

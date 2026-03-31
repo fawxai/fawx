@@ -5,12 +5,8 @@
 //! without restart. Changes are debounced per skill directory (500ms) and
 //! deduplicated by SHA-256 hash to avoid spurious reloads.
 
-use crate::registry::SkillRegistry;
+use crate::lifecycle::SkillLifecycleManager;
 use crate::skill::SkillError;
-use crate::wasm_skill::{
-    compute_wasm_hash, load_wasm_skill_from_dir, read_manifest, SignaturePolicy,
-};
-use fx_skills::live_host_api::CredentialProvider;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,12 +18,19 @@ use tokio::time::Instant;
 #[derive(Debug, Clone)]
 pub enum ReloadEvent {
     /// A new skill was loaded for the first time.
-    Loaded { skill_name: String, version: String },
+    Loaded {
+        skill_name: String,
+        version: String,
+        revision: String,
+        source: String,
+    },
     /// An existing skill was updated with a new binary.
     Updated {
         skill_name: String,
         old_version: String,
         new_version: String,
+        revision: String,
+        source: String,
     },
     /// A skill was removed (directory deleted or manifest/wasm missing).
     Removed { skill_name: String },
@@ -37,7 +40,7 @@ pub enum ReloadEvent {
 
 /// Tracks the last known state of a loaded skill.
 struct SkillState {
-    hash: [u8; 32],
+    hash: String,
     version: String,
 }
 
@@ -48,11 +51,9 @@ struct SkillState {
 /// hasn't actually changed.
 pub struct SkillWatcher {
     skills_dir: PathBuf,
-    registry: Arc<SkillRegistry>,
+    lifecycle: Arc<std::sync::Mutex<SkillLifecycleManager>>,
     event_tx: mpsc::Sender<ReloadEvent>,
     hashes: HashMap<String, SkillState>,
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
-    signature_policy: SignaturePolicy,
 }
 
 /// Debounce window for filesystem events (per skill directory).
@@ -65,18 +66,14 @@ impl SkillWatcher {
     /// to populate hashes for startup-loaded skills.
     pub fn new(
         skills_dir: PathBuf,
-        registry: Arc<SkillRegistry>,
+        lifecycle: Arc<std::sync::Mutex<SkillLifecycleManager>>,
         event_tx: mpsc::Sender<ReloadEvent>,
-        credential_provider: Option<Arc<dyn CredentialProvider>>,
-        signature_policy: SignaturePolicy,
     ) -> Self {
         Self {
             skills_dir,
-            registry,
+            lifecycle,
             event_tx,
             hashes: HashMap::new(),
-            credential_provider,
-            signature_policy,
         }
     }
 
@@ -85,49 +82,27 @@ impl SkillWatcher {
     /// Must be called before [`run`](Self::run) so the watcher can distinguish
     /// between new skills and updates to existing ones.
     pub fn initialize_hashes(&mut self) {
-        let entries = match std::fs::read_dir(&self.skills_dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to read skills dir for hash initialization"
-                );
+        let statuses = match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle.statuses(),
+            Err(error) => {
+                tracing::warn!(error = %error, "skill lifecycle lock poisoned");
                 return;
             }
         };
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            self.initialize_single_hash(&path);
+        for status in statuses {
+            self.hashes.insert(
+                status.name,
+                SkillState {
+                    hash: status.activation.revision.revision_hash(),
+                    version: status.activation.revision.version,
+                },
+            );
         }
 
         tracing::info!(
             count = self.hashes.len(),
             "initialized watcher hashes for existing skills"
         );
-    }
-
-    /// Initialize hash and version for a single skill directory.
-    ///
-    /// Reads the manifest and WASM bytes directly from disk to avoid
-    /// the cost of compiling the WASM module via wasmtime at startup.
-    fn initialize_single_hash(&mut self, path: &Path) {
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => return,
-        };
-        let wasm_path = path.join(format!("{name}.wasm"));
-        if let Ok(bytes) = std::fs::read(&wasm_path) {
-            let hash = compute_wasm_hash(&bytes);
-            let version = read_manifest(path)
-                .map(|m| m.version.clone())
-                .unwrap_or_else(|_| "unknown".to_string());
-            self.hashes
-                .insert(name.to_string(), SkillState { hash, version });
-        }
     }
 
     /// Run the watcher loop. This is async and runs forever until an
@@ -212,13 +187,16 @@ impl SkillWatcher {
 
     /// Attempt to load or update a skill from its directory.
     fn handle_load_or_update(&mut self, skill_name: &str, skill_dir: &Path) {
-        match load_wasm_skill_from_dir(
-            skill_dir,
-            self.credential_provider.clone(),
-            &self.signature_policy,
-        ) {
-            Ok((wasm_skill, new_hash)) => {
-                self.apply_loaded_skill(skill_name, wasm_skill, new_hash);
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = lifecycle.active(skill_name).cloned();
+        match lifecycle
+            .stage_from_source(skill_dir)
+            .and_then(|_| lifecycle.activate(skill_name))
+        {
+            Ok(changed) => {
+                let current = lifecycle.active(skill_name).cloned();
+                drop(lifecycle);
+                self.apply_loaded_skill(skill_name, previous, current, changed)
             }
             Err(e) => {
                 tracing::warn!(skill = %skill_name, error = %e, "failed to reload skill");
@@ -234,40 +212,56 @@ impl SkillWatcher {
     fn apply_loaded_skill(
         &mut self,
         skill_name: &str,
-        wasm_skill: crate::wasm_skill::WasmSkill,
-        new_hash: [u8; 32],
+        previous: Option<crate::lifecycle::SkillActivation>,
+        current: Option<crate::lifecycle::SkillActivation>,
+        changed: bool,
     ) {
-        let old_state = self.hashes.get(skill_name);
-        if old_state.map(|s| s.hash) == Some(new_hash) {
-            tracing::debug!(skill = %skill_name, "hash unchanged — skipping reload");
+        let mirrored = self.hashes.get(skill_name);
+        let Some(current) = current else {
+            tracing::warn!(skill = %skill_name, "reload reported success without active revision");
+            return;
+        };
+        if !changed {
+            tracing::debug!(
+                skill = %skill_name,
+                previous_hash = ?mirrored.as_ref().map(|state| state.hash.as_str()),
+                "hash unchanged — skipping reload"
+            );
             return;
         }
 
-        let new_version = wasm_skill.version().to_string();
-        let skill_arc: Arc<dyn crate::skill::Skill> = Arc::new(wasm_skill);
-
-        let event = if let Some(old) = old_state {
-            let old_version = old.version.clone();
-            self.registry.replace_skill(skill_name, skill_arc);
-            tracing::info!(skill = %skill_name, version = %new_version, "updated WASM skill");
+        let revision = current.revision.revision_hash();
+        let source = current.source.display();
+        let new_version = current.revision.version.clone();
+        let event = if let Some(old) = previous {
+            tracing::info!(
+                skill = %skill_name,
+                previous_version = ?mirrored.as_ref().map(|state| state.version.as_str()),
+                version = %new_version,
+                revision = %crate::lifecycle::short_hash(&revision),
+                "updated WASM skill"
+            );
             ReloadEvent::Updated {
                 skill_name: skill_name.to_string(),
-                old_version,
+                old_version: old.revision.version,
                 new_version: new_version.clone(),
+                revision: revision.clone(),
+                source: source.clone(),
             }
         } else {
-            self.registry.register(skill_arc);
-            tracing::info!(skill = %skill_name, version = %new_version, "loaded new WASM skill");
+            tracing::info!(skill = %skill_name, version = %new_version, revision = %crate::lifecycle::short_hash(&revision), "loaded new WASM skill");
             ReloadEvent::Loaded {
                 skill_name: skill_name.to_string(),
                 version: new_version.clone(),
+                revision: revision.clone(),
+                source: source.clone(),
             }
         };
 
         self.hashes.insert(
             skill_name.to_string(),
             SkillState {
-                hash: new_hash,
+                hash: revision,
                 version: new_version,
             },
         );
@@ -277,7 +271,11 @@ impl SkillWatcher {
     /// Handle removal of a skill directory.
     fn handle_removal(&mut self, skill_name: &str) {
         if self.hashes.remove(skill_name).is_some() {
-            self.registry.remove_skill(skill_name);
+            let _ = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove_skill(skill_name);
             tracing::info!(skill = %skill_name, "removed WASM skill");
             let _ = self.event_tx.try_send(ReloadEvent::Removed {
                 skill_name: skill_name.to_string(),
@@ -345,10 +343,23 @@ fn collect_skill_names_from_event(event: &notify::Event, names: &mut HashSet<Str
     }
 
     for path in &event.paths {
+        if is_lifecycle_path(path) {
+            continue;
+        }
         if let Some(name) = extract_skill_dir_name(path) {
             names.insert(name);
         }
     }
+}
+
+fn is_lifecycle_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            name.to_str() == Some(crate::lifecycle::SOURCE_METADATA_FILE)
+                || name.to_str() == Some(".fawx-lifecycle")
+        }
+        _ => false,
+    })
 }
 
 /// Extract the skill directory name from a file path.
@@ -403,15 +414,56 @@ mod tests {
         invocable_wasm_bytes, test_manifest_toml, versioned_manifest_toml, write_test_skill,
         write_versioned_test_skill,
     };
-    use crate::wasm_skill::compute_wasm_hash;
+    use crate::wasm_skill::load_wasm_artifact_from_dir;
+    use crate::{SignaturePolicy, SkillLifecycleConfig, SkillLifecycleManager, SkillRegistry};
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn new_lifecycle(
+        skills_dir: &Path,
+        registry: Arc<SkillRegistry>,
+    ) -> Arc<std::sync::Mutex<SkillLifecycleManager>> {
+        Arc::new(std::sync::Mutex::new(SkillLifecycleManager::new(
+            SkillLifecycleConfig {
+                skills_dir: skills_dir.to_path_buf(),
+                registry,
+                credential_provider: None,
+                signature_policy: SignaturePolicy::default(),
+            },
+        )))
+    }
+
+    fn new_watcher(
+        skills_dir: &Path,
+    ) -> (
+        Arc<SkillRegistry>,
+        Arc<std::sync::Mutex<SkillLifecycleManager>>,
+        SkillWatcher,
+        mpsc::Receiver<ReloadEvent>,
+    ) {
+        let registry = Arc::new(SkillRegistry::new());
+        let lifecycle = new_lifecycle(skills_dir, Arc::clone(&registry));
+        let (tx, rx) = mpsc::channel(16);
+        let watcher = SkillWatcher::new(skills_dir.to_path_buf(), Arc::clone(&lifecycle), tx);
+        (registry, lifecycle, watcher, rx)
+    }
+
+    fn load_startup_skills(lifecycle: &Arc<std::sync::Mutex<SkillLifecycleManager>>) {
+        lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .load_startup_skills()
+            .expect("load startup skills");
+    }
 
     #[test]
     fn reload_event_is_debug_and_clone() {
         let event = ReloadEvent::Loaded {
             skill_name: "test".to_string(),
             version: "1.0.0".to_string(),
+            revision: "abc123".to_string(),
+            source: "installed".to_string(),
         };
         let cloned = event.clone();
         let _debug = format!("{event:?}");
@@ -486,15 +538,8 @@ mod tests {
         write_test_skill(tmp.path(), "alpha").unwrap();
         write_test_skill(tmp.path(), "beta").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, lifecycle, mut watcher, _rx) = new_watcher(tmp.path());
+        load_startup_skills(&lifecycle);
 
         watcher.initialize_hashes();
         assert_eq!(watcher.hashes.len(), 2);
@@ -507,20 +552,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "test_hash").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, lifecycle, mut watcher, _rx) = new_watcher(tmp.path());
+        load_startup_skills(&lifecycle);
 
         watcher.initialize_hashes();
 
-        let expected = compute_wasm_hash(&invocable_wasm_bytes());
-        assert_eq!(watcher.hashes["test_hash"].hash, expected);
+        let expected = load_wasm_artifact_from_dir(
+            &tmp.path().join("test_hash"),
+            None,
+            &SignaturePolicy::default(),
+        )
+        .unwrap()
+        .revision
+        .revision_hash();
+        assert_eq!(watcher.hashes.get("test_hash").unwrap().hash, expected);
     }
 
     #[test]
@@ -528,18 +573,33 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_versioned_test_skill(tmp.path(), "versioned", "2.5.0").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, lifecycle, mut watcher, _rx) = new_watcher(tmp.path());
+        load_startup_skills(&lifecycle);
 
         watcher.initialize_hashes();
-        assert_eq!(watcher.hashes["versioned"].version, "2.5.0");
+        assert_eq!(watcher.hashes.get("versioned").unwrap().version, "2.5.0");
+    }
+
+    #[test]
+    fn initialize_hashes_uses_reconciled_offline_revision_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        write_versioned_test_skill(tmp.path(), "weather", "1.0.0").unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        let lifecycle = new_lifecycle(tmp.path(), Arc::clone(&registry));
+        load_startup_skills(&lifecycle);
+
+        fs::write(
+            tmp.path().join("weather").join("manifest.toml"),
+            versioned_manifest_toml("weather", "2.0.0"),
+        )
+        .unwrap();
+
+        let (_registry, lifecycle, mut watcher, _rx) = new_watcher(tmp.path());
+        load_startup_skills(&lifecycle);
+
+        watcher.initialize_hashes();
+        assert_eq!(watcher.hashes.get("weather").unwrap().version, "2.0.0");
     }
 
     #[test]
@@ -582,15 +642,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "newskill").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry.clone(),
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         watcher.process_skill_change("newskill").await;
 
@@ -612,15 +664,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_versioned_test_skill(tmp.path(), "verskill", "3.1.0").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         watcher.process_skill_change("verskill").await;
 
@@ -629,7 +673,7 @@ mod tests {
             ReloadEvent::Loaded { version, .. } => assert_eq!(version, "3.1.0"),
             other => panic!("expected Loaded, got {other:?}"),
         }
-        assert_eq!(watcher.hashes["verskill"].version, "3.1.0");
+        assert_eq!(watcher.hashes.get("verskill").unwrap().version, "3.1.0");
     }
 
     /// WAT source producing a different WASM binary (outputs "hi" instead of "ok").
@@ -657,15 +701,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "updskill").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry.clone(),
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         // First load
         watcher.process_skill_change("updskill").await;
@@ -687,15 +723,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_versioned_test_skill(tmp.path(), "upver", "1.0.0").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         // First load
         watcher.process_skill_change("upver").await;
@@ -727,19 +755,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_skill_change_manifest_only_update_changes_revision_identity() {
+        let tmp = TempDir::new().unwrap();
+        write_versioned_test_skill(tmp.path(), "manifestonly", "1.0.0").unwrap();
+
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
+
+        watcher.process_skill_change("manifestonly").await;
+        let _ = rx.try_recv();
+        let old_hash = watcher.hashes.get("manifestonly").unwrap().hash.clone();
+
+        fs::write(
+            tmp.path().join("manifestonly").join("manifest.toml"),
+            versioned_manifest_toml("manifestonly", "2.0.0"),
+        )
+        .unwrap();
+
+        watcher.process_skill_change("manifestonly").await;
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            ReloadEvent::Updated {
+                new_version,
+                revision,
+                ..
+            } => {
+                assert_eq!(new_version, "2.0.0");
+                assert_ne!(revision, old_hash);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        assert_eq!(watcher.hashes.get("manifestonly").unwrap().version, "2.0.0");
+        assert_ne!(watcher.hashes.get("manifestonly").unwrap().hash, old_hash);
+    }
+
+    #[tokio::test]
     async fn process_skill_change_same_hash_no_reload() {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "sameskill").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         // First load
         watcher.process_skill_change("sameskill").await;
@@ -757,15 +812,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "rmskill").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry.clone(),
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         // Load first
         watcher.process_skill_change("rmskill").await;
@@ -788,20 +835,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "errskill").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry.clone(),
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         // Load successfully first
         watcher.process_skill_change("errskill").await;
         let _ = rx.try_recv();
-        let old_hash = watcher.hashes["errskill"].hash;
+        let old_hash = watcher.hashes.get("errskill").unwrap().hash.clone();
 
         // Write invalid WASM but keep manifest valid
         let skill_dir = tmp.path().join("errskill");
@@ -814,7 +853,7 @@ mod tests {
         assert!(matches!(event, ReloadEvent::Error { .. }));
 
         // Old hash should still be there (skill preserved)
-        assert_eq!(watcher.hashes["errskill"].hash, old_hash);
+        assert_eq!(watcher.hashes.get("errskill").unwrap().hash, old_hash);
 
         // Old skill should still be registered
         assert_eq!(registry.all_tool_definitions().len(), 1);
@@ -833,15 +872,7 @@ mod tests {
         .unwrap();
         // No manifest.toml
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         watcher.process_skill_change(name).await;
 
@@ -854,15 +885,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_test_skill(tmp.path(), "debounce").unwrap();
 
-        let registry = Arc::new(SkillRegistry::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry.clone(),
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let (_registry, _lifecycle, mut watcher, mut rx) = new_watcher(tmp.path());
 
         watcher.process_skill_change("debounce").await;
         let _ = rx.try_recv(); // Loaded
@@ -919,15 +942,10 @@ mod tests {
         write_test_skill(tmp.path(), "trysend").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
+        let lifecycle = new_lifecycle(tmp.path(), Arc::clone(&registry));
         // Channel with capacity 1 — fill it to verify try_send doesn't block
         let (tx, _rx) = mpsc::channel(1);
-        let mut watcher = SkillWatcher::new(
-            tmp.path().to_path_buf(),
-            registry,
-            tx,
-            None,
-            SignaturePolicy::default(),
-        );
+        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), lifecycle, tx);
 
         // Load the skill first
         watcher.process_skill_change("trysend").await;

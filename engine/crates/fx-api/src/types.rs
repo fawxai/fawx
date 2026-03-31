@@ -318,6 +318,18 @@ pub struct SkillSummaryDto {
     pub description: String,
     pub tools: Vec<String>,
     pub capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_source: Option<String>,
 }
 
 impl From<(String, String, Vec<String>, Vec<String>)> for SkillSummaryDto {
@@ -329,6 +341,12 @@ impl From<(String, String, Vec<String>, Vec<String>)> for SkillSummaryDto {
             description,
             tools,
             capabilities,
+            version: None,
+            source: None,
+            revision_hash: None,
+            activated_at_ms: None,
+            signature_status: None,
+            stale_source: None,
         }
     }
 }
