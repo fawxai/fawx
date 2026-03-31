@@ -21,17 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Kernel-blind paths — blocked for agent read access when enforcement is on.
-/// These are compiled invariants and cannot be overridden.
-const KERNEL_BLIND_PATHS: &[&str] = &[
-    "engine/crates/fx-kernel/",
-    "engine/crates/fx-auth/",
-    "engine/crates/fx-security/",
-    "engine/crates/fx-consensus/",
-    "fawx-ripcord/",
-    "tests/invariant/",
-];
-
 /// An approved proposal that allows writes to specific paths.
 #[derive(Debug, Clone)]
 pub struct ActiveProposal {
@@ -123,38 +112,6 @@ enum GateDecision {
 
 pub fn is_tier3_path(relative_path: &str) -> bool {
     classify_write_domain(Path::new(relative_path), Path::new(".")) == WriteDomain::Sovereign
-}
-
-pub fn is_kernel_blind_path(relative_path: &str) -> bool {
-    let normalized = normalize_relative(relative_path);
-    KERNEL_BLIND_PATHS
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn is_kernel_blind_enforced() -> bool {
-    cfg!(feature = "kernel-blind")
-}
-
-fn normalize_relative(path: &str) -> String {
-    let unified = path.replace('\\', "/");
-    // Strip leading ./ prefix
-    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
-    // Strip leading / (absolute paths treated as relative to working dir)
-    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
-    // Collapse ../ segments
-    let mut parts: Vec<&str> = Vec::new();
-    for segment in stripped.split('/') {
-        match segment {
-            "" | "." => continue,
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
 }
 
 fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
@@ -563,6 +520,9 @@ fn assemble_results(
 mod tests {
     use super::*;
     use crate::act::{ToolCacheStats, ToolCacheability, ToolExecutorError, ToolResult};
+    use crate::kernel_blind::{
+        is_kernel_blind_enforced, is_kernel_blind_path, normalize_relative_path,
+    };
     use async_trait::async_trait;
     use fx_llm::ToolCall;
     use fx_propose::{extract_proposed_content, sha256_hex};
@@ -1548,17 +1508,10 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 17: normalize_relative unit tests
     #[test]
-    fn normalize_relative_handles_variants() {
-        assert_eq!(normalize_relative("./foo/bar"), "foo/bar");
-        assert_eq!(normalize_relative("a/../b/c"), "b/c");
-        assert_eq!(normalize_relative("/absolute/path"), "absolute/path");
-        assert_eq!(
-            normalize_relative("engine/../engine/crates/fx-kernel/src/lib.rs"),
-            "engine/crates/fx-kernel/src/lib.rs"
-        );
-        assert_eq!(normalize_relative("a/./b/../c"), "a/c");
-        assert_eq!(normalize_relative("foo\\bar\\baz"), "foo/bar/baz");
+    fn proposal_gate_tests_use_shared_normalization() {
+        assert_eq!(normalize_relative_path("./foo/bar"), "foo/bar");
+        assert_eq!(normalize_relative_path("a/../b/c"), "b/c");
+        assert_eq!(normalize_relative_path("/absolute/path"), "absolute/path");
     }
 }

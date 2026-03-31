@@ -259,10 +259,9 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
         let session_approved = self
             .prompt_state
             .is_session_allowed(&request.approval_scope());
-        let decision = self.authority.resolve_request(request, session_approved);
         self.authority
-            .publish_runtime_info(self.prompt_state.session_override_count());
-        decision
+            .set_active_session_approvals(self.prompt_state.session_override_count());
+        self.authority.resolve_request(request, session_approved)
     }
 
     async fn ask_permission(
@@ -292,7 +291,8 @@ impl<T: ToolExecutor> PermissionGateExecutor<T> {
         emit_prompt(&self.stream_callback, prompt);
         let result = await_decision(call, receiver, cancel, &self.authority, decision).await;
         self.authority
-            .publish_runtime_info(self.prompt_state.session_override_count());
+            .set_active_session_approvals(self.prompt_state.session_override_count());
+        self.authority.publish_runtime_info();
         result
     }
 }

@@ -37,6 +37,7 @@ pub mod conversation_compactor;
 pub mod decide;
 pub mod event_bus;
 pub mod input;
+mod kernel_blind;
 pub mod loop_engine;
 pub mod perceive;
 pub mod permission_gate;

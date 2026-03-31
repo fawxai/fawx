@@ -1,3 +1,7 @@
+use crate::kernel_blind::{
+    is_kernel_blind_enforced, is_kernel_blind_path, normalize_relative_path,
+    shell_targets_kernel_path,
+};
 use crate::permission_gate::PermissionPolicy;
 use crate::proposal_gate::{ActiveProposal, ProposalGateState};
 use fx_core::path::expand_tilde;
@@ -8,6 +12,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -235,6 +240,7 @@ pub struct AuthorityCoordinator {
     state: std::sync::Mutex<ProposalGateState>,
     cache: std::sync::Mutex<HashMap<String, CachedEntry>>,
     recent: std::sync::Mutex<VecDeque<AuthorityDecisionSnapshot>>,
+    active_session_approvals: AtomicUsize,
     runtime_info: std::sync::Mutex<Option<Arc<RwLock<RuntimeInfo>>>>,
 }
 
@@ -252,6 +258,7 @@ impl AuthorityCoordinator {
             state: std::sync::Mutex::new(state),
             cache: std::sync::Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(VecDeque::new()),
+            active_session_approvals: AtomicUsize::new(0),
             runtime_info: std::sync::Mutex::new(None),
         }
     }
@@ -263,7 +270,12 @@ impl AuthorityCoordinator {
             .unwrap_or_else(|error| error.into_inner());
         *slot = Some(runtime_info);
         drop(slot);
-        self.publish_runtime_info(0);
+        self.publish_runtime_info();
+    }
+
+    pub fn set_active_session_approvals(&self, count: usize) {
+        self.active_session_approvals
+            .store(count, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -346,7 +358,7 @@ impl AuthorityCoordinator {
     }
 
     #[must_use]
-    pub fn status_snapshot(&self, active_session_approvals: usize) -> AuthorityStatusSnapshot {
+    pub fn status_snapshot(&self) -> AuthorityStatusSnapshot {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let recent = self
             .recent
@@ -359,14 +371,14 @@ impl AuthorityCoordinator {
             capability_mode_mutates_path_policy: false,
             kernel_blind_enabled: is_kernel_blind_enforced(),
             sovereign_boundary_enforced: true,
-            active_session_approvals,
+            active_session_approvals: self.active_session_approvals(),
             active_proposal_override: state.active_proposal().map(|proposal| proposal.id.clone()),
             recent_decisions: recent.iter().cloned().collect(),
         }
     }
 
-    pub fn publish_runtime_info(&self, active_session_approvals: usize) {
-        let snapshot = self.status_snapshot(active_session_approvals);
+    pub fn publish_runtime_info(&self) {
+        let snapshot = self.status_snapshot();
         let authority_info = AuthorityRuntimeInfo {
             resolver: snapshot.resolver,
             approval_scope: snapshot.approval_scope,
@@ -414,7 +426,11 @@ impl AuthorityCoordinator {
             recent.pop_back();
         }
         drop(recent);
-        self.publish_runtime_info(0);
+        self.publish_runtime_info();
+    }
+
+    fn active_session_approvals(&self) -> usize {
+        self.active_session_approvals.load(Ordering::Relaxed)
     }
 }
 
@@ -427,32 +443,35 @@ fn classify_call(
     fallback_capability: &str,
     working_dir: &Path,
 ) -> AuthorityRequest {
-    let capability = capability_for_call(call, fallback_capability, working_dir);
-    let effect = effect_for_call(call);
-    match call.name.as_str() {
-        "write_file" | "create_file" | "edit_file" | "delete_file" | "remove_file"
-        | "read_file" | "search_text" | "list_directory" => {
-            classify_path_request(call, capability, effect, working_dir)
+    let surface = CallSurface::from_tool_name(&call.name);
+    let capability = capability_for_call(call, fallback_capability, working_dir, surface);
+    match surface {
+        CallSurface::PathRead | CallSurface::PathWrite | CallSurface::PathDelete => {
+            classify_path_request(call, capability, surface.effect(), working_dir)
         }
-        "git_checkpoint" => classify_git_checkpoint_request(call, capability, working_dir),
-        "run_command" | "shell" | "bash" | "execute_command" => {
-            classify_command_request(call, capability)
+        CallSurface::GitCheckpoint => {
+            classify_git_checkpoint_request(call, capability, working_dir)
         }
-        "web_search" | "brave_search" | "web_fetch" | "fetch_url" => {
-            classify_network_request(call, capability, effect)
-        }
-        _ => classify_none_request(call, capability, effect),
+        CallSurface::Command => classify_command_request(call, capability),
+        CallSurface::Network => classify_network_request(call, capability, surface.effect()),
+        CallSurface::Other => classify_none_request(call, capability, surface.effect()),
     }
 }
 
-fn capability_for_call(call: &ToolCall, fallback_capability: &str, working_dir: &Path) -> String {
-    if is_path_write_tool(&call.name) || is_path_delete_tool(&call.name) {
+fn capability_for_call(
+    call: &ToolCall,
+    fallback_capability: &str,
+    working_dir: &Path,
+    surface: CallSurface,
+) -> String {
+    if matches!(surface, CallSurface::PathWrite | CallSurface::PathDelete) {
         return path_capability(call, working_dir);
     }
-    if is_path_read_tool(&call.name) && read_targets_outside_workspace(call, working_dir) {
+    if matches!(surface, CallSurface::PathRead) && read_targets_outside_workspace(call, working_dir)
+    {
         return "outside_workspace".to_string();
     }
-    if call.name == "git_checkpoint" {
+    if matches!(surface, CallSurface::GitCheckpoint) {
         return "git".to_string();
     }
     fallback_capability.to_string()
@@ -471,17 +490,6 @@ fn read_targets_outside_workspace(call: &ToolCall, working_dir: &Path) -> bool {
             classify_write_domain(&expand_tilde(path), working_dir) == WriteDomain::External
         })
         .unwrap_or(false)
-}
-
-fn effect_for_call(call: &ToolCall) -> AuthorityEffect {
-    match call.name.as_str() {
-        "read_file" | "search_text" | "list_directory" => AuthorityEffect::Read,
-        "write_file" | "create_file" | "edit_file" | "git_checkpoint" => AuthorityEffect::Write,
-        "delete_file" | "remove_file" => AuthorityEffect::Delete,
-        "web_search" | "brave_search" | "web_fetch" | "fetch_url" => AuthorityEffect::Network,
-        "run_command" | "shell" | "bash" | "execute_command" => AuthorityEffect::Execute,
-        _ => AuthorityEffect::None,
-    }
 }
 
 fn classify_path_request(
@@ -804,70 +812,6 @@ fn extract_path(call: &ToolCall) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-fn is_path_write_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "write_file" | "create_file" | "edit_file")
-}
-
-fn is_path_delete_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "delete_file" | "remove_file")
-}
-
-fn is_path_read_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "search_text" | "list_directory")
-}
-
-pub fn is_kernel_blind_path(relative_path: &str) -> bool {
-    const KERNEL_BLIND_PATHS: &[&str] = &[
-        "engine/crates/fx-kernel/",
-        "engine/crates/fx-auth/",
-        "engine/crates/fx-security/",
-        "engine/crates/fx-consensus/",
-        "fawx-ripcord/",
-        "tests/invariant/",
-    ];
-    let normalized = normalize_relative_path(relative_path);
-    KERNEL_BLIND_PATHS
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-}
-
-#[must_use]
-pub fn is_kernel_blind_enforced() -> bool {
-    cfg!(feature = "kernel-blind")
-}
-
-pub fn shell_targets_kernel_path(command: &str) -> bool {
-    let read_commands = ["cat ", "head ", "tail ", "less ", "more ", "bat "];
-    let search_commands = ["grep ", "rg ", "ag ", "find "];
-    let git_commands = ["git show ", "git log -p", "git diff ", "git blame "];
-    let re_tools = [
-        "strings ", "objdump ", "otool ", "nm ", "readelf ", "hexdump ", "xxd ",
-    ];
-
-    if command.contains("/proc/self/exe") || command.contains("/proc/self/maps") {
-        return true;
-    }
-
-    read_commands
-        .iter()
-        .chain(search_commands.iter())
-        .chain(git_commands.iter())
-        .chain(re_tools.iter())
-        .any(|prefix| {
-            command.contains(prefix)
-                && [
-                    "engine/crates/fx-kernel/",
-                    "engine/crates/fx-auth/",
-                    "engine/crates/fx-security/",
-                    "engine/crates/fx-consensus/",
-                    "fawx-ripcord/",
-                    "tests/invariant/",
-                ]
-                .iter()
-                .any(|path| command.contains(path))
-        })
-}
-
 fn git_checkpoint_paths(working_dir: &Path) -> Vec<String> {
     git_status_paths(working_dir)
 }
@@ -946,23 +890,6 @@ fn normalize_relative_to_base(path: &Path, base_dir: &Path) -> String {
         .unwrap_or_else(|_| normalize_relative_path(&absolute.to_string_lossy()))
 }
 
-fn normalize_relative_path(path: &str) -> String {
-    let unified = path.replace('\\', "/");
-    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
-    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
-    let mut parts = Vec::new();
-    for segment in stripped.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            value => parts.push(value),
-        }
-    }
-    parts.join("/")
-}
-
 fn current_epoch_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -970,10 +897,47 @@ fn current_epoch_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy)]
+enum CallSurface {
+    PathRead,
+    PathWrite,
+    PathDelete,
+    GitCheckpoint,
+    Command,
+    Network,
+    Other,
+}
+
+impl CallSurface {
+    fn from_tool_name(tool_name: &str) -> Self {
+        match tool_name {
+            "read_file" | "search_text" | "list_directory" => Self::PathRead,
+            "write_file" | "create_file" | "edit_file" => Self::PathWrite,
+            "delete_file" | "remove_file" => Self::PathDelete,
+            "git_checkpoint" => Self::GitCheckpoint,
+            "run_command" | "shell" | "bash" | "execute_command" => Self::Command,
+            "web_search" | "brave_search" | "web_fetch" | "fetch_url" => Self::Network,
+            _ => Self::Other,
+        }
+    }
+
+    const fn effect(self) -> AuthorityEffect {
+        match self {
+            Self::PathRead => AuthorityEffect::Read,
+            Self::PathWrite | Self::GitCheckpoint => AuthorityEffect::Write,
+            Self::PathDelete => AuthorityEffect::Delete,
+            Self::Command => AuthorityEffect::Execute,
+            Self::Network => AuthorityEffect::Network,
+            Self::Other => AuthorityEffect::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fx_config::CapabilityMode;
+    use fx_core::runtime_info::ConfigSummary;
     use fx_core::self_modify::SelfModifyConfig;
     use std::collections::HashSet;
 
@@ -1142,7 +1106,7 @@ mod tests {
     #[test]
     fn capability_mode_does_not_mutate_path_policy_source() {
         let coordinator = AuthorityCoordinator::new(policy(CapabilityMode::Capability), state());
-        let snapshot = coordinator.status_snapshot(0);
+        let snapshot = coordinator.status_snapshot();
 
         assert_eq!(snapshot.path_policy_source, "self_modify_config");
         assert!(!snapshot.capability_mode_mutates_path_policy);
@@ -1178,10 +1142,49 @@ mod tests {
         );
         let _ = coordinator.resolve_request(request, false);
 
-        let snapshot = coordinator.status_snapshot(1);
+        coordinator.set_active_session_approvals(1);
+        let snapshot = coordinator.status_snapshot();
 
         assert_eq!(snapshot.resolver, "unified");
         assert_eq!(snapshot.active_session_approvals, 1);
+        assert_eq!(snapshot.recent_decisions.len(), 1);
+        assert_eq!(snapshot.recent_decisions[0].verdict, "prompt");
+    }
+
+    #[test]
+    fn runtime_info_reports_active_session_approvals_after_recording_decision() {
+        let coordinator = AuthorityCoordinator::new(policy(CapabilityMode::Prompt), state());
+        let runtime_info = Arc::new(RwLock::new(RuntimeInfo {
+            active_model: String::new(),
+            provider: String::new(),
+            skills: Vec::new(),
+            config_summary: ConfigSummary {
+                max_iterations: 10,
+                max_history: 20,
+                memory_enabled: true,
+            },
+            authority: None,
+            version: "test".to_string(),
+        }));
+        coordinator.set_active_session_approvals(2);
+        coordinator.attach_runtime_info(Arc::clone(&runtime_info));
+
+        let request = coordinator.classify_call(
+            &call(
+                "write_file",
+                serde_json::json!({"path":"README.md","content":"x"}),
+            ),
+            "file_write",
+        );
+        let _ = coordinator.resolve_request(request, false);
+
+        let snapshot = runtime_info
+            .read()
+            .expect("runtime info lock")
+            .authority
+            .clone()
+            .expect("authority runtime info");
+        assert_eq!(snapshot.active_session_approvals, 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert_eq!(snapshot.recent_decisions[0].verdict, "prompt");
     }

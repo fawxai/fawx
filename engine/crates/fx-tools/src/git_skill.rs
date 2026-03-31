@@ -165,15 +165,6 @@ impl GitSkill {
         }
         self.run_git_with_timeout(&["add", "-A"], CHECKPOINT_TIMEOUT)
             .await?;
-        if let Err(error) = self.check_staged_paths().await {
-            if let Err(reset_err) = self
-                .run_git_with_timeout(&["reset"], CHECKPOINT_TIMEOUT)
-                .await
-            {
-                tracing::warn!("failed to reset index after blocked checkpoint: {reset_err}");
-            }
-            return Err(error);
-        }
         match self
             .run_git_with_timeout(&["commit", "-m", &parsed.message], CHECKPOINT_TIMEOUT)
             .await
@@ -184,11 +175,6 @@ impl GitSkill {
             }
             Err(error) => Err(error),
         }
-    }
-
-    async fn check_staged_paths(&self) -> Result<(), String> {
-        let _ = &self.self_modify;
-        Ok(())
     }
 
     async fn execute_branch_create(&self, arguments: &str) -> Result<String, String> {
