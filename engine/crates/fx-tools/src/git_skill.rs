@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::cancellation::CancellationToken;
-use fx_llm::ToolDefinition;
+use fx_kernel::ToolAuthoritySurface;
+use fx_llm::{ToolCall, ToolDefinition};
 use fx_loadable::{Skill, SkillError};
 use fx_ripcord::git_guard::check_push_allowed;
 use serde::Deserialize;
@@ -359,6 +360,13 @@ impl Skill for GitSkill {
             git_push_definition(),
             github_pr_create_definition(),
         ]
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        match call.name.as_str() {
+            "git_checkpoint" => ToolAuthoritySurface::GitCheckpoint,
+            _ => ToolAuthoritySurface::Other,
+        }
     }
 
     async fn execute(
@@ -866,6 +874,21 @@ mod tests {
                 "{tool_name} description should include actionable usage guidance"
             );
         }
+    }
+
+    #[test]
+    fn git_skill_reports_checkpoint_authority_surface() {
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "git_checkpoint".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            skill.authority_surface(&call),
+            ToolAuthoritySurface::GitCheckpoint
+        );
     }
 
     #[test]

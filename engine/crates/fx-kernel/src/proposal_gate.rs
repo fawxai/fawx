@@ -10,7 +10,9 @@ use crate::act::{
     ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
     ToolExecutor, ToolExecutorError, ToolResult,
 };
-use crate::authority::{AuthorityCoordinator, AuthorityDecision, AuthorityVerdict};
+use crate::authority::{
+    AuthorityCoordinator, AuthorityDecision, AuthorityVerdict, ToolAuthoritySurface,
+};
 use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
 use fx_core::self_modify::{classify_write_domain, SelfModifyConfig, WriteDomain};
@@ -367,7 +369,8 @@ fn gate_decision_for_call(
         Some(entry) => entry.decision.clone(),
         None => {
             let fallback = inner.action_category(call);
-            let request = authority.classify_call(call, fallback);
+            let surface = inner.authority_surface(call);
+            let request = authority.classify_call(call, fallback, surface);
             authority.resolve_request(request, false)
         }
     };
@@ -437,6 +440,10 @@ impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
 
     fn action_category(&self, call: &ToolCall) -> &'static str {
         self.inner.action_category(call)
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.inner.authority_surface(call)
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
@@ -577,6 +584,16 @@ mod tests {
 
         fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
             ToolCacheability::NeverCache
+        }
+
+        fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+            match call.name.as_str() {
+                "write_file" | "edit_file" => ToolAuthoritySurface::PathWrite,
+                "read_file" | "search_text" | "list_directory" => ToolAuthoritySurface::PathRead,
+                "git_checkpoint" => ToolAuthoritySurface::GitCheckpoint,
+                "shell" => ToolAuthoritySurface::Command,
+                _ => ToolAuthoritySurface::Other,
+            }
         }
 
         fn clear_cache(&self) {}
@@ -1346,7 +1363,7 @@ mod tests {
         ));
         let inner = MockInner::new();
         let call = write_call("shared-1", "config/settings.toml", "data");
-        let request = authority.classify_call(&call, "file_write");
+        let request = authority.classify_call(&call, "file_write", ToolAuthoritySurface::PathWrite);
         let decision = authority.resolve_request(request, false);
 
         assert_eq!(decision.verdict, AuthorityVerdict::Propose);

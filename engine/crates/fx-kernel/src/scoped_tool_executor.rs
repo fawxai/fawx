@@ -3,6 +3,7 @@ use crate::act::{
     ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
+use crate::ToolAuthoritySurface;
 use async_trait::async_trait;
 use fx_llm::{ToolCall, ToolDefinition};
 use std::collections::HashSet;
@@ -143,6 +144,14 @@ impl ToolExecutor for ScopedToolExecutor {
             self.inner.action_category(call)
         } else {
             "unknown"
+        }
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        if self.allows(&call.name) {
+            self.inner.authority_surface(call)
+        } else {
+            ToolAuthoritySurface::Other
         }
     }
 

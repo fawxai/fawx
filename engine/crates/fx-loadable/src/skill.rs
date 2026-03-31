@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 
 /// Error type for skill execution failures.
@@ -52,6 +53,12 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
     fn action_category(&self, tool_name: &str) -> &'static str {
         let _ = tool_name;
         "unknown"
+    }
+
+    /// Authority-relevant surface for the given tool call.
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        let _ = call;
+        ToolAuthoritySurface::Other
     }
 
     /// Extract a ripcord journal action for a material tool call.
@@ -149,6 +156,7 @@ mod tests {
         };
 
         assert_eq!(skill.action_category("greet"), "unknown");
+        assert_eq!(skill.authority_surface(&call), ToolAuthoritySurface::Other);
         assert_eq!(skill.journal_action(&call, &result), None);
     }
 

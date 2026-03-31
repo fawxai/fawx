@@ -905,6 +905,10 @@ impl ToolExecutor for SharedSkillRegistry {
         self.registry.action_category(call)
     }
 
+    fn authority_surface(&self, call: &fx_llm::ToolCall) -> fx_kernel::ToolAuthoritySurface {
+        self.registry.authority_surface(call)
+    }
+
     fn journal_action(
         &self,
         call: &fx_llm::ToolCall,
@@ -2450,6 +2454,219 @@ mod tests {
         tracing::dispatcher::with_default(dispatch, || {
             tracing::info!(target: "fx_cli::tests", "{message}");
         });
+    }
+
+    #[derive(Debug)]
+    struct MetadataSurfaceSkill;
+
+    #[async_trait]
+    impl fx_loadable::Skill for MetadataSurfaceSkill {
+        fn name(&self) -> &str {
+            "metadata-surface"
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            vec![
+                fx_llm::ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "write".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["path", "content"]
+                    }),
+                },
+                fx_llm::ToolDefinition {
+                    name: "git_checkpoint".to_string(),
+                    description: "checkpoint".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "required": ["message"]
+                    }),
+                },
+            ]
+        }
+
+        fn authority_surface(&self, call: &fx_llm::ToolCall) -> fx_kernel::ToolAuthoritySurface {
+            match call.name.as_str() {
+                "write_file" => fx_kernel::ToolAuthoritySurface::PathWrite,
+                "git_checkpoint" => fx_kernel::ToolAuthoritySurface::GitCheckpoint,
+                _ => fx_kernel::ToolAuthoritySurface::Other,
+            }
+        }
+
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, fx_loadable::SkillError>> {
+            Some(Ok(format!("executed:{tool_name}")))
+        }
+    }
+
+    fn shared_metadata_registry() -> SharedSkillRegistry {
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(Arc::new(MetadataSurfaceSkill));
+        SharedSkillRegistry::new(registry)
+    }
+
+    fn metadata_policy_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn metadata_policy_config(root: &Path) -> fx_core::self_modify::SelfModifyConfig {
+        fx_core::self_modify::SelfModifyConfig {
+            enabled: true,
+            branch_prefix: "fawx/improve".to_string(),
+            require_tests: true,
+            allow_paths: vec!["README.md".to_string()],
+            propose_paths: vec![
+                "engine/crates/fx-kernel/**".to_string(),
+                "engine/crates/fx-loadable/**".to_string(),
+            ],
+            deny_paths: vec![
+                ".git/**".to_string(),
+                "*.key".to_string(),
+                "*.pem".to_string(),
+                "credentials.*".to_string(),
+            ],
+            proposals_dir: root.join(".fawx").join("proposals"),
+        }
+    }
+
+    fn metadata_authority(root: &Path, policy: PermissionPolicy) -> AuthorityCoordinator {
+        let proposals_dir = root.join(".fawx").join("proposals");
+        AuthorityCoordinator::new(
+            policy,
+            ProposalGateState::new(
+                metadata_policy_config(root),
+                root.to_path_buf(),
+                proposals_dir,
+            ),
+        )
+    }
+
+    fn prompt_policy_for(capability: &str) -> PermissionPolicy {
+        PermissionPolicy {
+            unrestricted: std::collections::HashSet::new(),
+            ask_required: std::iter::once(capability.to_string()).collect(),
+            default_ask: false,
+            mode: fx_config::CapabilityMode::Prompt,
+        }
+    }
+
+    fn metadata_write_call(path: &str) -> fx_llm::ToolCall {
+        fx_llm::ToolCall {
+            id: format!("call-{path}"),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "content": "probe"
+            }),
+        }
+    }
+
+    fn metadata_git_checkpoint_call() -> fx_llm::ToolCall {
+        fx_llm::ToolCall {
+            id: "call-git-checkpoint".to_string(),
+            name: "git_checkpoint".to_string(),
+            arguments: serde_json::json!({
+                "message": "authority parity checkpoint"
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_skill_registry_delegates_authority_surface() {
+        let registry = shared_metadata_registry();
+
+        assert_eq!(
+            registry.authority_surface(&metadata_write_call("README.md")),
+            fx_kernel::ToolAuthoritySurface::PathWrite
+        );
+        assert_eq!(
+            registry.authority_surface(&metadata_git_checkpoint_call()),
+            fx_kernel::ToolAuthoritySurface::GitCheckpoint
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_keeps_git_checkpoint_classified_as_git() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), prompt_policy_for("git"));
+        let call = metadata_git_checkpoint_call();
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "git");
+        assert_eq!(
+            request.target_summary,
+            "git checkpoint (clean working tree)"
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Prompt
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_preserves_proposal_classification_for_kernel_paths() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), PermissionPolicy::allow_all());
+        let call = metadata_write_call("engine/crates/fx-kernel/src/authority_proposal_probe.txt");
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "kernel_modify");
+        assert_eq!(
+            request.paths,
+            vec!["engine/crates/fx-kernel/src/authority_proposal_probe.txt".to_string()]
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Propose
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_preserves_deny_classification_for_git_internal_paths() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), PermissionPolicy::allow_all());
+        let call = metadata_write_call(".git/authority-deny-probe.txt");
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "file_write");
+        assert_eq!(
+            request.paths,
+            vec![".git/authority-deny-probe.txt".to_string()]
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Deny
+        );
     }
 
     #[test]

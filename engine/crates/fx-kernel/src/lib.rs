@@ -63,7 +63,7 @@ pub use act::{
 };
 pub use authority::{
     ApprovalScope, AuthorityCoordinator, AuthorityDecision, AuthorityEffect,
-    AuthorityStatusSnapshot, AuthorityTargetKind, AuthorityVerdict,
+    AuthorityStatusSnapshot, AuthorityTargetKind, AuthorityVerdict, ToolAuthoritySurface,
 };
 pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;

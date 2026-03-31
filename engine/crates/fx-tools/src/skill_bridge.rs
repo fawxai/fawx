@@ -2,6 +2,7 @@ use crate::tools::FawxToolExecutor;
 use async_trait::async_trait;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolExecutor, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::ToolCall;
 #[cfg(test)]
 use fx_loadable::SkillRegistry;
@@ -73,6 +74,13 @@ impl Skill for BuiltinToolsSkill {
         }
         self.executor
             .action_category(&Self::metadata_call(tool_name))
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        if !self.handles_tool(&call.name) {
+            return ToolAuthoritySurface::Other;
+        }
+        self.executor.authority_surface(call)
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
@@ -180,6 +188,26 @@ mod tests {
         assert_eq!(
             skill.action_category(&call.name),
             executor.action_category(&call)
+        );
+    }
+
+    #[test]
+    fn builtin_tools_skill_delegates_authority_surface() {
+        let temp = TempDir::new().expect("tempdir");
+        let executor = build_memory_executor(&temp);
+        let skill = BuiltinToolsSkill::new(executor.clone());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello"
+            }),
+        };
+
+        assert_eq!(
+            skill.authority_surface(&call),
+            executor.authority_surface(&call)
         );
     }
 

@@ -16,6 +16,7 @@ use fx_kernel::act::{
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_kernel::{ProcessConfig, ProcessRegistry};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
@@ -93,6 +94,13 @@ impl ToolRegistry {
 
     fn get(&self, name: &str) -> Option<ToolRef> {
         self.by_name.get(name).cloned()
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.get(call.name.as_str())
+            .map_or(ToolAuthoritySurface::Other, |tool| {
+                tool.authority_surface(call)
+            })
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {
@@ -488,6 +496,10 @@ impl ToolExecutor for FawxToolExecutor {
         self.tools
             .get(call.name.as_str())
             .map_or("unknown", |tool| tool.action_category())
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.tools.authority_surface(call)
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {

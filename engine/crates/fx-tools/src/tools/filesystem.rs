@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use fx_core::path::expand_tilde;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde::Deserialize;
 use std::fs;
@@ -129,6 +130,10 @@ impl Tool for ReadFileTool {
     fn action_category(&self) -> &'static str {
         "read_any"
     }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::PathRead
+    }
 }
 
 #[async_trait]
@@ -171,6 +176,10 @@ impl Tool for WriteFileTool {
 
     fn action_category(&self) -> &'static str {
         "file_write"
+    }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::PathWrite
     }
 }
 
@@ -216,6 +225,10 @@ impl Tool for EditFileTool {
     fn action_category(&self) -> &'static str {
         "file_write"
     }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::PathWrite
+    }
 }
 
 #[async_trait]
@@ -255,6 +268,10 @@ impl Tool for ListDirectoryTool {
 
     fn action_category(&self) -> &'static str {
         "read_any"
+    }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::PathRead
     }
 }
 
@@ -296,6 +313,10 @@ impl Tool for SearchTextTool {
 
     fn action_category(&self) -> &'static str {
         "read_any"
+    }
+
+    fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+        ToolAuthoritySurface::PathRead
     }
 }
 

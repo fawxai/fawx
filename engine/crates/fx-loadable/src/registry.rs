@@ -15,6 +15,7 @@ use fx_kernel::act::{
     ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
@@ -205,6 +206,13 @@ impl SkillRegistry {
         self.find_skill(tool_name)
             .map(|skill| skill.action_category(tool_name))
             .unwrap_or("unknown")
+    }
+
+    fn owning_skill_authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.find_skill(&call.name)
+            .map_or(ToolAuthoritySurface::Other, |skill| {
+                skill.authority_surface(call)
+            })
     }
 
     fn owning_skill_journal_action(
@@ -446,6 +454,10 @@ impl ToolExecutor for SkillRegistry {
         self.owning_skill_action_category(&call.name)
     }
 
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.owning_skill_authority_surface(call)
+    }
+
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
         self.owning_skill_journal_action(call, result)
     }
@@ -465,6 +477,7 @@ mod tests {
         tools: Vec<ToolDefinition>,
         cacheability: ToolCacheability,
         action_category: &'static str,
+        authority_surface: ToolAuthoritySurface,
         journal_action: Option<JournalAction>,
     }
 
@@ -492,6 +505,7 @@ mod tests {
                 tools,
                 cacheability,
                 action_category: "unknown",
+                authority_surface: ToolAuthoritySurface::Other,
                 journal_action: None,
             }
         }
@@ -505,6 +519,16 @@ mod tests {
             let mut skill = Self::new(name, tool_names);
             skill.action_category = action_category;
             skill.journal_action = Some(journal_action);
+            skill
+        }
+
+        fn with_authority_surface(
+            name: &str,
+            tool_names: &[&str],
+            authority_surface: ToolAuthoritySurface,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.authority_surface = authority_surface;
             skill
         }
     }
@@ -529,6 +553,10 @@ mod tests {
 
         fn action_category(&self, _tool_name: &str) -> &'static str {
             self.action_category
+        }
+
+        fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+            self.authority_surface
         }
 
         fn journal_action(&self, _call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
@@ -635,6 +663,27 @@ mod tests {
         assert_eq!(summaries[1].0, "net");
         assert_eq!(summaries[1].1, "net skill");
         assert_eq!(summaries[1].2, vec!["http_get"]);
+    }
+
+    #[test]
+    fn authority_surface_comes_from_owning_skill_metadata() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_authority_surface(
+            "fs",
+            &["custom_writer"],
+            ToolAuthoritySurface::PathWrite,
+        )));
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "custom_writer".to_string(),
+            arguments: serde_json::json!({"path":"notes.txt","content":"hello"}),
+        };
+
+        assert_eq!(
+            reg.authority_surface(&call),
+            ToolAuthoritySurface::PathWrite
+        );
     }
 
     #[tokio::test]
