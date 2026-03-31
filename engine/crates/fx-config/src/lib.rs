@@ -10,7 +10,7 @@ mod toml_io;
 mod types;
 mod validation;
 
-pub use defaults::DEFAULT_CONFIG_TEMPLATE;
+pub use defaults::{DEFAULT_CONFIG_TEMPLATE, DEFAULT_DENY_PATHS};
 pub use toml_io::{save_default_model, save_thinking_budget};
 pub use types::{
     AgentBehaviorConfig, AgentConfig, BorrowScope, BudgetConfig, CapabilityMode, FawxConfig,

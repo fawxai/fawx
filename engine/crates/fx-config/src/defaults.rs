@@ -6,12 +6,8 @@ use crate::{
     ProposalConfig, SandboxConfig, SelfModifyCliConfig, SelfModifyPathsCliConfig, ToolsConfig,
 };
 
-/// Default deny patterns for self-modification path enforcement.
-///
-/// These patterns are duplicated from `fx_core::self_modify::DEFAULT_DENY_PATHS`
-/// to keep fx-config independent of fx-core. If these defaults change, update
-/// both locations.
-pub(crate) const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
+/// Canonical default deny patterns for self-modification path enforcement.
+pub const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # Location: ~/.fawx/config.toml
