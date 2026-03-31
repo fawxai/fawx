@@ -955,6 +955,7 @@ mod tests {
         fs::write(proposals_dir.join(format!("{stem}.md")), markdown).expect("write markdown");
         let sidecar = ProposalSidecar {
             version: 1,
+            action: "write_file".to_string(),
             timestamp: parse_timestamp(stem),
             title: format!("Update {}", target_path.display()),
             description: description.to_string(),

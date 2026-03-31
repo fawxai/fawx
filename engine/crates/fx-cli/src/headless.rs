@@ -29,7 +29,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
+use fx_kernel::{ErrorCategory, PermissionPromptState, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{
     CompletionRequest, CompletionResponse, CompletionStream, DocumentAttachment, ImageAttachment,
@@ -220,6 +220,7 @@ pub struct HeadlessAppDeps {
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
     pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
@@ -257,6 +258,7 @@ pub struct HeadlessApp {
     last_session_messages: Vec<SessionMessage>,
     /// Shared callback slot for executor-triggered SSE stream events.
     stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    permission_prompt_state: Option<Arc<PermissionPromptState>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
@@ -1253,6 +1255,7 @@ impl HeadlessApp {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: deps.stream_callback_slot,
+            permission_prompt_state: deps.permission_prompt_state,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
         };
@@ -1532,6 +1535,10 @@ impl HeadlessApp {
     /// Return the shared config manager (if configured).
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
         self.config_manager.as_ref()
+    }
+
+    pub fn permission_prompt_state(&self) -> Option<&Arc<PermissionPromptState>> {
+        self.permission_prompt_state.as_ref()
     }
 
     pub fn ripcord_journal(&self) -> &Arc<fx_ripcord::RipcordJournal> {
@@ -2310,6 +2317,10 @@ impl AppEngine for HeadlessApp {
 
     fn session_bus(&self) -> Option<&SessionBus> {
         HeadlessApp::session_bus(self)
+    }
+
+    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
+        HeadlessApp::permission_prompt_state(self).cloned()
     }
 
     fn reload_providers(&mut self) -> Result<(), anyhow::Error> {
@@ -3247,6 +3258,7 @@ impl HeadlessSubagentFactory {
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
             stream_callback_slot: bundle.stream_callback_slot,
+            permission_prompt_state: Some(bundle.permission_prompt_state),
             ripcord_journal: bundle.ripcord_journal,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -3754,6 +3766,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4796,6 +4809,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4814,6 +4828,7 @@ mod tests {
                 max_history: 20,
                 memory_enabled: false,
             },
+            authority: None,
             version: "test".to_string(),
         }))
     }
@@ -5088,6 +5103,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -5608,6 +5624,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -5665,6 +5682,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),

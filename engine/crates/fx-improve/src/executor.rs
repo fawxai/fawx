@@ -292,6 +292,7 @@ fn build_proposal(
     let file_hash = proposal_file_hash(repo_root, &target_path)?;
 
     Ok(Proposal {
+        action: "improvement_proposal".to_string(),
         title: format!("Improvement: {}", plan.candidate.finding.pattern_name),
         description: format_proposal_description(plan, branch_name),
         target_path,

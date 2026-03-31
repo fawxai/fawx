@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use fx_bus::SessionBus;
 use fx_config::manager::ConfigManager;
 use fx_core::types::InputSource;
+use fx_kernel::PermissionPromptState;
 use fx_kernel::StreamCallback;
 use fx_llm::{DocumentAttachment, ImageAttachment, Message};
 use std::sync::{Arc, Mutex};
@@ -79,6 +80,10 @@ pub trait AppEngine: Send + Sync {
     fn config_manager(&self) -> Option<ConfigManagerHandle>;
 
     fn session_bus(&self) -> Option<&SessionBus>;
+
+    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
+        None
+    }
 
     fn reload_auth_state(&mut self) -> Result<(), anyhow::Error> {
         Ok(())

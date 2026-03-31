@@ -633,6 +633,7 @@ fn build_headless_app(
         cron_store: bundle.cron_store,
         startup_warnings: bundle.startup_warnings,
         stream_callback_slot: bundle.stream_callback_slot,
+        permission_prompt_state: Some(bundle.permission_prompt_state),
         ripcord_journal: bundle.ripcord_journal,
         #[cfg(feature = "http")]
         experiment_registry,

@@ -30,8 +30,8 @@ use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
 use fx_kernel::streaming::{StreamCallback, StreamEvent};
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
-    CachingExecutor, PermissionGateExecutor, PermissionPolicy, PermissionPromptState,
-    ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+    AuthorityCoordinator, CachingExecutor, PermissionGateExecutor, PermissionPolicy,
+    PermissionPromptState, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
 };
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
@@ -379,6 +379,7 @@ pub struct LoopEngineBundle {
     pub startup_warnings: Vec<StartupWarning>,
     /// Shared callback slot for SSE stream events that need executor-side access.
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    pub permission_prompt_state: Arc<PermissionPromptState>,
     pub ripcord_journal: Arc<RipcordJournal>,
     /// LLM provider for experiment/improvement pipelines.
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
@@ -549,14 +550,15 @@ fn build_loop_engine_with_options(
     );
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
-    let proposal_gate = ProposalGateExecutor::new(caching_registry, gate_state);
     let permission_policy = permissions_to_policy(&config.permissions);
+    let authority = Arc::new(AuthorityCoordinator::new(permission_policy, gate_state));
+    authority.attach_runtime_info(Arc::clone(&skills.runtime_info));
+    let proposal_gate = ProposalGateExecutor::new(caching_registry, Arc::clone(&authority));
     let prompt_state = options
         .permission_prompt_state
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
     let permission_gate =
-        PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state)
-            .with_working_dir(working_dir.clone())
+        PermissionGateExecutor::new(proposal_gate, authority, Arc::clone(&prompt_state))
             .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
     let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
         let snapshot_dir = data_dir.join("ripcord").join("snapshots");
@@ -614,6 +616,7 @@ fn build_loop_engine_with_options(
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
         stream_callback_slot,
+        permission_prompt_state: prompt_state,
         improvement_provider: improvement_provider_for_bundle,
         ripcord_journal,
     })
@@ -1551,6 +1554,7 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
             max_history: config.general.max_history,
             memory_enabled,
         },
+        authority: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
