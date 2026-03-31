@@ -44,7 +44,10 @@ use fx_core::channel::{Channel, ResponseContext};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
-use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
+use fx_kernel::{
+    ChannelRegistry, HttpChannel, PermissionPromptState, ResponseRouter, StreamCallback,
+    StreamEvent,
+};
 use fx_llm::{
     CompletionResponse, CompletionStream, ContentBlock, DocumentAttachment, ImageAttachment,
     Message, StreamChunk,
@@ -62,6 +65,109 @@ use tokio::sync::{mpsc, Mutex};
 use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-secret-token-abc123";
+
+struct PromptStateApp {
+    prompt_state: Arc<PermissionPromptState>,
+}
+
+#[async_trait]
+impl AppEngine for PromptStateApp {
+    async fn process_message(
+        &mut self,
+        _input: &str,
+        _images: Vec<ImageAttachment>,
+        _documents: Vec<DocumentAttachment>,
+        _source: InputSource,
+        _callback: Option<StreamCallback>,
+    ) -> Result<ApiCycleResult, anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        _input: &str,
+        _images: Vec<ImageAttachment>,
+        _documents: Vec<DocumentAttachment>,
+        _context: Vec<Message>,
+        _source: InputSource,
+        _callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    fn active_model(&self) -> &str {
+        "mock-model"
+    }
+
+    fn available_models(&self) -> Vec<ModelInfoDto> {
+        Vec::new()
+    }
+
+    fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    fn thinking_level(&self) -> ThinkingLevelDto {
+        ThinkingLevelDto {
+            level: "normal".to_string(),
+            budget_tokens: None,
+            available: Vec::new(),
+        }
+    }
+
+    fn context_info(&self) -> ContextInfoDto {
+        ContextInfoDto {
+            used_tokens: 0,
+            max_tokens: 4_096,
+            percentage: 0.0,
+            compaction_threshold: 0.8,
+        }
+    }
+
+    fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+        self.context_info()
+    }
+
+    fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+        Ok(self.thinking_level())
+    }
+
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+        Vec::new()
+    }
+
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+        Vec::new()
+    }
+
+    fn config_manager(&self) -> Option<ConfigManagerHandle> {
+        None
+    }
+
+    fn session_bus(&self) -> Option<&SessionBus> {
+        None
+    }
+
+    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
+        Some(Arc::clone(&self.prompt_state))
+    }
+
+    fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn app_permission_prompts_reuses_app_owned_prompt_state() {
+    let prompt_state = Arc::new(PermissionPromptState::new());
+    let app = PromptStateApp {
+        prompt_state: Arc::clone(&prompt_state),
+    };
+
+    let resolved = crate::app_permission_prompts(&app);
+
+    assert!(Arc::ptr_eq(&resolved, &prompt_state));
+}
 
 impl ContextInfoSnapshotLike for fx_cli::headless::ContextInfoSnapshot {
     fn used_tokens(&self) -> usize {
@@ -1485,6 +1591,7 @@ mod routing_and_status {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -3696,6 +3803,7 @@ allowed_chat_ids = [123]
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
                 stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                permission_prompt_state: None,
                 ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                     std::env::temp_dir().as_path(),
                 )),
@@ -5122,6 +5230,7 @@ mod telegram_update {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),

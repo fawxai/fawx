@@ -61,6 +61,11 @@ pub use types::{
 
 pub type SharedExperimentRegistry = Arc<Mutex<crate::experiment_registry::ExperimentRegistry>>;
 
+pub(crate) fn app_permission_prompts(app: &dyn AppEngine) -> Arc<fx_kernel::PermissionPromptState> {
+    app.permission_prompt_state()
+        .unwrap_or_else(|| Arc::new(fx_kernel::PermissionPromptState::new()))
+}
+
 pub struct RunConfig {
     pub port: u16,
     pub http_config: HttpConfig,
@@ -133,6 +138,10 @@ pub async fn run(
             has_synthesis,
         )
     };
+    let permission_prompts = {
+        let app = shared_app.lock().await;
+        app_permission_prompts(&*app)
+    };
     let state = HttpState {
         app: Arc::clone(&shared_app),
         shared: Arc::clone(&shared),
@@ -151,7 +160,7 @@ pub async fn run(
             has_synthesis,
         )),
         oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
-        permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+        permission_prompts,
         ripcord: config.ripcord.clone(),
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),

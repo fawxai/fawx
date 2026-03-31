@@ -379,6 +379,7 @@ pub struct LoopEngineBundle {
     pub startup_warnings: Vec<StartupWarning>,
     /// Shared callback slot for SSE stream events that need executor-side access.
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    pub permission_prompt_state: Arc<PermissionPromptState>,
     pub ripcord_journal: Arc<RipcordJournal>,
     /// LLM provider for experiment/improvement pipelines.
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
@@ -556,8 +557,9 @@ fn build_loop_engine_with_options(
     let prompt_state = options
         .permission_prompt_state
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
-    let permission_gate = PermissionGateExecutor::new(proposal_gate, authority, prompt_state)
-        .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
+    let permission_gate =
+        PermissionGateExecutor::new(proposal_gate, authority, Arc::clone(&prompt_state))
+            .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
     let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
         let snapshot_dir = data_dir.join("ripcord").join("snapshots");
         Arc::new(RipcordJournal::new(&snapshot_dir))
@@ -614,6 +616,7 @@ fn build_loop_engine_with_options(
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
         stream_callback_slot,
+        permission_prompt_state: prompt_state,
         improvement_provider: improvement_provider_for_bundle,
         ripcord_journal,
     })
