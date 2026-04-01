@@ -39,6 +39,23 @@ struct StreamConsumeContext<'a> {
     text_visibility: TextStreamVisibility,
 }
 
+#[derive(Debug, Default)]
+struct StreamConsumptionState {
+    response: StreamResponseState,
+    buffered_deltas: Vec<String>,
+    should_buffer_deltas: bool,
+}
+
+impl StreamConsumptionState {
+    fn new(phase: StreamPhase) -> Self {
+        Self {
+            response: StreamResponseState::default(),
+            buffered_deltas: Vec::new(),
+            should_buffer_deltas: buffer_phase_text_until_response(phase),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct StreamingRequestContext<'a> {
     stage: &'a str,
@@ -390,79 +407,82 @@ impl LoopEngine {
         phase: StreamPhase,
         text_visibility: TextStreamVisibility,
     ) -> Result<CompletionResponse, LoopError> {
-        let mut state = StreamResponseState::default();
-        let mut buffered_deltas = Vec::new();
-        let should_buffer_deltas = buffer_phase_text_until_response(phase);
         let event_bus = self.public_event_bus_clone();
         let context = StreamConsumeContext {
             event_bus: event_bus.as_ref(),
             phase,
             text_visibility,
         };
+        let mut state = StreamConsumptionState::new(phase);
 
         while let Some(chunk_result) = stream.next().await {
-            if self.stream_cancel_requested() {
-                return Ok(self.finish_cancelled_stream(
-                    state,
-                    &mut buffered_deltas,
-                    should_buffer_deltas,
-                    context,
-                ));
-            }
-
-            let chunk = match chunk_result {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    return self.fail_stream_consumption(
-                        error,
-                        &mut buffered_deltas,
-                        should_buffer_deltas,
-                        context,
-                    );
-                }
-            };
-
-            self.capture_stream_text_delta(
-                chunk.delta_content.clone(),
-                &mut buffered_deltas,
-                should_buffer_deltas,
-                context,
-            );
-            state.apply_chunk(chunk);
-
-            if self.stream_cancel_requested() {
-                return Ok(self.finish_cancelled_stream(
-                    state,
-                    &mut buffered_deltas,
-                    should_buffer_deltas,
-                    context,
-                ));
+            if let Some(response) =
+                self.consume_stream_iteration(&mut state, chunk_result, context)?
+            {
+                return Ok(response);
             }
         }
 
-        Ok(self.finish_stream_response(state, &mut buffered_deltas, should_buffer_deltas, context))
+        Ok(self.finish_stream_response(state, context))
+    }
+
+    fn consume_stream_iteration(
+        &mut self,
+        state: &mut StreamConsumptionState,
+        chunk_result: Result<StreamChunk, ProviderError>,
+        context: StreamConsumeContext<'_>,
+    ) -> Result<Option<CompletionResponse>, LoopError> {
+        if let Some(response) = self.cancelled_stream_response(state, context) {
+            return Ok(Some(response));
+        }
+
+        let chunk = self.stream_chunk_or_error(chunk_result, state, context)?;
+        self.capture_stream_text_delta(chunk.delta_content.clone(), state, context);
+        state.response.apply_chunk(chunk);
+        Ok(self.cancelled_stream_response(state, context))
+    }
+
+    fn cancelled_stream_response(
+        &mut self,
+        state: &mut StreamConsumptionState,
+        context: StreamConsumeContext<'_>,
+    ) -> Option<CompletionResponse> {
+        if self.stream_cancel_requested() {
+            return Some(self.finish_cancelled_stream(state, context));
+        }
+
+        None
+    }
+
+    fn stream_chunk_or_error(
+        &mut self,
+        chunk_result: Result<StreamChunk, ProviderError>,
+        state: &mut StreamConsumptionState,
+        context: StreamConsumeContext<'_>,
+    ) -> Result<StreamChunk, LoopError> {
+        match chunk_result {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => self.fail_stream_consumption(error, state, context),
+        }
     }
 
     fn finish_cancelled_stream(
         &self,
-        state: StreamResponseState,
-        buffered_deltas: &mut Vec<String>,
-        should_buffer_deltas: bool,
+        state: &mut StreamConsumptionState,
         context: StreamConsumeContext<'_>,
     ) -> CompletionResponse {
-        self.flush_local_stream_deltas(buffered_deltas, should_buffer_deltas, context);
+        self.flush_local_stream_deltas(state, context);
         self.publish_stream_finished(context.phase);
-        state.into_cancelled_response()
+        std::mem::take(&mut state.response).into_cancelled_response()
     }
 
     fn fail_stream_consumption(
         &mut self,
         error: ProviderError,
-        buffered_deltas: &mut Vec<String>,
-        should_buffer_deltas: bool,
+        state: &mut StreamConsumptionState,
         context: StreamConsumeContext<'_>,
-    ) -> Result<CompletionResponse, LoopError> {
-        self.flush_local_stream_deltas(buffered_deltas, should_buffer_deltas, context);
+    ) -> Result<StreamChunk, LoopError> {
+        self.flush_local_stream_deltas(state, context);
         self.publish_stream_finished(context.phase);
         self.emit_background_error(
             ErrorCategory::Provider,
@@ -479,16 +499,15 @@ impl LoopEngine {
     fn capture_stream_text_delta(
         &self,
         delta: Option<String>,
-        buffered_deltas: &mut Vec<String>,
-        should_buffer_deltas: bool,
+        state: &mut StreamConsumptionState,
         context: StreamConsumeContext<'_>,
     ) {
         let Some(delta) = delta else {
             return;
         };
 
-        if should_buffer_deltas {
-            buffered_deltas.push(delta);
+        if state.should_buffer_deltas {
+            state.buffered_deltas.push(delta);
             return;
         }
 
@@ -503,15 +522,13 @@ impl LoopEngine {
 
     fn finish_stream_response(
         &self,
-        state: StreamResponseState,
-        buffered_deltas: &mut Vec<String>,
-        should_buffer_deltas: bool,
+        mut state: StreamConsumptionState,
         context: StreamConsumeContext<'_>,
     ) -> CompletionResponse {
-        let response = state.into_response();
-        if should_buffer_deltas && response.tool_calls.is_empty() {
+        let response = state.response.into_response();
+        if state.should_buffer_deltas && response.tool_calls.is_empty() {
             flush_phase_text_deltas(
-                buffered_deltas,
+                &mut state.buffered_deltas,
                 None,
                 context.event_bus,
                 context.text_visibility,
@@ -524,13 +541,12 @@ impl LoopEngine {
 
     fn flush_local_stream_deltas(
         &self,
-        buffered_deltas: &mut Vec<String>,
-        should_buffer_deltas: bool,
+        state: &mut StreamConsumptionState,
         context: StreamConsumeContext<'_>,
     ) {
-        if should_buffer_deltas {
+        if state.should_buffer_deltas {
             flush_phase_text_deltas(
-                buffered_deltas,
+                &mut state.buffered_deltas,
                 None,
                 context.event_bus,
                 context.text_visibility,
@@ -604,41 +620,62 @@ fn merge_stream_tool_delta(
     id_to_index: &mut HashMap<String, usize>,
     index: usize,
 ) {
-    if let Some(incoming_id) = delta.id.clone() {
-        match entry.id.as_deref() {
-            None => entry.id = Some(incoming_id),
-            Some(current_id) if current_id == incoming_id => {}
-            Some(current_id)
-                if delta
-                    .provider_id
-                    .as_deref()
-                    .is_some_and(|provider_id| provider_id == current_id) =>
-            {
-                entry.id = Some(incoming_id);
-            }
-            Some(_) => {
-                if entry.provider_id.is_none() {
-                    entry.provider_id = Some(incoming_id);
-                }
+    let ToolUseDelta {
+        id,
+        provider_id,
+        name,
+        arguments_delta,
+        arguments_done,
+    } = delta;
+
+    reconcile_stream_tool_id(entry, id, provider_id.as_deref());
+    if entry.provider_id.is_none() {
+        entry.provider_id = provider_id;
+    }
+    if entry.name.is_none() {
+        entry.name = name;
+    }
+    register_stream_tool_identifiers(entry, id_to_index, index);
+    if let Some(arguments_delta) = arguments_delta {
+        merge_stream_arguments(&mut entry.arguments, &arguments_delta, arguments_done);
+    }
+    entry.arguments_done |= arguments_done;
+}
+
+fn reconcile_stream_tool_id(
+    entry: &mut StreamToolCallState,
+    incoming_id: Option<String>,
+    provider_id: Option<&str>,
+) {
+    let Some(incoming_id) = incoming_id else {
+        return;
+    };
+
+    match entry.id.as_deref() {
+        None => entry.id = Some(incoming_id),
+        Some(current_id) if current_id == incoming_id => {}
+        Some(current_id) if provider_id.is_some_and(|provider_id| provider_id == current_id) => {
+            entry.id = Some(incoming_id);
+        }
+        Some(_) => {
+            if entry.provider_id.is_none() {
+                entry.provider_id = Some(incoming_id);
             }
         }
     }
-    if entry.provider_id.is_none() {
-        entry.provider_id = delta.provider_id;
-    }
-    if entry.name.is_none() {
-        entry.name = delta.name;
-    }
+}
+
+fn register_stream_tool_identifiers(
+    entry: &StreamToolCallState,
+    id_to_index: &mut HashMap<String, usize>,
+    index: usize,
+) {
     if let Some(id) = entry.id.clone() {
         id_to_index.insert(id, index);
     }
     if let Some(provider_id) = entry.provider_id.clone() {
         id_to_index.insert(provider_id, index);
     }
-    if let Some(arguments_delta) = delta.arguments_delta {
-        merge_stream_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
-    }
-    entry.arguments_done |= delta.arguments_done;
 }
 
 fn merge_stream_arguments(arguments: &mut String, arguments_delta: &str, arguments_done: bool) {
@@ -672,6 +709,12 @@ struct FinalizedStreamToolCall {
     provider_id: Option<String>,
 }
 
+struct FinalizedStreamToolIdentity {
+    id: String,
+    name: String,
+    provider_id: Option<String>,
+}
+
 fn finalize_stream_tool_payloads(
     by_index: HashMap<usize, StreamToolCallState>,
 ) -> Vec<FinalizedStreamToolCall> {
@@ -695,44 +738,65 @@ fn finalized_stream_tool_call_from_state(
         return None;
     }
 
-    let id = state.id.or(state.provider_id.clone())?.trim().to_string();
-    let name = state.name?.trim().to_string();
+    let identity = finalized_stream_tool_identity(&state)?;
+    let arguments = parse_stream_tool_arguments(&state.arguments, &identity.id, &identity.name)?;
+    Some(FinalizedStreamToolCall {
+        provider_id: identity.provider_id,
+        call: ToolCall {
+            id: identity.id,
+            name: identity.name,
+            arguments,
+        },
+    })
+}
+
+fn finalized_stream_tool_identity(
+    state: &StreamToolCallState,
+) -> Option<FinalizedStreamToolIdentity> {
+    let id = state.id.as_deref().or(state.provider_id.as_deref())?;
+    let name = state.name.as_deref()?;
+    let id = id.trim().to_string();
+    let name = name.trim().to_string();
     if id.is_empty() || name.is_empty() {
         return None;
     }
 
-    let provider_id = state
-        .provider_id
-        .filter(|provider_id| {
-            let trimmed = provider_id.trim();
-            !trimmed.is_empty() && trimmed != id
-        })
-        .map(|provider_id| provider_id.trim().to_string());
+    Some(FinalizedStreamToolIdentity {
+        provider_id: normalized_provider_id(state.provider_id.as_deref(), &id),
+        id,
+        name,
+    })
+}
 
-    let raw_args = if state.arguments.trim().is_empty() {
-        "{}".to_string()
+fn normalized_provider_id(provider_id: Option<&str>, id: &str) -> Option<String> {
+    provider_id.and_then(|provider_id| {
+        let trimmed = provider_id.trim();
+        (!trimmed.is_empty() && trimmed != id).then(|| trimmed.to_string())
+    })
+}
+
+fn parse_stream_tool_arguments(
+    raw_arguments: &str,
+    id: &str,
+    name: &str,
+) -> Option<serde_json::Value> {
+    let raw_arguments = if raw_arguments.trim().is_empty() {
+        "{}"
     } else {
-        state.arguments.clone()
+        raw_arguments
     };
-    let arguments = match serde_json::from_str::<serde_json::Value>(&raw_args) {
-        Ok(value) => value,
+
+    match serde_json::from_str::<serde_json::Value>(raw_arguments) {
+        Ok(value) => Some(value),
         Err(error) => {
             tracing::warn!(
                 tool_id = %id,
                 tool_name = %name,
-                raw_arguments = %state.arguments,
+                raw_arguments = %raw_arguments,
                 error = %error,
                 "dropping tool call with malformed JSON arguments"
             );
-            return None;
+            None
         }
-    };
-    Some(FinalizedStreamToolCall {
-        provider_id,
-        call: ToolCall {
-            id,
-            name,
-            arguments,
-        },
-    })
+    }
 }
