@@ -64,9 +64,22 @@ mod continuation;
 mod direct_inspection;
 mod direct_utility;
 mod progress;
+mod request;
 mod retry;
 mod streaming;
 
+use self::request::{
+    build_continuation_request, build_forced_synthesis_request, build_reasoning_messages,
+    build_reasoning_request, build_truncation_continuation_request, completion_request_to_prompt,
+    ContinuationRequestParams, ForcedSynthesisRequestParams, ReasoningRequestParams,
+    RequestBuildContext, ToolRequestConfig, TruncationContinuationRequestParams,
+};
+#[cfg(test)]
+use self::request::{
+    build_reasoning_system_prompt, build_reasoning_system_prompt_with_notify_guidance,
+    build_tool_continuation_system_prompt, decompose_tool_definition, reasoning_user_prompt,
+    tool_definitions_with_decompose,
+};
 #[cfg(test)]
 use self::retry::same_call_failure_reason;
 use self::retry::{partition_by_retry_policy, BlockedToolCall, RetryTracker};
@@ -116,14 +129,6 @@ pub trait ScratchpadProvider: Send + Sync {
     fn render_for_context(&self) -> String;
     /// Compact scratchpad if it exceeds size thresholds.
     fn compact_if_needed(&self, current_iteration: u32);
-}
-
-#[derive(Clone)]
-struct RequestBuildContext<'a> {
-    memory_context: Option<&'a str>,
-    scratchpad_context: Option<&'a str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
 }
 
 struct SubGoalRetryContext {
@@ -331,17 +336,6 @@ fn build_user_message(snapshot: &PerceptionSnapshot, user_message: &str) -> Mess
         }
         _ => Message::user(user_message),
     }
-}
-
-fn build_processed_perception_message(perception: &ProcessedPerception, text: &str) -> Message {
-    if perception.images.is_empty() && perception.documents.is_empty() {
-        return Message::user(text);
-    }
-    Message::user_with_attachments(
-        text,
-        perception.images.clone(),
-        perception.documents.clone(),
-    )
 }
 
 /// Runtime loop status for `/loop` diagnostics.
@@ -2397,13 +2391,13 @@ impl LoopEngine {
             return None;
         }
 
-        let request = build_forced_synthesis_request_with_notify_guidance(
+        let request = build_forced_synthesis_request(ForcedSynthesisRequestParams::new(
             messages,
             llm.model_name(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             self.notify_tool_guidance_enabled,
-        );
+        ));
 
         let remaining_wall_ms = self
             .budget
@@ -2607,18 +2601,17 @@ impl LoopEngine {
                     .nudge_after_tool_turns
                     .saturating_add(tc.strip_tools_after_nudge);
         let tools = self.current_reasoning_tool_definitions(should_strip_tools);
-        let mut request = build_reasoning_request_with_notify_guidance(
+        let mut request = build_reasoning_request(ReasoningRequestParams::new(
             perception,
             llm.model_name(),
-            tools,
-            self.reasoning_decompose_enabled(),
-            RequestBuildContext {
-                memory_context: self.memory_context.as_deref(),
-                scratchpad_context: self.scratchpad_context.as_deref(),
-                thinking: self.thinking_config.clone(),
-                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
-            },
-        );
+            ToolRequestConfig::new(tools, self.reasoning_decompose_enabled()),
+            RequestBuildContext::new(
+                self.memory_context.as_deref(),
+                self.scratchpad_context.as_deref(),
+                self.thinking_config.clone(),
+                self.notify_tool_guidance_enabled,
+            ),
+        ));
         if let Some(directive) = self.pending_turn_commitment_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str("\n\nTurn commitment:\n");
@@ -2724,17 +2717,19 @@ impl LoopEngine {
         self.ensure_continuation_budget(continuation_messages, step)?;
         let continuation_tools =
             self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
-        let mut request = build_truncation_continuation_request_with_notify_guidance(
-            llm.model_name(),
-            continuation_messages,
-            continuation_tools,
-            self.effective_decompose_enabled(),
-            self.memory_context.as_deref(),
-            self.scratchpad_context.as_deref(),
-            step,
-            self.thinking_config.clone(),
-            self.notify_tool_guidance_enabled,
-        );
+        let mut request =
+            build_truncation_continuation_request(TruncationContinuationRequestParams::new(
+                llm.model_name(),
+                continuation_messages,
+                ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
+                RequestBuildContext::new(
+                    self.memory_context.as_deref(),
+                    self.scratchpad_context.as_deref(),
+                    self.thinking_config.clone(),
+                    self.notify_tool_guidance_enabled,
+                ),
+                step,
+            ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str(&directive);
@@ -5561,18 +5556,17 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let continuation_tools = self.apply_turn_execution_profile_tool_surface(continuation_tools);
-        let mut request = build_continuation_request_with_notify_guidance(
+        let mut request = build_continuation_request(ContinuationRequestParams::new(
             context_messages,
             llm.model_name(),
-            continuation_tools,
-            self.effective_decompose_enabled(),
-            RequestBuildContext {
-                memory_context: self.memory_context.as_deref(),
-                scratchpad_context: self.scratchpad_context.as_deref(),
-                thinking: self.thinking_config.clone(),
-                notify_tool_guidance_enabled: self.notify_tool_guidance_enabled,
-            },
-        );
+            ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
+            RequestBuildContext::new(
+                self.memory_context.as_deref(),
+                self.scratchpad_context.as_deref(),
+                self.thinking_config.clone(),
+                self.notify_tool_guidance_enabled,
+            ),
+        ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str(&directive);
@@ -6739,199 +6733,6 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
     )
 }
 
-fn completion_request_tools(
-    tool_definitions: Vec<ToolDefinition>,
-    decompose_enabled: bool,
-) -> Vec<ToolDefinition> {
-    if tool_definitions.is_empty() {
-        Vec::new()
-    } else if decompose_enabled {
-        tool_definitions_with_decompose(tool_definitions)
-    } else {
-        tool_definitions
-    }
-}
-
-fn tool_definitions_with_decompose(
-    mut tool_definitions: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let has_decompose = tool_definitions
-        .iter()
-        .any(|tool| tool.name == DECOMPOSE_TOOL_NAME);
-    if !has_decompose {
-        tool_definitions.push(decompose_tool_definition());
-    }
-    tool_definitions
-}
-
-fn decompose_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: DECOMPOSE_TOOL_NAME.to_string(),
-        description: DECOMPOSE_TOOL_DESCRIPTION.to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "sub_goals": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "description": "What this sub-goal should accomplish"},
-                            "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools needed for this sub-goal"},
-                            "expected_output": {"type": "string", "description": "What the result should look like"},
-                            "complexity_hint": {
-                                "type": "string",
-                                "enum": ["Trivial", "Moderate", "Complex"],
-                                "description": "Optional complexity hint to guide budget allocation"
-                            }
-                        },
-                        "required": ["description"]
-                    },
-                    "description": "List of sub-goals to execute"
-                },
-                "strategy": {"type": "string", "enum": ["Sequential", "Parallel"], "description": "Execution strategy"}
-            },
-            "required": ["sub_goals"]
-        }),
-    }
-}
-
-/// Build a CompletionRequest for tool result re-prompting.
-#[cfg(test)]
-fn build_continuation_request(
-    context_messages: &[Message],
-    model: &str,
-    tool_definitions: Vec<ToolDefinition>,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-) -> CompletionRequest {
-    build_continuation_request_with_notify_guidance(
-        context_messages,
-        model,
-        tool_definitions,
-        true,
-        RequestBuildContext {
-            memory_context,
-            scratchpad_context,
-            thinking,
-            notify_tool_guidance_enabled: false,
-        },
-    )
-}
-
-fn build_continuation_request_with_notify_guidance(
-    context_messages: &[Message],
-    model: &str,
-    tool_definitions: Vec<ToolDefinition>,
-    decompose_enabled: bool,
-    context: RequestBuildContext<'_>,
-) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions, decompose_enabled);
-    let system_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
-        context.memory_context,
-        context.scratchpad_context,
-        context.notify_tool_guidance_enabled,
-    );
-    CompletionRequest {
-        model: model.to_string(),
-        messages: context_messages.to_vec(),
-        tools,
-        temperature: Some(REASONING_TEMPERATURE),
-        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
-        system_prompt: Some(system_prompt),
-        thinking: context.thinking,
-    }
-}
-
-fn build_forced_synthesis_request_with_notify_guidance(
-    context_messages: &[Message],
-    model: &str,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    notify_tool_guidance_enabled: bool,
-) -> CompletionRequest {
-    let system_prompt = build_forced_synthesis_system_prompt_with_notify_guidance(
-        context_messages,
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
-    );
-
-    CompletionRequest {
-        model: model.to_string(),
-        messages: strip_system_messages(context_messages),
-        tools: vec![],
-        temperature: Some(0.3),
-        max_tokens: Some(2048),
-        system_prompt: Some(system_prompt),
-        thinking: None,
-    }
-}
-
-#[cfg(test)]
-fn build_truncation_continuation_request(
-    model: &str,
-    continuation_messages: &[Message],
-    tool_definitions: Vec<ToolDefinition>,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    step: LoopStep,
-    thinking: Option<fx_llm::ThinkingConfig>,
-) -> CompletionRequest {
-    build_truncation_continuation_request_with_notify_guidance(
-        model,
-        continuation_messages,
-        tool_definitions,
-        true,
-        memory_context,
-        scratchpad_context,
-        step,
-        thinking,
-        false,
-    )
-}
-
-// TODO: refactor into a params struct (pre-existing, out of scope for this PR)
-#[allow(clippy::too_many_arguments)]
-fn build_truncation_continuation_request_with_notify_guidance(
-    model: &str,
-    continuation_messages: &[Message],
-    tool_definitions: Vec<ToolDefinition>,
-    decompose_enabled: bool,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    step: LoopStep,
-    thinking: Option<fx_llm::ThinkingConfig>,
-    notify_tool_guidance_enabled: bool,
-) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions, decompose_enabled);
-    // Intentional: truncation continuations resume a cut-off response after context
-    // overflow. They are not the post-tool-result path, so they keep the plain
-    // reasoning prompt instead of the tool continuation directive.
-    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
-    );
-    CompletionRequest {
-        model: model.to_string(),
-        messages: continuation_messages.to_vec(),
-        tools: continuation_tools_for_step(step, tools),
-        temperature: Some(REASONING_TEMPERATURE),
-        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
-        system_prompt: Some(system_prompt),
-        thinking,
-    }
-}
-
-fn continuation_tools_for_step(step: LoopStep, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
-    match step {
-        LoopStep::Reason => tools,
-        _ => Vec::new(),
-    }
-}
-
 fn prioritize_flow_command(current: Option<LoopCommand>, incoming: LoopCommand) -> LoopCommand {
     match current {
         None => incoming,
@@ -7190,227 +6991,6 @@ fn message_content_to_text(message: &Message) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn strip_system_messages(messages: &[Message]) -> Vec<Message> {
-    messages
-        .iter()
-        .filter(|message| message.role != MessageRole::System)
-        .cloned()
-        .collect()
-}
-
-fn system_messages_to_prompt_directives(messages: &[Message]) -> Vec<String> {
-    messages
-        .iter()
-        .filter(|message| message.role == MessageRole::System)
-        .map(message_content_to_text)
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .collect()
-}
-
-fn completion_request_to_prompt(request: &CompletionRequest) -> String {
-    let system = request
-        .system_prompt
-        .as_deref()
-        .map(|prompt| {
-            format!(
-                "System:
-{prompt}
-
-"
-            )
-        })
-        .unwrap_or_default();
-    let messages = request
-        .messages
-        .iter()
-        .map(message_to_text)
-        .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
-
-    format!("{system}{messages}")
-}
-
-#[cfg(test)]
-fn build_reasoning_request(
-    perception: &ProcessedPerception,
-    model: &str,
-    tool_definitions: Vec<ToolDefinition>,
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    thinking: Option<fx_llm::ThinkingConfig>,
-) -> CompletionRequest {
-    build_reasoning_request_with_notify_guidance(
-        perception,
-        model,
-        tool_definitions,
-        true,
-        RequestBuildContext {
-            memory_context,
-            scratchpad_context,
-            thinking,
-            notify_tool_guidance_enabled: false,
-        },
-    )
-}
-
-fn build_reasoning_request_with_notify_guidance(
-    perception: &ProcessedPerception,
-    model: &str,
-    tool_definitions: Vec<ToolDefinition>,
-    decompose_enabled: bool,
-    context: RequestBuildContext<'_>,
-) -> CompletionRequest {
-    let tools = completion_request_tools(tool_definitions, decompose_enabled);
-    let system_prompt = build_reasoning_system_prompt_with_notify_guidance(
-        context.memory_context,
-        context.scratchpad_context,
-        context.notify_tool_guidance_enabled,
-    );
-
-    CompletionRequest {
-        model: model.to_string(),
-        messages: build_reasoning_messages(perception),
-        tools,
-        temperature: Some(REASONING_TEMPERATURE),
-        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
-        system_prompt: Some(system_prompt),
-        thinking: context.thinking,
-    }
-}
-
-fn build_reasoning_messages(perception: &ProcessedPerception) -> Vec<Message> {
-    let user_prompt = reasoning_user_prompt(perception);
-    [
-        perception.context_window.clone(),
-        vec![build_processed_perception_message(perception, &user_prompt)],
-    ]
-    .concat()
-}
-
-fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
-    let mut prompt = format!(
-        "Active goals:
-- {}
-
-Budget remaining: {} tokens, {} llm calls
-
-User message:
-{}",
-        perception.active_goals.join(
-            "
-- "
-        ),
-        perception.budget_remaining.tokens,
-        perception.budget_remaining.llm_calls,
-        perception.user_message,
-    );
-
-    if let Some(steer) = perception.steer_context.as_deref() {
-        prompt.push_str(&format!("\nUser steer (latest): {steer}"));
-    }
-
-    prompt
-}
-
-#[cfg(test)]
-fn build_reasoning_system_prompt(
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-) -> String {
-    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
-}
-
-fn build_reasoning_system_prompt_with_notify_guidance(
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    notify_tool_guidance_enabled: bool,
-) -> String {
-    build_system_prompt(
-        memory_context,
-        scratchpad_context,
-        None,
-        notify_tool_guidance_enabled,
-    )
-}
-
-fn build_forced_synthesis_system_prompt_with_notify_guidance(
-    context_messages: &[Message],
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    notify_tool_guidance_enabled: bool,
-) -> String {
-    let mut system_prompt = build_reasoning_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        notify_tool_guidance_enabled,
-    );
-    let directives = system_messages_to_prompt_directives(context_messages);
-    if !directives.is_empty() {
-        system_prompt.push_str("\n\nAdditional runtime directives:\n");
-        for directive in directives {
-            system_prompt.push_str("- ");
-            system_prompt.push_str(&directive);
-            system_prompt.push('\n');
-        }
-    }
-    system_prompt.push_str(BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE);
-    system_prompt
-}
-
-#[cfg(test)]
-fn build_tool_continuation_system_prompt(
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-) -> String {
-    build_tool_continuation_system_prompt_with_notify_guidance(
-        memory_context,
-        scratchpad_context,
-        false,
-    )
-}
-
-fn build_tool_continuation_system_prompt_with_notify_guidance(
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    notify_tool_guidance_enabled: bool,
-) -> String {
-    build_system_prompt(
-        memory_context,
-        scratchpad_context,
-        Some(TOOL_CONTINUATION_DIRECTIVE),
-        notify_tool_guidance_enabled,
-    )
-}
-
-fn build_system_prompt(
-    memory_context: Option<&str>,
-    scratchpad_context: Option<&str>,
-    extra_directive: Option<&str>,
-    notify_tool_guidance_enabled: bool,
-) -> String {
-    let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
-    if notify_tool_guidance_enabled {
-        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
-    }
-    if let Some(extra_directive) = extra_directive {
-        prompt.push_str(extra_directive);
-    }
-    if let Some(sp) = scratchpad_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(sp);
-    }
-    if let Some(mem) = memory_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(mem);
-        prompt.push_str(MEMORY_INSTRUCTION);
-    }
-    prompt
 }
 
 fn extract_requested_write_target(user_message: &str) -> Option<String> {
@@ -7917,14 +7497,12 @@ mod tests {
 
     #[test]
     fn continuation_request_includes_tool_continuation_directive_once() {
-        let request = build_continuation_request(
+        let request = build_continuation_request(ContinuationRequestParams::new(
             &[Message::assistant("intermediate")],
             "mock-model",
-            vec![],
-            None,
-            None,
-            None,
-        );
+            ToolRequestConfig::new(vec![], true),
+            RequestBuildContext::new(None, None, None, false),
+        ));
         let prompt = request
             .system_prompt
             .expect("continuation request should include a system prompt");
@@ -9522,24 +9100,22 @@ mod phase2_tests {
         }];
         let messages = vec![Message::user("continue")];
 
-        let reason_request = build_truncation_continuation_request(
-            "mock",
-            &messages,
-            tool_definitions.clone(),
-            None,
-            None,
-            LoopStep::Reason,
-            None,
-        );
-        let act_request = build_truncation_continuation_request(
-            "mock",
-            &messages,
-            tool_definitions,
-            None,
-            None,
-            LoopStep::Act,
-            None,
-        );
+        let reason_request =
+            build_truncation_continuation_request(TruncationContinuationRequestParams::new(
+                "mock",
+                &messages,
+                ToolRequestConfig::new(tool_definitions.clone(), true),
+                RequestBuildContext::new(None, None, None, false),
+                LoopStep::Reason,
+            ));
+        let act_request =
+            build_truncation_continuation_request(TruncationContinuationRequestParams::new(
+                "mock",
+                &messages,
+                ToolRequestConfig::new(tool_definitions, true),
+                RequestBuildContext::new(None, None, None, false),
+                LoopStep::Act,
+            ));
 
         assert!(reason_request
             .tools
@@ -9823,16 +9399,18 @@ mod phase2_tests {
             steer_context: None,
         };
 
-        let reasoning_request =
-            build_reasoning_request(&perception, "mock", vec![], None, None, None);
-        let continuation_request = build_continuation_request(
+        let reasoning_request = build_reasoning_request(ReasoningRequestParams::new(
+            &perception,
+            "mock",
+            ToolRequestConfig::new(vec![], true),
+            RequestBuildContext::new(None, None, None, false),
+        ));
+        let continuation_request = build_continuation_request(ContinuationRequestParams::new(
             &perception.context_window,
             "mock",
-            vec![],
-            None,
-            None,
-            None,
-        );
+            ToolRequestConfig::new(vec![], true),
+            RequestBuildContext::new(None, None, None, false),
+        ));
 
         assert_eq!(reasoning_request.max_tokens, Some(4096));
         assert_eq!(continuation_request.max_tokens, Some(4096));
@@ -14262,28 +13840,24 @@ mod decomposition_tests {
 
     #[test]
     fn decompose_tool_definition_included_in_reasoning_request() {
-        let request = build_reasoning_request(
+        let request = build_reasoning_request(ReasoningRequestParams::new(
             &sample_perception(),
             "mock-model",
-            vec![sample_tool_definition()],
-            None,
-            None,
-            None,
-        );
+            ToolRequestConfig::new(vec![sample_tool_definition()], true),
+            RequestBuildContext::new(None, None, None, false),
+        ));
 
         assert_decompose_tool_present(&request.tools);
     }
 
     #[test]
     fn decompose_tool_definition_included_in_continuation_request() {
-        let request = build_continuation_request(
+        let request = build_continuation_request(ContinuationRequestParams::new(
             &[Message::assistant("intermediate")],
             "mock-model",
-            vec![sample_tool_definition()],
-            None,
-            None,
-            None,
-        );
+            ToolRequestConfig::new(vec![sample_tool_definition()], true),
+            RequestBuildContext::new(None, None, None, false),
+        ));
 
         assert_decompose_tool_present(&request.tools);
     }
