@@ -207,6 +207,9 @@ pub(super) fn parse_extraction_response(response: &str) -> Option<SessionMemoryU
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
     Some(&text[start..=end])
 }
 
@@ -513,6 +516,11 @@ mod tests {
     #[test]
     fn parse_extraction_response_returns_none_for_garbage() {
         assert!(parse_extraction_response("definitely not json").is_none());
+    }
+
+    #[test]
+    fn parse_extraction_response_returns_none_for_reversed_braces() {
+        assert!(parse_extraction_response("}garbage{").is_none());
     }
 
     #[test]
