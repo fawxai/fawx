@@ -112,6 +112,18 @@ impl LoopEngine {
         self.compaction()
             .should_skip_compaction(scope, iteration, tier)
     }
+
+    #[cfg(test)]
+    pub(super) async fn summarize_before_slide(
+        &self,
+        messages: &[Message],
+        target_tokens: usize,
+        scope: CompactionScope,
+    ) -> Result<CompactionResult, LoopError> {
+        self.compaction()
+            .summarize_before_slide(messages, target_tokens, scope)
+            .await
+    }
 }
 
 impl<'a> CompactionSubsystem<'a> {
@@ -413,16 +425,18 @@ impl<'a> CompactionSubsystem<'a> {
     ) -> Result<CompactionResult, LoopError> {
         let plan = slide_summarization_plan(messages, self.compaction_config.preserve_recent_turns)
             .map_err(|error| compaction_failed_error(scope, error))?;
-        let llm = self
-            .summary_llm()
-            .map_err(|error| compaction_failed_error(scope, error))?;
-        match generate_summary(
-            llm,
-            &plan.evicted_messages,
-            self.compaction_config.max_summary_tokens,
-        )
-        .await
-        {
+        let summary = match self.summary_llm() {
+            Ok(llm) => {
+                generate_summary(
+                    llm,
+                    &plan.evicted_messages,
+                    self.compaction_config.max_summary_tokens,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match summary {
             Ok(summary) => {
                 let result = summarized_compaction_result(messages, &plan, summary);
                 Ok(self

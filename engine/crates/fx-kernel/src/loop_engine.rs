@@ -14,11 +14,11 @@ use crate::cancellation::CancellationToken;
 use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 
+#[cfg(test)]
+use crate::conversation_compactor::debug_assert_tool_pair_integrity;
 use crate::conversation_compactor::{
     estimate_text_tokens, CompactionConfig, CompactionMemoryFlush, ConversationBudget,
 };
-#[cfg(test)]
-use crate::conversation_compactor::debug_assert_tool_pair_integrity;
 use crate::decide::Decision;
 use crate::input::{LoopCommand, LoopInputChannel};
 
@@ -15590,6 +15590,31 @@ mod context_compaction_tests {
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(!has_conversation_summary_marker(compacted.as_ref()));
         assert!(!has_emergency_compaction_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn summarize_before_slide_without_llm_falls_back_to_lossy_slide() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = tiered_compaction_config(true);
+        let budget = tiered_budget(&config);
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let messages = vec![user(250), assistant(250), user(175), assistant(175)];
+
+        let usage = budget.usage_ratio(&messages);
+        assert!(usage > 0.80 && usage < 0.95, "usage ratio was {usage}");
+
+        let compacted = engine
+            .summarize_before_slide(
+                &messages,
+                budget.compaction_target(),
+                CompactionScope::Perceive,
+            )
+            .await
+            .expect("lossy slide fallback");
+
+        assert!(has_compaction_marker(&compacted.messages));
+        assert!(!has_conversation_summary_marker(&compacted.messages));
+        assert!(!has_emergency_compaction_marker(&compacted.messages));
     }
 
     #[tokio::test]
