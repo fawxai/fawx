@@ -22,7 +22,7 @@ use fx_decompose::{
     AggregationStrategy, ComplexityHint, DecompositionPlan, ExecutionContract, SubGoal,
     SubGoalOutcome, SubGoalResult,
 };
-use fx_llm::{Message, ToolDefinition};
+use fx_llm::{CompletionResponse, Message, ToolDefinition};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -496,20 +496,14 @@ impl LoopEngine {
         request: SubGoalRunRequest<'_>,
         run_context: SubGoalRunContext<'_>,
     ) -> SubGoalExecution {
-        let child_budget = self.sub_goal_budget_tracker(request.child_config);
-        let (mut child, compacted_context) = match self
-            .prepare_sub_goal_engine(request.sub_goal, child_budget, run_context.context_messages)
+        let timestamp_ms = current_time_ms();
+        let (mut child, snapshot) = match self
+            .prepare_sub_goal_run(&request, run_context.context_messages, timestamp_ms)
             .await
         {
             Ok(values) => values,
             Err(execution) => return execution,
         };
-        let snapshot = build_sub_goal_snapshot(
-            request.sub_goal,
-            request.prior_results,
-            compacted_context.as_ref(),
-            current_time_ms(),
-        );
         let result = self
             .execute_prepared_sub_goal(&mut child, request.sub_goal, &snapshot, run_context.llm)
             .await;
@@ -519,8 +513,36 @@ impl LoopEngine {
         }
     }
 
-    fn sub_goal_budget_tracker(&self, child_config: BudgetConfig) -> BudgetTracker {
-        BudgetTracker::new(child_config, current_time_ms(), self.budget.child_depth())
+    async fn prepare_sub_goal_run(
+        &self,
+        request: &SubGoalRunRequest<'_>,
+        context_messages: &[Message],
+        timestamp_ms: u64,
+    ) -> Result<(LoopEngine, PerceptionSnapshot), SubGoalExecution> {
+        let child_budget = self.sub_goal_budget_tracker(request.child_config.clone(), timestamp_ms);
+        let compacted_context = self
+            .compact_sub_goal_context(request.sub_goal, child_budget.clone(), context_messages)
+            .await?;
+        let snapshot = build_sub_goal_snapshot(
+            request.sub_goal,
+            request.prior_results,
+            compacted_context.as_ref(),
+            timestamp_ms,
+        );
+        let child = self
+            .build_child_engine(request.sub_goal, child_budget.clone())
+            .map_err(|error| {
+                failed_sub_goal_execution(request.sub_goal, error.reason, child_budget)
+            })?;
+        Ok((child, snapshot))
+    }
+
+    fn sub_goal_budget_tracker(
+        &self,
+        child_config: BudgetConfig,
+        timestamp_ms: u64,
+    ) -> BudgetTracker {
+        BudgetTracker::new(child_config, timestamp_ms, self.budget.child_depth())
     }
 
     async fn execute_prepared_sub_goal(
@@ -793,6 +815,21 @@ impl LoopEngine {
         continuation_messages: &[Message],
         continuation_tools: &[ToolDefinition],
     ) -> Result<ActionResult, LoopError> {
+        let response = self
+            .follow_up_round_response(child, llm, continuation_messages, continuation_tools)
+            .await?;
+        let decision = child.decide(&response).await?;
+        self.execute_follow_up_action(child, &decision, llm, continuation_messages)
+            .await
+    }
+
+    async fn follow_up_round_response(
+        &self,
+        child: &mut LoopEngine,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        continuation_tools: &[ToolDefinition],
+    ) -> Result<CompletionResponse, LoopError> {
         let mut tokens_used = TokenUsage::default();
         let response = child
             .request_tool_continuation(
@@ -804,8 +841,7 @@ impl LoopEngine {
             )
             .await?;
         child.record_continuation_cost(&response, continuation_messages);
-
-        let response = child
+        child
             .continue_truncated_response(
                 response,
                 continuation_messages,
@@ -813,11 +849,18 @@ impl LoopEngine {
                 LoopStep::Act,
                 CycleStream::disabled(),
             )
-            .await?;
+            .await
+    }
 
-        let decision = child.decide(&response).await?;
+    async fn execute_follow_up_action(
+        &self,
+        child: &mut LoopEngine,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+    ) -> Result<ActionResult, LoopError> {
         let action = Box::pin(child.act(
-            &decision,
+            decision,
             llm,
             continuation_messages,
             CycleStream::disabled(),
@@ -890,12 +933,12 @@ impl LoopEngine {
         }
     }
 
-    async fn prepare_sub_goal_engine<'a>(
+    async fn compact_sub_goal_context<'a>(
         &self,
         sub_goal: &SubGoal,
         child_budget: BudgetTracker,
         context_messages: &'a [Message],
-    ) -> Result<(LoopEngine, Cow<'a, [Message]>), SubGoalExecution> {
+    ) -> Result<Cow<'a, [Message]>, SubGoalExecution> {
         let compacted_context = self
             .compaction()
             .compact_if_needed(
@@ -913,11 +956,7 @@ impl LoopEngine {
             .map_err(|error| {
                 failed_sub_goal_execution(sub_goal, error.reason, child_budget.clone())
             })?;
-
-        let child = self
-            .build_child_engine(sub_goal, child_budget.clone())
-            .map_err(|error| failed_sub_goal_execution(sub_goal, error.reason, child_budget))?;
-        Ok((child, compacted_context))
+        Ok(compacted_context)
     }
 
     pub(super) fn build_child_engine(
@@ -1658,6 +1697,33 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(blocked.len(), 1);
         assert!(blocked[0].message.contains("recursion depth"));
+    }
+
+    #[tokio::test]
+    async fn prepare_sub_goal_run_shares_timestamp_between_budget_and_snapshot() {
+        let child_config = BudgetConfig {
+            max_wall_time_ms: 250,
+            ..BudgetConfig::default()
+        };
+        let engine = build_engine_with_budget(BudgetConfig::default(), 0);
+        let goal = sub_goal("child", &[], None);
+        let prior_results = Vec::new();
+        let request = SubGoalRunRequest {
+            sub_goal: &goal,
+            child_config: child_config.clone(),
+            prior_results: &prior_results,
+        };
+
+        let (child, snapshot) = engine
+            .prepare_sub_goal_run(&request, &[], 77)
+            .await
+            .expect("sub-goal preparation should succeed");
+
+        assert_eq!(snapshot.timestamp_ms, 77);
+        assert_eq!(
+            child.budget.remaining(77).wall_time_ms,
+            child_config.max_wall_time_ms
+        );
     }
 
     fn build_engine_with_budget(config: BudgetConfig, depth: u32) -> LoopEngine {
