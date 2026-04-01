@@ -49,6 +49,25 @@ cargo test --workspace
 
 If there are request-shape tests, keep them green or move them with the extracted code.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Direct inspection request path**
+   - Prompt: `Read README.md and quote the first paragraph exactly.`
+   - Pass if the assistant returns the real paragraph with no refusal or prompt drift.
+2. **Standard multi-step request path**
+   - Prompt: `Read README.md, append this exact marker on a new last line: <!-- STEP13_REQUEST_MARKER -->, then tell me exactly what you appended.`
+   - Pass if the assistant performs the read and append correctly and reports the exact line appended.
+3. **Follow-up correctness**
+   - Prompt: `Run git status and tell me which file is modified.`
+   - Pass if the assistant reports only detached `README.md` as modified.
+
+## Done means
+- request-building helpers are isolated in their module
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the slice stay purely about request construction?
 - Are the extracted functions still explicit and typed?

@@ -50,6 +50,24 @@ cargo test --workspace
 
 This slice should also preserve any targeted compaction regression tests already in the repo.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Read and append turn**
+   - Prompt: `Read README.md, append this exact marker on a new last line: <!-- STEP13_COMPACTION_MARKER -->, then summarize what changed.`
+   - Pass if the marker is appended only in the detached lane and the assistant describes the change accurately.
+2. **Follow-up exactness check**
+   - Prompt: `What exact line did you append? Run git status and tell me which file is modified.`
+   - Pass if the assistant returns the exact marker line and reports only detached `README.md` as modified.
+3. **No replay/order corruption**
+   - Pass if both turns complete without missing-tool-output, unknown-tool, or replay-order errors.
+
+## Done means
+- compaction entrypoints and state handoff are extracted cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the PR preserve history mutation semantics?
 - Is the interface clean, or did it just move ambient state behind a different file?

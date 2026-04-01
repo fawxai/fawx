@@ -40,6 +40,24 @@ cargo test --workspace
 
 Pay attention to fallback/synthesis regressions and any tests around terminal response behavior after tool rounds.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Terminal wrap-up after tool turn**
+   - Prompt: `Read README.md, append this exact marker on a new last line: <!-- STEP13_SYNTHESIS_MARKER -->, then tell me exactly what changed and stop.`
+   - Pass if the assistant performs the tool turn and returns a clean terminal answer with the exact change.
+2. **Follow-up exactness check**
+   - Prompt: `Quote the exact line you appended, then run git status and tell me which file is modified.`
+   - Pass if the assistant returns the exact marker and reports only detached `README.md` as modified.
+3. **Terminal response quality**
+   - Pass if the final answer is coherent, non-duplicated, and does not surface fallback-path corruption.
+
+## Done means
+- synthesis fallback and terminal wrap-up logic are isolated cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the fallback path move cleanly without policy drift?
 - Are terminal tool-wrap-up semantics unchanged?

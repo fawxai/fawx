@@ -47,6 +47,25 @@ cargo test --workspace
 
 Pay attention to tool-round regressions, blocked-call behavior, and call/result ordering.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Core read/write tool turn**
+   - Prompt: `Read README.md, append this exact marker on a new last line: <!-- STEP13_TOOL_CORE_MARKER -->, then tell me exactly what you appended.`
+   - Pass if the assistant performs the read/write correctly and reports the exact appended line.
+2. **Tool-state follow-up**
+   - Prompt: `Run git status and tell me which file is modified.`
+   - Pass if the response reports only detached `README.md` as modified.
+3. **Second-turn exactness**
+   - Prompt: `Quote the exact line you appended in the previous turn.`
+   - Pass if the assistant quotes the exact marker with no history corruption.
+
+## Done means
+- tool execution core is isolated in its module
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did this slice stop at the core execution boundary?
 - Is the new module actually cohesive, or is it just a partial dump of unrelated helpers?

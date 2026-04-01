@@ -28,6 +28,13 @@ cargo clippy --workspace --tests -- -D warnings
 cargo test --workspace
 ```
 
+Every slice must also pass a **live clean-bisect API smoke test on a fresh detached lane after implementation**.
+
+- Use `docs/runbooks/clean-bisect-lane.md`
+- Use the **headless API path only** for Step 13 slices
+- **No TUI smoke test is required** for these Step 13 PRs
+- Each slice spec below defines the specific smoke-test prompts and pass criteria for that slice
+
 For slices that touch behavior-heavy loop paths, also preserve targeted regression coverage for:
 - direct inspection
 - direct utility

@@ -52,6 +52,25 @@ This slice should preserve regressions for:
 - turn-scoped grouped tool history
 - multi-round continuation behavior
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Failure then recovery with write**
+   - Prompt: `Read DOES_NOT_EXIST_STEP13.md. If it is missing, read README.md instead, append this exact marker on a new last line: <!-- STEP13_TOOL_POLICY_MARKER -->, then tell me exactly what you appended.`
+   - Pass if the assistant recovers from the failed read, performs the write, and terminates cleanly without looping.
+2. **Follow-up status check**
+   - Prompt: `Run git status and tell me which file is modified.`
+   - Pass if the response reports only detached `README.md` as modified.
+3. **No runaway / ordering regression**
+   - Prompt: `Quote the exact line you appended and stop.`
+   - Pass if the assistant returns the exact marker and does not enter a repeated tool loop or surface tool-order errors.
+
+## Done means
+- tool-loop policy is isolated cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the PR preserve current loop-policy semantics?
 - Is this still a module extraction, not a stealth rewrite?

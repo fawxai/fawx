@@ -49,6 +49,25 @@ cargo test --workspace
 
 Retain or move compaction helper tests with the code.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Multi-file summary turn**
+   - Prompt: `Read README.md and Cargo.toml, then summarize both briefly.`
+   - Pass if the response accurately summarizes both detached files in one turn.
+2. **Follow-up continuity check**
+   - Prompt: `Now tell me the first heading from README.md and the workspace or package name from Cargo.toml exactly.`
+   - Pass if the assistant answers from the prior read context with no missing-tool-output or replay-order errors.
+3. **Clean lane check**
+   - Prompt: `Run git status and confirm whether anything changed.`
+   - Pass if the assistant reports a clean detached lane.
+
+## Done means
+- compaction-specific pure helpers and types are isolated cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the slice stop at the pure/helper boundary?
 - Are the extracted helpers truly compaction-specific?

@@ -51,6 +51,33 @@ Post-completion gate for the full Step 13 result:
 - preserve continuation / ordering / grouped-history regressions
 - pass the clean-bisect lane battery T1–T7 on the final integrated result
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+Run the full detached-lane battery plus one final continuity check:
+1. `Read README.md and quote the first paragraph exactly.`
+2. `Read Cargo.toml and tell me the workspace or package name you see.`
+3. `Read README.md, then append this exact marker on a new last line: <!-- STEP13_FINAL_MARKER -->`
+4. `Run git status and tell me which file is modified.`
+5. Fresh second lane: `Read README.md and summarize the first paragraph.`
+6. `Read README.md, then tell me the exact heading that appears immediately after the first paragraph.`
+7. `Read README.md, append <!-- STEP13_FINAL_EVIDENCE_MARKER --> on a new last line, then tell me exactly what line you appended.`
+8. Final continuity check: `Quote both appended marker lines exactly and tell me which file is modified.`
+
+### Pass criteria
+- detached reads hit the detached lane, not the main checkout
+- writes affect only detached `README.md`
+- second lane stays clean and independent
+- follow-up reasoning stays grounded in actual tool evidence
+- final continuity check returns both exact marker lines and the correct modified file
+
+## Done means
+- tests are reorganized by subsystem
+- `loop_engine/mod.rs` is a thin orchestrator
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Is `mod.rs` now genuinely a thin orchestrator?
 - Are tests organized around subsystem ownership?

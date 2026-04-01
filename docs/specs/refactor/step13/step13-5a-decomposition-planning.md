@@ -46,6 +46,25 @@ cargo test --workspace
 
 Retain targeted decomposition regressions if they already exist.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Multi-part read request**
+   - Prompt: `Read README.md and Cargo.toml, then tell me: (1) the first heading in README.md, and (2) the workspace or package name in Cargo.toml.`
+   - Pass if both answers are correct and grounded in the detached files.
+2. **Three-part aggregation check**
+   - Prompt: `Read README.md and docs/specs/refactor/1642-headless-decomposition.md, then list one concrete goal from each file.`
+   - Pass if the response returns one valid item from each file without dropping part of the request.
+3. **Clean lane check**
+   - Prompt: `Run git status and confirm whether anything changed.`
+   - Pass if the detached lane remains clean.
+
+## Done means
+- decomposition planning/allocation/aggregation logic is isolated cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did this slice stop before the recursive execution boundary?
 - Are planning and aggregation now clearly owned by the decomposition subsystem?

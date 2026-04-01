@@ -45,6 +45,24 @@ cargo test --workspace
 
 Pay attention to regressions around child-engine follow-up paths and aggregation behavior.
 
+## Live clean-bisect API smoke test
+Use `docs/runbooks/clean-bisect-lane.md` on a fresh detached lane. Use the headless API only.
+
+### Test cases
+1. **Complex multi-step task**
+   - Prompt: `Read README.md and Cargo.toml, append this exact marker on a new last line of README.md: <!-- STEP13_DECOMP_MARKER -->, then tell me the workspace or package name and exactly what line you appended.`
+   - Pass if the assistant completes the full task correctly without losing any requested sub-result.
+2. **Follow-up verification**
+   - Prompt: `Run git status and tell me which file is modified. Then quote the exact line you appended.`
+   - Pass if the assistant reports only detached `README.md` and quotes the exact appended marker.
+3. **No child-path corruption**
+   - Pass if the turn completes without runaway behavior, missing follow-up state, or dropped sub-results.
+
+## Done means
+- decomposition execution paths are isolated cleanly
+- workspace validation passes
+- the live clean-bisect API smoke test above passes on a fresh lane after implementation
+
 ## Reviewer focus
 - Did the extraction preserve recursive execution semantics?
 - Did the module boundary stay clean, or is it now tightly coupled to unrelated orchestrator state?
