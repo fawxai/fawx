@@ -15,10 +15,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 
 use crate::conversation_compactor::{
-    assemble_summarized_messages, debug_assert_tool_pair_integrity, emergency_compact,
-    estimate_text_tokens, generate_summary, has_prunable_blocks, prune_tool_blocks,
-    slide_summarization_plan, summary_message, CompactionConfig, CompactionError,
-    CompactionMemoryFlush, CompactionResult, ConversationBudget, SlideSummarizationPlan,
+    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, has_prunable_blocks,
+    prune_tool_blocks, slide_summarization_plan, summary_message, CompactionConfig,
+    CompactionError, CompactionMemoryFlush, CompactionResult, ConversationBudget,
     SlidingWindowCompactor,
 };
 use crate::decide::Decision;
@@ -60,6 +59,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fx_decompose::SubGoalContract;
 
 mod bounded_local;
+mod compaction;
 mod continuation;
 mod direct_inspection;
 mod direct_utility;
@@ -68,6 +68,18 @@ mod request;
 mod retry;
 mod streaming;
 
+use self::compaction::{
+    build_extraction_prompt, can_summarize_eviction, compacted_context_summary,
+    compaction_cooldown_active, compaction_failed_error, context_exceeded_after_compaction_error,
+    generate_eviction_summary, highest_compaction_tier, merge_summarized_follow_up,
+    parse_extraction_response, parse_summary_memory_update, summarized_compaction_result,
+    CompactionScope, CompactionTier, FinishTierContext,
+};
+#[cfg(test)]
+use self::compaction::{
+    has_compaction_marker, has_conversation_summary_marker, has_emergency_compaction_marker,
+    marker_message_index, session_memory_message_index, summary_message_index,
+};
 use self::request::{
     build_continuation_request, build_forced_synthesis_request, build_reasoning_messages,
     build_reasoning_request, build_truncation_continuation_request, completion_request_to_prompt,
@@ -448,46 +460,6 @@ impl LoopResult {
                     .unwrap_or_else(|| "user stopped".to_string()),
             ),
             Self::Error { .. } => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CompactionScope {
-    Perceive,
-    ToolContinuation,
-    DecomposeChild,
-}
-
-impl CompactionScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Perceive => "perceive",
-            Self::ToolContinuation => "tool_continuation",
-            Self::DecomposeChild => "decompose_child",
-        }
-    }
-}
-
-impl std::fmt::Display for CompactionScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CompactionTier {
-    Prune,
-    Slide,
-    Emergency,
-}
-
-impl CompactionTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Prune => "prune",
-            Self::Slide => "slide",
-            Self::Emergency => "emergency",
         }
     }
 }
@@ -939,74 +911,6 @@ fn build_compaction_components(
     Ok((compaction_config, conversation_budget))
 }
 
-fn build_extraction_prompt(messages: &[Message]) -> String {
-    format!(
-        concat!(
-            "Extract key facts from this conversation excerpt that is being removed from context.\n",
-            "Return a JSON object with these optional fields:\n",
-            "- \"project\": what the session is about (string, only if clearly identifiable)\n",
-            "- \"current_state\": current state of work (string, only if clear)\n",
-            "- \"key_decisions\": important decisions made (array of short strings)\n",
-            "- \"active_files\": files being worked on (array of paths)\n",
-            "- \"custom_context\": other important facts to remember (array of short strings)\n\n",
-            "Only include fields where the conversation clearly contains relevant information.\n",
-            "Keep each string under 100 characters. Return ONLY valid JSON, no markdown.\n\n",
-            "Conversation:\n{}"
-        ),
-        format_extraction_messages(messages)
-    )
-}
-
-fn format_extraction_messages(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .filter_map(format_extraction_message)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_extraction_message(message: &Message) -> Option<String> {
-    let role = extraction_role(&message.role)?;
-    let content = message
-        .content
-        .iter()
-        .map(format_extraction_block)
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!("{role}: {content}"))
-}
-
-fn extraction_role(role: &MessageRole) -> Option<&'static str> {
-    match role {
-        MessageRole::User => Some("user"),
-        MessageRole::Assistant => Some("assistant"),
-        MessageRole::System => None,
-        MessageRole::Tool => Some("tool"),
-    }
-}
-
-fn format_extraction_block(block: &ContentBlock) -> String {
-    match block {
-        ContentBlock::Text { text } => text.clone(),
-        ContentBlock::ToolUse { name, .. } => format!("[tool: {name}]"),
-        ContentBlock::ToolResult { content, .. } => {
-            truncate_prompt_text(&render_tool_result(content), 200)
-        }
-        ContentBlock::Image { .. } => "[image]".to_string(),
-        ContentBlock::Document { filename, .. } => filename
-            .as_ref()
-            .map(|filename| format!("[document:{filename}]"))
-            .unwrap_or_else(|| "[document]".to_string()),
-    }
-}
-
-fn render_tool_result(content: &serde_json::Value) -> String {
-    match content.as_str() {
-        Some(text) => text.to_string(),
-        None => content.to_string(),
-    }
-}
-
 fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -1015,145 +919,6 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
-}
-
-fn parse_extraction_response(response: &str) -> Option<SessionMemoryUpdate> {
-    let trimmed = response.trim();
-    if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(trimmed) {
-        return Some(update);
-    }
-    if let Some(json) = extract_json_object(trimmed) {
-        if let Ok(update) = serde_json::from_str::<SessionMemoryUpdate>(json) {
-            return Some(update);
-        }
-    }
-    tracing::warn!(
-        response_len = response.len(),
-        "failed to parse memory extraction response as JSON"
-    );
-    None
-}
-
-#[derive(Clone, Copy)]
-enum SummarySection {
-    Decisions,
-    FilesModified,
-    TaskState,
-    KeyContext,
-}
-
-#[derive(Default)]
-struct ParsedSummarySections {
-    decisions: Vec<String>,
-    files_modified: Vec<String>,
-    task_state: Vec<String>,
-    key_context: Vec<String>,
-}
-
-fn parse_summary_memory_update(summary: &str) -> Option<SessionMemoryUpdate> {
-    let sections = parse_summary_sections(summary);
-    let update = SessionMemoryUpdate {
-        project: None,
-        current_state: joined_summary_section(&sections.task_state),
-        key_decisions: optional_summary_items(sections.decisions),
-        active_files: optional_summary_items(sections.files_modified),
-        custom_context: optional_summary_items(sections.key_context),
-    };
-    has_memory_update_fields(&update).then_some(update)
-}
-
-fn parse_summary_sections(summary: &str) -> ParsedSummarySections {
-    let mut sections = ParsedSummarySections::default();
-    let mut current = None;
-    for line in summary
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if let Some((section, inline)) = summary_section_header(line) {
-            current = Some(section);
-            if let Some(text) = inline {
-                push_summary_section_line(&mut sections, section, text);
-            }
-            continue;
-        }
-        if let Some(section) = current {
-            push_summary_section_line(&mut sections, section, line);
-        }
-    }
-    sections
-}
-
-fn summary_section_header(line: &str) -> Option<(SummarySection, Option<&str>)> {
-    let (heading, remainder) = line.split_once(':')?;
-    let section = match strip_summary_section_numbering(heading) {
-        text if text.eq_ignore_ascii_case("Decisions") => SummarySection::Decisions,
-        text if text.eq_ignore_ascii_case("Files modified") => SummarySection::FilesModified,
-        text if text.eq_ignore_ascii_case("Task state") => SummarySection::TaskState,
-        text if text.eq_ignore_ascii_case("Key context") => SummarySection::KeyContext,
-        _ => return None,
-    };
-    let inline = (!remainder.trim().is_empty()).then_some(remainder.trim());
-    Some((section, inline))
-}
-
-fn strip_summary_section_numbering(heading: &str) -> &str {
-    let trimmed = heading.trim();
-    let digits_len = trimmed
-        .as_bytes()
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if digits_len == 0 {
-        return trimmed;
-    }
-    trimmed[digits_len..]
-        .strip_prefix('.')
-        .map_or(trimmed, |remainder| remainder.trim_start())
-}
-
-fn push_summary_section_line(
-    sections: &mut ParsedSummarySections,
-    section: SummarySection,
-    line: &str,
-) {
-    let trimmed = line.trim();
-    let item = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .unwrap_or(trimmed)
-        .trim();
-    if item.is_empty() {
-        return;
-    }
-    match section {
-        SummarySection::Decisions => sections.decisions.push(item.to_string()),
-        SummarySection::FilesModified => sections.files_modified.push(item.to_string()),
-        SummarySection::TaskState => sections.task_state.push(item.to_string()),
-        SummarySection::KeyContext => sections.key_context.push(item.to_string()),
-    }
-}
-
-fn joined_summary_section(items: &[String]) -> Option<String> {
-    (!items.is_empty()).then(|| items.join("; "))
-}
-
-fn optional_summary_items(items: Vec<String>) -> Option<Vec<String>> {
-    (!items.is_empty()).then_some(items)
-}
-
-fn has_memory_update_fields(update: &SessionMemoryUpdate) -> bool {
-    update.project.is_some()
-        || update.current_state.is_some()
-        || update.key_decisions.is_some()
-        || update.active_files.is_some()
-        || update.custom_context.is_some()
-}
-
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    Some(&text[start..=end])
 }
 
 fn required_builder_field<T>(value: Option<T>, field: &str) -> Result<T, LoopError> {
@@ -4140,21 +3905,6 @@ impl LoopEngine {
         }
     }
 
-    fn compaction_cooldown_active(
-        &self,
-        scope: CompactionScope,
-        iteration: u32,
-        cooldown_turns: u32,
-    ) -> bool {
-        let map = self
-            .compaction_last_iteration
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.get(&scope)
-            .map(|last| iteration.saturating_sub(*last) < cooldown_turns)
-            .unwrap_or(false)
-    }
-
     fn record_compaction_iteration(&self, scope: CompactionScope, iteration: u32) {
         let mut map = self
             .compaction_last_iteration
@@ -4163,30 +3913,20 @@ impl LoopEngine {
         map.insert(scope, iteration);
     }
 
-    fn highest_compaction_tier(&self, messages: &[Message]) -> Option<CompactionTier> {
-        if self
-            .conversation_budget
-            .at_tier(messages, self.compaction_config.emergency_threshold)
-        {
-            return Some(CompactionTier::Emergency);
-        }
-        if self
-            .conversation_budget
-            .at_tier(messages, self.compaction_config.slide_threshold)
-        {
-            return Some(CompactionTier::Slide);
-        }
-        None
-    }
-
     fn should_skip_compaction(
         &self,
         scope: CompactionScope,
         iteration: u32,
         tier: CompactionTier,
     ) -> bool {
-        let cooldown_active = self.compaction_cooldown_active(
-            scope,
+        let last_iteration = self
+            .compaction_last_iteration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&scope)
+            .copied();
+        let cooldown_active = compaction_cooldown_active(
+            last_iteration,
             iteration,
             self.compaction_config.recompact_cooldown_turns,
         );
@@ -4341,29 +4081,12 @@ impl LoopEngine {
                 .ok_or_else(|| CompactionError::SummarizationFailed {
                     source: Box::new(std::io::Error::other("no compaction LLM")),
                 })?;
-        generate_summary(
+        generate_eviction_summary(
             llm.as_ref(),
             messages,
             self.compaction_config.max_summary_tokens,
         )
         .await
-    }
-
-    fn summarized_compaction_result(
-        &self,
-        messages: &[Message],
-        plan: &SlideSummarizationPlan,
-        summary: String,
-    ) -> CompactionResult {
-        let compacted_messages = assemble_summarized_messages(messages, plan, &summary);
-        CompactionResult {
-            estimated_tokens: ConversationBudget::estimate_tokens(&compacted_messages),
-            messages: compacted_messages,
-            compacted_count: plan.evicted_messages.len(),
-            used_summarization: true,
-            summary: Some(summary),
-            evicted_indices: plan.evicted_indices.clone(),
-        }
     }
 
     async fn apply_follow_up_slide(
@@ -4380,7 +4103,7 @@ impl LoopEngine {
             .run_sliding_compaction(&result.messages, scope, target_tokens)
             .await
         {
-            Ok(follow_up) => Self::merge_summarized_follow_up(result, follow_up),
+            Ok(follow_up) => merge_summarized_follow_up(result, follow_up),
             Err(error) => {
                 tracing::warn!(
                     scope = scope.as_str(),
@@ -4393,36 +4116,27 @@ impl LoopEngine {
         }
     }
 
-    fn merge_summarized_follow_up(
-        base: CompactionResult,
-        follow_up: CompactionResult,
-    ) -> CompactionResult {
-        CompactionResult {
-            messages: follow_up.messages,
-            compacted_count: base.compacted_count + follow_up.compacted_count,
-            estimated_tokens: follow_up.estimated_tokens,
-            used_summarization: true,
-            summary: base.summary,
-            evicted_indices: base.evicted_indices,
-        }
-    }
-
     async fn finish_tier<'a>(
         &self,
         tier: CompactionTier,
         current: Cow<'a, [Message]>,
         result: CompactionResult,
-        scope: CompactionScope,
-        iteration: Option<u32>,
-        target_tokens: usize,
+        context: FinishTierContext,
     ) -> Cow<'a, [Message]> {
         let before_tokens = ConversationBudget::estimate_tokens(current.as_ref());
         let after_tokens = result.estimated_tokens;
-        self.flush_evicted(current.as_ref(), &result, scope).await;
-        if let Some(iteration) = iteration {
-            self.record_compaction_iteration(scope, iteration);
+        self.flush_evicted(current.as_ref(), &result, context.scope)
+            .await;
+        if let Some(iteration) = context.iteration {
+            self.record_compaction_iteration(context.scope, iteration);
         }
-        self.log_tier_result(tier, scope, current.as_ref(), target_tokens, &result);
+        self.log_tier_result(
+            tier,
+            context.scope,
+            current.as_ref(),
+            context.target_tokens,
+            &result,
+        );
         if result.compacted_count > 0 {
             self.emit_stream_event(StreamEvent::ContextCompacted {
                 tier: tier.as_str().to_string(),
@@ -4453,10 +4167,6 @@ impl LoopEngine {
         current
     }
 
-    fn can_summarize_eviction(&self) -> bool {
-        self.compaction_config.use_summarization && self.compaction_llm.is_some()
-    }
-
     async fn summarize_before_slide(
         &self,
         messages: &[Message],
@@ -4467,7 +4177,7 @@ impl LoopEngine {
             .map_err(|error| compaction_failed_error(scope, error))?;
         match self.generate_eviction_summary(&plan.evicted_messages).await {
             Ok(summary) => {
-                let result = self.summarized_compaction_result(messages, &plan, summary);
+                let result = summarized_compaction_result(messages, &plan, summary);
                 Ok(self
                     .apply_follow_up_slide(result, target_tokens, scope)
                     .await)
@@ -4498,7 +4208,7 @@ impl LoopEngine {
         )
         .await
         {
-            Ok(Ok(summary)) => Some(self.summarized_compaction_result(messages, &plan, summary)),
+            Ok(Ok(summary)) => Some(summarized_compaction_result(messages, &plan, summary)),
             Ok(Err(error)) => {
                 tracing::warn!(
                     scope = scope.as_str(),
@@ -4526,22 +4236,25 @@ impl LoopEngine {
         iteration: u32,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
         let target_tokens = self.conversation_budget.compaction_target();
-        let result = if self.can_summarize_eviction() {
-            self.summarize_before_slide(current.as_ref(), target_tokens, scope)
-                .await
-        } else {
-            self.run_sliding_compaction(current.as_ref(), scope, target_tokens)
-                .await
-        };
+        let result =
+            if can_summarize_eviction(&self.compaction_config, self.compaction_llm.is_some()) {
+                self.summarize_before_slide(current.as_ref(), target_tokens, scope)
+                    .await
+            } else {
+                self.run_sliding_compaction(current.as_ref(), scope, target_tokens)
+                    .await
+            };
         match result {
             Ok(result) => Ok(self
                 .finish_tier(
                     CompactionTier::Slide,
                     current,
                     result,
-                    scope,
-                    Some(iteration),
-                    target_tokens,
+                    FinishTierContext {
+                        scope,
+                        iteration: Some(iteration),
+                        target_tokens,
+                    },
                 )
                 .await),
             Err(error) => {
@@ -4561,23 +4274,33 @@ impl LoopEngine {
         current: Cow<'a, [Message]>,
         scope: CompactionScope,
     ) -> Result<Cow<'a, [Message]>, LoopError> {
-        let result = if self.can_summarize_eviction() {
-            self.best_effort_emergency_summary(current.as_ref(), scope)
-                .await
-                .unwrap_or_else(|| {
-                    emergency_compact(
-                        current.as_ref(),
-                        self.compaction_config.preserve_recent_turns,
-                    )
-                })
-        } else {
-            emergency_compact(
-                current.as_ref(),
-                self.compaction_config.preserve_recent_turns,
-            )
-        };
+        let result =
+            if can_summarize_eviction(&self.compaction_config, self.compaction_llm.is_some()) {
+                self.best_effort_emergency_summary(current.as_ref(), scope)
+                    .await
+                    .unwrap_or_else(|| {
+                        emergency_compact(
+                            current.as_ref(),
+                            self.compaction_config.preserve_recent_turns,
+                        )
+                    })
+            } else {
+                emergency_compact(
+                    current.as_ref(),
+                    self.compaction_config.preserve_recent_turns,
+                )
+            };
         Ok(self
-            .finish_tier(CompactionTier::Emergency, current, result, scope, None, 0)
+            .finish_tier(
+                CompactionTier::Emergency,
+                current,
+                result,
+                FinishTierContext {
+                    scope,
+                    iteration: None,
+                    target_tokens: 0,
+                },
+            )
             .await)
     }
 
@@ -4589,7 +4312,11 @@ impl LoopEngine {
     ) -> Result<Cow<'a, [Message]>, LoopError> {
         let current = Cow::Borrowed(messages);
         let current = self.apply_prune_tier(current, scope);
-        let current = match self.highest_compaction_tier(current.as_ref()) {
+        let current = match highest_compaction_tier(
+            current.as_ref(),
+            &self.conversation_budget,
+            &self.compaction_config,
+        ) {
             Some(CompactionTier::Emergency) => self.apply_emergency_tier(current, scope).await?,
             Some(tier @ CompactionTier::Slide) => {
                 if self.should_skip_compaction(scope, iteration, tier) {
@@ -6552,14 +6279,6 @@ fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopErr
     Ok(user_message)
 }
 
-fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
-    context
-        .working_memory
-        .iter()
-        .find(|entry| entry.key == "compacted_context_summary")
-        .map(|entry| entry.value.as_str())
-}
-
 fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> String {
     let has_tool_error = tool_results.iter().any(|result| !result.success);
     let error_relay_instruction = if has_tool_error {
@@ -7225,28 +6944,6 @@ fn summarize_tool_progress(results: &[ToolResult]) -> Option<String> {
     }
 
     Some(parts.join(". "))
-}
-
-fn compaction_failed_error(scope: CompactionScope, error: CompactionError) -> LoopError {
-    loop_error(
-        "compaction",
-        &format!("compaction_failed: scope={scope} error={error}"),
-        true,
-    )
-}
-
-fn context_exceeded_after_compaction_error(
-    scope: CompactionScope,
-    estimated_tokens: usize,
-    hard_limit_tokens: usize,
-) -> LoopError {
-    loop_error(
-        "compaction",
-        &format!(
-            "context_exceeded_after_compaction: scope={scope} estimated_tokens={estimated_tokens} hard_limit_tokens={hard_limit_tokens}",
-        ),
-        true,
-    )
 }
 
 fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
@@ -14963,74 +14660,6 @@ mod context_compaction_tests {
         }
     }
 
-    const COMPACTED_CONTEXT_SUMMARY_PREFIX: &str = "Compacted context summary:";
-
-    fn has_compaction_marker(messages: &[Message]) -> bool {
-        messages.iter().any(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
-                )
-            })
-        })
-    }
-
-    fn has_emergency_compaction_marker(messages: &[Message]) -> bool {
-        messages.iter().any(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text }
-                        if text.starts_with("[context compacted:") && text.contains("emergency")
-                )
-            })
-        })
-    }
-
-    fn has_conversation_summary_marker(messages: &[Message]) -> bool {
-        messages.iter().any(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text } if text.starts_with("[context summary]")
-                )
-            })
-        })
-    }
-
-    fn summary_message_index(messages: &[Message]) -> Option<usize> {
-        messages.iter().position(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text }
-                        if text.starts_with(COMPACTED_CONTEXT_SUMMARY_PREFIX)
-                )
-            })
-        })
-    }
-
-    fn marker_message_index(messages: &[Message]) -> Option<usize> {
-        messages.iter().position(|message| {
-            message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
-                )
-            })
-        })
-    }
-
-    fn session_memory_message_index(messages: &[Message]) -> Option<usize> {
-        messages.iter().position(|message| {
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with("[Session Memory]")))
-        })
-    }
-
     fn large_history(count: usize, words_per_message: usize) -> Vec<Message> {
         (0..count)
             .map(|index| {
@@ -15108,19 +14737,6 @@ mod context_compaction_tests {
             .compaction_config(config)
             .build()
             .expect("test engine build")
-    }
-
-    #[test]
-    fn compaction_scope_display_uses_scope_label() {
-        assert_eq!(CompactionScope::Perceive.to_string(), "perceive");
-        assert_eq!(
-            CompactionScope::ToolContinuation.to_string(),
-            "tool_continuation"
-        );
-        assert_eq!(
-            CompactionScope::DecomposeChild.to_string(),
-            "decompose_child"
-        );
     }
 
     #[test]
@@ -16214,121 +15830,6 @@ mod context_compaction_tests {
         );
         assert_eq!(memory.custom_context, vec!["no second LLM call needed"]);
         assert!(llm.prompts().is_empty());
-    }
-
-    #[test]
-    fn build_extraction_prompt_formats_messages() {
-        let prompt = build_extraction_prompt(&[
-            Message::system("system policy"),
-            Message::user("User fact"),
-            tool_use("call-1"),
-            tool_result("call-1", 250),
-            Message {
-                role: MessageRole::Assistant,
-                content: vec![ContentBlock::Image {
-                    media_type: "image/png".to_string(),
-                    data: "abc".to_string(),
-                }],
-            },
-        ]);
-
-        assert!(prompt.contains("Return ONLY valid JSON"));
-        assert!(prompt.contains("user: User fact"));
-        assert!(prompt.contains("assistant: [tool: read]"));
-        assert!(prompt.contains("tool: "));
-        assert!(prompt.contains("[image]"));
-        assert!(prompt.contains("..."));
-        assert!(!prompt.contains("system: system policy"));
-    }
-
-    #[test]
-    fn parse_extraction_response_handles_code_block() {
-        let response = "```json\n{\"project\":\"Phase 5\"}\n```";
-
-        let update = parse_extraction_response(response).expect("parse code block");
-
-        assert_eq!(update.project.as_deref(), Some("Phase 5"));
-    }
-
-    #[test]
-    fn parse_extraction_response_returns_none_for_garbage() {
-        assert!(parse_extraction_response("definitely not json").is_none());
-    }
-
-    #[test]
-    fn parse_summary_memory_update_extracts_sections() {
-        let summary = concat!(
-            "Decisions:\n",
-            "- Use summarize-before-slide\n",
-            "Files modified:\n",
-            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
-            "Task state:\n",
-            "- Implementing Phase 2\n",
-            "Key context:\n",
-            "- Preserve summary markers during follow-up slide"
-        );
-
-        let update = parse_summary_memory_update(summary).expect("summary parse");
-
-        assert_eq!(update.project, None);
-        assert_eq!(
-            update.current_state.as_deref(),
-            Some("Implementing Phase 2")
-        );
-        assert_eq!(
-            update.key_decisions,
-            Some(vec!["Use summarize-before-slide".to_string()])
-        );
-        assert_eq!(
-            update.active_files,
-            Some(vec![
-                "engine/crates/fx-kernel/src/loop_engine.rs".to_string()
-            ])
-        );
-        assert_eq!(
-            update.custom_context,
-            Some(vec![
-                "Preserve summary markers during follow-up slide".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn parse_summary_memory_update_extracts_numbered_sections() {
-        let summary = concat!(
-            "1. Decisions:\n",
-            "- Use summarize-before-slide\n",
-            "2. Files modified:\n",
-            "- engine/crates/fx-kernel/src/loop_engine.rs\n",
-            "3. Task state:\n",
-            "- Implementing Phase 2\n",
-            "4. Key context:\n",
-            "- Preserve summary markers during follow-up slide"
-        );
-
-        let update = parse_summary_memory_update(summary).expect("summary parse");
-
-        assert_eq!(update.project, None);
-        assert_eq!(
-            update.current_state.as_deref(),
-            Some("Implementing Phase 2")
-        );
-        assert_eq!(
-            update.key_decisions,
-            Some(vec!["Use summarize-before-slide".to_string()])
-        );
-        assert_eq!(
-            update.active_files,
-            Some(vec![
-                "engine/crates/fx-kernel/src/loop_engine.rs".to_string()
-            ])
-        );
-        assert_eq!(
-            update.custom_context,
-            Some(vec![
-                "Preserve summary markers during follow-up slide".to_string()
-            ])
-        );
     }
 
     #[tokio::test]
