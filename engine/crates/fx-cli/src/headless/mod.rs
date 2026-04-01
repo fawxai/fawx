@@ -84,21 +84,20 @@ use self::output::json_output_from_cycle;
 use self::session::is_quit_command;
 pub use self::session::{process_input_with_commands, process_input_with_commands_streaming};
 use crate::auth_store::AuthStore;
+#[cfg(test)]
+use crate::commands::slash::CommandHost;
 use crate::commands::slash::{
-    apply_thinking_budget, client_only_command_message, config_reload_success_message,
-    execute_command, init_default_config, is_command_input, parse_command, persist_default_model,
-    reload_runtime_config, render_budget_text, render_debug_dump, render_loop_status,
-    render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
+    apply_thinking_budget, is_command_input, persist_default_model, ImproveFlags,
     DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
 use crate::context::load_context_files;
+#[cfg(test)]
+use crate::helpers::render_model_menu_text;
 use crate::helpers::{
-    available_provider_names, fetch_shared_available_models, format_memory_for_prompt, read_router,
-    render_model_menu_text, render_status_text, resolve_model_alias,
-    thinking_config_for_active_model, trim_history, write_router, AnalysisCompletionProvider,
-    RouterLoopLlmProvider, SharedModelRouter,
+    format_memory_for_prompt, read_router, resolve_model_alias, trim_history, write_router,
+    AnalysisCompletionProvider, RouterLoopLlmProvider, SharedModelRouter,
 };
-use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
+use crate::proposal_review::ReviewContext;
 use crate::startup::{
     build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
     configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,

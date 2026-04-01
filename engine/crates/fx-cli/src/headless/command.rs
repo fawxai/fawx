@@ -1,4 +1,22 @@
-use super::*;
+use super::{
+    configured_data_dir, current_time_ms, fawx_data_dir, handle_headless_auth_command,
+    handle_headless_keys_command, handle_headless_synthesis_command, headless_config_json,
+    headless_config_path, headless_review_context, render_headless_config,
+    sync_headless_model_from_config, CycleResult, HeadlessApp, ResultKind,
+};
+use crate::commands::slash::{
+    client_only_command_message, config_reload_success_message, execute_command,
+    init_default_config, parse_command, reload_runtime_config, render_budget_text,
+    render_debug_dump, render_loop_status, render_signals_summary, CommandContext, CommandHost,
+    ParsedCommand,
+};
+use crate::helpers::{
+    available_provider_names, fetch_shared_available_models, read_router, render_model_menu_text,
+    render_status_text, thinking_config_for_active_model,
+};
+use crate::proposal_review::{approve_pending, reject_pending, render_pending};
+use fx_kernel::act::TokenUsage;
+use fx_llm::ModelInfo;
 
 pub(super) type HeadlessCommand = ParsedCommand;
 

@@ -3,11 +3,19 @@ use fx_canary::{CanaryConfig, RipcordTrigger, RollbackTrigger};
 use fx_consensus::ProgressCallback;
 use std::ffi::OsString;
 
+/// Request payload for embedded-mode headless startup.
+///
+/// Embedded callers inherit the host process working directory and do not
+/// perform detached-lane workspace-root rebinding.
 pub struct EmbeddedHeadlessAppRequest {
     pub system_prompt: Option<PathBuf>,
     pub experiment_progress: Option<ProgressCallback>,
 }
 
+/// Request payload for CLI/server headless startup.
+///
+/// Server-mode startup binds the workspace root to the built checkout so
+/// detached clean-bisect lanes execute against the tested repo.
 pub struct HeadlessStartupRequest {
     pub system_prompt: Option<PathBuf>,
     pub skip_session_db: bool,
@@ -40,6 +48,20 @@ struct HeadlessAppBuildConfig {
     experiment_progress: Option<ProgressCallback>,
     #[cfg(feature = "http")]
     experiment_registry: Option<fx_api::SharedExperimentRegistry>,
+}
+
+struct PreparedHeadlessStartup {
+    build_config: HeadlessAppBuildConfig,
+    logging_guard: WorkerGuard,
+    #[cfg(feature = "http")]
+    http_config: fx_config::HttpConfig,
+    #[cfg(feature = "http")]
+    telegram_config: fx_config::TelegramChannelConfig,
+    #[cfg(feature = "http")]
+    webhook_config: fx_config::WebhookConfig,
+    #[cfg(feature = "http")]
+    data_dir: PathBuf,
+    improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
 }
 
 pub fn build_embedded_headless_app(
@@ -75,49 +97,8 @@ pub fn build_embedded_headless_app(
 
 pub fn build_headless_startup(request: HeadlessStartupRequest) -> anyhow::Result<HeadlessStartup> {
     touch_embedded_startup_symbols();
-    let mut config = crate::startup::load_config()?;
-    crate::startup::bind_headless_workspace_root(&mut config);
-    let logging_guard = init_serve_logging(&config)?;
-    let auth_manager = crate::startup::load_auth_manager()?;
-    let router = build_seeded_router(&auth_manager, &config)?;
-    #[cfg(feature = "http")]
-    let http_config = config.http.clone();
-    #[cfg(feature = "http")]
-    let telegram_config = config.telegram.clone();
-    #[cfg(feature = "http")]
-    let webhook_config = config.webhook.clone();
-    let data_dir = crate::startup::fawx_data_dir();
-    let config_manager = Some(build_config_manager(&config));
-    let improvement_provider = crate::startup::build_improvement_provider(&auth_manager, &config);
-    let improvement_provider_for_channels = improvement_provider.clone();
-    #[cfg(feature = "http")]
-    let experiment_registry = build_experiment_registry(&request, &data_dir, &config)?;
-    let build_config = HeadlessAppBuildConfig {
-        router,
-        config,
-        improvement_provider,
-        system_prompt: request.system_prompt,
-        config_manager,
-        data_dir: data_dir.clone(),
-        skip_session_db: request.skip_session_db,
-        experiment_progress: None,
-        #[cfg(feature = "http")]
-        experiment_registry,
-    };
-    let app = build_headless_app(build_config)?;
-    Ok(HeadlessStartup {
-        app,
-        _logging_guard: logging_guard,
-        #[cfg(feature = "http")]
-        http_config,
-        #[cfg(feature = "http")]
-        telegram_config,
-        #[cfg(feature = "http")]
-        webhook_config,
-        #[cfg(feature = "http")]
-        data_dir,
-        improvement_provider: improvement_provider_for_channels,
-    })
+    let prepared = prepare_headless_startup(request)?;
+    build_headless_startup_inner(prepared)
 }
 
 pub fn prepare_embedded_config(mut config: FawxConfig) -> FawxConfig {
@@ -127,7 +108,7 @@ pub fn prepare_embedded_config(mut config: FawxConfig) -> FawxConfig {
     config
 }
 
-pub fn resolve_ripcord_path_with(
+pub(crate) fn resolve_ripcord_path_with(
     current_exe_candidate: Option<PathBuf>,
     data_dir: &Path,
     path_env: Option<OsString>,
@@ -141,7 +122,7 @@ pub fn resolve_ripcord_path_with(
         .find(|path| path.is_file())
 }
 
-pub fn ripcord_binary_name() -> &'static str {
+pub(crate) fn ripcord_binary_name() -> &'static str {
     #[cfg(windows)]
     {
         "fawx-ripcord.exe"
@@ -170,6 +151,86 @@ fn build_config_manager(config: &FawxConfig) -> Arc<Mutex<ConfigManager>> {
     let config_path = data_dir.join("config.toml");
     let manager = ConfigManager::from_config(config.clone(), config_path);
     Arc::new(Mutex::new(manager))
+}
+
+fn prepare_headless_startup(
+    request: HeadlessStartupRequest,
+) -> anyhow::Result<PreparedHeadlessStartup> {
+    let mut config = crate::startup::load_config()?;
+    crate::startup::bind_headless_workspace_root(&mut config);
+    let logging_guard = init_serve_logging(&config)?;
+    let auth_manager = crate::startup::load_auth_manager()?;
+    let router = build_seeded_router(&auth_manager, &config)?;
+    let data_dir = crate::startup::fawx_data_dir();
+    let improvement_provider = crate::startup::build_improvement_provider(&auth_manager, &config);
+    #[cfg(feature = "http")]
+    let http_config = config.http.clone();
+    #[cfg(feature = "http")]
+    let telegram_config = config.telegram.clone();
+    #[cfg(feature = "http")]
+    let webhook_config = config.webhook.clone();
+    Ok(PreparedHeadlessStartup {
+        build_config: build_headless_startup_config(
+            request,
+            router,
+            config,
+            data_dir.clone(),
+            improvement_provider.clone(),
+        )?,
+        logging_guard,
+        #[cfg(feature = "http")]
+        http_config,
+        #[cfg(feature = "http")]
+        telegram_config,
+        #[cfg(feature = "http")]
+        webhook_config,
+        #[cfg(feature = "http")]
+        data_dir,
+        improvement_provider,
+    })
+}
+
+fn build_headless_startup_config(
+    request: HeadlessStartupRequest,
+    router: SharedModelRouter,
+    config: FawxConfig,
+    data_dir: PathBuf,
+    improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
+) -> anyhow::Result<HeadlessAppBuildConfig> {
+    let config_manager = Some(build_config_manager(&config));
+    #[cfg(feature = "http")]
+    let experiment_registry = build_experiment_registry(&request, &data_dir, &config)?;
+    Ok(HeadlessAppBuildConfig {
+        router,
+        config,
+        improvement_provider,
+        system_prompt: request.system_prompt,
+        config_manager,
+        data_dir,
+        skip_session_db: request.skip_session_db,
+        experiment_progress: None,
+        #[cfg(feature = "http")]
+        experiment_registry,
+    })
+}
+
+fn build_headless_startup_inner(
+    prepared: PreparedHeadlessStartup,
+) -> anyhow::Result<HeadlessStartup> {
+    let app = build_headless_app(prepared.build_config)?;
+    Ok(HeadlessStartup {
+        app,
+        _logging_guard: prepared.logging_guard,
+        #[cfg(feature = "http")]
+        http_config: prepared.http_config,
+        #[cfg(feature = "http")]
+        telegram_config: prepared.telegram_config,
+        #[cfg(feature = "http")]
+        webhook_config: prepared.webhook_config,
+        #[cfg(feature = "http")]
+        data_dir: prepared.data_dir,
+        improvement_provider: prepared.improvement_provider,
+    })
 }
 
 fn build_headless_app(build_config: HeadlessAppBuildConfig) -> anyhow::Result<HeadlessApp> {
@@ -351,6 +412,8 @@ fn build_experiment_registry(
 }
 
 fn touch_embedded_startup_symbols() {
+    // Prevent LTO dead-code elimination of embedded-only startup entry points
+    // when the binary target only references the server-mode path directly.
     let _ = build_embedded_headless_app
         as fn(EmbeddedHeadlessAppRequest) -> anyhow::Result<HeadlessApp>;
     let _ = prepare_embedded_config as fn(FawxConfig) -> FawxConfig;
