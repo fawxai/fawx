@@ -5,10 +5,8 @@ use crate::act::{
     TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
 };
 use crate::budget::{
-    build_skip_mask, effective_max_depth, estimate_complexity, truncate_tool_result, ActionCost,
-    AllocationMode, AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState,
-    BudgetTracker, DepthMode, TerminationConfig, DEFAULT_LLM_CALL_COST_CENTS,
-    DEFAULT_TOOL_INVOCATION_COST_CENTS,
+    build_skip_mask, estimate_complexity, truncate_tool_result, ActionCost, AllocationPlan,
+    BudgetConfig, BudgetRemaining, BudgetState, BudgetTracker, TerminationConfig,
 };
 use crate::cancellation::CancellationToken;
 use crate::channels::ChannelRegistry;
@@ -60,6 +58,7 @@ use fx_decompose::SubGoalContract;
 mod bounded_local;
 mod compaction;
 mod continuation;
+mod decomposition;
 mod direct_inspection;
 mod direct_utility;
 mod progress;
@@ -74,6 +73,10 @@ use self::compaction::{compacted_context_summary, CompactionScope};
 use self::compaction::{
     has_compaction_marker, has_conversation_summary_marker, has_emergency_compaction_marker,
     marker_message_index, session_memory_message_index, summary_message_index,
+};
+use self::decomposition::{
+    aggregate_sub_goal_results, decomposition_results_all_skipped, estimate_plan_cost,
+    is_decomposition_results_message, parse_decomposition_plan,
 };
 use self::request::{
     build_continuation_request, build_forced_synthesis_request, build_reasoning_messages,
@@ -100,6 +103,8 @@ use self::streaming::{
 
 #[cfg(test)]
 use crate::act::ProceedUnderConstraints;
+#[cfg(test)]
+use crate::budget::{AllocationMode, BudgetAllocator, DepthMode};
 #[cfg(test)]
 use bounded_local::detect_turn_execution_profile;
 use bounded_local::{
@@ -2811,56 +2816,6 @@ impl LoopEngine {
         }
     }
 
-    async fn execute_decomposition(
-        &mut self,
-        decision: &Decision,
-        plan: &DecompositionPlan,
-        llm: &dyn LlmProvider,
-        context_messages: &[Message],
-    ) -> Result<ActionResult, LoopError> {
-        if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(decision, "decomposition", &[]));
-        }
-
-        let timestamp_ms = current_time_ms();
-        let remaining = self.budget.remaining(timestamp_ms);
-        let effective_cap = self.effective_decomposition_depth_cap(&remaining);
-        if self.decomposition_depth_limited(effective_cap) {
-            return Ok(self.depth_limited_decomposition_result(decision));
-        }
-
-        if let Some(original_sub_goals) = plan.truncated_from {
-            self.emit_decomposition_truncation_signal(original_sub_goals, plan.sub_goals.len());
-        }
-
-        let allocation = self.prepare_allocation_plan(plan, timestamp_ms, effective_cap);
-        let results = self
-            .execute_allocated_sub_goals(plan, &allocation, llm, context_messages)
-            .await;
-        let aggregate = aggregate_sub_goal_results(&results);
-
-        Ok(ActionResult {
-            decision: decision.clone(),
-            tool_results: Vec::new(),
-            response_text: aggregate.clone(),
-            tokens_used: TokenUsage::default(),
-            next_step: ActionNextStep::Continue(ActionContinuation::new(None, Some(aggregate))),
-        })
-    }
-
-    fn prepare_allocation_plan(
-        &self,
-        plan: &DecompositionPlan,
-        timestamp_ms: u64,
-        effective_cap: u32,
-    ) -> AllocationPlan {
-        let allocator = BudgetAllocator::new();
-        let mode = allocation_mode_for_strategy(&plan.strategy);
-        let mut allocation = allocator.allocate(&self.budget, &plan.sub_goals, mode, timestamp_ms);
-        self.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
-        allocation
-    }
-
     async fn execute_allocated_sub_goals(
         &mut self,
         plan: &DecompositionPlan,
@@ -3543,59 +3498,6 @@ impl LoopEngine {
         }
 
         SubGoalCompletionCheck::Valid
-    }
-
-    fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
-        self.budget.depth() >= effective_cap
-    }
-
-    fn effective_decomposition_depth_cap(&self, remaining: &BudgetRemaining) -> u32 {
-        let config = self.budget.config();
-        match config.decompose_depth_mode {
-            DepthMode::Static => config.max_recursion_depth,
-            DepthMode::Adaptive => config
-                .max_recursion_depth
-                .min(effective_max_depth(remaining)),
-        }
-    }
-
-    fn apply_effective_depth_cap(&self, sub_goal_budgets: &mut [BudgetConfig], effective_cap: u32) {
-        for budget in sub_goal_budgets {
-            budget.max_recursion_depth = budget.max_recursion_depth.min(effective_cap);
-        }
-    }
-
-    fn zero_sub_goal_budget(&self) -> BudgetConfig {
-        let template = self.budget.config();
-        BudgetConfig {
-            max_llm_calls: 0,
-            max_tool_invocations: 0,
-            max_tokens: 0,
-            max_cost_cents: 0,
-            max_wall_time_ms: 0,
-            max_recursion_depth: template.max_recursion_depth,
-            decompose_depth_mode: template.decompose_depth_mode,
-            soft_ceiling_percent: template.soft_ceiling_percent,
-            max_fan_out: template.max_fan_out,
-            max_tool_result_bytes: template.max_tool_result_bytes,
-            max_aggregate_result_bytes: template.max_aggregate_result_bytes,
-            max_synthesis_tokens: template.max_synthesis_tokens,
-            max_consecutive_failures: template.max_consecutive_failures,
-            max_cycle_failures: template.max_cycle_failures,
-            max_no_progress: template.max_no_progress,
-            max_tool_retries: template.max_tool_retries,
-            termination: template.termination.clone(),
-        }
-    }
-
-    fn depth_limited_decomposition_result(&mut self, decision: &Decision) -> ActionResult {
-        self.emit_signal(
-            LoopStep::Act,
-            SignalKind::Blocked,
-            "task decomposition blocked by recursion depth",
-            serde_json::json!({"reason": "max recursion depth reached"}),
-        );
-        self.text_action_result(decision, DECOMPOSITION_DEPTH_LIMIT_RESPONSE)
     }
 
     fn emit_sub_goal_progress(&mut self, index: usize, total: usize, description: &str) {
@@ -5312,58 +5214,6 @@ fn merge_sub_goal_signals(
     result
 }
 
-fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
-    if results.is_empty() {
-        return "Task decomposition contained no sub-goals.".to_string();
-    }
-
-    let mut lines = Vec::with_capacity(results.len() + 1);
-    lines.push(DECOMPOSITION_RESULTS_PREFIX.to_string());
-    for (index, result) in results.iter().enumerate() {
-        lines.push(format_sub_goal_line(index + 1, result));
-    }
-    lines.join("\n")
-}
-
-fn is_decomposition_results_message(text: &str) -> bool {
-    text.trim_start().starts_with(DECOMPOSITION_RESULTS_PREFIX)
-}
-
-fn decomposition_results_all_skipped(text: &str) -> bool {
-    is_decomposition_results_message(text)
-        && text
-            .lines()
-            .skip(1)
-            .all(|line| line.contains("=> skipped (below floor)"))
-}
-
-fn format_sub_goal_line(index: usize, result: &SubGoalResult) -> String {
-    format!(
-        "{index}. {} => {}",
-        result.goal.description,
-        format_sub_goal_outcome(&result.outcome)
-    )
-}
-
-fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
-    match outcome {
-        SubGoalOutcome::Completed(response) => format!("completed: {response}"),
-        SubGoalOutcome::Incomplete(message) => format!("incomplete: {message}"),
-        SubGoalOutcome::Failed(message) => format!("failed: {message}"),
-        SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| {
-                format!(
-                    "budget exhausted after partial: {}",
-                    truncate_prompt_text(text, 240)
-                )
-            })
-            .unwrap_or_else(|| "budget exhausted".to_string()),
-        SubGoalOutcome::Skipped => "skipped (below floor)".to_string(),
-    }
-}
-
 fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
     match &result.outcome {
         SubGoalOutcome::BudgetExhausted { partial_response } => partial_response
@@ -5374,96 +5224,10 @@ fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
     }
 }
 
-fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMode {
-    match strategy {
-        AggregationStrategy::Sequential => AllocationMode::Sequential,
-        AggregationStrategy::Parallel => AllocationMode::Concurrent,
-        AggregationStrategy::Custom(s) => {
-            unreachable!("custom strategy '{s}' should be rejected during parsing")
-        }
-    }
-}
-
 fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
     tool_calls
         .iter()
         .find(|call| call.name == DECOMPOSE_TOOL_NAME)
-}
-
-fn parse_decomposition_plan(arguments: &serde_json::Value) -> Result<DecompositionPlan, LoopError> {
-    let parsed = parse_decompose_arguments(arguments)?;
-    if let Some(strategy) = &parsed.strategy {
-        if matches!(strategy, AggregationStrategy::Custom(_)) {
-            return Err(loop_error(
-                "decide",
-                &format!("unsupported decomposition strategy: {strategy:?}"),
-                false,
-            ));
-        }
-    }
-
-    if parsed.sub_goals.is_empty() {
-        return Err(loop_error(
-            "decide",
-            "decompose tool requires at least one sub_goal",
-            false,
-        ));
-    }
-
-    let mut sub_goals: Vec<SubGoal> = parsed.sub_goals.into_iter().map(SubGoal::from).collect();
-    let truncated_from = if sub_goals.len() > MAX_SUB_GOALS {
-        let original_sub_goals = sub_goals.len();
-        sub_goals.truncate(MAX_SUB_GOALS);
-        Some(original_sub_goals)
-    } else {
-        None
-    };
-
-    Ok(DecompositionPlan {
-        sub_goals,
-        strategy: parsed.strategy.unwrap_or(AggregationStrategy::Sequential),
-        truncated_from,
-    })
-}
-
-fn parse_decompose_arguments(
-    arguments: &serde_json::Value,
-) -> Result<DecomposeToolArguments, LoopError> {
-    serde_json::from_value(arguments.clone()).map_err(|error| {
-        loop_error(
-            "decide",
-            &format!("invalid decompose tool arguments: {error}"),
-            false,
-        )
-    })
-}
-
-/// Estimate the budget cost of executing a decomposition plan.
-///
-/// Uses `estimate_complexity()` to derive per-sub-goal weights, then maps
-/// weights to estimated LLM calls and tool invocations using the default
-/// cost constants from the budget module.
-fn estimate_plan_cost(plan: &DecompositionPlan) -> ActionCost {
-    plan.sub_goals
-        .iter()
-        .fold(ActionCost::default(), |mut acc, sub_goal| {
-            let hint = sub_goal
-                .complexity_hint
-                .unwrap_or_else(|| estimate_complexity(sub_goal));
-            let llm_calls: u32 = match hint {
-                ComplexityHint::Trivial => 1,
-                ComplexityHint::Moderate => 2,
-                ComplexityHint::Complex => 4,
-            };
-            let tool_invocations = sub_goal.required_tools.len() as u32;
-            acc.llm_calls = acc.llm_calls.saturating_add(llm_calls);
-            acc.tool_invocations = acc.tool_invocations.saturating_add(tool_invocations);
-            acc.cost_cents = acc.cost_cents.saturating_add(
-                u64::from(llm_calls) * DEFAULT_LLM_CALL_COST_CENTS
-                    + u64::from(tool_invocations) * DEFAULT_TOOL_INVOCATION_COST_CENTS,
-            );
-            acc
-        })
 }
 
 fn decision_variant(decision: &Decision) -> &'static str {
@@ -12950,21 +12714,6 @@ mod decomposition_tests {
         assert_eq!(drop_signal.metadata["dropped_count"], serde_json::json!(1));
     }
 
-    #[test]
-    fn parse_decomposition_plan_truncates_sub_goals_to_maximum() {
-        let sub_goals = (0..8)
-            .map(|index| serde_json::json!({"description": format!("goal-{index}")}))
-            .collect::<Vec<_>>();
-        let arguments = serde_json::json!({"sub_goals": sub_goals});
-
-        let plan = parse_decomposition_plan(&arguments).expect("plan should parse");
-
-        assert_eq!(plan.sub_goals.len(), MAX_SUB_GOALS);
-        assert_eq!(plan.sub_goals[0].description, "goal-0");
-        assert_eq!(plan.sub_goals[MAX_SUB_GOALS - 1].description, "goal-4");
-        assert_eq!(plan.truncated_from, Some(8));
-    }
-
     #[tokio::test]
     async fn decide_rejects_empty_sub_goals() {
         let mut engine = decomposition_engine(budget_config(10, 6), 0);
@@ -13485,28 +13234,6 @@ mod decomposition_tests {
 
         assert_eq!(execution.budget.depth(), 1);
         assert_eq!(execution.budget.config().max_recursion_depth, effective_cap);
-    }
-
-    #[test]
-    fn format_sub_goal_outcome_includes_skipped_variant() {
-        assert_eq!(
-            format_sub_goal_outcome(&SubGoalOutcome::Skipped),
-            "skipped (below floor)"
-        );
-    }
-
-    #[test]
-    fn format_sub_goal_outcome_includes_budget_exhausted_partial_response() {
-        let outcome = SubGoalOutcome::BudgetExhausted {
-            partial_response: Some(
-                "I have enough from the search results to write a comprehensive spec.".to_string(),
-            ),
-        };
-
-        assert_eq!(
-            format_sub_goal_outcome(&outcome),
-            "budget exhausted after partial: I have enough from the search results to write a comprehensive spec."
-        );
     }
 
     #[test]
@@ -21906,43 +21633,6 @@ mod decompose_gate_tests {
     }
 
     // --- estimate_plan_cost unit tests ---
-
-    #[test]
-    fn estimate_plan_cost_trivial_no_tools() {
-        let p = plan(vec![sub_goal("a", &[], Some(ComplexityHint::Trivial))]);
-        let cost = estimate_plan_cost(&p);
-        // 1 LLM call * 2 cents + 0 tools = 2 cents
-        assert_eq!(cost.llm_calls, 1);
-        assert_eq!(cost.tool_invocations, 0);
-        assert_eq!(cost.cost_cents, 2);
-    }
-
-    #[test]
-    fn estimate_plan_cost_complex_with_tools() {
-        let p = plan(vec![sub_goal(
-            "task",
-            &["t1", "t2"],
-            Some(ComplexityHint::Complex),
-        )]);
-        let cost = estimate_plan_cost(&p);
-        // 4 LLM calls * 2 cents + 2 tools * 1 cent = 10 cents
-        assert_eq!(cost.llm_calls, 4);
-        assert_eq!(cost.tool_invocations, 2);
-        assert_eq!(cost.cost_cents, 10);
-    }
-
-    #[test]
-    fn estimate_plan_cost_accumulates_across_sub_goals() {
-        let p = plan(vec![
-            sub_goal("a", &["t1"], Some(ComplexityHint::Trivial)),
-            sub_goal("b", &["t1", "t2"], Some(ComplexityHint::Moderate)),
-        ]);
-        let cost = estimate_plan_cost(&p);
-        // Trivial: 1*2 + 1*1 = 3. Moderate: 2*2 + 2*1 = 6. Total = 9.
-        assert_eq!(cost.llm_calls, 3);
-        assert_eq!(cost.tool_invocations, 3);
-        assert_eq!(cost.cost_cents, 9);
-    }
 }
 
 /// Security boundary tests: kernel/loadable isolation (spec #1102).
