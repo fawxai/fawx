@@ -1727,6 +1727,35 @@ pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+pub(crate) fn bind_headless_workspace_root(config: &mut FawxConfig) {
+    let current_dir = std::env::current_dir().ok();
+    let current_exe = std::env::current_exe().ok();
+    bind_headless_workspace_root_with(config, current_dir.as_deref(), current_exe.as_deref());
+}
+
+fn bind_headless_workspace_root_with(
+    config: &mut FawxConfig,
+    current_dir: Option<&Path>,
+    current_exe: Option<&Path>,
+) {
+    let working_dir = resolve_headless_workspace_root(config, current_dir, current_exe);
+    config.tools.working_dir = Some(working_dir.clone());
+    config.workspace.root = Some(working_dir);
+}
+
+fn resolve_headless_workspace_root(
+    config: &FawxConfig,
+    current_dir: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> PathBuf {
+    current_dir
+        .zip(current_exe)
+        .and_then(|(current_dir, current_exe)| {
+            crate::repo_root::resolve_repo_root(current_dir, current_exe).ok()
+        })
+        .unwrap_or_else(|| configured_working_dir(config))
+}
+
 /// User-facing TUI errors.
 #[derive(Debug)]
 pub enum StartupError {
@@ -2097,6 +2126,53 @@ mod tests {
         (config, temp_dir)
     }
 
+    fn write_headless_repo_markers(path: &Path) {
+        std::fs::create_dir_all(path.join("engine/crates/fx-cli")).expect("crate dir");
+        std::fs::write(path.join("Cargo.toml"), "[workspace]\n").expect("workspace file");
+        std::fs::write(
+            path.join("engine/crates/fx-cli/Cargo.toml"),
+            "[package]\nname = \"fx-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate manifest");
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {:?} should succeed", args);
+    }
+
+    fn init_committed_repo(path: &Path, readme: &str) {
+        write_headless_repo_markers(path);
+        run_git(path, &["init"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        std::fs::write(path.join("README.md"), readme).expect("README");
+        run_git(path, &["add", "."]);
+        run_git(path, &["commit", "-m", "init"]);
+    }
+
+    async fn execute_tool(
+        bundle: &LoopEngineBundle,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> fx_kernel::act::ToolResult {
+        let call = fx_llm::ToolCall {
+            id: format!("call-{name}"),
+            name: name.to_string(),
+            arguments,
+        };
+        let results = bundle
+            .tool_executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("tool execution");
+        results.into_iter().next().expect("tool result")
+    }
+
     fn registry_has_skill(bundle: &LoopEngineBundle, name: &str) -> bool {
         bundle
             .skill_registry
@@ -2139,6 +2215,81 @@ mod tests {
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn bind_headless_workspace_root_prefers_detected_repo_root() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = detached_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+
+        write_headless_repo_markers(&detached_repo);
+        std::fs::write(detached_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, Some(&current_dir), Some(&current_exe));
+
+        assert_eq!(config.tools.working_dir, Some(detached_repo.clone()));
+        assert_eq!(config.workspace.root, Some(detached_repo));
+    }
+
+    #[tokio::test]
+    async fn headless_bundle_binds_read_write_and_git_status_to_detected_repo_root() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = detached_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let detached_readme = detached_repo.join("README.md");
+        let main_readme = main_checkout.join("README.md");
+
+        init_committed_repo(&detached_repo, "detached checkout\n");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::write(&main_readme, "main checkout\n").expect("main README");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout.clone());
+
+        bind_headless_workspace_root_with(&mut config, Some(&current_dir), Some(&current_exe));
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+
+        let read = execute_tool(
+            &bundle,
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        )
+        .await;
+        assert!(read.success, "{}", read.output);
+        assert!(read.output.contains("detached checkout"), "{}", read.output);
+        assert!(!read.output.contains("main checkout"), "{}", read.output);
+
+        let write = execute_tool(
+            &bundle,
+            "write_file",
+            serde_json::json!({"path": "README.md", "content": "updated detached\n"}),
+        )
+        .await;
+        assert!(write.success, "{}", write.output);
+        assert_eq!(
+            std::fs::read_to_string(&detached_readme).expect("detached README"),
+            "updated detached\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&main_readme).expect("main README"),
+            "main checkout\n"
+        );
+
+        let status = execute_tool(&bundle, "git_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        assert!(status.output.contains("README.md"), "{}", status.output);
     }
 
     #[test]

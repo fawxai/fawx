@@ -36,7 +36,6 @@ mod fleet_command {
 }
 #[path = "commands/marketplace.rs"]
 pub(crate) mod marketplace_commands;
-#[cfg(test)]
 #[allow(dead_code)]
 mod repo_root;
 #[cfg(test)]
