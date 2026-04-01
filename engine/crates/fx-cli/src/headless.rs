@@ -38,7 +38,8 @@ use fx_llm::{
 };
 use fx_memory::SignalStore;
 use fx_session::{
-    MessageRole as SessionRecordRole, SessionContentBlock, SessionKey, SessionMessage,
+    prune_unresolved_tool_history, MessageRole as SessionRecordRole, SessionContentBlock,
+    SessionKey, SessionMessage,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -538,7 +539,7 @@ impl SessionTurnCollector {
 
         messages.extend(assistant_messages);
 
-        messages
+        prune_unresolved_tool_history(&messages)
     }
 
     fn observe(&self, event: &StreamEvent) {
@@ -3818,6 +3819,78 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ReplaySafeCaptureProvider {
+        captured: Arc<std::sync::Mutex<Vec<fx_llm::CompletionRequest>>>,
+    }
+
+    impl ReplaySafeCaptureProvider {
+        fn capture_request(
+            &self,
+            request: &fx_llm::CompletionRequest,
+        ) -> Result<(), fx_llm::ProviderError> {
+            if request_replays_tool_use(request, "call_orphan") {
+                return Err(fx_llm::ProviderError::Provider(
+                    "No tool output found for function call fc_orphan".to_string(),
+                ));
+            }
+
+            self.captured
+                .lock()
+                .expect("capture lock")
+                .push(request.clone());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ReplaySafeCaptureProvider {
+        async fn complete(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            self.capture_request(&request)?;
+            Ok(mock_completion_response())
+        }
+
+        async fn complete_stream(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            self.capture_request(&request)?;
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(mock_completion_text()),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            "replay-safe-capture"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec!["replay-safe-model".to_string()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    fn request_replays_tool_use(request: &fx_llm::CompletionRequest, id: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, fx_llm::ContentBlock::ToolUse { id: block_id, .. } if block_id == id))
+        })
+    }
+
     fn mock_completion_response() -> fx_llm::CompletionResponse {
         fx_llm::CompletionResponse {
             content: vec![fx_llm::ContentBlock::Text {
@@ -3856,6 +3929,52 @@ mod tests {
             arguments_delta: arguments_delta.map(ToString::to_string),
             arguments_done,
         }
+    }
+
+    fn seed_resolved_and_orphaned_tool_history(
+        collector: &SessionTurnCollector,
+        resolved_name: &str,
+    ) {
+        record_tool_use_response(
+            collector,
+            "call_resolved",
+            "fc_resolved",
+            resolved_name,
+            serde_json::json!({"path": "README.md"}),
+        );
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_resolved".to_string(),
+            tool_name: resolved_name.to_string(),
+            output: "patched".to_string(),
+            is_error: false,
+        });
+        record_tool_use_response(
+            collector,
+            "call_orphan",
+            "fc_orphan",
+            "git_status",
+            serde_json::json!({}),
+        );
+    }
+
+    fn record_tool_use_response(
+        collector: &SessionTurnCollector,
+        id: &str,
+        provider_id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) {
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id: Some(provider_id.to_string()),
+                name: name.to_string(),
+                input,
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
     }
 
     #[test]
@@ -4069,19 +4188,16 @@ mod tests {
             20,
         );
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
-        assert!(
-            messages[1]
-                .content
-                .iter()
-                .all(|block| { !matches!(block, SessionContentBlock::Text { .. }) }),
-            "reconstructed tool turns should not persist assistant narration text"
-        );
-        assert!(messages[1].content.iter().any(|block| matches!(
-            block,
-            SessionContentBlock::ToolUse { id, name, .. } if id == "call_legacy" && name == "search"
-        )));
+        assert_eq!(messages[1].render_text(), "Search results are ready.");
+        assert!(!messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_legacy"
+            )));
     }
 
     #[test]
@@ -4115,33 +4231,18 @@ mod tests {
             20,
         );
 
-        assert_eq!(messages.len(), 3);
-        let tool_use_blocks = messages[1]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                SessionContentBlock::ToolUse {
-                    id,
-                    provider_id,
-                    name,
-                    input,
-                } => Some((id, provider_id, name, input)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tool_use_blocks.len(), 1);
-        assert!(matches!(
-            tool_use_blocks.as_slice(),
-            [(id, Some(provider_id), name, input)]
-                if *id == "call_3"
-                    && *provider_id == "fc_3"
-                    && *name == "weather"
-                    && **input == serde_json::json!({"location": "Denver, CO"})
-        ));
+        assert_eq!(messages.len(), 2);
         assert_eq!(
-            messages[2].render_text(),
+            messages[1].render_text(),
             "Weather lookup requires executing the recorded tool call."
         );
+        assert!(!messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_3"
+            )));
     }
 
     #[test]
@@ -4354,6 +4455,94 @@ mod tests {
         assert!(
             matches!(messages.last(), Some(message) if message.render_text().contains("outside my working directory"))
         );
+    }
+
+    #[test]
+    fn session_turn_collector_drops_unresolved_tool_use_from_partial_turn_history() {
+        let collector = SessionTurnCollector::default();
+        seed_resolved_and_orphaned_tool_history(&collector, "read_file");
+
+        let messages = collector.session_messages_for_turn(
+            "Read README then make a small improvement to it.",
+            &[],
+            &[],
+            "Updated README.md but could not finish follow-up verification.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_resolved"
+                    && provider_id.as_deref() == Some("fc_resolved")
+        ));
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }]
+                if tool_use_id == "call_resolved"
+        ));
+        assert!(!messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_orphan"
+            )));
+        assert!(matches!(
+            messages.last(),
+            Some(message)
+                if message
+                    .render_text()
+                    .contains("could not finish follow-up verification")
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
+    }
+
+    #[tokio::test]
+    async fn follow_up_turn_does_not_replay_unresolved_tool_use() {
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReplaySafeCaptureProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("replay-safe-model")
+            .expect("set active replay-safe model");
+
+        let mut app = test_app();
+        app.router = shared_router(router);
+        app.active_model = "replay-safe-model".to_string();
+
+        let collector = SessionTurnCollector::default();
+        seed_resolved_and_orphaned_tool_history(&collector, "edit_file");
+
+        let session_messages = collector.session_messages_for_turn(
+            "Read README then make a small improvement to it.",
+            &[],
+            &[],
+            "Updated README.md and stopped after the applied change.",
+            10,
+            20,
+        );
+        app.record_session_turn_messages(session_messages);
+
+        app.process_message("What changed?")
+            .await
+            .expect("follow-up turn should succeed");
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+
+        assert!(request_replays_tool_use(&captured_request, "call_resolved"));
+        assert!(!request_replays_tool_use(&captured_request, "call_orphan"));
     }
 
     #[test]

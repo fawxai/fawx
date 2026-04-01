@@ -529,7 +529,8 @@ fn build_headless_startup(
     skip_session_db: bool,
     #[cfg(feature = "http")] wire_experiment_registry: bool,
 ) -> anyhow::Result<HeadlessStartup> {
-    let config = startup::load_config()?;
+    let mut config = startup::load_config()?;
+    startup::bind_headless_workspace_root(&mut config);
     let logging_guard = headless::init_serve_logging(&config)?;
     let auth_manager = startup::load_auth_manager()?;
     let mut router = startup::build_router(&auth_manager)?;

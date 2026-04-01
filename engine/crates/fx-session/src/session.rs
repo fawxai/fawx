@@ -615,6 +615,15 @@ pub fn validate_tool_message_order(messages: &[SessionMessage]) -> Result<(), Se
     validate_tool_message_order_with_seen(messages.iter().enumerate(), &mut seen_tool_uses)
 }
 
+/// Drop tool-call blocks that cannot be replayed safely on a later turn.
+pub fn prune_unresolved_tool_history(messages: &[SessionMessage]) -> Vec<SessionMessage> {
+    let mut state = ReplaySafeToolHistory::new(messages);
+    messages
+        .iter()
+        .filter_map(|message| prune_message_for_replay(message, &mut state))
+        .collect()
+}
+
 fn validate_tool_message_order_with_seen<'a>(
     messages: impl IntoIterator<Item = (usize, &'a SessionMessage)>,
     seen_tool_uses: &mut HashSet<String>,
@@ -646,6 +655,113 @@ fn validate_tool_message_order_with_seen<'a>(
     }
 
     Ok(())
+}
+
+struct ReplaySafeToolHistory {
+    remaining_tool_results: HashMap<String, usize>,
+    seen_tool_uses: HashSet<String>,
+}
+
+impl ReplaySafeToolHistory {
+    fn new(messages: &[SessionMessage]) -> Self {
+        Self {
+            remaining_tool_results: remaining_tool_result_counts(messages),
+            seen_tool_uses: HashSet::new(),
+        }
+    }
+
+    fn keep_tool_use(&mut self, tool_use_id: &str) -> bool {
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let keep = self
+            .remaining_tool_results
+            .get(trimmed)
+            .copied()
+            .unwrap_or_default()
+            > 0;
+        if keep {
+            self.seen_tool_uses.insert(trimmed.to_string());
+        }
+        keep
+    }
+
+    fn keep_tool_result(&mut self, tool_use_id: &str) -> bool {
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let keep = self.seen_tool_uses.contains(trimmed);
+        decrement_remaining_tool_result(&mut self.remaining_tool_results, trimmed);
+        keep
+    }
+}
+
+fn remaining_tool_result_counts(messages: &[SessionMessage]) -> HashMap<String, usize> {
+    let mut remaining = HashMap::new();
+    for message in messages {
+        for block in &message.content {
+            if let SessionContentBlock::ToolResult { tool_use_id, .. } = block {
+                let trimmed = tool_use_id.trim();
+                if !trimmed.is_empty() {
+                    *remaining.entry(trimmed.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    remaining
+}
+
+fn prune_message_for_replay(
+    message: &SessionMessage,
+    state: &mut ReplaySafeToolHistory,
+) -> Option<SessionMessage> {
+    let content = message
+        .content
+        .iter()
+        .filter_map(|block| prune_block_for_replay(block, state))
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then_some(SessionMessage {
+        role: message.role,
+        content,
+        timestamp: message.timestamp,
+        token_count: message.token_count,
+        input_token_count: message.input_token_count,
+        output_token_count: message.output_token_count,
+    })
+}
+
+fn prune_block_for_replay(
+    block: &SessionContentBlock,
+    state: &mut ReplaySafeToolHistory,
+) -> Option<SessionContentBlock> {
+    match block {
+        SessionContentBlock::ToolUse { id, .. } => state.keep_tool_use(id).then(|| block.clone()),
+        SessionContentBlock::ToolResult { tool_use_id, .. } => {
+            state.keep_tool_result(tool_use_id).then(|| block.clone())
+        }
+        SessionContentBlock::Text { .. }
+        | SessionContentBlock::Image { .. }
+        | SessionContentBlock::Document { .. } => Some(block.clone()),
+    }
+}
+
+fn decrement_remaining_tool_result(
+    remaining_tool_results: &mut HashMap<String, usize>,
+    tool_use_id: &str,
+) {
+    let Some(count) = remaining_tool_results.get(tool_use_id).copied() else {
+        return;
+    };
+
+    if count <= 1 {
+        remaining_tool_results.remove(tool_use_id);
+    } else {
+        remaining_tool_results.insert(tool_use_id.to_string(), count - 1);
+    }
 }
 
 #[derive(Deserialize)]
@@ -1407,6 +1523,91 @@ mod tests {
             }
         );
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn prune_unresolved_tool_history_drops_half_resolved_tool_use() {
+        let messages = vec![
+            SessionMessage::text(MessageRole::User, "update the readme", 1),
+            SessionMessage::structured(
+                MessageRole::Assistant,
+                vec![
+                    SessionContentBlock::ToolUse {
+                        id: "call_resolved".to_string(),
+                        provider_id: Some("fc_resolved".to_string()),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "README.md"}),
+                    },
+                    SessionContentBlock::ToolUse {
+                        id: "call_orphan".to_string(),
+                        provider_id: Some("fc_orphan".to_string()),
+                        name: "git_status".to_string(),
+                        input: json!({}),
+                    },
+                ],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_resolved".to_string(),
+                    content: json!("updated"),
+                    is_error: Some(false),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::text(MessageRole::Assistant, "Updated README.md.", 4),
+        ];
+
+        let pruned = prune_unresolved_tool_history(&messages);
+
+        assert_eq!(pruned.len(), 4);
+        assert!(matches!(
+            pruned[1].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_resolved"
+                    && provider_id.as_deref() == Some("fc_resolved")
+        ));
+        assert!(matches!(
+            pruned[2].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }]
+                if tool_use_id == "call_resolved"
+        ));
+        assert!(validate_tool_message_order(&pruned).is_ok());
+        assert!(!pruned
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_orphan"
+            )));
+    }
+
+    #[test]
+    fn prune_unresolved_tool_history_drops_orphaned_tool_result() {
+        let messages = vec![
+            SessionMessage::text(MessageRole::User, "what changed?", 1),
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_orphan".to_string(),
+                    content: json!("stale"),
+                    is_error: Some(false),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::text(MessageRole::Assistant, "Nothing yet.", 3),
+        ];
+
+        let pruned = prune_unresolved_tool_history(&messages);
+
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned
+            .iter()
+            .all(|message| message.role != MessageRole::Tool));
     }
 
     #[test]

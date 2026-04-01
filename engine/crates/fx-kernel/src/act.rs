@@ -4,6 +4,7 @@ use crate::authority::ToolAuthoritySurface;
 use crate::cancellation::CancellationToken;
 use crate::decide::Decision;
 use async_trait::async_trait;
+use fx_llm::Message;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -346,6 +347,9 @@ pub struct ActionContinuation {
     pub partial_response: Option<String>,
     /// Context to append before the next reasoning pass.
     pub context_message: Option<String>,
+    /// Structured context to append before the next reasoning pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_messages: Vec<Message>,
     /// Optional constraint on the next public tool surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_tool_scope: Option<ContinuationToolScope>,
@@ -363,10 +367,17 @@ impl ActionContinuation {
         Self {
             partial_response,
             context_message,
+            context_messages: Vec::new(),
             next_tool_scope: None,
             turn_commitment: None,
             artifact_write_target: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_context_messages(mut self, context_messages: Vec<Message>) -> Self {
+        self.context_messages = context_messages;
+        self
     }
 
     #[must_use]
