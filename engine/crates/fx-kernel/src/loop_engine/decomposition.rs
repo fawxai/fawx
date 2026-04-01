@@ -110,10 +110,7 @@ impl LoopEngine {
         }
     }
 
-    pub(super) fn depth_limited_decomposition_result(
-        &mut self,
-        decision: &Decision,
-    ) -> ActionResult {
+    fn depth_limited_decomposition_result(&mut self, decision: &Decision) -> ActionResult {
         self.emit_signal(
             LoopStep::Act,
             SignalKind::Blocked,
@@ -287,7 +284,13 @@ fn estimated_llm_calls(sub_goal: &SubGoal) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::act::{ToolExecutor, ToolExecutorError, ToolResult};
+    use crate::budget::{BudgetConfig, BudgetTracker};
+    use crate::cancellation::CancellationToken;
+    use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
     use fx_decompose::{SubGoalContract, SubGoalOutcome};
+    use std::sync::Arc;
 
     #[test]
     fn parse_decomposition_plan_truncates_sub_goals_to_maximum() {
@@ -373,6 +376,39 @@ mod tests {
         assert_eq!(cost.cost_cents, 9);
     }
 
+    #[test]
+    fn depth_limited_result_emits_blocked_signal() {
+        let config = BudgetConfig {
+            max_recursion_depth: 1,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_budget(config, 1);
+        let decision = Decision::Decompose(plan(vec![sub_goal("blocked", &[], None)]));
+
+        let result = engine.depth_limited_decomposition_result(&decision);
+
+        assert!(result.tool_results.is_empty());
+        let blocked = engine
+            .signals
+            .signals()
+            .iter()
+            .filter(|signal| signal.kind == SignalKind::Blocked)
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1);
+        assert!(blocked[0].message.contains("recursion depth"));
+    }
+
+    fn build_engine_with_budget(config: BudgetConfig, depth: u32) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, depth))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(1)
+            .tool_executor(Arc::new(PassiveToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
+    }
+
     fn plan(sub_goals: Vec<SubGoal>) -> DecompositionPlan {
         DecompositionPlan {
             sub_goals,
@@ -402,6 +438,20 @@ mod tests {
                 .collect(),
             completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PassiveToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for PassiveToolExecutor {
+        async fn execute_tools(
+            &self,
+            _calls: &[fx_llm::ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            Ok(Vec::new())
         }
     }
 }

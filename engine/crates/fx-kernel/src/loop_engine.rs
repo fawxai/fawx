@@ -21967,38 +21967,6 @@ mod kernel_loadable_boundary_tests {
         assert!(!engine.decomposition_depth_limited(3));
     }
 
-    #[test]
-    fn t13_depth_limited_result_emits_blocked_signal() {
-        let config = BudgetConfig {
-            max_recursion_depth: 1,
-            ..BudgetConfig::default()
-        };
-        let mut engine = build_engine_with_budget(config, 1);
-
-        let decision = Decision::Decompose(fx_decompose::DecompositionPlan {
-            sub_goals: vec![fx_decompose::SubGoal {
-                description: "malicious sub-goal".into(),
-                required_tools: vec![],
-                completion_contract: SubGoalContract::from_definition_of_done(None),
-                complexity_hint: None,
-            }],
-            strategy: fx_decompose::AggregationStrategy::Sequential,
-            truncated_from: None,
-        });
-
-        let result = engine.depth_limited_decomposition_result(&decision);
-        assert!(result.tool_results.is_empty());
-
-        let blocked: Vec<_> = engine
-            .signals
-            .signals()
-            .iter()
-            .filter(|s| s.kind == SignalKind::Blocked)
-            .collect();
-        assert_eq!(blocked.len(), 1);
-        assert!(blocked[0].message.contains("recursion depth"));
-    }
-
     // ── Regression tests for scratchpad iteration / refresh / compaction ──
 
     mod scratchpad_wiring {
