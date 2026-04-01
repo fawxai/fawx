@@ -32,9 +32,7 @@ use crate::types::{
 use async_trait::async_trait;
 #[cfg(test)]
 use futures_util::StreamExt;
-use fx_core::message::{
-    InternalMessage, ProgressKind, StreamPhase, ToolRoundCall, ToolRoundResult,
-};
+use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
 #[cfg(test)]
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
@@ -66,6 +64,7 @@ mod progress;
 mod request;
 mod retry;
 mod streaming;
+mod tool_execution;
 
 #[cfg(test)]
 use self::compaction::CompactionTier;
@@ -98,8 +97,18 @@ use self::request::{
 };
 #[cfg(test)]
 use self::retry::same_call_failure_reason;
-use self::retry::{partition_by_retry_policy, BlockedToolCall, RetryTracker};
+use self::retry::RetryTracker;
 use self::streaming::{StreamingRequestContext, TextStreamVisibility};
+use self::tool_execution::{
+    build_blocked_tool_results, build_uniform_blocked_calls, extract_tool_use_provider_ids,
+    record_tool_round_messages,
+};
+
+#[cfg(test)]
+use self::tool_execution::{
+    append_tool_round_messages, blocked_tool_message, build_tool_result_message,
+    build_tool_use_assistant_message, truncate_tool_results,
+};
 
 #[cfg(test)]
 use self::streaming::{
@@ -116,8 +125,8 @@ use bounded_local::detect_turn_execution_profile;
 use bounded_local::{
     bounded_local_phase_label, bounded_local_terminal_partial_response,
     bounded_local_terminal_reason_label, bounded_local_terminal_reason_text,
-    detect_turn_execution_profile_for_ownership, partition_by_bounded_local_phase_semantics,
-    BoundedLocalPhase, BoundedLocalTerminalReason, TurnExecutionProfile,
+    detect_turn_execution_profile_for_ownership, BoundedLocalPhase, BoundedLocalTerminalReason,
+    TurnExecutionProfile,
 };
 use continuation::{
     commitment_tool_scope, render_turn_commitment_directive,
@@ -2961,91 +2970,6 @@ impl LoopEngine {
         }
     }
 
-    fn publish_tool_calls(&self, calls: &[ToolCall], stream: CycleStream<'_>) {
-        for call in calls {
-            stream.tool_call_start(call);
-            stream.tool_call_complete(call);
-            self.publish_tool_use(call);
-        }
-    }
-
-    fn publish_tool_use(&self, call: &ToolCall) {
-        let Some(bus) = self.public_event_bus() else {
-            return;
-        };
-        let _ = bus.publish(InternalMessage::ToolUse {
-            call_id: call.id.clone(),
-            provider_id: self.tool_call_provider_ids.get(&call.id).cloned(),
-            name: call.name.clone(),
-            arguments: call.arguments.clone(),
-        });
-    }
-
-    fn publish_tool_results(&mut self, results: &[ToolResult], stream: CycleStream<'_>) {
-        for result in results {
-            stream.tool_result(result);
-            self.publish_tool_result(result);
-        }
-    }
-
-    fn publish_tool_round(
-        &mut self,
-        calls: &[ToolCall],
-        results: &[ToolResult],
-        stream: CycleStream<'_>,
-    ) {
-        self.publish_tool_calls(calls, stream);
-        self.publish_tool_results(results, stream);
-
-        let Some(bus) = self.public_event_bus() else {
-            return;
-        };
-        let _ = bus.publish(InternalMessage::ToolRound {
-            calls: calls
-                .iter()
-                .map(|call| ToolRoundCall {
-                    call_id: call.id.clone(),
-                    provider_id: self.tool_call_provider_ids.get(&call.id).cloned(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            results: results
-                .iter()
-                .map(|result| ToolRoundResult {
-                    call_id: result.tool_call_id.clone(),
-                    name: result.tool_name.clone(),
-                    success: result.success,
-                    content: result.output.clone(),
-                })
-                .collect(),
-        });
-    }
-
-    fn emit_tool_errors(&self, results: &[ToolResult], stream: CycleStream<'_>) -> bool {
-        let mut has_errors = false;
-        for result in results.iter().filter(|result| !result.success) {
-            has_errors = true;
-            stream.tool_error(&result.tool_name, &result.output);
-        }
-        has_errors
-    }
-
-    fn publish_tool_result(&mut self, result: &ToolResult) {
-        if result.success && result.tool_name == NOTIFY_TOOL_NAME {
-            self.notify_called_this_cycle = true;
-        }
-        let Some(bus) = self.public_event_bus() else {
-            return;
-        };
-        let _ = bus.publish(InternalMessage::ToolResult {
-            call_id: result.tool_call_id.clone(),
-            name: result.tool_name.clone(),
-            success: result.success,
-            content: result.output.clone(),
-        });
-    }
-
     /// Emit observability signals summarizing the action result.
     fn emit_action_observations(&mut self, action: &ActionResult) {
         let has_tool_failure = action.tool_results.iter().any(|r| !r.success);
@@ -3591,15 +3515,6 @@ impl LoopEngine {
         self.text_action_result(decision, &response)
     }
 
-    fn record_tool_execution_cost(&mut self, tool_count: usize) {
-        self.budget.record(&ActionCost {
-            llm_calls: 0,
-            tool_invocations: tool_count as u32,
-            tokens: 0,
-            cost_cents: tool_count as u64,
-        });
-    }
-
     fn record_continuation_cost(
         &mut self,
         response: &CompletionResponse,
@@ -3634,35 +3549,6 @@ impl LoopEngine {
             format!("budget soft-ceiling reached during tool round {round}, breaking loop"),
             serde_json::json!({"reason": "budget_soft_ceiling", "round": round}),
         );
-    }
-
-    fn record_successful_tool_classifications(
-        &self,
-        state: &mut ToolRoundState,
-        calls: &[ToolCall],
-        results: &[ToolResult],
-    ) {
-        for result in results.iter().filter(|result| result.success) {
-            let classification = calls
-                .iter()
-                .find(|call| call.id == result.tool_call_id)
-                .map(|call| self.tool_executor.classify_call(call))
-                .unwrap_or_else(
-                    || match self.tool_executor.cacheability(&result.tool_name) {
-                        ToolCacheability::SideEffect => ToolCallClassification::Mutation,
-                        ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
-                            ToolCallClassification::Observation
-                        }
-                    },
-                );
-            match classification {
-                ToolCallClassification::Observation => state.used_observation_tools = true,
-                ToolCallClassification::Mutation => state.used_mutation_tools = true,
-            }
-            if state.used_observation_tools && state.used_mutation_tools {
-                break;
-            }
-        }
     }
 
     async fn execute_tool_round(
@@ -3807,156 +3693,6 @@ impl LoopEngine {
         }
 
         Ok(ToolRoundOutcome::Response(response))
-    }
-
-    #[cfg(test)]
-    async fn execute_tool_calls(
-        &mut self,
-        calls: &[ToolCall],
-    ) -> Result<Vec<ToolResult>, LoopError> {
-        self.execute_tool_calls_with_stream(calls, CycleStream::disabled())
-            .await
-    }
-
-    async fn execute_tool_calls_with_stream(
-        &mut self,
-        calls: &[ToolCall],
-        stream: CycleStream<'_>,
-    ) -> Result<Vec<ToolResult>, LoopError> {
-        let retry_policy = self.budget.config().retry_policy();
-        let (retry_allowed, mut blocked) =
-            partition_by_retry_policy(calls, &self.tool_retry_tracker, &retry_policy);
-        let phase_allowed = if let (Some(allowed_names), Some(reason)) = (
-            self.turn_execution_profile_tool_names(),
-            self.turn_execution_profile_block_reason(),
-        ) {
-            let (phase_allowed, phase_blocked) =
-                partition_by_allowed_tool_names(&retry_allowed, &allowed_names, reason);
-            blocked.extend(phase_blocked);
-            phase_allowed
-        } else {
-            retry_allowed
-        };
-        let artifact_target = self
-            .pending_artifact_write_target
-            .as_deref()
-            .or(self.requested_artifact_target.as_deref());
-        let semantically_allowed = if matches!(
-            &self.turn_execution_profile,
-            TurnExecutionProfile::BoundedLocal
-        ) {
-            let (semantically_allowed, semantic_blocked) =
-                partition_by_bounded_local_phase_semantics(
-                    &phase_allowed,
-                    self.bounded_local_phase,
-                    artifact_target,
-                );
-            blocked.extend(semantic_blocked);
-            semantically_allowed
-        } else {
-            phase_allowed
-        };
-        let allowed = if self
-            .turn_execution_profile
-            .uses_standard_observation_controls()
-            && self.observation_only_call_restriction_active()
-        {
-            let (mutation_allowed, observation_blocked) = partition_by_call_classification(
-                &semantically_allowed,
-                self.tool_executor.as_ref(),
-                ToolCallClassification::Mutation,
-                OBSERVATION_ONLY_CALL_BLOCK_REASON,
-            );
-            blocked.extend(observation_blocked);
-            mutation_allowed
-        } else {
-            semantically_allowed
-        };
-
-        self.emit_blocked_tool_errors(&blocked, stream);
-        let mut results = self.execute_allowed_tool_calls(&allowed, stream).await?;
-        self.tool_retry_tracker.record_results(&allowed, &results);
-        results.extend(build_blocked_tool_results(&blocked));
-        Ok(reorder_results_by_calls(calls, results))
-    }
-
-    fn emit_blocked_tool_errors(&mut self, blocked: &[BlockedToolCall], stream: CycleStream<'_>) {
-        for blocked_call in blocked {
-            let call = &blocked_call.call;
-            let signature_failures = self.tool_retry_tracker.consecutive_failures_for(call);
-            self.emit_signal(
-                LoopStep::Act,
-                SignalKind::Blocked,
-                format!("tool '{}' blocked: {}", call.name, blocked_call.reason),
-                serde_json::json!({
-                    "tool": call.name,
-                    "reason": blocked_call.reason,
-                    "signature_failures": signature_failures,
-                    "cycle_total_failures": self.tool_retry_tracker.cycle_total_failures(),
-                }),
-            );
-            stream.emit_error(
-                ErrorCategory::ToolExecution,
-                blocked_tool_message(&call.name, &blocked_call.reason),
-                true,
-            );
-        }
-    }
-
-    async fn execute_allowed_tool_calls(
-        &mut self,
-        allowed: &[ToolCall],
-        stream: CycleStream<'_>,
-    ) -> Result<Vec<ToolResult>, LoopError> {
-        if allowed.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Pre-flight: detect malformed tool arguments from parse-failure fallback.
-        let mut malformed_results: Vec<ToolResult> = Vec::new();
-        let valid: Vec<ToolCall> = allowed
-            .iter()
-            .filter(|call| {
-                if call.arguments.get("__fawx_raw_args").is_some() {
-                    tracing::warn!(
-                        tool = %call.name,
-                        "skipping tool call with malformed arguments"
-                    );
-                    malformed_results.push(ToolResult {
-                        tool_call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        success: false,
-                        output: "Tool call failed: arguments could not be parsed as valid JSON"
-                            .into(),
-                    });
-                    false
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-
-        let max_bytes = self.budget.config().max_tool_result_bytes;
-        let executed = self
-            .tool_executor
-            .execute_tools(&valid, self.cancel_token.as_ref())
-            .await
-            .map_err(|error| {
-                stream.emit_error(
-                    ErrorCategory::ToolExecution,
-                    tool_execution_failure_message(allowed, &error.message),
-                    error.recoverable,
-                );
-                loop_error(
-                    "act",
-                    &format!("tool execution failed: {}", error.message),
-                    error.recoverable,
-                )
-            })?;
-        let mut results = truncate_tool_results(executed, max_bytes);
-        results.append(&mut malformed_results);
-        Ok(results)
     }
 
     async fn request_tool_continuation(
@@ -4497,48 +4233,6 @@ fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usiz
     }
 }
 
-fn partition_by_call_classification(
-    calls: &[ToolCall],
-    executor: &dyn ToolExecutor,
-    required: ToolCallClassification,
-    reason: &str,
-) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
-    let mut allowed = Vec::new();
-    let mut blocked = Vec::new();
-    for call in calls {
-        if executor.classify_call(call) == required {
-            allowed.push(call.clone());
-        } else {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                reason: reason.to_string(),
-            });
-        }
-    }
-    (allowed, blocked)
-}
-
-fn partition_by_allowed_tool_names(
-    calls: &[ToolCall],
-    allowed_names: &[String],
-    reason: &str,
-) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
-    let allowed_names: HashSet<&str> = allowed_names.iter().map(String::as_str).collect();
-    let mut allowed = Vec::new();
-    let mut blocked = Vec::new();
-    for call in calls {
-        if allowed_names.contains(call.name.as_str()) {
-            allowed.push(call.clone());
-        } else {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                reason: reason.to_string(),
-            });
-        }
-    }
-    (allowed, blocked)
-}
-
 fn calls_are_all_classification(
     calls: &[ToolCall],
     executor: &dyn ToolExecutor,
@@ -4548,85 +4242,6 @@ fn calls_are_all_classification(
         && calls
             .iter()
             .all(|call| executor.classify_call(call) == required)
-}
-
-fn build_uniform_blocked_calls(calls: &[ToolCall], reason: &str) -> Vec<BlockedToolCall> {
-    calls
-        .iter()
-        .cloned()
-        .map(|call| BlockedToolCall {
-            call,
-            reason: reason.to_string(),
-        })
-        .collect()
-}
-
-fn blocked_tool_message(tool_name: &str, reason: &str) -> String {
-    format!(
-        "Tool '{}' blocked: {}. Try a different approach.",
-        tool_name, reason
-    )
-}
-
-fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> String {
-    match calls {
-        [call] => format!("Tool '{}' failed: {error_message}", call.name),
-        _ => {
-            let names = calls
-                .iter()
-                .map(|call| call.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Tool batch failed for [{names}]: {error_message}")
-        }
-    }
-}
-
-/// Build synthetic failure results for blocked tool calls.
-fn build_blocked_tool_results(blocked: &[BlockedToolCall]) -> Vec<ToolResult> {
-    blocked
-        .iter()
-        .map(|blocked_call| ToolResult {
-            tool_call_id: blocked_call.call.id.clone(),
-            tool_name: blocked_call.call.name.clone(),
-            success: false,
-            output: blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
-        })
-        .collect()
-}
-
-/// Reorder results to match the original call order by tool_call_id.
-///
-/// Uses a HashMap index for O(n) lookup instead of O(n²) linear search.
-fn reorder_results_by_calls(calls: &[ToolCall], results: Vec<ToolResult>) -> Vec<ToolResult> {
-    if results.len() <= 1 {
-        return results;
-    }
-    let mut by_id: HashMap<String, ToolResult> = HashMap::with_capacity(results.len());
-    for result in results {
-        by_id.insert(result.tool_call_id.clone(), result);
-    }
-    let mut ordered = Vec::with_capacity(calls.len());
-    for call in calls {
-        if let Some(result) = by_id.remove(&call.id) {
-            ordered.push(result);
-        }
-    }
-    // Append any results that didn't match a call ID (defensive).
-    ordered.extend(by_id.into_values());
-    ordered
-}
-
-fn truncate_tool_results(results: Vec<ToolResult>, max_bytes: usize) -> Vec<ToolResult> {
-    results
-        .into_iter()
-        .map(|mut result| {
-            if result.output.len() > max_bytes {
-                result.output = truncate_tool_result(&result.output, max_bytes).into_owned();
-            }
-            result
-        })
-        .collect()
 }
 
 fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {
@@ -4685,140 +4300,6 @@ fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
         input_tokens: estimate_tokens(prompt),
         output_tokens: estimate_tokens(response),
     }
-}
-
-#[cfg(test)]
-fn append_tool_round_messages(
-    context_messages: &mut Vec<Message>,
-    calls: &[ToolCall],
-    provider_item_ids: &HashMap<String, String>,
-    results: &[ToolResult],
-) -> Result<(), LoopError> {
-    let (assistant_message, result_message) =
-        build_tool_round_messages(calls, provider_item_ids, results)?;
-    context_messages.push(assistant_message);
-    context_messages.push(result_message);
-    Ok(())
-}
-
-fn build_tool_round_messages(
-    calls: &[ToolCall],
-    provider_item_ids: &HashMap<String, String>,
-    results: &[ToolResult],
-) -> Result<(Message, Message), LoopError> {
-    let assistant_message = build_tool_use_assistant_message(calls, provider_item_ids);
-    let result_message = build_tool_result_message(calls, results)?;
-    Ok((assistant_message, result_message))
-}
-
-fn record_tool_round_messages(
-    continuation_messages: &mut Vec<Message>,
-    evidence_messages: &mut Vec<Message>,
-    calls: &[ToolCall],
-    provider_item_ids: &HashMap<String, String>,
-    results: &[ToolResult],
-) -> Result<(), LoopError> {
-    let (assistant_message, result_message) =
-        build_tool_round_messages(calls, provider_item_ids, results)?;
-    continuation_messages.push(assistant_message.clone());
-    continuation_messages.push(result_message.clone());
-    evidence_messages.push(assistant_message);
-    evidence_messages.push(result_message);
-    Ok(())
-}
-
-/// Build an assistant message containing ToolUse content blocks.
-fn build_tool_use_assistant_message(
-    calls: &[ToolCall],
-    provider_item_ids: &HashMap<String, String>,
-) -> Message {
-    let content = calls
-        .iter()
-        .map(|call| ContentBlock::ToolUse {
-            id: call.id.clone(),
-            provider_id: provider_item_ids.get(&call.id).cloned(),
-            name: call.name.clone(),
-            input: call.arguments.clone(),
-        })
-        .collect();
-    Message {
-        role: MessageRole::Assistant,
-        content,
-    }
-}
-
-fn extract_tool_use_provider_ids(content: &[ContentBlock]) -> HashMap<String, String> {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse {
-                id,
-                provider_id: Some(provider_id),
-                ..
-            } if !id.trim().is_empty() && !provider_id.trim().is_empty() => {
-                Some((id.clone(), provider_id.clone()))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Build a tool message containing ToolResult content blocks.
-///
-/// Returns an error if any result has a `tool_call_id` not found in `calls`.
-fn build_tool_result_message(
-    calls: &[ToolCall],
-    results: &[ToolResult],
-) -> Result<Message, LoopError> {
-    let call_order = calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| (call.id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let mut ordered_results = indexed_tool_results(&call_order, results)?;
-    ordered_results.sort_by_key(|(index, _)| *index);
-    let content = ordered_results
-        .into_iter()
-        .map(|(_, result)| ContentBlock::ToolResult {
-            tool_use_id: result.tool_call_id.clone(),
-            content: if result.success {
-                serde_json::Value::String(result.output.clone())
-            } else {
-                serde_json::Value::String(format!("[ERROR] {}", result.output))
-            },
-        })
-        .collect();
-    Ok(Message {
-        role: MessageRole::Tool,
-        content,
-    })
-}
-
-fn indexed_tool_results<'a>(
-    call_order: &HashMap<String, usize>,
-    results: &'a [ToolResult],
-) -> Result<Vec<(usize, &'a ToolResult)>, LoopError> {
-    results
-        .iter()
-        .map(|result| {
-            call_order
-                .get(&result.tool_call_id)
-                .copied()
-                .map(|index| (index, result))
-                .ok_or_else(|| unmatched_tool_call_id_error(result))
-        })
-        .collect()
-}
-
-fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
-    loop_error(
-        "act",
-        &format!(
-            "tool result has unmatched tool_call_id '{}' for tool '{}'",
-            result.tool_call_id, result.tool_name
-        ),
-        false,
-    )
 }
 
 fn prioritize_flow_command(current: Option<LoopCommand>, incoming: LoopCommand) -> LoopCommand {
