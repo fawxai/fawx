@@ -15,9 +15,9 @@ use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 
 use crate::conversation_compactor::{
-    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, has_prunable_blocks,
-    prune_tool_blocks, slide_summarization_plan, summary_message, CompactionConfig,
-    CompactionError, CompactionMemoryFlush, CompactionResult, ConversationBudget,
+    debug_assert_tool_pair_integrity, emergency_compact, estimate_text_tokens, generate_summary,
+    has_prunable_blocks, prune_tool_blocks, slide_summarization_plan, summary_message,
+    CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult, ConversationBudget,
     SlidingWindowCompactor,
 };
 use crate::decide::Decision;
@@ -71,9 +71,9 @@ mod streaming;
 use self::compaction::{
     build_extraction_prompt, can_summarize_eviction, compacted_context_summary,
     compaction_cooldown_active, compaction_failed_error, context_exceeded_after_compaction_error,
-    generate_eviction_summary, highest_compaction_tier, merge_summarized_follow_up,
-    parse_extraction_response, parse_summary_memory_update, summarized_compaction_result,
-    CompactionScope, CompactionTier, FinishTierContext,
+    highest_compaction_tier, merge_summarized_follow_up, parse_extraction_response,
+    parse_summary_memory_update, summarized_compaction_result, CompactionScope, CompactionTier,
+    FinishTierContext,
 };
 #[cfg(test)]
 use self::compaction::{
@@ -4081,7 +4081,7 @@ impl LoopEngine {
                 .ok_or_else(|| CompactionError::SummarizationFailed {
                     source: Box::new(std::io::Error::other("no compaction LLM")),
                 })?;
-        generate_eviction_summary(
+        generate_summary(
             llm.as_ref(),
             messages,
             self.compaction_config.max_summary_tokens,
@@ -6946,7 +6946,7 @@ fn summarize_tool_progress(results: &[ToolResult]) -> Option<String> {
     Some(parts.join(". "))
 }
 
-fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
+pub(super) fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
     LoopError {
         stage: stage.to_string(),
         reason: reason.to_string(),

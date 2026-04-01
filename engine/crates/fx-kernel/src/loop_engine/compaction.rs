@@ -1,7 +1,7 @@
-use super::{truncate_prompt_text, LlmProvider};
+use super::{loop_error, truncate_prompt_text};
 use crate::conversation_compactor::{
-    assemble_summarized_messages, generate_summary, CompactionConfig, CompactionError,
-    CompactionResult, ConversationBudget, SlideSummarizationPlan,
+    assemble_summarized_messages, CompactionConfig, CompactionError, CompactionResult,
+    ConversationBudget, SlideSummarizationPlan,
 };
 use crate::types::{LoopError, ReasoningContext};
 use fx_llm::{ContentBlock, Message, MessageRole};
@@ -87,14 +87,6 @@ pub(super) fn can_summarize_eviction(
     has_compaction_llm: bool,
 ) -> bool {
     compaction_config.use_summarization && has_compaction_llm
-}
-
-pub(super) async fn generate_eviction_summary(
-    llm: &dyn LlmProvider,
-    messages: &[Message],
-    max_summary_tokens: usize,
-) -> Result<String, CompactionError> {
-    generate_summary(llm, messages, max_summary_tokens).await
 }
 
 pub(super) fn summarized_compaction_result(
@@ -215,7 +207,7 @@ pub(super) fn parse_extraction_response(response: &str) -> Option<SessionMemoryU
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
-    (end > start).then_some(&text[start..=end])
+    Some(&text[start..=end])
 }
 
 #[derive(Clone, Copy)]
@@ -335,11 +327,11 @@ fn has_memory_update_fields(update: &SessionMemoryUpdate) -> bool {
 }
 
 pub(super) fn compaction_failed_error(scope: CompactionScope, error: CompactionError) -> LoopError {
-    LoopError {
-        stage: "compaction".to_string(),
-        reason: format!("compaction_failed: scope={scope} error={error}"),
-        recoverable: true,
-    }
+    loop_error(
+        "compaction",
+        &format!("compaction_failed: scope={scope} error={error}"),
+        true,
+    )
 }
 
 pub(super) fn context_exceeded_after_compaction_error(
@@ -347,13 +339,13 @@ pub(super) fn context_exceeded_after_compaction_error(
     estimated_tokens: usize,
     hard_limit_tokens: usize,
 ) -> LoopError {
-    LoopError {
-        stage: "compaction".to_string(),
-        reason: format!(
+    loop_error(
+        "compaction",
+        &format!(
             "context_exceeded_after_compaction: scope={scope} estimated_tokens={estimated_tokens} hard_limit_tokens={hard_limit_tokens}",
         ),
-        recoverable: true,
-    }
+        true,
+    )
 }
 
 pub(super) fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
