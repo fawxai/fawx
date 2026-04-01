@@ -1419,6 +1419,7 @@ struct ToolRoundState {
     all_tool_results: Vec<ToolResult>,
     current_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
+    evidence_messages: Vec<Message>,
     accumulated_text: Vec<String>,
     tokens_used: TokenUsage,
     observation_replan_attempted: bool,
@@ -1432,6 +1433,7 @@ impl ToolRoundState {
             all_tool_results: Vec::new(),
             current_calls: calls.to_vec(),
             continuation_messages: context_messages.to_vec(),
+            evidence_messages: Vec::new(),
             accumulated_text: initial_text.into_iter().collect(),
             tokens_used: TokenUsage::default(),
             observation_replan_attempted: false,
@@ -1439,6 +1441,14 @@ impl ToolRoundState {
             used_mutation_tools: false,
         }
     }
+}
+
+struct ToolContinuationPayload {
+    response_text: String,
+    response: String,
+    tokens_used: TokenUsage,
+    next_tool_scope: Option<ContinuationToolScope>,
+    context_messages: Vec<Message>,
 }
 
 #[derive(Debug)]
@@ -2076,11 +2086,7 @@ impl LoopEngine {
             // every tool call/result message, because act_with_tools may
             // have run multiple inner rounds with different call IDs that
             // don't map 1:1 to the original Decision::UseTools calls.
-            if let Some(context_message) = continuation.context_message {
-                processed
-                    .context_window
-                    .push(Message::assistant(context_message));
-            }
+            append_continuation_context(&mut processed.context_window, &continuation);
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
             if let Some(result) = self.budget_terminal(reason_cost, action_partial.clone()) {
@@ -3990,9 +3996,7 @@ impl LoopEngine {
                 }
 
                 let mut follow_up_messages = continuation_messages.to_vec();
-                if let Some(context_message) = continuation.context_message {
-                    follow_up_messages.push(Message::assistant(context_message));
-                }
+                append_continuation_context(&mut follow_up_messages, &continuation);
                 match self
                     .execute_bounded_sub_goal_follow_up_round(
                         child,
@@ -4068,6 +4072,7 @@ impl LoopEngine {
                 FollowUpRoundResult::Continue(ActionContinuation {
                     partial_response: continuation.partial_response.or(action_partial),
                     context_message: continuation.context_message,
+                    context_messages: continuation.context_messages,
                     next_tool_scope: continuation.next_tool_scope,
                     turn_commitment: continuation.turn_commitment,
                     artifact_write_target: continuation.artifact_write_target,
@@ -5809,8 +5814,9 @@ impl LoopEngine {
             );
             self.emit_blocked_tool_errors(&blocked, stream);
             let blocked_results = build_blocked_tool_results(&blocked);
-            append_tool_round_messages(
+            record_tool_round_messages(
                 &mut state.continuation_messages,
+                &mut state.evidence_messages,
                 &state.current_calls,
                 &self.tool_call_provider_ids,
                 &blocked_results,
@@ -5852,8 +5858,9 @@ impl LoopEngine {
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
         self.budget.record_result_bytes(round_result_bytes);
 
-        append_tool_round_messages(
+        record_tool_round_messages(
             &mut state.continuation_messages,
+            &mut state.evidence_messages,
             &executed_calls,
             &self.tool_call_provider_ids,
             &results,
@@ -6144,13 +6151,22 @@ impl LoopEngine {
         if current_round_text.is_some() {
             let response = meaningful_response_text(&response_text)
                 .expect("stitched response should be meaningful when the current round has text");
+            let ToolRoundState {
+                all_tool_results,
+                evidence_messages,
+                tokens_used,
+                ..
+            } = state;
             return Ok(self.tool_continuation_action_result(
                 decision,
-                state.all_tool_results,
-                response_text,
-                response,
-                state.tokens_used,
-                next_tool_scope,
+                all_tool_results,
+                ToolContinuationPayload {
+                    response_text,
+                    response,
+                    tokens_used,
+                    next_tool_scope,
+                    context_messages: evidence_messages,
+                },
             ));
         }
 
@@ -6184,6 +6200,7 @@ impl LoopEngine {
         let ToolRoundState {
             all_tool_results,
             accumulated_text,
+            evidence_messages,
             mut tokens_used,
             ..
         } = state;
@@ -6204,11 +6221,14 @@ impl LoopEngine {
             Some(_) => self.tool_continuation_action_result(
                 decision,
                 evicted,
-                response_text,
-                final_response
-                    .expect("stitched response should be meaningful when synthesis has text"),
-                tokens_used,
-                next_tool_scope,
+                ToolContinuationPayload {
+                    response_text,
+                    response: final_response
+                        .expect("stitched response should be meaningful when synthesis has text"),
+                    tokens_used,
+                    next_tool_scope,
+                    context_messages: evidence_messages,
+                },
             ),
             None if self
                 .turn_execution_profile
@@ -6231,17 +6251,26 @@ impl LoopEngine {
         &self,
         decision: &Decision,
         tool_results: Vec<ToolResult>,
-        response_text: String,
-        response: String,
-        tokens_used: TokenUsage,
-        next_tool_scope: Option<ContinuationToolScope>,
+        payload: ToolContinuationPayload,
     ) -> ActionResult {
+        let ToolContinuationPayload {
+            response_text,
+            response,
+            tokens_used,
+            next_tool_scope,
+            context_messages,
+        } = payload;
         let turn_commitment = tool_continuation_turn_commitment(decision, next_tool_scope.as_ref());
         let artifact_write_target = tool_continuation_artifact_write_target(
             self.requested_artifact_target.as_deref(),
             next_tool_scope.as_ref(),
         );
-        let continuation = ActionContinuation::new(Some(response.clone()), Some(response.clone()));
+        let continuation = if context_messages.is_empty() {
+            ActionContinuation::new(Some(response.clone()), Some(response.clone()))
+        } else {
+            ActionContinuation::new(Some(response.clone()), None)
+                .with_context_messages(context_messages)
+        };
         let continuation = match next_tool_scope {
             Some(scope) => continuation.with_tool_scope(scope),
             None => continuation,
@@ -7126,16 +7155,43 @@ fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
     }
 }
 
+#[cfg(test)]
 fn append_tool_round_messages(
     context_messages: &mut Vec<Message>,
     calls: &[ToolCall],
     provider_item_ids: &HashMap<String, String>,
     results: &[ToolResult],
 ) -> Result<(), LoopError> {
-    let assistant_message = build_tool_use_assistant_message(calls, provider_item_ids);
-    let result_message = build_tool_result_message(calls, results)?;
+    let (assistant_message, result_message) =
+        build_tool_round_messages(calls, provider_item_ids, results)?;
     context_messages.push(assistant_message);
     context_messages.push(result_message);
+    Ok(())
+}
+
+fn build_tool_round_messages(
+    calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
+    results: &[ToolResult],
+) -> Result<(Message, Message), LoopError> {
+    let assistant_message = build_tool_use_assistant_message(calls, provider_item_ids);
+    let result_message = build_tool_result_message(calls, results)?;
+    Ok((assistant_message, result_message))
+}
+
+fn record_tool_round_messages(
+    continuation_messages: &mut Vec<Message>,
+    evidence_messages: &mut Vec<Message>,
+    calls: &[ToolCall],
+    provider_item_ids: &HashMap<String, String>,
+    results: &[ToolResult],
+) -> Result<(), LoopError> {
+    let (assistant_message, result_message) =
+        build_tool_round_messages(calls, provider_item_ids, results)?;
+    continuation_messages.push(assistant_message.clone());
+    continuation_messages.push(result_message.clone());
+    evidence_messages.push(assistant_message);
+    evidence_messages.push(result_message);
     Ok(())
 }
 
@@ -8274,6 +8330,20 @@ fn prepend_accumulated_text_to_action(
     action
 }
 
+fn append_continuation_context(
+    context_window: &mut Vec<Message>,
+    continuation: &ActionContinuation,
+) {
+    if !continuation.context_messages.is_empty() {
+        context_window.extend(continuation.context_messages.clone());
+        return;
+    }
+
+    if let Some(context_message) = continuation.context_message.as_ref() {
+        context_window.push(Message::assistant(context_message.clone()));
+    }
+}
+
 fn action_partial_response(action: &ActionResult) -> Option<String> {
     match &action.next_step {
         ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
@@ -9335,16 +9405,23 @@ mod phase2_tests {
             ActionNextStep::Continue(ActionContinuation {
                 partial_response,
                 context_message,
+                context_messages,
                 ..
             }) => {
                 assert_eq!(
                     partial_response.as_deref(),
                     Some("Initial findings\n\nFinal answer")
                 );
-                assert_eq!(
-                    context_message.as_deref(),
-                    Some("Initial findings\n\nFinal answer")
-                );
+                assert_eq!(context_message, None);
+                assert!(context_messages.iter().any(|message| {
+                    message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolResult { content, .. }
+                                if content == &serde_json::json!("ok")
+                        )
+                    })
+                }));
             }
             other => panic!("expected continuation, got {other:?}"),
         }
@@ -18820,6 +18897,7 @@ mod loop_resilience_tests {
         CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
     };
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -18854,6 +18932,223 @@ mod loop_resilience_tests {
 
     #[derive(Debug, Default)]
     struct ObservationMixedToolExecutor;
+
+    #[derive(Debug)]
+    struct StatefulReadWriteExecutor {
+        readme: Arc<Mutex<String>>,
+    }
+
+    impl StatefulReadWriteExecutor {
+        fn new(readme: &str) -> Self {
+            Self {
+                readme: Arc::new(Mutex::new(readme.to_string())),
+            }
+        }
+
+        fn readme_contents(&self) -> String {
+            self.readme.lock().expect("readme lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StatefulReadWriteExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            let mut readme = self.readme.lock().expect("readme lock");
+            Ok(calls
+                .iter()
+                .map(|call| {
+                    let success = true;
+                    let output = match call.name.as_str() {
+                        "read_file" => readme.clone(),
+                        "write_file" => {
+                            let content = call
+                                .arguments
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .expect("write_file content")
+                                .to_string();
+                            *readme = content;
+                            "wrote README.md".to_string()
+                        }
+                        other => format!("unsupported tool: {other}"),
+                    };
+                    ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success,
+                        output,
+                    }
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            ]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "write_file" => crate::act::ToolCacheability::SideEffect,
+                "read_file" => crate::act::ToolCacheability::Cacheable,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadEvidenceLlm {
+        call_count: AtomicUsize,
+        expected_tool_text: String,
+    }
+
+    impl ReadEvidenceLlm {
+        fn new(expected_tool_text: &str) -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                expected_tool_text: expected_tool_text.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ReadEvidenceLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "read-evidence"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(match index {
+                0 => tool_use_response(vec![ToolCall {
+                    id: "read-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }]),
+                1 => text_response("README summary that omits the real final line"),
+                2 => {
+                    if request_contains_tool_result_text(&request, &self.expected_tool_text) {
+                        text_response("ACTUAL FINAL LINE")
+                    } else {
+                        text_response("WRONG SYNTHETIC FINAL LINE")
+                    }
+                }
+                other => {
+                    return Err(ProviderError::Provider(format!(
+                        "unexpected completion call {other}"
+                    )))
+                }
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct AppendEvidenceLlm {
+        call_count: AtomicUsize,
+        baseline_readme: String,
+        verification_line: String,
+    }
+
+    impl AppendEvidenceLlm {
+        fn new(baseline_readme: &str, verification_line: &str) -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                baseline_readme: baseline_readme.to_string(),
+                verification_line: verification_line.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for AppendEvidenceLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "append-evidence"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(match index {
+                0 => tool_use_response(vec![ToolCall {
+                    id: "read-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }]),
+                1 => text_response("README summary only"),
+                2 => {
+                    let rewritten = format!("README summary only\n{}", self.verification_line);
+                    let appended = format!("{}\n{}", self.baseline_readme, self.verification_line);
+                    let content =
+                        if request_contains_tool_result_text(&request, &self.baseline_readme) {
+                            appended
+                        } else {
+                            rewritten
+                        };
+                    tool_use_response(vec![ToolCall {
+                        id: "write-1".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: serde_json::json!({
+                            "path":"README.md",
+                            "content": content,
+                        }),
+                    }])
+                }
+                3 | 4 => text_response("Appended the verification line."),
+                other => {
+                    return Err(ProviderError::Provider(format!(
+                        "unexpected completion call {other}"
+                    )))
+                }
+            })
+        }
+    }
 
     #[async_trait]
     impl ToolExecutor for ObservationMixedToolExecutor {
@@ -19425,6 +19720,17 @@ mod loop_resilience_tests {
             .expect("build")
     }
 
+    fn stateful_mixed_tool_engine(tool_executor: Arc<dyn ToolExecutor>) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(5)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
     fn run_command_observation_engine(config: BudgetConfig) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(config, 0, 0))
@@ -19510,6 +19816,24 @@ mod loop_resilience_tests {
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
             steer_context: None,
+        }
+    }
+
+    fn request_contains_tool_result_text(request: &CompletionRequest, needle: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    content.as_str().is_some_and(|text| text.contains(needle))
+                }
+                _ => false,
+            })
+        })
+    }
+
+    fn complete_response(result: LoopResult) -> String {
+        match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
         }
     }
 
@@ -20197,6 +20521,52 @@ mod loop_resilience_tests {
             }
             other => panic!("expected continuation, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_follow_up_uses_structured_tool_evidence_for_root_reasoning() {
+        let baseline = "README intro\nACTUAL FINAL LINE";
+        let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
+        let mut engine = stateful_mixed_tool_engine(executor.clone());
+        let llm = ReadEvidenceLlm::new(baseline);
+
+        let result = engine
+            .run_cycle(
+                test_snapshot("Read README.md again and tell me the current final line."),
+                &llm,
+            )
+            .await
+            .expect("run_cycle");
+
+        let response = complete_response(result);
+        assert_eq!(response, "ACTUAL FINAL LINE");
+        assert_eq!(executor.readme_contents(), baseline);
+    }
+
+    #[tokio::test]
+    async fn append_follow_up_uses_actual_file_body_instead_of_summary_rewrite() {
+        let baseline = "README intro\nACTUAL FINAL LINE";
+        let verification = "[verification] appended in place";
+        let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
+        let mut engine = stateful_mixed_tool_engine(executor.clone());
+        let llm = AppendEvidenceLlm::new(baseline, verification);
+
+        let result = engine
+            .run_cycle(
+                test_snapshot(
+                    "Read README.md, append one clearly marked verification line to it, then tell me exactly what changed.",
+                ),
+                &llm,
+            )
+            .await
+            .expect("run_cycle");
+
+        let response = complete_response(result);
+        assert_eq!(response, "Appended the verification line.");
+        assert_eq!(
+            executor.readme_contents(),
+            format!("{baseline}\n{verification}")
+        );
     }
 
     #[tokio::test]

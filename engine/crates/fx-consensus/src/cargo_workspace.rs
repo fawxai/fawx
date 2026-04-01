@@ -83,13 +83,8 @@ impl CargoWorkspace {
     }
 
     async fn run_cargo(&self, subcommand: &str) -> crate::Result<String> {
-        let mut cmd = Command::new("cargo");
-        cmd.arg(subcommand);
-        if let Some(pkg) = &self.package {
-            cmd.args(["-p", pkg]);
-        }
+        let mut cmd = async_cargo_command(&self.project_dir, self.package.as_deref(), subcommand);
         let output = cmd
-            .current_dir(&self.project_dir)
             .output()
             .await
             .map_err(|error| ConsensusError::WorkspaceError(error.to_string()))?;
@@ -198,13 +193,8 @@ fn validate_workspace_dir(project_dir: &Path) -> crate::Result<()> {
 }
 
 fn collect_baseline_tests(project_dir: &Path, package: Option<&str>) -> crate::Result<TestResult> {
-    let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("test");
-    if let Some(pkg) = package {
-        cmd.args(["-p", pkg]);
-    }
+    let mut cmd = blocking_cargo_command(project_dir, package, "test");
     let output = cmd
-        .current_dir(project_dir)
         .output()
         .map_err(|error| ConsensusError::WorkspaceError(error.to_string()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -217,6 +207,36 @@ fn collect_baseline_tests(project_dir: &Path, package: Option<&str>) -> crate::R
         Err(ConsensusError::WorkspaceError(format!(
             "failed to collect baseline tests: {combined}"
         )))
+    }
+}
+
+fn async_cargo_command(project_dir: &Path, package: Option<&str>, subcommand: &str) -> Command {
+    let mut cmd = Command::new("cargo");
+    configure_cargo_command(cmd.as_std_mut(), project_dir, package, subcommand);
+    cmd
+}
+
+fn blocking_cargo_command(
+    project_dir: &Path,
+    package: Option<&str>,
+    subcommand: &str,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new("cargo");
+    configure_cargo_command(&mut cmd, project_dir, package, subcommand);
+    cmd
+}
+
+fn configure_cargo_command(
+    cmd: &mut std::process::Command,
+    project_dir: &Path,
+    package: Option<&str>,
+    subcommand: &str,
+) {
+    cmd.arg(subcommand)
+        .current_dir(project_dir)
+        .env_remove("CARGO_TARGET_DIR");
+    if let Some(pkg) = package {
+        cmd.args(["-p", pkg]);
     }
 }
 
@@ -476,6 +496,28 @@ mod tests {
             .expect("read evaluator clone");
 
         assert_eq!(evaluator_lib, "pub fn value() -> i32 { 1 }\n");
+    }
+
+    #[test]
+    fn cargo_commands_remove_inherited_target_dir() {
+        let async_command = async_cargo_command(Path::new("/tmp/project"), None, "test");
+        let blocking_command = blocking_cargo_command(Path::new("/tmp/project"), None, "test");
+        let async_removed = async_command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "CARGO_TARGET_DIR" && value.is_none());
+        let blocking_removed = blocking_command
+            .get_envs()
+            .any(|(key, value)| key == "CARGO_TARGET_DIR" && value.is_none());
+
+        assert!(
+            async_removed,
+            "async cargo commands must ignore shared target dirs"
+        );
+        assert!(
+            blocking_removed,
+            "blocking cargo commands must ignore shared target dirs"
+        );
     }
 
     #[test]
