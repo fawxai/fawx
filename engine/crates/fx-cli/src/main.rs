@@ -471,6 +471,7 @@ fn build_headless_startup(
     })
 }
 
+#[cfg(test)]
 fn resolve_ripcord_path_with(
     current_exe_candidate: Option<PathBuf>,
     data_dir: &Path,
@@ -479,6 +480,7 @@ fn resolve_ripcord_path_with(
     headless::startup::resolve_ripcord_path_with(current_exe_candidate, data_dir, path_env)
 }
 
+#[cfg(test)]
 fn ripcord_binary_name() -> &'static str {
     headless::startup::ripcord_binary_name()
 }

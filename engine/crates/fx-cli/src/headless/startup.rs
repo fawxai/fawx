@@ -224,7 +224,9 @@ fn build_loop_bundle(
     session_bus: Option<SessionBus>,
     credential_store: Option<crate::startup::SharedCredentialStore>,
 ) -> anyhow::Result<crate::startup::LoopEngineBundle> {
+    let working_dir = crate::startup::configured_working_dir(&build_config.config);
     let options = HeadlessLoopBuildOptions {
+        working_dir: Some(working_dir),
         session_registry: session_registry(&build_config.data_dir, build_config.skip_session_db),
         credential_store: credential_store.clone(),
         #[cfg(feature = "http")]

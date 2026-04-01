@@ -1727,33 +1727,55 @@ pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+struct HeadlessWorkspaceRootCandidates<'a> {
+    current_dir: Option<&'a Path>,
+    current_exe: Option<&'a Path>,
+    build_manifest_dir: Option<&'a Path>,
+}
+
 pub(crate) fn bind_headless_workspace_root(config: &mut FawxConfig) {
     let current_dir = std::env::current_dir().ok();
     let current_exe = std::env::current_exe().ok();
-    bind_headless_workspace_root_with(config, current_dir.as_deref(), current_exe.as_deref());
+    let build_manifest_dir = option_env!("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let candidates = HeadlessWorkspaceRootCandidates {
+        current_dir: current_dir.as_deref(),
+        current_exe: current_exe.as_deref(),
+        build_manifest_dir: build_manifest_dir.as_deref(),
+    };
+    bind_headless_workspace_root_with(config, candidates);
 }
 
 fn bind_headless_workspace_root_with(
     config: &mut FawxConfig,
-    current_dir: Option<&Path>,
-    current_exe: Option<&Path>,
+    candidates: HeadlessWorkspaceRootCandidates<'_>,
 ) {
-    let working_dir = resolve_headless_workspace_root(config, current_dir, current_exe);
+    let working_dir = resolve_headless_workspace_root(config, candidates);
     config.tools.working_dir = Some(working_dir.clone());
     config.workspace.root = Some(working_dir);
 }
 
 fn resolve_headless_workspace_root(
     config: &FawxConfig,
+    candidates: HeadlessWorkspaceRootCandidates<'_>,
+) -> PathBuf {
+    resolve_build_repo_root(candidates.build_manifest_dir)
+        .or_else(|| resolve_runtime_repo_root(candidates.current_dir, candidates.current_exe))
+        .unwrap_or_else(|| configured_working_dir(config))
+}
+
+fn resolve_build_repo_root(build_manifest_dir: Option<&Path>) -> Option<PathBuf> {
+    build_manifest_dir.and_then(crate::repo_root::find_repo_root)
+}
+
+fn resolve_runtime_repo_root(
     current_dir: Option<&Path>,
     current_exe: Option<&Path>,
-) -> PathBuf {
+) -> Option<PathBuf> {
     current_dir
         .zip(current_exe)
         .and_then(|(current_dir, current_exe)| {
             crate::repo_root::resolve_repo_root(current_dir, current_exe).ok()
         })
-        .unwrap_or_else(|| configured_working_dir(config))
 }
 
 /// User-facing TUI errors.
@@ -2224,6 +2246,11 @@ mod tests {
         let main_checkout = temp_dir.path().join("main-checkout");
         let current_dir = detached_repo.join("engine/crates");
         let current_exe = temp_dir.path().join("bin/fawx");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: None,
+        };
 
         write_headless_repo_markers(&detached_repo);
         std::fs::write(detached_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
@@ -2232,7 +2259,37 @@ mod tests {
         std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
         config.tools.working_dir = Some(main_checkout);
 
-        bind_headless_workspace_root_with(&mut config, Some(&current_dir), Some(&current_exe));
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        assert_eq!(config.tools.working_dir, Some(detached_repo.clone()));
+        assert_eq!(config.workspace.root, Some(detached_repo));
+    }
+
+    #[test]
+    fn bind_headless_workspace_root_prefers_built_repo_root_over_ambient_repo() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let ambient_repo = temp_dir.path().join("ambient-repo");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = ambient_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let build_manifest_dir = detached_repo.join("engine/crates/fx-cli");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: Some(&build_manifest_dir),
+        };
+
+        write_headless_repo_markers(&detached_repo);
+        std::fs::write(detached_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        write_headless_repo_markers(&ambient_repo);
+        std::fs::write(ambient_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, candidates);
 
         assert_eq!(config.tools.working_dir, Some(detached_repo.clone()));
         assert_eq!(config.workspace.root, Some(detached_repo));
@@ -2247,6 +2304,11 @@ mod tests {
         let current_exe = temp_dir.path().join("bin/fawx");
         let detached_readme = detached_repo.join("README.md");
         let main_readme = main_checkout.join("README.md");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: None,
+        };
 
         init_committed_repo(&detached_repo, "detached checkout\n");
         std::fs::create_dir_all(&main_checkout).expect("main checkout");
@@ -2255,7 +2317,7 @@ mod tests {
         std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
         config.tools.working_dir = Some(main_checkout.clone());
 
-        bind_headless_workspace_root_with(&mut config, Some(&current_dir), Some(&current_exe));
+        bind_headless_workspace_root_with(&mut config, candidates);
 
         let bundle =
             build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
@@ -2290,6 +2352,57 @@ mod tests {
         let status = execute_tool(&bundle, "git_status", serde_json::json!({})).await;
         assert!(status.success, "{}", status.output);
         assert!(status.output.contains("README.md"), "{}", status.output);
+    }
+
+    #[tokio::test]
+    async fn headless_bundle_binds_run_command_to_built_repo_root_over_ambient_repo() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let ambient_repo = temp_dir.path().join("ambient-repo");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = ambient_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let build_manifest_dir = detached_repo.join("engine/crates/fx-cli");
+        let detached_marker = detached_repo.join("step12-marker.txt");
+        let ambient_marker = ambient_repo.join("step12-marker.txt");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: Some(&build_manifest_dir),
+        };
+
+        init_committed_repo(&detached_repo, "detached checkout\n");
+        init_committed_repo(&ambient_repo, "ambient checkout\n");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+
+        let run = execute_tool(
+            &bundle,
+            "run_command",
+            serde_json::json!({"command": "touch step12-marker.txt"}),
+        )
+        .await;
+        assert!(run.success, "{}", run.output);
+        assert!(detached_marker.exists(), "detached marker should exist");
+        assert!(
+            !ambient_marker.exists(),
+            "ambient marker should stay absent"
+        );
+
+        let status = execute_tool(&bundle, "git_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        assert!(
+            status.output.contains("step12-marker.txt"),
+            "{}",
+            status.output
+        );
     }
 
     #[test]
