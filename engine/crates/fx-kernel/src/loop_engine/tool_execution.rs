@@ -9,16 +9,18 @@ use super::request::{
 use super::retry::{partition_by_retry_policy, BlockedToolCall};
 use super::streaming::{StreamingRequestContext, TextStreamVisibility};
 use super::{
-    continuation_budget_cost, current_time_ms, find_decompose_tool_call, loop_error,
-    response_text_segment, stitch_response_segments, stitched_response_text,
-    summarize_tool_progress, tool_error_relay_directive, CycleStream, FollowUpDecomposeContext,
-    LlmProvider, LoopEngine, ToolRoundState, NOTIFY_TOOL_NAME, OBSERVATION_ONLY_CALL_BLOCK_REASON,
+    continuation_budget_cost, current_time_ms, estimate_text_tokens, estimate_tokens,
+    find_decompose_tool_call, loop_error, meaningful_response_text, response_text_segment,
+    stitch_response_segments, stitched_response_text, summarize_tool_progress,
+    tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
+    tool_error_relay_directive, CycleStream, FollowUpDecomposeContext, LlmProvider, LoopEngine,
+    ToolRoundState, NOTIFY_TOOL_NAME, OBSERVATION_ONLY_CALL_BLOCK_REASON,
     OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE, OBSERVATION_ONLY_TOOL_ROUND_NUDGE,
     TOOL_ROUND_PROGRESS_NUDGE,
 };
 use crate::act::{
-    ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope, ToolCacheability,
-    ToolCallClassification, ToolExecutor, ToolResult,
+    ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
+    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
 };
 use crate::budget::{truncate_tool_result, ActionCost, BudgetState};
 use crate::decide::Decision;
@@ -29,6 +31,11 @@ use fx_core::message::{InternalMessage, StreamPhase, ToolRoundCall, ToolRoundRes
 use fx_llm::{CompletionResponse, ContentBlock, Message, MessageRole, ToolCall, ToolDefinition};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+pub(super) const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 1024;
+const DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE: &str =
+    "Inspection completed but produced no summary.";
 
 struct PreparedToolCalls {
     allowed: Vec<ToolCall>,
@@ -88,6 +95,14 @@ struct ToolRoundContinuationRequest<'a> {
     calls_count: usize,
     started_at_ms: u64,
     stream: CycleStream<'a>,
+}
+
+struct ToolContinuationPayload {
+    response_text: String,
+    response: String,
+    tokens_used: TokenUsage,
+    next_tool_scope: Option<ContinuationToolScope>,
+    context_messages: Vec<Message>,
 }
 
 impl LoopEngine {
@@ -689,6 +704,312 @@ impl LoopEngine {
         let next_tool_scope = self.continuation_tool_scope_for_round(&state);
         self.synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
             .await
+    }
+
+    async fn finalize_tool_response(
+        &mut self,
+        decision: &Decision,
+        state: ToolRoundState,
+        response: &CompletionResponse,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+        next_tool_scope: Option<ContinuationToolScope>,
+    ) -> Result<ActionResult, LoopError> {
+        let current_round_text = response_text_segment(response);
+        let response_text =
+            stitch_response_segments(&state.accumulated_text, current_round_text.clone());
+        self.emit_empty_tool_response_signal_if_needed(&response_text, &state);
+        if current_round_text.is_some() {
+            return Ok(self.tool_continuation_action(
+                decision,
+                state,
+                response_text,
+                next_tool_scope,
+            ));
+        }
+        if self.turn_execution_profile.allows_synthesis_fallback() {
+            return self
+                .synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
+                .await;
+        }
+        Ok(self.incomplete_tool_continuation_action(decision, state))
+    }
+
+    fn emit_empty_tool_response_signal_if_needed(
+        &mut self,
+        response_text: &str,
+        state: &ToolRoundState,
+    ) {
+        if !response_text.is_empty() {
+            return;
+        }
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "tool continuation returned empty text",
+            serde_json::json!({
+                "tool_count": state.all_tool_results.len(),
+            }),
+        );
+    }
+
+    fn tool_continuation_action(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+        response_text: String,
+        next_tool_scope: Option<ContinuationToolScope>,
+    ) -> ActionResult {
+        let response = meaningful_response_text(&response_text)
+            .expect("stitched response should be meaningful when the current round has text");
+        let ToolRoundState {
+            all_tool_results,
+            evidence_messages,
+            tokens_used,
+            ..
+        } = state;
+        self.tool_continuation_action_result(
+            decision,
+            all_tool_results,
+            ToolContinuationPayload {
+                response_text,
+                response,
+                tokens_used,
+                next_tool_scope,
+                context_messages: evidence_messages,
+            },
+        )
+    }
+
+    fn incomplete_tool_continuation_action(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+    ) -> ActionResult {
+        let tool_summary = stitched_response_text(
+            &state.accumulated_text,
+            summarize_tool_progress(&state.all_tool_results),
+        );
+        self.incomplete_action_result(
+            decision,
+            state.all_tool_results,
+            tool_summary,
+            "tool continuation did not produce a usable final response",
+            state.tokens_used,
+        )
+    }
+
+    async fn synthesize_tool_fallback(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+        next_tool_scope: Option<ContinuationToolScope>,
+    ) -> Result<ActionResult, LoopError> {
+        let ToolRoundState {
+            all_tool_results,
+            accumulated_text,
+            evidence_messages,
+            mut tokens_used,
+            ..
+        } = state;
+        let max_tokens = self.budget.config().max_synthesis_tokens;
+        let evicted = evict_oldest_results(all_tool_results, max_tokens);
+        let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
+        stream.phase(Phase::Synthesize);
+        let llm_text = self
+            .generate_tool_summary(&synthesis_prompt, llm, stream, TextStreamVisibility::Hidden)
+            .await?;
+        tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
+        let synthesized_text = meaningful_response_text(&llm_text);
+        let response_text = stitch_response_segments(&accumulated_text, synthesized_text.clone());
+        let final_response = meaningful_response_text(&response_text);
+        let tool_summary =
+            stitched_response_text(&accumulated_text, summarize_tool_progress(&evicted));
+        Ok(match synthesized_text {
+            Some(_) => self.tool_continuation_action_result(
+                decision,
+                evicted,
+                ToolContinuationPayload {
+                    response_text,
+                    response: final_response
+                        .expect("stitched response should be meaningful when synthesis has text"),
+                    tokens_used,
+                    next_tool_scope,
+                    context_messages: evidence_messages,
+                },
+            ),
+            None if self
+                .turn_execution_profile
+                .direct_inspection_profile()
+                .is_some() =>
+            {
+                self.direct_inspection_empty_summary_action_result(decision, evicted, tokens_used)
+            }
+            None => self.incomplete_action_result(
+                decision,
+                evicted,
+                tool_summary,
+                "tool synthesis did not produce a usable final response",
+                tokens_used,
+            ),
+        })
+    }
+
+    fn tool_continuation_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        payload: ToolContinuationPayload,
+    ) -> ActionResult {
+        let ToolContinuationPayload {
+            response_text,
+            response,
+            tokens_used,
+            next_tool_scope,
+            context_messages,
+        } = payload;
+        let turn_commitment = tool_continuation_turn_commitment(decision, next_tool_scope.as_ref());
+        let artifact_write_target = tool_continuation_artifact_write_target(
+            self.requested_artifact_target.as_deref(),
+            next_tool_scope.as_ref(),
+        );
+        let continuation = if context_messages.is_empty() {
+            ActionContinuation::new(Some(response.clone()), Some(response.clone()))
+        } else {
+            ActionContinuation::new(Some(response.clone()), None)
+                .with_context_messages(context_messages)
+        };
+        let continuation = match next_tool_scope {
+            Some(scope) => continuation.with_tool_scope(scope),
+            None => continuation,
+        };
+        let continuation = match artifact_write_target {
+            Some(path) => continuation.with_artifact_write_target(path),
+            None => continuation,
+        };
+        let continuation = match turn_commitment {
+            Some(commitment) => continuation.with_turn_commitment(commitment),
+            None => continuation,
+        };
+        if self.turn_execution_profile.completes_terminally() {
+            return ActionResult {
+                decision: decision.clone(),
+                tool_results,
+                response_text,
+                tokens_used,
+                next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+            };
+        }
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text,
+            tokens_used,
+            next_step: ActionNextStep::Continue(continuation),
+        }
+    }
+
+    fn direct_inspection_empty_summary_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        let response = DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE.to_string();
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: response.clone(),
+            tokens_used,
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+        }
+    }
+
+    fn incomplete_action_result(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        partial_response: Option<String>,
+        reason: &str,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: String::new(),
+            tokens_used,
+            next_step: ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response,
+                reason: reason.to_string(),
+            }),
+        }
+    }
+
+    fn bounded_local_terminal_action_result(
+        &mut self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        partial_response: Option<String>,
+        tokens_used: TokenUsage,
+        reason: BoundedLocalTerminalReason,
+    ) -> ActionResult {
+        let reason_text = super::bounded_local_terminal_reason_text(reason);
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            reason_text,
+            serde_json::json!({
+                "profile": "bounded_local",
+                "terminal_reason": super::bounded_local_terminal_reason_label(reason),
+            }),
+        );
+        self.incomplete_action_result(
+            decision,
+            tool_results,
+            partial_response,
+            reason_text,
+            tokens_used,
+        )
+    }
+
+    pub(super) async fn generate_tool_summary(
+        &self,
+        synthesis_prompt: &str,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+        text_visibility: TextStreamVisibility,
+    ) -> Result<String, LoopError> {
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let callback_chunks = Arc::clone(&chunks);
+        let stream_callback = stream.callback.cloned();
+        let callback = Box::new(move |chunk: String| {
+            if let Ok(mut guard) = callback_chunks.lock() {
+                guard.push(chunk.clone());
+            }
+            if matches!(text_visibility, TextStreamVisibility::Public) {
+                if let Some(callback) = &stream_callback {
+                    callback(super::StreamEvent::TextDelta { text: chunk });
+                }
+            }
+        });
+        let fallback = llm
+            .generate_streaming(synthesis_prompt, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS, callback)
+            .await
+            .map_err(|error| {
+                loop_error(
+                    "act",
+                    &format!("tool synthesis generation failed: {error}"),
+                    true,
+                )
+            })?;
+        let assembled = join_streamed_chunks(&chunks)?;
+        if assembled.trim().is_empty() {
+            Ok(fallback)
+        } else {
+            Ok(assembled)
+        }
     }
 
     pub(super) fn apply_fan_out_cap(
@@ -1322,6 +1643,125 @@ pub(super) fn truncate_tool_results(results: Vec<ToolResult>, max_bytes: usize) 
             result
         })
         .collect()
+}
+
+pub(super) fn evict_oldest_results(
+    mut results: Vec<ToolResult>,
+    max_tokens: usize,
+) -> Vec<ToolResult> {
+    if results.is_empty() {
+        return results;
+    }
+    const MIN_SYNTHESIS_TOKENS: usize = 1_000;
+    let max_tokens = max_tokens.max(MIN_SYNTHESIS_TOKENS);
+    let total_tokens = estimate_results_tokens(&results);
+    if total_tokens <= max_tokens {
+        let total_bytes: usize = results.iter().map(|result| result.output.len()).sum();
+        tracing::debug!(
+            total_bytes,
+            total_tokens,
+            max_tokens,
+            result_count = results.len(),
+            "synthesis context guard: under token limit, no eviction needed"
+        );
+        return results;
+    }
+    let (evicted_count, bytes_saved) = evict_results_until_under_limit(&mut results, max_tokens);
+    if evicted_count > 0 {
+        tracing::info!(
+            evicted_count,
+            bytes_saved,
+            remaining = results.len() - evicted_count.min(results.len()),
+            "synthesis context guard: evicted oldest tool results"
+        );
+    }
+    truncate_single_oversized_result(&mut results, max_tokens);
+    results
+}
+
+fn estimate_results_tokens(results: &[ToolResult]) -> usize {
+    results
+        .iter()
+        .map(|result| estimate_text_tokens(&result.output))
+        .sum()
+}
+
+fn evict_results_until_under_limit(
+    results: &mut [ToolResult],
+    max_tokens: usize,
+) -> (usize, usize) {
+    let mut current_tokens = estimate_results_tokens(results);
+    let mut evicted_count = 0usize;
+    let mut bytes_saved = 0usize;
+    for result in results.iter_mut() {
+        if current_tokens <= max_tokens {
+            break;
+        }
+        let old_tokens = estimate_text_tokens(&result.output);
+        let stub = format!(
+            "[evicted: {} result too large for synthesis]",
+            result.tool_name
+        );
+        let stub_tokens = estimate_text_tokens(&stub);
+        bytes_saved = bytes_saved.saturating_add(result.output.len());
+        result.output = stub;
+        current_tokens = current_tokens
+            .saturating_sub(old_tokens)
+            .saturating_add(stub_tokens);
+        evicted_count = evicted_count.saturating_add(1);
+    }
+    (evicted_count, bytes_saved)
+}
+
+fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usize) {
+    let current_tokens = estimate_results_tokens(results);
+    if current_tokens <= max_tokens {
+        return;
+    }
+    if let Some(largest) = results.iter_mut().max_by_key(|result| result.output.len()) {
+        let excess_tokens = current_tokens.saturating_sub(max_tokens);
+        let excess_bytes = excess_tokens.saturating_mul(4);
+        let target_bytes = largest.output.len().saturating_sub(excess_bytes);
+        largest.output = truncate_tool_result(&largest.output, target_bytes).into_owned();
+    }
+}
+
+pub(super) fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> String {
+    let has_tool_error = tool_results.iter().any(|result| !result.success);
+    let error_relay_instruction = if has_tool_error {
+        "\nIf any tool returned an error, tell the user exactly what went wrong: include the actual error message. Do not soften, hedge, or paraphrase errors."
+    } else {
+        ""
+    };
+    let tool_summary = tool_results
+        .iter()
+        .map(|result| format!("- {}: {}", result.tool_name, result.output))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are Fawx. Never introduce yourself, greet the user, or add preamble. Answer the user's question using these tool results. \
+Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
+Just provide the answer directly. \
+If the user asked for a specific format or value type, preserve that exact format. \
+Do not convert timestamps to human-readable, counts to lists, or raw values to prose \
+unless the user explicitly asked for that.{error_relay_instruction}\n\n\
+{instruction}\n\n\
+Tool results:\n{tool_summary}"
+    )
+}
+
+fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
+    let parts = chunks
+        .lock()
+        .map_err(|_| loop_error("act", "tool synthesis stream collection failed", true))?;
+    Ok(parts.join(""))
+}
+
+fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
+    TokenUsage {
+        input_tokens: estimate_tokens(prompt),
+        output_tokens: estimate_tokens(response),
+    }
 }
 
 #[cfg(test)]
