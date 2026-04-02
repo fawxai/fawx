@@ -922,7 +922,9 @@ fn print_selected_skill_status(state: &SkillWizardState, selected: &[&SetupSkill
     }
     if !missing.is_empty() {
         println!("  ! Not yet installed: {}", missing.join(", "));
-        println!("  Run `skills/build.sh --install` to build and install skills.");
+        println!(
+            "  Run `skills/build.sh --install` from the repo to build and install the built-in skill set."
+        );
     }
 }
 

@@ -27,9 +27,9 @@ SKILL_SPECS=(
 usage() {
   cat <<'EOF'
 Usage:
-  ./skills/build.sh           Build WASM skills (debug)
-  ./skills/build.sh --release Build WASM skills (release)
-  ./skills/build.sh --install Build and install WASM skills to ~/.fawx/skills/
+  ./skills/build.sh           Build repo WASM skills (debug)
+  ./skills/build.sh --release Build repo WASM skills (release)
+  ./skills/build.sh --install Build and install repo WASM skills to ~/.fawx/skills/
 EOF
 }
 
@@ -59,11 +59,11 @@ parse_args() {
 }
 
 ensure_wasm_target() {
-  if "$RUSTUP_BIN" target list --installed | grep -qx 'wasm32-unknown-unknown'; then
+  if "$RUSTUP_BIN" target list --installed | grep -qx 'wasm32-wasip1'; then
     return
   fi
-  echo "Installing wasm32-unknown-unknown target..."
-  "$RUSTUP_BIN" target add wasm32-unknown-unknown
+  echo "Installing wasm32-wasip1 target..."
+  "$RUSTUP_BIN" target add wasm32-wasip1
 }
 
 install_skill() {
@@ -83,13 +83,13 @@ build_skill() {
   local spec="$1"
   local directory crate artifact source output
   IFS=: read -r directory crate artifact <<<"$spec"
-  source="$SCRIPT_DIR/$directory/target/wasm32-unknown-unknown/$PROFILE/$crate.wasm"
+  source="$SCRIPT_DIR/$directory/target/wasm32-wasip1/$PROFILE/$crate.wasm"
   output="$SCRIPT_DIR/$directory/$artifact"
 
   echo "Building $directory..."
   (
     cd "$SCRIPT_DIR/$directory"
-    "$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
+    "$CARGO_BIN" build --target wasm32-wasip1 -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   cp "$source" "$output"
   echo "✓ $directory built -> $directory/$artifact"

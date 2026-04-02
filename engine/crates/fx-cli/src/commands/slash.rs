@@ -479,7 +479,10 @@ pub fn help_text() -> String {
     ];
     lines.extend(crate::commands::skill_sign::slash_help_lines());
     lines.extend([
-        "  /skills         List installed skills",
+        "  /skills         Inspect local build/install state",
+        "                 Local dev: fawx skill build <project>",
+        "                 Prebuilt:  fawx skill install <path>",
+        "                 Repo skills: skills/build.sh --install",
         "  /install <name> Install a skill from the marketplace",
         "  /search [query] Search the skill marketplace",
         "  /status         Show model, tokens, budget summary",
@@ -1192,6 +1195,16 @@ mod tests {
         assert!(help.contains("/sign <skill>"));
         assert!(help.contains("/sign --all"));
         assert_eq!(help.matches("/sign ").count(), 2);
+    }
+
+    #[test]
+    fn help_text_documents_skill_workflow_split() {
+        let help = help_text();
+
+        assert!(help.contains("/skills         Inspect local build/install state"));
+        assert!(help.contains("Local dev: fawx skill build <project>"));
+        assert!(help.contains("Prebuilt:  fawx skill install <path>"));
+        assert!(help.contains("Repo skills: skills/build.sh --install"));
     }
 
     #[test]

@@ -220,26 +220,32 @@ Generate rich visual content: tables, charts, diagrams, and formatted documents.
 
 ## Building Skills
 
+Recommended workflow split:
+
+- Local dev project: `fawx skill build <project>`
+- Built-in repo skills: `./skills/build.sh --install`
+- Prebuilt artifact: `fawx skill install <path>`
+
 ### Prerequisites
-- Rust toolchain with `wasm32-unknown-unknown` target
+- Rust toolchain with `wasm32-wasip1` target
 
 ```bash
-rustup target add wasm32-unknown-unknown
+rustup target add wasm32-wasip1
 ```
 
-### Build All Skills
+### Build All Skills (from repo root)
 ```bash
-cd skills
-./build.sh
+./skills/build.sh
+./skills/build.sh --install
 ```
 
 ### Build Individual Skills
 ```bash
 cd weather-skill
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32-wasip1 --release
 ```
 
-The compiled WASM binary will be at `target/wasm32-unknown-unknown/release/weather_skill.wasm` (or `browser_skill.wasm` for the browser skill).
+The compiled WASM binary will be at `target/wasm32-wasip1/release/weather_skill.wasm` (or `browser_skill.wasm` for the browser skill).
 
 ## Installing Skills
 
@@ -322,21 +328,21 @@ extern "C" {
 }
 ```
 
-### 5. Build for WASM
-
-```bash
-cargo build --target wasm32-wasi --release
-```
-
-### 6. Create manifest.toml
+### 5. Create manifest.toml
 
 See format above.
 
-### 7. Install and test
+### 6. Build and install locally
 
 ```bash
-fawx skill install target/wasm32-wasi/release/my_skill.wasm
-fawx skill list
+fawx skill build .
+```
+
+### 7. Install a prebuilt artifact or sign later
+
+```bash
+fawx skill install target/wasm32-wasip1/release/my_skill.wasm
+fawx sign <skill>
 ```
 
 ## Host API Reference
@@ -370,7 +376,7 @@ fn host_api_v1_kv_set(
 
 ## Notes
 
-- Skills must be compiled for `wasm32-unknown-unknown` target
+- Skills should be built with the `wasm32-wasip1` target
 - Skills run in a sandboxed environment
 - Only declared capabilities are granted
 - Skills communicate via JSON input/output
