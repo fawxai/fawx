@@ -2022,6 +2022,53 @@ mod routing_and_status {
             .collect()
     }
 
+    fn listed_session<'a>(json: &'a serde_json::Value, key: &SessionKey) -> &'a serde_json::Value {
+        json["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|session| session["key"] == key.as_str())
+            .expect("session entry")
+    }
+
+    fn assert_archive_metadata(json: &serde_json::Value, archived: bool) {
+        assert_eq!(json["archived"], archived);
+        if archived {
+            assert!(json["archived_at"].as_u64().is_some());
+        } else {
+            assert!(json["archived_at"].is_null());
+        }
+    }
+
+    fn exported_message_texts(json: &serde_json::Value) -> Vec<String> {
+        json["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| {
+                message["content"][0]["text"]
+                    .as_str()
+                    .expect("message text")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    async fn expect_ok_json(app: Router, method: &str, uri: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(authed_request(method, uri))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn assert_list_membership(app: Router, uri: &str, key: &SessionKey, present: bool) {
+        let json = expect_ok_json(app, "GET", uri).await;
+        let keys = listed_session_keys(&json);
+        assert_eq!(keys.contains(&key.to_string()), present);
+    }
+
     #[tokio::test]
     async fn telemetry_consent_endpoint_returns_defaults() {
         let app = build_router(test_state(None, Vec::new()), None);
@@ -2566,6 +2613,20 @@ mod routing_and_status {
         }
     }
 
+    fn seed_export_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = seed_session(registry, key);
+        record_session_messages(
+            registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "first message"),
+                (SessionMessageRole::Assistant, "second message"),
+                (SessionMessageRole::User, "third message"),
+            ],
+        );
+        key
+    }
+
     fn poisoned_session(key: &str) -> Session {
         Session {
             key: SessionKey::new(key).expect("session key"),
@@ -2854,6 +2915,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["label"], "Primary");
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["message_count"], 0);
+        assert_archive_metadata(&json, false);
     }
 
     #[tokio::test]
@@ -2872,6 +2934,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["total"], 1);
         assert_eq!(listed_session_keys(&json), vec![active.to_string()]);
         assert!(!listed_session_keys(&json).contains(&archived.to_string()));
+        assert_archive_metadata(listed_session(&json, &active), false);
     }
 
     #[tokio::test]
@@ -2892,6 +2955,8 @@ allowed_chat_ids = [123]
         assert_eq!(json["total"], 2);
         assert!(keys.contains(&active.to_string()));
         assert!(keys.contains(&archived.to_string()));
+        assert_archive_metadata(listed_session(&json, &active), false);
+        assert_archive_metadata(listed_session(&json, &archived), true);
     }
 
     #[tokio::test]
@@ -2950,6 +3015,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["key"], key.as_str());
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["label"], "label-sess-info");
+        assert_archive_metadata(&json, false);
     }
 
     #[tokio::test]
@@ -2970,8 +3036,8 @@ allowed_chat_ids = [123]
         assert_eq!(first.status(), StatusCode::OK);
         let first_json = response_json(first).await;
         assert_eq!(first_json["key"], key.as_str());
-        assert_eq!(first_json["archived"], true);
-        assert!(first_json["archived_at"].as_u64().is_some());
+        assert_eq!(first_json["status"], "idle");
+        assert_archive_metadata(&first_json, true);
 
         let second = app
             .oneshot(authed_request(
@@ -2984,7 +3050,7 @@ allowed_chat_ids = [123]
         assert_eq!(second.status(), StatusCode::OK);
         let second_json = response_json(second).await;
         assert_eq!(second_json["key"], key.as_str());
-        assert_eq!(second_json["archived"], true);
+        assert_archive_metadata(&second_json, true);
         assert!(registry.get_info(&key).expect("session info").is_archived());
     }
 
@@ -3006,8 +3072,8 @@ allowed_chat_ids = [123]
         assert_eq!(first.status(), StatusCode::OK);
         let first_json = response_json(first).await;
         assert_eq!(first_json["key"], key.as_str());
-        assert_eq!(first_json["archived"], false);
-        assert!(first_json["archived_at"].is_null());
+        assert_eq!(first_json["status"], "idle");
+        assert_archive_metadata(&first_json, false);
 
         let second = app
             .oneshot(authed_request(
@@ -3020,7 +3086,7 @@ allowed_chat_ids = [123]
         assert_eq!(second.status(), StatusCode::OK);
         let second_json = response_json(second).await;
         assert_eq!(second_json["key"], key.as_str());
-        assert_eq!(second_json["archived"], false);
+        assert_archive_metadata(&second_json, false);
         assert!(!registry.get_info(&key).expect("session info").is_archived());
     }
 
@@ -3038,7 +3104,7 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["key"], key.as_str());
-        assert!(json["archived_at"].as_u64().is_some());
+        assert_archive_metadata(&json, true);
     }
 
     #[tokio::test]
@@ -3158,8 +3224,7 @@ allowed_chat_ids = [123]
         assert_eq!(json["key"], key.as_str());
         assert_eq!(json["session"]["kind"], "main");
         assert_eq!(json["session"]["status"], "idle");
-        assert_eq!(json["archive"]["archived"], false);
-        assert!(json["archive"]["archived_at"].is_null());
+        assert_archive_metadata(&json["archive"], false);
         assert_eq!(json["total_messages"], 2);
         assert_eq!(
             json["messages"][0]["content"][0]["text"],
@@ -3197,8 +3262,7 @@ allowed_chat_ids = [123]
         let json = response_json(response).await;
         assert_eq!(json["key"], key.as_str());
         assert_eq!(json["session"]["kind"], "main");
-        assert_eq!(json["archive"]["archived"], true);
-        assert!(json["archive"]["archived_at"].as_u64().is_some());
+        assert_archive_metadata(&json["archive"], true);
         assert_eq!(json["total_messages"], 2);
         assert_eq!(
             json["messages"][0]["content"][0]["text"],
@@ -3263,8 +3327,7 @@ allowed_chat_ids = [123]
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["archive"]["archived"], true);
-        assert!(json["archive"]["archived_at"].as_u64().is_some());
+        assert_archive_metadata(&json["archive"], true);
     }
 
     #[tokio::test]
@@ -3292,25 +3355,99 @@ allowed_chat_ids = [123]
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        let texts = json["messages"]
-            .as_array()
-            .expect("messages array")
-            .iter()
-            .map(|message| {
-                message["content"][0]["text"]
-                    .as_str()
-                    .expect("message text")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            texts,
+            exported_message_texts(&json),
             vec![
                 "first message".to_string(),
                 "second message".to_string(),
                 "third message".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn archive_export_lifecycle_restores_default_list_membership() {
+        let registry = make_session_registry();
+        let key = seed_export_session(&registry, "sess-archive-lifecycle");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        assert_list_membership(app.clone(), "/v1/sessions", &key, true).await;
+        assert_archive_metadata(
+            &expect_ok_json(app.clone(), "POST", &format!("/v1/sessions/{key}/archive")).await,
+            true,
+        );
+        assert_list_membership(app.clone(), "/v1/sessions", &key, false).await;
+        let archived_only = expect_ok_json(app.clone(), "GET", "/v1/sessions?archived=only").await;
+        assert_eq!(listed_session_keys(&archived_only), vec![key.to_string()]);
+        assert_archive_metadata(listed_session(&archived_only, &key), true);
+        let info = expect_ok_json(app.clone(), "GET", &format!("/v1/sessions/{key}")).await;
+        assert_archive_metadata(&info, true);
+        let export = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/sessions/{key}/export?format=json"),
+        )
+        .await;
+        assert_archive_metadata(&export["archive"], true);
+        assert_eq!(
+            exported_message_texts(&export),
+            vec![
+                "first message".to_string(),
+                "second message".to_string(),
+                "third message".to_string()
+            ]
+        );
+        assert_archive_metadata(
+            &expect_ok_json(
+                app.clone(),
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            )
+            .await,
+            false,
+        );
+        assert_list_membership(app, "/v1/sessions", &key, true).await;
+    }
+
+    #[tokio::test]
+    async fn clear_and_delete_stay_distinct_after_archive_round_trip() {
+        let registry = make_session_registry();
+        let clear_key = seed_export_session(&registry, "sess-clear-contract");
+        let delete_key = seed_session(&registry, "sess-delete-contract");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let archive_uri = format!("/v1/sessions/{clear_key}/archive");
+        expect_ok_json(app.clone(), "POST", &archive_uri).await;
+        expect_ok_json(app.clone(), "DELETE", &archive_uri).await;
+        let clear = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{clear_key}/clear"),
+            ))
+            .await
+            .expect("clear response");
+        assert_eq!(clear.status(), StatusCode::OK);
+        let cleared =
+            expect_ok_json(app.clone(), "GET", &format!("/v1/sessions/{clear_key}")).await;
+        assert_eq!(cleared["message_count"], 0);
+        assert_archive_metadata(&cleared, false);
+        assert_list_membership(app.clone(), "/v1/sessions", &clear_key, true).await;
+        let delete = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{delete_key}"),
+            ))
+            .await
+            .expect("delete response");
+        assert_eq!(delete.status(), StatusCode::OK);
+        assert_list_membership(app.clone(), "/v1/sessions", &delete_key, false).await;
+        let deleted = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{delete_key}")))
+            .await
+            .expect("deleted session response");
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

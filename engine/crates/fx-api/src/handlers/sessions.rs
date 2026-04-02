@@ -92,7 +92,7 @@ impl SessionExportQuery {
 
 #[derive(Debug, Serialize)]
 pub struct ListSessionsResponse {
-    pub sessions: Vec<SessionInfo>,
+    pub sessions: Vec<SessionSummaryResponse>,
     pub total: usize,
 }
 
@@ -106,9 +106,31 @@ pub struct SessionMessagesResponse {
 pub struct SessionExportResponse {
     pub key: String,
     pub session: SessionExportSessionMetadata,
-    pub archive: SessionExportArchiveMetadata,
+    pub archive: SessionArchiveMetadata,
     pub messages: Vec<SessionMessage>,
     pub total_messages: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionArchiveMetadata {
+    pub archived: bool,
+    pub archived_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionSummaryResponse {
+    pub key: String,
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub model: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    #[serde(flatten)]
+    pub archive: SessionArchiveMetadata,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,12 +146,6 @@ pub struct SessionExportSessionMetadata {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SessionExportArchiveMetadata {
-    pub archived: bool,
-    pub archived_at: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct DeleteSessionResponse {
     pub deleted: bool,
     pub key: String,
@@ -139,14 +155,6 @@ pub struct DeleteSessionResponse {
 pub struct ClearSessionResponse {
     pub cleared: bool,
     pub key: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionArchiveResponse {
-    pub key: String,
-    pub archived: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<u64>,
 }
 
 struct SessionExportData {
@@ -219,12 +227,30 @@ impl ArchiveRouteOperation {
     }
 }
 
-impl From<SessionInfo> for SessionArchiveResponse {
-    fn from(info: SessionInfo) -> Self {
+impl From<&SessionInfo> for SessionArchiveMetadata {
+    fn from(info: &SessionInfo) -> Self {
         Self {
-            key: info.key.to_string(),
             archived: info.is_archived(),
             archived_at: info.archived_at,
+        }
+    }
+}
+
+impl From<SessionInfo> for SessionSummaryResponse {
+    fn from(info: SessionInfo) -> Self {
+        let archive = SessionArchiveMetadata::from(&info);
+        Self {
+            key: info.key.to_string(),
+            kind: info.kind,
+            status: info.status,
+            label: info.label,
+            title: info.title,
+            preview: info.preview,
+            model: info.model,
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+            message_count: info.message_count,
+            archive,
         }
     }
 }
@@ -244,22 +270,13 @@ impl From<&SessionInfo> for SessionExportSessionMetadata {
     }
 }
 
-impl From<&SessionInfo> for SessionExportArchiveMetadata {
-    fn from(info: &SessionInfo) -> Self {
-        Self {
-            archived: info.is_archived(),
-            archived_at: info.archived_at,
-        }
-    }
-}
-
 impl SessionExportData {
     fn into_json_payload(self) -> SessionExportResponse {
         let total_messages = self.messages.len();
         SessionExportResponse {
             key: self.info.key.to_string(),
             session: SessionExportSessionMetadata::from(&self.info),
-            archive: SessionExportArchiveMetadata::from(&self.info),
+            archive: SessionArchiveMetadata::from(&self.info),
             messages: self.messages,
             total_messages,
         }
@@ -293,7 +310,11 @@ pub async fn handle_create_session(
     };
 
     let info = create_session(&registry, config).map_err(internal_error)?;
-    Ok((StatusCode::CREATED, Json(info)).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(SessionSummaryResponse::from(info)),
+    )
+        .into_response())
 }
 
 pub async fn handle_list_sessions(
@@ -313,6 +334,10 @@ pub async fn handle_list_sessions(
     });
     let total = sessions.len();
     sessions.truncate(query.limit.unwrap_or(50));
+    let sessions = sessions
+        .into_iter()
+        .map(SessionSummaryResponse::from)
+        .collect();
 
     Ok(Json(ListSessionsResponse { sessions, total }).into_response())
 }
@@ -326,7 +351,7 @@ pub async fn handle_get_session(
     let info = registry
         .get_info(&key)
         .map_err(|error| map_session_error(&id, error))?;
-    Ok(Json(info).into_response())
+    Ok(Json(SessionSummaryResponse::from(info)).into_response())
 }
 
 pub async fn handle_get_context(
@@ -713,7 +738,7 @@ async fn update_session_archive_state(
     let info = registry
         .get_info(&key)
         .map_err(|error| map_session_error(&id, error))?;
-    Ok(Json(SessionArchiveResponse::from(info)).into_response())
+    Ok(Json(SessionSummaryResponse::from(info)).into_response())
 }
 
 fn load_session_export(
