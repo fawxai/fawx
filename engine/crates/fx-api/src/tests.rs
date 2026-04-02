@@ -2538,6 +2538,7 @@ mod routing_and_status {
             model: "mock-model".to_string(),
             created_at: 1,
             updated_at: 2,
+            archived_at: None,
             messages: vec![
                 SessionMessage::structured(
                     SessionMessageRole::Tool,
