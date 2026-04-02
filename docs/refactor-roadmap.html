@@ -301,19 +301,19 @@
   </div>
   <div class="sequence-step">
     <strong>Step 12. #1642: headless decomposition</strong>
-    <div class="step-meta">This is now the active next step. Split headless responsibilities once lifecycle, authority, and dispatch seams are stable.</div>
+    <div class="step-meta">Completed in PR <code>#1674</code>. Headless startup, routing, and execution seams are now decomposed behind stable module boundaries.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 13. Full loop decomposition beyond direct inspection</strong>
-    <div class="step-meta">Resume broader loop refactoring after authority model, audit, and headless cleanup reduce architectural risk.</div>
+    <div class="step-meta">Completed via PRs <code>#1676</code>, <code>#1678</code>, <code>#1679</code>, <code>#1680</code>, <code>#1681</code>, <code>#1682</code>, <code>#1683</code>, <code>#1684</code>, <code>#1685</code>, <code>#1686</code>, and <code>#1687</code>. The loop engine is now structurally decomposed with final test reorg and thin orchestrator cleanup landed.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 14. #1487: session archive / export backend</strong>
-    <div class="step-meta">Backend archive/export support that the Swift session browser and export flow depend on.</div>
+    <div class="step-meta">Completed via PRs <code>#1688</code>, <code>#1689</code>, <code>#1690</code>, <code>#1691</code>, and <code>#1692</code>. Archive metadata, archive routes, archived-session filtering, canonical export, and final contract hardening are now on <code>dev</code>.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 15. #1637: Swift session archive / browser / export UI</strong>
-    <div class="step-meta">Product follow-on after the backend archive/export contract exists.</div>
+    <div class="step-meta">Next step. Option A is now spec'd on <code>dev</code>: single-session archive / unarchive, archived-session filter, and per-session export UI with no bulk actions in the first pass.</div>
   </div>
 </div>
 
@@ -392,31 +392,31 @@
       <div class="issue-body">Completed on dev via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>. Canonical deny defaults, tool-owned action / journal metadata, and authority-surface contracts replaced the highest-leverage static dispatch drift.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">FOLLOW-UP</span><span class="issue-title">Detached headless transcript / continuation integrity</span><span class="tag tag-active">now</span></div>
-      <div class="issue-body">Immediate post-Step-11 stabilization fix. Detached headless lanes can mutate the right files but fail to converge cleanly, poison later turns, or surface missing tool-output / continuation-history errors.</div>
+      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Completed in PR <code>#1674</code>. Headless responsibilities are now split behind explicit startup, routing, execution, and output seams.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">FOLLOW-UP</span><span class="issue-title">Detached workspace / config application drift</span><span class="tag tag-next">next</span></div>
-      <div class="issue-body">Detached verification lanes can behave as if stale config or wrong worktree bindings are active. Fix this before relying on headless verification as a hard merge gate.</div>
+      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Completed in the Step 13 PR chain through <code>#1687</code>. The loop engine refactor and final thin-orchestrator cleanup are now on <code>dev</code>.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-next">step 12</span></div>
-      <div class="issue-body">Still the next numbered architectural step. Run it after the immediate detached-lane stabilization follow-ups land.</div>
+      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Completed in the Step 14 PR chain through <code>#1692</code>. Archive metadata, archive routes, archived-session filters, export, and contract hardening are now stable on <code>dev</code>.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-next">step 13</span></div>
-      <div class="issue-body">Broader loop refactor after the direct-inspection stabilization tranche and architectural cleanup.</div>
+      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">step 15</span></div>
+      <div class="issue-body">Current next numbered step. Option A spec is now on <code>dev</code>: single-session archive / unarchive, archived-session filter, and per-session export UI with no bulk actions in the first pass.</div>
     </div>
   </div>
   <div class="panel">
     <h3>Archive / export follow-ons</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-next">step 14</span></div>
-      <div class="issue-body">Backend archive/export contract for browsing, bulk actions, and export surfaces.</div>
+      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Backend archive/export contract is now complete on <code>dev</code> through <code>#1692</code>.</div>
     </div>
     <div class="issue-card">
       <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">step 15</span></div>
-      <div class="issue-body">Swift UI follow-on that depends on the backend archive/export contract from <code>#1487</code>.</div>
+      <div class="issue-body">Swift UI follow-on is now the next step, with Option A spec docs already on <code>dev</code>.</div>
     </div>
   </div>
 </div>
