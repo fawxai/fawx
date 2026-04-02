@@ -2003,6 +2003,16 @@ mod routing_and_status {
         serde_json::from_slice(&body).expect("json")
     }
 
+    async fn response_text(response: axum::response::Response) -> String {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
     fn listed_session_keys(json: &serde_json::Value) -> Vec<String> {
         json["sessions"]
             .as_array()
@@ -2544,6 +2554,18 @@ mod routing_and_status {
         key
     }
 
+    fn record_session_messages(
+        registry: &SessionRegistry,
+        key: &SessionKey,
+        messages: &[(SessionMessageRole, &str)],
+    ) {
+        for (role, content) in messages {
+            registry
+                .record_message(key, *role, content)
+                .expect("record session message");
+        }
+    }
+
     fn poisoned_session(key: &str) -> Session {
         Session {
             key: SessionKey::new(key).expect("session key"),
@@ -3045,6 +3067,250 @@ allowed_chat_ids = [123]
         assert_eq!(unarchive.status(), StatusCode::NOT_FOUND);
         let unarchive_json = response_json(unarchive).await;
         assert_eq!(unarchive_json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn export_active_session_as_text() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-active-text");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "First question"),
+                (SessionMessageRole::Assistant, "First answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/export")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
+            "text/plain; charset=utf-8"
+        );
+        let text = response_text(response).await;
+        let question_index = text.find("First question").expect("question text");
+        let answer_index = text.find("First answer").expect("answer text");
+        assert!(text.contains(&format!("Session: {key}")));
+        assert!(text.contains("Messages: 2"));
+        assert!(question_index < answer_index);
+    }
+
+    #[tokio::test]
+    async fn export_archived_session_as_text() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archived-text");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Archived question"),
+                (SessionMessageRole::Assistant, "Archived answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/export")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(text.contains(&format!("Session: {key}")));
+        assert!(text.contains("Archived: yes"));
+        assert!(text.contains("Archived question"));
+        assert!(text.contains("Archived answer"));
+    }
+
+    #[tokio::test]
+    async fn export_active_session_as_json() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-active-json");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Active json question"),
+                (SessionMessageRole::Assistant, "Active json answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["session"]["kind"], "main");
+        assert_eq!(json["session"]["status"], "idle");
+        assert_eq!(json["archive"]["archived"], false);
+        assert!(json["archive"]["archived_at"].is_null());
+        assert_eq!(json["total_messages"], 2);
+        assert_eq!(
+            json["messages"][0]["content"][0]["text"],
+            "Active json question"
+        );
+        assert_eq!(
+            json["messages"][1]["content"][0]["text"],
+            "Active json answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_archived_session_as_json() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archived-json");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Archived json question"),
+                (SessionMessageRole::Assistant, "Archived json answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["session"]["kind"], "main");
+        assert_eq!(json["archive"]["archived"], true);
+        assert!(json["archive"]["archived_at"].as_u64().is_some());
+        assert_eq!(json["total_messages"], 2);
+        assert_eq!(
+            json["messages"][0]["content"][0]["text"],
+            "Archived json question"
+        );
+        assert_eq!(
+            json["messages"][1]["content"][0]["text"],
+            "Archived json answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_export_format_returns_400() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-invalid-format");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=markdown"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "invalid export format 'markdown'; expected one of: text, json"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_export_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions/sess-missing/export"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn archived_json_export_includes_archive_metadata() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archive-metadata");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["archive"]["archived"], true);
+        assert!(json["archive"]["archived_at"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn export_preserves_stored_message_order() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-message-order");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "first message"),
+                (SessionMessageRole::Assistant, "second message"),
+                (SessionMessageRole::User, "third message"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let texts = json["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| {
+                message["content"][0]["text"]
+                    .as_str()
+                    .expect("message text")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "first message".to_string(),
+                "second message".to_string(),
+                "third message".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

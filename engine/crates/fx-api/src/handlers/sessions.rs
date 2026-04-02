@@ -14,18 +14,20 @@ use crate::types::{
     SendToSessionRequest, SendToSessionResponse,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{TimeZone, Utc};
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
 use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
-    prune_unresolved_tool_history, validate_tool_message_order, SessionArchiveFilter,
-    SessionConfig, SessionError, SessionHistoryError, SessionInfo, SessionKey, SessionKind,
-    SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
+    prune_unresolved_tool_history, render_content_blocks_with_options, validate_tool_message_order,
+    ContentRenderOptions, SessionArchiveFilter, SessionConfig, SessionError, SessionHistoryError,
+    SessionInfo, SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry,
+    SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -76,6 +78,18 @@ pub struct SessionMessagesQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SessionExportQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+impl SessionExportQuery {
+    fn export_format(&self) -> Result<SessionExportFormat, (StatusCode, Json<ErrorBody>)> {
+        SessionExportFormat::parse(self.format.as_deref())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ListSessionsResponse {
     pub sessions: Vec<SessionInfo>,
@@ -86,6 +100,33 @@ pub struct ListSessionsResponse {
 pub struct SessionMessagesResponse {
     pub messages: Vec<SessionMessage>,
     pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExportResponse {
+    pub key: String,
+    pub session: SessionExportSessionMetadata,
+    pub archive: SessionExportArchiveMetadata,
+    pub messages: Vec<SessionMessage>,
+    pub total_messages: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExportSessionMetadata {
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub model: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExportArchiveMetadata {
+    pub archived: bool,
+    pub archived_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,11 +149,38 @@ pub struct SessionArchiveResponse {
     pub archived_at: Option<u64>,
 }
 
+struct SessionExportData {
+    info: SessionInfo,
+    messages: Vec<SessionMessage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimestampDisplay {
+    Minute,
+    Second,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ArchivedQueryValue {
     Active,
     All,
     Only,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionExportFormat {
+    Text,
+    Json,
+}
+
+impl SessionExportFormat {
+    fn parse(value: Option<&str>) -> Result<Self, (StatusCode, Json<ErrorBody>)> {
+        match value.unwrap_or("text") {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(invalid_export_format(other)),
+        }
+    }
 }
 
 impl ArchivedQueryValue {
@@ -157,6 +225,43 @@ impl From<SessionInfo> for SessionArchiveResponse {
             key: info.key.to_string(),
             archived: info.is_archived(),
             archived_at: info.archived_at,
+        }
+    }
+}
+
+impl From<&SessionInfo> for SessionExportSessionMetadata {
+    fn from(info: &SessionInfo) -> Self {
+        Self {
+            kind: info.kind,
+            status: info.status,
+            label: info.label.clone(),
+            title: info.title.clone(),
+            preview: info.preview.clone(),
+            model: info.model.clone(),
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+        }
+    }
+}
+
+impl From<&SessionInfo> for SessionExportArchiveMetadata {
+    fn from(info: &SessionInfo) -> Self {
+        Self {
+            archived: info.is_archived(),
+            archived_at: info.archived_at,
+        }
+    }
+}
+
+impl SessionExportData {
+    fn into_json_payload(self) -> SessionExportResponse {
+        let total_messages = self.messages.len();
+        SessionExportResponse {
+            key: self.info.key.to_string(),
+            session: SessionExportSessionMetadata::from(&self.info),
+            archive: SessionExportArchiveMetadata::from(&self.info),
+            messages: self.messages,
+            total_messages,
         }
     }
 }
@@ -320,6 +425,19 @@ pub async fn handle_unarchive_session(
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     update_session_archive_state(state, id, ArchiveRouteOperation::Unarchive).await
+}
+
+pub async fn handle_export_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(query): Query<SessionExportQuery>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let export = load_session_export(&registry, &id)?;
+    Ok(render_session_export_response(
+        export,
+        query.export_format()?,
+    ))
 }
 
 pub async fn handle_get_messages(
@@ -598,6 +716,117 @@ async fn update_session_archive_state(
     Ok(Json(SessionArchiveResponse::from(info)).into_response())
 }
 
+fn load_session_export(
+    registry: &SessionRegistry,
+    id: &str,
+) -> Result<SessionExportData, (StatusCode, Json<ErrorBody>)> {
+    let key = session_key(id)?;
+    let info = registry
+        .get_info(&key)
+        .map_err(|error| map_session_error(id, error))?;
+    let messages = registry
+        .history(&key, info.message_count)
+        .map_err(|error| map_session_error(id, error))?;
+    Ok(SessionExportData { info, messages })
+}
+
+fn render_session_export_response(
+    export: SessionExportData,
+    format: SessionExportFormat,
+) -> Response {
+    match format {
+        SessionExportFormat::Json => Json(export.into_json_payload()).into_response(),
+        SessionExportFormat::Text => text_export_response(render_session_export_text(&export)),
+    }
+}
+
+fn text_export_response(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+fn render_session_export_text(export: &SessionExportData) -> String {
+    let mut output = format!(
+        "Session: {}\nKind: {} | Status: {} | Model: {}\nCreated: {} | Updated: {}\n{}\nMessages: {}\n---\n",
+        export.info.key,
+        export.info.kind,
+        export.info.status,
+        export.info.model,
+        format_export_timestamp(export.info.created_at, TimestampDisplay::Minute),
+        format_export_timestamp(export.info.updated_at, TimestampDisplay::Minute),
+        format_archive_line(&export.info),
+        export.info.message_count,
+    );
+    if export.messages.is_empty() {
+        return output;
+    }
+    let blocks = export
+        .messages
+        .iter()
+        .map(format_export_message)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    output.push('\n');
+    output.push_str(&blocks);
+    output.push('\n');
+    output
+}
+
+fn format_archive_line(info: &SessionInfo) -> String {
+    match info.archived_at {
+        Some(timestamp) => {
+            format!(
+                "Archived: yes | Archived at: {}",
+                format_export_timestamp(timestamp, TimestampDisplay::Minute)
+            )
+        }
+        None => "Archived: no".to_string(),
+    }
+}
+
+fn format_export_message(message: &SessionMessage) -> String {
+    format!(
+        "[{}] {}{}\n{}",
+        message.role,
+        format_export_timestamp(message.timestamp, TimestampDisplay::Second),
+        format_export_token_suffix(message),
+        render_content_blocks_with_options(
+            &message.content,
+            ContentRenderOptions {
+                include_tool_use_id: true,
+            },
+        )
+    )
+}
+
+fn format_export_token_suffix(message: &SessionMessage) -> String {
+    match (
+        message.total_token_count(),
+        message.input_token_count,
+        message.output_token_count,
+    ) {
+        (Some(total), Some(input), Some(output)) => {
+            format!(" | {total} tokens ({input} in / {output} out)")
+        }
+        (Some(total), _, _) => format!(" | {total} tokens"),
+        (None, _, _) => String::new(),
+    }
+}
+
+fn format_export_timestamp(timestamp: u64, display: TimestampDisplay) -> String {
+    let (pattern, fallback) = match display {
+        TimestampDisplay::Minute => ("%Y-%m-%d %H:%M", "1970-01-01 00:00"),
+        TimestampDisplay::Second => ("%Y-%m-%d %H:%M:%S", "1970-01-01 00:00:00"),
+    };
+    format_timestamp(timestamp, pattern, fallback)
+}
+
+fn format_timestamp(timestamp: u64, pattern: &str, fallback: &str) -> String {
+    match Utc.timestamp_opt(timestamp as i64, 0).single() {
+        Some(value) => value.format(pattern).to_string(),
+        None => fallback.to_string(),
+    }
+}
+
 fn create_session(
     registry: &SessionRegistry,
     config: SessionConfig,
@@ -702,6 +931,12 @@ fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
 fn invalid_archive_filter(value: &str) -> (StatusCode, Json<ErrorBody>) {
     bad_request(&format!(
         "invalid archived filter '{value}'; expected one of: active, all, only"
+    ))
+}
+
+fn invalid_export_format(value: &str) -> (StatusCode, Json<ErrorBody>) {
+    bad_request(&format!(
+        "invalid export format '{value}'; expected one of: text, json"
     ))
 }
 
