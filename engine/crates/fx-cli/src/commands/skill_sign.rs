@@ -392,4 +392,20 @@ mod tests {
             SLASH_SIGN_USAGE
         );
     }
+
+    #[test]
+    fn parse_slash_selection_rejects_extra_args() {
+        assert_eq!(
+            parse_slash_selection(Some("weather"), true)
+                .expect_err("extra args for single skill")
+                .to_string(),
+            SLASH_SIGN_USAGE
+        );
+        assert_eq!(
+            parse_slash_selection(Some("--all"), true)
+                .expect_err("extra args for all skills")
+                .to_string(),
+            SLASH_SIGN_USAGE
+        );
+    }
 }
