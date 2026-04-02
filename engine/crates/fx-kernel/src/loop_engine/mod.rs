@@ -7253,6 +7253,11 @@ mod phase4_tests {
         assert_eq!(action.response_text, "summary");
     }
 
+    #[test]
+    fn tool_round_outcome_budget_low_remains_debuggable() {
+        assert_eq!(format!("{:?}", ToolRoundOutcome::BudgetLow), "BudgetLow");
+    }
+
     #[tokio::test]
     async fn tool_result_has_tool_call_id() {
         let executor = Phase4StubToolExecutor;

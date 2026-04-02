@@ -27,6 +27,7 @@ use crate::streaming::{ErrorCategory, Phase};
 use crate::types::LoopError;
 use fx_core::message::{InternalMessage, StreamPhase, ToolRoundCall, ToolRoundResult};
 use fx_llm::{CompletionResponse, ContentBlock, Message, MessageRole, ToolCall, ToolDefinition};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 struct PreparedToolCalls {
@@ -46,12 +47,18 @@ impl PreparedToolCalls {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum ToolRoundOutcome {
     Cancelled,
+    /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
     BudgetLow,
+    /// Direct utility profile can answer immediately from tool output.
     DirectUtilityAnswered(String),
+    /// Bounded-local phase machine reached a typed terminal blocker.
     BoundedLocalTerminal(BoundedLocalTerminalReason),
+    /// Repeated observation-only rounds were blocked and could not be replanned.
     ObservationRestricted,
+    /// Repeated observation-only rounds were blocked; request one mutation-only follow-up.
     ObservationRestrictedReplan,
     Response(CompletionResponse),
 }
@@ -73,7 +80,8 @@ struct ToolRoundContinuationRequest<'a> {
     round: u32,
     llm: &'a dyn LlmProvider,
     continuation_tools: Vec<ToolDefinition>,
-    executed: ExecutedToolRound,
+    calls_count: usize,
+    started_at_ms: u64,
     stream: CycleStream<'a>,
 }
 
@@ -353,7 +361,7 @@ impl LoopEngine {
         context_messages: &[Message],
         stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
-        let mut state = self.prepare_tool_action_state(calls, context_messages);
+        let state = self.prepare_tool_action_state(calls, context_messages);
         if self.budget.state() == BudgetState::Low {
             return Ok(self.budget_low_blocked_result(
                 decision,
@@ -362,34 +370,13 @@ impl LoopEngine {
             ));
         }
 
-        for round in 0..self.max_iterations {
-            if self.tool_round_interrupted() {
-                return Ok(self.cancelled_tool_action_from_state(decision, state));
+        match self.run_tool_loop(decision, llm, state, stream).await? {
+            ToolLoopStep::Break(state) | ToolLoopStep::Continue(state) => {
+                self.finish_tool_loop_on_exhaustion(decision, state, llm, stream)
+                    .await
             }
-            if self.tool_loop_budget_low(round) {
-                break;
-            }
-
-            let continuation_tools =
-                self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
-            let outcome = self
-                .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
-                .await?;
-            match self
-                .handle_tool_round_outcome(decision, llm, state, outcome, stream)
-                .await?
-            {
-                ToolLoopStep::Continue(next_state) => state = next_state,
-                ToolLoopStep::Break(next_state) => {
-                    state = next_state;
-                    break;
-                }
-                ToolLoopStep::Return(action) => return Ok(*action),
-            }
+            ToolLoopStep::Return(action) => Ok(*action),
         }
-
-        self.finish_tool_loop_on_exhaustion(decision, state, llm, stream)
-            .await
     }
 
     fn prepare_tool_action_state(
@@ -413,6 +400,53 @@ impl LoopEngine {
         }
         self.emit_budget_low_break_signal(round);
         true
+    }
+
+    async fn run_tool_loop(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        mut state: ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        for round in 0..self.max_iterations {
+            if self.tool_round_interrupted() {
+                return Ok(ToolLoopStep::Return(Box::new(
+                    self.cancelled_tool_action_from_state(decision, state),
+                )));
+            }
+            if self.tool_loop_budget_low(round) {
+                return Ok(ToolLoopStep::Break(state));
+            }
+
+            match self
+                .run_tool_loop_round(decision, llm, state, round, stream)
+                .await?
+            {
+                ToolLoopStep::Continue(next_state) => state = next_state,
+                ToolLoopStep::Break(next_state) => return Ok(ToolLoopStep::Break(next_state)),
+                ToolLoopStep::Return(action) => return Ok(ToolLoopStep::Return(action)),
+            }
+        }
+        Ok(ToolLoopStep::Break(state))
+    }
+
+    async fn run_tool_loop_round(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        state: ToolRoundState,
+        round: u32,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        let mut state = state;
+        let continuation_tools =
+            self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
+        let outcome = self
+            .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
+            .await?;
+        self.handle_tool_round_outcome(decision, llm, state, outcome, stream)
+            .await
     }
 
     async fn handle_tool_round_outcome(
@@ -745,7 +779,7 @@ impl LoopEngine {
                 .compact_if_needed(messages, CompactionScope::ToolContinuation, round)
                 .await?
         };
-        if let std::borrow::Cow::Owned(compacted_messages) = compacted {
+        if let Cow::Owned(compacted_messages) = compacted {
             *messages = compacted_messages;
         }
         self.compaction()
@@ -777,7 +811,15 @@ impl LoopEngine {
         }
 
         let executed = self.run_tool_round_calls(round, state, stream).await?;
-        self.record_executed_tool_round(state, &executed)?;
+        let request = ToolRoundContinuationRequest {
+            round,
+            llm,
+            continuation_tools,
+            calls_count: executed.calls.len(),
+            started_at_ms: executed.started_at_ms,
+            stream,
+        };
+        self.record_executed_tool_round(state, executed)?;
         if let Some(outcome) = self.round_terminal_outcome(state, stream) {
             return Ok(outcome);
         }
@@ -788,17 +830,7 @@ impl LoopEngine {
             return Ok(outcome);
         }
 
-        self.request_tool_round_response(
-            state,
-            ToolRoundContinuationRequest {
-                round,
-                llm,
-                continuation_tools,
-                executed,
-                stream,
-            },
-        )
-        .await
+        self.request_tool_round_response(state, request).await
     }
 
     async fn maybe_handle_observation_only_round(
@@ -882,14 +914,20 @@ impl LoopEngine {
     fn record_executed_tool_round(
         &mut self,
         state: &mut ToolRoundState,
-        executed: &ExecutedToolRound,
+        executed: ExecutedToolRound,
     ) -> Result<(), LoopError> {
-        self.record_successful_tool_classifications(state, &executed.calls, &executed.results);
-        self.record_tool_round_result_bytes(&executed.results);
-        self.record_round_messages(state, executed)?;
-        state.all_tool_results.extend(executed.results.clone());
-        self.record_tool_round_kind(&executed.calls);
-        self.advance_bounded_local_phase_after_tool_round(&executed.calls, &executed.results);
+        let ExecutedToolRound {
+            calls,
+            results,
+            has_tool_errors,
+            ..
+        } = executed;
+        self.record_successful_tool_classifications(state, &calls, &results);
+        self.record_tool_round_result_bytes(&results);
+        self.record_round_messages(state, &calls, &results, has_tool_errors)?;
+        self.record_tool_round_kind(&calls);
+        self.advance_bounded_local_phase_after_tool_round(&calls, &results);
+        state.all_tool_results.extend(results);
         Ok(())
     }
 
@@ -901,17 +939,19 @@ impl LoopEngine {
     fn record_round_messages(
         &self,
         state: &mut ToolRoundState,
-        executed: &ExecutedToolRound,
+        calls: &[ToolCall],
+        results: &[ToolResult],
+        has_tool_errors: bool,
     ) -> Result<(), LoopError> {
         record_tool_round_messages(
             &mut state.continuation_messages,
             &mut state.evidence_messages,
-            &executed.calls,
+            calls,
             &self.tool_call_provider_ids,
-            &executed.results,
+            results,
         )?;
-        if executed.has_tool_errors {
-            self.append_tool_error_relay(state, &executed.results);
+        if has_tool_errors {
+            self.append_tool_error_relay(state, results);
         }
         Ok(())
     }
@@ -987,9 +1027,9 @@ impl LoopEngine {
         self.record_continuation_cost(&response, &state.continuation_messages);
         self.emit_tool_round_trace_and_perf(
             request.round,
-            request.executed.calls.len(),
+            request.calls_count,
             &response,
-            current_time_ms().saturating_sub(request.executed.started_at_ms),
+            current_time_ms().saturating_sub(request.started_at_ms),
         );
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
