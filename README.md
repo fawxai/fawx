@@ -126,7 +126,10 @@ Use the other paths when they match your input:
 - `fawx skill build <project>` is the canonical local-dev path for a custom skill project.
 - `skills/build.sh --install` is the repo maintainer path for the built-in `skills/` collection.
 - `fawx skill install <path>` is the artifact path for a prebuilt `.wasm` file or skill directory.
+- `fawx keys generate` creates a local signing keypair and trusts the matching public key for local verification.
 - `fawx sign <skill>` signs an already-installed skill when it still needs a signature.
+
+If you generate or trust a key while the server is already running, restart it before expecting the loaded skill state to flip from `invalid` to `valid`.
 
 ```bash
 # Prebuilt local artifact

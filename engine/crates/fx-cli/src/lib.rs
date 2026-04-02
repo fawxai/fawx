@@ -34,6 +34,9 @@ mod fleet_command {
         include!("commands/fleet.rs");
     }
 }
+#[allow(dead_code)]
+#[path = "commands/keys.rs"]
+pub(crate) mod keys_commands;
 #[path = "commands/marketplace.rs"]
 pub(crate) mod marketplace_commands;
 #[allow(dead_code)]
@@ -51,6 +54,7 @@ mod start_stop_command {
     include!("commands/start_stop.rs");
 }
 mod commands {
+    pub(crate) use super::keys_commands as keys;
     pub(crate) use super::marketplace_commands as marketplace;
     pub(crate) use super::skill_sign_commands as skill_sign;
     pub(crate) use super::slash_commands as slash;

@@ -341,9 +341,12 @@ fawx skill build .
 ### 7. Install a prebuilt artifact or sign later
 
 ```bash
+fawx keys generate
 fawx skill install target/wasm32-wasip1/release/my_skill.wasm
 fawx sign <skill>
 ```
+
+If the Fawx server is already running when you generate or trust a key, restart it before expecting the loaded skill to report a valid signature.
 
 ## Host API Reference
 
