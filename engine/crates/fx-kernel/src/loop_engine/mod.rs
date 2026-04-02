@@ -83,11 +83,13 @@ use self::decomposition::{
     decomposition_results_all_skipped, estimate_plan_cost, is_decomposition_results_message,
     parse_decomposition_plan,
 };
+#[cfg(test)]
+use self::request::{build_continuation_request, ContinuationRequestParams};
 use self::request::{
-    build_continuation_request, build_forced_synthesis_request, build_reasoning_messages,
-    build_reasoning_request, build_truncation_continuation_request, completion_request_to_prompt,
-    ContinuationRequestParams, ForcedSynthesisRequestParams, ReasoningRequestParams,
-    RequestBuildContext, ToolRequestConfig, TruncationContinuationRequestParams,
+    build_forced_synthesis_request, build_reasoning_messages, build_reasoning_request,
+    build_truncation_continuation_request, completion_request_to_prompt,
+    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, ToolRequestConfig,
+    TruncationContinuationRequestParams,
 };
 #[cfg(test)]
 use self::request::{
@@ -99,10 +101,9 @@ use self::request::{
 use self::retry::same_call_failure_reason;
 use self::retry::RetryTracker;
 use self::streaming::{StreamingRequestContext, TextStreamVisibility};
-use self::tool_execution::{
-    build_blocked_tool_results, build_uniform_blocked_calls, extract_tool_use_provider_ids,
-    record_tool_round_messages,
-};
+use self::tool_execution::extract_tool_use_provider_ids;
+#[cfg(test)]
+use self::tool_execution::ToolRoundOutcome;
 
 #[cfg(test)]
 use self::tool_execution::{
@@ -123,10 +124,9 @@ use crate::budget::{AllocationMode, BudgetAllocator, DepthMode};
 #[cfg(test)]
 use bounded_local::detect_turn_execution_profile;
 use bounded_local::{
-    bounded_local_phase_label, bounded_local_terminal_partial_response,
-    bounded_local_terminal_reason_label, bounded_local_terminal_reason_text,
-    detect_turn_execution_profile_for_ownership, BoundedLocalPhase, BoundedLocalTerminalReason,
-    TurnExecutionProfile,
+    bounded_local_phase_label, bounded_local_terminal_reason_label,
+    bounded_local_terminal_reason_text, detect_turn_execution_profile_for_ownership,
+    BoundedLocalPhase, BoundedLocalTerminalReason, TurnExecutionProfile,
 };
 use continuation::{
     commitment_tool_scope, render_turn_commitment_directive,
@@ -140,7 +140,7 @@ use direct_inspection::{direct_inspection_profile_label, DirectInspectionOwnersh
 use direct_utility::DirectUtilityProfile;
 use direct_utility::{
     detect_direct_utility_profile, direct_utility_completion_response, direct_utility_directive,
-    direct_utility_progress, direct_utility_terminal_response, direct_utility_tool_names,
+    direct_utility_progress, direct_utility_tool_names,
 };
 use progress::json_string_arg;
 #[cfg(test)]
@@ -1002,22 +1002,6 @@ struct FollowUpDecomposeContext {
     accumulated_text: Vec<String>,
 }
 
-#[derive(Debug)]
-enum ToolRoundOutcome {
-    Cancelled,
-    /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
-    BudgetLow,
-    /// Direct utility profile can answer immediately from tool output.
-    DirectUtilityAnswered(String),
-    /// Bounded-local phase machine reached a typed terminal blocker.
-    BoundedLocalTerminal(BoundedLocalTerminalReason),
-    /// Repeated observation-only rounds were blocked and could not be replanned.
-    ObservationRestricted,
-    /// Repeated observation-only rounds were blocked; request one mutation-only follow-up.
-    ObservationRestrictedReplan,
-    Response(CompletionResponse),
-}
-
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
     sub_goals: Vec<DecomposeSubGoalArguments>,
@@ -1765,58 +1749,6 @@ impl LoopEngine {
         (!action.has_tool_activity()).then(|| self.action_cost_from_result(action))
     }
 
-    /// Apply nudge/strip policy for the current tool continuation round.
-    ///
-    /// Mutates `continuation_messages` by appending a progress nudge at the
-    /// nudge threshold round. Returns the tool definitions to use: either the
-    /// full set (normal) or an empty vec (tools stripped at strip threshold).
-    fn apply_tool_round_progress_policy(
-        &self,
-        round: u32,
-        continuation_messages: &mut Vec<Message>,
-    ) -> Vec<ToolDefinition> {
-        let termination = self.current_termination_config();
-        let tc = termination.as_ref();
-        let nudge_threshold = u32::from(tc.tool_round_nudge_after);
-        let strip_threshold =
-            nudge_threshold.saturating_add(u32::from(tc.tool_round_strip_after_nudge));
-        let observation_nudge_threshold = u32::from(tc.observation_only_round_nudge_after);
-        let observation_strip_threshold = observation_nudge_threshold
-            .saturating_add(u32::from(tc.observation_only_round_strip_after_nudge));
-        let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
-        let all_tools = self.tool_executor.tool_definitions();
-
-        let profile_owns_surface = self.turn_execution_profile.owns_tool_surface();
-
-        if !profile_owns_surface
-            && observation_nudge_threshold > 0
-            && observation_rounds == observation_nudge_threshold
-        {
-            continuation_messages.push(Message::system(
-                OBSERVATION_ONLY_TOOL_ROUND_NUDGE.to_string(),
-            ));
-        }
-
-        // Fire nudge exactly once (at the threshold round) to avoid stacking
-        // duplicate nudge messages in continuation_messages across rounds.
-        if nudge_threshold > 0 && round == nudge_threshold {
-            continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
-        }
-
-        if !profile_owns_surface
-            && observation_nudge_threshold > 0
-            && observation_rounds >= observation_strip_threshold
-        {
-            return self.side_effect_tool_definitions();
-        }
-
-        if nudge_threshold > 0 && round >= strip_threshold {
-            self.progress_limited_tool_definitions()
-        } else {
-            all_tools
-        }
-    }
-
     fn side_effect_tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tool_executor
             .tool_definitions()
@@ -1997,22 +1929,6 @@ impl LoopEngine {
         self.apply_pending_artifact_gate(phased)
     }
 
-    fn continuation_tool_scope_for_round(
-        &self,
-        state: &ToolRoundState,
-    ) -> Option<ContinuationToolScope> {
-        if self.turn_execution_profile.owns_tool_surface() {
-            return None;
-        }
-        if state.used_observation_tools && !state.used_mutation_tools {
-            let mutation_tools = self.side_effect_tool_definitions();
-            if !mutation_tools.is_empty() {
-                return Some(ContinuationToolScope::MutationOnly);
-            }
-        }
-        None
-    }
-
     fn pending_turn_commitment_directive(&self) -> Option<String> {
         self.pending_turn_commitment
             .as_ref()
@@ -2059,29 +1975,6 @@ impl LoopEngine {
             Vec::new()
         } else {
             mutation_tools
-        }
-    }
-
-    fn observation_only_call_restriction_active(&self) -> bool {
-        let termination = self.current_termination_config();
-        let tc = termination.as_ref();
-        let nudge_threshold = u32::from(tc.observation_only_round_nudge_after);
-        let strip_threshold =
-            nudge_threshold.saturating_add(u32::from(tc.observation_only_round_strip_after_nudge));
-        nudge_threshold > 0
-            && u32::from(self.consecutive_observation_only_rounds) >= strip_threshold
-    }
-
-    fn record_tool_round_kind(&mut self, calls: &[ToolCall]) {
-        let observation_only = !calls.is_empty()
-            && calls.iter().all(|call| {
-                self.tool_executor.classify_call(call) == ToolCallClassification::Observation
-            });
-        if observation_only {
-            self.consecutive_observation_only_rounds =
-                self.consecutive_observation_only_rounds.saturating_add(1);
-        } else {
-            self.consecutive_observation_only_rounds = 0;
         }
     }
 
@@ -3217,527 +3110,6 @@ impl LoopEngine {
         ))
     }
 
-    // Evaluated introducing a ToolActionContext wrapper here, but kept explicit
-    // arguments because there are only four call-site inputs and bundling them
-    // made the call site less readable.
-    async fn act_with_tools(
-        &mut self,
-        decision: &Decision,
-        calls: &[ToolCall],
-        llm: &dyn LlmProvider,
-        context_messages: &[Message],
-        stream: CycleStream<'_>,
-    ) -> Result<ActionResult, LoopError> {
-        let initial_text = self.pending_tool_response_text.take();
-        let mut state = ToolRoundState::new(calls, context_messages, initial_text);
-        if self.budget.state() == BudgetState::Low {
-            return Ok(self.budget_low_blocked_result(
-                decision,
-                "tool dispatch",
-                &state.accumulated_text,
-            ));
-        }
-
-        let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
-        state.current_calls = execute_calls;
-
-        // Inject deferred tool results immediately so they're present in
-        // all_tool_results regardless of which return path the loop takes.
-        if !deferred.is_empty() {
-            self.append_deferred_tool_results(&mut state, &deferred, calls.len());
-        }
-
-        for round in 0..self.max_iterations {
-            if self.tool_round_interrupted() {
-                return Ok(self.cancelled_tool_action_from_state(decision, state));
-            }
-
-            if self.budget.state() == BudgetState::Low {
-                self.emit_budget_low_break_signal(round);
-                break;
-            }
-
-            let continuation_tools =
-                self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
-
-            match self
-                .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
-                .await?
-            {
-                ToolRoundOutcome::Cancelled => {
-                    return Ok(self.cancelled_tool_action_from_state(decision, state));
-                }
-                ToolRoundOutcome::DirectUtilityAnswered(response) => {
-                    let response =
-                        stitch_response_segments(&state.accumulated_text, Some(response));
-                    return Ok(ActionResult {
-                        decision: decision.clone(),
-                        tool_results: state.all_tool_results,
-                        response_text: response.clone(),
-                        tokens_used: state.tokens_used,
-                        next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
-                    });
-                }
-                ToolRoundOutcome::BoundedLocalTerminal(reason) => {
-                    let partial_response = stitched_response_text(
-                        &state.accumulated_text,
-                        Some(bounded_local_terminal_partial_response(
-                            reason,
-                            &state.all_tool_results,
-                        )),
-                    );
-                    return Ok(self.bounded_local_terminal_action_result(
-                        decision,
-                        state.all_tool_results,
-                        partial_response,
-                        state.tokens_used,
-                        reason,
-                    ));
-                }
-                ToolRoundOutcome::BudgetLow => break,
-                ToolRoundOutcome::ObservationRestrictedReplan => {
-                    let mutation_tools = self.side_effect_tool_definitions();
-                    if mutation_tools.is_empty() {
-                        let partial = stitched_response_text(
-                            &state.accumulated_text,
-                            summarize_tool_progress(&state.all_tool_results),
-                        );
-                        return Ok(self.incomplete_action_result(
-                            decision,
-                            state.all_tool_results,
-                            partial,
-                            OBSERVATION_ONLY_CALL_BLOCK_REASON,
-                            state.tokens_used,
-                        ));
-                    }
-
-                    stream.phase(Phase::Synthesize);
-                    let response = self
-                        .request_tool_continuation(
-                            llm,
-                            &state.continuation_messages,
-                            mutation_tools,
-                            &mut state.tokens_used,
-                            stream,
-                        )
-                        .await?;
-                    self.record_continuation_cost(&response, &state.continuation_messages);
-
-                    if !response.tool_calls.is_empty() {
-                        if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let context = FollowUpDecomposeContext {
-                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
-                                prior_tokens_used: state.tokens_used,
-                                accumulated_text: std::mem::take(&mut state.accumulated_text),
-                            };
-                            return self
-                                .handle_follow_up_decompose(
-                                    &response,
-                                    llm,
-                                    &state.continuation_messages,
-                                    context,
-                                )
-                                .await;
-                        }
-                        self.record_tool_round_response_state(&mut state, &response);
-                        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
-                        self.append_deferred_tool_results(
-                            &mut state,
-                            &round_deferred,
-                            response.tool_calls.len(),
-                        );
-                        state.current_calls = capped;
-                        continue;
-                    }
-
-                    let response = self
-                        .continue_truncated_response(
-                            response,
-                            &state.continuation_messages,
-                            llm,
-                            LoopStep::Act,
-                            stream,
-                        )
-                        .await?;
-                    let partial = stitched_response_text(
-                        &state.accumulated_text,
-                        response_text_segment(&response)
-                            .or_else(|| summarize_tool_progress(&state.all_tool_results)),
-                    );
-                    return Ok(self.incomplete_action_result(
-                        decision,
-                        state.all_tool_results,
-                        partial,
-                        OBSERVATION_ONLY_CALL_BLOCK_REASON,
-                        state.tokens_used,
-                    ));
-                }
-                ToolRoundOutcome::ObservationRestricted => {
-                    let partial = stitched_response_text(
-                        &state.accumulated_text,
-                        summarize_tool_progress(&state.all_tool_results),
-                    );
-                    return Ok(self.incomplete_action_result(
-                        decision,
-                        state.all_tool_results,
-                        partial,
-                        OBSERVATION_ONLY_CALL_BLOCK_REASON,
-                        state.tokens_used,
-                    ));
-                }
-                ToolRoundOutcome::Response(response) => {
-                    if !response.tool_calls.is_empty() {
-                        if find_decompose_tool_call(&response.tool_calls).is_some() {
-                            let context = FollowUpDecomposeContext {
-                                prior_tool_results: std::mem::take(&mut state.all_tool_results),
-                                prior_tokens_used: state.tokens_used,
-                                accumulated_text: std::mem::take(&mut state.accumulated_text),
-                            };
-                            return self
-                                .handle_follow_up_decompose(
-                                    &response,
-                                    llm,
-                                    &state.continuation_messages,
-                                    context,
-                                )
-                                .await;
-                        }
-                        self.record_tool_round_response_state(&mut state, &response);
-                        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
-                        self.append_deferred_tool_results(
-                            &mut state,
-                            &round_deferred,
-                            response.tool_calls.len(),
-                        );
-                        state.current_calls = capped;
-                        continue;
-                    }
-
-                    let response = self
-                        .continue_truncated_response(
-                            response,
-                            &state.continuation_messages,
-                            llm,
-                            LoopStep::Act,
-                            stream,
-                        )
-                        .await?;
-
-                    let next_tool_scope = self.continuation_tool_scope_for_round(&state);
-                    return self
-                        .finalize_tool_response(
-                            decision,
-                            state,
-                            &response,
-                            llm,
-                            stream,
-                            next_tool_scope,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        let next_tool_scope = self.continuation_tool_scope_for_round(&state);
-        self.synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
-            .await
-    }
-
-    fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
-        let max_fan_out = self.budget.config().max_fan_out;
-        if calls.len() <= max_fan_out {
-            return (calls.to_vec(), Vec::new());
-        }
-        let execute = calls[..max_fan_out].to_vec();
-        let deferred = calls[max_fan_out..].to_vec();
-        let deferred_names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
-        self.emit_signal(
-            LoopStep::Act,
-            SignalKind::Friction,
-            format!(
-                "fan-out cap: executing {}/{}, deferring: {}",
-                max_fan_out,
-                calls.len(),
-                deferred_names.join(", ")
-            ),
-            serde_json::json!({
-                "executed": max_fan_out,
-                "total": calls.len(),
-                "deferred_tools": deferred_names,
-            }),
-        );
-        (execute, deferred)
-    }
-
-    fn append_deferred_tool_results(
-        &self,
-        state: &mut ToolRoundState,
-        deferred: &[ToolCall],
-        total: usize,
-    ) {
-        let executed = total.saturating_sub(deferred.len());
-        let names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
-        let msg = format!(
-            "Tool calls deferred (budget: {executed}/{total}): {}. \
-             Re-request in your next turn if still needed.",
-            names.join(", ")
-        );
-        // Inject as synthetic tool results so synthesize_tool_fallback
-        // (which builds its prompt from all_tool_results) includes them.
-        for call in deferred {
-            state.all_tool_results.push(ToolResult {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                success: false,
-                output: msg.clone(),
-            });
-        }
-    }
-
-    fn budget_low_blocked_result(
-        &mut self,
-        decision: &Decision,
-        action_name: &str,
-        accumulated_text: &[String],
-    ) -> ActionResult {
-        self.emit_signal(
-            LoopStep::Act,
-            SignalKind::Blocked,
-            format!("{action_name} blocked: budget is low, wrapping up"),
-            serde_json::json!({"reason": "budget_soft_ceiling"}),
-        );
-        let response = stitch_response_segments(
-            accumulated_text,
-            Some(format!(
-                "{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."
-            )),
-        );
-        self.text_action_result(decision, &response)
-    }
-
-    fn record_continuation_cost(
-        &mut self,
-        response: &CompletionResponse,
-        context_messages: &[Message],
-    ) {
-        let cost = continuation_budget_cost(response, context_messages);
-        self.budget.record(&cost);
-    }
-
-    async fn compact_tool_continuation(
-        &mut self,
-        round: u32,
-        messages: &mut Vec<Message>,
-    ) -> Result<(), LoopError> {
-        let compacted = {
-            let compaction = self.compaction();
-            compaction
-                .compact_if_needed(messages, CompactionScope::ToolContinuation, round)
-                .await?
-        };
-        if let Cow::Owned(compacted_messages) = compacted {
-            *messages = compacted_messages;
-        }
-        self.compaction()
-            .ensure_within_hard_limit(CompactionScope::ToolContinuation, messages)
-    }
-
-    fn emit_budget_low_break_signal(&mut self, round: u32) {
-        self.emit_signal(
-            LoopStep::Act,
-            SignalKind::Blocked,
-            format!("budget soft-ceiling reached during tool round {round}, breaking loop"),
-            serde_json::json!({"reason": "budget_soft_ceiling", "round": round}),
-        );
-    }
-
-    async fn execute_tool_round(
-        &mut self,
-        round: u32,
-        llm: &dyn LlmProvider,
-        state: &mut ToolRoundState,
-        continuation_tools: Vec<ToolDefinition>,
-        stream: CycleStream<'_>,
-    ) -> Result<ToolRoundOutcome, LoopError> {
-        if self
-            .turn_execution_profile
-            .uses_standard_observation_controls()
-            && self.observation_only_call_restriction_active()
-            && calls_are_all_classification(
-                &state.current_calls,
-                self.tool_executor.as_ref(),
-                ToolCallClassification::Observation,
-            )
-        {
-            let blocked = build_uniform_blocked_calls(
-                &state.current_calls,
-                OBSERVATION_ONLY_CALL_BLOCK_REASON,
-            );
-            self.emit_blocked_tool_errors(&blocked, stream);
-            let blocked_results = build_blocked_tool_results(&blocked);
-            record_tool_round_messages(
-                &mut state.continuation_messages,
-                &mut state.evidence_messages,
-                &state.current_calls,
-                &self.tool_call_provider_ids,
-                &blocked_results,
-            )?;
-            state.all_tool_results.extend(blocked_results);
-            self.emit_signal(
-                LoopStep::Act,
-                SignalKind::Blocked,
-                "observation-only rounds forced to wrap up",
-                serde_json::json!({
-                    "round": round,
-                    "blocked_calls": state.current_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
-                }),
-            );
-            if !state.observation_replan_attempted {
-                state.observation_replan_attempted = true;
-                state
-                    .continuation_messages
-                    .push(Message::system(OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE));
-                self.compact_tool_continuation(round, &mut state.continuation_messages)
-                    .await?;
-                self.last_reasoning_messages = state.continuation_messages.clone();
-                return Ok(ToolRoundOutcome::ObservationRestrictedReplan);
-            }
-            return Ok(ToolRoundOutcome::ObservationRestricted);
-        }
-
-        let round_started = current_time_ms();
-        let executed_calls = state.current_calls.clone();
-        self.maybe_publish_tool_round_progress(round as usize, &executed_calls, stream);
-        let results = self
-            .execute_tool_calls_with_stream(&executed_calls, stream)
-            .await?;
-        self.publish_tool_round(&executed_calls, &results, stream);
-        let has_tool_errors = self.emit_tool_errors(&results, stream);
-        self.record_tool_execution_cost(results.len());
-        self.record_successful_tool_classifications(state, &executed_calls, &results);
-
-        let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
-        self.budget.record_result_bytes(round_result_bytes);
-
-        record_tool_round_messages(
-            &mut state.continuation_messages,
-            &mut state.evidence_messages,
-            &executed_calls,
-            &self.tool_call_provider_ids,
-            &results,
-        )?;
-        if has_tool_errors {
-            let failed: Vec<(&str, &str)> = results
-                .iter()
-                .filter(|result| !result.success)
-                .map(|result| (result.tool_name.as_str(), result.output.as_str()))
-                .collect();
-            state
-                .continuation_messages
-                .push(Message::system(tool_error_relay_directive(&failed)));
-        }
-        let round_results = results.clone();
-        state.all_tool_results.extend(results);
-        self.record_tool_round_kind(&executed_calls);
-        self.advance_bounded_local_phase_after_tool_round(&executed_calls, &round_results);
-        if let Some(reason) = self.bounded_local_terminal_reason.take() {
-            self.last_reasoning_messages = state.continuation_messages.clone();
-            self.expire_activity_progress(stream);
-            return Ok(ToolRoundOutcome::BoundedLocalTerminal(reason));
-        }
-        // DirectUtility authors its final answer directly from tool results, so it exits
-        // before the continuation/synthesis path. DirectInspection still goes through
-        // finalize_tool_response so the model can produce an evidence-backed answer and use
-        // its single synthesis fallback when the immediate continuation comes back empty.
-        if let TurnExecutionProfile::DirectUtility(profile) = &self.turn_execution_profile {
-            let response = direct_utility_terminal_response(profile, &state.all_tool_results);
-            self.last_reasoning_messages = state.continuation_messages.clone();
-            self.expire_activity_progress(stream);
-            return Ok(ToolRoundOutcome::DirectUtilityAnswered(response));
-        }
-
-        self.compact_tool_continuation(round, &mut state.continuation_messages)
-            .await?;
-        self.last_reasoning_messages = state.continuation_messages.clone();
-        self.expire_activity_progress(stream);
-
-        if self.cancellation_token_triggered() {
-            return Ok(ToolRoundOutcome::Cancelled);
-        }
-
-        if self.budget.state() == BudgetState::Low {
-            self.emit_budget_low_break_signal(round);
-            return Ok(ToolRoundOutcome::BudgetLow);
-        }
-
-        stream.phase(Phase::Synthesize);
-        let response = self
-            .request_tool_continuation(
-                llm,
-                &state.continuation_messages,
-                continuation_tools,
-                &mut state.tokens_used,
-                stream,
-            )
-            .await?;
-        self.record_continuation_cost(&response, &state.continuation_messages);
-        self.emit_tool_round_trace_and_perf(
-            round,
-            executed_calls.len(),
-            &response,
-            current_time_ms().saturating_sub(round_started),
-        );
-
-        if self.cancellation_token_triggered() {
-            return Ok(ToolRoundOutcome::Cancelled);
-        }
-
-        Ok(ToolRoundOutcome::Response(response))
-    }
-
-    async fn request_tool_continuation(
-        &mut self,
-        llm: &dyn LlmProvider,
-        context_messages: &[Message],
-        continuation_tools: Vec<ToolDefinition>,
-        tokens_used: &mut TokenUsage,
-        stream: CycleStream<'_>,
-    ) -> Result<CompletionResponse, LoopError> {
-        let continuation_tools = self.apply_turn_execution_profile_tool_surface(continuation_tools);
-        let mut request = build_continuation_request(ContinuationRequestParams::new(
-            context_messages,
-            llm.model_name(),
-            ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
-            RequestBuildContext::new(
-                self.memory_context.as_deref(),
-                self.scratchpad_context.as_deref(),
-                self.thinking_config.clone(),
-                self.notify_tool_guidance_enabled,
-            ),
-        ));
-        if let Some(directive) = self.turn_execution_profile_directive() {
-            if let Some(system_prompt) = request.system_prompt.as_mut() {
-                system_prompt.push_str(&directive);
-            }
-        }
-
-        let response = self
-            .request_completion(
-                llm,
-                request,
-                StreamingRequestContext::new(
-                    "act",
-                    StreamPhase::Synthesize,
-                    TextStreamVisibility::Hidden,
-                ),
-                stream,
-            )
-            .await?;
-
-        tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
-        Ok(response)
-    }
-
     async fn finalize_tool_response(
         &mut self,
         decision: &Decision,
@@ -4231,17 +3603,6 @@ fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usiz
         let target_bytes = largest.output.len().saturating_sub(excess_bytes);
         largest.output = truncate_tool_result(&largest.output, target_bytes).into_owned();
     }
-}
-
-fn calls_are_all_classification(
-    calls: &[ToolCall],
-    executor: &dyn ToolExecutor,
-    required: ToolCallClassification,
-) -> bool {
-    !calls.is_empty()
-        && calls
-            .iter()
-            .all(|call| executor.classify_call(call) == required)
 }
 
 fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {

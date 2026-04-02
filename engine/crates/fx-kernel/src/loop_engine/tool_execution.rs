@@ -1,16 +1,32 @@
-use super::bounded_local::{partition_by_bounded_local_phase_semantics, TurnExecutionProfile};
-use super::retry::{partition_by_retry_policy, BlockedToolCall};
-use super::{
-    loop_error, CycleStream, LoopEngine, ToolRoundState, NOTIFY_TOOL_NAME,
-    OBSERVATION_ONLY_CALL_BLOCK_REASON,
+use super::bounded_local::{
+    bounded_local_terminal_partial_response, partition_by_bounded_local_phase_semantics,
+    BoundedLocalTerminalReason, TurnExecutionProfile,
 };
-use crate::act::{ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult};
-use crate::budget::{truncate_tool_result, ActionCost};
+use super::compaction::CompactionScope;
+use super::request::{
+    build_continuation_request, ContinuationRequestParams, RequestBuildContext, ToolRequestConfig,
+};
+use super::retry::{partition_by_retry_policy, BlockedToolCall};
+use super::streaming::{StreamingRequestContext, TextStreamVisibility};
+use super::{
+    continuation_budget_cost, current_time_ms, find_decompose_tool_call, loop_error,
+    response_text_segment, stitch_response_segments, stitched_response_text,
+    summarize_tool_progress, tool_error_relay_directive, CycleStream, FollowUpDecomposeContext,
+    LlmProvider, LoopEngine, ToolRoundState, NOTIFY_TOOL_NAME, OBSERVATION_ONLY_CALL_BLOCK_REASON,
+    OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE, OBSERVATION_ONLY_TOOL_ROUND_NUDGE,
+    TOOL_ROUND_PROGRESS_NUDGE,
+};
+use crate::act::{
+    ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope, ToolCacheability,
+    ToolCallClassification, ToolExecutor, ToolResult,
+};
+use crate::budget::{truncate_tool_result, ActionCost, BudgetState};
+use crate::decide::Decision;
 use crate::signals::{LoopStep, SignalKind};
-use crate::streaming::ErrorCategory;
+use crate::streaming::{ErrorCategory, Phase};
 use crate::types::LoopError;
-use fx_core::message::{InternalMessage, ToolRoundCall, ToolRoundResult};
-use fx_llm::{ContentBlock, Message, MessageRole, ToolCall};
+use fx_core::message::{InternalMessage, StreamPhase, ToolRoundCall, ToolRoundResult};
+use fx_llm::{CompletionResponse, ContentBlock, Message, MessageRole, ToolCall, ToolDefinition};
 use std::collections::{HashMap, HashSet};
 
 struct PreparedToolCalls {
@@ -28,6 +44,37 @@ impl PreparedToolCalls {
         self.blocked.extend(blocked);
         self
     }
+}
+
+pub(super) enum ToolRoundOutcome {
+    Cancelled,
+    BudgetLow,
+    DirectUtilityAnswered(String),
+    BoundedLocalTerminal(BoundedLocalTerminalReason),
+    ObservationRestricted,
+    ObservationRestrictedReplan,
+    Response(CompletionResponse),
+}
+
+enum ToolLoopStep {
+    Continue(ToolRoundState),
+    Break(ToolRoundState),
+    Return(Box<ActionResult>),
+}
+
+struct ExecutedToolRound {
+    calls: Vec<ToolCall>,
+    results: Vec<ToolResult>,
+    has_tool_errors: bool,
+    started_at_ms: u64,
+}
+
+struct ToolRoundContinuationRequest<'a> {
+    round: u32,
+    llm: &'a dyn LlmProvider,
+    continuation_tools: Vec<ToolDefinition>,
+    executed: ExecutedToolRound,
+    stream: CycleStream<'a>,
 }
 
 impl LoopEngine {
@@ -296,6 +343,778 @@ impl LoopEngine {
         let mut results = truncate_tool_results(executed, max_bytes);
         results.append(&mut malformed_results);
         Ok(results)
+    }
+
+    pub(super) async fn act_with_tools(
+        &mut self,
+        decision: &Decision,
+        calls: &[ToolCall],
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+        stream: CycleStream<'_>,
+    ) -> Result<ActionResult, LoopError> {
+        let mut state = self.prepare_tool_action_state(calls, context_messages);
+        if self.budget.state() == BudgetState::Low {
+            return Ok(self.budget_low_blocked_result(
+                decision,
+                "tool dispatch",
+                &state.accumulated_text,
+            ));
+        }
+
+        for round in 0..self.max_iterations {
+            if self.tool_round_interrupted() {
+                return Ok(self.cancelled_tool_action_from_state(decision, state));
+            }
+            if self.tool_loop_budget_low(round) {
+                break;
+            }
+
+            let continuation_tools =
+                self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
+            let outcome = self
+                .execute_tool_round(round + 1, llm, &mut state, continuation_tools, stream)
+                .await?;
+            match self
+                .handle_tool_round_outcome(decision, llm, state, outcome, stream)
+                .await?
+            {
+                ToolLoopStep::Continue(next_state) => state = next_state,
+                ToolLoopStep::Break(next_state) => {
+                    state = next_state;
+                    break;
+                }
+                ToolLoopStep::Return(action) => return Ok(*action),
+            }
+        }
+
+        self.finish_tool_loop_on_exhaustion(decision, state, llm, stream)
+            .await
+    }
+
+    fn prepare_tool_action_state(
+        &mut self,
+        calls: &[ToolCall],
+        context_messages: &[Message],
+    ) -> ToolRoundState {
+        let initial_text = self.pending_tool_response_text.take();
+        let mut state = ToolRoundState::new(calls, context_messages, initial_text);
+        let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
+        state.current_calls = execute_calls;
+        if !deferred.is_empty() {
+            self.append_deferred_tool_results(&mut state, &deferred, calls.len());
+        }
+        state
+    }
+
+    fn tool_loop_budget_low(&mut self, round: u32) -> bool {
+        if self.budget.state() != BudgetState::Low {
+            return false;
+        }
+        self.emit_budget_low_break_signal(round);
+        true
+    }
+
+    async fn handle_tool_round_outcome(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        state: ToolRoundState,
+        outcome: ToolRoundOutcome,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        match outcome {
+            ToolRoundOutcome::Cancelled => Ok(ToolLoopStep::Return(Box::new(
+                self.cancelled_tool_action_from_state(decision, state),
+            ))),
+            ToolRoundOutcome::BudgetLow => Ok(ToolLoopStep::Break(state)),
+            ToolRoundOutcome::DirectUtilityAnswered(response) => Ok(ToolLoopStep::Return(
+                Box::new(self.direct_utility_action_result(decision, state, response)),
+            )),
+            ToolRoundOutcome::BoundedLocalTerminal(reason) => Ok(ToolLoopStep::Return(Box::new(
+                self.bounded_local_terminal_action(decision, state, reason),
+            ))),
+            ToolRoundOutcome::ObservationRestricted => Ok(ToolLoopStep::Return(Box::new(
+                self.observation_restricted_action(decision, state, None),
+            ))),
+            ToolRoundOutcome::ObservationRestrictedReplan => {
+                self.handle_observation_restricted_replan(decision, llm, state, stream)
+                    .await
+            }
+            ToolRoundOutcome::Response(response) => {
+                self.handle_tool_round_response(decision, llm, state, response, stream)
+                    .await
+            }
+        }
+    }
+
+    fn direct_utility_action_result(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+        response: String,
+    ) -> ActionResult {
+        let response = stitch_response_segments(&state.accumulated_text, Some(response));
+        ActionResult {
+            decision: decision.clone(),
+            tool_results: state.all_tool_results,
+            response_text: response.clone(),
+            tokens_used: state.tokens_used,
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
+        }
+    }
+
+    fn bounded_local_terminal_action(
+        &mut self,
+        decision: &Decision,
+        state: ToolRoundState,
+        reason: BoundedLocalTerminalReason,
+    ) -> ActionResult {
+        let partial_response = stitched_response_text(
+            &state.accumulated_text,
+            Some(bounded_local_terminal_partial_response(
+                reason,
+                &state.all_tool_results,
+            )),
+        );
+        self.bounded_local_terminal_action_result(
+            decision,
+            state.all_tool_results,
+            partial_response,
+            state.tokens_used,
+            reason,
+        )
+    }
+
+    fn observation_restricted_action(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+        tail: Option<String>,
+    ) -> ActionResult {
+        let partial = stitched_response_text(
+            &state.accumulated_text,
+            tail.or_else(|| summarize_tool_progress(&state.all_tool_results)),
+        );
+        self.incomplete_action_result(
+            decision,
+            state.all_tool_results,
+            partial,
+            OBSERVATION_ONLY_CALL_BLOCK_REASON,
+            state.tokens_used,
+        )
+    }
+
+    async fn handle_observation_restricted_replan(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        mut state: ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        let mutation_tools = self.side_effect_tool_definitions();
+        if mutation_tools.is_empty() {
+            return Ok(ToolLoopStep::Return(Box::new(
+                self.observation_restricted_action(decision, state, None),
+            )));
+        }
+
+        let response = self
+            .request_observation_restricted_replan(llm, &mut state, mutation_tools, stream)
+            .await?;
+        if response.tool_calls.is_empty() {
+            return self
+                .finish_observation_restricted_replan(decision, llm, state, response, stream)
+                .await;
+        }
+        self.handle_follow_up_tool_calls(llm, state, response).await
+    }
+
+    async fn request_observation_restricted_replan(
+        &mut self,
+        llm: &dyn LlmProvider,
+        state: &mut ToolRoundState,
+        continuation_tools: Vec<ToolDefinition>,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        stream.phase(Phase::Synthesize);
+        let response = self
+            .request_tool_continuation(
+                llm,
+                &state.continuation_messages,
+                continuation_tools,
+                &mut state.tokens_used,
+                stream,
+            )
+            .await?;
+        self.record_continuation_cost(&response, &state.continuation_messages);
+        Ok(response)
+    }
+
+    async fn finish_observation_restricted_replan(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        state: ToolRoundState,
+        response: CompletionResponse,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        let response = self
+            .continue_truncated_response(
+                response,
+                &state.continuation_messages,
+                llm,
+                LoopStep::Act,
+                stream,
+            )
+            .await?;
+        Ok(ToolLoopStep::Return(Box::new(
+            self.observation_restricted_action(decision, state, response_text_segment(&response)),
+        )))
+    }
+
+    async fn handle_tool_round_response(
+        &mut self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        state: ToolRoundState,
+        response: CompletionResponse,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolLoopStep, LoopError> {
+        if !response.tool_calls.is_empty() {
+            return self.handle_follow_up_tool_calls(llm, state, response).await;
+        }
+
+        let response = self
+            .continue_truncated_response(
+                response,
+                &state.continuation_messages,
+                llm,
+                LoopStep::Act,
+                stream,
+            )
+            .await?;
+        let next_tool_scope = self.continuation_tool_scope_for_round(&state);
+        let action = self
+            .finalize_tool_response(decision, state, &response, llm, stream, next_tool_scope)
+            .await?;
+        Ok(ToolLoopStep::Return(Box::new(action)))
+    }
+
+    async fn handle_follow_up_tool_calls(
+        &mut self,
+        llm: &dyn LlmProvider,
+        mut state: ToolRoundState,
+        response: CompletionResponse,
+    ) -> Result<ToolLoopStep, LoopError> {
+        if find_decompose_tool_call(&response.tool_calls).is_some() {
+            let ToolRoundState {
+                all_tool_results,
+                accumulated_text,
+                continuation_messages,
+                tokens_used,
+                ..
+            } = state;
+            let context = FollowUpDecomposeContext {
+                prior_tool_results: all_tool_results,
+                prior_tokens_used: tokens_used,
+                accumulated_text,
+            };
+            let action = self
+                .handle_follow_up_decompose(&response, llm, &continuation_messages, context)
+                .await?;
+            return Ok(ToolLoopStep::Return(Box::new(action)));
+        }
+
+        self.record_tool_round_response_state(&mut state, &response);
+        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
+        if !round_deferred.is_empty() {
+            self.append_deferred_tool_results(
+                &mut state,
+                &round_deferred,
+                response.tool_calls.len(),
+            );
+        }
+        state.current_calls = capped;
+        Ok(ToolLoopStep::Continue(state))
+    }
+
+    async fn finish_tool_loop_on_exhaustion(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+    ) -> Result<ActionResult, LoopError> {
+        let next_tool_scope = self.continuation_tool_scope_for_round(&state);
+        self.synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
+            .await
+    }
+
+    pub(super) fn apply_fan_out_cap(
+        &mut self,
+        calls: &[ToolCall],
+    ) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        let max_fan_out = self.budget.config().max_fan_out;
+        if calls.len() <= max_fan_out {
+            return (calls.to_vec(), Vec::new());
+        }
+
+        let execute = calls[..max_fan_out].to_vec();
+        let deferred = calls[max_fan_out..].to_vec();
+        let deferred_names: Vec<&str> = deferred.iter().map(|call| call.name.as_str()).collect();
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            format!(
+                "fan-out cap: executing {}/{}, deferring: {}",
+                max_fan_out,
+                calls.len(),
+                deferred_names.join(", ")
+            ),
+            serde_json::json!({
+                "executed": max_fan_out,
+                "total": calls.len(),
+                "deferred_tools": deferred_names,
+            }),
+        );
+        (execute, deferred)
+    }
+
+    fn append_deferred_tool_results(
+        &self,
+        state: &mut ToolRoundState,
+        deferred: &[ToolCall],
+        total: usize,
+    ) {
+        let executed = total.saturating_sub(deferred.len());
+        let names: Vec<&str> = deferred.iter().map(|call| call.name.as_str()).collect();
+        let message = format!(
+            "Tool calls deferred (budget: {executed}/{total}): {}. \
+             Re-request in your next turn if still needed.",
+            names.join(", ")
+        );
+        for call in deferred {
+            state.all_tool_results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: false,
+                output: message.clone(),
+            });
+        }
+    }
+
+    pub(super) fn budget_low_blocked_result(
+        &mut self,
+        decision: &Decision,
+        action_name: &str,
+        accumulated_text: &[String],
+    ) -> ActionResult {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("{action_name} blocked: budget is low, wrapping up"),
+            serde_json::json!({"reason": "budget_soft_ceiling"}),
+        );
+        let response = stitch_response_segments(
+            accumulated_text,
+            Some(format!(
+                "{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."
+            )),
+        );
+        self.text_action_result(decision, &response)
+    }
+
+    pub(super) fn record_continuation_cost(
+        &mut self,
+        response: &CompletionResponse,
+        context_messages: &[Message],
+    ) {
+        let cost = continuation_budget_cost(response, context_messages);
+        self.budget.record(&cost);
+    }
+
+    async fn compact_tool_continuation(
+        &mut self,
+        round: u32,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), LoopError> {
+        let compacted = {
+            let compaction = self.compaction();
+            compaction
+                .compact_if_needed(messages, CompactionScope::ToolContinuation, round)
+                .await?
+        };
+        if let std::borrow::Cow::Owned(compacted_messages) = compacted {
+            *messages = compacted_messages;
+        }
+        self.compaction()
+            .ensure_within_hard_limit(CompactionScope::ToolContinuation, messages)
+    }
+
+    fn emit_budget_low_break_signal(&mut self, round: u32) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("budget soft-ceiling reached during tool round {round}, breaking loop"),
+            serde_json::json!({"reason": "budget_soft_ceiling", "round": round}),
+        );
+    }
+
+    pub(super) async fn execute_tool_round(
+        &mut self,
+        round: u32,
+        llm: &dyn LlmProvider,
+        state: &mut ToolRoundState,
+        continuation_tools: Vec<ToolDefinition>,
+        stream: CycleStream<'_>,
+    ) -> Result<ToolRoundOutcome, LoopError> {
+        if let Some(outcome) = self
+            .maybe_handle_observation_only_round(round, state, stream)
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        let executed = self.run_tool_round_calls(round, state, stream).await?;
+        self.record_executed_tool_round(state, &executed)?;
+        if let Some(outcome) = self.round_terminal_outcome(state, stream) {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self
+            .prepare_round_continuation(round, state, stream)
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        self.request_tool_round_response(
+            state,
+            ToolRoundContinuationRequest {
+                round,
+                llm,
+                continuation_tools,
+                executed,
+                stream,
+            },
+        )
+        .await
+    }
+
+    async fn maybe_handle_observation_only_round(
+        &mut self,
+        round: u32,
+        state: &mut ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Result<Option<ToolRoundOutcome>, LoopError> {
+        if !self
+            .turn_execution_profile
+            .uses_standard_observation_controls()
+            || !self.observation_only_call_restriction_active()
+            || !calls_are_all_classification(
+                &state.current_calls,
+                self.tool_executor.as_ref(),
+                ToolCallClassification::Observation,
+            )
+        {
+            return Ok(None);
+        }
+
+        let blocked =
+            build_uniform_blocked_calls(&state.current_calls, OBSERVATION_ONLY_CALL_BLOCK_REASON);
+        self.emit_blocked_tool_errors(&blocked, stream);
+        let blocked_results = build_blocked_tool_results(&blocked);
+        record_tool_round_messages(
+            &mut state.continuation_messages,
+            &mut state.evidence_messages,
+            &state.current_calls,
+            &self.tool_call_provider_ids,
+            &blocked_results,
+        )?;
+        state.all_tool_results.extend(blocked_results);
+        self.emit_observation_only_block_signal(round, &state.current_calls);
+        if !state.observation_replan_attempted {
+            state.observation_replan_attempted = true;
+            state
+                .continuation_messages
+                .push(Message::system(OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE));
+            self.compact_tool_continuation(round, &mut state.continuation_messages)
+                .await?;
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            return Ok(Some(ToolRoundOutcome::ObservationRestrictedReplan));
+        }
+        Ok(Some(ToolRoundOutcome::ObservationRestricted))
+    }
+
+    fn emit_observation_only_block_signal(&mut self, round: u32, calls: &[ToolCall]) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            "observation-only rounds forced to wrap up",
+            serde_json::json!({
+                "round": round,
+                "blocked_calls": calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    async fn run_tool_round_calls(
+        &mut self,
+        round: u32,
+        state: &ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Result<ExecutedToolRound, LoopError> {
+        let started_at_ms = current_time_ms();
+        let calls = state.current_calls.clone();
+        self.maybe_publish_tool_round_progress(round as usize, &calls, stream);
+        let results = self.execute_tool_calls_with_stream(&calls, stream).await?;
+        self.publish_tool_round(&calls, &results, stream);
+        let has_tool_errors = self.emit_tool_errors(&results, stream);
+        self.record_tool_execution_cost(results.len());
+        Ok(ExecutedToolRound {
+            calls,
+            results,
+            has_tool_errors,
+            started_at_ms,
+        })
+    }
+
+    fn record_executed_tool_round(
+        &mut self,
+        state: &mut ToolRoundState,
+        executed: &ExecutedToolRound,
+    ) -> Result<(), LoopError> {
+        self.record_successful_tool_classifications(state, &executed.calls, &executed.results);
+        self.record_tool_round_result_bytes(&executed.results);
+        self.record_round_messages(state, executed)?;
+        state.all_tool_results.extend(executed.results.clone());
+        self.record_tool_round_kind(&executed.calls);
+        self.advance_bounded_local_phase_after_tool_round(&executed.calls, &executed.results);
+        Ok(())
+    }
+
+    fn record_tool_round_result_bytes(&mut self, results: &[ToolResult]) {
+        let round_result_bytes: usize = results.iter().map(|result| result.output.len()).sum();
+        self.budget.record_result_bytes(round_result_bytes);
+    }
+
+    fn record_round_messages(
+        &self,
+        state: &mut ToolRoundState,
+        executed: &ExecutedToolRound,
+    ) -> Result<(), LoopError> {
+        record_tool_round_messages(
+            &mut state.continuation_messages,
+            &mut state.evidence_messages,
+            &executed.calls,
+            &self.tool_call_provider_ids,
+            &executed.results,
+        )?;
+        if executed.has_tool_errors {
+            self.append_tool_error_relay(state, &executed.results);
+        }
+        Ok(())
+    }
+
+    fn append_tool_error_relay(&self, state: &mut ToolRoundState, results: &[ToolResult]) {
+        let failed: Vec<(&str, &str)> = results
+            .iter()
+            .filter(|result| !result.success)
+            .map(|result| (result.tool_name.as_str(), result.output.as_str()))
+            .collect();
+        state
+            .continuation_messages
+            .push(Message::system(tool_error_relay_directive(&failed)));
+    }
+
+    fn round_terminal_outcome(
+        &mut self,
+        state: &ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Option<ToolRoundOutcome> {
+        if let Some(reason) = self.bounded_local_terminal_reason.take() {
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            self.expire_activity_progress(stream);
+            return Some(ToolRoundOutcome::BoundedLocalTerminal(reason));
+        }
+        if let TurnExecutionProfile::DirectUtility(profile) = &self.turn_execution_profile {
+            let response = super::direct_utility::direct_utility_terminal_response(
+                profile,
+                &state.all_tool_results,
+            );
+            self.last_reasoning_messages = state.continuation_messages.clone();
+            self.expire_activity_progress(stream);
+            return Some(ToolRoundOutcome::DirectUtilityAnswered(response));
+        }
+        None
+    }
+
+    async fn prepare_round_continuation(
+        &mut self,
+        round: u32,
+        state: &mut ToolRoundState,
+        stream: CycleStream<'_>,
+    ) -> Result<Option<ToolRoundOutcome>, LoopError> {
+        self.compact_tool_continuation(round, &mut state.continuation_messages)
+            .await?;
+        self.last_reasoning_messages = state.continuation_messages.clone();
+        self.expire_activity_progress(stream);
+        if self.cancellation_token_triggered() {
+            return Ok(Some(ToolRoundOutcome::Cancelled));
+        }
+        if self.budget.state() == BudgetState::Low {
+            self.emit_budget_low_break_signal(round);
+            return Ok(Some(ToolRoundOutcome::BudgetLow));
+        }
+        Ok(None)
+    }
+
+    async fn request_tool_round_response(
+        &mut self,
+        state: &mut ToolRoundState,
+        request: ToolRoundContinuationRequest<'_>,
+    ) -> Result<ToolRoundOutcome, LoopError> {
+        request.stream.phase(Phase::Synthesize);
+        let response = self
+            .request_tool_continuation(
+                request.llm,
+                &state.continuation_messages,
+                request.continuation_tools,
+                &mut state.tokens_used,
+                request.stream,
+            )
+            .await?;
+        self.record_continuation_cost(&response, &state.continuation_messages);
+        self.emit_tool_round_trace_and_perf(
+            request.round,
+            request.executed.calls.len(),
+            &response,
+            current_time_ms().saturating_sub(request.executed.started_at_ms),
+        );
+        if self.cancellation_token_triggered() {
+            return Ok(ToolRoundOutcome::Cancelled);
+        }
+        Ok(ToolRoundOutcome::Response(response))
+    }
+
+    pub(super) fn apply_tool_round_progress_policy(
+        &self,
+        round: u32,
+        continuation_messages: &mut Vec<Message>,
+    ) -> Vec<ToolDefinition> {
+        let termination = self.current_termination_config();
+        let config = termination.as_ref();
+        let tool_nudge = u32::from(config.tool_round_nudge_after);
+        let tool_strip = tool_nudge.saturating_add(u32::from(config.tool_round_strip_after_nudge));
+        let observation_nudge = u32::from(config.observation_only_round_nudge_after);
+        let observation_strip = observation_nudge
+            .saturating_add(u32::from(config.observation_only_round_strip_after_nudge));
+        let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
+        let all_tools = self.tool_executor.tool_definitions();
+        let profile_owns_surface = self.turn_execution_profile.owns_tool_surface();
+
+        if !profile_owns_surface && observation_nudge > 0 && observation_rounds == observation_nudge
+        {
+            continuation_messages.push(Message::system(
+                OBSERVATION_ONLY_TOOL_ROUND_NUDGE.to_string(),
+            ));
+        }
+        if tool_nudge > 0 && round == tool_nudge {
+            continuation_messages.push(Message::system(TOOL_ROUND_PROGRESS_NUDGE.to_string()));
+        }
+        if !profile_owns_surface && observation_nudge > 0 && observation_rounds >= observation_strip
+        {
+            return self.side_effect_tool_definitions();
+        }
+        if tool_nudge > 0 && round >= tool_strip {
+            self.progress_limited_tool_definitions()
+        } else {
+            all_tools
+        }
+    }
+
+    pub(super) fn continuation_tool_scope_for_round(
+        &self,
+        state: &ToolRoundState,
+    ) -> Option<ContinuationToolScope> {
+        if self.turn_execution_profile.owns_tool_surface() {
+            return None;
+        }
+        if state.used_observation_tools && !state.used_mutation_tools {
+            let mutation_tools = self.side_effect_tool_definitions();
+            if !mutation_tools.is_empty() {
+                return Some(ContinuationToolScope::MutationOnly);
+            }
+        }
+        None
+    }
+
+    fn observation_only_call_restriction_active(&self) -> bool {
+        let termination = self.current_termination_config();
+        let config = termination.as_ref();
+        let nudge_threshold = u32::from(config.observation_only_round_nudge_after);
+        let strip_threshold = nudge_threshold
+            .saturating_add(u32::from(config.observation_only_round_strip_after_nudge));
+        nudge_threshold > 0
+            && u32::from(self.consecutive_observation_only_rounds) >= strip_threshold
+    }
+
+    pub(super) fn record_tool_round_kind(&mut self, calls: &[ToolCall]) {
+        let observation_only = !calls.is_empty()
+            && calls.iter().all(|call| {
+                self.tool_executor.classify_call(call) == ToolCallClassification::Observation
+            });
+        if observation_only {
+            self.consecutive_observation_only_rounds =
+                self.consecutive_observation_only_rounds.saturating_add(1);
+        } else {
+            self.consecutive_observation_only_rounds = 0;
+        }
+    }
+
+    pub(super) async fn request_tool_continuation(
+        &mut self,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+        continuation_tools: Vec<ToolDefinition>,
+        tokens_used: &mut crate::act::TokenUsage,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        let continuation_tools = self.apply_turn_execution_profile_tool_surface(continuation_tools);
+        let mut request = build_continuation_request(ContinuationRequestParams::new(
+            context_messages,
+            llm.model_name(),
+            ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
+            RequestBuildContext::new(
+                self.memory_context.as_deref(),
+                self.scratchpad_context.as_deref(),
+                self.thinking_config.clone(),
+                self.notify_tool_guidance_enabled,
+            ),
+        ));
+        if let Some(directive) = self.turn_execution_profile_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
+
+        let response = self
+            .request_completion(
+                llm,
+                request,
+                StreamingRequestContext::new(
+                    "act",
+                    StreamPhase::Synthesize,
+                    TextStreamVisibility::Hidden,
+                ),
+                stream,
+            )
+            .await?;
+        tokens_used.accumulate(super::response_usage_or_estimate(
+            &response,
+            context_messages,
+        ));
+        Ok(response)
     }
 }
 
@@ -591,6 +1410,17 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
         ),
         false,
     )
+}
+
+fn calls_are_all_classification(
+    calls: &[ToolCall],
+    executor: &dyn ToolExecutor,
+    required: ToolCallClassification,
+) -> bool {
+    !calls.is_empty()
+        && calls
+            .iter()
+            .all(|call| executor.classify_call(call) == required)
 }
 
 #[cfg(test)]
