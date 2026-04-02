@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/scripts/build.sh"
 SKILLS_BUILD_SCRIPT="$ROOT_DIR/skills/build.sh"
 LIB_SCRIPT="$ROOT_DIR/scripts/lib.sh"
+SKILL_WASM_TARGET="wasm32-wasip1"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -46,8 +47,8 @@ assert_skill_install_artifacts() {
   local install_dir="$1"
   local directory artifact
   while IFS=: read -r directory artifact; do
-    assert_exists "$install_dir/$artifact"
-    assert_exists "$install_dir/$directory.toml"
+    assert_exists "$install_dir/$directory/$artifact"
+    assert_exists "$install_dir/$directory/manifest.toml"
   done <<'EOF'
 weather-skill:weather.wasm
 calculator-skill:calculator.wasm
@@ -64,6 +65,14 @@ TMP_DIR="$(mktemp -d)"
 FAKE_BIN="$TMP_DIR/bin"
 FAKE_HOME="$TMP_DIR/home"
 CARGO_LOG="$TMP_DIR/cargo.log"
+REAL_AWK="$(command -v awk)"
+REAL_BASH="$(command -v bash)"
+REAL_CAT="$(command -v cat)"
+REAL_CP="$(command -v cp)"
+REAL_DATE="$(command -v date)"
+REAL_DIRNAME="$(command -v dirname)"
+REAL_GREP="$(command -v grep)"
+REAL_MKDIR="$(command -v mkdir)"
 export CARGO_LOG
 mkdir -p "$FAKE_BIN" "$FAKE_HOME/.cargo/bin"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -74,18 +83,18 @@ require_contains "$BUILD_SCRIPT" './build.sh ${skills_args[@]+"${skills_args[@]}
 require_contains "$BUILD_SCRIPT" 'clippy ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"} -- -D warnings'
 require_contains "$BUILD_SCRIPT" 'test ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"}'
 require_contains "$SKILLS_BUILD_SCRIPT" 'source "$SCRIPT_DIR/../scripts/lib.sh"'
-require_contains "$SKILLS_BUILD_SCRIPT" '"$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}'
+require_contains "$SKILLS_BUILD_SCRIPT" "\"\$CARGO_BIN\" build --target $SKILL_WASM_TARGET -j \"\$CARGO_BUILD_JOBS_VALUE\" \${CARGO_ARGS[@]+\"\${CARGO_ARGS[@]}\"}"
 require_contains "$LIB_SCRIPT" 'detect_cpu_count()'
 require_contains "$LIB_SCRIPT" 'resolve_tool()'
 
-make_fake_command "$FAKE_BIN/bash" 'exec /bin/bash "$@"'
-make_fake_command "$FAKE_BIN/dirname" 'exec /usr/bin/dirname "$@"'
-make_fake_command "$FAKE_BIN/date" 'exec /usr/bin/date "$@"'
-make_fake_command "$FAKE_BIN/awk" 'exec /usr/bin/awk "$@"'
-make_fake_command "$FAKE_BIN/cat" 'exec /usr/bin/cat "$@"'
-make_fake_command "$FAKE_BIN/grep" 'exec /usr/bin/grep "$@"'
-make_fake_command "$FAKE_BIN/mkdir" 'exec /bin/mkdir "$@"'
-make_fake_command "$FAKE_BIN/cp" 'exec /bin/cp "$@"'
+make_fake_command "$FAKE_BIN/bash" 'exec "'"$REAL_BASH"'" "$@"'
+make_fake_command "$FAKE_BIN/dirname" 'exec "'"$REAL_DIRNAME"'" "$@"'
+make_fake_command "$FAKE_BIN/date" 'exec "'"$REAL_DATE"'" "$@"'
+make_fake_command "$FAKE_BIN/awk" 'exec "'"$REAL_AWK"'" "$@"'
+make_fake_command "$FAKE_BIN/cat" 'exec "'"$REAL_CAT"'" "$@"'
+make_fake_command "$FAKE_BIN/grep" 'exec "'"$REAL_GREP"'" "$@"'
+make_fake_command "$FAKE_BIN/mkdir" 'exec "'"$REAL_MKDIR"'" "$@"'
+make_fake_command "$FAKE_BIN/cp" 'exec "'"$REAL_CP"'" "$@"'
 make_fake_command "$FAKE_BIN/cargo" '
 {
   printf "argc=%s\n" "$#"
@@ -109,17 +118,17 @@ done
 
 crate="${PWD##*/}"
 crate="${crate//-/_}"
-target_dir="$PWD/target/wasm32-unknown-unknown/$profile"
+target_dir="$PWD/target/'"$SKILL_WASM_TARGET"'/$profile"
 mkdir -p "$target_dir"
 printf "fake wasm for %s\n" "$crate" >"$target_dir/$crate.wasm"
 '
 make_fake_command "$FAKE_HOME/.cargo/bin/rustup" '
 if [[ "${1:-}" == "target" && "${2:-}" == "list" && "${3:-}" == "--installed" ]]; then
-  printf "wasm32-unknown-unknown\n"
+  printf "'"$SKILL_WASM_TARGET"'\n"
   exit 0
 fi
 
-if [[ "${1:-}" == "target" && "${2:-}" == "add" && "${3:-}" == "wasm32-unknown-unknown" ]]; then
+if [[ "${1:-}" == "target" && "${2:-}" == "add" && "${3:-}" == "'"$SKILL_WASM_TARGET"'" ]]; then
   exit 0
 fi
 

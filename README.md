@@ -103,7 +103,7 @@ WASM skills extend Fawx's capabilities. Each skill runs in a sandboxed WebAssemb
 
 ## WASM Skills
 
-Skills are Rust crates compiled to WebAssembly. The [skill marketplace](https://github.com/fawxai) has ready-to-install skills. Building your own takes minutes:
+Skills are Rust crates compiled to WebAssembly. The recommended local-dev workflow is `fawx skill build <project>`: it builds the project for `wasm32-wasip1`, installs it into `~/.fawx/skills/`, and signs it when a signing key is present.
 
 ```rust
 #[no_mangle]
@@ -115,13 +115,26 @@ pub extern "C" fn run() {
 ```
 
 ```bash
-# Install a skill
-fawx skill install fawxai/skill-web-search
-
-# Or build your own
+# Recommended local-dev workflow
 cargo generate fawxai/skill-template
-cargo build --release --target wasm32-unknown-unknown
-fawx skill install ./target/wasm32-unknown-unknown/release/my_skill.wasm
+cd my-skill
+fawx skill build .
+```
+
+Use the other paths when they match your input:
+
+- `fawx skill build <project>` is the canonical local-dev path for a custom skill project.
+- `skills/build.sh --install` is the repo maintainer path for the built-in `skills/` collection.
+- `fawx skill install <path>` is the artifact path for a prebuilt `.wasm` file or skill directory.
+- `fawx sign <skill>` signs an already-installed skill when it still needs a signature.
+
+```bash
+# Prebuilt local artifact
+cargo build --release --target wasm32-wasip1
+fawx skill install ./target/wasm32-wasip1/release/my_skill.wasm
+
+# Built-in repo skills collection
+skills/build.sh --install
 ```
 
 Available skills: [web search](https://github.com/fawxai/skill-brave-search) · [web fetch](https://github.com/fawxai/skill-web-fetch) · [scheduler](https://github.com/fawxai/skill-scheduler) · weather · vision · TTS · STT · browser · canvas

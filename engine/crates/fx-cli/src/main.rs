@@ -33,6 +33,41 @@ use std::{
 
 pub use confirmation::ConfirmationUi;
 
+const SKILL_COMMAND_AFTER_HELP: &str = concat!(
+    "Recommended workflows:\n",
+    "  Local dev project:  fawx skill build <project>\n",
+    "  Repo built-in set:  skills/build.sh --install\n",
+    "  Prebuilt artifact:  fawx skill install <path>\n",
+    "\n",
+    "Use `fawx sign <skill>` only when an already-installed skill still needs a signature.\n",
+);
+const SKILL_BUILD_AFTER_HELP: &str = concat!(
+    "Recommended local-dev path.\n",
+    "Builds the project for wasm32-wasip1, installs it into ~/.fawx/skills/, and signs it when a signing key exists.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx skill build <project>\n",
+    "  fawx skill build <project> --no-install\n",
+    "\n",
+    "Use `fawx sign <skill>` only if you need to sign an already-installed skill.\n",
+);
+const SKILL_INSTALL_AFTER_HELP: &str = concat!(
+    "Use this for prebuilt local artifacts or skill directories.\n",
+    "Any argument containing `/`, `\\`, or ending in `.wasm` is treated as a local path.\n",
+    "Bare names go through the marketplace install flow.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx skill install <path>\n",
+    "  fawx skill install <marketplace-name>\n",
+);
+const SIGN_COMMAND_AFTER_HELP: &str = concat!(
+    "Use this after a skill is already installed, or after building with --no-sign.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx sign <skill>\n",
+    "  fawx sign --all\n",
+);
+
 #[derive(Parser)]
 #[command(name = "fawx")]
 #[command(about = "Fawx AI Agent CLI", long_about = None)]
@@ -179,12 +214,14 @@ enum Commands {
     },
 
     /// Manage skills
+    #[command(after_long_help = SKILL_COMMAND_AFTER_HELP)]
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
     },
 
     /// Sign installed WASM skills
+    #[command(after_long_help = SIGN_COMMAND_AFTER_HELP)]
     Sign(commands::skill_sign::SignArgs),
 
     /// Search the skill registry
@@ -313,9 +350,10 @@ enum SkillCommands {
         query: Option<String>,
     },
 
-    /// Install a skill
+    /// Install a skill by marketplace name or local path
+    #[command(after_long_help = SKILL_INSTALL_AFTER_HELP)]
     Install {
-        /// Skill name or path to WASM file
+        /// Marketplace name or local path to a .wasm file / skill directory
         name_or_path: String,
         /// Override data directory (default: ~/.fawx)
         #[arg(long)]
@@ -332,6 +370,7 @@ enum SkillCommands {
     },
 
     /// Build a skill from source (compile, sign, install)
+    #[command(after_long_help = SKILL_BUILD_AFTER_HELP)]
     Build {
         /// Path to skill project directory
         path: String,
@@ -1303,19 +1342,55 @@ mod tests {
         ));
     }
 
+    fn render_subcommand_help(mut command: clap::Command, path: &[&str]) -> String {
+        let mut current = &mut command;
+        for segment in path {
+            current = current
+                .find_subcommand_mut(segment)
+                .unwrap_or_else(|| panic!("missing subcommand: {segment}"));
+        }
+        let mut help = Vec::new();
+        current.write_long_help(&mut help).expect("write help");
+        String::from_utf8(help).expect("utf8 help")
+    }
+
     #[test]
     fn cli_sign_help_matches_slash_help_surface() {
-        let mut command = Cli::command();
-        let sign = command.find_subcommand_mut("sign").expect("sign command");
-        let mut help = Vec::new();
-        sign.write_long_help(&mut help).expect("write help");
-        let help = String::from_utf8(help).expect("utf8 help");
+        let help = render_subcommand_help(Cli::command(), &["sign"]);
         let slash_help = crate::commands::slash::help_text();
 
         assert!(help.contains("SKILL"));
         assert!(help.contains("--all"));
         assert!(slash_help.contains("/sign <skill>"));
         assert!(slash_help.contains("/sign --all"));
+    }
+
+    #[test]
+    fn cli_skill_help_describes_recommended_workflows() {
+        let help = render_subcommand_help(Cli::command(), &["skill"]);
+
+        assert!(help.contains("fawx skill build <project>"));
+        assert!(help.contains("skills/build.sh --install"));
+        assert!(help.contains("fawx skill install <path>"));
+    }
+
+    #[test]
+    fn cli_skill_build_help_calls_out_wasip1_path() {
+        let help = render_subcommand_help(Cli::command(), &["skill", "build"]);
+
+        assert!(help.contains("wasm32-wasip1"));
+        assert!(help.contains("fawx skill build <project>"));
+        assert!(help.contains("fawx sign <skill>"));
+    }
+
+    #[test]
+    fn cli_skill_install_help_explains_path_vs_marketplace_routing() {
+        let help = render_subcommand_help(Cli::command(), &["skill", "install"]);
+
+        assert!(help.contains("ending in `.wasm` is treated as a local path"));
+        assert!(help.contains("Bare names go through the marketplace install flow"));
+        assert!(help.contains("fawx skill install <path>"));
+        assert!(help.contains("fawx skill install <marketplace-name>"));
     }
 
     #[test]

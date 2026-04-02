@@ -235,8 +235,11 @@ fn list_skill_directories(skills_dir: &Path) -> Result<Vec<fs::DirEntry>> {
 fn print_empty_skills_message() {
     println!("No skills installed.");
     println!();
-    println!("To install a skill:");
-    println!("  fawx skill install <path-to-skill>");
+    println!("Recommended local-dev workflow:");
+    println!("  fawx skill build <project>");
+    println!();
+    println!("Prebuilt artifact workflow:");
+    println!("  fawx skill install <path>");
 }
 
 fn print_skill_entry(skill_dir: &Path) {
@@ -529,19 +532,21 @@ fn lib_rs(name: &str) -> String {
 }
 
 fn readme_md(name: &str) -> String {
+    let artifact_name = name.replace('-', "_");
     format!(
         concat!(
             "# {name}\n\n",
             "A Fawx WASM skill.\n\n",
-            "## Build\n\n",
+            "## Recommended Local Workflow\n\n",
             "```bash\n",
-            "cargo build --release --target wasm32-unknown-unknown\n",
+            "fawx skill build .\n",
             "```\n\n",
-            "## Install\n\n",
+            "## Prebuilt Artifact Install\n\n",
             "```bash\n",
-            "fawx skill install target/wasm32-unknown-unknown/release/{name}.wasm\n",
+            "fawx skill install target/wasm32-wasip1/release/{artifact_name}.wasm\n",
             "```\n"
         ),
+        artifact_name = artifact_name,
         name = name
     )
 }
@@ -549,13 +554,13 @@ fn readme_md(name: &str) -> String {
 fn print_create_summary(project_dir: &Path, name: &str) {
     println!("Created skill project: {}/", project_dir.display());
     println!();
-    println!("To build:");
+    println!("Recommended local workflow:");
     println!("  cd {}", project_dir.display());
-    println!("  cargo build --release --target wasm32-unknown-unknown");
+    println!("  fawx skill build .");
     println!();
-    println!("To install:");
+    println!("To install a prebuilt artifact:");
     println!(
-        "  fawx skill install target/wasm32-unknown-unknown/release/{}.wasm",
+        "  fawx skill install target/wasm32-wasip1/release/{}.wasm",
         name.replace('-', "_")
     );
 }
@@ -758,6 +763,15 @@ mod tests {
         let manifest = read(project_dir.join("manifest.toml"));
 
         assert!(manifest.contains("capabilities = [\"network\", \"storage\"]"));
+    }
+
+    #[test]
+    fn generated_readme_uses_canonical_local_workflow() {
+        let readme = readme_md("weather-skill");
+
+        assert!(readme.contains("fawx skill build ."));
+        assert!(readme.contains("target/wasm32-wasip1/release/weather_skill.wasm"));
+        assert!(!readme.contains("wasm32-unknown-unknown"));
     }
 
     #[test]

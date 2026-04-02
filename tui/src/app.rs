@@ -53,7 +53,7 @@ const WELCOME_COMMAND_WIDTH: usize = 28;
 const MAX_VISIBLE_SKILLS: usize = 8;
 const VERSION_LABEL: &str = concat!("Fawx v", env!("CARGO_PKG_VERSION"));
 const EMPTY_SKILLS_MESSAGE: &str =
-    "No local skills installed. Run /skills to inspect local build/install state or fawx skill install <name>.";
+    "No local skills installed. Run /skills for workflow help, fawx skill build <project> for local dev, or fawx skill install <path> for prebuilt artifacts.";
 const DEFAULT_SKILL_ICON: &str = "🧩";
 const ASCII_LOGO_ART: &str = r#"    ___                  
    / __\__ ___      ___ __
@@ -1251,13 +1251,24 @@ fn built_skill_artifact_exists(path: &Path) -> bool {
     if package_name.is_empty() {
         return false;
     }
-    let target_wasm = path
-        .join("target")
-        .join("wasm32-wasi")
-        .join("release")
-        .join(format!("{package_name}.wasm"));
-    let packaged_wasm = path.join("pkg").join(format!("{package_name}.wasm"));
-    target_wasm.exists() || packaged_wasm.exists()
+    wasm_artifact_names(package_name)
+        .iter()
+        .any(|artifact_name| {
+            let target_wasm = path
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release")
+                .join(artifact_name);
+            let packaged_wasm = path.join("pkg").join(artifact_name);
+            target_wasm.exists() || packaged_wasm.exists()
+        })
+}
+
+fn wasm_artifact_names(package_name: &str) -> [String; 2] {
+    [
+        format!("{package_name}.wasm"),
+        format!("{}.wasm", package_name.replace('-', "_")),
+    ]
 }
 
 fn read_skill_manifest(path: &Path) -> LocalSkillSummary {
@@ -1325,6 +1336,11 @@ fn format_skills_message(
         LocalSkillState::BuiltLocally.description().to_string(),
         LocalSkillState::InstalledLocally.description().to_string(),
         "Loaded on server: running server reports it via /v1/skills".to_string(),
+        String::new(),
+        "Recommended workflows:".to_string(),
+        "  Local dev: fawx skill build <project>".to_string(),
+        "  Prebuilt artifact: fawx skill install <path>".to_string(),
+        "  Built-in repo skills: skills/build.sh --install".to_string(),
     ];
     let sections = skill_sections(installed, available);
     lines.push(String::new());
@@ -2107,6 +2123,12 @@ mod tests {
         "  /keys revoke <fingerprint>\n",
         "  /sign <skill>  Sign one installed WASM skill\n",
         "  /sign --all    Sign all installed WASM skills\n",
+        "  /skills         Inspect local build/install state\n",
+        "                 Local dev: fawx skill build <project>\n",
+        "                 Prebuilt:  fawx skill install <path>\n",
+        "                 Repo skills: skills/build.sh --install\n",
+        "  /install <name> Install a skill from the marketplace\n",
+        "  /search [query] Search the skill marketplace\n",
         "  /status        Show model, tokens, budget summary\n",
         "  /budget        Show detailed budget usage\n",
         "  /loop          Show loop iteration details\n",
@@ -2991,7 +3013,8 @@ mod tests {
 
         assert!(text.contains("No local skills installed."));
         assert!(text.contains("/skills"));
-        assert!(text.contains("local build/install state"));
+        assert!(text.contains("workflow help"));
+        assert!(text.contains("fawx skill build"));
         assert!(text.contains("fawx skill install"));
     }
 
@@ -3003,6 +3026,8 @@ mod tests {
         assert!(text.contains("Built locally (repo artifact found):"));
         assert!(text.contains("○ 🧪 test-built"));
         assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
+        assert!(text.contains("Recommended workflows:"));
+        assert!(text.contains("Local dev: fawx skill build <project>"));
         assert!(text.contains("/skills does not verify loaded-on-server state."));
     }
 
@@ -3014,6 +3039,7 @@ mod tests {
         assert!(text.contains("Installed locally (~/.fawx/skills):"));
         assert!(text.contains("✓ 🌤 weather"));
         assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
+        assert!(text.contains("Prebuilt artifact: fawx skill install <path>"));
         assert!(text.contains("/skills does not verify loaded-on-server state."));
     }
 
@@ -3022,6 +3048,7 @@ mod tests {
         let text = format_skills_message(&[], &[]);
 
         assert!(text.contains("No local built or installed skills found."));
+        assert!(text.contains("Built-in repo skills: skills/build.sh --install"));
         assert!(text.contains("/skills does not verify loaded-on-server state."));
         assert!(text.contains(
             "The Swift Skills UI and /v1/skills show only skills the running server has loaded."
@@ -3105,6 +3132,34 @@ mod tests {
     }
 
     #[test]
+    fn built_skill_artifact_detection_uses_wasip1_target_output() {
+        let built_dir = repo_root_from_manifest_dir()
+            .expect("repo root")
+            .join("skills")
+            .join("test-wasip1-built-skill");
+        fs::create_dir_all(
+            built_dir
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release"),
+        )
+        .expect("built dir");
+        fs::write(
+            built_dir
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release")
+                .join("test_wasip1_built_skill.wasm"),
+            b"wasm",
+        )
+        .expect("built wasm");
+
+        assert!(built_skill_artifact_exists(&built_dir));
+
+        fs::remove_dir_all(&built_dir).expect("cleanup built dir");
+    }
+
+    #[test]
     fn skills_command_shows_installed_and_built_skills() {
         let _guard = env_lock().blocking_lock();
         let home = temp_test_dir("home");
@@ -3147,6 +3202,7 @@ mod tests {
         assert!(text.contains("✓ 🌤 weather"));
         assert!(text.contains("Built locally (repo artifact found):"));
         assert!(text.contains("○ 🧪 test-built"));
+        assert!(text.contains("Recommended workflows:"));
         assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
         assert!(text.contains("/skills does not verify loaded-on-server state."));
     }
