@@ -175,33 +175,33 @@
 </head>
 <body>
 
-<h1>Fawx Roadmap v4.4</h1>
-<p class="subtitle">Kernel contract stabilization first. One PR at a time on dev. New substrate and authority work resume only after the loop, transcript, and persistence contracts are trustworthy again.</p>
+<h1>Fawx Roadmap v4.5</h1>
+<p class="subtitle">The core refactor and Step 14 backend contract are now effectively complete on <code>dev</code>. Remaining open items are narrow cleanup issues, plus one intentionally parked Swift follow-on.</p>
 
 <div class="checkpoint">
-  <strong>Checkpoint (2026-03-30):</strong> <code>#1641</code> direct-inspection profile is fully landed across four phases. The fake-permission regression is fixed, direct inspection completes terminally from evidence, profile boundaries are consolidated with regression lock-in, and the redundant prompt-level working_dir restriction is removed. Gates A and B are clear. Next: <code>#1658</code> runaway continuation, then <code>#1656</code> tool ordering.
+  <strong>Checkpoint (2026-04-02):</strong> Steps 12 through 14 are landed, stale refactor/backend issues have been reconciled against the codebase, and the remaining open refactor items are now the narrow leftovers: <code>#1638</code>, <code>#1640</code>, and <code>#1644</code>. Step 15 is spec-ready but intentionally parked.
 </div>
 
 <div class="thesis">
-  "Extensibility resumes after the runtime can finish a deterministic inspection turn, persist a clean tool history, and replay that history without inventing blockers or losing tool identity."
+  "The runtime contract work is now largely done. What remains is cleanup of the last static-dispatch and action/provider pockets, plus product follow-ons that are no longer on the critical path."
 </div>
 
 <div class="summary-grid">
   <div class="summary-card">
-    <div class="number" style="color: var(--green)">6</div>
-    <div class="label">Landed foundation items</div>
+    <div class="number" style="color: var(--green)">14</div>
+    <div class="label">Landed refactor / backend items</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--red)">3</div>
-    <div class="label">Active stabilization items</div>
+    <div class="label">Open refactor cleanup issues</div>
   </div>
   <div class="summary-card">
-    <div class="number" style="color: var(--yellow)">3</div>
-    <div class="label">Queued architecture items</div>
+    <div class="number" style="color: var(--yellow)">1</div>
+    <div class="label">Open quality bug tied to the tranche</div>
   </div>
   <div class="summary-card">
     <div class="number" style="color: var(--text-muted)">1</div>
-    <div class="label">Deferred feature item</div>
+    <div class="label">Parked feature follow-on</div>
   </div>
 </div>
 
@@ -209,63 +209,59 @@
 <div class="panel">
   <div class="panel-grid">
     <div>
-      <h3>Foundation already landed</h3>
+      <h3>Landed refactor and backend tranche</h3>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait completion</span><span class="tag tag-done">merged</span></div>
-        <div class="issue-body">Necessary cleanup. Reduced stringly action checks.</div>
+        <div class="issue-header"><span class="issue-number">#1639</span><span class="issue-title">Tool trait / registry</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Built-in tool dispatch now runs through a shared <code>Tool</code> trait and registry architecture.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1643</span><span class="issue-title">Config decomposition</span><span class="tag tag-done">merged</span></div>
-        <div class="issue-body">Good refactor. Not the center of current instability.</div>
+        <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Loop / direct-inspection refactor tranche</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">The direct-inspection profile, loop stabilization follow-ups, and the broader loop decomposition through Step 13 are now on <code>dev</code>.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata on traits</span><span class="tag tag-done">merged</span></div>
-        <div class="issue-body">Good refactor. Removed provider-name dispatch.</div>
+        <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Headless responsibilities are now split behind explicit startup, routing, execution, and output seams.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1614</span><span class="issue-title">Mixed text preservation</span><span class="tag tag-done">merged</span></div>
-        <div class="issue-body">Feature goal landed, but <code>13376838</code> reintroduced runaway behavior tracked separately in <code>#1658</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1643</span><span class="issue-title">Config decomposition</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">The config crate is now decomposed into focused modules instead of a single monolith.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1639</span><span class="issue-title">Tool trait / registry</span><span class="tag tag-done">merged to dev</span></div>
-        <div class="issue-body">Critical path refactor is now in dev. This unlocks later skill work, but it does not solve the runtime contract bugs.</div>
+        <div class="issue-header"><span class="issue-number">#1655 / #1656 / #1658</span><span class="issue-title">Transcript, ordering, and mixed-text follow-ups</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Grouped historical tool activity, tool ordering protection, and the mixed-text runaway fix are all now landed and closed.</div>
+      </div>
+      <div class="issue-card">
+        <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
+        <div class="issue-body">Step 14 shipped archive metadata, archive routes, archived-session filters, export, and contract hardening through <code>#1692</code>.</div>
       </div>
     </div>
     <div>
-      <h3>Current stabilization tranche</h3>
+      <h3>Remaining open items</h3>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Direct inspection profile</span><span class="tag tag-done">landed (4 phases)</span></div>
-        <div class="issue-body">Architectural fix for the fake-permission / outside-working-directory regression. Four phases merged to dev:
-          <ul>
-            <li><strong>Phase 1</strong> (#1659): detection and profile routing</li>
-            <li><strong>Phase 2</strong> (#1660): profile-owned tool surface, directives, block reasons</li>
-            <li><strong>Phase 3</strong> (#1661): terminal completion from evidence + working_dir prompt removal</li>
-            <li><strong>Phase 4</strong> (#1662): profile boundary consolidation, outside-workspace read fix, regression lock-in</li>
-          </ul>
-          Also shipped: <code>fx-core::path::expand_tilde</code> extraction, <code>resolve_read_path</code> / <code>jailed_path</code> write-safety split, cross-profile boundary tests, updated bisect lane runbook with headless API + macOS app modes.
-        </div>
+        <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-risk">still open</span></div>
+        <div class="issue-body">Most of the high-leverage audit landed, but residual static-dispatch pockets remain and the parent issue still serves as the cleanup umbrella.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduced by 13376838</span><span class="tag tag-done">landed</span></div>
-        <div class="issue-body">Separate from the original <code>#1652</code> regression and separate from <code>#1641</code>. Traced in <code>docs/fix/1653-runaway-reintroduction-trace.md</code>. Fixed on dev in PR <code>#1663</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata on traits</span><span class="tag tag-risk">partial</span></div>
+        <div class="issue-body">Provider-owned metadata is much better, but some provider-name dispatch still exists in setup/catalog paths, so this is not fully done yet.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Persisted tool ordering / unknown tool</span><span class="tag tag-done">landed</span></div>
-        <div class="issue-body">Post-turn identity and ordering corruption. Traced in <code>docs/fix/1656-unknown-tool-post-turn-trace.md</code>. Fixed on dev in PR <code>#1664</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait completion</span><span class="tag tag-risk">still open</span></div>
+        <div class="issue-body">This one should stay open. The codebase still has stringly <code>ActionStep</code> / action-name matching that has not been replaced end to end.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-done">landed</span></div>
-        <div class="issue-body">Turn-scoped transcript contract cleanup after ordering was fixed. Landed on dev in PR <code>#1665</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1614</span><span class="issue-title">Double response when model emits text + tool call</span><span class="tag tag-risk">open bug</span></div>
+        <div class="issue-body">Still a real quality bug. It should not be represented as already done just because adjacent loop work landed.</div>
       </div>
       <div class="issue-card">
-        <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing and visible tool contracts</span><span class="tag tag-done">landed</span></div>
-        <div class="issue-body">Manifest-driven direct utility routing, visible structured tool contracts, and startup/data-dir contract alignment. Landed on dev in PR <code>#1666</code>.</div>
+        <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export UI</span><span class="tag tag-next">parked</span></div>
+        <div class="issue-body">Option A spec docs are on <code>dev</code>, but this is now an intentionally parked Swift follow-on rather than a critical-path refactor step.</div>
       </div>
     </div>
   </div>
 </div>
 
-<h2>Linear plan we can begin now</h2>
+<h2>Completed sequence and parked follow-on</h2>
 <div class="panel" style="border-left: 3px solid var(--accent);">
   <div class="sequence-step" style="border-left: 3px solid var(--green);">
     <strong>✅ Steps 1-4. #1641 Phases 1-4: direct inspection profile (COMPLETE)</strong>
@@ -297,7 +293,7 @@
   </div>
   <div class="sequence-step">
     <strong>Step 11. #1638: static dispatch audit</strong>
-    <div class="step-meta">Completed via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>. Canonical defaults, tool-owned action/journal metadata, and authority-surface contracts now replace the highest-leverage static dispatch drift.</div>
+    <div class="step-meta">The major tranche landed via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>, but <code>#1638</code> remains open as the umbrella for the smaller residual static-dispatch pockets still in the tree.</div>
   </div>
   <div class="sequence-step">
     <strong>Step 12. #1642: headless decomposition</strong>
@@ -311,9 +307,9 @@
     <strong>Step 14. #1487: session archive / export backend</strong>
     <div class="step-meta">Completed via PRs <code>#1688</code>, <code>#1689</code>, <code>#1690</code>, <code>#1691</code>, and <code>#1692</code>. Archive metadata, archive routes, archived-session filtering, canonical export, and final contract hardening are now on <code>dev</code>.</div>
   </div>
-  <div class="sequence-step">
+  <div class="sequence-step" style="border-left: 3px solid var(--text-muted);">
     <strong>Step 15. #1637: Swift session archive / browser / export UI</strong>
-    <div class="step-meta">Next step. Option A is now spec'd on <code>dev</code>: single-session archive / unarchive, archived-session filter, and per-session export UI with no bulk actions in the first pass.</div>
+    <div class="step-meta">Parked follow-on. Option A is spec'd on <code>dev</code>: single-session archive / unarchive, archived-session filter, and per-session export UI with no bulk actions in the first pass, but this is no longer the critical path after the completed refactor/backend tranche.</div>
   </div>
 </div>
 
@@ -331,92 +327,42 @@
 <h2>Current issue classification</h2>
 <div class="panel-grid">
   <div class="panel">
-    <h3>True refactors, keep these as refactors</h3>
+    <h3>Closed and landed</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1639</span><span class="issue-title">Tool trait</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Good substrate refactor. Foundation for later work.</div>
+      <div class="issue-header"><span class="issue-number">#1639 / #1641 / #1642 / #1643</span><span class="issue-title">Core structural refactors</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Tool trait/registry, loop decomposition, headless decomposition, and config decomposition are all now in the tree and reflected in the closed issue set.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Good metadata refactor.</div>
+      <div class="issue-header"><span class="issue-number">#1646 / #1647</span><span class="issue-title">Skill/runtime contract follow-through</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">Visible tool contracts, direct utility routing, and revisioned skill activation lifecycle landed and the issues were reconciled against the code.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1643</span><span class="issue-title">Config decomposition</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Good cleanup, lower leverage than the current runtime contract bugs.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Good cleanup.</div>
+      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
+      <div class="issue-body">The backend contract is complete and closed. Remaining session-browser work is purely a Swift/UI follow-on.</div>
     </div>
   </div>
 
   <div class="panel">
-    <h3>Rewrite-in-place / contract work</h3>
+    <h3>Still open for good reasons</h3>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Loop engine direct-inspection slice</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Four-phase implementation complete. Profile detection, owned tool surface, terminal completion, boundary consolidation.</div>
+      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-risk">open</span></div>
+      <div class="issue-body">Residual pockets remain in action/provider/setup/catalog code. This issue is now much smaller, but it is not false-open.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1658</span><span class="issue-title">Runaway continuation reintroduction</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1663</code>. Mixed-text continuation semantics are stable again.</div>
+      <div class="issue-header"><span class="issue-number">#1640</span><span class="issue-title">Provider metadata on traits</span><span class="tag tag-risk">open</span></div>
+      <div class="issue-body">Partially landed. Provider-owned metadata is stronger, but provider-name dispatch still exists in a few places.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1656</span><span class="issue-title">Tool ordering and identity integrity</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1664</code>. Session write boundary and replay correctness are now locked in.</div>
+      <div class="issue-header"><span class="issue-number">#1644</span><span class="issue-title">Action trait completion</span><span class="tag tag-risk">open</span></div>
+      <div class="issue-body">Still legitimately open. Stringly <code>ActionStep</code> and action-name matching have not been fully retired.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1655</span><span class="issue-title">Turn-scoped grouped tool history</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1665</code>. Historical tool activity is now persisted per completed turn, not per round.</div>
+      <div class="issue-header"><span class="issue-number">#1614</span><span class="issue-title">Double response bug</span><span class="tag tag-risk">open</span></div>
+      <div class="issue-body">Separate quality bug. Important, but not evidence that the overall refactor/backend tranche is incomplete.</div>
     </div>
     <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1646</span><span class="issue-title">Direct utility routing</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1666</code>. Kernel contract visibility for deterministic utility tools is now manifest-driven.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1647</span><span class="issue-title">Skill activation lifecycle</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1667</code>. Revisioned activation now owns published and local skill lifecycle seams.</div>
-    </div>
-  </div>
-</div>
-
-<h2>Post-Step-11 queue</h2>
-<div class="panel-grid">
-  <div class="panel">
-    <h3>Architectural follow-through</h3>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">STEP 10</span><span class="issue-title">Unified authority model implementation</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Fixed on dev in PR <code>#1668</code>. Unified authority resolution, shared prompt ownership, and coherent proposal / deny routing are now in the kernel path.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1638</span><span class="issue-title">Static dispatch audit</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Completed on dev via PRs <code>#1669</code>, <code>#1670</code>, and <code>#1672</code>. Canonical deny defaults, tool-owned action / journal metadata, and authority-surface contracts replaced the highest-leverage static dispatch drift.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1642</span><span class="issue-title">Headless decomposition</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Completed in PR <code>#1674</code>. Headless responsibilities are now split behind explicit startup, routing, execution, and output seams.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1641</span><span class="issue-title">Full loop decomposition beyond direct inspection</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Completed in the Step 13 PR chain through <code>#1687</code>. The loop engine refactor and final thin-orchestrator cleanup are now on <code>dev</code>.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Completed in the Step 14 PR chain through <code>#1692</code>. Archive metadata, archive routes, archived-session filters, export, and contract hardening are now stable on <code>dev</code>.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">step 15</span></div>
-      <div class="issue-body">Current next numbered step. Option A spec is now on <code>dev</code>: single-session archive / unarchive, archived-session filter, and per-session export UI with no bulk actions in the first pass.</div>
-    </div>
-  </div>
-  <div class="panel">
-    <h3>Archive / export follow-ons</h3>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1487</span><span class="issue-title">Session archive / export backend</span><span class="tag tag-done">landed</span></div>
-      <div class="issue-body">Backend archive/export contract is now complete on <code>dev</code> through <code>#1692</code>.</div>
-    </div>
-    <div class="issue-card">
-      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">step 15</span></div>
-      <div class="issue-body">Swift UI follow-on is now the next step, with Option A spec docs already on <code>dev</code>.</div>
+      <div class="issue-header"><span class="issue-number">#1637</span><span class="issue-title">Swift session archive / browser / export</span><span class="tag tag-next">parked</span></div>
+      <div class="issue-body">Spec-ready on <code>dev</code>, but intentionally held out as a product/UI add-on rather than the next required refactor step.</div>
     </div>
   </div>
 </div>
@@ -438,7 +384,7 @@
 </div>
 
 <div class="timestamp">
-  Updated 2026-03-31 21:53 UTC (v4.9) · #1667 + #1668 + #1669 + #1670 + #1672 landed on dev · Step 11 static-dispatch cleanup complete · Immediate follow-ups: detached transcript / continuation integrity, then detached workspace / config drift · Next numbered step: #1642 · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
+  Updated 2026-04-02 14:31 UTC (v4.5) · Steps 12, 13, and 14 landed on dev · stale refactor/backend issues reconciled against code · remaining open refactor issues: #1638, #1640, #1644 · Step 15 parked as a spec-ready Swift follow-on · <a href="https://github.com/abbudjoe/fawx/issues?q=is%3Aopen+label%3Aenhancement">Open issues</a>
 </div>
 
 </body>
