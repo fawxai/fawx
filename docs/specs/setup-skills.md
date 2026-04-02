@@ -110,7 +110,7 @@ Examples:
 - If a skill reuses a provider key, no prompt needed — just inform the user
 
 ### Skill installation
-- Build from source: `cargo build -p <skill> --target wasm32-unknown-unknown`
+- Build from source: `cargo build -p <skill> --target wasm32-wasip1`
 - Or download pre-built from release artifacts (future)
 - Install to `~/.fawx/skills/<name>/`
 

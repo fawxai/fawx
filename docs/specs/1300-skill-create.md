@@ -107,13 +107,13 @@ A Fawx WASM skill.
 ## Build
 
 \`\`\`bash
-cargo build --release --target wasm32-unknown-unknown
+fawx skill build .
 \`\`\`
 
-## Install
+## Prebuilt Artifact Install
 
 \`\`\`bash
-fawx skill install target/wasm32-unknown-unknown/release/<name>.wasm
+fawx skill install target/wasm32-wasip1/release/<name_underscored>.wasm
 \`\`\`
 ```
 
@@ -131,10 +131,10 @@ Created skill project: <path>/<name>/
 
 To build:
   cd <path>/<name>
-  cargo build --release --target wasm32-unknown-unknown
+  fawx skill build .
 
-To install:
-  fawx skill install target/wasm32-unknown-unknown/release/<name_underscored>.wasm
+To install a prebuilt artifact:
+  fawx skill install target/wasm32-wasip1/release/<name_underscored>.wasm
 ```
 
 ### Error cases

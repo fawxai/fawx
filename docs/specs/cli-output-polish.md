@@ -73,7 +73,7 @@ Use 256-color (orange 208) when `$TERM` supports it, fall back to basic ANSI yel
 
 ◆ System ─────────────────────────────
   ✓ Rust toolchain    1.85.0
-  ✓ WASM target       wasm32-unknown-unknown
+  ✓ WASM target       wasm32-wasip1
   ✓ Data directory    ~/.fawx/
   ✓ Config file       ~/.fawx/config.toml
 
