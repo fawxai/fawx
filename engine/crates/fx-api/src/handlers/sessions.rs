@@ -23,9 +23,9 @@ use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
 use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
-    prune_unresolved_tool_history, validate_tool_message_order, SessionConfig, SessionError,
-    SessionHistoryError, SessionInfo, SessionKey, SessionKind, SessionMemory, SessionMessage,
-    SessionRegistry, SessionStatus,
+    prune_unresolved_tool_history, validate_tool_message_order, SessionArchiveFilter,
+    SessionConfig, SessionError, SessionHistoryError, SessionInfo, SessionKey, SessionKind,
+    SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -60,6 +60,14 @@ pub struct ListSessionsQuery {
     pub kind: Option<SessionKind>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub archived: Option<String>,
+}
+
+impl ListSessionsQuery {
+    fn archive_filter(&self) -> Result<SessionArchiveFilter, (StatusCode, Json<ErrorBody>)> {
+        ArchivedQueryValue::parse(self.archived.as_deref()).map(SessionArchiveFilter::from)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +98,67 @@ pub struct DeleteSessionResponse {
 pub struct ClearSessionResponse {
     pub cleared: bool,
     pub key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionArchiveResponse {
+    pub key: String,
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchivedQueryValue {
+    Active,
+    All,
+    Only,
+}
+
+impl ArchivedQueryValue {
+    fn parse(value: Option<&str>) -> Result<Self, (StatusCode, Json<ErrorBody>)> {
+        match value.unwrap_or("active") {
+            "active" => Ok(Self::Active),
+            "all" => Ok(Self::All),
+            "only" => Ok(Self::Only),
+            other => Err(invalid_archive_filter(other)),
+        }
+    }
+}
+
+impl From<ArchivedQueryValue> for SessionArchiveFilter {
+    fn from(value: ArchivedQueryValue) -> Self {
+        match value {
+            ArchivedQueryValue::Active => Self::ActiveOnly,
+            ArchivedQueryValue::All => Self::All,
+            ArchivedQueryValue::Only => Self::ArchivedOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchiveRouteOperation {
+    Archive,
+    Unarchive,
+}
+
+impl ArchiveRouteOperation {
+    fn apply(self, registry: &SessionRegistry, key: &SessionKey) -> Result<(), SessionError> {
+        match self {
+            Self::Archive => registry.archive(key),
+            Self::Unarchive => registry.unarchive(key),
+        }
+    }
+}
+
+impl From<SessionInfo> for SessionArchiveResponse {
+    fn from(info: SessionInfo) -> Self {
+        Self {
+            key: info.key.to_string(),
+            archived: info.is_archived(),
+            archived_at: info.archived_at,
+        }
+    }
 }
 
 struct StreamingSessionMessageTask {
@@ -127,8 +196,9 @@ pub async fn handle_list_sessions(
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let registry = require_session_registry(&state)?;
+    let archive_filter = query.archive_filter()?;
     let mut sessions = registry
-        .list(query.kind)
+        .list_with_archive_filter(query.kind, archive_filter)
         .map_err(|error| internal_error(anyhow::Error::new(error)))?;
     sessions.sort_by(|left, right| {
         right
@@ -236,6 +306,20 @@ pub async fn handle_clear_session(
         key: id,
     })
     .into_response())
+}
+
+pub async fn handle_archive_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    update_session_archive_state(state, id, ArchiveRouteOperation::Archive).await
+}
+
+pub async fn handle_unarchive_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    update_session_archive_state(state, id, ArchiveRouteOperation::Unarchive).await
 }
 
 pub async fn handle_get_messages(
@@ -498,6 +582,22 @@ fn persist_session_turn(
     registry.record_turn(key, session_messages, session_memory)
 }
 
+async fn update_session_archive_state(
+    state: HttpState,
+    id: String,
+    operation: ArchiveRouteOperation,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    operation
+        .apply(&registry, &key)
+        .map_err(|error| map_session_error(&id, error))?;
+    let info = registry
+        .get_info(&key)
+        .map_err(|error| map_session_error(&id, error))?;
+    Ok(Json(SessionArchiveResponse::from(info)).into_response())
+}
+
 fn create_session(
     registry: &SessionRegistry,
     config: SessionConfig,
@@ -597,6 +697,12 @@ fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
             error: message.to_string(),
         }),
     )
+}
+
+fn invalid_archive_filter(value: &str) -> (StatusCode, Json<ErrorBody>) {
+    bad_request(&format!(
+        "invalid archived filter '{value}'; expected one of: active, all, only"
+    ))
 }
 
 fn require_session_registry(
