@@ -480,6 +480,9 @@ pub struct Session {
     pub created_at: u64,
     /// Unix epoch seconds of last activity.
     pub updated_at: u64,
+    /// Unix epoch seconds when the session was archived, if archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     /// Ordered conversation messages.
     pub messages: Vec<SessionMessage>,
     /// Persistent memory that survives compaction.
@@ -499,6 +502,7 @@ impl Session {
             model: config.model,
             created_at: now,
             updated_at: now,
+            archived_at: None,
             messages: Vec::new(),
             memory: SessionMemory::default(),
         }
@@ -569,6 +573,10 @@ impl Session {
         self.updated_at = current_epoch_secs();
     }
 
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+
     /// Return the most recent `limit` messages (or all if fewer exist).
     pub fn recent_messages(&self, limit: usize) -> &[SessionMessage] {
         let start = self.messages.len().saturating_sub(limit);
@@ -587,6 +595,7 @@ impl Session {
             model: self.model.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
             message_count: self.messages.len(),
         }
     }
@@ -1012,6 +1021,25 @@ mod tests {
     }
 
     #[test]
+    fn session_backward_compat_defaults_archive_metadata_when_missing() {
+        let session = Session::new(
+            SessionKey::new("legacy-archive").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        let mut value = serde_json::to_value(&session).expect("serialize session");
+        let Some(object) = value.as_object_mut() else {
+            panic!("session json should be an object");
+        };
+        object.remove("archived_at");
+
+        let restored: Session = serde_json::from_value(value).expect("deserialize session");
+
+        assert!(restored.archived_at.is_none());
+        assert!(!restored.is_archived());
+    }
+
+    #[test]
     fn apply_update_overwrites_project_and_state() {
         let mut memory = SessionMemory::default();
         let mut initial = memory_update();
@@ -1202,6 +1230,7 @@ mod tests {
         assert_eq!(info.kind, SessionKind::Channel);
         assert_eq!(info.title.as_deref(), Some("hi"));
         assert_eq!(info.preview.as_deref(), Some("hello"));
+        assert!(!info.is_archived());
         assert_eq!(info.message_count, 2);
     }
 
@@ -1279,6 +1308,7 @@ mod tests {
                 model: "claude".to_string(),
             },
         );
+        session.archived_at = Some(321);
         session
             .add_message(MessageRole::System, "init")
             .expect("add message");
@@ -1286,6 +1316,8 @@ mod tests {
         let restored: Session = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.key, session.key);
         assert_eq!(restored.kind, session.kind);
+        assert_eq!(restored.archived_at, session.archived_at);
+        assert!(restored.is_archived());
         assert_eq!(restored.messages.len(), 1);
         assert_eq!(restored.messages[0].render_text(), "init");
     }

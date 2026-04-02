@@ -325,6 +325,7 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             created_at: 1,
             updated_at: 2,
+            archived_at: None,
             messages: vec![
                 SessionMessage::structured(
                     MessageRole::Tool,
