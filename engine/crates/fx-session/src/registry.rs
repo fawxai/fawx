@@ -5,13 +5,15 @@ use crate::session::{
 };
 use crate::store::SessionStore;
 use crate::types::{
-    MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
+    MessageRole, SessionArchiveFilter, SessionConfig, SessionInfo, SessionKey, SessionKind,
+    SessionStatus,
 };
 use fx_core::error::StorageError;
 use fx_storage::Storage;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, SessionError>;
 
@@ -61,8 +63,13 @@ impl CorruptedSession {
         }
     }
 
-    fn matches_kind(&self, filter: Option<SessionKind>) -> bool {
-        filter.is_none_or(|kind| self.info.kind == kind)
+    fn matches_filters(
+        &self,
+        kind_filter: Option<SessionKind>,
+        archive_filter: SessionArchiveFilter,
+    ) -> bool {
+        kind_filter.is_none_or(|kind| self.info.kind == kind)
+            && archive_filter.matches(self.info.is_archived())
     }
 
     fn to_error(&self, key: &SessionKey) -> SessionError {
@@ -77,6 +84,27 @@ impl CorruptedSession {
 struct HydratedSessions {
     healthy: HashMap<SessionKey, Session>,
     corrupted: HashMap<SessionKey, CorruptedSession>,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveOperation {
+    Archive,
+    Unarchive,
+}
+
+impl ArchiveOperation {
+    fn apply(self, session: &mut Session) {
+        match self {
+            Self::Archive => {
+                if !session.is_archived() {
+                    session.archived_at = Some(current_epoch_secs());
+                }
+            }
+            Self::Unarchive => {
+                session.archived_at = None;
+            }
+        }
+    }
 }
 
 /// Manages all active sessions, backed by persistent storage.
@@ -132,15 +160,27 @@ impl SessionRegistry {
 
     /// List sessions, optionally filtered by kind.
     pub fn list(&self, filter: Option<SessionKind>) -> Result<Vec<SessionInfo>> {
+        self.list_with_archive_filter(filter, SessionArchiveFilter::default())
+    }
+
+    /// List sessions with explicit archive-state filtering.
+    pub fn list_with_archive_filter(
+        &self,
+        kind_filter: Option<SessionKind>,
+        archive_filter: SessionArchiveFilter,
+    ) -> Result<Vec<SessionInfo>> {
         let map = self.read()?;
         let corrupted = self.read_corrupted()?;
         let healthy_infos = map
             .values()
-            .filter(|s| filter.is_none_or(|k| s.kind == k))
+            .filter(|session| {
+                kind_filter.is_none_or(|kind| session.kind == kind)
+                    && archive_filter.matches(session.is_archived())
+            })
             .map(Session::info);
         let corrupted_infos = corrupted
             .values()
-            .filter(|session| session.matches_kind(filter))
+            .filter(|session| session.matches_filters(kind_filter, archive_filter))
             .map(|session| session.info.clone());
         Ok(healthy_infos.chain(corrupted_infos).collect())
     }
@@ -219,17 +259,10 @@ impl SessionRegistry {
         content: Vec<SessionContentBlock>,
         token_count: Option<u32>,
     ) -> Result<()> {
-        self.fail_if_corrupted(key)?;
-        let snapshot = {
-            let mut map = self.write()?;
-            let session = map
-                .get_mut(key)
-                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        self.update_session(key, move |session| {
             session.add_message_blocks(role, content, token_count)?;
-            session.clone()
-        };
-        self.store.save(&snapshot)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Append multiple pre-built session messages in a single save.
@@ -238,17 +271,10 @@ impl SessionRegistry {
             return Ok(());
         }
 
-        self.fail_if_corrupted(key)?;
-        let snapshot = {
-            let mut map = self.write()?;
-            let session = map
-                .get_mut(key)
-                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        self.update_session(key, move |session| {
             session.extend_messages(messages)?;
-            session.clone()
-        };
-        self.store.save(&snapshot)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Read the persistent memory for a session.
@@ -268,20 +294,13 @@ impl SessionRegistry {
         messages: Vec<SessionMessage>,
         memory: SessionMemory,
     ) -> Result<()> {
-        self.fail_if_corrupted(key)?;
-        let snapshot = {
-            let mut map = self.write()?;
-            let session = map
-                .get_mut(key)
-                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        self.update_session(key, move |session| {
             if !messages.is_empty() {
                 session.extend_messages(messages)?;
             }
             session.set_memory(memory);
-            session.clone()
-        };
-        self.store.save(&snapshot)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Retrieve conversation history for a session (most recent `limit`).
@@ -296,32 +315,28 @@ impl SessionRegistry {
 
     /// Clear the recorded message history for a session.
     pub fn clear(&self, key: &SessionKey) -> Result<()> {
-        self.fail_if_corrupted(key)?;
-        let snapshot = {
-            let mut map = self.write()?;
-            let session = map
-                .get_mut(key)
-                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        self.update_session(key, |session| {
             session.clear_messages();
-            session.clone()
-        };
-        self.store.save(&snapshot)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Update the status of a session.
     pub fn set_status(&self, key: &SessionKey, status: SessionStatus) -> Result<()> {
-        self.fail_if_corrupted(key)?;
-        let snapshot = {
-            let mut map = self.write()?;
-            let session = map
-                .get_mut(key)
-                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+        self.update_session(key, |session| {
             session.status = status;
-            session.clone()
-        };
-        self.store.save(&snapshot)?;
-        Ok(())
+            Ok(())
+        })
+    }
+
+    /// Archive a session without deleting or clearing its history.
+    pub fn archive(&self, key: &SessionKey) -> Result<()> {
+        self.update_archive_state(key, ArchiveOperation::Archive)
+    }
+
+    /// Unarchive a session and restore it to the active listing.
+    pub fn unarchive(&self, key: &SessionKey) -> Result<()> {
+        self.update_archive_state(key, ArchiveOperation::Unarchive)
     }
 
     /// Get a snapshot of a single session's info.
@@ -370,6 +385,31 @@ impl SessionRegistry {
         }
         Ok(())
     }
+
+    fn update_session(
+        &self,
+        key: &SessionKey,
+        update: impl FnOnce(&mut Session) -> Result<()>,
+    ) -> Result<()> {
+        self.fail_if_corrupted(key)?;
+        let snapshot = {
+            let mut map = self.write()?;
+            let session = map
+                .get_mut(key)
+                .ok_or_else(|| SessionError::NotFound(key.as_str().to_string()))?;
+            update(session)?;
+            session.clone()
+        };
+        self.store.save(&snapshot)?;
+        Ok(())
+    }
+
+    fn update_archive_state(&self, key: &SessionKey, operation: ArchiveOperation) -> Result<()> {
+        self.update_session(key, |session| {
+            operation.apply(session);
+            Ok(())
+        })
+    }
 }
 
 fn hydrate_sessions(persisted: Vec<Session>) -> HydratedSessions {
@@ -402,11 +442,20 @@ fn record_corrupted_session(
         .insert(key, CorruptedSession::from_session(session, source));
 }
 
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fx_llm::ContentBlock;
     use fx_storage::Storage;
+    use std::thread;
+    use std::time::Duration;
 
     fn test_registry() -> SessionRegistry {
         let storage = Storage::open_in_memory().expect("in-memory storage");
@@ -480,6 +529,202 @@ mod tests {
         let mains = reg.list(Some(SessionKind::Main)).expect("list mains");
         assert_eq!(mains.len(), 1);
         assert_eq!(mains[0].key, SessionKey::new("a").unwrap());
+    }
+
+    #[test]
+    fn archive_marks_session_archived_and_preserves_messages() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        let reg = SessionRegistry::new(store).expect("registry");
+        let key = SessionKey::new("archive-preserves").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "hello")
+            .expect("record user");
+        reg.record_message(&key, MessageRole::Assistant, "world")
+            .expect("record assistant");
+        reg.set_status(&key, SessionStatus::Paused)
+            .expect("pause session");
+
+        reg.archive(&key).expect("archive");
+
+        let reopened = SessionRegistry::new(SessionStore::new(storage)).expect("reopen registry");
+        let info = reopened.get_info(&key).expect("get archived info");
+        let history = reopened.history(&key, 10).expect("get archived history");
+
+        assert!(info.archived_at.is_some());
+        assert_eq!(info.status, SessionStatus::Paused);
+        assert_eq!(info.label.as_deref(), Some("test"));
+        assert_eq!(info.model, "gpt-4");
+        assert_eq!(info.message_count, 2);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].render_text(), "hello");
+        assert_eq!(history[1].render_text(), "world");
+    }
+
+    #[test]
+    fn archive_is_idempotent_for_already_archived_session() {
+        let reg = test_registry();
+        let key = SessionKey::new("archive-idempotent").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "still here")
+            .expect("record user");
+
+        reg.archive(&key).expect("first archive");
+        let first_info = reg.get_info(&key).expect("first info");
+        thread::sleep(Duration::from_millis(1100));
+
+        reg.archive(&key).expect("second archive");
+        let second_info = reg.get_info(&key).expect("second info");
+        let history = reg.history(&key, 10).expect("history");
+
+        assert_eq!(second_info.archived_at, first_info.archived_at);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].render_text(), "still here");
+    }
+
+    #[test]
+    fn unarchive_restores_active_state() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        let reg = SessionRegistry::new(store).expect("registry");
+        let key = SessionKey::new("unarchive-restores").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "persisted")
+            .expect("record user");
+        reg.archive(&key).expect("archive");
+        reg.unarchive(&key).expect("unarchive");
+
+        let reopened = SessionRegistry::new(SessionStore::new(storage)).expect("reopen registry");
+        let info = reopened.get_info(&key).expect("get unarchived info");
+        let listed = reopened.list(None).expect("list active sessions");
+        let history = reopened.history(&key, 10).expect("history");
+
+        assert!(info.archived_at.is_none());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].render_text(), "persisted");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, key);
+    }
+
+    #[test]
+    fn unarchive_is_idempotent_for_active_session() {
+        let reg = test_registry();
+        let key = SessionKey::new("unarchive-idempotent").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "active")
+            .expect("record user");
+
+        reg.unarchive(&key).expect("unarchive active session");
+
+        let info = reg.get_info(&key).expect("get active info");
+        let history = reg.history(&key, 10).expect("history");
+
+        assert!(info.archived_at.is_none());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].render_text(), "active");
+    }
+
+    #[test]
+    fn default_list_excludes_archived_sessions() {
+        let reg = test_registry();
+        let active_key = SessionKey::new("active-default").unwrap();
+        let archived_key = SessionKey::new("archived-default").unwrap();
+        reg.create(active_key.clone(), SessionKind::Main, default_config())
+            .expect("create active");
+        reg.create(archived_key.clone(), SessionKind::Main, default_config())
+            .expect("create archived");
+        reg.archive(&archived_key).expect("archive");
+
+        let listed = reg.list(None).expect("default list");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, active_key);
+    }
+
+    #[test]
+    fn archived_only_filter_returns_archived_sessions_only() {
+        let reg = test_registry();
+        let active_key = SessionKey::new("active-filter").unwrap();
+        let archived_key = SessionKey::new("archived-filter").unwrap();
+        reg.create(active_key.clone(), SessionKind::Main, default_config())
+            .expect("create active");
+        reg.create(
+            archived_key.clone(),
+            SessionKind::Subagent,
+            default_config(),
+        )
+        .expect("create archived");
+        reg.archive(&archived_key).expect("archive");
+
+        let listed = reg
+            .list_with_archive_filter(None, SessionArchiveFilter::ArchivedOnly)
+            .expect("archived-only list");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, archived_key);
+        assert!(listed[0].is_archived());
+    }
+
+    #[test]
+    fn all_filter_includes_active_and_archived_sessions() {
+        let reg = test_registry();
+        let active_key = SessionKey::new("active-all").unwrap();
+        let archived_key = SessionKey::new("archived-all").unwrap();
+        reg.create(active_key.clone(), SessionKind::Main, default_config())
+            .expect("create active");
+        reg.create(archived_key.clone(), SessionKind::Main, default_config())
+            .expect("create archived");
+        reg.archive(&archived_key).expect("archive");
+
+        let mut listed = reg
+            .list_with_archive_filter(None, SessionArchiveFilter::All)
+            .expect("all list");
+        listed.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].key, active_key);
+        assert_eq!(listed[1].key, archived_key);
+        assert!(listed[1].is_archived());
+    }
+
+    #[test]
+    fn direct_lookup_returns_archived_sessions_by_key() {
+        let reg = test_registry();
+        let key = SessionKey::new("archived-lookup").unwrap();
+        reg.create(key.clone(), SessionKind::Main, default_config())
+            .expect("create");
+        reg.record_message(&key, MessageRole::User, "lookup me")
+            .expect("record user");
+        reg.archive(&key).expect("archive");
+
+        let info = reg.get_info(&key).expect("get archived info");
+        let history = reg.history(&key, 10).expect("get archived history");
+
+        assert!(info.is_archived());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].render_text(), "lookup me");
+    }
+
+    #[test]
+    fn archive_missing_session_returns_not_found() {
+        let reg = test_registry();
+        let error = reg
+            .archive(&SessionKey::new("missing-archive").unwrap())
+            .expect_err("archive should fail");
+        assert!(matches!(error, SessionError::NotFound(_)));
+    }
+
+    #[test]
+    fn unarchive_missing_session_returns_not_found() {
+        let reg = test_registry();
+        let error = reg
+            .unarchive(&SessionKey::new("missing-unarchive").unwrap())
+            .expect_err("unarchive should fail");
+        assert!(matches!(error, SessionError::NotFound(_)));
     }
 
     #[test]
