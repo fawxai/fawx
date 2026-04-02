@@ -27,19 +27,23 @@ Rules:
 - `all` returns active + archived sessions
 - `only` returns archived sessions only
 - existing `kind` and `limit` query parameters remain supported
+- list items expose explicit archive metadata as `archived` plus `archived_at`
 
 ### Archive
 `POST /v1/sessions/{id}/archive`
 
-Response shape should confirm the session key and resulting archive state.
+Response shape should return the canonical session summary, including `archived`
+and `archived_at`.
 
 ### Unarchive
 `DELETE /v1/sessions/{id}/archive`
 
-Response shape should confirm the session key and resulting archive state.
+Response shape should return the canonical session summary, including `archived`
+and `archived_at`.
 
 ### Session info
-`GET /v1/sessions/{id}` should surface archive metadata so clients do not need to infer it from list placement.
+`GET /v1/sessions/{id}` should surface explicit archive metadata so clients do
+not need to infer it from list placement.
 
 ## Error and idempotency rules
 - missing session: 404

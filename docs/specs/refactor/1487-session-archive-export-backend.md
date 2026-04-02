@@ -68,6 +68,8 @@ Keep the existing `/v1/sessions/{id}` naming convention, where `{id}` refers to 
 - `archived=active` is the default
 - `archived=all` includes both active and archived sessions
 - `archived=only` returns archived sessions only
+- list and direct session-info responses should expose explicit archive fields:
+  `archived: bool` and `archived_at: u64 | null`
 
 Existing `kind` and `limit` query parameters remain supported.
 
@@ -77,12 +79,17 @@ Existing `kind` and `limit` query parameters remain supported.
 
 These operations should be idempotent. Repeating archive on an archived session or unarchive on an active session should succeed without changing message history.
 
+Archive and unarchive should return the canonical session summary shape, including the same
+`archived` and `archived_at` fields exposed by list and direct lookup.
+
 ### Export
 `GET /v1/sessions/{id}/export?format=text|json`
 
 - default format: `text`
 - `format=json` returns a structured export object suitable for clients and tooling
 - export works for active and archived sessions
+- JSON export should include archive metadata using the same field names:
+  `archive.archived` and `archive.archived_at`
 
 ## Proposed implementation slices
 This spec is intentionally broken into PR-sized slices in `docs/specs/refactor/step14/`.

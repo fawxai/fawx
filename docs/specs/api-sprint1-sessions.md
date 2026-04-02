@@ -36,9 +36,12 @@ POST /message → fx-api handler → AppEngine::process_message()
 
 ```
 POST   /v1/sessions                → SessionRegistry::create()
-GET    /v1/sessions                → SessionRegistry::list()
+GET    /v1/sessions                → SessionRegistry::list_with_archive_filter()
 GET    /v1/sessions/{id}           → SessionRegistry::get_info()
 DELETE /v1/sessions/{id}           → SessionRegistry::destroy()
+POST   /v1/sessions/{id}/archive   → SessionRegistry::archive()
+DELETE /v1/sessions/{id}/archive   → SessionRegistry::unarchive()
+GET    /v1/sessions/{id}/export    → SessionRegistry::get_info() + history()
 GET    /v1/sessions/{id}/messages  → SessionRegistry::history()
 POST   /v1/sessions/{id}/messages  → AppEngine::process_with_context() → record in session
 POST   /v1/sessions/{id}/clear     → SessionRegistry::clear()
@@ -135,9 +138,13 @@ Response (201):
     "kind": "main",
     "status": "idle",
     "label": "optional human name",
+    "title": null,
+    "preview": null,
     "model": "gpt-4",
     "created_at": 1710300000,
     "updated_at": 1710300000,
+    "archived": false,
+    "archived_at": null,
     "message_count": 0
 }
 ```
@@ -146,31 +153,81 @@ Implementation:
 - Generate UUID-based key: `sess-{uuid4_short}`
 - Kind: `SessionKind::Main`
 - Model: use provided model or fall back to `AppEngine::active_model()`
-- Return `SessionInfo` as JSON
+- Return the canonical session summary JSON
 
 #### `GET /v1/sessions` — List sessions
 
 Query params:
 - `kind` (optional): filter by session kind
 - `limit` (optional, default 50): max results
+- `archived` (optional, default `active`): `active`, `all`, or `only`
 
 Response (200):
 ```json
 {
-    "sessions": [SessionInfo, ...],
+    "sessions": [Session summary, ...],
     "total": 42
+}
+```
+
+Every session summary in the response includes explicit archive metadata:
+
+```json
+{
+    "key": "sess-a1b2c3d4",
+    "kind": "main",
+    "status": "idle",
+    "label": "optional human name",
+    "title": "First user message",
+    "preview": "Most recent message",
+    "model": "gpt-4",
+    "created_at": 1710300000,
+    "updated_at": 1710300300,
+    "archived": false,
+    "archived_at": null,
+    "message_count": 4
 }
 ```
 
 #### `GET /v1/sessions/{id}` — Get session info
 
-Response (200): `SessionInfo` JSON
+Response (200): same session summary shape as `GET /v1/sessions`
 Response (404): `{ "error": "session not found: {id}" }`
 
 #### `DELETE /v1/sessions/{id}` — Delete session
 
 Response (200): `{ "deleted": true, "key": "{id}" }`
 Response (404): `{ "error": "session not found: {id}" }`
+
+#### `POST /v1/sessions/{id}/archive` — Archive session
+
+Preserves the session and its message history while hiding it from the default active list.
+
+Response (200): same session summary shape as `GET /v1/sessions/{id}`, with:
+
+```json
+{
+    "archived": true,
+    "archived_at": 1710300400
+}
+```
+
+The route is idempotent: archiving an already archived session still succeeds.
+
+#### `DELETE /v1/sessions/{id}/archive` — Unarchive session
+
+Returns the session to the default active list without restoring or modifying message history.
+
+Response (200): same session summary shape as `GET /v1/sessions/{id}`, with:
+
+```json
+{
+    "archived": false,
+    "archived_at": null
+}
+```
+
+The route is idempotent: unarchiving an already active session still succeeds.
 
 #### `POST /v1/sessions/{id}/clear` — Clear conversation
 
@@ -228,6 +285,42 @@ Implementation:
 5. Record both user message and assistant response in the session via `registry.send()`
 6. Persist automatically (registry persists on each operation)
 7. Return response (JSON or SSE stream)
+
+#### `GET /v1/sessions/{id}/export?format=text|json` — Export session
+
+Query params:
+- `format` (optional, default `text`): `text` or `json`
+
+Rules:
+- export works for active and archived sessions
+- export does not special-case archived sessions
+- invalid `format` returns 400
+
+`format=text` returns a plain-text transcript.
+
+`format=json` returns:
+
+```json
+{
+    "key": "sess-a1b2c3d4",
+    "session": {
+        "kind": "main",
+        "status": "idle",
+        "label": "optional human name",
+        "title": "First user message",
+        "preview": "Most recent message",
+        "model": "gpt-4",
+        "created_at": 1710300000,
+        "updated_at": 1710300300
+    },
+    "archive": {
+        "archived": true,
+        "archived_at": 1710300400
+    },
+    "messages": [SessionMessage, "..."],
+    "total_messages": 4
+}
+```
 
 ### 4. Extend `/message` endpoint (`fx-api/src/handlers/message.rs`)
 
@@ -370,8 +463,8 @@ If unsupported:
 
 ### Session not found (all single-session endpoints)
 `GET/DELETE /v1/sessions/{id}`, `POST /v1/sessions/{id}/clear`,
-`GET/POST /v1/sessions/{id}/messages` — all return 404 if session
-doesn't exist:
+`GET/POST /v1/sessions/{id}/messages`, `POST/DELETE /v1/sessions/{id}/archive`,
+and `GET /v1/sessions/{id}/export` — all return 404 if session doesn't exist:
 ```
 404 Not Found
 { "error": "session not found: {id}" }
@@ -419,7 +512,7 @@ limit (if configured) provides a natural ceiling. Document as follow-up.
 ### Unit tests in `fx-api` (new test module or extend `tests.rs`)
 
 1. `create_session_returns_201` — POST /v1/sessions returns 201 with
-   valid SessionInfo JSON.
+   valid session summary JSON.
 2. `list_sessions_returns_array` — GET /v1/sessions returns sessions
    array after creating two.
 3. `get_session_returns_info` — GET /v1/sessions/{id} returns correct
@@ -473,6 +566,9 @@ POST   /v1/sessions                → handle_create_session
 GET    /v1/sessions                → handle_list_sessions
 GET    /v1/sessions/{id}           → handle_get_session
 DELETE /v1/sessions/{id}           → handle_delete_session
+POST   /v1/sessions/{id}/archive   → handle_archive_session
+DELETE /v1/sessions/{id}/archive   → handle_unarchive_session
+GET    /v1/sessions/{id}/export    → handle_export_session
 POST   /v1/sessions/{id}/clear     → handle_clear_session
 GET    /v1/sessions/{id}/messages  → handle_get_messages
 POST   /v1/sessions/{id}/messages  → handle_send_message

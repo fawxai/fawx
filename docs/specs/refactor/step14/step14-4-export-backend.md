@@ -43,7 +43,8 @@ Structured payload suitable for clients and tooling. Include enough metadata to 
 Suggested top-level fields:
 - session key
 - session metadata or summary info
-- archive metadata
+- archive metadata using the same field names exposed elsewhere in the API:
+  `archived` and `archived_at`
 - ordered messages
 - total message count
 
@@ -61,7 +62,7 @@ The API endpoint can share formatting or serialization helpers with other export
 ## Acceptance criteria
 - export endpoint is routed and authenticated
 - archived sessions export successfully by key
-- active and archived sessions produce the same export shape except for archive metadata
+- active and archived sessions produce the same export shape except for archive metadata values
 - text and json formats are both supported or clearly rejected when invalid
 - missing sessions return stable not-found errors
 
