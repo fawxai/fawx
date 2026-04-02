@@ -2049,7 +2049,7 @@ mod tests {
         "  /keys list     List trusted public keys\n",
         "  /keys trust <path>\n",
         "  /keys revoke <fingerprint>\n",
-        "  /sign <skill>  Sign one WASM skill\n",
+        "  /sign <skill>  Sign one installed WASM skill\n",
         "  /sign --all    Sign all installed WASM skills\n",
         "  /status        Show model, tokens, budget summary\n",
         "  /budget        Show detailed budget usage\n",

@@ -55,6 +55,8 @@ pub mod sessions;
 #[allow(dead_code)]
 pub mod setup;
 #[allow(dead_code)]
+pub mod skill_sign;
+#[allow(dead_code)]
 pub(crate) mod skill_signatures;
 #[allow(dead_code)]
 pub mod skills;

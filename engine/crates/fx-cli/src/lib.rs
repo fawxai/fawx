@@ -41,6 +41,8 @@ mod repo_root;
 #[cfg(test)]
 #[allow(dead_code)]
 mod restart;
+#[path = "commands/skill_sign.rs"]
+pub(crate) mod skill_sign_commands;
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;
 #[cfg(test)]
@@ -50,6 +52,7 @@ mod start_stop_command {
 }
 mod commands {
     pub(crate) use super::marketplace_commands as marketplace;
+    pub(crate) use super::skill_sign_commands as skill_sign;
     pub(crate) use super::slash_commands as slash;
 }
 mod config_bridge;

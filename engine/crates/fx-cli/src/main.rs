@@ -184,6 +184,9 @@ enum Commands {
         command: SkillCommands,
     },
 
+    /// Sign installed WASM skills
+    Sign(commands::skill_sign::SignArgs),
+
     /// Search the skill registry
     Search {
         /// Search query
@@ -914,6 +917,10 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
+        Commands::Sign(args) => {
+            commands::skill_sign::run(&args)?;
+            Ok(0)
+        }
         Commands::Search { query } => {
             println!("{}", commands::marketplace::search_output(&query)?);
             Ok(0)
@@ -1052,7 +1059,7 @@ mod tests {
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use clap_complete::Shell;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1272,6 +1279,43 @@ mod tests {
                 command: SkillCommands::Search { query: Some(query) }
             }) if query == "weather"
         ));
+    }
+
+    #[test]
+    fn cli_parses_sign_single_skill_command() {
+        let cli = Cli::parse_from(["fawx", "sign", "weather"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sign(args))
+                if args.selection().expect("selection")
+                    == crate::commands::skill_sign::SignSelection::Skill("weather".to_string())
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sign_all_command() {
+        let cli = Cli::parse_from(["fawx", "sign", "--all"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sign(args))
+                if args.selection().expect("selection")
+                    == crate::commands::skill_sign::SignSelection::All
+        ));
+    }
+
+    #[test]
+    fn cli_sign_help_matches_slash_help_surface() {
+        let mut command = Cli::command();
+        let sign = command.find_subcommand_mut("sign").expect("sign command");
+        let mut help = Vec::new();
+        sign.write_long_help(&mut help).expect("write help");
+        let help = String::from_utf8(help).expect("utf8 help");
+        let slash_help = crate::commands::slash::help_text();
+
+        assert!(help.contains("SKILL"));
+        assert!(help.contains("--all"));
+        assert!(slash_help.contains("/sign <skill>"));
+        assert!(slash_help.contains("/sign --all"));
     }
 
     #[test]
