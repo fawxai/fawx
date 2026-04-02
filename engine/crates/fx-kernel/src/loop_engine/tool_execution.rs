@@ -69,6 +69,11 @@ enum ToolLoopStep {
     Return(Box<ActionResult>),
 }
 
+enum ToolLoopExit {
+    Exhausted(ToolRoundState),
+    Return(Box<ActionResult>),
+}
+
 struct ExecutedToolRound {
     calls: Vec<ToolCall>,
     results: Vec<ToolResult>,
@@ -371,11 +376,11 @@ impl LoopEngine {
         }
 
         match self.run_tool_loop(decision, llm, state, stream).await? {
-            ToolLoopStep::Break(state) | ToolLoopStep::Continue(state) => {
+            ToolLoopExit::Exhausted(state) => {
                 self.finish_tool_loop_on_exhaustion(decision, state, llm, stream)
                     .await
             }
-            ToolLoopStep::Return(action) => Ok(*action),
+            ToolLoopExit::Return(action) => Ok(*action),
         }
     }
 
@@ -408,15 +413,15 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         mut state: ToolRoundState,
         stream: CycleStream<'_>,
-    ) -> Result<ToolLoopStep, LoopError> {
+    ) -> Result<ToolLoopExit, LoopError> {
         for round in 0..self.max_iterations {
             if self.tool_round_interrupted() {
-                return Ok(ToolLoopStep::Return(Box::new(
+                return Ok(ToolLoopExit::Return(Box::new(
                     self.cancelled_tool_action_from_state(decision, state),
                 )));
             }
             if self.tool_loop_budget_low(round) {
-                return Ok(ToolLoopStep::Break(state));
+                return Ok(ToolLoopExit::Exhausted(state));
             }
 
             match self
@@ -424,22 +429,23 @@ impl LoopEngine {
                 .await?
             {
                 ToolLoopStep::Continue(next_state) => state = next_state,
-                ToolLoopStep::Break(next_state) => return Ok(ToolLoopStep::Break(next_state)),
-                ToolLoopStep::Return(action) => return Ok(ToolLoopStep::Return(action)),
+                ToolLoopStep::Break(next_state) => {
+                    return Ok(ToolLoopExit::Exhausted(next_state));
+                }
+                ToolLoopStep::Return(action) => return Ok(ToolLoopExit::Return(action)),
             }
         }
-        Ok(ToolLoopStep::Break(state))
+        Ok(ToolLoopExit::Exhausted(state))
     }
 
     async fn run_tool_loop_round(
         &mut self,
         decision: &Decision,
         llm: &dyn LlmProvider,
-        state: ToolRoundState,
+        mut state: ToolRoundState,
         round: u32,
         stream: CycleStream<'_>,
     ) -> Result<ToolLoopStep, LoopError> {
-        let mut state = state;
         let continuation_tools =
             self.apply_tool_round_progress_policy(round, &mut state.continuation_messages);
         let outcome = self
