@@ -72,6 +72,24 @@ final class AuthenticatedChatFlowTests: XCTestCase {
         add(attachment)
     }
 
+    @MainActor
+    func testAuthenticatedUserCanSeeExpectedLoadedSkillInSkillsScreen() async throws {
+        let expectedSkillName = try Self.requireExpectedSkillName()
+        try await Self.requireReachableServer()
+
+        let app = TestConfig.makeApp(resetState: true)
+        app.launch()
+        try await completeAuthenticatedLaunchIfNeeded(in: app)
+        try await waitForMainShell(in: app)
+        openSkills(in: app)
+
+        let skillCard = app.descendants(matching: .any)["skillCard_\(expectedSkillName)"]
+        XCTAssertTrue(
+            skillCard.waitForExistence(timeout: 10),
+            "Expected the server-loaded Skills screen to include '\(expectedSkillName)'."
+        )
+    }
+
     private static func createSession(label: String) async throws -> String {
         let (serverURL, bearerToken) = try requireCredentials()
 
@@ -98,6 +116,13 @@ final class AuthenticatedChatFlowTests: XCTestCase {
             throw XCTSkip("Missing FAWX_TEST_BEARER_TOKEN")
         }
         return (serverURL, bearerToken)
+    }
+
+    private static func requireExpectedSkillName() throws -> String {
+        guard let expectedSkillName = TestConfig.expectedSkillName else {
+            throw XCTSkip("Missing FAWX_TEST_EXPECTED_SKILL_NAME")
+        }
+        return expectedSkillName
     }
 
     private static func requireReachableServer() async throws {
@@ -173,8 +198,154 @@ final class AuthenticatedChatFlowTests: XCTestCase {
             "Expected the sessions list to appear after switching to the Sessions section."
         )
     }
+
+    @MainActor
+    private func completeAuthenticatedLaunchIfNeeded(in app: XCUIApplication) async throws {
+        if isMainShellVisible(in: app) {
+            return
+        }
+
+        TestConfig.openRemoteOnboardingIfNeeded(in: app)
+        let (serverURL, bearerToken) = try Self.requireCredentials()
+        try await enterServerURLIfNeeded(in: app, serverURL: serverURL)
+
+        if isMainShellVisible(in: app) {
+            return
+        }
+
+        try await enterPairingCodeIfNeeded(
+            in: app,
+            serverURL: serverURL,
+            bearerToken: bearerToken
+        )
+    }
+
+    @MainActor
+    private func waitForMainShell(in app: XCUIApplication) async throws {
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if isMainShellVisible(in: app) {
+                return
+            }
+            if app.descendants(matching: .any)["serverURLField"].exists {
+                throw XCTSkip("App launched into onboarding instead of authenticated shell.")
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        throw XCTSkip("Main app shell did not appear within 15 seconds.")
+    }
+
+    @MainActor
+    private func enterServerURLIfNeeded(in app: XCUIApplication, serverURL: String) async throws {
+        let serverField = app.descendants(matching: .any)["serverURLField"]
+        guard serverField.waitForExistence(timeout: 5) else {
+            return
+        }
+
+        serverField.tap()
+        serverField.typeText(serverURL)
+
+        let continueButton = app.buttons["continueButton"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5), "Expected continue button.")
+        if continueButton.isEnabled == false {
+            let healthButton = app.buttons["testConnectionButton"]
+            XCTAssertTrue(healthButton.waitForExistence(timeout: 5), "Expected test connection button.")
+            healthButton.tap()
+            if await waitForEnabled(continueButton, timeoutSeconds: 20) == false {
+                throw XCTSkip("Could not continue onboarding because the server connection never became ready.")
+            }
+        }
+        continueButton.tap()
+    }
+
+    @MainActor
+    private func enterPairingCodeIfNeeded(
+        in app: XCUIApplication,
+        serverURL: String,
+        bearerToken: String
+    ) async throws {
+        let codeField = app.descendants(matching: .any)["bearerTokenField"]
+        guard codeField.waitForExistence(timeout: 8) else {
+            return
+        }
+
+        let pairingCode = try await Self.generatePairingCode(serverURL: serverURL, bearerToken: bearerToken)
+        codeField.tap()
+        codeField.typeText(pairingCode)
+
+        let pairButton = app.buttons["Pair Device"]
+        XCTAssertTrue(pairButton.waitForExistence(timeout: 5), "Expected Pair Device button.")
+        if await waitForEnabled(pairButton, timeoutSeconds: 10) == false {
+            throw XCTSkip("Could not pair device because the pairing button never became enabled.")
+        }
+        pairButton.tap()
+    }
+
+    @MainActor
+    private func waitForEnabled(_ element: XCUIElement, timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while element.isEnabled == false && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return element.isEnabled
+    }
+
+    @MainActor
+    private func isMainShellVisible(in app: XCUIApplication) -> Bool {
+        app.descendants(matching: .any)["sessionList"].exists
+            || app.descendants(matching: .any)["messageInput"].exists
+            || app.buttons["newSessionButton"].exists
+    }
+
+    @MainActor
+    private func openSkills(in app: XCUIApplication) {
+#if os(macOS)
+        let navigateMenu = app.menuBars.menuBarItems["Navigate"]
+        XCTAssertTrue(navigateMenu.waitForExistence(timeout: 5), "Expected Navigate menu.")
+        navigateMenu.tap()
+
+        let skillsMenuItem = app.menuItems["Skills"]
+        XCTAssertTrue(skillsMenuItem.waitForExistence(timeout: 5), "Expected Skills menu item.")
+        skillsMenuItem.tap()
+#else
+        let sectionMenuButton = app.buttons["sectionMenuButton"]
+        XCTAssertTrue(sectionMenuButton.waitForExistence(timeout: 5), "Expected section menu button.")
+        sectionMenuButton.tap()
+
+        let skillsButton = app.buttons["Skills"]
+        XCTAssertTrue(skillsButton.waitForExistence(timeout: 5), "Expected Skills button.")
+        skillsButton.tap()
+#endif
+
+        let searchField = app.descendants(matching: .any)["skillsSearchField"]
+        XCTAssertTrue(searchField.waitForExistence(timeout: 10), "Expected Skills screen.")
+    }
+
+    private static func generatePairingCode(serverURL: String, bearerToken: String) async throws -> String {
+        let endpoint = try XCTUnwrap(URL(string: serverURL + "/v1/pair/generate"))
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [:])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let httpResponse = try XCTUnwrap(response as? HTTPURLResponse)
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "<non-UTF8>"
+            throw XCTSkip("Could not generate pairing code: \(httpResponse.statusCode) \(body)")
+        }
+
+        let generated = try JSONDecoder().decode(GeneratedPairingCode.self, from: data)
+        return generated.code
+    }
 }
 
 private struct CreatedSession: Decodable {
     let key: String
+}
+
+private struct GeneratedPairingCode: Decodable {
+    let code: String
 }

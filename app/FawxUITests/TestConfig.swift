@@ -18,6 +18,10 @@ enum TestConfig {
         environmentKey: "FAWX_TEST_PAIRED_DEVICE_NAME",
         fallbackFile: "/tmp/fawx_test_paired_device_name.txt"
     )
+    static let expectedSkillName = value(
+        environmentKey: "FAWX_TEST_EXPECTED_SKILL_NAME",
+        fallbackFile: "/tmp/fawx_test_expected_skill_name.txt"
+    )
     static let localConfigPath = value(environmentKey: "FAWX_TEST_LOCAL_CONFIG_PATH")
 
     static var defaultsSuite: String {

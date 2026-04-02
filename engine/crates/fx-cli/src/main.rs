@@ -67,6 +67,16 @@ const SIGN_COMMAND_AFTER_HELP: &str = concat!(
     "  fawx sign <skill>\n",
     "  fawx sign --all\n",
 );
+const KEYS_COMMAND_AFTER_HELP: &str = concat!(
+    "Manage local WASM signing keys.\n",
+    "Generate writes ~/.fawx/keys/signing_key.pem and trusts the matching public key locally.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx keys generate\n",
+    "  fawx keys list\n",
+    "  fawx keys trust /path/to/key.pub\n",
+    "  fawx keys revoke <fingerprint>\n",
+);
 
 #[derive(Parser)]
 #[command(name = "fawx")]
@@ -211,6 +221,13 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommands,
+    },
+
+    /// Manage WASM signing keys
+    #[command(after_long_help = KEYS_COMMAND_AFTER_HELP)]
+    Keys {
+        #[command(subcommand)]
+        command: commands::keys::KeysCommands,
     },
 
     /// Manage skills
@@ -955,6 +972,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Reset(args) => commands::reset::run(&args),
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
+        Commands::Keys { command } => commands::keys::run(command),
         Commands::Skill { command } => dispatch_skill(command).await,
         Commands::Sign(args) => {
             commands::skill_sign::run(&args)?;
@@ -1105,7 +1123,7 @@ mod tests {
     use std::{
         ffi::OsString,
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Mutex, OnceLock},
     };
 
@@ -1342,6 +1360,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cli_parses_keys_generate_command() {
+        let cli = Cli::parse_from(["fawx", "keys", "generate", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Keys {
+                command: crate::commands::keys::KeysCommands::Generate(args)
+            }) if args.force
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_trust_command() {
+        let cli = Cli::parse_from(["fawx", "keys", "trust", "/tmp/demo.pub"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Keys {
+                command: crate::commands::keys::KeysCommands::Trust(args)
+            }) if args.path == PathBuf::from("/tmp/demo.pub")
+        ));
+    }
+
     fn render_subcommand_help(mut command: clap::Command, path: &[&str]) -> String {
         let mut current = &mut command;
         for segment in path {
@@ -1363,6 +1403,21 @@ mod tests {
         assert!(help.contains("--all"));
         assert!(slash_help.contains("/sign <skill>"));
         assert!(slash_help.contains("/sign --all"));
+    }
+
+    #[test]
+    fn cli_keys_help_matches_slash_help_surface() {
+        let help = render_subcommand_help(Cli::command(), &["keys"]);
+        let slash_help = crate::commands::slash::help_text();
+
+        assert!(help.contains("generate"));
+        assert!(help.contains("list"));
+        assert!(help.contains("trust"));
+        assert!(help.contains("revoke"));
+        assert!(slash_help.contains("/keys generate [--force]"));
+        assert!(slash_help.contains("/keys list"));
+        assert!(slash_help.contains("/keys trust <path>"));
+        assert!(slash_help.contains("/keys revoke <fingerprint>"));
     }
 
     #[test]

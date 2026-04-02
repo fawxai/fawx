@@ -50,7 +50,6 @@ use fx_session::{
     prune_unresolved_tool_history, MessageRole as SessionRecordRole, SessionContentBlock,
     SessionKey, SessionMessage,
 };
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1127,13 +1126,6 @@ impl fx_api::ContextInfoSnapshotLike for ContextInfoSnapshot {
     fn compaction_threshold(&self) -> f32 {
         self.compaction_threshold
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrustedKeyEntry {
-    file_name: String,
-    fingerprint: String,
-    file_size: u64,
 }
 
 pub fn init_serve_logging(
