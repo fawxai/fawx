@@ -73,6 +73,45 @@
 
   <div class="timeline">
 
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Current priorities</span>
+        <h2 class="phase-title">Now / Soon / Later</h2>
+      </div>
+      <p class="phase-desc">The core refactor and the Step 14 backend contract are now effectively complete. Current priorities are focused on correctness, hardening, and the last narrow cleanup seams, not on adding more UI surface area by default.</p>
+
+      <h3 style="font-size: 1rem; margin: 0 0 10px;">Now</h3>
+      <ul class="feature-list" style="margin-bottom: 18px;">
+        <li><span class="wip">◐</span> <strong>#1614</strong> Double response when the model emits text plus a tool call in the same turn</li>
+        <li><span class="wip">◐</span> <strong>#1203</strong> HTTP API hardening: tool restrictions, rate limiting, audit logging</li>
+        <li><span class="wip">◐</span> <strong>#1638 / #1640 / #1644</strong> Final refactor cleanup: residual static dispatch, provider metadata cleanup, action-trait completion</li>
+        <li><span class="wip">◐</span> <strong>#1657</strong> Deterministic workspace search should stay bounded and avoid fan-out into broad tool chaos</li>
+        <li><span class="wip">◐</span> <strong>#1342</strong> Setup wizard should securely prompt for OpenAI auth when selected skills need it</li>
+      </ul>
+
+      <h3 style="font-size: 1rem; margin: 0 0 10px;">Soon</h3>
+      <ul class="feature-list" style="margin-bottom: 18px;">
+        <li><span class="planned">○</span> <strong>#1492</strong> Fleet GUI node pairing / registration flow</li>
+        <li><span class="planned">○</span> <strong>#1591</strong> Attachment storage growth follow-up</li>
+        <li><span class="planned">○</span> <strong>#1490</strong> Native app microphone input for STT</li>
+        <li><span class="planned">○</span> <strong>#1346</strong> Skill lifecycle management polish and richer sign/install UX</li>
+      </ul>
+
+      <h3 style="font-size: 1rem; margin: 0 0 10px;">Later</h3>
+      <ul class="feature-list" style="margin-bottom: 18px;">
+        <li><span class="planned">○</span> <strong>#1519</strong> <code>run_experiment</code> non-Cargo support or explicit evaluator requirement</li>
+        <li><span class="planned">○</span> <strong>#1484</strong> Generic web scraping and structured extraction skill</li>
+        <li><span class="planned">○</span> <strong>#1159</strong> Scratchpad persistence across sessions</li>
+        <li><span class="planned">○</span> <strong>#1440</strong> Human interrupt primitive for the agentic loop</li>
+      </ul>
+
+      <h3 style="font-size: 1rem; margin: 0 0 10px;">Parked</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> <strong>#1637</strong> Swift session archive / browser / export UI. Option A is spec-ready on <code>dev</code>, but intentionally parked while we take stock after the completed refactor tranche.</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
     <!-- ═══════════════════════════════════════════ -->
     <!--  ACTIVE FOCUS: OSS LAUNCH + MARKETPLACE   -->
     <!-- ═══════════════════════════════════════════ -->
