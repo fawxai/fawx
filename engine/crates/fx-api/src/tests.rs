@@ -2003,6 +2003,15 @@ mod routing_and_status {
         serde_json::from_slice(&body).expect("json")
     }
 
+    fn listed_session_keys(json: &serde_json::Value) -> Vec<String> {
+        json["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .map(|session| session["key"].as_str().expect("session key").to_string())
+            .collect()
+    }
+
     #[tokio::test]
     async fn telemetry_consent_endpoint_returns_defaults() {
         let app = build_router(test_state(None, Vec::new()), None);
@@ -2529,6 +2538,12 @@ mod routing_and_status {
         key
     }
 
+    fn seed_archived_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = seed_session(registry, key);
+        registry.archive(&key).expect("archive session");
+        key
+    }
+
     fn poisoned_session(key: &str) -> Session {
         Session {
             key: SessionKey::new(key).expect("session key"),
@@ -2820,26 +2835,77 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
-    async fn list_sessions_returns_array() {
+    async fn list_sessions_defaults_to_active_only() {
         let registry = make_session_registry();
-        seed_session(&registry, "sess-one");
-        seed_session(&registry, "sess-two");
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
         let app = build_router(test_state_with_sessions(registry), None);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/sessions")
-            .header("authorization", format!("Bearer {TEST_TOKEN}"))
-            .body(Body::empty())
-            .expect("request");
+        let resp = app
+            .oneshot(authed_request("GET", "/v1/sessions"))
+            .await
+            .expect("response");
 
-        let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.expect("body").to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let json = response_json(resp).await;
+        assert_eq!(json["total"], 1);
+        assert_eq!(listed_session_keys(&json), vec![active.to_string()]);
+        assert!(!listed_session_keys(&json).contains(&archived.to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_archived_all_includes_archived_sessions() {
+        let registry = make_session_registry();
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=all"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let keys = listed_session_keys(&json);
         assert_eq!(json["total"], 2);
+        assert!(keys.contains(&active.to_string()));
+        assert!(keys.contains(&archived.to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_archived_only_excludes_active_sessions() {
+        let registry = make_session_registry();
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=only"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 1);
+        assert_eq!(listed_session_keys(&json), vec![archived.to_string()]);
+        assert!(!listed_session_keys(&json).contains(&active.to_string()));
+    }
+
+    #[tokio::test]
+    async fn invalid_archived_filter_returns_400() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=maybe"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
         assert_eq!(
-            json["sessions"].as_array().expect("sessions array").len(),
-            2
+            json["error"],
+            "invalid archived filter 'maybe'; expected one of: active, all, only"
         );
     }
 
@@ -2862,6 +2928,123 @@ allowed_chat_ids = [123]
         assert_eq!(json["key"], key.as_str());
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["label"], "label-sess-info");
+    }
+
+    #[tokio::test]
+    async fn archive_route_archives_session_and_returns_success_payload() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-archive");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let first = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("first response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json = response_json(first).await;
+        assert_eq!(first_json["key"], key.as_str());
+        assert_eq!(first_json["archived"], true);
+        assert!(first_json["archived_at"].as_u64().is_some());
+
+        let second = app
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("second response");
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_json = response_json(second).await;
+        assert_eq!(second_json["key"], key.as_str());
+        assert_eq!(second_json["archived"], true);
+        assert!(registry.get_info(&key).expect("session info").is_archived());
+    }
+
+    #[tokio::test]
+    async fn unarchive_route_restores_active_state_and_returns_success_payload() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-unarchive");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let first = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("first response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json = response_json(first).await;
+        assert_eq!(first_json["key"], key.as_str());
+        assert_eq!(first_json["archived"], false);
+        assert!(first_json["archived_at"].is_null());
+
+        let second = app
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("second response");
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_json = response_json(second).await;
+        assert_eq!(second_json["key"], key.as_str());
+        assert_eq!(second_json["archived"], false);
+        assert!(!registry.get_info(&key).expect("session info").is_archived());
+    }
+
+    #[tokio::test]
+    async fn get_session_info_includes_archive_metadata_for_archived_session() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-archived-info");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert!(json["archived_at"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_session_on_archive_and_unarchive_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let archive = app
+            .clone()
+            .oneshot(authed_request("POST", "/v1/sessions/sess-missing/archive"))
+            .await
+            .expect("archive response");
+
+        assert_eq!(archive.status(), StatusCode::NOT_FOUND);
+        let archive_json = response_json(archive).await;
+        assert_eq!(archive_json["error"], "session not found: sess-missing");
+
+        let unarchive = app
+            .oneshot(authed_request(
+                "DELETE",
+                "/v1/sessions/sess-missing/archive",
+            ))
+            .await
+            .expect("unarchive response");
+
+        assert_eq!(unarchive.status(), StatusCode::NOT_FOUND);
+        let unarchive_json = response_json(unarchive).await;
+        assert_eq!(unarchive_json["error"], "session not found: sess-missing");
     }
 
     #[tokio::test]
