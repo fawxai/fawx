@@ -155,6 +155,12 @@ struct SessionExportData {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum TimestampDisplay {
+    Minute,
+    Second,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum ArchivedQueryValue {
     Active,
     All,
@@ -249,12 +255,13 @@ impl From<&SessionInfo> for SessionExportArchiveMetadata {
 
 impl SessionExportData {
     fn into_json_payload(self) -> SessionExportResponse {
+        let total_messages = self.messages.len();
         SessionExportResponse {
             key: self.info.key.to_string(),
             session: SessionExportSessionMetadata::from(&self.info),
             archive: SessionExportArchiveMetadata::from(&self.info),
             messages: self.messages,
-            total_messages: self.info.message_count,
+            total_messages,
         }
     }
 }
@@ -744,8 +751,8 @@ fn render_session_export_text(export: &SessionExportData) -> String {
         export.info.kind,
         export.info.status,
         export.info.model,
-        format_minute_timestamp(export.info.created_at),
-        format_minute_timestamp(export.info.updated_at),
+        format_export_timestamp(export.info.created_at, TimestampDisplay::Minute),
+        format_export_timestamp(export.info.updated_at, TimestampDisplay::Minute),
         format_archive_line(&export.info),
         export.info.message_count,
     );
@@ -769,7 +776,7 @@ fn format_archive_line(info: &SessionInfo) -> String {
         Some(timestamp) => {
             format!(
                 "Archived: yes | Archived at: {}",
-                format_minute_timestamp(timestamp)
+                format_export_timestamp(timestamp, TimestampDisplay::Minute)
             )
         }
         None => "Archived: no".to_string(),
@@ -780,7 +787,7 @@ fn format_export_message(message: &SessionMessage) -> String {
     format!(
         "[{}] {}{}\n{}",
         message.role,
-        format_second_timestamp(message.timestamp),
+        format_export_timestamp(message.timestamp, TimestampDisplay::Second),
         format_export_token_suffix(message),
         render_content_blocks_with_options(
             &message.content,
@@ -805,12 +812,12 @@ fn format_export_token_suffix(message: &SessionMessage) -> String {
     }
 }
 
-fn format_minute_timestamp(timestamp: u64) -> String {
-    format_timestamp(timestamp, "%Y-%m-%d %H:%M", "1970-01-01 00:00")
-}
-
-fn format_second_timestamp(timestamp: u64) -> String {
-    format_timestamp(timestamp, "%Y-%m-%d %H:%M:%S", "1970-01-01 00:00:00")
+fn format_export_timestamp(timestamp: u64, display: TimestampDisplay) -> String {
+    let (pattern, fallback) = match display {
+        TimestampDisplay::Minute => ("%Y-%m-%d %H:%M", "1970-01-01 00:00"),
+        TimestampDisplay::Second => ("%Y-%m-%d %H:%M:%S", "1970-01-01 00:00:00"),
+    };
+    format_timestamp(timestamp, pattern, fallback)
 }
 
 fn format_timestamp(timestamp: u64, pattern: &str, fallback: &str) -> String {

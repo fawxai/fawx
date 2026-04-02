@@ -3126,6 +3126,7 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::OK);
         let text = response_text(response).await;
         assert!(text.contains(&format!("Session: {key}")));
+        assert!(text.contains("Archived: yes"));
         assert!(text.contains("Archived question"));
         assert!(text.contains("Archived answer"));
     }
