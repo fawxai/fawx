@@ -5,8 +5,7 @@ use crate::act::{
     TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
 };
 use crate::budget::{
-    estimate_complexity, truncate_tool_result, ActionCost, BudgetRemaining, BudgetState,
-    BudgetTracker, TerminationConfig,
+    estimate_complexity, ActionCost, BudgetRemaining, BudgetState, BudgetTracker, TerminationConfig,
 };
 #[cfg(test)]
 use crate::budget::{AllocationPlan, BudgetConfig};
@@ -108,7 +107,8 @@ use self::tool_execution::ToolRoundOutcome;
 #[cfg(test)]
 use self::tool_execution::{
     append_tool_round_messages, blocked_tool_message, build_tool_result_message,
-    build_tool_use_assistant_message, truncate_tool_results,
+    build_tool_use_assistant_message, evict_oldest_results, tool_synthesis_prompt,
+    truncate_tool_results, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS,
 };
 
 #[cfg(test)]
@@ -987,14 +987,6 @@ impl ToolRoundState {
     }
 }
 
-struct ToolContinuationPayload {
-    response_text: String,
-    response: String,
-    tokens_used: TokenUsage,
-    next_tool_scope: Option<ContinuationToolScope>,
-    context_messages: Vec<Message>,
-}
-
 #[derive(Debug)]
 struct FollowUpDecomposeContext {
     prior_tool_results: Vec<ToolResult>,
@@ -1035,7 +1027,6 @@ const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 4096;
 const REASONING_TEMPERATURE: f32 = 0.2;
-const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 1024;
 const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
@@ -1100,8 +1091,6 @@ const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls w
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
 const DIRECT_INSPECTION_TASK_DIRECTIVE: &str = "\n\nThis turn is a direct local inspection request. Do not plan. Do not decompose. Use only the provided observation tools to inspect the explicit local path the user named. If the tool results answer the request, answer directly from that evidence. Do not broaden the task into repo research, code modification, testing, command execution, or web work.";
 const DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE: &str = "\n\nDirect inspection focus: read_local_path.\nUse `read_file` to inspect the explicit local path the user requested. Do not call unrelated tools or reopen the task as general research.";
-const DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE: &str =
-    "Inspection completed but produced no summary.";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
 const DIRECT_TOOL_TASK_DIRECTIVE: &str = "\n\nThis turn is a simple direct-tool request. Do not plan. Do not decompose. Use the one relevant utility tool immediately, then answer directly from its result. Do not call unrelated tools or do extra research unless the direct tool fails.";
 const BOUNDED_LOCAL_DISCOVERY_PHASE_DIRECTIVE: &str = "\n\nBounded local workflow phase: discovery.\nOnly use local discovery tools (`search_text`, `read_file`, `list_directory`). Do not use `run_command` in this phase. For code-edit tasks, do not move on to mutation until you have grounded the edit target by reading the most relevant file directly. Gather only the context needed to identify and read that file, then move to the concrete code change.";
@@ -2936,69 +2925,6 @@ impl LoopEngine {
         }
     }
 
-    fn direct_inspection_empty_summary_action_result(
-        &self,
-        decision: &Decision,
-        tool_results: Vec<ToolResult>,
-        tokens_used: TokenUsage,
-    ) -> ActionResult {
-        let response = DIRECT_INSPECTION_EMPTY_SUMMARY_RESPONSE.to_string();
-        ActionResult {
-            decision: decision.clone(),
-            tool_results,
-            response_text: response.clone(),
-            tokens_used,
-            next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
-        }
-    }
-
-    fn incomplete_action_result(
-        &self,
-        decision: &Decision,
-        tool_results: Vec<ToolResult>,
-        partial_response: Option<String>,
-        reason: &str,
-        tokens_used: TokenUsage,
-    ) -> ActionResult {
-        ActionResult {
-            decision: decision.clone(),
-            tool_results,
-            response_text: String::new(),
-            tokens_used,
-            next_step: ActionNextStep::Finish(ActionTerminal::Incomplete {
-                partial_response,
-                reason: reason.to_string(),
-            }),
-        }
-    }
-
-    fn bounded_local_terminal_action_result(
-        &mut self,
-        decision: &Decision,
-        tool_results: Vec<ToolResult>,
-        partial_response: Option<String>,
-        tokens_used: TokenUsage,
-        reason: BoundedLocalTerminalReason,
-    ) -> ActionResult {
-        let reason_text = bounded_local_terminal_reason_text(reason);
-        self.emit_signal(
-            LoopStep::Act,
-            SignalKind::Blocked,
-            reason_text,
-            serde_json::json!({
-                "profile": "bounded_local",
-                "terminal_reason": bounded_local_terminal_reason_label(reason),
-            }),
-        );
-        self.incomplete_action_result(
-            decision,
-            tool_results,
-            partial_response,
-            reason_text,
-            tokens_used,
-        )
-    }
-
     fn cancellation_token_triggered(&self) -> bool {
         self.cancel_token
             .as_ref()
@@ -3108,221 +3034,6 @@ impl LoopEngine {
             action,
             &accumulated_text,
         ))
-    }
-
-    async fn finalize_tool_response(
-        &mut self,
-        decision: &Decision,
-        state: ToolRoundState,
-        response: &CompletionResponse,
-        llm: &dyn LlmProvider,
-        stream: CycleStream<'_>,
-        next_tool_scope: Option<ContinuationToolScope>,
-    ) -> Result<ActionResult, LoopError> {
-        let current_round_text = response_text_segment(response);
-        let response_text =
-            stitch_response_segments(&state.accumulated_text, current_round_text.clone());
-        if response_text.is_empty() {
-            self.emit_signal(
-                LoopStep::Act,
-                SignalKind::Trace,
-                "tool continuation returned empty text",
-                serde_json::json!({
-                    "tool_count": state.all_tool_results.len(),
-                }),
-            );
-        }
-        if current_round_text.is_some() {
-            let response = meaningful_response_text(&response_text)
-                .expect("stitched response should be meaningful when the current round has text");
-            let ToolRoundState {
-                all_tool_results,
-                evidence_messages,
-                tokens_used,
-                ..
-            } = state;
-            return Ok(self.tool_continuation_action_result(
-                decision,
-                all_tool_results,
-                ToolContinuationPayload {
-                    response_text,
-                    response,
-                    tokens_used,
-                    next_tool_scope,
-                    context_messages: evidence_messages,
-                },
-            ));
-        }
-
-        if self.turn_execution_profile.allows_synthesis_fallback() {
-            return self
-                .synthesize_tool_fallback(decision, state, llm, stream, next_tool_scope)
-                .await;
-        }
-
-        let tool_summary = stitched_response_text(
-            &state.accumulated_text,
-            summarize_tool_progress(&state.all_tool_results),
-        );
-        Ok(self.incomplete_action_result(
-            decision,
-            state.all_tool_results,
-            tool_summary,
-            "tool continuation did not produce a usable final response",
-            state.tokens_used,
-        ))
-    }
-
-    async fn synthesize_tool_fallback(
-        &self,
-        decision: &Decision,
-        state: ToolRoundState,
-        llm: &dyn LlmProvider,
-        stream: CycleStream<'_>,
-        next_tool_scope: Option<ContinuationToolScope>,
-    ) -> Result<ActionResult, LoopError> {
-        let ToolRoundState {
-            all_tool_results,
-            accumulated_text,
-            evidence_messages,
-            mut tokens_used,
-            ..
-        } = state;
-        let max_tokens = self.budget.config().max_synthesis_tokens;
-        let evicted = evict_oldest_results(all_tool_results, max_tokens);
-        let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
-        stream.phase(Phase::Synthesize);
-        let llm_text = self
-            .generate_tool_summary(&synthesis_prompt, llm, stream, TextStreamVisibility::Hidden)
-            .await?;
-        tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
-        let synthesized_text = meaningful_response_text(&llm_text);
-        let response_text = stitch_response_segments(&accumulated_text, synthesized_text.clone());
-        let final_response = meaningful_response_text(&response_text);
-        let tool_summary =
-            stitched_response_text(&accumulated_text, summarize_tool_progress(&evicted));
-        Ok(match synthesized_text {
-            Some(_) => self.tool_continuation_action_result(
-                decision,
-                evicted,
-                ToolContinuationPayload {
-                    response_text,
-                    response: final_response
-                        .expect("stitched response should be meaningful when synthesis has text"),
-                    tokens_used,
-                    next_tool_scope,
-                    context_messages: evidence_messages,
-                },
-            ),
-            None if self
-                .turn_execution_profile
-                .direct_inspection_profile()
-                .is_some() =>
-            {
-                self.direct_inspection_empty_summary_action_result(decision, evicted, tokens_used)
-            }
-            None => self.incomplete_action_result(
-                decision,
-                evicted,
-                tool_summary,
-                "tool synthesis did not produce a usable final response",
-                tokens_used,
-            ),
-        })
-    }
-
-    fn tool_continuation_action_result(
-        &self,
-        decision: &Decision,
-        tool_results: Vec<ToolResult>,
-        payload: ToolContinuationPayload,
-    ) -> ActionResult {
-        let ToolContinuationPayload {
-            response_text,
-            response,
-            tokens_used,
-            next_tool_scope,
-            context_messages,
-        } = payload;
-        let turn_commitment = tool_continuation_turn_commitment(decision, next_tool_scope.as_ref());
-        let artifact_write_target = tool_continuation_artifact_write_target(
-            self.requested_artifact_target.as_deref(),
-            next_tool_scope.as_ref(),
-        );
-        let continuation = if context_messages.is_empty() {
-            ActionContinuation::new(Some(response.clone()), Some(response.clone()))
-        } else {
-            ActionContinuation::new(Some(response.clone()), None)
-                .with_context_messages(context_messages)
-        };
-        let continuation = match next_tool_scope {
-            Some(scope) => continuation.with_tool_scope(scope),
-            None => continuation,
-        };
-        let continuation = match artifact_write_target {
-            Some(path) => continuation.with_artifact_write_target(path),
-            None => continuation,
-        };
-        let continuation = match turn_commitment {
-            Some(commitment) => continuation.with_turn_commitment(commitment),
-            None => continuation,
-        };
-        if self.turn_execution_profile.completes_terminally() {
-            return ActionResult {
-                decision: decision.clone(),
-                tool_results,
-                response_text,
-                tokens_used,
-                next_step: ActionNextStep::Finish(ActionTerminal::Complete { response }),
-            };
-        }
-        ActionResult {
-            decision: decision.clone(),
-            tool_results,
-            response_text,
-            tokens_used,
-            next_step: ActionNextStep::Continue(continuation),
-        }
-    }
-
-    async fn generate_tool_summary(
-        &self,
-        synthesis_prompt: &str,
-        llm: &dyn LlmProvider,
-        stream: CycleStream<'_>,
-        text_visibility: TextStreamVisibility,
-    ) -> Result<String, LoopError> {
-        let chunks = Arc::new(Mutex::new(Vec::new()));
-        let callback_chunks = Arc::clone(&chunks);
-        let stream_callback = stream.callback.cloned();
-        let callback = Box::new(move |chunk: String| {
-            if let Ok(mut guard) = callback_chunks.lock() {
-                guard.push(chunk.clone());
-            }
-            if matches!(text_visibility, TextStreamVisibility::Public) {
-                if let Some(callback) = &stream_callback {
-                    callback(StreamEvent::TextDelta { text: chunk });
-                }
-            }
-        });
-
-        let fallback = llm
-            .generate_streaming(synthesis_prompt, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS, callback)
-            .await
-            .map_err(|error| {
-                loop_error(
-                    "act",
-                    &format!("tool synthesis generation failed: {error}"),
-                    true,
-                )
-            })?;
-
-        let assembled = join_streamed_chunks(&chunks)?;
-        if assembled.trim().is_empty() {
-            Ok(fallback)
-        } else {
-            Ok(assembled)
-        }
     }
 
     fn estimate_reasoning_cost(&self, perception: &ProcessedPerception) -> ActionCost {
@@ -3505,106 +3216,6 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
 ///
 /// Evicted results are replaced with stubs preserving `tool_call_id` and `tool_name`.
 /// If a single remaining result still exceeds the limit, it is truncated in-place.
-fn evict_oldest_results(mut results: Vec<ToolResult>, max_tokens: usize) -> Vec<ToolResult> {
-    if results.is_empty() {
-        return results;
-    }
-
-    // NB1: Clamp max_tokens to a floor of 1000 tokens so that a misconfigured
-    // `max_synthesis_tokens: 0` doesn't evict everything including the last result,
-    // leaving nothing for synthesis.
-    const MIN_SYNTHESIS_TOKENS: usize = 1_000;
-    let max_tokens = max_tokens.max(MIN_SYNTHESIS_TOKENS);
-
-    let total_tokens = estimate_results_tokens(&results);
-    if total_tokens <= max_tokens {
-        // NTH1: Log accumulated bytes when eviction is NOT triggered to aid
-        // debugging "why didn't it evict?" scenarios.
-        let total_bytes: usize = results.iter().map(|r| r.output.len()).sum();
-        tracing::debug!(
-            total_bytes,
-            total_tokens,
-            max_tokens,
-            result_count = results.len(),
-            "synthesis context guard: under token limit, no eviction needed"
-        );
-        return results;
-    }
-
-    let (evicted_count, bytes_saved) = evict_results_until_under_limit(&mut results, max_tokens);
-
-    if evicted_count > 0 {
-        tracing::info!(
-            evicted_count,
-            bytes_saved,
-            remaining = results.len() - evicted_count.min(results.len()),
-            "synthesis context guard: evicted oldest tool results"
-        );
-    }
-
-    truncate_single_oversized_result(&mut results, max_tokens);
-    results
-}
-
-fn estimate_results_tokens(results: &[ToolResult]) -> usize {
-    results
-        .iter()
-        .map(|r| estimate_text_tokens(&r.output))
-        .sum()
-}
-
-/// Walk results front-to-back (oldest first), replacing with stubs.
-/// Returns `(evicted_count, bytes_saved)`.
-fn evict_results_until_under_limit(
-    results: &mut [ToolResult],
-    max_tokens: usize,
-) -> (usize, usize) {
-    let mut current_tokens = estimate_results_tokens(results);
-    let mut evicted_count = 0usize;
-    let mut bytes_saved = 0usize;
-
-    for result in results.iter_mut() {
-        if current_tokens <= max_tokens {
-            break;
-        }
-        let old_tokens = estimate_text_tokens(&result.output);
-        let stub = format!(
-            "[evicted: {} result too large for synthesis]",
-            result.tool_name
-        );
-        let stub_tokens = estimate_text_tokens(&stub);
-        bytes_saved = bytes_saved.saturating_add(result.output.len());
-        result.output = stub;
-        current_tokens = current_tokens
-            .saturating_sub(old_tokens)
-            .saturating_add(stub_tokens);
-        evicted_count = evicted_count.saturating_add(1);
-    }
-
-    (evicted_count, bytes_saved)
-}
-
-/// If a single result still exceeds `max_tokens`, truncate it.
-fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usize) {
-    let current_tokens = estimate_results_tokens(results);
-    if current_tokens <= max_tokens {
-        return;
-    }
-
-    // Find the largest result and truncate it
-    if let Some(largest) = results.iter_mut().max_by_key(|r| r.output.len()) {
-        let excess_tokens = current_tokens.saturating_sub(max_tokens);
-        // NB2: This uses the char-based inverse (4 bytes/token) of `estimate_text_tokens`.
-        // When the word-count path dominates (many short words), this undershoots — the
-        // result may remain slightly over limit. This is intentional: conservative eviction
-        // (removing less than optimal) is safer than over-eviction which could discard
-        // useful context needed for synthesis.
-        let excess_bytes = excess_tokens.saturating_mul(4);
-        let target_bytes = largest.output.len().saturating_sub(excess_bytes);
-        largest.output = truncate_tool_result(&largest.output, target_bytes).into_owned();
-    }
-}
-
 fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {
     let user_message = snapshot
         .user_input
@@ -3622,45 +3233,6 @@ fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopErr
     }
 
     Ok(user_message)
-}
-
-fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> String {
-    let has_tool_error = tool_results.iter().any(|result| !result.success);
-    let error_relay_instruction = if has_tool_error {
-        "\nIf any tool returned an error, tell the user exactly what went wrong: include the actual error message. Do not soften, hedge, or paraphrase errors."
-    } else {
-        ""
-    };
-    let tool_summary = tool_results
-        .iter()
-        .map(|result| format!("- {}: {}", result.tool_name, result.output))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "You are Fawx. Never introduce yourself, greet the user, or add preamble. Answer the user's question using these tool results. \
-Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
-Just provide the answer directly. \
-If the user asked for a specific format or value type, preserve that exact format. \
-Do not convert timestamps to human-readable, counts to lists, or raw values to prose \
-unless the user explicitly asked for that.{error_relay_instruction}\n\n\
-{instruction}\n\n\
-Tool results:\n{tool_summary}"
-    )
-}
-
-fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
-    let parts = chunks
-        .lock()
-        .map_err(|_| loop_error("act", "tool synthesis stream collection failed", true))?;
-    Ok(parts.join(""))
-}
-
-fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
-    TokenUsage {
-        input_tokens: estimate_tokens(prompt),
-        output_tokens: estimate_tokens(response),
-    }
 }
 
 fn prioritize_flow_command(current: Option<LoopCommand>, incoming: LoopCommand) -> LoopCommand {
@@ -17321,7 +16893,10 @@ mod synthesis_context_guard_tests {
         }
 
         // Total tokens should be under limit
-        let total_tokens = estimate_results_tokens(&evicted);
+        let total_tokens: usize = evicted
+            .iter()
+            .map(|result| estimate_text_tokens(&result.output))
+            .sum();
         assert!(
             total_tokens <= 10_000,
             "total tokens {total_tokens} should be <= 10_000"
