@@ -2554,6 +2554,7 @@ mod tests {
     use fx_session::SessionKey;
     use fx_subagent::SpawnConfig;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::time::Duration;
 
@@ -2640,6 +2641,26 @@ mod tests {
             )),
             bus_receiver: None,
         }
+    }
+
+    fn write_test_signing_key(data_dir: &Path) {
+        let (private_key, _) = fx_skills::signing::generate_keypair().expect("generate keypair");
+        let keys_dir = data_dir.join("keys");
+        std::fs::create_dir_all(&keys_dir).expect("create keys dir");
+        std::fs::write(keys_dir.join("signing_key.pem"), private_key).expect("write signing key");
+    }
+
+    fn install_test_skill(data_dir: &Path, name: &str, wasm_bytes: &[u8]) {
+        let skill_dir = data_dir.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"test\"\nauthor = \"tester\"\napi_version = \"host_api_v1\"\ncapabilities = []\n"
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(skill_dir.join(format!("{name}.wasm")), wasm_bytes).expect("write wasm");
     }
 
     #[derive(Debug)]
@@ -4564,6 +4585,9 @@ mod tests {
             [7_u8; 32],
         )
         .expect("write trusted key");
+        write_test_signing_key(temp.path());
+        install_test_skill(temp.path(), "demo", b"demo-wasm");
+        install_test_skill(temp.path(), "weather", b"weather-wasm");
 
         let mut app = test_app();
         app.config.general.data_dir = Some(temp.path().to_path_buf());
@@ -4607,10 +4631,15 @@ mod tests {
         let sign = process_input_with_commands(&mut app, "/sign demo", None)
             .await
             .expect("process sign command");
-        assert_eq!(
-            sign.response,
-            "Use `fawx sign <skill>` CLI to sign WASM packages."
-        );
+        assert!(sign.response.contains("Signed skill 'demo'"));
+        assert!(temp.path().join("skills/demo/demo.wasm.sig").exists());
+
+        let sign_all = process_input_with_commands(&mut app, "/sign --all", None)
+            .await
+            .expect("process sign all command");
+        assert!(sign_all.response.contains("Signed skill 'demo'"));
+        assert!(sign_all.response.contains("Signed skill 'weather'"));
+        assert!(temp.path().join("skills/weather/weather.wasm.sig").exists());
     }
 
     #[cfg(feature = "http")]

@@ -154,8 +154,10 @@ impl CommandHost for HeadlessApp {
         handle_headless_keys_command(&data_dir, subcommand, value, option, has_extra_args)
     }
 
-    fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
-        Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
+    fn handle_sign(&self, target: Option<&str>, has_extra_args: bool) -> anyhow::Result<String> {
+        let selection = crate::commands::skill_sign::parse_slash_selection(target, has_extra_args)?;
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        crate::commands::skill_sign::sign_output(selection, Some(&data_dir))
     }
 
     fn list_skills(&self) -> anyhow::Result<String> {
