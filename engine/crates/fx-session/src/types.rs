@@ -89,6 +89,28 @@ impl fmt::Display for SessionStatus {
     }
 }
 
+/// Filter for including active and/or archived sessions in registry listings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionArchiveFilter {
+    /// Return active sessions only.
+    #[default]
+    ActiveOnly,
+    /// Return both active and archived sessions.
+    All,
+    /// Return archived sessions only.
+    ArchivedOnly,
+}
+
+impl SessionArchiveFilter {
+    pub fn matches(self, is_archived: bool) -> bool {
+        match self {
+            Self::ActiveOnly => !is_archived,
+            Self::All => true,
+            Self::ArchivedOnly => is_archived,
+        }
+    }
+}
+
 /// Summary metadata for a session (returned by list operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -369,5 +391,23 @@ mod tests {
 
         assert!(!active.is_archived());
         assert!(archived.is_archived());
+    }
+
+    #[test]
+    fn archive_filter_defaults_to_active_only() {
+        assert_eq!(
+            SessionArchiveFilter::default(),
+            SessionArchiveFilter::ActiveOnly
+        );
+    }
+
+    #[test]
+    fn archive_filter_matches_expected_archive_states() {
+        assert!(SessionArchiveFilter::ActiveOnly.matches(false));
+        assert!(!SessionArchiveFilter::ActiveOnly.matches(true));
+        assert!(SessionArchiveFilter::All.matches(false));
+        assert!(SessionArchiveFilter::All.matches(true));
+        assert!(!SessionArchiveFilter::ArchivedOnly.matches(false));
+        assert!(SessionArchiveFilter::ArchivedOnly.matches(true));
     }
 }

@@ -17,6 +17,6 @@ pub use session::{
 };
 pub use store::SessionStore;
 pub use types::{
-    InvalidSessionKey, MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind,
-    SessionStatus,
+    InvalidSessionKey, MessageRole, SessionArchiveFilter, SessionConfig, SessionInfo, SessionKey,
+    SessionKind, SessionStatus,
 };
