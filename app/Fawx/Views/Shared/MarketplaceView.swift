@@ -53,7 +53,7 @@ struct MarketplaceView: View {
                     ForEach(skillsViewModel.marketplaceSkills) { skill in
                         MarketplaceSkillCard(
                             skill: skill,
-                            isInstalled: skillsViewModel.isInstalled(skill),
+                            isLoadedOnServer: skillsViewModel.isLoadedOnServer(skill),
                             isInstalling: skillsViewModel.installingSkillNames.contains(skill.name)
                         ) {
                             Task {
@@ -87,7 +87,7 @@ struct MarketplaceView: View {
 
 private struct MarketplaceSkillCard: View {
     let skill: MarketplaceSkillSummary
-    let isInstalled: Bool
+    let isLoadedOnServer: Bool
     let isInstalling: Bool
     let installAction: () -> Void
 
@@ -132,8 +132,8 @@ private struct MarketplaceSkillCard: View {
             Spacer(minLength: 0)
 
             HStack {
-                if isInstalled {
-                    MarketplaceBadge(label: "Installed", tone: .installed)
+                if isLoadedOnServer {
+                    MarketplaceBadge(label: LoadedSkillsCopy.serverLoaded.statusLabel, tone: .loaded)
                 } else {
                     Button(isInstalling ? "Installing..." : "Install") {
                         installAction()
@@ -159,7 +159,7 @@ private struct MarketplaceSkillCard: View {
 private struct MarketplaceBadge: View {
     enum Tone {
         case verified
-        case installed
+        case loaded
     }
 
     let label: String
@@ -179,7 +179,7 @@ private struct MarketplaceBadge: View {
         switch tone {
         case .verified:
             .fawxSuccess
-        case .installed:
+        case .loaded:
             .fawxTextSecondary
         }
     }
@@ -188,7 +188,7 @@ private struct MarketplaceBadge: View {
         switch tone {
         case .verified:
             Color.fawxSuccess.opacity(0.12)
-        case .installed:
+        case .loaded:
             Color.fawxSurfaceActive.opacity(0.12)
         }
     }

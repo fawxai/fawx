@@ -228,7 +228,7 @@ final class SkillsViewModel {
         }
     }
 
-    func isInstalled(_ marketplaceSkill: MarketplaceSkillSummary) -> Bool {
+    func isLoadedOnServer(_ marketplaceSkill: MarketplaceSkillSummary) -> Bool {
         skills.contains(where: { $0.name == marketplaceSkill.name })
     }
 }

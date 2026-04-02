@@ -7,7 +7,7 @@ struct SkillsView: View {
     @Bindable var skillsViewModel: SkillsViewModel
     let isActive: Bool
     let showsHeader: Bool
-    @State private var selectedSection: SkillsSection = .installed
+    @State private var selectedSection: SkillsSection = .loadedOnServer
     @State private var searchText = ""
 
     init(skillsViewModel: SkillsViewModel, isActive: Bool = true, showsHeader: Bool = true) {
@@ -37,7 +37,7 @@ struct SkillsView: View {
             }
             await skillsViewModel.refresh()
         }
-        .task(id: "\(isActive)|\(selectedSection == .marketplace ? searchText : "__installed__")") {
+        .task(id: "\(isActive)|\(selectedSection == .marketplace ? searchText : "__loaded__")") {
             guard isActive, selectedSection == .marketplace else {
                 return
             }
@@ -93,7 +93,7 @@ struct SkillsView: View {
                 .font(FawxTypography.heading1)
                 .foregroundStyle(Color.fawxText)
 
-            Text(selectedSection == .installed ? "Loaded on server" : "Signed marketplace skills")
+            Text(selectedSection.subtitle)
                 .font(FawxTypography.chatBody)
                 .foregroundStyle(Color.fawxTextSecondary)
         }
@@ -144,15 +144,15 @@ struct SkillsView: View {
     @ViewBuilder
     private var content: some View {
         switch selectedSection {
-        case .installed:
-            installedContent
+        case .loadedOnServer:
+            loadedSkillsContent
         case .marketplace:
             MarketplaceView(skillsViewModel: skillsViewModel, searchText: searchText)
         }
     }
 
     @ViewBuilder
-    private var installedContent: some View {
+    private var loadedSkillsContent: some View {
         if skillsViewModel.isLoading && skillsViewModel.skills.isEmpty {
             ProgressView("Loading skills...")
                 .foregroundStyle(Color.fawxTextSecondary)
@@ -173,8 +173,8 @@ struct SkillsView: View {
         } else if skillsViewModel.skills.isEmpty {
             SkillsPlaceholderView(
                 systemImage: "puzzlepiece.extension",
-                title: "No skills loaded",
-                message: "Skills are loaded on the Fawx server. Check your server configuration."
+                title: LoadedSkillsCopy.serverLoaded.emptyTitle,
+                message: LoadedSkillsCopy.serverLoaded.emptyMessage
             )
             .frame(maxWidth: .infinity, minHeight: 280)
         } else if filteredSkills.isEmpty {
@@ -187,7 +187,7 @@ struct SkillsView: View {
         } else {
             VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
                 if !showsHeader {
-                    Text("Loaded on server")
+                    Text(LoadedSkillsCopy.serverLoaded.subtitle)
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
                 }
@@ -237,8 +237,8 @@ struct SkillsView: View {
 
     private var searchPrompt: String {
         switch selectedSection {
-        case .installed:
-            "Search installed skills"
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.searchPrompt
         case .marketplace:
             "Search marketplace skills"
         }
@@ -352,7 +352,7 @@ private struct SkillCardView: View {
 
                 Spacer(minLength: 0)
 
-                SkillStatusPill(label: "Installed", tone: .loaded)
+                SkillStatusPill(label: LoadedSkillsCopy.serverLoaded.statusLabel, tone: .loaded)
 
                 Spacer(minLength: 0)
 
@@ -385,16 +385,43 @@ private struct SkillCardView: View {
 
 }
 
-private enum SkillsSection: CaseIterable {
-    case installed
+struct LoadedSkillsCopy: Equatable {
+    let sectionTitle: String
+    let subtitle: String
+    let searchPrompt: String
+    let emptyTitle: String
+    let emptyMessage: String
+    let statusLabel: String
+
+    static let serverLoaded = Self(
+        sectionTitle: "Loaded",
+        subtitle: "Loaded on server",
+        searchPrompt: "Search loaded skills",
+        emptyTitle: "No skills loaded",
+        emptyMessage: "Skills appear here only after the running Fawx server reports them via /v1/skills.",
+        statusLabel: "Loaded"
+    )
+}
+
+enum SkillsSection: CaseIterable {
+    case loadedOnServer
     case marketplace
 
     var title: String {
         switch self {
-        case .installed:
-            "Installed"
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.sectionTitle
         case .marketplace:
             "Marketplace"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.subtitle
+        case .marketplace:
+            "Signed marketplace skills"
         }
     }
 }
