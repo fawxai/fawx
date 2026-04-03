@@ -24,7 +24,7 @@ pub enum FleetCommands {
     Init,
     /// Add a worker node to the fleet
     Add {
-        /// Node name (e.g., "macmini")
+        /// Node name (e.g., "build-node")
         name: String,
         /// Tailscale IP address
         #[arg(long)]
@@ -505,7 +505,10 @@ mod tests {
 
     #[test]
     fn parsed_hostname_trims_trailing_newline() {
-        assert_eq!(parsed_hostname(b"macmini\n"), Some("macmini".to_string()));
+        assert_eq!(
+            parsed_hostname(b"build-node\n"),
+            Some("build-node".to_string())
+        );
     }
 
     #[test]
@@ -549,7 +552,7 @@ mod tests {
         let mut output = Vec::new();
         execute_fleet_command(
             &FleetCommands::Add {
-                name: "macmini".to_string(),
+                name: "build-node".to_string(),
                 ip: "198.51.100.19".to_string(),
                 port: 8400,
             },
@@ -563,7 +566,7 @@ mod tests {
         let tokens = read_tokens(&fleet_dir);
         let token = tokens.first().expect("token should exist");
 
-        assert!(output.contains("✓ Node \"macmini\" registered"));
+        assert!(output.contains("✓ Node \"build-node\" registered"));
         assert!(output.contains("✓ Token generated"));
         assert!(output.contains("Join command (run on the worker):"));
         assert!(output.contains(&format!(
@@ -583,7 +586,7 @@ mod tests {
         let mut first_output = Vec::new();
         execute_fleet_command(
             &FleetCommands::Add {
-                name: "macmini".to_string(),
+                name: "build-node".to_string(),
                 ip: "198.51.100.19".to_string(),
                 port: 8400,
             },
@@ -595,7 +598,7 @@ mod tests {
 
         let result = execute_fleet_command(
             &FleetCommands::Add {
-                name: "macmini".to_string(),
+                name: "build-node".to_string(),
                 ip: "198.51.100.20".to_string(),
                 port: 8400,
             },
@@ -612,7 +615,7 @@ mod tests {
         let mut server = TestRegisterServer::spawn(TestRegisterResponse {
             status: StatusCode::OK,
             body: FleetRegistrationResponse {
-                node_id: "macmini-a1b2c3".to_string(),
+                node_id: "build-node-a1b2c3".to_string(),
                 accepted: true,
                 message: "registered".to_string(),
             },
@@ -650,12 +653,12 @@ mod tests {
             .json
             .capabilities
             .contains(&"agentic_loop".to_string()));
-        assert_eq!(identity.node_id, "macmini-a1b2c3");
+        assert_eq!(identity.node_id, "build-node-a1b2c3");
         assert_eq!(identity.primary_endpoint, server.base_url);
         assert_eq!(identity.bearer_token, token);
         assert!(identity.registered_at_ms > 0);
         assert!(output.contains("✓ Connected to primary at"));
-        assert!(output.contains("✓ Registered as node \"macmini-a1b2c3\""));
+        assert!(output.contains("✓ Registered as node \"build-node-a1b2c3\""));
         assert!(output.contains("✓ Identity saved to"));
     }
 
@@ -665,13 +668,13 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "198.51.100.19", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
 
         let mut output = Vec::new();
         execute_fleet_command(
             &FleetCommands::Remove {
-                name: "macmini".to_string(),
+                name: "build-node".to_string(),
             },
             &fleet_dir,
             &mut output,
@@ -682,7 +685,7 @@ mod tests {
         let reloaded_manager = FleetManager::load(&fleet_dir).expect("fleet should load");
         let output = String::from_utf8(output).expect("utf8");
 
-        assert!(output.contains("✓ Node \"macmini\" removed and token revoked"));
+        assert!(output.contains("✓ Node \"build-node\" removed and token revoked"));
         assert_eq!(reloaded_manager.verify_bearer(&token.secret), None);
         assert!(reloaded_manager.list_nodes().is_empty());
     }
@@ -738,7 +741,7 @@ mod tests {
 
         let mut manager = FleetManager::load(&fleet_dir).expect("fleet should load");
         manager
-            .add_node("macmini", "198.51.100.19", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("first node should add");
         manager
             .add_node("macbook", "198.51.100.20", 8400)
@@ -762,7 +765,7 @@ mod tests {
         let output = String::from_utf8(output).expect("utf8");
         assert!(output.contains("Fleet Nodes:"));
         assert!(output.contains("macbook"));
-        assert!(output.contains("macmini"));
+        assert!(output.contains("build-node"));
         assert!(output.contains("198.51.100.19:8400"));
         assert!(output.contains("198.51.100.20:8400"));
         assert!(output.contains("online"));
@@ -777,13 +780,13 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let token = manager
-            .add_node("macmini", "198.51.100.19", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
 
         let nodes = manager.list_nodes();
         let output = render_list_output(&nodes, current_time_ms());
 
-        assert!(output.contains("macmini"));
+        assert!(output.contains("build-node"));
         assert!(!output.contains(&token.secret));
     }
 

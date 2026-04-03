@@ -2200,8 +2200,8 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_returns_device_list() {
         let mut devices = DeviceStore::new();
-        let (_, first) = devices.create_device("Joe's MacBook");
-        let (_, second) = devices.create_device("Joe's iPhone");
+        let (_, first) = devices.create_device("Alice's MacBook");
+        let (_, second) = devices.create_device("Alice's iPhone");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -2220,7 +2220,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_excludes_token_hash() {
         let mut devices = DeviceStore::new();
-        let _ = devices.create_device("Joe's MacBook");
+        let _ = devices.create_device("Alice's MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -2235,7 +2235,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn delete_device_revokes_token() {
         let mut devices = DeviceStore::new();
-        let (raw_token, device) = devices.create_device("Joe's MacBook");
+        let (raw_token, device) = devices.create_device("Alice's MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let before_delete = Request::builder()
@@ -2745,7 +2745,7 @@ allowed_chat_ids = [123]
         let temp = TempDir::new().expect("tempdir");
         let mut manager = FleetManager::init(temp.path()).expect("fleet init");
         let token = manager
-            .add_node("macmini", "198.51.100.19", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
         let app = build_router(
             test_state(None, Vec::new()),
@@ -2757,7 +2757,7 @@ allowed_chat_ids = [123]
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&fx_fleet::FleetRegistrationRequest {
-                    node_name: "macmini".to_string(),
+                    node_name: "build-node".to_string(),
                     bearer_token: token.secret,
                     capabilities: vec!["agentic_loop".to_string()],
                     rust_version: None,

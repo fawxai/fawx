@@ -435,8 +435,8 @@ mod tests {
     #[test]
     fn node_info_from_config_maps_fleet_fields() {
         let config = NodeConfig {
-            id: "mac-mini".to_string(),
-            name: "Mac Mini".to_string(),
+            id: "build-node".to_string(),
+            name: "Build Node".to_string(),
             endpoint: Some("https://10.0.0.5:8400".to_string()),
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
@@ -447,8 +447,8 @@ mod tests {
 
         let node = NodeInfo::from(&config);
 
-        assert_eq!(node.node_id, "mac-mini");
-        assert_eq!(node.name, "Mac Mini");
+        assert_eq!(node.node_id, "build-node");
+        assert_eq!(node.name, "Build Node");
         assert_eq!(node.endpoint, "https://10.0.0.5:8400");
         assert_eq!(node.auth_token.as_deref(), Some("token"));
         assert_eq!(

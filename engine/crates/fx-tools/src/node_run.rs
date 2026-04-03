@@ -264,11 +264,11 @@ mod tests {
     #[tokio::test]
     async fn resolves_node_by_name() {
         let transport = Arc::new(MockTransport::succeeding("ok\n"));
-        let state = make_state(vec![make_node("n1", "Mac Mini")], transport.clone());
+        let state = make_state(vec![make_node("n1", "Build Node")], transport.clone());
 
         let result = handle_node_run(
             &state,
-            &serde_json::json!({"node": "Mac Mini", "command": "ls"}),
+            &serde_json::json!({"node": "Build Node", "command": "ls"}),
         )
         .await
         .expect("should resolve by name");
