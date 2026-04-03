@@ -429,7 +429,7 @@ mod tests {
             relevant_semantic: vec![],
             active_procedures: vec![],
             identity_context: IdentityContext {
-                user_name: Some("Example User".to_owned()),
+                user_name: Some("Alice".to_owned()),
                 preferences: parent_preferences,
                 personality_traits: vec!["concise".to_owned()],
             },
@@ -465,7 +465,7 @@ mod tests {
             relevant_semantic: vec![],
             active_procedures: vec![],
             identity_context: IdentityContext {
-                user_name: Some("Example User".to_owned()),
+                user_name: Some("Alice".to_owned()),
                 preferences: child_preferences,
                 personality_traits: vec!["focused".to_owned()],
             },
@@ -603,7 +603,7 @@ mod tests {
         preferences.insert("lang".to_owned(), "en".to_owned());
 
         let identity = IdentityContext {
-            user_name: Some("Example User".to_owned()),
+            user_name: Some("Alice".to_owned()),
             preferences,
             personality_traits: vec!["friendly".to_owned()],
         };

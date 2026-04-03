@@ -203,11 +203,13 @@ feature/* → dev → staging → main
 
 - **feature branches**: cut from `dev`, PRs target `dev`
 - **dev**: integration branch — merge freely after CI + TUI smoke test pass. Multiple features tested together here.
-- **staging**: release candidate — maintainer promotes `dev → staging` after integration testing passes
+- **staging**: release candidate — Joe manually promotes `dev → staging` after integration testing passes
 - **main**: production releases only — `staging → main` for releases
 
 All three long-lived branches are protected: no force push, no deletion.
 
 ---
 
-*This file defines the engineering standards for the Fawx codebase. All contributions are held to these rules. For style preferences, see `TASTE.md`.*
+---
+
+*This file is immutable doctrine. Cite it in PR reviews. Changes require explicit user approval. For evolving preferences and style, see `TASTE.md`.*

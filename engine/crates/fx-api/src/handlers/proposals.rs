@@ -12,6 +12,8 @@ use std::fs;
 struct ProposalSidecar {
     #[allow(dead_code)]
     pub version: u8,
+    #[serde(default = "default_proposal_action")]
+    pub action: String,
     pub timestamp: u64,
     pub title: String,
     pub description: String,
@@ -20,6 +22,10 @@ struct ProposalSidecar {
     pub risk: String,
     #[allow(dead_code)]
     pub file_hash_at_creation: Option<String>,
+}
+
+fn default_proposal_action() -> String {
+    "write_file".to_string()
 }
 
 use super::HandlerResult;
@@ -146,7 +152,7 @@ pub async fn handle_history(State(state): State<HttpState>) -> Json<ProposalHist
             entries.push(ProposalHistoryEntry {
                 id: proposal_id_from_sidecar(&sidecar),
                 tier: classify_risk(&sidecar.risk),
-                action: "write_file".to_string(),
+                action: sidecar.action.clone(),
                 target: sidecar.target_path.clone(),
                 agent_reason: sidecar.description.clone(),
                 approved,
@@ -170,7 +176,7 @@ fn sidecar_to_proposal(sidecar: &ProposalSidecar) -> PendingProposal {
     PendingProposal {
         id: proposal_id_from_sidecar(sidecar),
         tier: classify_risk(&sidecar.risk),
-        action: "write_file".to_string(),
+        action: sidecar.action.clone(),
         target: sidecar.target_path.clone(),
         agent_reason: sidecar.description.clone(),
         diff: Some(sidecar.proposed_content.clone()),
@@ -340,6 +346,7 @@ mod tests {
     fn sidecar_to_proposal_maps_fields() {
         let sidecar = ProposalSidecar {
             version: 1,
+            action: "git_checkpoint".into(),
             timestamp: 1700000000,
             title: "Update config".into(),
             description: "Need to update config".into(),
@@ -351,6 +358,7 @@ mod tests {
 
         let proposal = sidecar_to_proposal(&sidecar);
 
+        assert_eq!(proposal.action, "git_checkpoint");
         assert_eq!(proposal.tier, ProposalTier::Elevated);
         assert_eq!(proposal.target, "/etc/config");
         assert_eq!(proposal.diff, Some("+new line".into()));

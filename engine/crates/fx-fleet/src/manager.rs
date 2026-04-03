@@ -448,7 +448,7 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         let token = manager
-            .add_node("Worker Node A", "203.0.113.10", 8400)
+            .add_node("Build Node", "198.51.100.19", 8400)
             .expect("node should add");
         let node = manager
             .list_nodes()
@@ -457,10 +457,10 @@ mod tests {
 
         assert_eq!(token.node_id, node.node_id);
         assert_ne!(token.node_id, node.name);
-        assert!(token.node_id.starts_with("worker-node-a-"));
-        assert_eq!(node.name, "Worker Node A");
-        assert_eq!(node.endpoint, "https://203.0.113.10:8400");
-        assert_eq!(node.address.as_deref(), Some("203.0.113.10"));
+        assert!(token.node_id.starts_with("build-node-"));
+        assert_eq!(node.name, "Build Node");
+        assert_eq!(node.endpoint, "https://198.51.100.19:8400");
+        assert_eq!(node.address.as_deref(), Some("198.51.100.19"));
         assert_eq!(node.status, NodeStatus::Offline);
     }
 
@@ -470,9 +470,9 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("first node should add");
-        let result = manager.add_node("node-a", "203.0.113.11", 8400);
+        let result = manager.add_node("build-node", "198.51.100.20", 8400);
 
         assert!(matches!(result, Err(FleetError::DuplicateNode)));
     }
@@ -482,11 +482,11 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
 
         manager
-            .remove_node("node-a")
+            .remove_node("build-node")
             .expect("node should remove cleanly");
 
         assert!(manager.list_nodes().is_empty());
@@ -510,7 +510,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("Worker Node A", "203.0.113.10", 8400)
+            .add_node("Build Node", "198.51.100.19", 8400)
             .expect("node should add");
 
         let verified = manager.verify_bearer(&token.secret);
@@ -523,10 +523,10 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
         manager
-            .remove_node("node-a")
+            .remove_node("build-node")
             .expect("node should remove cleanly");
 
         let verified = manager.verify_bearer(&token.secret);
@@ -547,7 +547,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
 
         let node = manager
@@ -571,7 +571,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
 
         manager
@@ -592,7 +592,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("node should add");
         manager
             .record_worker_heartbeat(&token.node_id, NodeStatus::Busy, 100)
@@ -617,19 +617,19 @@ mod tests {
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
         let active = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("first node should add");
         let revoked = manager
-            .add_node("node-b", "203.0.113.11", 8401)
+            .add_node("macbook", "198.51.100.20", 8401)
             .expect("second node should add");
         manager
-            .remove_node("node-b")
+            .remove_node("macbook")
             .expect("node should remove cleanly");
 
         let loaded = FleetManager::load(&fleet_dir).expect("fleet should load");
         let node_names = sorted_node_names(loaded.list_nodes());
 
-        assert_eq!(node_names, vec!["node-a".to_string()]);
+        assert_eq!(node_names, vec!["build-node".to_string()]);
         assert_eq!(
             loaded.verify_bearer(&active.secret).as_deref(),
             Some(active.node_id.as_str())
@@ -648,7 +648,7 @@ mod tests {
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         manager
-            .add_node("Worker Node A", "203.0.113.10", 8400)
+            .add_node("Build Node", "198.51.100.19", 8400)
             .expect("node should add");
 
         assert_private_permissions(&nodes_path(temp_dir.path()));
@@ -682,15 +682,15 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
         manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("build-node", "198.51.100.19", 8400)
             .expect("first node should add");
         manager
-            .add_node("node-b", "203.0.113.11", 8401)
+            .add_node("macbook", "198.51.100.20", 8401)
             .expect("second node should add");
 
         let names = sorted_node_names(manager.list_nodes());
 
-        assert_eq!(names, vec!["node-a".to_string(), "node-b".to_string()]);
+        assert_eq!(names, vec!["build-node".to_string(), "macbook".to_string()]);
     }
 
     fn sorted_node_names(nodes: Vec<&NodeInfo>) -> Vec<String> {

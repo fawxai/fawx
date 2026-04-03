@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
+use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::cancellation::CancellationToken;
-use fx_llm::ToolDefinition;
+use fx_kernel::ToolAuthoritySurface;
+use fx_llm::{ToolCall, ToolDefinition};
 use fx_loadable::{Skill, SkillError};
 use fx_ripcord::git_guard::check_push_allowed;
 use serde::Deserialize;
@@ -165,15 +166,6 @@ impl GitSkill {
         }
         self.run_git_with_timeout(&["add", "-A"], CHECKPOINT_TIMEOUT)
             .await?;
-        if let Err(error) = self.check_staged_paths().await {
-            if let Err(reset_err) = self
-                .run_git_with_timeout(&["reset"], CHECKPOINT_TIMEOUT)
-                .await
-            {
-                tracing::warn!("failed to reset index after blocked checkpoint: {reset_err}");
-            }
-            return Err(error);
-        }
         match self
             .run_git_with_timeout(&["commit", "-m", &parsed.message], CHECKPOINT_TIMEOUT)
             .await
@@ -183,33 +175,6 @@ impl GitSkill {
                 Ok("nothing to commit, working tree clean".to_string())
             }
             Err(error) => Err(error),
-        }
-    }
-
-    async fn check_staged_paths(&self) -> Result<(), String> {
-        let Some(ref config) = self.self_modify else {
-            return Ok(());
-        };
-        let output = self.run_git(&["diff", "--cached", "--name-only"]).await?;
-        let mut violations = Vec::new();
-        for line in output.lines() {
-            let file_path = line.trim();
-            if file_path.is_empty() {
-                continue;
-            }
-            let full = self.working_dir.join(file_path);
-            let tier = classify_path(&full, &self.working_dir, config);
-            if let Some(message) = format_tier_violation(Path::new(file_path), tier) {
-                violations.push(message);
-            }
-        }
-        if violations.is_empty() {
-            Ok(())
-        } else {
-            Err(violations.join(
-                "
-",
-            ))
         }
     }
 
@@ -395,6 +360,13 @@ impl Skill for GitSkill {
             git_push_definition(),
             github_pr_create_definition(),
         ]
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        match call.name.as_str() {
+            "git_checkpoint" => ToolAuthoritySurface::GitCheckpoint,
+            _ => ToolAuthoritySurface::Other,
+        }
     }
 
     async fn execute(
@@ -902,6 +874,21 @@ mod tests {
                 "{tool_name} description should include actionable usage guidance"
             );
         }
+    }
+
+    #[test]
+    fn git_skill_reports_checkpoint_authority_surface() {
+        let skill = GitSkill::new(PathBuf::from("."), None, None);
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "git_checkpoint".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            skill.authority_surface(&call),
+            ToolAuthoritySurface::GitCheckpoint
+        );
     }
 
     #[test]
@@ -1421,7 +1408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_checkpoint_blocks_denied_path() {
+    async fn git_checkpoint_does_not_self_enforce_denied_path_policy() {
         let repo = init_test_repo();
         let config = SelfModifyConfig {
             enabled: true,
@@ -1430,18 +1417,18 @@ mod tests {
         };
         fs::write(repo.path().join("secret.txt"), "private").expect("write text file");
         let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
-        let error = run_tool(
+        let output = run_tool(
             &skill,
             "git_checkpoint",
             serde_json::json!({ "message": "should fail" }),
         )
         .await
-        .expect_err("checkpoint with denied file should fail");
-        assert!(error.contains("Self-modify policy violation [deny]"));
+        .expect("checkpoint should succeed without local authority enforcement");
+        assert!(output.contains("should fail"));
     }
 
     #[tokio::test]
-    async fn git_checkpoint_propose_tier_requires_proposal_system() {
+    async fn git_checkpoint_does_not_require_local_proposal_system() {
         let repo = init_test_repo();
         let config = SelfModifyConfig {
             enabled: true,
@@ -1452,15 +1439,14 @@ mod tests {
         fs::write(repo.path().join("kernel/loop.rs"), "pub fn tick() {}")
             .expect("write kernel file");
         let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
-        let error = run_tool(
+        let output = run_tool(
             &skill,
             "git_checkpoint",
             serde_json::json!({ "message": "should fail" }),
         )
         .await
-        .expect_err("checkpoint with propose path should fail");
-        assert!(error.contains("Self-modify policy violation [propose]"));
-        assert!(error.contains("proposal system"));
+        .expect("checkpoint should succeed without local proposal enforcement");
+        assert!(output.contains("should fail"));
     }
 
     #[tokio::test]
@@ -1498,7 +1484,7 @@ mod tests {
         assert!(output.contains("no enforcement"));
     }
     #[tokio::test]
-    async fn git_checkpoint_resets_index_on_deny() {
+    async fn git_checkpoint_leaves_clean_index_after_commit() {
         let repo = init_test_repo();
         let config = SelfModifyConfig {
             enabled: true,
@@ -1507,15 +1493,14 @@ mod tests {
         };
         fs::write(repo.path().join("secret.key"), "private").expect("write key file");
         let skill = GitSkill::new(repo.path().to_path_buf(), Some(config), None);
-        let _error = run_tool(
+        let _output = run_tool(
             &skill,
             "git_checkpoint",
             serde_json::json!({ "message": "should fail" }),
         )
         .await
-        .expect_err("checkpoint with denied file should fail");
+        .expect("checkpoint should succeed");
 
-        // After denial, the index should be reset (file should be unstaged)
         let status = StdCommand::new("git")
             .args(["status", "--porcelain"])
             .current_dir(repo.path())
@@ -1524,8 +1509,8 @@ mod tests {
         let status_text =
             String::from_utf8(status.stdout).expect("git status output should be valid UTF-8");
         assert!(
-            status_text.contains("?? secret.key"),
-            "secret.key should be unstaged after denied checkpoint, got: {status_text}"
+            status_text.trim().is_empty(),
+            "working tree should be clean after checkpoint, got: {status_text}"
         );
     }
 

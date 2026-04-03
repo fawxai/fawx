@@ -10,7 +10,7 @@ const GPT_5_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 const O1_O3_LEVELS: &[&str] = &["off", "low", "medium", "high"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelFamily {
+pub(crate) enum ModelFamily {
     ClaudeOpus46,
     ClaudeSonnet46,
     /// Claude 4.5, Haiku, and all older Claude models (same behavior).
@@ -26,7 +26,7 @@ fn model_name(model_id: &str) -> &str {
     model_id.split('/').next_back().unwrap_or(model_id)
 }
 
-fn classify_model(model_id: &str) -> ModelFamily {
+pub(crate) fn classify_model_family(model_id: &str) -> ModelFamily {
     let model = model_name(model_id);
     if model.contains("opus-4-6") {
         return ModelFamily::ClaudeOpus46;
@@ -90,8 +90,8 @@ fn legacy_claude_budget(model_id: &str, level: &str) -> u32 {
 }
 
 /// Return valid thinking levels for a model.
-pub fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
-    match classify_model(model_id) {
+pub(crate) fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
+    match classify_model_family(model_id) {
         ModelFamily::ClaudeOpus46 => CLAUDE_OPUS_46_LEVELS,
         ModelFamily::ClaudeSonnet46 => CLAUDE_SONNET_46_LEVELS,
         ModelFamily::ClaudeLegacy => CLAUDE_LEGACY_LEVELS,
@@ -105,7 +105,7 @@ pub fn valid_thinking_levels(model_id: &str) -> &'static [&'static str] {
 
 /// Return the default thinking level for a model.
 pub fn default_thinking_level(model_id: &str) -> &'static str {
-    match classify_model(model_id) {
+    match classify_model_family(model_id) {
         ModelFamily::ClaudeOpus46 | ModelFamily::ClaudeSonnet46 | ModelFamily::ClaudeLegacy => {
             "high"
         }
@@ -121,7 +121,7 @@ pub fn thinking_config_for_model(model_id: &str, level: &str) -> Option<Thinking
         return Some(ThinkingConfig::Off);
     }
 
-    match classify_model(model_id) {
+    match classify_model_family(model_id) {
         ModelFamily::ClaudeOpus46 | ModelFamily::ClaudeSonnet46 => Some(ThinkingConfig::Adaptive {
             effort: anthropic_46_effort(level),
         }),

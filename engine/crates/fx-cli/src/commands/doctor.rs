@@ -352,9 +352,9 @@ fn wasm_target_line() -> DoctorLine {
         DoctorStatus::NotConfigured
     };
     let message = if installed {
-        "wasm32-unknown-unknown target installed"
+        "wasm32-wasip1 target installed"
     } else {
-        "wasm32-unknown-unknown target not installed"
+        "wasm32-wasip1 target not installed"
     };
     DoctorLine::new(status, message)
 }
@@ -370,9 +370,7 @@ fn wasm_target_installed() -> bool {
 }
 
 fn parse_installed_targets(output: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.trim() == "wasm32-unknown-unknown")
+    output.lines().any(|line| line.trim() == "wasm32-wasip1")
 }
 
 fn network_section(layout: &RuntimeLayout) -> DoctorSection {
@@ -430,7 +428,7 @@ mod tests {
     #[test]
     fn wasm_target_detection_parses_installed_targets() {
         assert!(parse_installed_targets(
-            "x86_64-unknown-linux-gnu\nwasm32-unknown-unknown\n"
+            "x86_64-unknown-linux-gnu\nwasm32-wasip1\n"
         ));
     }
 

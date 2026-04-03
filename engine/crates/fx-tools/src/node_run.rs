@@ -264,11 +264,11 @@ mod tests {
     #[tokio::test]
     async fn resolves_node_by_name() {
         let transport = Arc::new(MockTransport::succeeding("ok\n"));
-        let state = make_state(vec![make_node("n1", "Worker Node A")], transport.clone());
+        let state = make_state(vec![make_node("n1", "Build Node")], transport.clone());
 
         let result = handle_node_run(
             &state,
-            &serde_json::json!({"node": "Worker Node A", "command": "ls"}),
+            &serde_json::json!({"node": "Build Node", "command": "ls"}),
         )
         .await
         .expect("should resolve by name");
@@ -281,11 +281,11 @@ mod tests {
     #[tokio::test]
     async fn resolves_node_name_case_insensitive() {
         let transport = Arc::new(MockTransport::succeeding("ok\n"));
-        let state = make_state(vec![make_node("n1", "Worker Node B")], transport.clone());
+        let state = make_state(vec![make_node("n1", "MacBook Pro")], transport.clone());
 
         let result = handle_node_run(
             &state,
-            &serde_json::json!({"node": "worker node b", "command": "ls"}),
+            &serde_json::json!({"node": "macbook pro", "command": "ls"}),
         )
         .await;
 

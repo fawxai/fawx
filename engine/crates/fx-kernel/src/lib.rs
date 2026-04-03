@@ -26,6 +26,7 @@
 //! - Three-gate decision: policy → budget → permission, no gate skippable
 
 pub mod act;
+pub mod authority;
 pub mod budget;
 pub mod caching_executor;
 pub mod cancellation;
@@ -36,6 +37,7 @@ pub mod conversation_compactor;
 pub mod decide;
 pub mod event_bus;
 pub mod input;
+mod kernel_blind;
 pub mod loop_engine;
 pub mod perceive;
 pub mod permission_gate;
@@ -46,6 +48,7 @@ pub mod process_registry;
 pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
+pub mod scoped_tool_executor;
 pub mod signals;
 pub mod streaming;
 pub mod system_prompt;
@@ -57,6 +60,10 @@ pub mod yield_primitive;
 pub use act::{
     cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
     ToolCacheStats, ToolCacheability, ToolResult,
+};
+pub use authority::{
+    ApprovalScope, AuthorityCoordinator, AuthorityDecision, AuthorityEffect,
+    AuthorityStatusSnapshot, AuthorityTargetKind, AuthorityVerdict, ToolAuthoritySurface,
 };
 pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;

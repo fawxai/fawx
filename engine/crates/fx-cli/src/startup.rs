@@ -30,16 +30,16 @@ use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
 use fx_kernel::streaming::{StreamCallback, StreamEvent};
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
-    CachingExecutor, PermissionGateExecutor, PermissionPolicy, PermissionPromptState,
-    ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+    AuthorityCoordinator, CachingExecutor, PermissionGateExecutor, PermissionPolicy,
+    PermissionPromptState, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
 };
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
 use fx_loadable::watcher::{ReloadEvent, SkillWatcher};
 use fx_loadable::{
-    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillRegistry,
-    TransactionSkill,
+    NotificationSender, NotifySkill, SessionMemorySkill, SignaturePolicy, SkillLifecycleConfig,
+    SkillLifecycleManager, SkillRegistry, TransactionSkill,
 };
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
@@ -379,6 +379,7 @@ pub struct LoopEngineBundle {
     pub startup_warnings: Vec<StartupWarning>,
     /// Shared callback slot for SSE stream events that need executor-side access.
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
+    pub permission_prompt_state: Arc<PermissionPromptState>,
     pub ripcord_journal: Arc<RipcordJournal>,
     /// LLM provider for experiment/improvement pipelines.
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
@@ -543,16 +544,21 @@ fn build_loop_engine_with_options(
 
     // Build executor chain:
     // PermissionGateExecutor → TripwireEvaluator → ProposalGateExecutor → CachingExecutor → SkillRegistry
-    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let self_modify_config = crate::config_bridge::effective_self_modify_config(
+        &config.self_modify,
+        &config.permissions,
+    );
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
-    let proposal_gate = ProposalGateExecutor::new(caching_registry, gate_state);
     let permission_policy = permissions_to_policy(&config.permissions);
+    let authority = Arc::new(AuthorityCoordinator::new(permission_policy, gate_state));
+    authority.attach_runtime_info(Arc::clone(&skills.runtime_info));
+    let proposal_gate = ProposalGateExecutor::new(caching_registry, Arc::clone(&authority));
     let prompt_state = options
         .permission_prompt_state
         .unwrap_or_else(|| Arc::new(PermissionPromptState::new()));
     let permission_gate =
-        PermissionGateExecutor::new(proposal_gate, permission_policy, prompt_state)
+        PermissionGateExecutor::new(proposal_gate, authority, Arc::clone(&prompt_state))
             .with_stream_callback_slot(Arc::clone(&stream_callback_slot));
     let ripcord_journal = options.ripcord_journal.unwrap_or_else(|| {
         let snapshot_dir = data_dir.join("ripcord").join("snapshots");
@@ -610,6 +616,7 @@ fn build_loop_engine_with_options(
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
         stream_callback_slot,
+        permission_prompt_state: prompt_state,
         improvement_provider: improvement_provider_for_bundle,
         ripcord_journal,
     })
@@ -894,6 +901,22 @@ impl ToolExecutor for SharedSkillRegistry {
         self.registry.cacheability(tool_name)
     }
 
+    fn action_category(&self, call: &fx_llm::ToolCall) -> &'static str {
+        self.registry.action_category(call)
+    }
+
+    fn authority_surface(&self, call: &fx_llm::ToolCall) -> fx_kernel::ToolAuthoritySurface {
+        self.registry.authority_surface(call)
+    }
+
+    fn journal_action(
+        &self,
+        call: &fx_llm::ToolCall,
+        result: &fx_kernel::act::ToolResult,
+    ) -> Option<fx_kernel::act::JournalAction> {
+        self.registry.journal_action(call, result)
+    }
+
     fn cache_stats(&self) -> Option<fx_kernel::act::ToolCacheStats> {
         self.registry.cache_stats()
     }
@@ -926,9 +949,12 @@ fn build_skill_registry(
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     options: SkillRegistryBuildOptions,
 ) -> SkillRegistryBundle {
+    let permission_policy = permissions_to_policy(&config.permissions);
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
+        allow_outside_workspace_reads: permission_policy.unrestricted.contains("outside_workspace")
+            || permission_policy.ask_required.contains("outside_workspace"),
         ..ToolConfig::default()
     };
     let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {
@@ -948,7 +974,10 @@ fn build_skill_registry(
             &mut startup_warnings,
         );
 
-    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let self_modify_config = crate::config_bridge::effective_self_modify_config(
+        &config.self_modify,
+        &config.permissions,
+    );
     let sm = self_modify_config.enabled.then_some(self_modify_config);
     if let Some(ref smc) = sm {
         executor = executor.with_self_modify(smc.clone());
@@ -1063,25 +1092,31 @@ fn build_skill_registry(
         .with_protected_branches(config.git.protected_branches.clone());
     registry.register(Arc::new(git_skill));
 
-    // Load WASM skills from ~/.fawx/skills/
-    let trusted_keys = fx_loadable::wasm_skill::load_trusted_keys().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to load trusted keys");
-        vec![]
-    });
+    let skills_dir = data_dir.join("skills");
+    let trusted_keys =
+        fx_loadable::wasm_skill::load_trusted_keys_from(&data_dir.join("trusted_keys"))
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load trusted keys");
+                vec![]
+            });
     let signature_policy = SignaturePolicy {
         trusted_keys,
         require_signatures: config.security.require_signatures,
     };
-    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone(), &signature_policy)
+    let lifecycle = Arc::new(Mutex::new(SkillLifecycleManager::new(
+        SkillLifecycleConfig {
+            skills_dir: skills_dir.clone(),
+            registry: Arc::clone(&registry),
+            credential_provider: credential_provider.clone(),
+            signature_policy: signature_policy.clone(),
+        },
+    )));
+    if let Err(error) = lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .load_startup_skills()
     {
-        Ok(wasm_skills) => {
-            for skill in wasm_skills {
-                registry.register(skill);
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: failed to load WASM skills: {e}");
-        }
+        eprintln!("warning: failed to load WASM skills: {error}");
     }
 
     // Register cron/scheduler skill.
@@ -1109,13 +1144,11 @@ fn build_skill_registry(
     };
 
     apply_skill_summaries(&runtime_info, registry.as_ref());
-    let skills_dir = data_dir.join("skills");
     start_skill_watcher(
         skills_dir,
         Arc::clone(&registry),
+        lifecycle,
         Arc::clone(&runtime_info),
-        credential_provider.clone(),
-        signature_policy.clone(),
     );
 
     SkillRegistryBundle {
@@ -1139,9 +1172,8 @@ fn build_skill_registry(
 fn start_skill_watcher(
     skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
+    lifecycle: Arc<Mutex<SkillLifecycleManager>>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
-    signature_policy: SignaturePolicy,
 ) {
     if let Err(error) = fs::create_dir_all(&skills_dir) {
         tracing::warn!(path = %skills_dir.display(), error = %error, "failed to create skills directory for watcher");
@@ -1154,13 +1186,7 @@ fn start_skill_watcher(
     };
 
     let (reload_event_tx, reload_event_rx) = mpsc::channel(32);
-    let mut skill_watcher = SkillWatcher::new(
-        skills_dir,
-        Arc::clone(&registry),
-        reload_event_tx,
-        credential_provider,
-        signature_policy,
-    );
+    let mut skill_watcher = SkillWatcher::new(skills_dir, lifecycle, reload_event_tx);
     skill_watcher.initialize_hashes();
     handle.spawn(handle_skill_reload_events(
         reload_event_rx,
@@ -1190,15 +1216,27 @@ fn log_skill_reload_event(event: &ReloadEvent) {
         ReloadEvent::Loaded {
             skill_name,
             version,
-        } => tracing::info!(skill = %skill_name, version = %version, "skill hot-loaded"),
+            revision,
+            source,
+        } => tracing::info!(
+            skill = %skill_name,
+            version = %version,
+            revision = %revision,
+            source = %source,
+            "skill hot-loaded"
+        ),
         ReloadEvent::Updated {
             skill_name,
             old_version,
             new_version,
+            revision,
+            source,
         } => tracing::info!(
             skill = %skill_name,
             old_version = %old_version,
             new_version = %new_version,
+            revision = %revision,
+            source = %source,
             "skill hot-reloaded"
         ),
         ReloadEvent::Removed { skill_name } => {
@@ -1520,19 +1558,34 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
             max_history: config.general.max_history,
             memory_enabled,
         },
+        authority: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
 
 fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &SkillRegistry) {
     let skills = registry
-        .skill_summaries()
+        .skill_statuses()
         .into_iter()
-        .map(|(name, description, tool_names, capabilities)| SkillInfo {
-            name,
-            description: Some(description),
-            tool_names,
-            capabilities,
+        .map(|status| {
+            let revision_hash = status.activation.revision.revision_hash();
+            let version = status.activation.revision.version.clone();
+            let manifest_hash = status.activation.revision.manifest_hash.clone();
+            let signature_status = status.activation.revision.signature.display();
+
+            SkillInfo {
+                name: status.name,
+                description: Some(status.description),
+                tool_names: status.tool_names,
+                capabilities: status.capabilities,
+                version: Some(version),
+                source: Some(status.activation.source.display()),
+                revision_hash: Some(revision_hash),
+                manifest_hash: Some(manifest_hash),
+                activated_at_ms: Some(status.activation.activated_at),
+                signature_status: Some(signature_status),
+                stale_source: status.source_drift.map(|drift| drift.to_string()),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1672,6 +1725,57 @@ pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
         return path.clone();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+struct HeadlessWorkspaceRootCandidates<'a> {
+    current_dir: Option<&'a Path>,
+    current_exe: Option<&'a Path>,
+    build_manifest_dir: Option<&'a Path>,
+}
+
+pub(crate) fn bind_headless_workspace_root(config: &mut FawxConfig) {
+    let current_dir = std::env::current_dir().ok();
+    let current_exe = std::env::current_exe().ok();
+    let build_manifest_dir = option_env!("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let candidates = HeadlessWorkspaceRootCandidates {
+        current_dir: current_dir.as_deref(),
+        current_exe: current_exe.as_deref(),
+        build_manifest_dir: build_manifest_dir.as_deref(),
+    };
+    bind_headless_workspace_root_with(config, candidates);
+}
+
+fn bind_headless_workspace_root_with(
+    config: &mut FawxConfig,
+    candidates: HeadlessWorkspaceRootCandidates<'_>,
+) {
+    let working_dir = resolve_headless_workspace_root(config, candidates);
+    config.tools.working_dir = Some(working_dir.clone());
+    config.workspace.root = Some(working_dir);
+}
+
+fn resolve_headless_workspace_root(
+    config: &FawxConfig,
+    candidates: HeadlessWorkspaceRootCandidates<'_>,
+) -> PathBuf {
+    resolve_build_repo_root(candidates.build_manifest_dir)
+        .or_else(|| resolve_runtime_repo_root(candidates.current_dir, candidates.current_exe))
+        .unwrap_or_else(|| configured_working_dir(config))
+}
+
+fn resolve_build_repo_root(build_manifest_dir: Option<&Path>) -> Option<PathBuf> {
+    build_manifest_dir.and_then(crate::repo_root::find_repo_root)
+}
+
+fn resolve_runtime_repo_root(
+    current_dir: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Option<PathBuf> {
+    current_dir
+        .zip(current_exe)
+        .and_then(|(current_dir, current_exe)| {
+            crate::repo_root::resolve_repo_root(current_dir, current_exe).ok()
+        })
 }
 
 /// User-facing TUI errors.
@@ -1844,18 +1948,16 @@ fn register_keyed_provider(
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
             })?
             .with_supported_models(supported_models);
-        router.register_provider_with_auth(Arc::new(anthropic), auth_label);
+        router.register_provider(Box::new(anthropic));
         return Ok(());
     }
 
-    let provider_client = OpenAiProvider::new(base_url_for_provider(provider), key.to_string())
+    let provider_client = build_openai_provider(provider, key, auth_label, supported_models)
         .map_err(|error| {
             StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-        })?
-        .with_name(provider.to_string())
-        .with_supported_models(supported_models);
+        })?;
 
-    router.register_provider_with_auth(Arc::new(provider_client), auth_label);
+    router.register_provider(Box::new(provider_client));
     Ok(())
 }
 
@@ -1876,20 +1978,45 @@ fn register_oauth_provider(
                 })?
                 .with_supported_models(supported_models);
 
-        router.register_provider_with_auth(Arc::new(provider_client), "subscription");
+        router.register_provider(Box::new(provider_client));
         return Ok(());
     }
 
     let provider_client =
-        OpenAiProvider::new(base_url_for_provider(provider), access_token.to_string())
-            .map_err(|error| {
+        build_openai_provider(provider, access_token, "subscription", supported_models).map_err(
+            |error| {
                 StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-            })?
-            .with_name(provider.to_string())
-            .with_supported_models(supported_models);
+            },
+        )?;
 
-    router.register_provider_with_auth(Arc::new(provider_client), "subscription");
+    router.register_provider(Box::new(provider_client));
     Ok(())
+}
+
+fn build_openai_provider(
+    provider: &str,
+    credential: &str,
+    auth_method: &str,
+    supported_models: Vec<String>,
+) -> Result<OpenAiProvider, fx_llm::ProviderError> {
+    let base_url = base_url_for_provider(provider);
+    let provider = match provider {
+        "openai" => OpenAiProvider::openai(base_url, credential.to_string())?,
+        "openrouter" => OpenAiProvider::openrouter(base_url, credential.to_string())?,
+        _ => OpenAiProvider::compatible(base_url, credential.to_string(), provider.to_string())?,
+    };
+    Ok(provider
+        .with_auth_method(canonical_auth_method(auth_method))
+        .with_supported_models(supported_models))
+}
+
+fn canonical_auth_method(auth_method: &str) -> &'static str {
+    match auth_method {
+        "api_key" => "api_key",
+        "subscription" => "subscription",
+        "setup_token" => "setup_token",
+        _ => "api_key",
+    }
 }
 
 fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
@@ -2021,6 +2148,53 @@ mod tests {
         (config, temp_dir)
     }
 
+    fn write_headless_repo_markers(path: &Path) {
+        std::fs::create_dir_all(path.join("engine/crates/fx-cli")).expect("crate dir");
+        std::fs::write(path.join("Cargo.toml"), "[workspace]\n").expect("workspace file");
+        std::fs::write(
+            path.join("engine/crates/fx-cli/Cargo.toml"),
+            "[package]\nname = \"fx-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate manifest");
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {:?} should succeed", args);
+    }
+
+    fn init_committed_repo(path: &Path, readme: &str) {
+        write_headless_repo_markers(path);
+        run_git(path, &["init"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+        std::fs::write(path.join("README.md"), readme).expect("README");
+        run_git(path, &["add", "."]);
+        run_git(path, &["commit", "-m", "init"]);
+    }
+
+    async fn execute_tool(
+        bundle: &LoopEngineBundle,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> fx_kernel::act::ToolResult {
+        let call = fx_llm::ToolCall {
+            id: format!("call-{name}"),
+            name: name.to_string(),
+            arguments,
+        };
+        let results = bundle
+            .tool_executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("tool execution");
+        results.into_iter().next().expect("tool result")
+    }
+
     fn registry_has_skill(bundle: &LoopEngineBundle, name: &str) -> bool {
         bundle
             .skill_registry
@@ -2054,15 +2228,181 @@ mod tests {
 
     fn test_fleet_node_config() -> fx_config::NodeConfig {
         fx_config::NodeConfig {
-            id: "mac-mini".to_string(),
-            name: "Worker Node A".to_string(),
+            id: "build-node".to_string(),
+            name: "Build Node".to_string(),
             endpoint: Some("https://10.0.0.5:8400".to_string()),
             auth_token: Some("token".to_string()),
             capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
             address: Some("10.0.0.5".to_string()),
-            user: Some("builder".to_string()),
+            user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn bind_headless_workspace_root_prefers_detected_repo_root() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = detached_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: None,
+        };
+
+        write_headless_repo_markers(&detached_repo);
+        std::fs::write(detached_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        assert_eq!(config.tools.working_dir, Some(detached_repo.clone()));
+        assert_eq!(config.workspace.root, Some(detached_repo));
+    }
+
+    #[test]
+    fn bind_headless_workspace_root_prefers_built_repo_root_over_ambient_repo() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let ambient_repo = temp_dir.path().join("ambient-repo");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = ambient_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let build_manifest_dir = detached_repo.join("engine/crates/fx-cli");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: Some(&build_manifest_dir),
+        };
+
+        write_headless_repo_markers(&detached_repo);
+        std::fs::write(detached_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        write_headless_repo_markers(&ambient_repo);
+        std::fs::write(ambient_repo.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        assert_eq!(config.tools.working_dir, Some(detached_repo.clone()));
+        assert_eq!(config.workspace.root, Some(detached_repo));
+    }
+
+    #[tokio::test]
+    async fn headless_bundle_binds_read_write_and_git_status_to_detected_repo_root() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = detached_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let detached_readme = detached_repo.join("README.md");
+        let main_readme = main_checkout.join("README.md");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: None,
+        };
+
+        init_committed_repo(&detached_repo, "detached checkout\n");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::write(&main_readme, "main checkout\n").expect("main README");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout.clone());
+
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+
+        let read = execute_tool(
+            &bundle,
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        )
+        .await;
+        assert!(read.success, "{}", read.output);
+        assert!(read.output.contains("detached checkout"), "{}", read.output);
+        assert!(!read.output.contains("main checkout"), "{}", read.output);
+
+        let write = execute_tool(
+            &bundle,
+            "write_file",
+            serde_json::json!({"path": "README.md", "content": "updated detached\n"}),
+        )
+        .await;
+        assert!(write.success, "{}", write.output);
+        assert_eq!(
+            std::fs::read_to_string(&detached_readme).expect("detached README"),
+            "updated detached\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&main_readme).expect("main README"),
+            "main checkout\n"
+        );
+
+        let status = execute_tool(&bundle, "git_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        assert!(status.output.contains("README.md"), "{}", status.output);
+    }
+
+    #[tokio::test]
+    async fn headless_bundle_binds_run_command_to_built_repo_root_over_ambient_repo() {
+        let (mut config, temp_dir) = test_config_with_temp_dir();
+        let detached_repo = temp_dir.path().join("detached-worktree");
+        let ambient_repo = temp_dir.path().join("ambient-repo");
+        let main_checkout = temp_dir.path().join("main-checkout");
+        let current_dir = ambient_repo.join("engine/crates");
+        let current_exe = temp_dir.path().join("bin/fawx");
+        let build_manifest_dir = detached_repo.join("engine/crates/fx-cli");
+        let detached_marker = detached_repo.join("step12-marker.txt");
+        let ambient_marker = ambient_repo.join("step12-marker.txt");
+        let candidates = HeadlessWorkspaceRootCandidates {
+            current_dir: Some(&current_dir),
+            current_exe: Some(&current_exe),
+            build_manifest_dir: Some(&build_manifest_dir),
+        };
+
+        init_committed_repo(&detached_repo, "detached checkout\n");
+        init_committed_repo(&ambient_repo, "ambient checkout\n");
+        std::fs::create_dir_all(&main_checkout).expect("main checkout");
+        std::fs::create_dir_all(current_exe.parent().expect("exe parent")).expect("bin dir");
+        config.tools.working_dir = Some(main_checkout);
+
+        bind_headless_workspace_root_with(&mut config, candidates);
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+
+        let run = execute_tool(
+            &bundle,
+            "run_command",
+            serde_json::json!({"command": "touch step12-marker.txt"}),
+        )
+        .await;
+        assert!(run.success, "{}", run.output);
+        assert!(detached_marker.exists(), "detached marker should exist");
+        assert!(
+            !ambient_marker.exists(),
+            "ambient marker should stay absent"
+        );
+
+        let status = execute_tool(&bundle, "git_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        assert!(
+            status.output.contains("step12-marker.txt"),
+            "{}",
+            status.output
+        );
     }
 
     #[test]
@@ -2380,6 +2720,219 @@ mod tests {
         });
     }
 
+    #[derive(Debug)]
+    struct MetadataSurfaceSkill;
+
+    #[async_trait]
+    impl fx_loadable::Skill for MetadataSurfaceSkill {
+        fn name(&self) -> &str {
+            "metadata-surface"
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            vec![
+                fx_llm::ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "write".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["path", "content"]
+                    }),
+                },
+                fx_llm::ToolDefinition {
+                    name: "git_checkpoint".to_string(),
+                    description: "checkpoint".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "required": ["message"]
+                    }),
+                },
+            ]
+        }
+
+        fn authority_surface(&self, call: &fx_llm::ToolCall) -> fx_kernel::ToolAuthoritySurface {
+            match call.name.as_str() {
+                "write_file" => fx_kernel::ToolAuthoritySurface::PathWrite,
+                "git_checkpoint" => fx_kernel::ToolAuthoritySurface::GitCheckpoint,
+                _ => fx_kernel::ToolAuthoritySurface::Other,
+            }
+        }
+
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, fx_loadable::SkillError>> {
+            Some(Ok(format!("executed:{tool_name}")))
+        }
+    }
+
+    fn shared_metadata_registry() -> SharedSkillRegistry {
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(Arc::new(MetadataSurfaceSkill));
+        SharedSkillRegistry::new(registry)
+    }
+
+    fn metadata_policy_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn metadata_policy_config(root: &Path) -> fx_core::self_modify::SelfModifyConfig {
+        fx_core::self_modify::SelfModifyConfig {
+            enabled: true,
+            branch_prefix: "fawx/improve".to_string(),
+            require_tests: true,
+            allow_paths: vec!["README.md".to_string()],
+            propose_paths: vec![
+                "engine/crates/fx-kernel/**".to_string(),
+                "engine/crates/fx-loadable/**".to_string(),
+            ],
+            deny_paths: vec![
+                ".git/**".to_string(),
+                "*.key".to_string(),
+                "*.pem".to_string(),
+                "credentials.*".to_string(),
+            ],
+            proposals_dir: root.join(".fawx").join("proposals"),
+        }
+    }
+
+    fn metadata_authority(root: &Path, policy: PermissionPolicy) -> AuthorityCoordinator {
+        let proposals_dir = root.join(".fawx").join("proposals");
+        AuthorityCoordinator::new(
+            policy,
+            ProposalGateState::new(
+                metadata_policy_config(root),
+                root.to_path_buf(),
+                proposals_dir,
+            ),
+        )
+    }
+
+    fn prompt_policy_for(capability: &str) -> PermissionPolicy {
+        PermissionPolicy {
+            unrestricted: std::collections::HashSet::new(),
+            ask_required: std::iter::once(capability.to_string()).collect(),
+            default_ask: false,
+            mode: fx_config::CapabilityMode::Prompt,
+        }
+    }
+
+    fn metadata_write_call(path: &str) -> fx_llm::ToolCall {
+        fx_llm::ToolCall {
+            id: format!("call-{path}"),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "content": "probe"
+            }),
+        }
+    }
+
+    fn metadata_git_checkpoint_call() -> fx_llm::ToolCall {
+        fx_llm::ToolCall {
+            id: "call-git-checkpoint".to_string(),
+            name: "git_checkpoint".to_string(),
+            arguments: serde_json::json!({
+                "message": "authority parity checkpoint"
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_skill_registry_delegates_authority_surface() {
+        let registry = shared_metadata_registry();
+
+        assert_eq!(
+            registry.authority_surface(&metadata_write_call("README.md")),
+            fx_kernel::ToolAuthoritySurface::PathWrite
+        );
+        assert_eq!(
+            registry.authority_surface(&metadata_git_checkpoint_call()),
+            fx_kernel::ToolAuthoritySurface::GitCheckpoint
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_keeps_git_checkpoint_classified_as_git() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), prompt_policy_for("git"));
+        let call = metadata_git_checkpoint_call();
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "git");
+        assert_eq!(
+            request.target_summary,
+            "git checkpoint (clean working tree)"
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Prompt
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_preserves_proposal_classification_for_kernel_paths() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), PermissionPolicy::allow_all());
+        let call = metadata_write_call("engine/crates/fx-kernel/src/authority_proposal_probe.txt");
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "kernel_modify");
+        assert_eq!(
+            request.paths,
+            vec!["engine/crates/fx-kernel/src/authority_proposal_probe.txt".to_string()]
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Propose
+        );
+    }
+
+    #[test]
+    fn shared_skill_registry_preserves_deny_classification_for_git_internal_paths() {
+        let temp = metadata_policy_root();
+        let registry = shared_metadata_registry();
+        let authority = metadata_authority(temp.path(), PermissionPolicy::allow_all());
+        let call = metadata_write_call(".git/authority-deny-probe.txt");
+
+        let request = authority.classify_call(
+            &call,
+            registry.action_category(&call),
+            registry.authority_surface(&call),
+        );
+
+        assert_eq!(request.capability, "file_write");
+        assert_eq!(
+            request.paths,
+            vec![".git/authority-deny-probe.txt".to_string()]
+        );
+        assert_eq!(
+            authority.resolve_request(request, false).verdict,
+            fx_kernel::AuthorityVerdict::Deny
+        );
+    }
+
     #[test]
     fn resolve_logging_config_applies_mode_defaults() {
         let tui = resolve_logging_config(&LoggingConfig::default(), LoggingMode::Tui)
@@ -2677,6 +3230,25 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_loads_wasm_skills_from_configured_data_dir() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let skills_dir = config
+            .general
+            .data_dir
+            .clone()
+            .expect("data dir")
+            .join("skills");
+        write_test_skill(&skills_dir, "configuredskill").expect("write test skill");
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        assert!(names.contains(&"configuredskill".to_string()));
     }
 
     #[tokio::test]

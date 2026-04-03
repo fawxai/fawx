@@ -19,6 +19,7 @@ pub mod events;
 pub mod kernel_manifest;
 pub mod memory;
 pub mod message;
+pub mod path;
 pub mod runtime_info;
 pub mod self_modify;
 pub mod signals;

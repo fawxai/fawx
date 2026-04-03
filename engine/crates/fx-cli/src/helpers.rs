@@ -4,8 +4,8 @@ use fx_config::ThinkingBudget;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopStatus};
 use fx_llm::{
-    CompletionRequest, Message, ModelInfo, ModelRouter, ProviderError, StreamCallback, StreamChunk,
-    ThinkingConfig,
+    null_loop_harness, CompletionRequest, LoopHarness, Message, ModelInfo, ModelRouter,
+    ProviderError, StreamCallback, StreamChunk, ThinkingConfig,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -167,6 +167,27 @@ fn prepare_router_request(
     })
 }
 
+fn resolve_loop_harness(
+    router: &SharedModelRouter,
+    active_model: &str,
+) -> &'static dyn LoopHarness {
+    let probe = CompletionRequest {
+        model: active_model.to_string(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        system_prompt: None,
+        thinking: None,
+    };
+    read_router(router, |router| {
+        let Ok((provider, _)) = router.request_for_model(active_model, probe) else {
+            return null_loop_harness();
+        };
+        provider.loop_harness(active_model)
+    })
+}
+
 /// Convert a thinking budget level into a provider-specific [`ThinkingConfig`].
 ///
 /// Uses the active model ID to determine the correct wire format:
@@ -286,6 +307,7 @@ impl fmt::Debug for RouterLoopLlmProvider {
 
 impl RouterLoopLlmProvider {
     pub(crate) fn new(router: SharedModelRouter, active_model: String) -> Self {
+        let _ = resolve_loop_harness(&router, &active_model);
         Self {
             router,
             active_model,
@@ -461,7 +483,10 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use fx_config::ThinkingBudget;
-    use fx_llm::{CompletionProvider, CompletionResponse, CompletionStream, ProviderCapabilities};
+    use fx_llm::{
+        CompletionProvider, CompletionResponse, CompletionStream, LoopBufferedCompletionStrategy,
+        LoopPromptOverlayContext, ProviderCapabilities,
+    };
     use std::sync::{Arc, Mutex, RwLock};
 
     fn shared_router(router: ModelRouter) -> SharedModelRouter {
@@ -473,6 +498,32 @@ mod tests {
         provider_name: String,
         models: Vec<String>,
     }
+
+    #[derive(Debug)]
+    struct ResponsesHarness;
+
+    impl LoopHarness for ResponsesHarness {
+        fn buffered_completion_strategy(&self) -> LoopBufferedCompletionStrategy {
+            LoopBufferedCompletionStrategy::SingleResponse
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaudeHarness;
+
+    impl LoopHarness for ClaudeHarness {
+        fn prompt_overlay(&self, context: LoopPromptOverlayContext) -> Option<&'static str> {
+            match context {
+                LoopPromptOverlayContext::Reasoning => {
+                    Some("\n\nModel-family guidance for Claude models")
+                }
+                LoopPromptOverlayContext::ToolContinuation => None,
+            }
+        }
+    }
+
+    static RESPONSES_HARNESS: ResponsesHarness = ResponsesHarness;
+    static CLAUDE_HARNESS: ClaudeHarness = ClaudeHarness;
 
     #[async_trait]
     impl CompletionProvider for ModelEchoProvider {
@@ -502,6 +553,14 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+            }
+        }
+
+        fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
+            if model.starts_with("claude-") {
+                &CLAUDE_HARNESS
+            } else {
+                null_loop_harness()
             }
         }
     }
@@ -554,6 +613,10 @@ mod tests {
                 supports_temperature: false,
                 requires_streaming: true,
             }
+        }
+
+        fn loop_harness(&self, _model: &str) -> &'static dyn LoopHarness {
+            &RESPONSES_HARNESS
         }
     }
 
@@ -693,6 +756,38 @@ mod tests {
             router.active_model().map(ToString::to_string)
         });
         assert_eq!(active_model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn resolve_loop_harness_uses_provider_owned_responses_semantics() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StreamingProvider {
+            provider_name: "openai".to_string(),
+            model: "gpt-5.4".to_string(),
+            chunks: vec!["hello"],
+        }));
+        let router = shared_router(router);
+
+        assert_eq!(
+            resolve_loop_harness(&router, "gpt-5.4").buffered_completion_strategy(),
+            LoopBufferedCompletionStrategy::SingleResponse
+        );
+    }
+
+    #[test]
+    fn resolve_loop_harness_uses_provider_owned_prompt_overlay() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "anthropic".to_string(),
+            models: vec!["claude-opus-4-6".to_string()],
+        }));
+        let router = shared_router(router);
+
+        assert_eq!(
+            resolve_loop_harness(&router, "claude-opus-4-6")
+                .prompt_overlay(LoopPromptOverlayContext::Reasoning),
+            Some("\n\nModel-family guidance for Claude models")
+        );
     }
 
     #[tokio::test]

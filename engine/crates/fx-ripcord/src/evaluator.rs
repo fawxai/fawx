@@ -2,13 +2,12 @@ use crate::config::TripwireConfig;
 use crate::journal::{JournalAction, RipcordJournal};
 use async_trait::async_trait;
 use fx_kernel::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolCallClassification, ToolExecutor,
+    ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Callback for notifying the user when a tripwire is crossed.
@@ -44,7 +43,7 @@ impl<T: ToolExecutor> TripwireEvaluator<T> {
     }
 
     async fn evaluate_call(&self, call: &ToolCall, result: &ToolResult) {
-        let category = tool_to_action_category(&call.name);
+        let category = self.inner.action_category(call);
         let path = extract_path(&call.arguments);
         let command = extract_command(&call.arguments);
         self.journal.increment_category(category).await;
@@ -82,7 +81,7 @@ impl<T: ToolExecutor> TripwireEvaluator<T> {
         if !self.journal.is_active().await {
             return;
         }
-        if let Some(action) = extract_journal_action(call, result) {
+        if let Some(action) = self.inner.journal_action(call, result) {
             self.journal.record(&call.name, &call.id, action).await;
         }
     }
@@ -114,6 +113,18 @@ impl<T: ToolExecutor> ToolExecutor for TripwireEvaluator<T> {
         self.inner.cacheability(tool_name)
     }
 
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.inner.classify_call(call)
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.inner.action_category(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
+    }
+
     fn clear_cache(&self) {
         self.inner.clear_cache();
     }
@@ -123,145 +134,23 @@ impl<T: ToolExecutor> ToolExecutor for TripwireEvaluator<T> {
     }
 }
 
-fn extract_journal_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    match call.name.as_str() {
-        "write_file" | "create_file" | "edit_file" => file_write_action(call),
-        "delete_file" | "remove_file" => file_delete_action(call),
-        "git_commit" => git_commit_action(call, result),
-        "git_push" => git_push_action(call, result),
-        "shell" | "bash" | "execute_command" => shell_action(call, result),
-        _ => None,
-    }
-}
-
-fn file_write_action(call: &ToolCall) -> Option<JournalAction> {
-    let path = extract_path_buf(&call.arguments)?;
-    let content = string_arg(&call.arguments, "content").unwrap_or_default();
-    let size_bytes = content.len() as u64;
-    Some(JournalAction::FileWrite {
-        path,
-        snapshot_hash: None,
-        size_bytes,
-        created: call.name == "create_file",
-    })
-}
-
-fn file_delete_action(call: &ToolCall) -> Option<JournalAction> {
-    let path = extract_path_buf(&call.arguments)?;
-    Some(JournalAction::FileDelete {
-        path,
-        snapshot_hash: "unknown".to_string(),
-    })
-}
-
-fn git_commit_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let repo = extract_repo(&call.arguments)?;
-    let commit_sha = string_arg(&call.arguments, "commit_sha")
-        .or_else(|| string_arg(&call.arguments, "hash"))
-        .or_else(|| first_word(&result.output))
-        .unwrap_or_else(|| "unknown".to_string());
-    let pre_ref = string_arg(&call.arguments, "pre_ref")
-        .or_else(|| string_arg(&call.arguments, "ref"))
-        .unwrap_or_else(|| "HEAD~1".to_string());
-    Some(JournalAction::GitCommit {
-        repo,
-        pre_ref,
-        commit_sha,
-    })
-}
-
-fn git_push_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let repo = extract_repo(&call.arguments)?;
-    let remote = string_arg(&call.arguments, "remote")
-        .or_else(|| find_json_string(&result.output, "remote"))
-        .unwrap_or_else(|| "origin".to_string());
-    let branch = string_arg(&call.arguments, "branch")
-        .or_else(|| find_json_string(&result.output, "branch"))
-        .unwrap_or_else(|| "HEAD".to_string());
-    let pre_ref = string_arg(&call.arguments, "pre_ref")
-        .or_else(|| string_arg(&call.arguments, "ref"))
-        .unwrap_or_else(|| "unknown".to_string());
-    Some(JournalAction::GitPush {
-        repo,
-        remote,
-        branch,
-        pre_ref,
-    })
-}
-
-fn shell_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-    let command = extract_command(&call.arguments)?;
-    Some(JournalAction::ShellCommand {
-        command,
-        exit_code: extract_exit_code(&result.output, result.success),
-    })
-}
-
 fn extract_path(arguments: &Value) -> Option<String> {
     string_arg(arguments, "path").or_else(|| string_arg(arguments, "file_path"))
-}
-
-fn extract_path_buf(arguments: &Value) -> Option<PathBuf> {
-    extract_path(arguments).map(PathBuf::from)
 }
 
 fn extract_command(arguments: &Value) -> Option<String> {
     string_arg(arguments, "command")
 }
 
-fn extract_repo(arguments: &Value) -> Option<PathBuf> {
-    string_arg(arguments, "repo")
-        .or_else(|| string_arg(arguments, "working_dir"))
-        .or_else(|| string_arg(arguments, "cwd"))
-        .or_else(|| string_arg(arguments, "path"))
-        .map(PathBuf::from)
-}
-
 fn string_arg(arguments: &Value, key: &str) -> Option<String> {
     arguments.get(key)?.as_str().map(ToString::to_string)
-}
-
-fn first_word(text: &str) -> Option<String> {
-    text.split_whitespace().next().map(ToString::to_string)
-}
-
-fn extract_exit_code(output: &str, success: bool) -> i32 {
-    parse_exit_code(output).unwrap_or(if success { 0 } else { -1 })
-}
-
-fn parse_exit_code(output: &str) -> Option<i32> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("exit_code: "))?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn find_json_string(output: &str, key: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(output).ok()?;
-    value.get(key)?.as_str().map(ToString::to_string)
-}
-
-fn tool_to_action_category(tool_name: &str) -> &'static str {
-    match tool_name {
-        "web_search" | "brave_search" => "web_search",
-        "web_fetch" | "fetch_url" => "web_fetch",
-        "read_file" | "search_text" | "list_directory" => "read_any",
-        "write_file" | "create_file" | "edit_file" => "file_write",
-        "shell" | "bash" | "execute_command" => "shell",
-        "git" | "git_status" | "git_diff" | "git_commit" | "git_push" => "git",
-        "delete_file" | "remove_file" => "file_delete",
-        "run_experiment" | "experiment" => "tool_call",
-        "subagent_spawn" | "subagent_status" | "subagent_cancel" => "tool_call",
-        "run_command" | "execute" => "code_execute",
-        _ => "unknown",
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_loadable::{Skill, SkillError, SkillRegistry};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -300,6 +189,14 @@ mod tests {
             ToolCacheability::NeverCache
         }
 
+        fn action_category(&self, call: &ToolCall) -> &'static str {
+            test_action_category(&call.name)
+        }
+
+        fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+            test_journal_action(call, result)
+        }
+
         fn clear_cache(&self) {}
 
         fn cache_stats(&self) -> Option<ToolCacheStats> {
@@ -311,12 +208,79 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RegistryMetadataSkill;
+
+    #[async_trait]
+    impl Skill for RegistryMetadataSkill {
+        fn name(&self) -> &str {
+            "registry-metadata"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            ["shell", "write_file", "delete_file"]
+                .into_iter()
+                .map(|name| ToolDefinition {
+                    name: name.to_string(),
+                    description: format!("test/{name}"),
+                    parameters: serde_json::json!({"type": "object"}),
+                })
+                .collect()
+        }
+
+        fn action_category(&self, tool_name: &str) -> &'static str {
+            test_action_category(tool_name)
+        }
+
+        fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+            test_journal_action(call, result)
+        }
+
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, SkillError>> {
+            match tool_name {
+                "shell" | "write_file" | "delete_file" => Some(Ok("executed".to_string())),
+                _ => None,
+            }
+        }
+    }
+
     fn executed_result(call: &ToolCall) -> ToolResult {
         ToolResult {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             success: true,
             output: "executed".to_string(),
+        }
+    }
+
+    fn test_action_category(tool_name: &str) -> &'static str {
+        match tool_name {
+            "shell" => "shell",
+            "write_file" => "file_write",
+            "delete_file" => "file_delete",
+            _ => "unknown",
+        }
+    }
+
+    fn test_journal_action(call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        match call.name.as_str() {
+            "shell" => Some(JournalAction::ShellCommand {
+                command: extract_command(&call.arguments).unwrap_or_default(),
+                exit_code: if result.success { 0 } else { 1 },
+            }),
+            "write_file" => Some(JournalAction::FileWrite {
+                path: PathBuf::from(extract_path(&call.arguments)?),
+                snapshot_hash: None,
+                size_bytes: string_arg(&call.arguments, "content")
+                    .map_or(0, |content| content.len() as u64),
+                created: false,
+            }),
+            _ => None,
         }
     }
 
@@ -355,6 +319,12 @@ mod tests {
     fn test_journal() -> Arc<RipcordJournal> {
         let temp_dir = TempDir::new().expect("temp dir");
         Arc::new(RipcordJournal::new(temp_dir.path()))
+    }
+
+    fn registry_executor() -> SkillRegistry {
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(RegistryMetadataSkill));
+        registry
     }
 
     #[tokio::test]
@@ -491,6 +461,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_path_tripwire_activates_ripcord_on_match() {
+        let journal = test_journal();
+        let executor = TripwireEvaluator::new(
+            registry_executor(),
+            vec![action_tripwire()],
+            Arc::clone(&journal),
+        );
+        let call = test_call("shell", serde_json::json!({"command": "rm -rf tmp"}));
+
+        executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("execute");
+
+        assert!(journal.is_active().await);
+    }
+
+    #[tokio::test]
+    async fn registry_path_records_action_when_active() {
+        let journal = test_journal();
+        journal.activate("manual", "already active").await;
+        let executor = TripwireEvaluator::new(
+            registry_executor(),
+            vec![action_tripwire()],
+            Arc::clone(&journal),
+        );
+        let call = test_call(
+            "write_file",
+            serde_json::json!({"path": "/tmp/notes.txt", "content": "hello"}),
+        );
+
+        executor
+            .execute_tools(&[call], None)
+            .await
+            .expect("execute");
+
+        let entries = journal.entries().await;
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].action,
+            JournalAction::FileWrite {
+                path,
+                size_bytes: 5,
+                created: false,
+                ..
+            } if path == Path::new("/tmp/notes.txt")
+        ));
+    }
+
+    #[tokio::test]
     async fn results_pass_through_unchanged() {
         let call = test_call("shell", serde_json::json!({"command": "rm -rf tmp"}));
         let expected = vec![ToolResult {
@@ -517,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_journal_action_builds_shell_entry() {
+    fn journal_action_builds_shell_entry() {
         let call = test_call("shell", serde_json::json!({"command": "echo hi"}));
         let result = ToolResult {
             tool_call_id: call.id.clone(),
@@ -525,8 +545,11 @@ mod tests {
             success: true,
             output: "exit_code: 0\nstdout:\nhi".into(),
         };
+        let executor = PassthroughExecutor::executed();
 
-        let action = extract_journal_action(&call, &result).expect("shell action");
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("shell action");
 
         assert!(matches!(
             action,

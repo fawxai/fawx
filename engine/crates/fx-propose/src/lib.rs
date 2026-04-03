@@ -20,6 +20,7 @@ const SIDECAR_VERSION: u8 = 1;
 /// A structured proposal for a self-modification change.
 #[derive(Debug, Clone)]
 pub struct Proposal {
+    pub action: String,
     pub title: String,
     pub description: String,
     pub target_path: PathBuf,
@@ -33,6 +34,8 @@ pub struct Proposal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposalSidecar {
     pub version: u8,
+    #[serde(default = "default_proposal_action")]
+    pub action: String,
     pub timestamp: u64,
     pub title: String,
     pub description: String,
@@ -42,11 +45,16 @@ pub struct ProposalSidecar {
     pub file_hash_at_creation: Option<String>,
 }
 
+fn default_proposal_action() -> String {
+    "write_file".to_string()
+}
+
 impl ProposalSidecar {
     #[must_use]
     pub fn from_proposal(proposal: &Proposal) -> Self {
         Self {
             version: SIDECAR_VERSION,
+            action: proposal.action.clone(),
             timestamp: proposal.timestamp,
             title: proposal.title.clone(),
             description: proposal.description.clone(),
@@ -299,6 +307,7 @@ mod tests {
 
     fn sample_proposal() -> Proposal {
         Proposal {
+            action: "write_file".to_string(),
             title: "Modify kernel/loop.rs".to_string(),
             description: "Refine loop behavior".to_string(),
             target_path: PathBuf::from("kernel/loop.rs"),

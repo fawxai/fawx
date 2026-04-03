@@ -13,15 +13,16 @@ Fawx is a local-first agentic engine. It runs on your machine, calls LLMs for re
 ## Quick Start
 
 ```bash
+# Build
 git clone https://github.com/fawxai/fawx.git
-cd fawx
-./scripts/install.sh
+cd fawx && cargo build --release
 
-fawx setup
-fawx serve
+# Configure (interactive wizard)
+./target/release/fawx setup
+
+# Run
+./target/release/fawx serve
 ```
-
-This builds from source, installs the `fawx` binary to `~/.local/bin/`, and walks you through configuration. Set `INSTALL_DIR` to change the install location.
 
 Bring your own API key (Anthropic, OpenAI, or local models). Fawx never sends data anywhere except the LLM provider you choose.
 
@@ -102,7 +103,7 @@ WASM skills extend Fawx's capabilities. Each skill runs in a sandboxed WebAssemb
 
 ## WASM Skills
 
-Skills are Rust crates compiled to WebAssembly. The [skill marketplace](https://github.com/fawxai) has ready-to-install skills. Building your own takes minutes:
+Skills are Rust crates compiled to WebAssembly. The recommended local-dev workflow is `fawx skill build <project>`: it builds the project for `wasm32-wasip1`, installs it into `~/.fawx/skills/`, and signs it when a signing key is present.
 
 ```rust
 #[no_mangle]
@@ -114,13 +115,29 @@ pub extern "C" fn run() {
 ```
 
 ```bash
-# Install a skill
-fawx skill install fawxai/skill-web-search
-
-# Or build your own
+# Recommended local-dev workflow
 cargo generate fawxai/skill-template
-cargo build --release --target wasm32-unknown-unknown
-fawx skill install ./target/wasm32-unknown-unknown/release/my_skill.wasm
+cd my-skill
+fawx skill build .
+```
+
+Use the other paths when they match your input:
+
+- `fawx skill build <project>` is the canonical local-dev path for a custom skill project.
+- `skills/build.sh --install` is the repo maintainer path for the built-in `skills/` collection.
+- `fawx skill install <path>` is the artifact path for a prebuilt `.wasm` file or skill directory.
+- `fawx keys generate` creates a local signing keypair and trusts the matching public key for local verification.
+- `fawx sign <skill>` signs an already-installed skill when it still needs a signature.
+
+If you generate or trust a key while the server is already running, restart it before expecting the loaded skill state to flip from `invalid` to `valid`.
+
+```bash
+# Prebuilt local artifact
+cargo build --release --target wasm32-wasip1
+fawx skill install ./target/wasm32-wasip1/release/my_skill.wasm
+
+# Built-in repo skills collection
+skills/build.sh --install
 ```
 
 Available skills: [web search](https://github.com/fawxai/skill-brave-search) · [web fetch](https://github.com/fawxai/skill-web-fetch) · [scheduler](https://github.com/fawxai/skill-scheduler) · weather · vision · TTS · STT · browser · canvas
