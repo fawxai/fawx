@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::budget::{truncate_tool_result, BudgetConfig, BudgetTracker};
 use fx_llm::{ContentBlock, MessageRole, ToolCall, ToolDefinition};

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::act::{ToolExecutor, ToolResult};
 use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};

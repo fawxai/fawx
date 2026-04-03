@@ -1378,7 +1378,7 @@ mod tests {
             cli.command,
             Some(Commands::Keys {
                 command: crate::commands::keys::KeysCommands::Trust(args)
-            }) if args.path == PathBuf::from("/tmp/demo.pub")
+            }) if args.path == std::path::Path::new("/tmp/demo.pub")
         ));
     }
 

@@ -1,4 +1,3 @@
-
 use super::test_fixtures::{text_response, tool_use_response, RecordingLlm};
 use super::*;
 use crate::act::{ToolCallClassification, ToolExecutor, ToolResult};

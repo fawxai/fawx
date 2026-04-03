@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn make_tool_result(index: usize, output_size: usize) -> ToolResult {

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::cancellation::CancellationToken;
 use crate::input::{loop_input_channel, LoopCommand};
