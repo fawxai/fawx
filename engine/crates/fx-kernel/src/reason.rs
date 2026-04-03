@@ -468,7 +468,7 @@ mod tests {
                 version: 2,
             }],
             identity_context: IdentityContext {
-                user_name: Some("Example User".to_owned()),
+                user_name: Some("Joe".to_owned()),
                 preferences,
                 personality_traits: vec!["helpful".to_owned()],
             },
@@ -497,9 +497,7 @@ mod tests {
             .contains("Goal: Draft and send a reply"));
         assert!(prompt.messages[0].content.contains("last_contact = Alex"));
         assert!(prompt.messages[0].content.contains("Identity context:"));
-        assert!(prompt.messages[0]
-            .content
-            .contains("User name: Example User"));
+        assert!(prompt.messages[0].content.contains("User name: Joe"));
         assert!(prompt.messages[0].content.contains("tone: direct"));
         assert!(prompt.messages[0]
             .content

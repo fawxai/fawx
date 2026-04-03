@@ -1,7 +1,13 @@
 //! Skill management commands.
 
 use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
 use fx_author::{BuildConfig, BuildResult};
+use fx_core::path::expand_tilde;
+use fx_loadable::{
+    find_revision_snapshot_dir, read_revision_source_metadata, read_skill_statuses,
+    revision_snapshot_dir, write_source_metadata, SkillSource,
+};
 use fx_skills::manifest::{
     validate_skill_name as validate_manifest_skill_name, Capability, ALL_CAPABILITIES,
 };
@@ -12,17 +18,18 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_WASM_SIZE: usize = 10 * 1024 * 1024;
 const MAX_CAPABILITIES: usize = 10;
+
 /// Get the skills directory path.
-fn get_skills_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Failed to get home directory")?;
-    let skills_dir = home.join(".fawx").join("skills");
+fn get_skills_dir(data_dir: Option<&Path>) -> Result<PathBuf> {
+    let root = resolve_data_dir(data_dir)?;
+    let skills_dir = root.join("skills");
     fs::create_dir_all(&skills_dir)
         .with_context(|| format!("Failed to create skills directory: {:?}", skills_dir))?;
     Ok(skills_dir)
 }
 
 /// Install a skill from a WASM file and manifest.
-pub async fn install(path: &str) -> Result<()> {
+pub async fn install(path: &str, data_dir: Option<&Path>) -> Result<()> {
     let input_path = Path::new(path);
     ensure_input_exists(path, input_path)?;
 
@@ -34,7 +41,13 @@ pub async fn install(path: &str) -> Result<()> {
         .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
     validate_wasm(&manifest, &wasm_bytes)?;
 
-    install_skill_files(&manifest, &wasm_path, &manifest_path)?;
+    install_skill_files(
+        &manifest,
+        &wasm_path,
+        &manifest_path,
+        data_dir,
+        infer_local_source(input_path),
+    )?;
     Ok(())
 }
 
@@ -154,8 +167,10 @@ fn install_skill_files(
     manifest: &fx_skills::manifest::SkillManifest,
     wasm_path: &Path,
     manifest_path: &Path,
+    data_dir: Option<&Path>,
+    source: Option<SkillSource>,
 ) -> Result<()> {
-    let skills_dir = get_skills_dir()?;
+    let skills_dir = get_skills_dir(data_dir)?;
     let skill_dir = skills_dir.join(&manifest.name);
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("Failed to create skill directory: {:?}", skill_dir))?;
@@ -167,6 +182,9 @@ fn install_skill_files(
     let dest_manifest = skill_dir.join("manifest.toml");
     fs::copy(manifest_path, &dest_manifest)
         .with_context(|| format!("Failed to copy manifest to {:?}", dest_manifest))?;
+    if let Some(source) = source {
+        write_source_metadata(&skill_dir, &source).map_err(anyhow::Error::msg)?;
+    }
 
     print_install_summary(manifest, &skill_dir);
     Ok(())
@@ -188,8 +206,8 @@ fn print_install_summary(manifest: &fx_skills::manifest::SkillManifest, skill_di
 }
 
 /// List installed skills.
-pub async fn list() -> Result<()> {
-    let skills_dir = get_skills_dir()?;
+pub async fn list(data_dir: Option<&Path>) -> Result<()> {
+    let skills_dir = get_skills_dir(data_dir)?;
     let entries = list_skill_directories(&skills_dir)?;
 
     if entries.is_empty() {
@@ -217,8 +235,11 @@ fn list_skill_directories(skills_dir: &Path) -> Result<Vec<fs::DirEntry>> {
 fn print_empty_skills_message() {
     println!("No skills installed.");
     println!();
-    println!("To install a skill:");
-    println!("  fawx skill install <path-to-skill>");
+    println!("Recommended local-dev workflow:");
+    println!("  fawx skill build <project>");
+    println!();
+    println!("Prebuilt artifact workflow:");
+    println!("  fawx skill install <path>");
 }
 
 fn print_skill_entry(skill_dir: &Path) {
@@ -267,12 +288,12 @@ fn format_capabilities(capabilities: &[Capability]) -> String {
 }
 
 /// Remove an installed skill.
-pub async fn remove(name: &str) -> Result<()> {
+pub async fn remove(name: &str, data_dir: Option<&Path>) -> Result<()> {
     if has_invalid_skill_name(name) {
         anyhow::bail!("Invalid skill name: must not contain path separators or '..'");
     }
 
-    let skills_dir = get_skills_dir()?;
+    let skills_dir = get_skills_dir(data_dir)?;
     let skill_dir = skills_dir.join(name);
 
     if !skill_dir.exists() {
@@ -287,21 +308,22 @@ pub async fn remove(name: &str) -> Result<()> {
 }
 
 /// Build a skill from source.
-pub fn build(path: &str, no_sign: bool, no_install: bool) -> Result<()> {
+pub fn build(path: &str, no_sign: bool, no_install: bool, data_dir: Option<&Path>) -> Result<()> {
     let project_path = PathBuf::from(path)
         .canonicalize()
         .with_context(|| format!("Invalid project path: {path}"))?;
 
-    let data_dir = resolve_data_dir()?;
+    let data_dir = resolve_data_dir(data_dir)?;
 
     let config = BuildConfig {
-        project_path,
+        project_path: project_path.clone(),
         data_dir,
         no_sign,
         no_install,
     };
 
     let result = fx_author::build_skill(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    write_local_dev_install_metadata(&project_path, result.install_path.as_ref())?;
     print_build_summary(&result);
     Ok(())
 }
@@ -349,7 +371,7 @@ impl CreateOptions {
 
 fn resolve_parent_dir(path: Option<&str>) -> Result<PathBuf> {
     match path {
-        Some(path) => Ok(PathBuf::from(path)),
+        Some(path) => Ok(expand_tilde(path)),
         None => {
             let cwd = std::env::current_dir().context("Failed to get current directory")?;
             Ok(cwd.join("skills"))
@@ -510,19 +532,21 @@ fn lib_rs(name: &str) -> String {
 }
 
 fn readme_md(name: &str) -> String {
+    let artifact_name = name.replace('-', "_");
     format!(
         concat!(
             "# {name}\n\n",
             "A Fawx WASM skill.\n\n",
-            "## Build\n\n",
+            "## Recommended Local Workflow\n\n",
             "```bash\n",
-            "cargo build --release --target wasm32-unknown-unknown\n",
+            "fawx skill build .\n",
             "```\n\n",
-            "## Install\n\n",
+            "## Prebuilt Artifact Install\n\n",
             "```bash\n",
-            "fawx skill install target/wasm32-unknown-unknown/release/{name}.wasm\n",
+            "fawx skill install target/wasm32-wasip1/release/{artifact_name}.wasm\n",
             "```\n"
         ),
+        artifact_name = artifact_name,
         name = name
     )
 }
@@ -530,20 +554,145 @@ fn readme_md(name: &str) -> String {
 fn print_create_summary(project_dir: &Path, name: &str) {
     println!("Created skill project: {}/", project_dir.display());
     println!();
-    println!("To build:");
+    println!("Recommended local workflow:");
     println!("  cd {}", project_dir.display());
-    println!("  cargo build --release --target wasm32-unknown-unknown");
+    println!("  fawx skill build .");
     println!();
-    println!("To install:");
+    println!("To install a prebuilt artifact:");
     println!(
-        "  fawx skill install target/wasm32-unknown-unknown/release/{}.wasm",
+        "  fawx skill install target/wasm32-wasip1/release/{}.wasm",
         name.replace('-', "_")
     );
 }
 
-fn resolve_data_dir() -> Result<PathBuf> {
+pub fn status_output(data_dir: Option<&Path>) -> Result<String> {
+    let skills_dir = get_skills_dir(data_dir)?;
+    let statuses = read_skill_statuses(&skills_dir).map_err(anyhow::Error::msg)?;
+    if statuses.is_empty() {
+        return Ok("No activated loadable skills.".to_string());
+    }
+    let mut lines = vec!["Skill lifecycle status:".to_string()];
+    for status in statuses {
+        lines.push(format!(
+            "  {} v{}",
+            status.name, status.activation.revision.version
+        ));
+        lines.push(format!(
+            "    source: {}",
+            status.activation.source.display()
+        ));
+        lines.push(format!(
+            "    revision: {}",
+            status.activation.revision.revision_hash()
+        ));
+        lines.push(format!(
+            "    manifest: {}",
+            status.activation.revision.manifest_hash
+        ));
+        lines.push(format!(
+            "    activated: {}",
+            format_timestamp(status.activation.activated_at)
+        ));
+        lines.push(format!(
+            "    signature: {}",
+            status.activation.revision.signature.display()
+        ));
+        if let Some(drift) = status.source_drift {
+            lines.push(format!("    stale: {}", drift));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn rollback(name: &str, data_dir: Option<&Path>) -> Result<String> {
+    let skills_dir = get_skills_dir(data_dir)?;
+    let activation = fx_loadable::read_activation_record(&skills_dir, name)
+        .map_err(anyhow::Error::msg)?
+        .context("No active lifecycle record for skill")?;
+    let previous = activation
+        .previous
+        .as_deref()
+        .context("No previous revision available for rollback")?;
+    let revision_dir = find_revision_snapshot_dir(&skills_dir, name, previous)
+        .unwrap_or_else(|| revision_snapshot_dir(&skills_dir, name, previous));
+    let skill_dir = skills_dir.join(name);
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("Failed to create skill directory: {}", skill_dir.display()))?;
+    copy_revision_file(
+        &revision_dir.join("manifest.toml"),
+        &skill_dir.join("manifest.toml"),
+    )?;
+    copy_revision_file(
+        &revision_dir.join(format!("{name}.wasm")),
+        &skill_dir.join(format!("{name}.wasm")),
+    )?;
+    sync_revision_signature(&revision_dir, &skill_dir, name)?;
+    let source = read_revision_source_metadata(&revision_dir).map_err(anyhow::Error::msg)?;
+    write_source_metadata(&skill_dir, &source).map_err(anyhow::Error::msg)?;
+    Ok(format!(
+        "Prepared rollback for {name} to revision {}. The running watcher will activate it on the next reload event.",
+        previous.revision_hash()
+    ))
+}
+
+fn resolve_data_dir(data_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(data_dir) = data_dir {
+        return Ok(data_dir.to_path_buf());
+    }
     let home = dirs::home_dir().context("Failed to get home directory")?;
     Ok(home.join(".fawx"))
+}
+
+fn infer_local_source(input_path: &Path) -> Option<SkillSource> {
+    let source_path = if input_path.is_dir() {
+        input_path.canonicalize().ok()?
+    } else {
+        input_path.parent()?.canonicalize().ok()?
+    };
+    Some(SkillSource::LocalDev { source_path })
+}
+
+fn write_local_dev_install_metadata(
+    project_path: &Path,
+    install_path: Option<&PathBuf>,
+) -> Result<()> {
+    let Some(install_path) = install_path else {
+        return Ok(());
+    };
+    let source = SkillSource::LocalDev {
+        source_path: project_path.to_path_buf(),
+    };
+    write_source_metadata(install_path, &source).map_err(anyhow::Error::msg)
+}
+
+fn copy_revision_file(from: &Path, to: &Path) -> Result<()> {
+    fs::copy(from, to)
+        .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+    Ok(())
+}
+
+fn sync_revision_signature(revision_dir: &Path, skill_dir: &Path, name: &str) -> Result<()> {
+    let source = revision_dir.join(format!("{name}.wasm.sig"));
+    let target = skill_dir.join(format!("{name}.wasm.sig"));
+    if source.exists() {
+        copy_revision_file(&source, &target)?;
+        return Ok(());
+    }
+    match fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "Failed to remove stale signature {}: {error}",
+            target.display()
+        )),
+    }
+}
+
+fn format_timestamp(timestamp_ms: u64) -> String {
+    let Some(datetime) = Utc.timestamp_millis_opt(timestamp_ms as i64).single() else {
+        return timestamp_ms.to_string();
+    };
+    datetime.to_rfc3339()
 }
 
 fn print_build_summary(result: &BuildResult) {
@@ -617,6 +766,15 @@ mod tests {
     }
 
     #[test]
+    fn generated_readme_uses_canonical_local_workflow() {
+        let readme = readme_md("weather-skill");
+
+        assert!(readme.contains("fawx skill build ."));
+        assert!(readme.contains("target/wasm32-wasip1/release/weather_skill.wasm"));
+        assert!(!readme.contains("wasm32-unknown-unknown"));
+    }
+
+    #[test]
     fn create_with_custom_tool_name() {
         let temp_dir = TempDir::new().expect("temp dir");
         let options = CreateOptions::new(
@@ -644,6 +802,15 @@ mod tests {
 
         assert_eq!(project_dir, custom_root.join("weather-skill"));
         assert!(project_dir.join("Cargo.toml").exists());
+    }
+
+    #[test]
+    fn create_with_tilde_path_expands_home() {
+        let home = dirs::home_dir().expect("home dir");
+        let options = CreateOptions::new("weather-skill", None, None, Some("~/fawx/skills"))
+            .expect("options");
+
+        assert_eq!(options.parent_dir, home.join("fawx").join("skills"));
     }
 
     #[test]

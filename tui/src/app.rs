@@ -52,7 +52,8 @@ const WELCOME_LEFT_WIDTH: usize = 30;
 const WELCOME_COMMAND_WIDTH: usize = 28;
 const MAX_VISIBLE_SKILLS: usize = 8;
 const VERSION_LABEL: &str = concat!("Fawx v", env!("CARGO_PKG_VERSION"));
-const EMPTY_SKILLS_MESSAGE: &str = "No skills installed. Run /skills or fawx skill install <name>.";
+const EMPTY_SKILLS_MESSAGE: &str =
+    "No local skills installed. Run /skills for workflow help, fawx skill build <project> for local dev, or fawx skill install <path> for prebuilt artifacts.";
 const DEFAULT_SKILL_ICON: &str = "🧩";
 const ASCII_LOGO_ART: &str = r#"    ___                  
    / __\__ ___      ___ __
@@ -63,7 +64,7 @@ const ASCII_LOGO_ART: &str = r#"    ___
 const WELCOME_COMMANDS: [(&str, &str); 6] = [
     ("/help", "overview"),
     ("/model", "switch LLM"),
-    ("/skills", "show skills"),
+    ("/skills", "local skill state"),
     ("/clear", "clear chat"),
     ("/status", "engine info"),
     ("/quit", "exit"),
@@ -175,9 +176,38 @@ struct Entry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct InstalledSkill {
+struct LocalSkillSummary {
     icon: String,
     name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalSkillState {
+    BuiltLocally,
+    InstalledLocally,
+}
+
+impl LocalSkillState {
+    fn description(self) -> &'static str {
+        match self {
+            Self::BuiltLocally => "Built locally: artifact exists in the repo/build tree",
+            Self::InstalledLocally => "Installed locally: skill exists in ~/.fawx/skills",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::BuiltLocally => "Built locally (repo artifact found):",
+            Self::InstalledLocally => "Installed locally (~/.fawx/skills):",
+        }
+    }
+
+    fn marker(self) -> char {
+        match self {
+            Self::BuiltLocally => '○',
+            Self::InstalledLocally => '✓',
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,7 +354,7 @@ struct App {
     connection: ConnectionState,
     streaming_text: Option<String>,
     logo_art: String,
-    installed_skills: Vec<InstalledSkill>,
+    installed_skills: Vec<LocalSkillSummary>,
     pending_request: bool,
     awaiting_stream_start: bool,
     follow_output: bool,
@@ -1150,13 +1180,13 @@ fn logo_art_looks_garbled(art: &str) -> bool {
     noise * 2 >= visible
 }
 
-fn discover_installed_skills() -> Vec<InstalledSkill> {
+fn discover_installed_skills() -> Vec<LocalSkillSummary> {
     home_skills_dir()
         .map(|path| discover_installed_skills_from(&path))
         .unwrap_or_default()
 }
 
-fn discover_built_skills(installed: &[InstalledSkill]) -> Vec<InstalledSkill> {
+fn discover_built_skills(installed: &[LocalSkillSummary]) -> Vec<LocalSkillSummary> {
     let Some(root) = repo_root_from_manifest_dir() else {
         return Vec::new();
     };
@@ -1182,7 +1212,7 @@ fn home_skills_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".fawx").join("skills"))
 }
 
-fn discover_installed_skills_from(path: &Path) -> Vec<InstalledSkill> {
+fn discover_installed_skills_from(path: &Path) -> Vec<LocalSkillSummary> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -1205,7 +1235,7 @@ fn repo_root_from_manifest_dir() -> Option<PathBuf> {
 fn read_built_skill(
     path: &Path,
     installed: &std::collections::BTreeSet<String>,
-) -> Option<InstalledSkill> {
+) -> Option<LocalSkillSummary> {
     if !built_skill_artifact_exists(path) {
         return None;
     }
@@ -1221,16 +1251,27 @@ fn built_skill_artifact_exists(path: &Path) -> bool {
     if package_name.is_empty() {
         return false;
     }
-    let target_wasm = path
-        .join("target")
-        .join("wasm32-wasi")
-        .join("release")
-        .join(format!("{package_name}.wasm"));
-    let packaged_wasm = path.join("pkg").join(format!("{package_name}.wasm"));
-    target_wasm.exists() || packaged_wasm.exists()
+    wasm_artifact_names(package_name)
+        .iter()
+        .any(|artifact_name| {
+            let target_wasm = path
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release")
+                .join(artifact_name);
+            let packaged_wasm = path.join("pkg").join(artifact_name);
+            target_wasm.exists() || packaged_wasm.exists()
+        })
 }
 
-fn read_skill_manifest(path: &Path) -> InstalledSkill {
+fn wasm_artifact_names(package_name: &str) -> [String; 2] {
+    [
+        format!("{package_name}.wasm"),
+        format!("{}.wasm", package_name.replace('-', "_")),
+    ]
+}
+
+fn read_skill_manifest(path: &Path) -> LocalSkillSummary {
     let fallback_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -1246,7 +1287,7 @@ fn read_skill_manifest(path: &Path) -> InstalledSkill {
         .as_deref()
         .and_then(|value| parse_manifest_string(value, "icon"))
         .unwrap_or_else(|| default_skill_icon(&name).to_string());
-    InstalledSkill { icon, name }
+    LocalSkillSummary { icon, name }
 }
 
 fn parse_manifest_string(content: &str, field: &str) -> Option<String> {
@@ -1286,27 +1327,58 @@ fn default_skill_icon(name: &str) -> &'static str {
     }
 }
 
-fn format_skills_message(installed: &[InstalledSkill], available: &[InstalledSkill]) -> String {
-    if installed.is_empty() && available.is_empty() {
-        return "No skills found. Build with ./scripts/build.sh --skills".to_string();
+fn format_skills_message(
+    installed: &[LocalSkillSummary],
+    available: &[LocalSkillSummary],
+) -> String {
+    let mut lines = vec![
+        "Local skill state (/skills):".to_string(),
+        LocalSkillState::BuiltLocally.description().to_string(),
+        LocalSkillState::InstalledLocally.description().to_string(),
+        "Loaded on server: running server reports it via /v1/skills".to_string(),
+        String::new(),
+        "Recommended workflows:".to_string(),
+        "  Local dev: fawx skill build <project>".to_string(),
+        "  Prebuilt artifact: fawx skill install <path>".to_string(),
+        "  Built-in repo skills: skills/build.sh --install".to_string(),
+    ];
+    let sections = skill_sections(installed, available);
+    lines.push(String::new());
+    if sections.is_empty() {
+        lines.push("No local built or installed skills found.".to_string());
+    } else {
+        lines.extend(sections);
     }
-
-    let mut sections = Vec::new();
-    if !installed.is_empty() {
-        sections.push(format_skill_section("Installed:", '✓', installed));
-    }
-    if !available.is_empty() {
-        sections.push(format_skill_section("Available (built):", '○', available));
-    }
-    sections.join("\n\n")
+    lines.push(String::new());
+    lines.push(
+        "/skills does not verify loaded-on-server state. The Swift Skills UI and /v1/skills show only skills the running server has loaded.".to_string(),
+    );
+    lines.join("\n")
 }
 
-fn format_skill_section(title: &str, marker: char, skills: &[InstalledSkill]) -> String {
-    let mut lines = vec![title.to_string()];
+fn skill_sections(installed: &[LocalSkillSummary], available: &[LocalSkillSummary]) -> Vec<String> {
+    let mut sections = Vec::new();
+    if !installed.is_empty() {
+        sections.push(format_skill_section(
+            LocalSkillState::InstalledLocally,
+            installed,
+        ));
+    }
+    if !available.is_empty() {
+        sections.push(format_skill_section(
+            LocalSkillState::BuiltLocally,
+            available,
+        ));
+    }
+    sections
+}
+
+fn format_skill_section(state: LocalSkillState, skills: &[LocalSkillSummary]) -> String {
+    let mut lines = vec![state.title().to_string()];
     lines.extend(
         skills
             .iter()
-            .map(|skill| format!("{marker} {} {}", skill.icon, skill.name)),
+            .map(|skill| format!("{} {} {}", state.marker(), skill.icon, skill.name)),
     );
     lines.join("\n")
 }
@@ -1314,7 +1386,7 @@ fn format_skill_section(title: &str, marker: char, skills: &[InstalledSkill]) ->
 fn render_welcome_screen(
     width: usize,
     mascot_art: &str,
-    skills: &[InstalledSkill],
+    skills: &[LocalSkillSummary],
 ) -> Vec<Line<'static>> {
     match WelcomeLayout::for_width(width) {
         WelcomeLayout::Wide => render_wide_welcome(width, mascot_art, skills),
@@ -1326,7 +1398,7 @@ fn render_welcome_screen(
 fn render_wide_welcome(
     width: usize,
     mascot_art: &str,
-    skills: &[InstalledSkill],
+    skills: &[LocalSkillSummary],
 ) -> Vec<Line<'static>> {
     let mascot_width = width
         .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COMMAND_WIDTH + (WELCOME_COLUMN_GAP * 2))
@@ -1350,7 +1422,7 @@ fn render_wide_welcome(
 fn render_medium_welcome(
     width: usize,
     mascot_art: &str,
-    skills: &[InstalledSkill],
+    skills: &[LocalSkillSummary],
 ) -> Vec<Line<'static>> {
     let mascot_width = width
         .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COMMAND_WIDTH + (WELCOME_COLUMN_GAP * 2))
@@ -1371,7 +1443,7 @@ fn render_medium_welcome(
     lines
 }
 
-fn render_narrow_welcome(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+fn render_narrow_welcome(width: usize, skills: &[LocalSkillSummary]) -> Vec<Line<'static>> {
     let mut lines = welcome_command_section(width);
     lines.push(blank_line());
     lines.extend(welcome_skill_section(width, skills));
@@ -1419,7 +1491,7 @@ fn welcome_mascot_column(mascot_art: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn welcome_commands_and_skills(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+fn welcome_commands_and_skills(width: usize, skills: &[LocalSkillSummary]) -> Vec<Line<'static>> {
     let mut lines = welcome_command_section(width);
     lines.push(blank_line());
     lines.extend(welcome_skill_section(width, skills));
@@ -1434,13 +1506,13 @@ fn welcome_command_section(width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn welcome_skill_section(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+fn welcome_skill_section(width: usize, skills: &[LocalSkillSummary]) -> Vec<Line<'static>> {
     let mut lines = vec![section_header("Skills")];
     lines.extend(render_skill_items(width, skills));
     lines
 }
 
-fn render_skill_items(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+fn render_skill_items(width: usize, skills: &[LocalSkillSummary]) -> Vec<Line<'static>> {
     if skills.is_empty() {
         return wrap_plain_text(EMPTY_SKILLS_MESSAGE, width.max(1))
             .into_iter()
@@ -1490,7 +1562,7 @@ fn command_line(command: &str, description: &str, width: usize) -> Line<'static>
     ])
 }
 
-fn skill_line(skill: &InstalledSkill, width: usize) -> Line<'static> {
+fn skill_line(skill: &LocalSkillSummary, width: usize) -> Line<'static> {
     let text = truncate_text(&format!("{}  {}", skill.icon, skill.name), width.max(1));
     styled_line(text, Style::default().fg(Color::Gray))
 }
@@ -2049,8 +2121,14 @@ mod tests {
         "  /keys list     List trusted public keys\n",
         "  /keys trust <path>\n",
         "  /keys revoke <fingerprint>\n",
-        "  /sign <skill>  Sign one WASM skill\n",
+        "  /sign <skill>  Sign one installed WASM skill\n",
         "  /sign --all    Sign all installed WASM skills\n",
+        "  /skills         Inspect local build/install state\n",
+        "                 Local dev: fawx skill build <project>\n",
+        "                 Prebuilt:  fawx skill install <path>\n",
+        "                 Repo skills: skills/build.sh --install\n",
+        "  /install <name> Install a skill from the marketplace\n",
+        "  /search [query] Search the skill marketplace\n",
         "  /status        Show model, tokens, budget summary\n",
         "  /budget        Show detailed budget usage\n",
         "  /loop          Show loop iteration details\n",
@@ -2201,8 +2279,8 @@ mod tests {
         assert_eq!(expected, TOOL_PREFIX_DISPLAY_WIDTH);
     }
 
-    fn skill(name: &str, icon: &str) -> InstalledSkill {
-        InstalledSkill {
+    fn skill(name: &str, icon: &str) -> LocalSkillSummary {
+        LocalSkillSummary {
             icon: icon.to_string(),
             name: name.to_string(),
         }
@@ -2933,10 +3011,48 @@ mod tests {
         let lines = render_welcome_screen(50, "FOX", &[]);
         let text = rendered_text(&lines).join("\n");
 
-        assert!(text.contains("No skills installed."));
+        assert!(text.contains("No local skills installed."));
         assert!(text.contains("/skills"));
-        assert!(text.contains("fawx skill"));
-        assert!(text.contains("install <name>"));
+        assert!(text.contains("workflow help"));
+        assert!(text.contains("fawx skill build"));
+        assert!(text.contains("fawx skill install"));
+    }
+
+    #[test]
+    fn skills_message_for_built_only_skill_keeps_server_step_distinct() {
+        let text = format_skills_message(&[], &[skill("test-built", "🧪")]);
+
+        assert!(text.contains("Built locally: artifact exists in the repo/build tree"));
+        assert!(text.contains("Built locally (repo artifact found):"));
+        assert!(text.contains("○ 🧪 test-built"));
+        assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
+        assert!(text.contains("Recommended workflows:"));
+        assert!(text.contains("Local dev: fawx skill build <project>"));
+        assert!(text.contains("/skills does not verify loaded-on-server state."));
+    }
+
+    #[test]
+    fn skills_message_for_installed_skill_requires_server_confirmation() {
+        let text = format_skills_message(&[skill("weather", "🌤")], &[]);
+
+        assert!(text.contains("Installed locally: skill exists in ~/.fawx/skills"));
+        assert!(text.contains("Installed locally (~/.fawx/skills):"));
+        assert!(text.contains("✓ 🌤 weather"));
+        assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
+        assert!(text.contains("Prebuilt artifact: fawx skill install <path>"));
+        assert!(text.contains("/skills does not verify loaded-on-server state."));
+    }
+
+    #[test]
+    fn skills_message_without_local_skills_stays_explicit_about_scope() {
+        let text = format_skills_message(&[], &[]);
+
+        assert!(text.contains("No local built or installed skills found."));
+        assert!(text.contains("Built-in repo skills: skills/build.sh --install"));
+        assert!(text.contains("/skills does not verify loaded-on-server state."));
+        assert!(text.contains(
+            "The Swift Skills UI and /v1/skills show only skills the running server has loaded."
+        ));
     }
 
     #[test]
@@ -3016,6 +3132,34 @@ mod tests {
     }
 
     #[test]
+    fn built_skill_artifact_detection_uses_wasip1_target_output() {
+        let built_dir = repo_root_from_manifest_dir()
+            .expect("repo root")
+            .join("skills")
+            .join("test-wasip1-built-skill");
+        fs::create_dir_all(
+            built_dir
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release"),
+        )
+        .expect("built dir");
+        fs::write(
+            built_dir
+                .join("target")
+                .join("wasm32-wasip1")
+                .join("release")
+                .join("test_wasip1_built_skill.wasm"),
+            b"wasm",
+        )
+        .expect("built wasm");
+
+        assert!(built_skill_artifact_exists(&built_dir));
+
+        fs::remove_dir_all(&built_dir).expect("cleanup built dir");
+    }
+
+    #[test]
     fn skills_command_shows_installed_and_built_skills() {
         let _guard = env_lock().blocking_lock();
         let home = temp_test_dir("home");
@@ -3054,10 +3198,13 @@ mod tests {
         }
         fs::remove_dir_all(&home).expect("cleanup home");
 
-        assert!(text.contains("Installed:"));
+        assert!(text.contains("Installed locally (~/.fawx/skills):"));
         assert!(text.contains("✓ 🌤 weather"));
-        assert!(text.contains("Available (built):"));
+        assert!(text.contains("Built locally (repo artifact found):"));
         assert!(text.contains("○ 🧪 test-built"));
+        assert!(text.contains("Recommended workflows:"));
+        assert!(text.contains("Loaded on server: running server reports it via /v1/skills"));
+        assert!(text.contains("/skills does not verify loaded-on-server state."));
     }
 
     #[tokio::test(flavor = "current_thread")]

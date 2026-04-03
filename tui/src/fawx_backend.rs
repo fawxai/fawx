@@ -108,6 +108,8 @@ struct ToolResultData {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
     output: Option<String>,
     #[serde(default)]
     is_error: bool,
@@ -562,7 +564,10 @@ fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow:
     try_send(
         tx,
         BackendEvent::ToolResult {
-            name: d.id,
+            name: d
+                .tool_name
+                .filter(|name| !name.is_empty())
+                .or_else(|| d.id.filter(|id| !id.is_empty())),
             success: true,
             content: d.output.unwrap_or_default(),
         },
@@ -861,6 +866,30 @@ model = "gpt-4"
 
     #[test]
     fn dispatch_tool_result_maps_fields_correctly() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: tool_result\ndata: {\"id\":\"c1\",\"tool_name\":\"read_file\",\"output\":\"file contents\",\"is_error\":false}",
+            &tx,
+            &mut saw,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolResult {
+                name,
+                success,
+                content,
+            } => {
+                assert_eq!(name.as_deref(), Some("read_file"));
+                assert!(success);
+                assert_eq!(content, "file contents");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_result_falls_back_to_id_when_tool_name_missing() {
         let (tx, mut rx) = unbounded_channel();
         let mut saw = false;
         dispatch_sse_frame(

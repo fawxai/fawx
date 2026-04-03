@@ -28,11 +28,11 @@ impl ModelRouter {
         Self::default()
     }
 
-    /// Register a provider and infer auth method metadata from its name.
+    /// Register a provider using the auth method declared by the provider instance.
     pub fn register_provider(&mut self, provider: Box<dyn CompletionProvider>) {
         let provider: Arc<dyn CompletionProvider> = provider.into();
-        let inferred_auth_method = infer_auth_method(provider.name());
-        self.register_provider_with_auth(provider, inferred_auth_method);
+        let auth_method = provider.auth_method().to_string();
+        self.register_provider_with_auth(provider, auth_method);
     }
 
     /// Register a provider with an explicit auth method descriptor.
@@ -108,11 +108,11 @@ impl ModelRouter {
             .iter()
             .map(|(provider_name, provider)| ProviderCatalogEntry {
                 provider_name: provider_name.clone(),
-                auth_method: self
-                    .provider_auth_methods
-                    .get(provider_name)
-                    .cloned()
-                    .unwrap_or_else(|| infer_auth_method(provider_name)),
+                auth_method: provider_auth_method(
+                    &self.providers,
+                    &self.provider_auth_methods,
+                    provider_name,
+                ),
                 provider: Arc::clone(provider),
             })
             .collect()
@@ -120,12 +120,29 @@ impl ModelRouter {
 
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
-        build_model_infos(&self.model_to_provider, &self.provider_auth_methods)
+        build_model_infos(
+            &self.model_to_provider,
+            &self.providers,
+            &self.provider_auth_methods,
+        )
     }
 
     /// Fetch available models from all registered providers dynamically.
     pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
         fetch_available_models_from_catalog(self.provider_catalog()).await
+    }
+
+    pub fn context_window_for_model(&self, model: &str) -> Result<usize, RouterError> {
+        let (resolved_model, provider) = self.resolved_provider(model)?;
+        Ok(provider.context_window(&resolved_model))
+    }
+
+    pub fn thinking_levels_for_model(
+        &self,
+        model: &str,
+    ) -> Result<&'static [&'static str], RouterError> {
+        let (resolved_model, provider) = self.resolved_provider(model)?;
+        Ok(provider.thinking_levels(&resolved_model))
     }
 
     /// Prepare a request for a specific model without borrowing the router across await points.
@@ -140,15 +157,9 @@ impl ModelRouter {
             ));
         }
 
-        let resolved_model = self
-            .resolve_model(model)
+        let (resolved_model, provider) = self
+            .resolved_provider(model)
             .map_err(|error| ProviderLlmError::Config(error.to_string()))?;
-        let provider_name = self.model_to_provider.get(&resolved_model).ok_or_else(|| {
-            ProviderLlmError::Config(RouterError::ModelNotFound(resolved_model.clone()).to_string())
-        })?;
-        let provider = self.providers.get(provider_name).cloned().ok_or_else(|| {
-            ProviderLlmError::Provider(format!("provider '{provider_name}' was not registered"))
-        })?;
 
         request.model = resolved_model;
         if !provider.capabilities().supports_temperature {
@@ -194,6 +205,23 @@ impl ModelRouter {
             .clone()
             .ok_or_else(|| ProviderLlmError::Config(RouterError::NoActiveModel.to_string()))?;
         self.request_for_model(&active_model, request)
+    }
+
+    fn resolved_provider(
+        &self,
+        model: &str,
+    ) -> Result<(String, Arc<dyn CompletionProvider>), RouterError> {
+        let resolved_model = self.resolve_model(model)?;
+        let provider_name = self
+            .model_to_provider
+            .get(&resolved_model)
+            .ok_or_else(|| RouterError::ModelNotFound(resolved_model.clone()))?;
+        let provider = self.providers.get(provider_name).cloned().ok_or_else(|| {
+            RouterError::ProviderError(ProviderLlmError::Provider(format!(
+                "provider '{provider_name}' was not registered"
+            )))
+        })?;
+        Ok((resolved_model, provider))
     }
 }
 
@@ -252,6 +280,7 @@ fn add_provider_models(
 
 fn build_model_infos(
     model_to_provider: &HashMap<String, String>,
+    providers: &HashMap<String, Arc<dyn CompletionProvider>>,
     provider_auth_methods: &HashMap<String, String>,
 ) -> Vec<ModelInfo> {
     let mut models = model_to_provider
@@ -259,10 +288,7 @@ fn build_model_infos(
         .map(|(model_id, provider_name)| ModelInfo {
             model_id: model_id.clone(),
             provider_name: provider_name.clone(),
-            auth_method: provider_auth_methods
-                .get(provider_name)
-                .cloned()
-                .unwrap_or_else(|| infer_auth_method(provider_name)),
+            auth_method: provider_auth_method(providers, provider_auth_methods, provider_name),
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
@@ -300,20 +326,20 @@ pub enum RouterError {
     ProviderError(ProviderLlmError),
 }
 
-fn infer_auth_method(provider_name: &str) -> String {
-    let provider = provider_name.to_ascii_lowercase();
-
-    if provider.contains("setup") || provider.contains("oauth") || provider.contains("subscription")
-    {
-        return "subscription".to_string();
-    }
-
-    if provider == "anthropic" {
-        // Default Anthropic path in Fawx currently uses Claude subscriptions.
-        return "subscription".to_string();
-    }
-
-    "api_key".to_string()
+fn provider_auth_method(
+    providers: &HashMap<String, Arc<dyn CompletionProvider>>,
+    overrides: &HashMap<String, String>,
+    provider_name: &str,
+) -> String {
+    overrides
+        .get(provider_name)
+        .cloned()
+        .or_else(|| {
+            providers
+                .get(provider_name)
+                .map(|provider| provider.auth_method().to_string())
+        })
+        .unwrap_or_else(|| "api_key".to_string())
 }
 
 /// Strategy for routing LLM requests.
@@ -477,28 +503,6 @@ impl LlmRouter {
         }
         count
     }
-}
-
-/// Hardcoded context window lookup for known model families.
-///
-/// Returns the context window size in tokens. This is a stopgap until
-/// `ModelInfo` carries provider-reported context window sizes.
-pub fn context_window_for_model(model_id: &str) -> usize {
-    let id = model_id.to_lowercase();
-    if id.contains("claude-opus") || id.contains("claude-sonnet") || id.contains("claude-haiku") {
-        return 200_000;
-    }
-    if id.contains("gpt-5") || id.contains("gpt-4") {
-        return 128_000;
-    }
-    if id.contains("deepseek") {
-        return 64_000;
-    }
-    if id.contains("gemini") {
-        return 1_000_000;
-    }
-    // Conservative default for unknown models.
-    128_000
 }
 
 #[cfg(test)]
@@ -673,6 +677,9 @@ mod model_router_tests {
         models: Vec<String>,
         response_text: String,
         dynamic_models: Result<Vec<String>, String>,
+        auth_method: &'static str,
+        context_window: usize,
+        thinking_levels: &'static [&'static str],
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
         capabilities: ProviderCapabilities,
@@ -694,6 +701,9 @@ mod model_router_tests {
                 models: model_ids.clone(),
                 response_text: response_text.to_string(),
                 dynamic_models: Ok(model_ids),
+                auth_method: "api_key",
+                context_window: 128_000,
+                thinking_levels: &["off"],
                 captured_models,
                 captured_temperatures,
                 capabilities,
@@ -708,6 +718,21 @@ mod model_router_tests {
 
         fn with_list_models_delay_ms(mut self, delay_ms: u64) -> Self {
             self.list_models_delay_ms = delay_ms;
+            self
+        }
+
+        fn with_auth_method(mut self, auth_method: &'static str) -> Self {
+            self.auth_method = auth_method;
+            self
+        }
+
+        fn with_context_window(mut self, context_window: usize) -> Self {
+            self.context_window = context_window;
+            self
+        }
+
+        fn with_thinking_levels(mut self, thinking_levels: &'static [&'static str]) -> Self {
+            self.thinking_levels = thinking_levels;
             self
         }
     }
@@ -765,6 +790,18 @@ mod model_router_tests {
 
         fn capabilities(&self) -> ProviderCapabilities {
             self.capabilities
+        }
+
+        fn auth_method(&self) -> &'static str {
+            self.auth_method
+        }
+
+        fn context_window(&self, _model: &str) -> usize {
+            self.context_window
+        }
+
+        fn thinking_levels(&self, _model: &str) -> &'static [&'static str] {
+            self.thinking_levels
         }
     }
 
@@ -845,7 +882,8 @@ mod model_router_tests {
             captured,
             temperatures,
             default_capabilities(),
-        );
+        )
+        .with_auth_method("subscription");
 
         let mut router = ModelRouter::new();
         router.register_provider(Box::new(provider));
@@ -879,6 +917,54 @@ mod model_router_tests {
         let models = router.available_models();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].auth_method, "api_key");
+    }
+
+    #[test]
+    fn context_window_for_model_uses_provider_contract() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "custom",
+            vec!["custom-model"],
+            "from custom",
+            captured,
+            temperatures,
+            default_capabilities(),
+        )
+        .with_context_window(42_000);
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+
+        let context_window = router
+            .context_window_for_model("custom-model")
+            .expect("context window");
+
+        assert_eq!(context_window, 42_000);
+    }
+
+    #[test]
+    fn thinking_levels_for_model_use_provider_contract() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "custom",
+            vec!["custom-model"],
+            "from custom",
+            captured,
+            temperatures,
+            default_capabilities(),
+        )
+        .with_thinking_levels(&["off", "careful"]);
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+
+        let levels = router
+            .thinking_levels_for_model("custom-model")
+            .expect("thinking levels");
+
+        assert_eq!(levels, &["off", "careful"]);
     }
 
     #[tokio::test]
@@ -1240,7 +1326,6 @@ mod thinking_level_tests {
     use crate::provider::{
         CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
     };
-    use crate::supported_thinking_levels;
     use crate::types::{CompletionRequest, CompletionResponse, LlmError};
     use async_trait::async_trait;
 
@@ -1298,60 +1383,5 @@ mod thinking_level_tests {
             router.provider_for_model("claude-sonnet-4-20250514"),
             Some("anthropic")
         );
-    }
-
-    #[test]
-    fn supported_thinking_levels_anthropic() {
-        let levels = supported_thinking_levels("anthropic");
-        assert_eq!(levels, vec!["off", "low", "adaptive", "high"]);
-    }
-
-    #[test]
-    fn supported_thinking_levels_openai() {
-        let levels = supported_thinking_levels("openai");
-        assert_eq!(levels, vec!["off", "low", "high"]);
-    }
-
-    #[test]
-    fn supported_thinking_levels_falls_back_to_off_for_unknown_provider() {
-        assert_eq!(
-            supported_thinking_levels("mystery"),
-            vec!["off".to_string()]
-        );
-    }
-}
-
-#[cfg(test)]
-mod context_window_tests {
-    use super::context_window_for_model;
-
-    #[test]
-    fn returns_200k_for_claude_models() {
-        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
-        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for_model("claude-haiku-4-5"), 200_000);
-    }
-
-    #[test]
-    fn returns_128k_for_gpt_models() {
-        assert_eq!(context_window_for_model("gpt-5.4"), 128_000);
-        assert_eq!(context_window_for_model("gpt-4o"), 128_000);
-    }
-
-    #[test]
-    fn returns_64k_for_deepseek_models() {
-        assert_eq!(context_window_for_model("deepseek-chat"), 64_000);
-        assert_eq!(context_window_for_model("deepseek-reasoner"), 64_000);
-    }
-
-    #[test]
-    fn returns_1m_for_gemini_models() {
-        assert_eq!(context_window_for_model("gemini-2.5-pro"), 1_000_000);
-        assert_eq!(context_window_for_model("gemini-2.5-flash"), 1_000_000);
-    }
-
-    #[test]
-    fn returns_default_for_unknown_models() {
-        assert_eq!(context_window_for_model("some-unknown-model"), 128_000);
     }
 }

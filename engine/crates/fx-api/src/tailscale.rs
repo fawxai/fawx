@@ -108,11 +108,11 @@ mod tests {
 
     #[test]
     fn parse_tailscale_cli_output_returns_cgnat_ip() {
-        let stdout = b"100.64.0.42\n";
+        let stdout = b"100.100.100.1\n";
 
         assert_eq!(
             parse_tailscale_cli_output(stdout),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 1)))
         );
     }
 
@@ -132,17 +132,17 @@ mod tests {
 
     #[test]
     fn parse_macos_ifconfig_line_extracts_cgnat_ip() {
-        let line = "inet 100.64.0.43 --> 100.64.0.43 netmask 0xffffffff";
+        let line = "inet 100.101.20.63 --> 100.101.20.63 netmask 0xffffffff";
 
         assert_eq!(
             extract_ip_from_line(line),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 43)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 101, 20, 63)))
         );
     }
 
     #[test]
     fn parse_macos_ifconfig_line_without_inet_prefix_returns_none() {
-        let line = "100.64.0.43 --> 100.64.0.43 netmask 0xffffffff";
+        let line = "100.101.20.63 --> 100.101.20.63 netmask 0xffffffff";
 
         assert_eq!(extract_ip_from_line(line), None);
     }
@@ -157,11 +157,12 @@ mod tests {
 
     #[test]
     fn linux_ip_output_still_parsed_correctly() {
-        let text = "7: tailscale0    inet 100.64.0.42/32 brd 100.64.0.42 scope global tailscale0";
+        let text =
+            "7: tailscale0    inet 100.100.100.1/32 brd 100.100.100.1 scope global tailscale0";
 
         assert_eq!(
             find_cgnat_ip(text),
-            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42)))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 1)))
         );
     }
 }

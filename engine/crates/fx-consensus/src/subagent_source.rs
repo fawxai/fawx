@@ -291,11 +291,7 @@ fn verified_response(mut response: PatchResponse) -> PatchResponse {
 }
 
 async fn verify_build(working_dir: &Path, timeout: Duration) -> Result<(), ConsensusError> {
-    let mut command = Command::new("cargo");
-    command
-        .arg("check")
-        .current_dir(working_dir)
-        .kill_on_drop(true);
+    let mut command = build_verify_command(working_dir);
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| build_timeout_error(timeout))?
@@ -307,6 +303,16 @@ async fn verify_build(working_dir: &Path, timeout: Duration) -> Result<(), Conse
         &output.stdout,
         &output.stderr,
     )))
+}
+
+fn build_verify_command(working_dir: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg("check")
+        .current_dir(working_dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .kill_on_drop(true);
+    command
 }
 
 fn build_timeout_error(timeout: Duration) -> ConsensusError {
@@ -979,6 +985,17 @@ mod tests {
         let output = command_output(b"compiled\n", b"warning\n");
 
         assert_eq!(output, "--- stdout ---\ncompiled\n--- stderr ---\nwarning");
+    }
+
+    #[test]
+    fn build_verify_command_removes_inherited_target_dir() {
+        let command = build_verify_command(Path::new("/tmp/project"));
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "CARGO_TARGET_DIR" && value.is_none());
+
+        assert!(removed, "verify_build should ignore inherited target dirs");
     }
 
     #[test]

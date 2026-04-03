@@ -1,58 +1,50 @@
 use crate::experiment_tool::{
-    handle_run_experiment, run_experiment_tool_definition, spawn_background_experiment,
-    ExperimentRegistrar, ExperimentToolState,
+    handle_run_experiment, spawn_background_experiment, ExperimentRegistrar, ExperimentToolState,
 };
+pub use crate::tool_trait::ToolConfig;
+use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
-use fx_config::{manager::ConfigManager, FawxConfig};
+use fx_config::manager::ConfigManager;
 use fx_consensus::ProgressCallback;
-use fx_core::kernel_manifest::{build_kernel_manifest, BudgetSummary, ManifestSources};
+use fx_core::kernel_manifest::BudgetSummary;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
-use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
+use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
-    ToolExecutor, ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, JournalAction,
+    ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
-use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
+use fx_kernel::ToolAuthoritySurface;
+use fx_kernel::{ProcessConfig, ProcessRegistry};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
-use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
-use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
-use fx_subagent::{
-    SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
-};
+use fx_subagent::SubagentControl;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::process::Command;
+use std::time::Duration;
 
-/// Expand a leading `~` or `~/` prefix to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(path)
-}
+mod config;
+mod experiment;
+mod filesystem;
+#[cfg(feature = "improvement")]
+mod improvement;
+mod memory;
+mod node;
+mod process;
+mod runtime;
+mod shell;
+mod subagent;
 
-const MAX_RECURSION_DEPTH: usize = 5;
-const MAX_SEARCH_MATCHES: usize = 100;
-const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
-const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_MEMORY_SEARCH_RESULTS: usize = 5;
+#[cfg(test)]
+use self::filesystem::{is_builtin_ignored_directory, MAX_SEARCH_MATCHES};
+#[cfg(test)]
+use self::runtime::{day_of_week_from_epoch, iso8601_utc_from_epoch};
 
 fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
     Arc::new(ProcessRegistry::new(ProcessConfig {
@@ -72,68 +64,71 @@ fn build_budget_summary(config: &KernelBudgetConfig) -> BudgetSummary {
     }
 }
 
+type ToolRef = Arc<dyn Tool>;
+
+#[derive(Clone, Default)]
+struct ToolRegistry {
+    ordered: Vec<ToolRef>,
+    by_name: HashMap<String, ToolRef>,
+}
+
+impl ToolRegistry {
+    fn register<T>(&mut self, tool: T)
+    where
+        T: Tool + 'static,
+    {
+        let tool: ToolRef = Arc::new(tool);
+        let name = tool.name().to_string();
+        match self.by_name.entry(name.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                tracing::error!(tool = %name, "duplicate tool registration");
+                debug_assert!(false, "duplicate tool registration: {name}");
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&tool));
+            }
+        }
+        self.ordered.push(tool);
+    }
+
+    fn get(&self, name: &str) -> Option<ToolRef> {
+        self.by_name.get(name).cloned()
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.get(call.name.as_str())
+            .map_or(ToolAuthoritySurface::Other, |tool| {
+                tool.authority_surface(call)
+            })
+    }
+
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.ordered
+            .iter()
+            .filter(|tool| tool.is_available())
+            .map(|tool| tool.definition())
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct FawxToolExecutor {
-    working_dir: PathBuf,
-    config: ToolConfig,
-    process_registry: Arc<ProcessRegistry>,
-    memory: Option<Arc<Mutex<dyn MemoryStore>>>,
-    embedding_index: Option<Arc<Mutex<EmbeddingIndex>>>,
-    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
-    self_modify: Option<SelfModifyConfig>,
+    context: Arc<ToolContext>,
+    tools: Arc<ToolRegistry>,
     concurrency_policy: ConcurrencyPolicy,
-    config_manager: Option<Arc<Mutex<ConfigManager>>>,
-    protected_branches: Vec<String>,
-    kernel_budget: KernelBudgetConfig,
-    start_time: std::time::Instant,
-    subagent_control: Option<Arc<dyn SubagentControl>>,
-    experiment: Option<ExperimentToolState>,
-    experiment_progress: Option<ProgressCallback>,
-    experiment_registrar: Option<Arc<dyn ExperimentRegistrar>>,
-    background_experiments: bool,
-    node_run: Option<crate::node_run::NodeRunState>,
-    #[cfg(feature = "improvement")]
-    improvement: Option<crate::improvement_tools::ImprovementToolsState>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolConfig {
-    /// Maximum file size for write operations (bytes)
-    pub max_file_size: u64,
-    /// Maximum file size for read_file operations (bytes)
-    pub max_read_size: u64,
-    /// Additional directories to exclude from search
-    pub search_exclude: Vec<String>,
-    /// Command execution timeout
-    pub command_timeout: Duration,
-    /// Whether to allow commands outside working_dir
-    pub jail_to_working_dir: bool,
-}
-
-impl Default for ToolConfig {
-    fn default() -> Self {
-        Self {
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
-            max_read_size: DEFAULT_MAX_READ_SIZE,
-            search_exclude: Vec::new(),
-            command_timeout: Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
-            jail_to_working_dir: true,
-        }
-    }
 }
 
 impl FawxToolExecutor {
     pub fn new(working_dir: PathBuf, config: ToolConfig) -> Self {
-        let process_registry = default_process_registry(&working_dir);
-        Self {
+        let context = Arc::new(ToolContext {
+            process_registry: default_process_registry(&working_dir),
             working_dir,
             config,
-            process_registry,
             memory: None,
             embedding_index: None,
             runtime_info: None,
             self_modify: None,
-            concurrency_policy: ConcurrencyPolicy::default(),
             config_manager: None,
             protected_branches: Vec::new(),
             kernel_budget: KernelBudgetConfig::default(),
@@ -146,6 +141,11 @@ impl FawxToolExecutor {
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
+        });
+        Self {
+            tools: Arc::new(build_registry(&context)),
+            context,
+            concurrency_policy: ConcurrencyPolicy::default(),
         }
     }
 
@@ -156,92 +156,101 @@ impl FawxToolExecutor {
         self
     }
 
+    fn update_context(&mut self, update: impl FnOnce(&mut ToolContext)) {
+        update(Arc::make_mut(&mut self.context));
+        self.rebuild_tools();
+    }
+
+    fn rebuild_tools(&mut self) {
+        self.tools = Arc::new(build_registry(&self.context));
+    }
+
     /// Attach a persistent memory provider.
     pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
-        self.memory = Some(memory);
+        self.update_context(|context| context.memory = Some(memory));
         self
     }
 
     /// Attach a semantic embedding index for memory search.
     pub fn with_embedding_index(mut self, index: Arc<Mutex<EmbeddingIndex>>) -> Self {
-        self.embedding_index = Some(index);
+        self.update_context(|context| context.embedding_index = Some(index));
         self
     }
 
     /// Attach runtime self-introspection state.
     pub fn with_runtime_info(mut self, info: Arc<RwLock<RuntimeInfo>>) -> Self {
-        self.runtime_info = Some(info);
+        self.update_context(|context| context.runtime_info = Some(info));
         self
     }
 
     /// Attach a self-modification path enforcement config.
     pub fn with_self_modify(mut self, config: SelfModifyConfig) -> Self {
-        self.self_modify = Some(config);
+        self.update_context(|context| context.self_modify = Some(config));
         self
     }
 
     /// Attach a config manager for runtime config read/write tools.
     pub fn with_config_manager(mut self, mgr: Arc<Mutex<ConfigManager>>) -> Self {
-        self.config_manager = Some(mgr);
+        self.update_context(|context| context.config_manager = Some(mgr));
         self
     }
 
     #[must_use]
     pub fn with_protected_branches(mut self, protected_branches: Vec<String>) -> Self {
-        self.protected_branches = protected_branches;
+        self.update_context(|context| context.protected_branches = protected_branches);
         self
     }
 
     /// Attach the active kernel budget configuration.
     pub fn with_kernel_budget(mut self, budget: KernelBudgetConfig) -> Self {
-        self.kernel_budget = budget;
+        self.update_context(|context| context.kernel_budget = budget);
         self
     }
 
     /// Attach subagent lifecycle tools (spawn_agent, subagent_status).
     pub fn with_subagent_control(mut self, control: Arc<dyn SubagentControl>) -> Self {
-        self.subagent_control = Some(control);
+        self.update_context(|context| context.subagent_control = Some(control));
         self
     }
 
     /// Attach experiment execution state for run_experiment.
     pub fn with_experiment(mut self, state: ExperimentToolState) -> Self {
-        self.experiment = Some(state);
+        self.update_context(|context| context.experiment = Some(state));
         self
     }
 
     /// Attach an experiment progress callback for run_experiment.
     pub fn with_experiment_progress(mut self, progress: ProgressCallback) -> Self {
-        self.experiment_progress = Some(progress);
+        self.update_context(|context| context.experiment_progress = Some(progress));
         self
     }
 
     /// Attach an experiment registry bridge for background run_experiment calls.
     pub fn with_experiment_registrar(mut self, registrar: Arc<dyn ExperimentRegistrar>) -> Self {
-        self.experiment_registrar = Some(registrar);
+        self.update_context(|context| context.experiment_registrar = Some(registrar));
         self
     }
 
     /// Toggle spawn-and-return behavior for run_experiment.
     #[must_use]
     pub fn with_background_experiments(mut self, background: bool) -> Self {
-        self.background_experiments = background;
+        self.update_context(|context| context.background_experiments = background);
         self
     }
 
     pub fn set_experiment(&mut self, state: ExperimentToolState) {
-        self.experiment = Some(state);
+        self.update_context(|context| context.experiment = Some(state));
     }
 
     /// Attach node_run tool state for remote command execution.
     pub fn with_node_run(mut self, state: crate::node_run::NodeRunState) -> Self {
-        self.node_run = Some(state);
+        self.update_context(|context| context.node_run = Some(state));
         self
     }
 
     /// Attach a background process registry shared with the engine lifecycle.
     pub fn with_process_registry(mut self, registry: Arc<ProcessRegistry>) -> Self {
-        self.process_registry = registry;
+        self.update_context(|context| context.process_registry = registry);
         self
     }
 
@@ -251,34 +260,8 @@ impl FawxToolExecutor {
         mut self,
         state: crate::improvement_tools::ImprovementToolsState,
     ) -> Self {
-        self.improvement = Some(state);
+        self.update_context(|context| context.improvement = Some(state));
         self
-    }
-
-    /// Whether improvement tools are configured and enabled.
-    #[cfg(feature = "improvement")]
-    fn improvement_tools_enabled(&self) -> bool {
-        self.improvement.as_ref().is_some_and(|s| s.config.enabled)
-    }
-
-    fn cacheability_for(tool_name: &str) -> ToolCacheability {
-        match tool_name {
-            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list"
-            | "memory_search" => ToolCacheability::Cacheable,
-            "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
-            | "exec_background" | "exec_kill" | "config_set" | "fawx_restart" | "spawn_agent"
-            | "node_run" | "run_experiment" => ToolCacheability::SideEffect,
-            "current_time"
-            | "self_info"
-            | "config_get"
-            | "fawx_status"
-            | "kernel_manifest"
-            | "exec_status"
-            | "subagent_status"
-            | "analyze_signals"
-            | "propose_improvement" => ToolCacheability::NeverCache,
-            _ => ToolCacheability::NeverCache,
-        }
     }
 
     pub(crate) async fn execute_call(
@@ -289,749 +272,109 @@ impl FawxToolExecutor {
         if is_cancelled(cancel) {
             return cancelled_result(&call.id, &call.name);
         }
-        let output = match call.name.as_str() {
-            "read_file" => self.handle_read_file(&call.arguments),
-            "write_file" => self.handle_write_file(&call.arguments),
-            "edit_file" => self.handle_edit_file(&call.arguments),
-            "list_directory" => self.handle_list_directory(&call.arguments),
-            "run_command" => self.handle_run_command(&call.arguments).await,
-            "exec_background" => self.handle_exec_background(&call.arguments),
-            "exec_status" => self.handle_exec_status(&call.arguments),
-            "exec_kill" => self.handle_exec_kill(&call.arguments).await,
-            "search_text" => self.handle_search_text(&call.arguments),
-            "current_time" => self.handle_current_time(),
-            "self_info" => self.handle_self_info(&call.arguments),
-            "config_get" => self.handle_config_get(&call.arguments),
-            "config_set" => self.handle_config_set(&call.arguments),
-            "fawx_status" => self.handle_fawx_status(),
-            "kernel_manifest" => self.handle_kernel_manifest(),
-            "fawx_restart" => self.handle_fawx_restart(&call.arguments),
-            "memory_write" => self.handle_memory_write(&call.arguments),
-            "memory_read" => self.handle_memory_read(&call.arguments),
-            "memory_list" => self.handle_memory_list(),
-            "memory_search" => self.handle_memory_search(&call.arguments),
-            "memory_delete" => self.handle_memory_delete(&call.arguments),
-            "spawn_agent" => self.handle_spawn_agent(&call.arguments).await,
-            "subagent_status" => self.handle_subagent_status(&call.arguments).await,
-            "run_experiment" => self.handle_run_experiment(&call.arguments).await,
-            "node_run" => {
-                return self.dispatch_node_run(call).await;
-            }
-            #[cfg(feature = "improvement")]
-            "analyze_signals" => {
-                return self.dispatch_analyze_signals(call).await;
-            }
-            #[cfg(feature = "improvement")]
-            "propose_improvement" => {
-                return self.dispatch_propose_improvement(call).await;
-            }
-            _ => Err(format!("unknown tool: {}", call.name)),
-        };
-        to_tool_result(&call.id, &call.name, output)
-    }
-
-    fn subagent_control(&self) -> Result<&Arc<dyn SubagentControl>, String> {
-        self.subagent_control
-            .as_ref()
-            .ok_or_else(|| "subagent control not configured".to_string())
-    }
-
-    fn jailed_path(&self, requested: &str) -> Result<PathBuf, String> {
-        if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(Path::new(requested));
-        }
-        validate_path(&self.working_dir, requested)
-    }
-
-    fn validated_existing_entry(&self, path: &Path) -> Result<Option<PathBuf>, String> {
-        if !self.config.jail_to_working_dir {
-            return Ok(Some(path.to_path_buf()));
-        }
-        let requested = path.to_string_lossy().to_string();
-        match validate_path(&self.working_dir, &requested) {
-            Ok(validated) => Ok(Some(validated)),
-            Err(_) => Ok(None),
+        match self.tools.get(call.name.as_str()) {
+            Some(tool) => tool.execute(call, cancel).await,
+            None => to_tool_result(
+                &call.id,
+                &call.name,
+                Err(format!("unknown tool: {}", call.name)),
+            ),
         }
     }
+}
 
-    fn resolve_tool_path(&self, requested: &str) -> Result<PathBuf, String> {
-        let expanded = expand_tilde(requested);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        self.jailed_path(expanded_str)
-    }
-
-    fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, String> {
-        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-        if size_limit.is_some_and(|limit| metadata.len() > limit) {
-            return Err("file exceeds maximum allowed size".to_string());
-        }
-        let bytes = fs::read(path).map_err(|error| error.to_string())?;
-        String::from_utf8(bytes).map_err(|_| "file appears to be binary".to_string())
-    }
-
+#[cfg(test)]
+impl FawxToolExecutor {
     fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ReadFileArgs = parse_args(args)?;
-        let path = self.resolve_tool_path(&parsed.path)?;
-        let content = self.read_utf8_file(&path, Some(self.config.max_read_size))?;
-        render_read_output(&content, parsed.offset, parsed.limit)
+        self.context.handle_read_file(args)
     }
 
     fn handle_write_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: WriteFileArgs = parse_args(args)?;
-        let path = self.resolve_tool_path(&parsed.path)?;
-        if let Some(message) = self.apply_write_policy(&path, &parsed.content)? {
-            return Ok(message);
-        }
-        write_text_file(&path, &parsed.content)?;
-        Ok(format!(
-            "wrote {} bytes to {}",
-            parsed.content.len(),
-            path.display()
-        ))
+        self.context.handle_write_file(args)
     }
 
     fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: EditFileArgs = parse_args(args)?;
-        validate_edit_args(&parsed)?;
-        let path = self.resolve_tool_path(&parsed.path)?;
-        let content = self.read_utf8_file(&path, Some(self.config.max_file_size))?;
-        let plan = plan_exact_edit(&path, &content, &parsed.old_text, &parsed.new_text)?;
-        if let Some(message) = self.apply_write_policy(&path, &plan.updated_content)? {
-            return Ok(message);
-        }
-        write_text_file(&path, &plan.updated_content)?;
-        Ok(format!(
-            "Successfully edited {} (lines {}-{})",
-            path.display(),
-            plan.start_line,
-            plan.end_line
-        ))
-    }
-
-    fn apply_write_policy(&self, path: &Path, content: &str) -> Result<Option<String>, String> {
-        // Defense-in-depth: ProposalGateExecutor in the kernel is the primary
-        // enforcement layer for self-modify policy. This tool-level check is
-        // retained as a secondary guard in case the kernel gate is bypassed or
-        // misconfigured.
-        self.check_max_file_size(content.len())?;
-        let Some(ref config) = self.self_modify else {
-            return Ok(None);
-        };
-        let tier = classify_path(path, &self.working_dir, config);
-        match tier {
-            PathTier::Deny => Err(deny_tier_message(path, tier)),
-            PathTier::Propose => self.write_proposal(path, content, config).map(Some),
-            PathTier::Allow => Ok(None),
-        }
-    }
-
-    fn check_max_file_size(&self, len: usize) -> Result<(), String> {
-        if (len as u64) > self.config.max_file_size {
-            return Err("content exceeds maximum allowed size".to_string());
-        }
-        Ok(())
-    }
-
-    fn write_proposal(
-        &self,
-        path: &Path,
-        content: &str,
-        config: &SelfModifyConfig,
-    ) -> Result<String, String> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown");
-        let action = if path.exists() { "replace" } else { "create" };
-        let file_hash = current_file_hash(&self.working_dir, path)
-            .map_err(|error| format!("failed to inspect target file: {error}"))?;
-        let proposal = Proposal {
-            title: format!("Modify {filename}"),
-            description: format!(
-                "Agent attempted to {} propose-tier path: {} ({} bytes)",
-                action,
-                path.display(),
-                content.len()
-            ),
-            target_path: path.to_path_buf(),
-            proposed_content: build_proposed_content(path, content),
-            risk: "This path is classified as propose-tier under self-modification policy."
-                .to_string(),
-            timestamp,
-            file_hash,
-        };
-        let writer = ProposalWriter::new(config.proposals_dir.clone());
-        let proposal_path = writer.write(&proposal).map_err(|error| error.to_string())?;
-        Ok(format!(
-            "Proposal created at {}. The target file '{}' was NOT modified. \
-             A human must review and approve this proposal.",
-            proposal_path.display(),
-            path.display()
-        ))
+        self.context.handle_edit_file(args)
     }
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ListDirectoryArgs = parse_args(args)?;
-        let expanded = expand_tilde(&parsed.path);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        let path = self.jailed_path(expanded_str)?;
-        let recursive = parsed.recursive.unwrap_or(false);
-        if recursive {
-            return self.list_recursive(&path, 0);
-        }
-        self.list_flat(&path)
-    }
-
-    fn list_flat(&self, path: &Path) -> Result<String, String> {
-        let mut lines = Vec::new();
-        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let kind = entry_kind(&entry.path())?;
-            lines.push(format!("[{kind}] {}", entry.file_name().to_string_lossy()));
-        }
-        lines.sort();
-        Ok(lines.join("\n"))
-    }
-
-    fn list_recursive(&self, path: &Path, depth: usize) -> Result<String, String> {
-        if depth > MAX_RECURSION_DEPTH {
-            return Ok(String::new());
-        }
-        let mut lines = Vec::new();
-        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let entry_path = entry.path();
-
-            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                if self.is_ignored_directory(name) && entry_path.is_dir() {
-                    continue;
-                }
-            }
-
-            let Some(validated) = self.validated_existing_entry(&entry_path)? else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().to_string();
-            let kind = entry_kind(&entry_path)?;
-            lines.push(format!("{}[{}] {}", "  ".repeat(depth), kind, name));
-            if kind == "dir" {
-                let nested = self.list_recursive(&validated, depth + 1)?;
-                if !nested.is_empty() {
-                    lines.push(nested);
-                }
-            }
-        }
-        Ok(lines.join("\n"))
+        self.context.handle_list_directory(args)
     }
 
     async fn handle_run_command(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: RunCommandArgs = parse_args(args)?;
-        let command = parsed.command.trim();
-        if command.is_empty() {
-            return Err("command cannot be empty".to_string());
-        }
-        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
-        self.guard_push_command(command)?;
-        let child = build_command(command, parsed.shell.unwrap_or(false), &working_dir)?
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        let output = wait_with_timeout(child, self.config.command_timeout).await?;
-        Ok(format_command_output(output, parsed.shell.unwrap_or(false)))
+        self.context.handle_run_command(args).await
     }
 
     fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ExecBackgroundArgs = parse_args(args)?;
-        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
-        self.guard_push_command(&parsed.command)?;
-        let result = self
-            .process_registry
-            .spawn(parsed.command, working_dir, parsed.label)?;
-        serialize_output(exec_spawn_value(result))
+        self.context.handle_exec_background(args)
     }
 
     fn handle_exec_status(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ExecStatusArgs = parse_args(args)?;
-        let tail = parsed.tail.unwrap_or(20);
-        if let Some(session_id) = parsed.session_id.as_deref() {
-            let status = self
-                .process_registry
-                .status(session_id, tail)
-                .ok_or_else(|| format!("unknown session_id: {session_id}"))?;
-            return serialize_output(exec_status_value(status));
-        }
-        serialize_output(exec_list_value(self.process_registry.list()))
+        self.context.handle_exec_status(args)
     }
 
     async fn handle_exec_kill(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ExecKillArgs = parse_args(args)?;
-        self.process_registry.kill(&parsed.session_id).await?;
-        serialize_output(serde_json::json!({
-            "session_id": parsed.session_id,
-            "status": "killed",
-        }))
-    }
-
-    fn guard_push_command(&self, command: &str) -> Result<(), String> {
-        let targets = extract_push_targets(command);
-        if targets.is_empty() {
-            return Ok(());
-        }
-        check_push_allowed(&targets, &self.protected_branches)
-    }
-
-    fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let desired = requested.unwrap_or_else(|| self.working_dir.to_str().unwrap_or("."));
-        if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(Path::new(desired));
-        }
-        validate_path(&self.working_dir, desired)
+        self.context.handle_exec_kill(args).await
     }
 
     fn handle_search_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: SearchTextArgs = parse_args(args)?;
-        let root = self.resolve_search_root(parsed.path.as_deref())?;
-        let mut results = Vec::new();
-        self.search_path(&root, &parsed, &mut results)?;
-        Ok(results.join("\n"))
+        self.context.handle_search_text(args)
     }
 
     fn handle_current_time(&self) -> Result<String, String> {
-        let now = SystemTime::now();
-        let duration = now
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("system time before Unix epoch: {error}"))?;
-        let epoch = duration.as_secs();
-        let iso = iso8601_utc_from_epoch(epoch);
-        let day_of_week = day_of_week_from_epoch(epoch);
-        Ok(format!(
-            "iso8601_utc: {iso}\nepoch: {epoch}\nday_of_week: {day_of_week}"
-        ))
+        self.context.handle_current_time()
     }
 
     fn handle_self_info(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: SelfInfoArgs = parse_args(args)?;
-        let info_lock = self
-            .runtime_info
-            .as_ref()
-            .ok_or_else(|| "runtime info not configured".to_string())?;
-        let info = info_lock
-            .read()
-            .map_err(|error| format!("failed to read runtime info: {error}"))?;
-        let section = parsed.section.as_deref().unwrap_or("all");
-        serialize_section(&info, section)
+        self.context.handle_self_info(args)
     }
 
     fn handle_config_get(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ConfigGetArgs = parse_args(args)?;
-        let mgr = self.locked_config_manager()?;
-        let section = parsed.section.as_deref().unwrap_or("all");
-        let value = mgr.get(section)?;
-        serde_json::to_string_pretty(&value).map_err(|e| format!("failed to format config: {e}"))
+        self.context.handle_config_get(args)
     }
 
     fn handle_config_set(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ConfigSetRequest = parse_args(args)?;
-        let mut mgr = self
-            .config_manager
-            .as_ref()
-            .ok_or_else(|| "config manager not configured".to_string())?
-            .lock()
-            .map_err(|e| format!("failed to lock config manager: {e}"))?;
-        mgr.set(&parsed.key, &parsed.value)?;
-        Ok(format!("updated {} = {}", parsed.key, parsed.value))
+        self.context.handle_config_set(args)
     }
 
     fn handle_fawx_status(&self) -> Result<String, String> {
-        let uptime = self.start_time.elapsed();
-        let model = self.active_model_name();
-        let memory_entries = self.memory_entry_count();
-        let skills_loaded = self.skills_loaded_count();
-        let sessions = self.active_session_count();
-        let status = serde_json::json!({
-            "status": "running",
-            "uptime_seconds": uptime.as_secs(),
-            "model": model,
-            "memory_entries": memory_entries,
-            "skills_loaded": skills_loaded,
-            "sessions": sessions,
-        });
-        serde_json::to_string_pretty(&status).map_err(|e| format!("failed to format status: {e}"))
+        self.context.handle_fawx_status()
     }
 
     fn handle_kernel_manifest(&self) -> Result<String, String> {
-        let runtime = self.locked_runtime_info()?;
-        let config = self.locked_config()?;
-        let (sm_enabled, sm_allow, sm_deny) = match &self.self_modify {
-            Some(sm) => (sm.enabled, sm.allow_paths.clone(), sm.deny_paths.clone()),
-            None => (false, Vec::new(), Vec::new()),
-        };
-        let working_dir = self.working_dir.to_string_lossy().into_owned();
-        let budget = build_budget_summary(&self.kernel_budget);
-        let can_request_capabilities = runtime.skills.iter().any(|skill| {
-            skill
-                .tool_names
-                .iter()
-                .any(|tool| tool == "request_capability")
-        });
-        let sources = ManifestSources {
-            version: &runtime.version,
-            active_model: &runtime.active_model,
-            provider: &runtime.provider,
-            preset: Some(config.permissions.preset.as_str()),
-            permissions: &config.permissions,
-            budget: &budget,
-            sandbox: &config.sandbox,
-            self_modify_enabled: sm_enabled,
-            self_modify_allow: &sm_allow,
-            self_modify_deny: &sm_deny,
-            skills: &runtime.skills,
-            working_dir: &working_dir,
-            can_request_capabilities,
-        };
-        let manifest = build_kernel_manifest(&sources);
-        serde_json::to_string_pretty(&manifest)
-            .map_err(|e| format!("failed to serialize manifest: {e}"))
+        self.context.handle_kernel_manifest()
     }
 
     fn handle_fawx_restart(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: FawxRestartArgs = parse_args(args)?;
-        let delay = parsed.delay_seconds.unwrap_or(2);
-        let reason = parsed.reason.as_deref().unwrap_or("requested by agent");
-        tracing::info!(reason, delay, "scheduling SIGHUP restart");
-        schedule_sighup_restart(delay, reason.to_string())?;
-        let clamped = delay.min(MAX_RESTART_DELAY_SECS);
-        Ok(format!(
-            "restart scheduled in {clamped}s (reason: {reason})"
-        ))
+        self.context.handle_fawx_restart(args)
     }
 
-    fn locked_runtime_info(&self) -> Result<RuntimeInfo, String> {
-        let info = self
-            .runtime_info
-            .as_ref()
-            .ok_or_else(|| "runtime info not configured".to_string())?;
-        info.read()
-            .map_err(|error| format!("failed to read runtime info: {error}"))
-            .map(|guard| guard.clone())
-    }
-
-    fn locked_config(&self) -> Result<FawxConfig, String> {
-        let manager = self
-            .config_manager
-            .as_ref()
-            .ok_or_else(|| "config manager not available".to_string())?;
-        let guard = manager
-            .lock()
-            .map_err(|error| format!("config lock failed: {error}"))?;
-        Ok(guard.config().clone())
-    }
-
-    fn locked_config_manager(&self) -> Result<std::sync::MutexGuard<'_, ConfigManager>, String> {
-        self.config_manager
-            .as_ref()
-            .ok_or_else(|| "config manager not configured".to_string())?
-            .lock()
-            .map_err(|e| format!("failed to lock config manager: {e}"))
-    }
-
-    fn active_model_name(&self) -> String {
-        self.runtime_info
-            .as_ref()
-            .and_then(|info| info.read().ok())
-            .map(|info| info.active_model.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-
-    fn memory_entry_count(&self) -> usize {
-        self.memory
-            .as_ref()
-            .and_then(|m| m.lock().ok())
-            .map(|store| store.list().len())
-            .unwrap_or(0)
-    }
-
-    fn skills_loaded_count(&self) -> usize {
-        self.runtime_info
-            .as_ref()
-            .and_then(|info| info.read().ok())
-            .map(|info| info.skills.len())
-            .unwrap_or(0)
-    }
-
-    /// Stub: session count is not yet tracked in the tool executor.
-    /// Returns 0 until fx-session wiring is complete.
-    fn active_session_count(&self) -> usize {
-        0
-    }
-
-    fn is_ignored_directory(&self, name: &str) -> bool {
-        if is_builtin_ignored_directory(name) {
-            return true;
-        }
-        self.config.search_exclude.iter().any(|item| item == name)
-    }
-
-    fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let default_root = self.working_dir.to_string_lossy().to_string();
-        let requested = requested.unwrap_or(&default_root);
-        let expanded = expand_tilde(requested);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(Path::new(expanded_str));
-        }
-        validate_path(&self.working_dir, expanded_str)
-    }
-
-    fn search_path(
-        &self,
-        root: &Path,
-        args: &SearchTextArgs,
-        out: &mut Vec<String>,
-    ) -> Result<(), String> {
-        if out.len() >= MAX_SEARCH_MATCHES {
-            return Ok(());
-        }
-        if root.is_dir() {
-            self.search_directory(root, args, out)?;
-        } else {
-            self.search_file(root, args, out)?;
-        }
-        Ok(())
-    }
-
-    fn search_directory(
-        &self,
-        dir: &Path,
-        args: &SearchTextArgs,
-        out: &mut Vec<String>,
-    ) -> Result<(), String> {
-        for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
-            if out.len() >= MAX_SEARCH_MATCHES {
-                break;
-            }
-            let entry_path = entry.map_err(|error| error.to_string())?.path();
-
-            // Skip build artifacts, VCS, and dependency directories
-            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                if self.is_ignored_directory(name) && entry_path.is_dir() {
-                    continue;
-                }
-            }
-
-            let Some(validated) = self.validated_existing_entry(&entry_path)? else {
-                continue;
-            };
-            if validated.is_dir() {
-                self.search_directory(&validated, args, out)?;
-                continue;
-            }
-            self.search_file(&validated, args, out)?;
-        }
-        Ok(())
-    }
-
-    fn search_file(
-        &self,
-        file: &Path,
-        args: &SearchTextArgs,
-        out: &mut Vec<String>,
-    ) -> Result<(), String> {
-        if !matches_glob(file, args.file_glob.as_deref()) {
-            return Ok(());
-        }
-        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
-        if metadata.len() > self.config.max_read_size {
-            return Ok(());
-        }
-        let mut bytes = Vec::new();
-        let mut reader = fs::File::open(file).map_err(|error| error.to_string())?;
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return Ok(()),
-        };
-        for (index, line) in text.lines().enumerate() {
-            if out.len() >= MAX_SEARCH_MATCHES {
-                break;
-            }
-            if line.contains(&args.pattern) {
-                out.push(format!("{}:{}:{}", file.display(), index + 1, line));
-            }
-        }
-        Ok(())
-    }
     fn handle_memory_write(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: MemoryWriteArgs = parse_args(args)?;
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
-        guard.write(&parsed.key, &parsed.value)?;
-        drop(guard);
-        self.upsert_embedding_memory(&parsed.key, &parsed.value)?;
-        Ok(format!("stored key '{}'", parsed.key))
+        self.context.handle_memory_write(args)
     }
 
     fn handle_memory_read(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: MemoryReadArgs = parse_args(args)?;
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
-        let value = guard.read(&parsed.key);
-        if value.is_some() {
-            guard.touch(&parsed.key)?;
-        }
-        match value {
-            Some(value) => Ok(value),
-            None => Ok(format!("key '{}' not found", parsed.key)),
-        }
+        self.context.handle_memory_read(args)
     }
 
     fn handle_memory_list(&self) -> Result<String, String> {
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let guard = memory.lock().map_err(|e| format!("{e}"))?;
-        let entries = guard.list();
-        if entries.is_empty() {
-            return Ok("no memories stored".to_string());
-        }
-        let lines = format_memory_list(&entries);
-        Ok(lines)
+        self.context.handle_memory_list()
     }
 
     fn handle_memory_search(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: MemorySearchArgs = parse_args(args)?;
-        let max_results = parsed.max_results.unwrap_or(DEFAULT_MEMORY_SEARCH_RESULTS);
-        let results = self.memory_search_results(&parsed.query, max_results)?;
-        self.touch_memory_search_results(&results)?;
-        Ok(format_memory_search_results(&parsed.query, &results))
+        self.context.handle_memory_search(args)
     }
 
     fn handle_memory_delete(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: MemoryDeleteArgs = parse_args(args)?;
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
-        let deleted = guard.delete(&parsed.key);
-        drop(guard);
-        if deleted {
-            self.remove_embedding_memory(&parsed.key)?;
-            Ok(format!("deleted key '{}'", parsed.key))
-        } else {
-            Ok(format!("key '{}' not found", parsed.key))
-        }
+        self.context.handle_memory_delete(args)
     }
+}
 
-    fn memory_search_results(
+impl ToolContext {
+    pub(crate) async fn handle_run_experiment(
         &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<MemorySearchResult>, String> {
-        if let Some(index) = &self.embedding_index {
-            match self.semantic_memory_search(index, query, max_results) {
-                Ok(results) => return Ok(results),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "semantic search failed; falling back to keyword search"
-                    );
-                }
-            }
-        }
-        self.keyword_memory_search(query, max_results)
-    }
-
-    fn touch_memory_search_results(&self, results: &[MemorySearchResult]) -> Result<(), String> {
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let mut guard = memory.lock().map_err(|error| format!("{error}"))?;
-        results
-            .iter()
-            .try_for_each(|result| guard.touch(&result.key))
-    }
-
-    fn semantic_memory_search(
-        &self,
-        index: &Arc<Mutex<EmbeddingIndex>>,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<MemorySearchResult>, String> {
-        let hits = index
-            .lock()
-            .map_err(|e| format!("{e}"))?
-            .search(query, max_results)
-            .map_err(|error| error.to_string())?;
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let guard = memory.lock().map_err(|e| format!("{e}"))?;
-        Ok(hits
-            .into_iter()
-            .filter_map(|(key, score)| {
-                guard.read(&key).map(|value| MemorySearchResult {
-                    key,
-                    value,
-                    score: Some(score),
-                })
-            })
-            .collect())
-    }
-
-    fn keyword_memory_search(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<MemorySearchResult>, String> {
-        let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let guard = memory.lock().map_err(|e| format!("{e}"))?;
-        Ok(guard
-            .search_relevant(query, max_results)
-            .into_iter()
-            .map(|(key, value)| MemorySearchResult {
-                key,
-                value,
-                score: None,
-            })
-            .collect())
-    }
-
-    fn upsert_embedding_memory(&self, key: &str, value: &str) -> Result<(), String> {
-        let Some(index) = &self.embedding_index else {
-            return Ok(());
-        };
-        index
-            .lock()
-            .map_err(|e| format!("{e}"))?
-            .upsert(key, value)
-            .map_err(|error| error.to_string())
-    }
-
-    fn remove_embedding_memory(&self, key: &str) -> Result<(), String> {
-        let Some(index) = &self.embedding_index else {
-            return Ok(());
-        };
-        index.lock().map_err(|e| format!("{e}"))?.remove(key);
-        Ok(())
-    }
-
-    async fn handle_spawn_agent(&self, args: &serde_json::Value) -> Result<String, String> {
-        let control = self.subagent_control()?;
-        let parsed: SpawnAgentArgs = parse_args(args)?;
-        let config = parsed.into_spawn_config()?;
-        let handle = control
-            .spawn(config)
-            .await
-            .map_err(|error| error.to_string())?;
-        serialize_output(spawned_handle_value(&handle))
-    }
-
-    async fn handle_run_experiment(&self, args: &serde_json::Value) -> Result<String, String> {
+        args: &serde_json::Value,
+    ) -> Result<String, String> {
         let state = self
             .experiment
             .as_ref()
@@ -1057,74 +400,9 @@ impl FawxToolExecutor {
             .await
         }
     }
+}
 
-    async fn handle_subagent_status(&self, args: &serde_json::Value) -> Result<String, String> {
-        let control = self.subagent_control()?;
-        let parsed: SubagentStatusArgs = parse_args(args)?;
-        let action = parse_subagent_action(&parsed.action)?;
-        let output = match action {
-            SubagentAction::List => list_subagents_output(control).await?,
-            SubagentAction::Status => status_subagent_output(control, parsed.id).await?,
-            SubagentAction::Cancel => cancel_subagent_output(control, parsed.id).await?,
-            SubagentAction::Send => {
-                send_subagent_output(control, parsed.id, parsed.message).await?
-            }
-        };
-        serialize_output(output)
-    }
-
-    #[cfg(feature = "improvement")]
-    async fn dispatch_analyze_signals(&self, call: &ToolCall) -> ToolResult {
-        let state = match &self.improvement {
-            Some(s) if s.config.enabled => s,
-            _ => {
-                return to_tool_result(
-                    &call.id,
-                    &call.name,
-                    Err("improvement tools not enabled".to_string()),
-                );
-            }
-        };
-        let output = crate::improvement_tools::handle_analyze_signals(state, &call.arguments).await;
-        to_tool_result(&call.id, &call.name, output)
-    }
-
-    #[cfg(feature = "improvement")]
-    async fn dispatch_propose_improvement(&self, call: &ToolCall) -> ToolResult {
-        let state = match &self.improvement {
-            Some(s) if s.config.enabled => s,
-            _ => {
-                return to_tool_result(
-                    &call.id,
-                    &call.name,
-                    Err("improvement tools not enabled".to_string()),
-                );
-            }
-        };
-        let output = crate::improvement_tools::handle_propose_improvement(
-            state,
-            &call.arguments,
-            &self.working_dir,
-        )
-        .await;
-        to_tool_result(&call.id, &call.name, output)
-    }
-
-    async fn dispatch_node_run(&self, call: &ToolCall) -> ToolResult {
-        let state = match &self.node_run {
-            Some(s) => s,
-            None => {
-                return to_tool_result(
-                    &call.id,
-                    &call.name,
-                    Err("node_run not configured".to_string()),
-                );
-            }
-        };
-        let output = crate::node_run::handle_node_run(state, &call.arguments).await;
-        to_tool_result(&call.id, &call.name, output)
-    }
-
+impl FawxToolExecutor {
     async fn execute_single_tool(
         &self,
         call: &ToolCall,
@@ -1174,205 +452,6 @@ impl FawxToolExecutor {
     }
 }
 
-fn build_proposed_content(path: &Path, content: &str) -> String {
-    let original = if path.exists() {
-        Some(fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string()))
-    } else {
-        None
-    };
-    build_proposal_content(original.as_deref(), content)
-}
-
-struct EditPlan {
-    updated_content: String,
-    start_line: usize,
-    end_line: usize,
-}
-
-fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    fs::write(path, content.as_bytes()).map_err(|error| error.to_string())
-}
-
-fn deny_tier_message(path: &Path, tier: PathTier) -> String {
-    format_tier_violation(path, tier).unwrap_or_else(|| {
-        format!(
-            "Self-modify policy violation [deny]: {}. This path cannot be modified.",
-            path.display()
-        )
-    })
-}
-
-fn validate_edit_args(args: &EditFileArgs) -> Result<(), String> {
-    if args.old_text.is_empty() {
-        return Err("old_text must not be empty".to_string());
-    }
-    if args.old_text == args.new_text {
-        return Err("old_text and new_text must differ".to_string());
-    }
-    Ok(())
-}
-
-fn render_read_output(
-    content: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<String, String> {
-    validate_line_window(offset, limit)?;
-    if offset.is_none() && limit.is_none() {
-        return Ok(content.to_string());
-    }
-    let lines = collect_lines(content);
-    let start_line = offset.unwrap_or(1);
-    if start_line > lines.len() {
-        return Ok(offset_past_end_message(start_line, lines.len()));
-    }
-    let start_index = start_line - 1;
-    let end_index = slice_end_index(start_index, limit, lines.len());
-    let body = lines[start_index..end_index].concat();
-    Ok(partial_read_response(
-        start_line,
-        end_index,
-        lines.len(),
-        body,
-    ))
-}
-
-fn validate_line_window(offset: Option<usize>, limit: Option<usize>) -> Result<(), String> {
-    if offset == Some(0) {
-        return Err("offset must be at least 1".to_string());
-    }
-    if limit == Some(0) {
-        return Err("limit must be at least 1".to_string());
-    }
-    Ok(())
-}
-
-fn collect_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-    content.split_inclusive('\n').collect()
-}
-
-fn offset_past_end_message(start_line: usize, total_lines: usize) -> String {
-    format!("(no lines returned; offset {start_line} is past end of file with {total_lines} lines)")
-}
-
-fn slice_end_index(start_index: usize, limit: Option<usize>, total_lines: usize) -> usize {
-    match limit {
-        Some(limit) => (start_index + limit).min(total_lines),
-        None => total_lines,
-    }
-}
-
-fn partial_read_response(
-    start_line: usize,
-    end_index: usize,
-    total_lines: usize,
-    body: String,
-) -> String {
-    let header = format!("[Lines {start_line}-{end_index} of {total_lines}]");
-    if body.is_empty() {
-        header
-    } else {
-        format!("{header}\n{body}")
-    }
-}
-
-fn plan_exact_edit(
-    path: &Path,
-    content: &str,
-    old_text: &str,
-    new_text: &str,
-) -> Result<EditPlan, String> {
-    let matches = count_exact_matches(content, old_text);
-    if matches == 0 {
-        return Err(format!(
-            "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
-            path.display()
-        ));
-    }
-    if matches > 1 {
-        return Err(format!(
-            "Found {matches} matches for old_text in {}. Please provide more context to uniquely identify the target.",
-            path.display()
-        ));
-    }
-    let start = content.find(old_text).ok_or_else(|| {
-        format!(
-            "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
-            path.display()
-        )
-    })?;
-    let (start_line, end_line) = line_span(content, start, old_text);
-    Ok(EditPlan {
-        updated_content: replace_exact_range(content, start, old_text, new_text),
-        start_line,
-        end_line,
-    })
-}
-
-fn count_exact_matches(content: &str, needle: &str) -> usize {
-    let haystack = content.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return 0;
-    }
-    haystack
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
-}
-
-fn line_span(content: &str, start: usize, old_text: &str) -> (usize, usize) {
-    let start_line = content[..start]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1;
-    let line_count = old_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    (start_line, start_line + line_count - 1)
-}
-
-fn replace_exact_range(content: &str, start: usize, old_text: &str, new_text: &str) -> String {
-    let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());
-    updated.push_str(&content[..start]);
-    updated.push_str(new_text);
-    updated.push_str(&content[start + old_text.len()..]);
-    updated
-}
-
-fn serialize_section(info: &RuntimeInfo, section: &str) -> Result<String, String> {
-    let value = match section {
-        "model" => serde_json::json!({
-            "model": {
-                "active": &info.active_model,
-                "provider": &info.provider,
-            }
-        }),
-        "skills" => serde_json::json!({"skills": &info.skills}),
-        "config" => serde_json::json!({"config": &info.config_summary}),
-        "all" => serde_json::json!({
-            "model": {
-                "active": &info.active_model,
-                "provider": &info.provider,
-            },
-            "skills": &info.skills,
-            "config": &info.config_summary,
-            "version": &info.version,
-        }),
-        other => {
-            return Err(format!(
-                "unknown section '{other}', valid sections: model, skills, config, all"
-            ));
-        }
-    };
-    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
-}
-
 #[async_trait]
 impl ToolExecutor for FawxToolExecutor {
     async fn execute_tools(
@@ -1396,26 +475,50 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs =
-            fawx_tool_definitions(self.subagent_control.is_some(), self.experiment.is_some());
-        if self.memory.is_some() {
-            defs.extend(memory_tool_definitions());
-        }
-        if self.config_manager.is_some() {
-            defs.extend(config_tool_definitions());
-        }
-        if self.node_run.is_some() {
-            defs.push(crate::node_run::node_run_tool_definition());
-        }
-        #[cfg(feature = "improvement")]
-        if self.improvement_tools_enabled() {
-            defs.extend(crate::improvement_tools::improvement_tool_definitions());
-        }
-        defs
+        self.tools.definitions()
     }
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
-        Self::cacheability_for(tool_name)
+        self.tools
+            .get(tool_name)
+            .map_or(ToolCacheability::NeverCache, |tool| tool.cacheability())
+    }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.tools
+            .get(call.name.as_str())
+            .map_or(ToolCallClassification::Observation, |tool| {
+                tool.classify_call(call)
+            })
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.tools
+            .get(call.name.as_str())
+            .map_or("unknown", |tool| tool.action_category())
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.tools.authority_surface(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.tools
+            .get(call.name.as_str())
+            .and_then(|tool| tool.journal_action(call, result))
+    }
+
+    fn route_sub_goal_call(
+        &self,
+        request: &fx_kernel::act::SubGoalToolRoutingRequest,
+        call_id: &str,
+    ) -> Option<ToolCall> {
+        let tool_name = request.required_tools.first()?;
+        let tool = self.tools.get(tool_name)?;
+        if !tool.is_available() {
+            return None;
+        }
+        tool.route_sub_goal(request, call_id)
     }
 }
 
@@ -1423,23 +526,33 @@ impl std::fmt::Debug for FawxToolExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("FawxToolExecutor");
         debug
-            .field("working_dir", &self.working_dir)
-            .field("config", &self.config)
+            .field("working_dir", &self.context.working_dir)
+            .field("config", &self.context.config)
+            .field("registered_tools", &self.tools.ordered.len())
             .field("process_registry", &true)
-            .field("memory", &self.memory.is_some())
-            .field("embedding_index", &self.embedding_index.is_some())
-            .field("runtime_info", &self.runtime_info.is_some())
-            .field("self_modify", &self.self_modify)
+            .field("memory", &self.context.memory.is_some())
+            .field("embedding_index", &self.context.embedding_index.is_some())
+            .field("runtime_info", &self.context.runtime_info.is_some())
+            .field("self_modify", &self.context.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
-            .field("config_manager", &self.config_manager.is_some())
-            .field("kernel_budget", &self.kernel_budget)
-            .field("subagent_control", &self.subagent_control.is_some())
-            .field("experiment", &self.experiment.is_some())
-            .field("experiment_progress", &self.experiment_progress.is_some())
-            .field("experiment_registrar", &self.experiment_registrar.is_some())
-            .field("background_experiments", &self.background_experiments);
+            .field("config_manager", &self.context.config_manager.is_some())
+            .field("kernel_budget", &self.context.kernel_budget)
+            .field("subagent_control", &self.context.subagent_control.is_some())
+            .field("experiment", &self.context.experiment.is_some())
+            .field(
+                "experiment_progress",
+                &self.context.experiment_progress.is_some(),
+            )
+            .field(
+                "experiment_registrar",
+                &self.context.experiment_registrar.is_some(),
+            )
+            .field(
+                "background_experiments",
+                &self.context.background_experiments,
+            );
         #[cfg(feature = "improvement")]
-        debug.field("improvement", &self.improvement.is_some());
+        debug.field("improvement", &self.context.improvement.is_some());
         debug.finish()
     }
 }
@@ -1522,534 +635,20 @@ async fn collect_ordered_results(
     Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
-pub fn fawx_tool_definitions(
-    include_subagent_tools: bool,
-    include_experiment_tool: bool,
-) -> Vec<ToolDefinition> {
-    let mut definitions = vec![
-        ToolDefinition {
-            name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from disk. Supports `~` to reference the home directory."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Line number to start reading from (1-indexed)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of lines to return"
-                    }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "write_file".to_string(),
-            description: "Write UTF-8 content to a file on disk. Supports `~` to reference the home directory."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolDefinition {
-            name: "edit_file".to_string(),
-            description: "Replace exact text in a file. The old_text must match exactly (including whitespace and newlines). Use for precise, surgical edits."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "old_text": { "type": "string" },
-                    "new_text": { "type": "string" }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_directory".to_string(),
-            description:
-                "List files and directories, optionally recursively. Supports `~` to reference the home directory."
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "recursive": { "type": "boolean" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "run_command".to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
-                    "shell": { "type": "boolean" }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "exec_background".to_string(),
-            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "working_dir": { "type": "string" },
-                    "label": { "type": "string" }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "exec_status".to_string(),
-            description: "Check one background process or list all background processes.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "tail": { "type": "integer" }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "exec_kill".to_string(),
-            description: "Kill a background process by session ID.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "search_text".to_string(),
-            description:
-                "Search text in files and return file:line matches. Supports `~` to reference the home directory."
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "file_glob": { "type": "string" }
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDefinition {
-            name: "self_info".to_string(),
-            description:
-                "Inspect runtime state: active model, loaded skills, configuration, and version"
-                    .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "section": {
-                        "type": "string",
-                        "enum": ["model", "skills", "config", "all"],
-                        "description": "Filter to a specific section. Defaults to 'all'."
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current date, time, timezone, and Unix epoch timestamp"
-                .to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        },
-    ];
-    if include_experiment_tool {
-        definitions.insert(0, run_experiment_tool_definition());
-    }
-    if include_subagent_tools {
-        definitions.extend(subagent_tool_definitions());
-    }
-    definitions
-}
-
-fn subagent_tool_definitions() -> Vec<ToolDefinition> {
-    vec![spawn_agent_definition(), subagent_status_definition()]
-}
-
-fn spawn_agent_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "spawn_agent".to_string(),
-        description:
-            "Spawn an isolated subagent to handle a task. Returns a subagent ID for monitoring."
-                .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The task or prompt for the subagent"
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Human-readable label for identification"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["run", "session"],
-                    "description": "run = one-shot (default), session = persistent"
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "description": "Maximum execution time in seconds (default: 600)"
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the subagent"
-                }
-            },
-            "required": ["task"]
-        }),
-    }
-}
-
-fn subagent_status_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "subagent_status".to_string(),
-        description: "Check status of a subagent, list all subagents, or cancel one.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["status", "list", "cancel", "send"],
-                    "description": "Action to perform"
-                },
-                "id": {
-                    "type": "string",
-                    "description": "Subagent ID (required for status/cancel/send)"
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Message to send (required for send action)"
-                }
-            },
-            "required": ["action"]
-        }),
-    }
-}
-
-fn serialize_output(value: serde_json::Value) -> Result<String, String> {
-    serde_json::to_string(&value).map_err(|error| error.to_string())
-}
-
-fn exec_spawn_value(result: SpawnResult) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": result.session_id,
-        "pid": result.pid,
-        "label": result.label,
-        "status": result.status,
-    })
-}
-
-fn exec_status_value(status: StatusResult) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": status.session_id,
-        "label": status.label,
-        "working_dir": status.working_dir,
-        "status": status.status.name(),
-        "exit_code": status.status.exit_code(),
-        "runtime_seconds": status.runtime_seconds,
-        "output_lines": status.output_lines,
-        "tail": status.tail,
-    })
-}
-
-fn exec_list_value(processes: Vec<ListEntry>) -> serde_json::Value {
-    let items = processes
-        .into_iter()
-        .map(exec_list_entry_value)
-        .collect::<Vec<_>>();
-    serde_json::json!({ "processes": items })
-}
-
-fn exec_list_entry_value(entry: ListEntry) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": entry.session_id,
-        "label": entry.label,
-        "working_dir": entry.working_dir,
-        "status": entry.status.name(),
-        "exit_code": entry.status.exit_code(),
-        "runtime_seconds": entry.runtime_seconds,
-        "output_lines": entry.output_lines,
-    })
-}
-
-fn spawned_handle_value(handle: &SubagentHandle) -> serde_json::Value {
-    serde_json::json!({
-        "id": handle.id.0.clone(),
-        "label": handle.label.clone(),
-        "mode": spawn_mode_name(&handle.mode),
-        "status": subagent_status_value(&handle.status),
-        "initial_response": handle.initial_response.clone(),
-    })
-}
-
-fn subagent_status_value(status: &SubagentStatus) -> serde_json::Value {
-    match status {
-        SubagentStatus::Running => serde_json::json!({ "state": "running" }),
-        SubagentStatus::Completed {
-            result,
-            tokens_used,
-        } => serde_json::json!({
-            "state": "completed",
-            "result": result,
-            "tokens_used": tokens_used,
-        }),
-        SubagentStatus::Failed { error } => {
-            serde_json::json!({ "state": "failed", "error": error })
-        }
-        SubagentStatus::Cancelled => serde_json::json!({ "state": "cancelled" }),
-        SubagentStatus::TimedOut => serde_json::json!({ "state": "timed_out" }),
-    }
-}
-
-fn spawn_mode_name(mode: &SpawnMode) -> &'static str {
-    match mode {
-        SpawnMode::Run => "run",
-        SpawnMode::Session => "session",
-    }
-}
-
-async fn list_subagents_output(
-    control: &Arc<dyn SubagentControl>,
-) -> Result<serde_json::Value, String> {
-    let handles = control.list().await.map_err(|error| error.to_string())?;
-    let subagents = handles.iter().map(spawned_handle_value).collect::<Vec<_>>();
-    Ok(serde_json::json!({ "subagents": subagents }))
-}
-
-async fn status_subagent_output(
-    control: &Arc<dyn SubagentControl>,
-    id: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let id = required_subagent_id(id, "status")?;
-    let handle = require_subagent_handle(control, &id).await?;
-    Ok(spawned_handle_value(&handle))
-}
-
-async fn cancel_subagent_output(
-    control: &Arc<dyn SubagentControl>,
-    id: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let id = required_subagent_id(id, "cancel")?;
-    control
-        .cancel(&id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let handle = require_subagent_handle(control, &id).await?;
-    Ok(spawned_handle_value(&handle))
-}
-
-async fn send_subagent_output(
-    control: &Arc<dyn SubagentControl>,
-    id: Option<String>,
-    message: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let id = required_subagent_id(id, "send")?;
-    let message = required_send_message(message)?;
-    let response = control
-        .send(&id, &message)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(serde_json::json!({
-        "id": id.0,
-        "response": response,
-    }))
-}
-
-fn required_subagent_id(id: Option<String>, action: &str) -> Result<SubagentId, String> {
-    let id = id.ok_or_else(|| format!("id is required for '{action}' action"))?;
-    if id.trim().is_empty() {
-        return Err(format!("id is required for '{action}' action"));
-    }
-    Ok(SubagentId(id))
-}
-
-fn required_send_message(message: Option<String>) -> Result<String, String> {
-    let message = message.ok_or_else(|| "message is required for 'send' action".to_string())?;
-    if message.trim().is_empty() {
-        return Err("message is required for 'send' action".to_string());
-    }
-    Ok(message)
-}
-
-async fn require_subagent_handle(
-    control: &Arc<dyn SubagentControl>,
-    id: &SubagentId,
-) -> Result<SubagentHandle, String> {
-    control
-        .list()
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|handle| &handle.id == id)
-        .ok_or_else(|| format!("subagent '{id}' not found"))
-}
-
-fn parse_subagent_action(action: &str) -> Result<SubagentAction, String> {
-    match action {
-        "status" => Ok(SubagentAction::Status),
-        "list" => Ok(SubagentAction::List),
-        "cancel" => Ok(SubagentAction::Cancel),
-        "send" => Ok(SubagentAction::Send),
-        other => Err(format!(
-            "unknown subagent action '{other}', valid actions: status, list, cancel, send"
-        )),
-    }
-}
-
-pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "memory_write".to_string(),
-            description: "Store a fact in persistent memory. Use for user preferences, project context, important decisions, or anything worth remembering across sessions."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["key", "value"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_read".to_string(),
-            description: "Retrieve a stored fact from persistent memory.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string" }
-                },
-                "required": ["key"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_list".to_string(),
-            description: "List all stored memory keys with value previews."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "memory_delete".to_string(),
-            description: "Remove a stored fact from persistent memory.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string" }
-                },
-                "required": ["key"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_search".to_string(),
-            description: "Search agent memory by meaning. Finds semantically related memories even without exact keyword matches."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language search query"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum results to return (default: 5)"
-                    }
-                },
-                "required": ["query"]
-            }),
-        },
-    ]
-}
-
-fn format_memory_list(entries: &[(String, String)]) -> String {
-    entries
-        .iter()
-        .map(|(k, v)| {
-            let preview = truncate_preview(v, 80);
-            format!("- {k}: {preview}")
-        })
-        .collect::<Vec<_>>()
-        .join(
-            "
-",
-        )
-}
-
-struct MemorySearchResult {
-    key: String,
-    value: String,
-    score: Option<f32>,
-}
-
-fn format_memory_search_results(query: &str, results: &[MemorySearchResult]) -> String {
-    if results.is_empty() {
-        return format!("No relevant memories found for: {query}");
-    }
-
-    let items = results
-        .iter()
-        .enumerate()
-        .map(|(index, result)| format_memory_search_item(index + 1, result))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("Found {} relevant memories:\n\n{items}", results.len())
-}
-
-fn format_memory_search_item(index: usize, result: &MemorySearchResult) -> String {
-    let header = match result.score {
-        Some(score) => format!("{index}. [{}] (score: {score:.2})", result.key),
-        None => format!("{index}. [{}]", result.key),
-    };
-    let value = indent_memory_value(&result.value);
-    format!("{header}\n{value}")
-}
-
-fn indent_memory_value(value: &str) -> String {
-    value
-        .lines()
-        .map(|line| format!("   {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn truncate_preview(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        return value.to_string();
-    }
-    let mut end = max_len;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &value[..end])
+fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
+    let mut registry = ToolRegistry::default();
+    experiment::register_tools(&mut registry, context);
+    filesystem::register_tools(&mut registry, context);
+    shell::register_tools(&mut registry, context);
+    process::register_tools(&mut registry, context);
+    runtime::register_tools(&mut registry, context);
+    subagent::register_tools(&mut registry, context);
+    memory::register_tools(&mut registry, context);
+    config::register_tools(&mut registry, context);
+    node::register_tools(&mut registry, context);
+    #[cfg(feature = "improvement")]
+    improvement::register_tools(&mut registry, context);
+    registry
 }
 
 pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
@@ -2119,239 +718,8 @@ fn to_tool_result(
     }
 }
 
-fn entry_kind(path: &Path) -> Result<&'static str, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    let kind = if metadata.file_type().is_dir() {
-        "dir"
-    } else if metadata.file_type().is_symlink() {
-        "symlink"
-    } else {
-        "file"
-    };
-    Ok(kind)
-}
-
-fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Command, String> {
-    if shell {
-        let mut built = Command::new("/bin/sh");
-        built.kill_on_drop(true);
-        built.arg("-c").arg(command).current_dir(working_dir);
-        return Ok(built);
-    }
-    let mut parts = command.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| "command cannot be empty".to_string())?;
-    let mut built = Command::new(program);
-    built.kill_on_drop(true);
-    built.args(parts).current_dir(working_dir);
-    Ok(built)
-}
-
-async fn wait_with_timeout(
-    child: tokio::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    match waited {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("command timed out".to_string()),
-    }
-}
-
-fn format_command_output(output: std::process::Output, shell: bool) -> String {
-    let mut lines = vec![format!("exit_code: {}", output.status.code().unwrap_or(-1))];
-    if shell {
-        lines.push("warning: command executed via shell=true".to_string());
-    }
-    lines.push(format!(
-        "stdout:\n{}",
-        String::from_utf8_lossy(&output.stdout)
-    ));
-    lines.push(format!(
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    ));
-    lines.join("\n")
-}
-
-fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
-    let Some(pattern) = file_glob else {
-        return true;
-    };
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    simple_glob_match(name, pattern)
-}
-
-/// Directories that should never be searched — build artifacts, VCS, dependencies.
-fn is_builtin_ignored_directory(name: &str) -> bool {
-    matches!(
-        name,
-        "target"
-            | ".git"
-            | "node_modules"
-            | ".build"
-            | "build"
-            | ".gradle"
-            | "__pycache__"
-            | ".mypy_cache"
-            | ".pytest_cache"
-            | "dist"
-            | ".next"
-            | ".turbo"
-    )
-}
-
-fn simple_glob_match(name: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return name == pattern;
-    }
-    let parts = pattern.split('*').collect::<Vec<_>>();
-    if parts.len() == 2 {
-        return name.starts_with(parts[0]) && name.ends_with(parts[1]);
-    }
-    name.contains(&pattern.replace('*', ""))
-}
-
-fn day_of_week_from_epoch(epoch: u64) -> &'static str {
-    let days_since_epoch = (epoch / 86_400) as i64;
-    let weekday_index = (days_since_epoch + 4).rem_euclid(7);
-    match weekday_index {
-        0 => "Sunday",
-        1 => "Monday",
-        2 => "Tuesday",
-        3 => "Wednesday",
-        4 => "Thursday",
-        5 => "Friday",
-        _ => "Saturday",
-    }
-}
-
-fn iso8601_utc_from_epoch(epoch: u64) -> String {
-    let days_since_epoch = (epoch / 86_400) as i64;
-    let seconds_of_day = epoch % 86_400;
-    let (year, month, day) = civil_from_days(days_since_epoch);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year, month as u32, day as u32)
-}
-
 fn parse_args<T: for<'de> Deserialize<'de>>(value: &serde_json::Value) -> Result<T, String> {
     serde_json::from_value(value.clone()).map_err(|error| error.to_string())
-}
-
-#[derive(Deserialize)]
-struct ReadFileArgs {
-    path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct WriteFileArgs {
-    path: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct EditFileArgs {
-    path: String,
-    old_text: String,
-    new_text: String,
-}
-
-#[derive(Deserialize)]
-struct ListDirectoryArgs {
-    path: String,
-    recursive: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct RunCommandArgs {
-    command: String,
-    working_dir: Option<String>,
-    shell: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct ExecBackgroundArgs {
-    command: String,
-    working_dir: Option<String>,
-    label: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ExecStatusArgs {
-    session_id: Option<String>,
-    tail: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct ExecKillArgs {
-    session_id: String,
-}
-
-#[derive(Deserialize)]
-struct SearchTextArgs {
-    pattern: String,
-    path: Option<String>,
-    file_glob: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SelfInfoArgs {
-    section: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct MemoryWriteArgs {
-    key: String,
-    value: String,
-}
-
-#[derive(Deserialize)]
-struct MemoryReadArgs {
-    key: String,
-}
-
-#[derive(Deserialize)]
-struct MemoryDeleteArgs {
-    key: String,
-}
-
-#[derive(Deserialize)]
-struct MemorySearchArgs {
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct ConfigGetArgs {
-    section: Option<String>,
 }
 
 /// Shared request type for config set — used by both the tool handler and
@@ -2360,12 +728,6 @@ struct ConfigGetArgs {
 pub struct ConfigSetRequest {
     pub key: String,
     pub value: String,
-}
-
-#[derive(Deserialize)]
-struct FawxRestartArgs {
-    reason: Option<String>,
-    delay_seconds: Option<u64>,
 }
 
 /// Maximum allowed restart delay in seconds. Prevents the agent from
@@ -2419,142 +781,6 @@ fn schedule_sighup_restart(delay_secs: u64, reason: String) -> Result<(), String
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct SpawnAgentArgs {
-    task: String,
-    label: Option<String>,
-    model: Option<String>,
-    mode: Option<String>,
-    timeout_seconds: Option<u64>,
-    cwd: Option<String>,
-}
-
-impl SpawnAgentArgs {
-    fn into_spawn_config(self) -> Result<SpawnConfig, String> {
-        reject_model_override(self.model.as_deref())?;
-        Ok(SpawnConfig {
-            label: self.label,
-            task: self.task,
-            model: None,
-            thinking: None,
-            mode: parse_spawn_mode(self.mode.as_deref())?,
-            timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(600)),
-            max_tokens: None,
-            cwd: self.cwd.map(PathBuf::from),
-            system_prompt: None,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct SubagentStatusArgs {
-    action: String,
-    id: Option<String>,
-    message: Option<String>,
-}
-
-enum SubagentAction {
-    Status,
-    List,
-    Cancel,
-    Send,
-}
-
-fn parse_spawn_mode(mode: Option<&str>) -> Result<SpawnMode, String> {
-    match mode.unwrap_or("run") {
-        "run" => Ok(SpawnMode::Run),
-        "session" => Ok(SpawnMode::Session),
-        other => Err(format!(
-            "unknown spawn mode '{other}', valid modes: run, session"
-        )),
-    }
-}
-
-fn reject_model_override(model: Option<&str>) -> Result<(), String> {
-    if model.is_some() {
-        return Err("model override is not supported for headless subagents".to_string());
-    }
-    Ok(())
-}
-
-pub fn config_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "config_get".to_string(),
-            description: "Read current Fawx configuration".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "section": {
-                        "type": "string",
-                        "description": "Config section (model, general, tools, memory, http, telegram, etc.) or 'all'"
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "config_set".to_string(),
-            description: "Update a configuration value. Validates before applying.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": {
-                        "type": "string",
-                        "description": "Dot-separated path (e.g. 'model.default_model')"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "New value"
-                    }
-                },
-                "required": ["key", "value"]
-            }),
-        },
-        ToolDefinition {
-            name: "fawx_status".to_string(),
-            description: "Get server status: uptime, model, memory entries".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "kernel_manifest".to_string(),
-            description: "Get a structured description of the kernel's current configuration, \
-                permissions, budget limits, sandbox rules, and available tools. Use this at the \
-                start of complex tasks to understand your capabilities and constraints before \
-                planning."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "fawx_restart".to_string(),
-            description: "Gracefully restart the Fawx server. Use after config changes."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Why restarting"
-                    },
-                    "delay_seconds": {
-                        "type": "integer",
-                        "description": "Delay before restart (default: 2)"
-                    }
-                },
-                "required": []
-            }),
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2593,12 +819,73 @@ mod tests {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
     }
 
+    fn executor_with_tool<T>(root: &Path, tool: T) -> FawxToolExecutor
+    where
+        T: Tool + 'static,
+    {
+        let mut executor = test_executor(root);
+        let mut registry = ToolRegistry::default();
+        registry.register(tool);
+        executor.tools = Arc::new(registry);
+        executor
+    }
+
     fn memory_executor(root: &Path) -> (FawxToolExecutor, Arc<Mutex<fx_memory::JsonFileMemory>>) {
         let memory = Arc::new(Mutex::new(
             fx_memory::JsonFileMemory::new(root).expect("memory"),
         ));
         let executor = test_executor(root).with_memory(memory.clone());
         (executor, memory)
+    }
+
+    struct MetadataOnlyTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MetadataOnlyTool {
+        fn name(&self) -> &'static str {
+            "metadata_probe"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "probe metadata ownership".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string" },
+                        "branch": { "type": "string" }
+                    },
+                    "required": ["repo", "branch"]
+                }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _cancel: Option<&CancellationToken>,
+        ) -> ToolResult {
+            ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: "ok".to_string(),
+            }
+        }
+
+        fn journal_action(&self, call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+            let repo = call.arguments.get("repo")?.as_str()?;
+            let branch = call.arguments.get("branch")?.as_str()?;
+            Some(JournalAction::GitBranchCreate {
+                repo: PathBuf::from(repo),
+                branch: branch.to_string(),
+            })
+        }
+
+        fn action_category(&self) -> &'static str {
+            "metadata_owned"
+        }
     }
 
     fn embedding_executor(
@@ -2631,14 +918,48 @@ mod tests {
                 description: Some("Built-in runtime tools".to_string()),
                 tool_names: vec!["read_file".to_string(), "self_info".to_string()],
                 capabilities: Vec::new(),
+                version: None,
+                source: None,
+                revision_hash: None,
+                manifest_hash: None,
+                activated_at_ms: None,
+                signature_status: None,
+                stale_source: None,
             }],
             config_summary: fx_core::runtime_info::ConfigSummary {
                 max_iterations: 6,
                 max_history: 128,
                 memory_enabled: true,
             },
+            authority: None,
             version: "0.1.0".to_string(),
         }))
+    }
+
+    fn sample_runtime_info_with_authority(model: &str) -> Arc<RwLock<RuntimeInfo>> {
+        let runtime = sample_runtime_info(model);
+        runtime.write().expect("runtime lock").authority =
+            Some(fx_core::runtime_info::AuthorityRuntimeInfo {
+                resolver: "unified".to_string(),
+                approval_scope: "classified_request_identity".to_string(),
+                path_policy_source: "self_modify_config".to_string(),
+                capability_mode_mutates_path_policy: false,
+                kernel_blind_enabled: true,
+                sovereign_boundary_enforced: true,
+                active_session_approvals: 1,
+                active_proposal_override: Some("proposal-1".to_string()),
+                recent_decisions: vec![fx_core::runtime_info::AuthorityDecisionInfo {
+                    tool_name: "write_file".to_string(),
+                    capability: "file_write".to_string(),
+                    effect: "write".to_string(),
+                    target_kind: "path".to_string(),
+                    domain: "project".to_string(),
+                    target_summary: "README.md".to_string(),
+                    verdict: "prompt".to_string(),
+                    reason: "approval required by permission policy".to_string(),
+                }],
+            });
+        runtime
     }
 
     fn parse_json_output(output: &str) -> serde_json::Value {
@@ -2701,6 +1022,21 @@ mod tests {
             router: Arc::new(ModelRouter::new()),
             config: FawxConfig::default(),
         }
+    }
+
+    fn tool_definitions(
+        include_subagent_tools: bool,
+        include_experiment_tool: bool,
+    ) -> Vec<ToolDefinition> {
+        let temp = TempDir::new().expect("temp");
+        let mut executor = test_executor(temp.path());
+        if include_experiment_tool {
+            executor = executor.with_experiment(experiment_state(temp.path()));
+        }
+        if include_subagent_tools {
+            executor = executor.with_subagent_control(Arc::new(StubSubagentControl::new()));
+        }
+        executor.tool_definitions()
     }
 
     #[test]
@@ -2797,6 +1133,27 @@ mod tests {
         let executor = test_executor(temp.path());
         let output = executor.handle_read_file(&serde_json::json!({"path": "../escape.txt"}));
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn read_file_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor.handle_read_file(&serde_json::json!({
+            "path": outside_file.to_string_lossy()
+        }));
+
+        assert_eq!(output.expect("read"), "secret");
     }
 
     #[cfg(unix)]
@@ -3030,6 +1387,30 @@ three
         let result =
             executor.handle_write_file(&serde_json::json!({"path": "../x.txt", "content": "no"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_file_respects_jail_even_when_outside_workspace_reads_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("x.txt");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let result = executor.handle_write_file(&serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "no"
+        }));
+
+        assert!(matches!(
+            result,
+            Err(message) if message.contains("path escapes working directory")
+        ));
     }
 
     #[test]
@@ -3299,7 +1680,7 @@ three
     }
 
     #[test]
-    fn edit_file_denied_by_self_modify() {
+    fn edit_file_does_not_self_enforce_authority_policy() {
         let temp = TempDir::new().expect("temp");
         fs::write(temp.path().join("secret.txt"), "alpha").expect("write");
         let config = SelfModifyConfig {
@@ -3310,18 +1691,22 @@ three
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_self_modify(config);
 
-        let error = executor
+        let result = executor
             .handle_edit_file(&serde_json::json!({
                 "path": "secret.txt",
                 "old_text": "alpha",
                 "new_text": "beta"
             }))
-            .expect_err("edit should fail");
-        assert!(error.contains("Self-modify policy violation [deny]"));
+            .expect("edit should succeed");
+        assert!(result.contains("Successfully edited"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("secret.txt")).expect("read"),
+            "beta"
+        );
     }
 
     #[test]
-    fn edit_file_propose_tier_creates_proposal_without_modifying_target() {
+    fn edit_file_does_not_create_proposal_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -3347,14 +1732,14 @@ three
                 "old_text": "old",
                 "new_text": "new"
             }))
-            .expect("proposal");
-        assert!(message.contains("Proposal created"));
+            .expect("edit should succeed");
+        assert!(message.contains("Successfully edited"));
         assert_eq!(
             fs::read_to_string(kernel_dir.join("loop.rs")).expect("read"),
-            "fn old() {}
+            "fn new() {}
 "
         );
-        assert!(proposals_dir.exists());
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
@@ -3385,6 +1770,30 @@ three
         let executor = test_executor(temp.path());
         let output = executor.handle_list_directory(&serde_json::json!({"path": "../"}));
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn list_directory_allows_absolute_outside_workspace_when_enabled() {
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_dir = outside.path().join("secret-dir");
+        fs::create_dir_all(&outside_dir).expect("mkdir");
+        fs::write(outside_dir.join("secret.txt"), "secret").expect("write");
+        let executor = FawxToolExecutor::new(
+            jail.path().to_path_buf(),
+            ToolConfig {
+                allow_outside_workspace_reads: true,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_list_directory(&serde_json::json!({
+                "path": outside_dir.to_string_lossy()
+            }))
+            .expect("list");
+
+        assert!(output.contains("[file] secret.txt"));
     }
 
     #[test]
@@ -3886,12 +2295,12 @@ three
 
     #[test]
     fn run_experiment_definition_only_appears_when_enabled() {
-        let without_experiment = fawx_tool_definitions(false, false);
+        let without_experiment = tool_definitions(false, false);
         assert!(!without_experiment
             .iter()
             .any(|tool| tool.name == "run_experiment"));
 
-        let with_experiment = fawx_tool_definitions(false, true);
+        let with_experiment = tool_definitions(false, true);
         assert!(with_experiment
             .iter()
             .any(|tool| tool.name == "run_experiment"));
@@ -3972,19 +2381,19 @@ three
 
     #[test]
     fn current_time_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
     #[test]
     fn edit_file_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]
     fn background_process_tools_appear_in_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions
             .iter()
             .any(|tool| tool.name == "exec_background"));
@@ -3994,7 +2403,7 @@ three
 
     #[test]
     fn read_file_definition_exposes_offset_and_limit() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         let read_file = definitions
             .iter()
             .find(|tool| tool.name == "read_file")
@@ -4064,6 +2473,284 @@ three
             executor.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn action_category_uses_registered_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = memory_executor(temp.path()).0;
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "memory_search".to_string(),
+            arguments: serde_json::json!({"query": "preferences"}),
+        };
+
+        assert_eq!(executor.action_category(&call), "tool_call");
+    }
+
+    #[test]
+    fn action_category_uses_custom_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_tool(temp.path(), MetadataOnlyTool);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "metadata_probe".to_string(),
+            arguments: serde_json::json!({
+                "repo": ".",
+                "branch": "feature/custom-metadata"
+            }),
+        };
+
+        assert_eq!(executor.action_category(&call), "metadata_owned");
+    }
+
+    #[test]
+    fn journal_action_uses_registered_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello"
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("file write action");
+
+        assert!(matches!(
+            action,
+            JournalAction::FileWrite {
+                path,
+                size_bytes: 5,
+                created: false,
+                ..
+            } if path == Path::new("notes.txt")
+        ));
+    }
+
+    #[test]
+    fn journal_action_uses_custom_tool_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_tool(temp.path(), MetadataOnlyTool);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "metadata_probe".to_string(),
+            arguments: serde_json::json!({
+                "repo": ".",
+                "branch": "feature/custom-metadata"
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        let action = executor
+            .journal_action(&call, &result)
+            .expect("metadata-owned journal action");
+
+        assert!(matches!(
+            action,
+            JournalAction::GitBranchCreate { repo, branch }
+            if repo == Path::new(".") && branch == "feature/custom-metadata"
+        ));
+    }
+
+    #[test]
+    fn classify_call_treats_read_only_run_command_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep -rn \"kv_get\" ./skills | head -20",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_mutating_run_command_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "cd ~/fawx && cargo run -- skill create x-post",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_redirected_echo_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "echo hello > notes.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_grep_gt_pattern_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "grep \"error > warning\" log.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_jq_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "jq '.items[] | select(.value > 5)' report.json",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_quoted_awk_comparison_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "awk '$1 > 100' metrics.txt",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_ps_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "ps aux",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_noninteractive_top_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "top -l 1",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Observation
+        );
+    }
+
+    #[test]
+    fn route_sub_goal_call_rejects_tools_with_required_arguments() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Scaffold the skill".to_string(),
+            required_tools: vec!["run_command".to_string()],
+        };
+
+        assert!(
+            executor
+                .route_sub_goal_call(&request, "decompose-gate-0")
+                .is_none(),
+            "run_command should not be direct-routed without a declared materializer"
+        );
+    }
+
+    #[test]
+    fn route_sub_goal_call_allows_zero_argument_tools() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let request = fx_kernel::act::SubGoalToolRoutingRequest {
+            description: "Check the clock".to_string(),
+            required_tools: vec!["current_time".to_string()],
+        };
+
+        let call = executor
+            .route_sub_goal_call(&request, "decompose-gate-0")
+            .expect("current_time should be routable");
+        assert_eq!(call.name, "current_time");
+        assert_eq!(call.arguments, serde_json::json!({}));
     }
 
     #[test]
@@ -4215,7 +2902,10 @@ three
 
     #[test]
     fn spawn_agent_schema_omits_model_override() {
-        let definition = spawn_agent_definition();
+        let definition = tool_definitions(true, false)
+            .into_iter()
+            .find(|tool| tool.name == "spawn_agent")
+            .expect("spawn_agent definition");
         let properties = definition.parameters["properties"]
             .as_object()
             .expect("spawn properties object");
@@ -4330,7 +3020,7 @@ three
 
     #[test]
     fn self_info_appears_in_tool_definitions() {
-        let definitions = fawx_tool_definitions(false, false);
+        let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "self_info"));
     }
 
@@ -4830,7 +3520,7 @@ three
     }
 
     #[test]
-    fn write_file_denied_by_self_modify() {
+    fn write_file_does_not_self_enforce_authority_policy() {
         let temp = TempDir::new().expect("temp");
         let config = SelfModifyConfig {
             enabled: true,
@@ -4841,14 +3531,15 @@ three
             .with_self_modify(config);
         let result = executor
             .handle_write_file(&serde_json::json!({"path": "secret.txt", "content": "data"}));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Self-modify policy violation [deny]"));
+        assert!(result.is_ok());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("secret.txt")).expect("read"),
+            "data"
+        );
     }
 
     #[test]
-    fn write_file_propose_tier_creates_markdown_and_sidecar() {
+    fn write_file_does_not_create_proposal_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -4864,26 +3555,17 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn tick() {}"}),
             )
-            .expect("propose tier should create proposal");
-        assert!(message.contains("Proposal created"));
-        assert!(message.contains("NOT modified"));
-        assert!(proposals_dir.exists());
-
-        let proposal_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
-            .expect("markdown proposal");
-        let content = fs::read_to_string(&proposal_path).expect("read proposal");
-        assert!(content.contains("# Proposal:"));
-        assert!(content.contains("fn tick() {}"));
-        assert!(content.contains("kernel/loop.rs") || content.contains("loop.rs"));
-        assert!(proposal_path.with_extension("json").exists());
+            .expect("write should succeed");
+        assert!(message.contains("wrote"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("kernel/loop.rs")).expect("read"),
+            "fn tick() {}"
+        );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
-    fn write_file_propose_tier_includes_original_in_proposal() {
+    fn write_file_updates_target_instead_of_writing_proposal_payload() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -4901,34 +3583,16 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
             )
-            .expect("propose should succeed");
-        let proposal_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .next()
-            .expect("entry")
-            .expect("entry read")
-            .path();
-        let proposal = fs::read_to_string(proposal_path).expect("read proposal");
-        assert!(
-            proposal.contains("fn old() {}"),
-            "missing original: {proposal}"
+            .expect("write should succeed");
+        assert_eq!(
+            fs::read_to_string(kernel_dir.join("loop.rs")).expect("read target"),
+            "fn new() {}"
         );
-        assert!(
-            proposal.contains("fn new() {}"),
-            "missing proposed: {proposal}"
-        );
-        assert!(
-            proposal.contains("original"),
-            "missing original label: {proposal}"
-        );
-        assert!(
-            proposal.contains("proposed"),
-            "missing proposed label: {proposal}"
-        );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
-    fn write_file_propose_tier_records_target_hash_in_sidecar() {
+    fn write_file_does_not_emit_sidecar_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -4948,34 +3612,23 @@ three
             .handle_write_file(
                 &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
             )
-            .expect("propose should succeed");
+            .expect("write should succeed");
 
-        let sidecar_path = fs::read_dir(&proposals_dir)
-            .expect("read proposals")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .expect("sidecar proposal");
-        let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar");
-        let value: serde_json::Value = serde_json::from_str(&sidecar).expect("parse sidecar");
-
+        assert!(!proposals_dir.exists());
         assert_eq!(
-            value["file_hash_at_creation"],
-            serde_json::Value::String(format!(
-                "sha256:{}",
-                fx_propose::sha256_hex(b"fn old() {}\n")
-            ))
+            fs::read_to_string(&target).expect("read target"),
+            "fn new() {}"
         );
     }
 
     #[test]
-    fn write_file_propose_tier_does_not_modify_target() {
+    fn write_file_updates_target_without_kernel_gate() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
             enabled: true,
             propose_paths: vec!["kernel/**".to_string()],
-            proposals_dir,
+            proposals_dir: proposals_dir.clone(),
             ..SelfModifyConfig::default()
         };
 
@@ -4993,9 +3646,10 @@ three
 
         let actual = fs::read_to_string(kernel_dir.join("loop.rs")).expect("read target");
         assert_eq!(
-            actual, "original content",
-            "target file should NOT be modified"
+            actual, "new content",
+            "target file should be updated directly when no kernel gate is present"
         );
+        assert!(!proposals_dir.exists());
     }
 
     #[test]
@@ -5206,38 +3860,6 @@ three
     }
 
     #[test]
-    fn expand_tilde_with_home() {
-        let result = expand_tilde("~/foo");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home.join("foo"));
-    }
-
-    #[test]
-    fn expand_tilde_bare() {
-        let result = expand_tilde("~");
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        assert_eq!(result, home);
-    }
-
-    #[test]
-    fn expand_tilde_no_tilde() {
-        let result = expand_tilde("/absolute/path");
-        assert_eq!(result, PathBuf::from("/absolute/path"));
-    }
-
-    #[test]
-    fn expand_tilde_relative() {
-        let result = expand_tilde("relative/path");
-        assert_eq!(result, PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn expand_tilde_other_user_not_expanded() {
-        let result = expand_tilde("~otheruser/foo");
-        assert_eq!(result, PathBuf::from("~otheruser/foo"));
-    }
-
-    #[test]
     fn tilde_expansion_respects_jail() {
         let jail = TempDir::new().expect("jail");
         let executor = test_executor(jail.path());
@@ -5397,6 +4019,25 @@ three
         assert_eq!(json["skills_loaded"], 1);
     }
 
+    #[test]
+    fn fawx_status_includes_authority_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec =
+            test_executor(temp.path()).with_runtime_info(sample_runtime_info_with_authority("m"));
+        let result = exec.handle_fawx_status().expect("status");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+
+        assert_eq!(json["authority"]["resolver"], "unified");
+        assert_eq!(
+            json["authority"]["approval_scope"],
+            "classified_request_identity"
+        );
+        assert_eq!(
+            json["authority"]["recent_decisions"][0]["verdict"],
+            "prompt"
+        );
+    }
+
     // ── kernel_manifest tests ─────────────────────────────────────────
 
     #[test]
@@ -5416,6 +4057,30 @@ three
         assert!(json["budget"]["max_llm_calls"].is_number());
         assert!(json.get("tripwire").is_none(), "must not expose tripwires");
         assert!(json.get("ripcord").is_none(), "must not expose ripcord");
+    }
+
+    #[test]
+    fn kernel_manifest_includes_authority_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = FawxConfig::default();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+        let manager = fx_config::manager::ConfigManager::from_config(config, config_path);
+        let exec = test_executor(temp.path())
+            .with_runtime_info(sample_runtime_info_with_authority("gpt-5.4"))
+            .with_config_manager(Arc::new(Mutex::new(manager)));
+        let result = exec.handle_kernel_manifest().expect("manifest");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+
+        assert_eq!(json["authority"]["resolver"], "unified");
+        assert_eq!(
+            json["authority"]["path_policy_source"],
+            "self_modify_config"
+        );
+        assert_eq!(
+            json["authority"]["recent_decisions"][0]["tool_name"],
+            "write_file"
+        );
     }
 
     #[test]

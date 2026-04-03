@@ -305,7 +305,7 @@ pub fn execute_command<H: CommandHost>(
             Some(ctx.app.handle_thinking(level.as_deref()).map(response))
         }
         ParsedCommand::Config(action) => Some(execute_config(ctx.app, action.as_deref())),
-        ParsedCommand::Help => Some(Ok(response(help_text().to_string()))),
+        ParsedCommand::Help => Some(Ok(response(help_text()))),
         ParsedCommand::Quit => None,
         ParsedCommand::Unknown(command) => Some(Ok(response(unknown_command_message(command)))),
     }
@@ -463,46 +463,51 @@ pub(crate) fn apply_thinking_budget(
     Ok(format!("Thinking budget set to: {budget}"))
 }
 
-pub fn help_text() -> &'static str {
-    concat!(
-        "Commands\n",
-        "  /model         List models and switch active model\n",
-        "  /model <name>  Switch to a specific model\n",
-        "  /auth          Show credential status + auth help\n",
-        "  /auth <provider> set-token <TOKEN>\n",
-        "                 Save API key or PAT for a provider\n",
-        "  /keys          Manage WASM signing keys\n",
-        "  /keys generate [--force]\n",
-        "  /keys list     List trusted public keys\n",
-        "  /keys trust <path>\n",
-        "  /keys revoke <fingerprint>\n",
-        "  /sign <skill>   Sign one WASM skill\n",
-        "  /sign --all     Sign all installed WASM skills\n",
-        "  /skills         List installed skills\n",
-        "  /install <name> Install a skill from the marketplace\n",
-        "  /search [query] Search the skill marketplace\n",
-        "  /status         Show model, tokens, budget summary\n",
-        "  /budget        Show detailed budget usage\n",
-        "  /loop          Show loop iteration details\n",
-        "  /signals       Show condensed signal summary for last turn\n",
-        "  /debug         Show full signal dump for last turn\n",
-        "  /analyze       Analyze persisted signals across sessions\n",
-        "  /improve       Run self-improvement cycle\n",
-        "  /proposals     List pending self-modification proposals\n",
-        "  /proposals <id> Show a proposal diff preview\n",
-        "  /approve       Apply a pending proposal (/approve <id> [--force])\n",
-        "  /reject        Archive a pending proposal (/reject <id>)\n",
-        "  /synthesis     Set or reset synthesis instruction\n",
-        "  /thinking      Show or set thinking budget (high|low|adaptive|off)\n",
-        "  /clear         Clear the screen and active conversation\n",
-        "  /new           Start a new conversation\n",
-        "  /history       List saved conversations\n",
-        "  /config        Show loaded config values\n",
-        "  /config init   Create ~/.fawx/config.toml template\n",
-        "  /config reload Reload config.toml without restarting\n",
-        "  /help          Show this help\n",
-        "  /quit          Exit"
-    )
+pub fn help_text() -> String {
+    let mut lines = vec![
+        "Commands",
+        "  /model         List models and switch active model",
+        "  /model <name>  Switch to a specific model",
+        "  /auth          Show credential status + auth help",
+        "  /auth <provider> set-token <TOKEN>",
+        "                 Save API key or PAT for a provider",
+        "  /keys          Manage WASM signing keys",
+        "  /keys generate [--force]",
+        "  /keys list     List trusted public keys",
+        "  /keys trust <path>",
+        "  /keys revoke <fingerprint>",
+    ];
+    lines.extend(crate::commands::skill_sign::slash_help_lines());
+    lines.extend([
+        "  /skills         Inspect local build/install state",
+        "                 Local dev: fawx skill build <project>",
+        "                 Prebuilt:  fawx skill install <path>",
+        "                 Repo skills: skills/build.sh --install",
+        "  /install <name> Install a skill from the marketplace",
+        "  /search [query] Search the skill marketplace",
+        "  /status         Show model, tokens, budget summary",
+        "  /budget        Show detailed budget usage",
+        "  /loop          Show loop iteration details",
+        "  /signals       Show condensed signal summary for last turn",
+        "  /debug         Show full signal dump for last turn",
+        "  /analyze       Analyze persisted signals across sessions",
+        "  /improve       Run self-improvement cycle",
+        "  /proposals     List pending self-modification proposals",
+        "  /proposals <id> Show a proposal diff preview",
+        "  /approve       Apply a pending proposal (/approve <id> [--force])",
+        "  /reject        Archive a pending proposal (/reject <id>)",
+        "  /synthesis     Set or reset synthesis instruction",
+        "  /thinking      Show or set thinking budget (high|low|adaptive|off)",
+        "  /clear         Clear the screen and active conversation",
+        "  /new           Start a new conversation",
+        "  /history       List saved conversations",
+        "  /config        Show loaded config values",
+        "  /config init   Create ~/.fawx/config.toml template",
+        "  /config reload Reload config.toml without restarting",
+        "  /help          Show this help",
+        "  /quit          Exit",
+    ]);
+    lines.join("\n")
 }
 
 fn parse_auth_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
@@ -726,9 +731,11 @@ mod tests {
         skills: String,
         installed_skill: String,
         search_results: String,
+        sign_response: String,
         last_model: Option<String>,
         last_installed_skill: RefCell<Option<String>>,
         last_search_query: RefCell<Option<String>>,
+        last_sign_request: RefCell<Option<(Option<String>, bool)>>,
         thinking_level: Option<String>,
     }
 
@@ -791,6 +798,12 @@ mod tests {
         fn handle_thinking(&mut self, level: Option<&str>) -> Result<String> {
             self.thinking_level = level.map(ToString::to_string);
             Ok(self.thinking.clone())
+        }
+
+        fn handle_sign(&self, target: Option<&str>, has_extra_args: bool) -> Result<String> {
+            self.last_sign_request
+                .replace(Some((target.map(ToString::to_string), has_extra_args)));
+            Ok(self.sign_response.clone())
         }
 
         fn list_skills(&self) -> Result<String> {
@@ -969,6 +982,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_sign_command_with_skill_and_all() {
+        assert_eq!(
+            parse_command("/sign weather"),
+            ParsedCommand::Sign {
+                target: Some("weather".to_string()),
+                has_extra_args: false,
+            }
+        );
+        assert_eq!(
+            parse_command("/sign --all"),
+            ParsedCommand::Sign {
+                target: Some("--all".to_string()),
+                has_extra_args: false,
+            }
+        );
+    }
+
+    #[test]
     fn parse_proposals_accepts_optional_id() {
         assert_eq!(
             parse_command("/proposals"),
@@ -1129,6 +1160,51 @@ mod tests {
 
         assert_eq!(result.response, "Search results");
         assert_eq!(host.last_search_query.borrow().as_deref(), Some("weather"));
+    }
+
+    #[test]
+    fn execute_sign_command_routes_target_and_flags() {
+        let mut host = StubHost {
+            sign_response: "Signed skill 'weather'".to_string(),
+            ..StubHost::default()
+        };
+        let result = {
+            let mut context = CommandContext { app: &mut host };
+            execute_command(
+                &mut context,
+                &ParsedCommand::Sign {
+                    target: Some("weather".to_string()),
+                    has_extra_args: false,
+                },
+            )
+            .expect("server-side")
+            .expect("ok")
+        };
+
+        assert_eq!(result.response, "Signed skill 'weather'");
+        assert_eq!(
+            host.last_sign_request.borrow().as_ref(),
+            Some(&(Some("weather".to_string()), false))
+        );
+    }
+
+    #[test]
+    fn help_text_lists_sign_surface_once_with_all_option() {
+        let help = help_text();
+
+        assert!(help.contains("/sign <skill>"));
+        assert!(help.contains("/sign --all"));
+        assert_eq!(help.matches("/sign ").count(), 2);
+    }
+
+    #[test]
+    fn help_text_documents_skill_workflow_split() {
+        let help = help_text();
+
+        assert!(help.contains("/skills         Inspect local build/install state"));
+        assert!(help.contains("Local dev: fawx skill build <project>"));
+        assert!(help.contains("Prebuilt:  fawx skill install <path>"));
+        assert!(help.contains("Repo skills: skills/build.sh --install"));
     }
 
     #[test]

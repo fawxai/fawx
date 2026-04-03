@@ -5,6 +5,9 @@ use fx_decompose::{ComplexityHint, SubGoal};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+#[cfg(test)]
+use fx_decompose::SubGoalContract;
+
 /// Budget state for soft-ceiling awareness.
 ///
 /// Only two states. `Exhausted` is already handled by the existing
@@ -187,6 +190,17 @@ pub struct TerminationConfig {
     /// stripped, forcing a text response.
     #[serde(default = "default_tool_round_strip_after_nudge")]
     pub tool_round_strip_after_nudge: u16,
+
+    /// Consecutive observation-only tool rounds before injecting a targeted
+    /// nudge telling the agent to stop researching and either implement or
+    /// return an incomplete response.
+    #[serde(default = "default_observation_only_round_nudge_after")]
+    pub observation_only_round_nudge_after: u16,
+
+    /// Additional observation-only rounds after the targeted nudge before the
+    /// loop strips observation-only tools, leaving only side-effecting tools.
+    #[serde(default = "default_observation_only_round_strip_after_nudge")]
+    pub observation_only_round_strip_after_nudge: u16,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -204,6 +218,12 @@ fn default_tool_round_nudge_after() -> u16 {
 fn default_tool_round_strip_after_nudge() -> u16 {
     2
 }
+fn default_observation_only_round_nudge_after() -> u16 {
+    2
+}
+fn default_observation_only_round_strip_after_nudge() -> u16 {
+    1
+}
 
 impl Default for TerminationConfig {
     fn default() -> Self {
@@ -213,6 +233,9 @@ impl Default for TerminationConfig {
             strip_tools_after_nudge: default_strip_tools_after_nudge(),
             tool_round_nudge_after: default_tool_round_nudge_after(),
             tool_round_strip_after_nudge: default_tool_round_strip_after_nudge(),
+            observation_only_round_nudge_after: default_observation_only_round_nudge_after(),
+            observation_only_round_strip_after_nudge:
+                default_observation_only_round_strip_after_nudge(),
         }
     }
 }
@@ -1368,7 +1391,7 @@ mod tests {
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
-            expected_output: None,
+            completion_contract: SubGoalContract::from_definition_of_done(None),
             complexity_hint: hint,
         }
     }

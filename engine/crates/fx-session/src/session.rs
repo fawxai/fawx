@@ -7,7 +7,7 @@ use fx_llm::{ContentBlock, Message, Usage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A structured content block stored in session history.
@@ -226,6 +226,19 @@ impl SessionMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentRenderOptions {
     pub include_tool_use_id: bool,
+}
+
+/// Errors raised when session history violates tool ordering invariants.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionHistoryError {
+    #[error(
+        "invalid tool history: tool result '{tool_use_id}' at message {message_index} block {block_index} has no matching earlier tool_use"
+    )]
+    ToolResultBeforeToolUse {
+        tool_use_id: String,
+        message_index: usize,
+        block_index: usize,
+    },
 }
 
 const DEFAULT_SESSION_MEMORY_MAX_ITEMS: usize = 40;
@@ -467,6 +480,9 @@ pub struct Session {
     pub created_at: u64,
     /// Unix epoch seconds of last activity.
     pub updated_at: u64,
+    /// Unix epoch seconds when the session was archived, if archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     /// Ordered conversation messages.
     pub messages: Vec<SessionMessage>,
     /// Persistent memory that survives compaction.
@@ -486,20 +502,25 @@ impl Session {
             model: config.model,
             created_at: now,
             updated_at: now,
+            archived_at: None,
             messages: Vec::new(),
             memory: SessionMemory::default(),
         }
     }
 
     /// Append a message and update the timestamp.
-    pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) {
+    pub fn add_message(
+        &mut self,
+        role: MessageRole,
+        content: impl Into<String>,
+    ) -> Result<(), SessionHistoryError> {
         self.add_message_blocks(
             role,
             vec![SessionContentBlock::Text {
                 text: content.into(),
             }],
             None,
-        );
+        )
     }
 
     /// Append a structured message and update the timestamp.
@@ -508,23 +529,37 @@ impl Session {
         role: MessageRole,
         content: Vec<SessionContentBlock>,
         token_count: Option<u32>,
-    ) {
+    ) -> Result<(), SessionHistoryError> {
         let now = current_epoch_secs();
-        self.messages
-            .push(SessionMessage::structured(role, content, now, token_count));
-        self.updated_at = now;
+        self.extend_messages([SessionMessage::structured(role, content, now, token_count)])
     }
 
     /// Append already-constructed messages and update the timestamp once.
-    pub fn extend_messages(&mut self, messages: impl IntoIterator<Item = SessionMessage>) {
-        let mut appended_any = false;
-        for message in messages {
-            self.messages.push(message);
-            appended_any = true;
+    pub fn extend_messages(
+        &mut self,
+        messages: impl IntoIterator<Item = SessionMessage>,
+    ) -> Result<(), SessionHistoryError> {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
         }
-        if appended_any {
-            self.updated_at = current_epoch_secs();
-        }
+
+        let mut seen_tool_uses = HashSet::new();
+        validate_tool_message_order_with_seen(
+            self.messages.iter().enumerate(),
+            &mut seen_tool_uses,
+        )?;
+        validate_tool_message_order_with_seen(
+            messages
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| (self.messages.len() + offset, message)),
+            &mut seen_tool_uses,
+        )?;
+
+        self.messages.extend(messages);
+        self.updated_at = current_epoch_secs();
+        Ok(())
     }
 
     pub fn set_memory(&mut self, memory: SessionMemory) {
@@ -536,6 +571,10 @@ impl Session {
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.updated_at = current_epoch_secs();
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 
     /// Return the most recent `limit` messages (or all if fewer exist).
@@ -556,6 +595,7 @@ impl Session {
             model: self.model.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
             message_count: self.messages.len(),
         }
     }
@@ -571,6 +611,165 @@ impl Session {
         self.messages
             .last()
             .map(|message| truncate_text(&message.render_text(), 120))
+    }
+
+    pub fn validate_history(&self) -> Result<(), SessionHistoryError> {
+        validate_tool_message_order(&self.messages)
+    }
+}
+
+/// Validate that each stored `ToolResult` references a matching earlier `ToolUse`.
+pub fn validate_tool_message_order(messages: &[SessionMessage]) -> Result<(), SessionHistoryError> {
+    let mut seen_tool_uses = HashSet::new();
+    validate_tool_message_order_with_seen(messages.iter().enumerate(), &mut seen_tool_uses)
+}
+
+/// Drop tool-call blocks that cannot be replayed safely on a later turn.
+pub fn prune_unresolved_tool_history(messages: &[SessionMessage]) -> Vec<SessionMessage> {
+    let mut state = ReplaySafeToolHistory::new(messages);
+    messages
+        .iter()
+        .filter_map(|message| prune_message_for_replay(message, &mut state))
+        .collect()
+}
+
+fn validate_tool_message_order_with_seen<'a>(
+    messages: impl IntoIterator<Item = (usize, &'a SessionMessage)>,
+    seen_tool_uses: &mut HashSet<String>,
+) -> Result<(), SessionHistoryError> {
+    for (message_index, message) in messages {
+        for (block_index, block) in message.content.iter().enumerate() {
+            match block {
+                SessionContentBlock::ToolUse { id, .. } => {
+                    let trimmed = id.trim();
+                    if !trimmed.is_empty() {
+                        seen_tool_uses.insert(trimmed.to_string());
+                    }
+                }
+                SessionContentBlock::ToolResult { tool_use_id, .. } => {
+                    let trimmed = tool_use_id.trim();
+                    if !trimmed.is_empty() && !seen_tool_uses.contains(trimmed) {
+                        return Err(SessionHistoryError::ToolResultBeforeToolUse {
+                            tool_use_id: trimmed.to_string(),
+                            message_index,
+                            block_index,
+                        });
+                    }
+                }
+                SessionContentBlock::Text { .. }
+                | SessionContentBlock::Image { .. }
+                | SessionContentBlock::Document { .. } => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct ReplaySafeToolHistory {
+    remaining_tool_results: HashMap<String, usize>,
+    seen_tool_uses: HashSet<String>,
+}
+
+impl ReplaySafeToolHistory {
+    fn new(messages: &[SessionMessage]) -> Self {
+        Self {
+            remaining_tool_results: remaining_tool_result_counts(messages),
+            seen_tool_uses: HashSet::new(),
+        }
+    }
+
+    fn keep_tool_use(&mut self, tool_use_id: &str) -> bool {
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let keep = self
+            .remaining_tool_results
+            .get(trimmed)
+            .copied()
+            .unwrap_or_default()
+            > 0;
+        if keep {
+            self.seen_tool_uses.insert(trimmed.to_string());
+        }
+        keep
+    }
+
+    fn keep_tool_result(&mut self, tool_use_id: &str) -> bool {
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let keep = self.seen_tool_uses.contains(trimmed);
+        decrement_remaining_tool_result(&mut self.remaining_tool_results, trimmed);
+        keep
+    }
+}
+
+fn remaining_tool_result_counts(messages: &[SessionMessage]) -> HashMap<String, usize> {
+    let mut remaining = HashMap::new();
+    for message in messages {
+        for block in &message.content {
+            if let SessionContentBlock::ToolResult { tool_use_id, .. } = block {
+                let trimmed = tool_use_id.trim();
+                if !trimmed.is_empty() {
+                    *remaining.entry(trimmed.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    remaining
+}
+
+fn prune_message_for_replay(
+    message: &SessionMessage,
+    state: &mut ReplaySafeToolHistory,
+) -> Option<SessionMessage> {
+    let content = message
+        .content
+        .iter()
+        .filter_map(|block| prune_block_for_replay(block, state))
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then_some(SessionMessage {
+        role: message.role,
+        content,
+        timestamp: message.timestamp,
+        token_count: message.token_count,
+        input_token_count: message.input_token_count,
+        output_token_count: message.output_token_count,
+    })
+}
+
+fn prune_block_for_replay(
+    block: &SessionContentBlock,
+    state: &mut ReplaySafeToolHistory,
+) -> Option<SessionContentBlock> {
+    match block {
+        SessionContentBlock::ToolUse { id, .. } => state.keep_tool_use(id).then(|| block.clone()),
+        SessionContentBlock::ToolResult { tool_use_id, .. } => {
+            state.keep_tool_result(tool_use_id).then(|| block.clone())
+        }
+        SessionContentBlock::Text { .. }
+        | SessionContentBlock::Image { .. }
+        | SessionContentBlock::Document { .. } => Some(block.clone()),
+    }
+}
+
+fn decrement_remaining_tool_result(
+    remaining_tool_results: &mut HashMap<String, usize>,
+    tool_use_id: &str,
+) {
+    let Some(count) = remaining_tool_results.get(tool_use_id).copied() else {
+        return;
+    };
+
+    if count <= 1 {
+        remaining_tool_results.remove(tool_use_id);
+    } else {
+        remaining_tool_results.insert(tool_use_id.to_string(), count - 1);
     }
 }
 
@@ -822,6 +1021,25 @@ mod tests {
     }
 
     #[test]
+    fn session_backward_compat_defaults_archive_metadata_when_missing() {
+        let session = Session::new(
+            SessionKey::new("legacy-archive").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+        let mut value = serde_json::to_value(&session).expect("serialize session");
+        let Some(object) = value.as_object_mut() else {
+            panic!("session json should be an object");
+        };
+        object.remove("archived_at");
+
+        let restored: Session = serde_json::from_value(value).expect("deserialize session");
+
+        assert!(restored.archived_at.is_none());
+        assert!(!restored.is_archived());
+    }
+
+    #[test]
     fn apply_update_overwrites_project_and_state() {
         let mut memory = SessionMemory::default();
         let mut initial = memory_update();
@@ -948,7 +1166,9 @@ mod tests {
             test_config(),
         );
         let before = session.updated_at;
-        session.add_message(MessageRole::User, "hello");
+        session
+            .add_message(MessageRole::User, "hello")
+            .expect("add message");
         assert_eq!(session.messages.len(), 1);
         assert!(session.updated_at >= before);
         assert_eq!(session.messages[0].role, MessageRole::User);
@@ -968,7 +1188,9 @@ mod tests {
             test_config(),
         );
         for i in 0..10 {
-            session.add_message(MessageRole::User, format!("msg-{i}"));
+            session
+                .add_message(MessageRole::User, format!("msg-{i}"))
+                .expect("add message");
         }
         let recent = session.recent_messages(3);
         assert_eq!(recent.len(), 3);
@@ -983,7 +1205,9 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::User, "only one");
+        session
+            .add_message(MessageRole::User, "only one")
+            .expect("add message");
         let recent = session.recent_messages(100);
         assert_eq!(recent.len(), 1);
     }
@@ -995,13 +1219,18 @@ mod tests {
             SessionKind::Channel,
             test_config(),
         );
-        session.add_message(MessageRole::User, "hi");
-        session.add_message(MessageRole::Assistant, "hello");
+        session
+            .add_message(MessageRole::User, "hi")
+            .expect("add user");
+        session
+            .add_message(MessageRole::Assistant, "hello")
+            .expect("add assistant");
         let info = session.info();
         assert_eq!(info.key, SessionKey::new("s5").unwrap());
         assert_eq!(info.kind, SessionKind::Channel);
         assert_eq!(info.title.as_deref(), Some("hi"));
         assert_eq!(info.preview.as_deref(), Some("hello"));
+        assert!(!info.is_archived());
         assert_eq!(info.message_count, 2);
     }
 
@@ -1012,9 +1241,15 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::Assistant, "system ready");
-        session.add_message(MessageRole::User, "first user title");
-        session.add_message(MessageRole::User, "second user title");
+        session
+            .add_message(MessageRole::Assistant, "system ready")
+            .expect("add assistant");
+        session
+            .add_message(MessageRole::User, "first user title")
+            .expect("add first user");
+        session
+            .add_message(MessageRole::User, "second user title")
+            .expect("add second user");
 
         let info = session.info();
 
@@ -1028,8 +1263,12 @@ mod tests {
             SessionKind::Main,
             test_config(),
         );
-        session.add_message(MessageRole::User, "hello");
-        session.add_message(MessageRole::Assistant, "latest preview");
+        session
+            .add_message(MessageRole::User, "hello")
+            .expect("add user");
+        session
+            .add_message(MessageRole::Assistant, "latest preview")
+            .expect("add assistant");
 
         let info = session.info();
 
@@ -1069,11 +1308,16 @@ mod tests {
                 model: "claude".to_string(),
             },
         );
-        session.add_message(MessageRole::System, "init");
+        session.archived_at = Some(321);
+        session
+            .add_message(MessageRole::System, "init")
+            .expect("add message");
         let json = serde_json::to_string(&session).expect("serialize");
         let restored: Session = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.key, session.key);
         assert_eq!(restored.kind, session.kind);
+        assert_eq!(restored.archived_at, session.archived_at);
+        assert!(restored.is_archived());
         assert_eq!(restored.messages.len(), 1);
         assert_eq!(restored.messages[0].render_text(), "init");
     }
@@ -1219,15 +1463,183 @@ mod tests {
         );
         session.updated_at = 0;
 
-        session.extend_messages([
-            SessionMessage::text(MessageRole::User, "first", 1),
-            SessionMessage::text(MessageRole::Assistant, "second", 2),
-        ]);
+        session
+            .extend_messages([
+                SessionMessage::text(MessageRole::User, "first", 1),
+                SessionMessage::text(MessageRole::Assistant, "second", 2),
+            ])
+            .expect("extend messages");
 
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].render_text(), "first");
         assert_eq!(session.messages[1].render_text(), "second");
         assert!(session.updated_at > 0);
+    }
+
+    #[test]
+    fn validate_tool_message_order_rejects_result_before_matching_tool_use() {
+        let messages = vec![
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("missing"),
+                    is_error: Some(false),
+                }],
+                1,
+                None,
+            ),
+            SessionMessage::structured(
+                MessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: Some("fc_1".to_string()),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "README.md"}),
+                }],
+                2,
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            validate_tool_message_order(&messages),
+            Err(SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_1".to_string(),
+                message_index: 0,
+                block_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn extend_messages_rejects_tool_result_before_matching_tool_use() {
+        let mut session = Session::new(
+            SessionKey::new("invalid-tool-order").unwrap(),
+            SessionKind::Main,
+            test_config(),
+        );
+
+        let error = session
+            .extend_messages([
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: json!("missing"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        provider_id: Some("fc_1".to_string()),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "README.md"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ])
+            .expect_err("invalid tool ordering should fail");
+
+        assert_eq!(
+            error,
+            SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_1".to_string(),
+                message_index: 0,
+                block_index: 0,
+            }
+        );
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn prune_unresolved_tool_history_drops_half_resolved_tool_use() {
+        let messages = vec![
+            SessionMessage::text(MessageRole::User, "update the readme", 1),
+            SessionMessage::structured(
+                MessageRole::Assistant,
+                vec![
+                    SessionContentBlock::ToolUse {
+                        id: "call_resolved".to_string(),
+                        provider_id: Some("fc_resolved".to_string()),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "README.md"}),
+                    },
+                    SessionContentBlock::ToolUse {
+                        id: "call_orphan".to_string(),
+                        provider_id: Some("fc_orphan".to_string()),
+                        name: "git_status".to_string(),
+                        input: json!({}),
+                    },
+                ],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_resolved".to_string(),
+                    content: json!("updated"),
+                    is_error: Some(false),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::text(MessageRole::Assistant, "Updated README.md.", 4),
+        ];
+
+        let pruned = prune_unresolved_tool_history(&messages);
+
+        assert_eq!(pruned.len(), 4);
+        assert!(matches!(
+            pruned[1].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_resolved"
+                    && provider_id.as_deref() == Some("fc_resolved")
+        ));
+        assert!(matches!(
+            pruned[2].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }]
+                if tool_use_id == "call_resolved"
+        ));
+        assert!(validate_tool_message_order(&pruned).is_ok());
+        assert!(!pruned
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_orphan"
+            )));
+    }
+
+    #[test]
+    fn prune_unresolved_tool_history_drops_orphaned_tool_result() {
+        let messages = vec![
+            SessionMessage::text(MessageRole::User, "what changed?", 1),
+            SessionMessage::structured(
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_orphan".to_string(),
+                    content: json!("stale"),
+                    is_error: Some(false),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::text(MessageRole::Assistant, "Nothing yet.", 3),
+        ];
+
+        let pruned = prune_unresolved_tool_history(&messages);
+
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned
+            .iter()
+            .all(|message| message.role != MessageRole::Tool));
     }
 
     #[test]

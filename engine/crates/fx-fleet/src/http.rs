@@ -527,7 +527,7 @@ mod tests {
 
     fn sample_registration_request() -> FleetRegistrationRequest {
         FleetRegistrationRequest {
-            node_name: "node-a-01".to_string(),
+            node_name: "macmini-01".to_string(),
             bearer_token: "node-secret".to_string(),
             capabilities: vec!["generate".to_string(), "evaluate".to_string()],
             rust_version: Some("1.86.0".to_string()),
@@ -539,7 +539,7 @@ mod tests {
 
     fn sample_heartbeat() -> FleetHeartbeat {
         FleetHeartbeat {
-            node_id: "node-a-01".to_string(),
+            node_id: "macmini-01".to_string(),
             status: WorkerState::Idle,
             current_task: None,
         }
@@ -547,7 +547,7 @@ mod tests {
 
     fn sample_worker_status() -> FleetWorkerStatus {
         FleetWorkerStatus {
-            node_id: "node-a-01".to_string(),
+            node_id: "macmini-01".to_string(),
             status: WorkerState::Busy,
             current_task: Some("exp-001".to_string()),
             uptime_seconds: 42,
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn registration_debug_redacts_bearer_token() {
         let request = FleetRegistrationRequest {
-            node_name: "node-a-01".to_string(),
+            node_name: "macmini-01".to_string(),
             bearer_token: "node-secret".to_string(),
             capabilities: vec!["generate".to_string()],
             rust_version: None,

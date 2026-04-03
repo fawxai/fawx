@@ -281,7 +281,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_session::{MessageRole, SessionConfig, SessionContentBlock};
+    use fx_session::{
+        MessageRole, Session, SessionConfig, SessionContentBlock, SessionMemory, SessionStatus,
+        SessionStore,
+    };
+    use fx_storage::Storage;
     use tempfile::TempDir;
 
     fn db_path(temp_dir: &TempDir) -> PathBuf {
@@ -310,6 +314,50 @@ mod tests {
             )
             .expect("create session");
         key
+    }
+
+    fn poisoned_session(id: &str) -> Session {
+        Session {
+            key: SessionKey::new(id).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "gpt-4o-mini".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            archived_at: None,
+            messages: vec![
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
+        }
+    }
+
+    fn seed_poisoned_session(temp_dir: &TempDir, id: &str) {
+        let storage = Storage::open(&db_path(temp_dir)).expect("storage");
+        SessionStore::new(storage)
+            .save(&poisoned_session(id))
+            .expect("save poisoned session");
     }
 
     #[test]
@@ -370,6 +418,18 @@ mod tests {
             .expect_err("missing session should fail");
 
         assert!(error.to_string().contains("session not found: missing"));
+    }
+
+    #[test]
+    fn export_rejects_corrupted_session_history() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        seed_poisoned_session(&temp_dir, "poisoned");
+
+        let error = load_session_export_from(&db_path(&temp_dir), "poisoned", None)
+            .expect_err("corrupted session should fail");
+
+        assert!(error.to_string().contains("corrupted session 'poisoned'"));
+        assert!(error.to_string().contains("call_bad"));
     }
 
     #[test]

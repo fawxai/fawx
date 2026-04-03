@@ -93,7 +93,9 @@ mod tests {
     fn save_and_load_round_trips() {
         let store = test_store();
         let mut session = make_session("s1");
-        session.add_message(crate::types::MessageRole::User, "hello");
+        session
+            .add_message(crate::types::MessageRole::User, "hello")
+            .expect("add message");
 
         store.save(&session).expect("save");
         let loaded = store
@@ -101,8 +103,34 @@ mod tests {
             .expect("load")
             .expect("should exist");
         assert_eq!(loaded.key, session.key);
+        assert!(!loaded.is_archived());
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].render_text(), "hello");
+    }
+
+    #[test]
+    fn load_legacy_active_session_without_archive_timestamp() {
+        let store = test_store();
+        let session = make_session("legacy");
+        let mut value = serde_json::to_value(&session).expect("serialize session");
+        let Some(object) = value.as_object_mut() else {
+            panic!("session json should be an object");
+        };
+        object.remove("archived_at");
+        let bytes = serde_json::to_vec(&value).expect("serialize legacy session");
+
+        store
+            .storage
+            .put(SESSIONS_TABLE, session.key.as_str(), &bytes)
+            .expect("write legacy session");
+
+        let loaded = store
+            .load(&SessionKey::new("legacy").unwrap())
+            .expect("load legacy")
+            .expect("legacy session should exist");
+
+        assert!(loaded.archived_at.is_none());
+        assert!(!loaded.is_archived());
     }
 
     #[test]
@@ -171,7 +199,9 @@ mod tests {
         let mut session = make_session("overwrite");
         store.save(&session).expect("first save");
 
-        session.add_message(crate::types::MessageRole::User, "new message");
+        session
+            .add_message(crate::types::MessageRole::User, "new message")
+            .expect("add message");
         store.save(&session).expect("second save");
 
         let loaded = store
@@ -180,5 +210,22 @@ mod tests {
             .expect("should exist");
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].render_text(), "new message");
+    }
+
+    #[test]
+    fn save_and_load_preserves_archive_metadata() {
+        let store = test_store();
+        let mut session = make_session("archived");
+        session.archived_at = Some(77);
+
+        store.save(&session).expect("save archived session");
+
+        let loaded = store
+            .load(&SessionKey::new("archived").unwrap())
+            .expect("load archived session")
+            .expect("archived session should exist");
+
+        assert_eq!(loaded.archived_at, Some(77));
+        assert!(loaded.is_archived());
     }
 }
