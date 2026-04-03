@@ -44,33 +44,13 @@ impl LocalModel {
             )));
         }
 
-        #[cfg(not(feature = "llama-cpp"))]
-        {
-            debug!("LocalModel created without llama-cpp feature; inference will fail at runtime");
-        }
+        debug!("LocalModel created; llama-cpp backend not linked in this build");
 
         Ok(Self { config })
     }
 
     /// Internal method to perform actual inference.
-    ///
-    /// This is where llama.cpp FFI calls would happen.
     #[allow(dead_code)]
-    #[cfg(feature = "llama-cpp")]
-    fn infer_internal(&self, _prompt: &str, _max_tokens: u32) -> Result<String, LlmError> {
-        // Future: Actual llama.cpp inference
-        // 1. Tokenize prompt
-        // 2. Run inference loop
-        // 3. Decode tokens to string
-        // 4. Return result
-
-        Err(LlmError::Inference(
-            "llama.cpp integration not yet implemented".to_string(),
-        ))
-    }
-
-    #[allow(dead_code)]
-    #[cfg(not(feature = "llama-cpp"))]
     fn infer_internal(&self, _prompt: &str, _max_tokens: u32) -> Result<String, LlmError> {
         Err(LlmError::Model(
             "llama-cpp feature not enabled; cannot perform local inference".to_string(),
@@ -92,21 +72,9 @@ impl LlmProvider for LocalModel {
         let _prompt = prompt.to_string();
 
         tokio::task::spawn_blocking(move || {
-            // Placeholder: would call self.infer_internal here
-            // For now, return error since feature is not enabled
-            #[cfg(feature = "llama-cpp")]
-            {
-                Err(LlmError::Inference(
-                    "llama.cpp integration not yet implemented".to_string(),
-                ))
-            }
-
-            #[cfg(not(feature = "llama-cpp"))]
-            {
-                Err(LlmError::Model(
-                    "llama-cpp feature not enabled; cannot perform local inference".to_string(),
-                ))
-            }
+            Err(LlmError::Model(
+                "llama-cpp feature not enabled; cannot perform local inference".to_string(),
+            ))
         })
         .await
         .map_err(|e| LlmError::Inference(format!("Task join error: {}", e)))?
@@ -187,8 +155,7 @@ mod tests {
 
         let result = model.generate("test prompt", 10).await;
 
-        // Without llama-cpp feature, should error
-        #[cfg(not(feature = "llama-cpp"))]
+        // Without llama-cpp backend, should always error
         assert!(result.is_err());
 
         // Cleanup
@@ -197,9 +164,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_callback_signature() {
-        // This test verifies the streaming API signature works correctly
-        // without requiring actual model inference
-
         let temp_dir = std::env::temp_dir();
         let model_path = temp_dir.join("test-model-streaming.gguf");
         std::fs::write(&model_path, b"fake model").unwrap();
@@ -207,16 +171,13 @@ mod tests {
         let config = LocalModelConfig::new(model_path.clone(), 2048, 0.7, 0.95, 512).unwrap();
         let model = LocalModel::new(config).unwrap();
 
-        // Verify callback accepts owned String (not &str)
         let callback = Box::new(|chunk: String| {
-            // In real use, this would send chunk to a channel/stream
-            assert!(!chunk.is_empty() || chunk.is_empty()); // Always true, just to use chunk
+            assert!(!chunk.is_empty() || chunk.is_empty());
         });
 
         let result = model.generate_streaming("test", 10, callback).await;
 
-        // Without llama-cpp feature, generate() fails, so streaming also fails
-        #[cfg(not(feature = "llama-cpp"))]
+        // Without llama-cpp backend, generate() fails, so streaming also fails
         assert!(result.is_err());
 
         // Cleanup
