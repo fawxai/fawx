@@ -112,7 +112,12 @@ Video tokenizer learns to predict next frame (self-supervised)
 Perception head learns to output structured scene state
          (supervised by accessibility tree labels)
          |
-Planner trains on (scene_state, observed_outcome) pairs
+Planner trains on (scene_state, action, observed_outcome) triples
+         |
+         Action labels: TBD — options include inverse dynamics from
+         visual diffs, replay of agentic-loop action logs, or
+         reintroducing lightweight input capture for Bite 4+.
+         This is an open design question for the planner stage.
          |
 Personalized to THIS USER's visual environment
 ```
@@ -161,14 +166,14 @@ This gets tuned empirically. Too small and perception quality drops, the model f
 
 ### Stage 1: Accessibility Tree (structured labels, free on macOS)
 
-macOS exposes the full accessibility tree for every application: button labels, text field values, menu items, window hierarchy, element roles, bounding boxes. For every frame of screen video, we can query the OS for exactly what's there — perfect ground truth.
+macOS exposes the full accessibility tree for every application: button labels, text field values, menu items, window hierarchy, element roles, bounding boxes. For any given moment we can query the OS for structured UI state — high-quality ground truth, though not literally every transient state.
 
 The accessibility tree is a **training-time luxury**. We use it while we have it so the model doesn't need it when we don't. At runtime: gone. On a pendant: never existed. On a robot: doesn't apply. But during Stage 1 training, it's the labeled dataset that teaches the model to produce structured scene state.
 
-- Capture: separate thread polls accessibility tree at 1-2 Hz
-- Output: timestamped JSONL, aligned to video frames offline (+/- 500ms tolerance)
-- 1 Hz captures >95% of meaningful UI state transitions (the tree is static between user actions)
-- During fast interaction (typing, scrolling), intermediate tree states may be missed — the visual stream is continuous and the final state is captured
+- Capture: separate thread polls accessibility tree at some cadence (starting point: 1-2 Hz)
+- Output: timestamped JSONL, aligned to video frames offline
+- **Open question: optimal polling cadence.** 1 Hz likely captures most steady-state UI, but transient states (menus, dialogs, mid-typing) will be missed at low rates. The agentic loop currently snapshots the tree after every UI-mutating action, which is event-driven rather than polled. The right answer may be hybrid: low-frequency polling + event-triggered snapshots during active interaction. This needs empirical testing.
+- The visual stream is continuous regardless — polling gaps mean noisier labels, not missing training data
 
 ### Stage 2: Physics + Human Behavior
 
@@ -318,19 +323,19 @@ Note the `prediction_error` field. This is the tokenizer's surprise signal expos
 - Volume estimate: ~2-4 Mbps typical → 1-2 GB/hour, 8-16 GB/workday, 2-4 TB/year. A 4TB external SSD handles a full year.
 
 ### Accessibility tree:
-- Polling rate: 1-2 Hz in a separate thread
+- Polling rate: TBD — starting point 1-2 Hz, likely needs event-triggered augmentation (see open question in Supervision section)
 - Format: timestamped JSONL
-- Alignment: offline, +/- 500ms tolerance against video frame timestamps
+- Alignment: offline against video frame timestamps (tolerance TBD with cadence)
 - Includes: focused app, window title, element hierarchy with types/labels/bounds/values
 
 ### Privacy:
 The privacy boundary is the device. This data never leaves the machine. Training is local. The raw video exists to produce model weights, then gets purged. The model learns temporal patterns and visual structure — it doesn't memorize specific frames. A next-frame prediction model that overfits to individual frames is a broken model; generalization pressure works in privacy's favor.
 
-Practical controls:
+Planned controls (none of these exist yet — all are TODO for the fawx-eyes control plane):
 - Manual pause/resume (user hits a key to stop recording during sensitive work)
 - Retention policy: raw video auto-deletes after N days, only model weights persist
 - No export mechanism for raw capture data — it's a training input, not a product feature
-- The existing AX security model applies: ripcord can wipe training data
+- Training data wipe surface: needs its own implementation. The AX ripcord currently handles file/git rollback for agentic actions but does not cover training data purge — that's a separate control to build.
 - FileVault handles the physical-access threat model
 
 ### What we don't capture:
