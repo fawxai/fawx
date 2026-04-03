@@ -131,15 +131,36 @@ bump_plist_version() {
     fi
 }
 
-echo "── Step 1: Version bump ──"
-bump_plist_version "$INFO_PLIST" "macOS"
-bump_plist_version "$INFO_PLIST_IOS" "iOS"
-echo ""
+# Check if version bump is already committed (e.g. re-running after PR merge)
+CURRENT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST" 2>/dev/null || echo "")
+if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
+    echo "── Step 1: Version bump ──"
+    echo "   Already at $VERSION; skipping bump"
+    echo ""
+else
+    echo "── Step 1: Version bump ──"
+    bump_plist_version "$INFO_PLIST" "macOS"
+    bump_plist_version "$INFO_PLIST_IOS" "iOS"
+    echo ""
 
-# Commit version bump
-if ! $DRY_RUN; then
-    git -C "$REPO_ROOT" add "$INFO_PLIST" "$INFO_PLIST_IOS"
-    git -C "$REPO_ROOT" commit -m "release: bump version to $VERSION"
+    # Commit version bump via PR branch (main is branch-protected)
+    if ! $DRY_RUN; then
+        RELEASE_BRANCH="release/$VERSION"
+        git -C "$REPO_ROOT" checkout -b "$RELEASE_BRANCH"
+        git -C "$REPO_ROOT" add "$INFO_PLIST" "$INFO_PLIST_IOS"
+        git -C "$REPO_ROOT" commit -m "release: bump version to $VERSION"
+        git -C "$REPO_ROOT" push origin "$RELEASE_BRANCH"
+        FAWX_REPO="$(git -C "$REPO_ROOT" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')"
+        gh pr create --repo "$FAWX_REPO" \
+            --base main --head "$RELEASE_BRANCH" \
+            --title "release: bump version to $VERSION" \
+            --body "Version bump for v$VERSION release."
+        echo ""
+        echo "   ⚠ PR created for version bump. Merge it, then re-run:"
+        echo "   git checkout main && git pull origin main && ./scripts/release.sh $VERSION --skip-build"
+        echo ""
+        exit 0
+    fi
 fi
 
 # ── Step 2: Build DMG ────────────────────────────────────────────
@@ -215,7 +236,7 @@ if $DRY_RUN; then
     echo "   Would push: main + tags"
 else
     git -C "$REPO_ROOT" tag -a "$TAG" -m "Release $VERSION"
-    git -C "$REPO_ROOT" push origin main --tags
+    git -C "$REPO_ROOT" push origin "$TAG"
     echo "   ✅ Tagged $TAG and pushed"
 fi
 echo ""
@@ -299,10 +320,24 @@ if $DRY_RUN; then
     echo "   Vercel auto-deploys on push"
 else
     cd "$FAWX_SITE_DIR"
+    SITE_DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)"
+    SITE_RELEASE_BRANCH="release/appcast-$VERSION"
+    git checkout -b "$SITE_RELEASE_BRANCH"
     git add appcast.xml
     git commit -m "release: appcast $VERSION"
-    git push origin main
-    echo "   ✅ Pushed to fawx-site; Vercel will auto-deploy"
+    if git push origin "$SITE_DEFAULT_BRANCH" 2>/dev/null; then
+        echo "   ✅ Pushed directly to fawx-site; Vercel will auto-deploy"
+    else
+        echo "   Branch protection detected; creating PR..."
+        git push origin "$SITE_RELEASE_BRANCH"
+        SITE_REPO="$(git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')"
+        gh pr create --repo "$SITE_REPO" \
+            --base "$SITE_DEFAULT_BRANCH" --head "$SITE_RELEASE_BRANCH" \
+            --title "release: appcast $VERSION" \
+            --body "Add v$VERSION entry to Sparkle appcast. Vercel auto-deploys on merge."
+        echo "   ✅ PR created on fawx-site; merge to deploy"
+    fi
+    git checkout "$SITE_DEFAULT_BRANCH"
 fi
 echo ""
 

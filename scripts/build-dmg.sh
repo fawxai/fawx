@@ -137,8 +137,11 @@ generate_sparkle_appcast() {
     fi
 
     echo "   Generating Sparkle appcast..."
-    "$appcast_tool" "$output_dir"
-    echo "   ✅ Appcast: $output_dir/appcast.xml"
+    if "$appcast_tool" "$output_dir"; then
+        echo "   ✅ Appcast: $output_dir/appcast.xml"
+    else
+        echo "   ⚠ generate_appcast failed (non-fatal); release.sh builds the appcast entry separately"
+    fi
 }
 
 # Step 1: Build engine binary
@@ -348,6 +351,9 @@ step_dmg() {
             echo "   ✅ Notarized + stapled"
         fi
     fi
+
+    # Clean up temp DMG before Sparkle tools (generate_appcast chokes on duplicates)
+    rm -f "$temp_dmg"
 
     if sparkle_updates_configured; then
         sign_dmg_for_sparkle "$dmg_path"
