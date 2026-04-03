@@ -48,33 +48,23 @@ Skills declare required capabilities in their manifest:
 - `storage` - Persistent key-value storage
 - `notifications` - Send user notifications
 - `sensors` - Read sensor data (location, accelerometer, etc.)
-- `phone_actions` - Control phone functions (high privilege)
 
 Capabilities are enforced at runtime. Skills cannot access resources they haven't declared.
 
 ## Skill Lifecycle
 
-### Development
+### Recommended Workflows
 
-1. Write skill in Rust (or other WASM language)
-2. Implement `run()` entry point
-3. Use host API functions via `extern "C"` imports
-4. Compile to `wasm32-wasi` target
-5. Create `manifest.toml`
-
-### Installation
-
-```bash
-fawx skill install path/to/skill-directory
-# or
-fawx skill install path/to/skill.wasm
-```
-
-Installation:
-- Validates manifest
-- Verifies WASM module compiles
-- Copies to `~/.fawx/skills/{skill-name}/`
-- Optionally verifies signature
+- Local dev project: `fawx skill build <project>`
+  - Canonical local-dev path for a custom skill project
+  - Builds for `wasm32-wasip1`
+  - Installs into `~/.fawx/skills/{skill-name}/`
+  - Signs automatically when a signing key exists
+- Prebuilt artifact: `fawx skill install <path>`
+  - Use for a prebuilt `.wasm` file or skill directory
+- Built-in repo skills: `skills/build.sh --install`
+  - Specialized repo maintainer path for the built-in `skills/` collection
+- Already-installed skill that still needs a signature: `fawx sign <skill>` or `fawx sign --all`
 
 ### Discovery
 
@@ -164,16 +154,17 @@ pub extern "C" fn run() {
 }
 ```
 
-### Build
+### Build And Install
 
 ```bash
-cargo build --target wasm32-wasi --release
+fawx skill build .
 ```
 
-### Install
+### Prebuilt Artifact Install
 
 ```bash
-fawx skill install target/wasm32-wasi/release/calculator_skill.wasm
+cargo build --target wasm32-wasip1 --release
+fawx skill install target/wasm32-wasip1/release/calculator_skill.wasm
 ```
 
 ### Use
@@ -287,11 +278,24 @@ Installed skills:
     Capabilities: network, storage
 ```
 
-### Install Skill
+### Recommended Local Dev
+
+```bash
+fawx skill build ./skills/calculator-skill
+```
+
+### Install Prebuilt Skill
 
 ```bash
 fawx skill install skills/calculator-skill
 fawx skill install skills/calculator-skill/calculator.wasm
+```
+
+### Sign Installed Skill
+
+```bash
+fawx sign calculator
+fawx sign --all
 ```
 
 ### Remove Skill
@@ -324,7 +328,7 @@ fawx skill remove calculator
 - Check manifest is valid TOML
 - Verify API version is `host_api_v1`
 - Ensure WASM file is present
-- Check compilation target is `wasm32-wasi`
+- Check compilation target is `wasm32-wasip1`
 
 ### Runtime Errors
 

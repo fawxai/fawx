@@ -7,6 +7,7 @@ mod improvement_tools;
 pub mod node_run;
 mod session_tools;
 mod skill_bridge;
+pub mod tool_trait;
 mod tools;
 
 pub use capability_request::{CapabilityRequest, CapabilityRequestHandler, CapabilityRequestSkill};
@@ -18,4 +19,5 @@ pub use improvement_tools::ImprovementToolsState;
 pub use node_run::NodeRunState;
 pub use session_tools::SessionToolsSkill;
 pub use skill_bridge::BuiltinToolsSkill;
-pub use tools::{ConfigSetRequest, FawxToolExecutor, ToolConfig};
+pub use tool_trait::{Tool, ToolConfig, ToolContext};
+pub use tools::{ConfigSetRequest, FawxToolExecutor};

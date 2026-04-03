@@ -277,7 +277,7 @@ mod tests {
         let response = DevicesResponse {
             devices: vec![DeviceInfo {
                 id: "dev-a1b2c3".to_string(),
-                device_name: "Example MacBook".to_string(),
+                device_name: "Alice's MacBook".to_string(),
                 created_at: 1_773_400_000,
                 last_used_at: 1_773_435_000,
             }],
@@ -289,7 +289,7 @@ mod tests {
         .expect("device JSON should parse");
 
         assert_eq!(json["devices"][0]["id"], "dev-a1b2c3");
-        assert_eq!(json["devices"][0]["device_name"], "Example MacBook");
+        assert_eq!(json["devices"][0]["device_name"], "Alice's MacBook");
         assert_eq!(json["devices"][0]["created_at"], 1_773_400_000);
         assert_eq!(json["devices"][0]["last_used_at"], 1_773_435_000);
     }
@@ -299,7 +299,7 @@ mod tests {
         let response = DevicesResponse {
             devices: vec![DeviceInfo {
                 id: "dev-a1b2c3".to_string(),
-                device_name: "Example MacBook".to_string(),
+                device_name: "Alice's MacBook".to_string(),
                 created_at: 1_700_000_000,
                 last_used_at: 1_700_000_300,
             }],

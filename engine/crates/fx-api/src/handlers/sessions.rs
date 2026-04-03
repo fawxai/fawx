@@ -14,21 +14,23 @@ use crate::types::{
     SendToSessionRequest, SendToSessionResponse,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{TimeZone, Utc};
 use fx_bus::{Envelope, Payload, SessionBus};
 use fx_core::channel::ResponseContext;
 use fx_core::types::InputSource;
 use fx_kernel::StreamCallback;
-use fx_llm::{trim_conversation_history, ContentBlock, Message};
+use fx_llm::{trim_conversation_history, Message};
 use fx_session::{
-    SessionConfig, SessionError, SessionInfo, SessionKey, SessionKind, SessionMemory,
-    SessionMessage, SessionRegistry, SessionStatus,
+    prune_unresolved_tool_history, render_content_blocks_with_options, validate_tool_message_order,
+    ContentRenderOptions, SessionArchiveFilter, SessionConfig, SessionError, SessionHistoryError,
+    SessionInfo, SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry,
+    SessionStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +62,14 @@ pub struct ListSessionsQuery {
     pub kind: Option<SessionKind>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub archived: Option<String>,
+}
+
+impl ListSessionsQuery {
+    fn archive_filter(&self) -> Result<SessionArchiveFilter, (StatusCode, Json<ErrorBody>)> {
+        ArchivedQueryValue::parse(self.archived.as_deref()).map(SessionArchiveFilter::from)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,9 +78,21 @@ pub struct SessionMessagesQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SessionExportQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+impl SessionExportQuery {
+    fn export_format(&self) -> Result<SessionExportFormat, (StatusCode, Json<ErrorBody>)> {
+        SessionExportFormat::parse(self.format.as_deref())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ListSessionsResponse {
-    pub sessions: Vec<SessionInfo>,
+    pub sessions: Vec<SessionSummaryResponse>,
     pub total: usize,
 }
 
@@ -78,6 +100,49 @@ pub struct ListSessionsResponse {
 pub struct SessionMessagesResponse {
     pub messages: Vec<SessionMessage>,
     pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExportResponse {
+    pub key: String,
+    pub session: SessionExportSessionMetadata,
+    pub archive: SessionArchiveMetadata,
+    pub messages: Vec<SessionMessage>,
+    pub total_messages: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionArchiveMetadata {
+    pub archived: bool,
+    pub archived_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionSummaryResponse {
+    pub key: String,
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub model: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    #[serde(flatten)]
+    pub archive: SessionArchiveMetadata,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExportSessionMetadata {
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub model: String,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +155,132 @@ pub struct DeleteSessionResponse {
 pub struct ClearSessionResponse {
     pub cleared: bool,
     pub key: String,
+}
+
+struct SessionExportData {
+    info: SessionInfo,
+    messages: Vec<SessionMessage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimestampDisplay {
+    Minute,
+    Second,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchivedQueryValue {
+    Active,
+    All,
+    Only,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionExportFormat {
+    Text,
+    Json,
+}
+
+impl SessionExportFormat {
+    fn parse(value: Option<&str>) -> Result<Self, (StatusCode, Json<ErrorBody>)> {
+        match value.unwrap_or("text") {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(invalid_export_format(other)),
+        }
+    }
+}
+
+impl ArchivedQueryValue {
+    fn parse(value: Option<&str>) -> Result<Self, (StatusCode, Json<ErrorBody>)> {
+        match value.unwrap_or("active") {
+            "active" => Ok(Self::Active),
+            "all" => Ok(Self::All),
+            "only" => Ok(Self::Only),
+            other => Err(invalid_archive_filter(other)),
+        }
+    }
+}
+
+impl From<ArchivedQueryValue> for SessionArchiveFilter {
+    fn from(value: ArchivedQueryValue) -> Self {
+        match value {
+            ArchivedQueryValue::Active => Self::ActiveOnly,
+            ArchivedQueryValue::All => Self::All,
+            ArchivedQueryValue::Only => Self::ArchivedOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchiveRouteOperation {
+    Archive,
+    Unarchive,
+}
+
+impl ArchiveRouteOperation {
+    fn apply(self, registry: &SessionRegistry, key: &SessionKey) -> Result<(), SessionError> {
+        match self {
+            Self::Archive => registry.archive(key),
+            Self::Unarchive => registry.unarchive(key),
+        }
+    }
+}
+
+impl From<&SessionInfo> for SessionArchiveMetadata {
+    fn from(info: &SessionInfo) -> Self {
+        Self {
+            archived: info.is_archived(),
+            archived_at: info.archived_at,
+        }
+    }
+}
+
+impl From<SessionInfo> for SessionSummaryResponse {
+    fn from(info: SessionInfo) -> Self {
+        let archive = SessionArchiveMetadata::from(&info);
+        Self {
+            key: info.key.to_string(),
+            kind: info.kind,
+            status: info.status,
+            label: info.label,
+            title: info.title,
+            preview: info.preview,
+            model: info.model,
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+            message_count: info.message_count,
+            archive,
+        }
+    }
+}
+
+impl From<&SessionInfo> for SessionExportSessionMetadata {
+    fn from(info: &SessionInfo) -> Self {
+        Self {
+            kind: info.kind,
+            status: info.status,
+            label: info.label.clone(),
+            title: info.title.clone(),
+            preview: info.preview.clone(),
+            model: info.model.clone(),
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+        }
+    }
+}
+
+impl SessionExportData {
+    fn into_json_payload(self) -> SessionExportResponse {
+        let total_messages = self.messages.len();
+        SessionExportResponse {
+            key: self.info.key.to_string(),
+            session: SessionExportSessionMetadata::from(&self.info),
+            archive: SessionArchiveMetadata::from(&self.info),
+            messages: self.messages,
+            total_messages,
+        }
+    }
 }
 
 struct StreamingSessionMessageTask {
@@ -119,7 +310,11 @@ pub async fn handle_create_session(
     };
 
     let info = create_session(&registry, config).map_err(internal_error)?;
-    Ok((StatusCode::CREATED, Json(info)).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(SessionSummaryResponse::from(info)),
+    )
+        .into_response())
 }
 
 pub async fn handle_list_sessions(
@@ -127,8 +322,9 @@ pub async fn handle_list_sessions(
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let registry = require_session_registry(&state)?;
+    let archive_filter = query.archive_filter()?;
     let mut sessions = registry
-        .list(query.kind)
+        .list_with_archive_filter(query.kind, archive_filter)
         .map_err(|error| internal_error(anyhow::Error::new(error)))?;
     sessions.sort_by(|left, right| {
         right
@@ -138,6 +334,10 @@ pub async fn handle_list_sessions(
     });
     let total = sessions.len();
     sessions.truncate(query.limit.unwrap_or(50));
+    let sessions = sessions
+        .into_iter()
+        .map(SessionSummaryResponse::from)
+        .collect();
 
     Ok(Json(ListSessionsResponse { sessions, total }).into_response())
 }
@@ -151,7 +351,7 @@ pub async fn handle_get_session(
     let info = registry
         .get_info(&key)
         .map_err(|error| map_session_error(&id, error))?;
-    Ok(Json(info).into_response())
+    Ok(Json(SessionSummaryResponse::from(info)).into_response())
 }
 
 pub async fn handle_get_context(
@@ -166,7 +366,8 @@ pub async fn handle_get_context(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let context = session_messages_to_context(&history);
+    let context = session_messages_to_context(&history)
+        .map_err(|error| map_session_history_error(&id, error))?;
     let app = state.app.lock().await;
     Ok(Json(app.context_info_for_messages(&context)).into_response())
 }
@@ -237,6 +438,33 @@ pub async fn handle_clear_session(
     .into_response())
 }
 
+pub async fn handle_archive_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    update_session_archive_state(state, id, ArchiveRouteOperation::Archive).await
+}
+
+pub async fn handle_unarchive_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    update_session_archive_state(state, id, ArchiveRouteOperation::Unarchive).await
+}
+
+pub async fn handle_export_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(query): Query<SessionExportQuery>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let export = load_session_export(&registry, &id)?;
+    Ok(render_session_export_response(
+        export,
+        query.export_format()?,
+    ))
+}
+
 pub async fn handle_get_messages(
     State(state): State<HttpState>,
     Path(id): Path<String>,
@@ -299,7 +527,8 @@ pub(crate) async fn handle_send_message_for_session(
     let history = registry
         .history(&key, usize::MAX)
         .map_err(|error| map_session_error(&id, error))?;
-    let mut context = session_messages_to_context(&history);
+    let mut context = session_messages_to_context(&history)
+        .map_err(|error| map_session_history_error(&id, error))?;
     let max_history = {
         let app = state.app.lock().await;
         app.max_history()
@@ -343,7 +572,7 @@ pub(crate) async fn handle_send_message_for_session(
     .await
     .map_err(internal_error)?;
     persist_session_turn(&registry, &key, session_messages, session_memory)
-        .map_err(|error| internal_error(anyhow::Error::new(error)))?;
+        .map_err(|error| map_session_error(&id, error))?;
 
     Ok(Json(MessageResponse {
         response,
@@ -354,53 +583,16 @@ pub(crate) async fn handle_send_message_for_session(
     .into_response())
 }
 
-pub(crate) fn session_messages_to_context(messages: &[SessionMessage]) -> Vec<Message> {
-    let context = messages
+pub(crate) fn session_messages_to_context(
+    messages: &[SessionMessage],
+) -> Result<Vec<Message>, SessionHistoryError> {
+    validate_tool_message_order(messages)?;
+    let replay_safe = prune_unresolved_tool_history(messages);
+    let context = replay_safe
         .iter()
         .map(SessionMessage::to_llm_message)
         .collect();
-    prune_unresolved_tool_context(context)
-}
-
-fn prune_unresolved_tool_context(messages: Vec<Message>) -> Vec<Message> {
-    let mut tool_use_ids = HashSet::new();
-    let mut tool_result_ids = HashSet::new();
-
-    for message in &messages {
-        for block in &message.content {
-            match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    tool_use_ids.insert(id.clone());
-                }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    tool_result_ids.insert(tool_use_id.clone());
-                }
-                ContentBlock::Text { .. }
-                | ContentBlock::Image { .. }
-                | ContentBlock::Document { .. } => {}
-            }
-        }
-    }
-
-    let unresolved_tool_use_ids = tool_use_ids
-        .iter()
-        .filter(|id| !tool_result_ids.contains(*id))
-        .cloned()
-        .collect::<HashSet<_>>();
-
-    messages
-        .into_iter()
-        .filter_map(|mut message| {
-            message.content.retain(|block| match block {
-                ContentBlock::ToolUse { id, .. } => !unresolved_tool_use_ids.contains(id),
-                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_ids.contains(tool_use_id),
-                ContentBlock::Text { .. }
-                | ContentBlock::Image { .. }
-                | ContentBlock::Document { .. } => true,
-            });
-            (!message.content.is_empty()).then_some(message)
-        })
-        .collect()
+    Ok(context)
 }
 
 async fn stream_session_message_response(
@@ -533,6 +725,133 @@ fn persist_session_turn(
     registry.record_turn(key, session_messages, session_memory)
 }
 
+async fn update_session_archive_state(
+    state: HttpState,
+    id: String,
+    operation: ArchiveRouteOperation,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let registry = require_session_registry(&state)?;
+    let key = session_key(&id)?;
+    operation
+        .apply(&registry, &key)
+        .map_err(|error| map_session_error(&id, error))?;
+    let info = registry
+        .get_info(&key)
+        .map_err(|error| map_session_error(&id, error))?;
+    Ok(Json(SessionSummaryResponse::from(info)).into_response())
+}
+
+fn load_session_export(
+    registry: &SessionRegistry,
+    id: &str,
+) -> Result<SessionExportData, (StatusCode, Json<ErrorBody>)> {
+    let key = session_key(id)?;
+    let info = registry
+        .get_info(&key)
+        .map_err(|error| map_session_error(id, error))?;
+    let messages = registry
+        .history(&key, info.message_count)
+        .map_err(|error| map_session_error(id, error))?;
+    Ok(SessionExportData { info, messages })
+}
+
+fn render_session_export_response(
+    export: SessionExportData,
+    format: SessionExportFormat,
+) -> Response {
+    match format {
+        SessionExportFormat::Json => Json(export.into_json_payload()).into_response(),
+        SessionExportFormat::Text => text_export_response(render_session_export_text(&export)),
+    }
+}
+
+fn text_export_response(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+fn render_session_export_text(export: &SessionExportData) -> String {
+    let mut output = format!(
+        "Session: {}\nKind: {} | Status: {} | Model: {}\nCreated: {} | Updated: {}\n{}\nMessages: {}\n---\n",
+        export.info.key,
+        export.info.kind,
+        export.info.status,
+        export.info.model,
+        format_export_timestamp(export.info.created_at, TimestampDisplay::Minute),
+        format_export_timestamp(export.info.updated_at, TimestampDisplay::Minute),
+        format_archive_line(&export.info),
+        export.info.message_count,
+    );
+    if export.messages.is_empty() {
+        return output;
+    }
+    let blocks = export
+        .messages
+        .iter()
+        .map(format_export_message)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    output.push('\n');
+    output.push_str(&blocks);
+    output.push('\n');
+    output
+}
+
+fn format_archive_line(info: &SessionInfo) -> String {
+    match info.archived_at {
+        Some(timestamp) => {
+            format!(
+                "Archived: yes | Archived at: {}",
+                format_export_timestamp(timestamp, TimestampDisplay::Minute)
+            )
+        }
+        None => "Archived: no".to_string(),
+    }
+}
+
+fn format_export_message(message: &SessionMessage) -> String {
+    format!(
+        "[{}] {}{}\n{}",
+        message.role,
+        format_export_timestamp(message.timestamp, TimestampDisplay::Second),
+        format_export_token_suffix(message),
+        render_content_blocks_with_options(
+            &message.content,
+            ContentRenderOptions {
+                include_tool_use_id: true,
+            },
+        )
+    )
+}
+
+fn format_export_token_suffix(message: &SessionMessage) -> String {
+    match (
+        message.total_token_count(),
+        message.input_token_count,
+        message.output_token_count,
+    ) {
+        (Some(total), Some(input), Some(output)) => {
+            format!(" | {total} tokens ({input} in / {output} out)")
+        }
+        (Some(total), _, _) => format!(" | {total} tokens"),
+        (None, _, _) => String::new(),
+    }
+}
+
+fn format_export_timestamp(timestamp: u64, display: TimestampDisplay) -> String {
+    let (pattern, fallback) = match display {
+        TimestampDisplay::Minute => ("%Y-%m-%d %H:%M", "1970-01-01 00:00"),
+        TimestampDisplay::Second => ("%Y-%m-%d %H:%M:%S", "1970-01-01 00:00:00"),
+    };
+    format_timestamp(timestamp, pattern, fallback)
+}
+
+fn format_timestamp(timestamp: u64, pattern: &str, fallback: &str) -> String {
+    match Utc.timestamp_opt(timestamp as i64, 0).single() {
+        Some(value) => value.format(pattern).to_string(),
+        None => fallback.to_string(),
+    }
+}
+
 fn create_session(
     registry: &SessionRegistry,
     config: SessionConfig,
@@ -634,6 +953,18 @@ fn bad_request(message: &str) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+fn invalid_archive_filter(value: &str) -> (StatusCode, Json<ErrorBody>) {
+    bad_request(&format!(
+        "invalid archived filter '{value}'; expected one of: active, all, only"
+    ))
+}
+
+fn invalid_export_format(value: &str) -> (StatusCode, Json<ErrorBody>) {
+    bad_request(&format!(
+        "invalid export format '{value}'; expected one of: text, json"
+    ))
+}
+
 fn require_session_registry(
     state: &HttpState,
 ) -> Result<SessionRegistry, (StatusCode, Json<ErrorBody>)> {
@@ -650,8 +981,17 @@ fn session_key(id: &str) -> Result<SessionKey, (StatusCode, Json<ErrorBody>)> {
 fn map_session_error(id: &str, error: SessionError) -> (StatusCode, Json<ErrorBody>) {
     match error {
         SessionError::NotFound(_) => session_not_found(id),
+        SessionError::Corrupted { source, .. } => corrupted_session(id, &source),
+        SessionError::InvalidHistory(source) => corrupted_session(id, &source),
         other => internal_error(anyhow::Error::new(other)),
     }
+}
+
+fn map_session_history_error(
+    id: &str,
+    error: SessionHistoryError,
+) -> (StatusCode, Json<ErrorBody>) {
+    corrupted_session(id, &error)
 }
 
 fn session_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
@@ -659,6 +999,15 @@ fn session_not_found(id: &str) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::NOT_FOUND,
         Json(ErrorBody {
             error: format!("session not found: {id}"),
+        }),
+    )
+}
+
+fn corrupted_session(id: &str, error: &SessionHistoryError) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody {
+            error: format!("corrupted session '{id}': {error}"),
         }),
     )
 }
@@ -724,7 +1073,7 @@ mod tests {
             ),
         ];
 
-        let context = session_messages_to_context(&messages);
+        let context = session_messages_to_context(&messages).expect("valid context");
 
         assert_eq!(context.len(), 3);
         assert!(context
@@ -733,7 +1082,7 @@ mod tests {
             .any(|block| {
                 matches!(
                     block,
-                    ContentBlock::ToolUse { id, .. } if id == "call_good"
+                    fx_llm::ContentBlock::ToolUse { id, .. } if id == "call_good"
                 )
             }));
         assert!(!context
@@ -742,9 +1091,67 @@ mod tests {
             .any(|block| {
                 matches!(
                     block,
-                    ContentBlock::ToolUse { id, .. } if id == "call_bad"
+                    fx_llm::ContentBlock::ToolUse { id, .. } if id == "call_bad"
                 )
             }));
+    }
+
+    #[test]
+    fn session_messages_to_context_rejects_poisoned_tool_ordering() {
+        let messages = vec![
+            SessionMessage::text(SessionMessageRole::User, "first", 1),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_bad".to_string(),
+                    content: serde_json::json!("bad"),
+                    is_error: Some(false),
+                }],
+                2,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_bad".to_string(),
+                    provider_id: Some("fc_bad".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bad.txt"}),
+                }],
+                3,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_good".to_string(),
+                    provider_id: Some("fc_good".to_string()),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "good.txt"}),
+                }],
+                4,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_good".to_string(),
+                    content: serde_json::json!("ok"),
+                    is_error: Some(false),
+                }],
+                5,
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            session_messages_to_context(&messages),
+            Err(SessionHistoryError::ToolResultBeforeToolUse {
+                tool_use_id: "call_bad".to_string(),
+                message_index: 1,
+                block_index: 0,
+            })
+        );
     }
 
     #[test]

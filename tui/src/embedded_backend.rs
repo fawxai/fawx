@@ -147,12 +147,13 @@ fn handle_stream_event(
         }
         StreamEvent::ToolResult {
             id,
+            tool_name,
             output,
             is_error,
         } => {
             complete_experiment_tool(active_experiments, experiment_panel, &id);
             if !is_error {
-                send_tool_result(tx, None, output, true);
+                send_tool_result(tx, Some(tool_name), output, true);
             }
         }
         StreamEvent::ToolError { tool_name, error } => {
@@ -163,6 +164,9 @@ fn handle_stream_event(
             tracing::warn!("stream error in embedded mode: {message}");
         }
         StreamEvent::Done { .. }
+        | StreamEvent::Progress { .. }
+        | StreamEvent::Notification { .. }
+        | StreamEvent::ContextCompacted { .. }
         | StreamEvent::PhaseChange { .. }
         | StreamEvent::PermissionPrompt(_) => {}
     }
@@ -442,21 +446,26 @@ mod tests {
             .expect("test engine")
     }
 
-    fn test_router_with_provider(provider: impl CompletionProvider + 'static) -> Arc<ModelRouter> {
+    fn test_router_with_provider(
+        provider: impl CompletionProvider + 'static,
+    ) -> Arc<std::sync::RwLock<ModelRouter>> {
         let mut router = ModelRouter::new();
         router.register_provider(Box::new(provider));
         router.set_active("mock-model").expect("set active model");
-        Arc::new(router)
+        Arc::new(std::sync::RwLock::new(router))
     }
 
     fn test_subagent_manager(
-        router: Arc<ModelRouter>,
+        router: Arc<std::sync::RwLock<ModelRouter>>,
         config: &FawxConfig,
     ) -> Arc<SubagentManager> {
         let factory = HeadlessSubagentFactory::new(HeadlessSubagentFactoryDeps {
             router,
             config: config.clone(),
             improvement_provider: None,
+            session_bus: None,
+            credential_store: None,
+            token_broker: None,
         });
         Arc::new(SubagentManager::new(SubagentManagerDeps {
             factory: Arc::new(factory),
@@ -481,6 +490,17 @@ mod tests {
         HeadlessApp::new(HeadlessAppDeps {
             loop_engine: test_engine(),
             router,
+            runtime_info: Arc::new(std::sync::RwLock::new(fx_core::runtime_info::RuntimeInfo {
+                active_model: String::new(),
+                provider: String::new(),
+                skills: Vec::new(),
+                config_summary: fx_core::runtime_info::ConfigSummary {
+                    max_iterations: 3,
+                    max_history: 20,
+                    memory_enabled: false,
+                },
+                version: "test".to_string(),
+            })),
             config,
             memory: None,
             embedding_index_persistence: None,
@@ -489,6 +509,15 @@ mod tests {
             system_prompt_text: None,
             subagent_manager,
             canary_monitor: None,
+            session_bus: None,
+            session_key: None,
+            cron_store: None,
+            startup_warnings: Vec::new(),
+            stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                std::env::temp_dir().as_path(),
+            )),
+            experiment_registry: None,
         })
         .expect("headless app")
     }
@@ -558,6 +587,23 @@ mod tests {
 
     fn test_active_experiments() -> ActiveExperimentTools {
         StdMutex::new(HashSet::new())
+    }
+
+    fn assert_stream_event_ignored(event: StreamEvent) {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            event,
+        );
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -639,6 +685,7 @@ mod tests {
             &active_experiments,
             StreamEvent::ToolResult {
                 id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
                 output: "file contents".to_string(),
                 is_error: false,
             },
@@ -650,7 +697,7 @@ mod tests {
                 success,
                 content,
             } => {
-                assert!(name.is_none());
+                assert_eq!(name.as_deref(), Some("read_file"));
                 assert!(success);
                 assert_eq!(content, "file contents");
             }
@@ -688,6 +735,21 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_stream_event_ignores_metadata_only_stream_events() {
+        assert_stream_event_ignored(StreamEvent::Notification {
+            title: "Heads up".to_string(),
+            body: "done".to_string(),
+        });
+        assert_stream_event_ignored(StreamEvent::ContextCompacted {
+            tier: "soft".to_string(),
+            messages_removed: 3,
+            tokens_before: 200,
+            tokens_after: 120,
+            usage_ratio: 0.6,
+        });
     }
 
     #[test]

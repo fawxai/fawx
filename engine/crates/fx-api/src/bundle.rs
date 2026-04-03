@@ -60,9 +60,9 @@ mod tests {
 
     #[test]
     fn find_bundle_root_finds_nested_app() {
-        let path = Path::new("/Applications/Fawx.app/Contents/MacOS/fawx-server");
+        let path = Path::new("/Users/joe/Desktop/Fawx.app/Contents/MacOS/fawx-server");
         let root = find_bundle_root(path);
-        assert_eq!(root, Some(PathBuf::from("/Applications/Fawx.app")));
+        assert_eq!(root, Some(PathBuf::from("/Users/joe/Desktop/Fawx.app")));
     }
 
     #[test]

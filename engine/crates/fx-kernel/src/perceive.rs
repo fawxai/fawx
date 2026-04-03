@@ -597,7 +597,7 @@ mod tests {
         preferences.insert("tone".to_owned(), "concise".to_owned());
 
         IdentityContext {
-            user_name: Some("Example User".to_owned()),
+            user_name: Some("Alice".to_owned()),
             preferences,
             personality_traits: vec!["helpful".to_owned()],
         }

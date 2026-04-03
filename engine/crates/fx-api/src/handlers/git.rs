@@ -725,7 +725,7 @@ mod tests {
                 hash: "abcdef123456".to_string(),
                 short_hash: "abcdef1".to_string(),
                 message: "feat: add git api".to_string(),
-                author: "Example Author".to_string(),
+                author: "Alice".to_string(),
                 timestamp: "2026-03-15T20:00:00Z".to_string(),
             }],
         };
@@ -733,7 +733,7 @@ mod tests {
         let json = serde_json::to_value(response).unwrap();
 
         assert_eq!(json["commits"][0]["hash"], "abcdef123456");
-        assert_eq!(json["commits"][0]["author"], "Example Author");
+        assert_eq!(json["commits"][0]["author"], "Alice");
     }
 
     #[test]
@@ -779,14 +779,14 @@ mod tests {
     #[test]
     fn parse_log_line() {
         let commit = super::parse_log_line(
-            "abcdef123456|abcdef1|feat: support pipes | in messages|Example Author|2026-03-15T20:00:00Z",
+            "abcdef123456|abcdef1|feat: support pipes | in messages|Alice|2026-03-15T20:00:00Z",
         )
         .unwrap();
 
         assert_eq!(commit.hash, "abcdef123456");
         assert_eq!(commit.short_hash, "abcdef1");
         assert_eq!(commit.message, "feat: support pipes | in messages");
-        assert_eq!(commit.author, "Example Author");
+        assert_eq!(commit.author, "Alice");
     }
 
     #[test]

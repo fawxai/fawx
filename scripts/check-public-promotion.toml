@@ -25,13 +25,8 @@ allowlist = [
   "TASTE.md",
   "DOCTRINE.md",
   "docs/README.md",
-  "docs/SPEC.md",
   "docs/WASM_SKILLS.md",
-  "docs/assets/**",
-  "docs/architecture/**",
-  "docs/decisions/**",
   "docs/legal/**",
-  "docs/oss-extraction-checklist.md",
 ]
 
 blocklist = [
@@ -52,6 +47,11 @@ blocklist = [
   "scripts/build-dmg.sh",
   "scripts/build-dmg-config.example.sh",
   "scripts/release.sh",
+  "docs/architecture/**",
+  "docs/assets/**",
+  "docs/decisions/**",
+  "docs/SPEC.md",
+  "docs/oss-extraction-checklist.md",
   "scripts/imported/**",
   "scripts/squad/**",
   ".github/workflows/android-atomic-nightly.yml",

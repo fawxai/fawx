@@ -13,6 +13,7 @@ use tempfile::TempDir;
 enum TestError {
     Io(std::io::Error),
     Toml(toml::de::Error),
+    TomlSerialize(toml::ser::Error),
     Validation(String),
 }
 
@@ -21,6 +22,7 @@ impl std::fmt::Display for TestError {
         match self {
             TestError::Io(e) => write!(f, "IO error: {e}"),
             TestError::Toml(e) => write!(f, "TOML parse error: {e}"),
+            TestError::TomlSerialize(e) => write!(f, "TOML serialize error: {e}"),
             TestError::Validation(msg) => write!(f, "Validation error: {msg}"),
         }
     }
@@ -35,6 +37,12 @@ impl From<std::io::Error> for TestError {
 impl From<toml::de::Error> for TestError {
     fn from(e: toml::de::Error) -> Self {
         TestError::Toml(e)
+    }
+}
+
+impl From<toml::ser::Error> for TestError {
+    fn from(e: toml::ser::Error) -> Self {
+        TestError::TomlSerialize(e)
     }
 }
 
@@ -85,6 +93,8 @@ struct Expectations {
     #[serde(default)]
     tool_calls: Option<Vec<String>>,
     #[serde(default)]
+    tool_input_contains: Option<Vec<String>>,
+    #[serde(default)]
     output_contains: Option<Vec<String>>,
     #[serde(default)]
     output_not_contains: Option<Vec<String>>,
@@ -96,8 +106,25 @@ struct Expectations {
 #[derive(Debug, Default)]
 struct FawxOutput {
     tool_calls: Vec<String>,
+    tool_inputs: Vec<String>,
     response_text: String,
     tool_errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadlessJsonOutput {
+    response: String,
+    #[serde(default)]
+    tool_calls: Vec<String>,
+    #[serde(default)]
+    tool_inputs: Vec<String>,
+    #[serde(default)]
+    tool_errors: Vec<String>,
+}
+
+struct ScenarioRuntime {
+    work_dir: TempDir,
+    data_dir: TempDir,
 }
 
 /// Result of running a single scenario.
@@ -176,6 +203,66 @@ fn setup_temp_dir(setup: &SetupConfig) -> Result<TempDir, TestError> {
     Ok(tmp)
 }
 
+const SCENARIO_DATA_FILES: &[&str] = &[
+    "config.toml",
+    "auth.db",
+    ".auth-salt",
+    "credentials.db",
+    ".credentials-salt",
+];
+
+fn prepare_scenario_runtime(setup: &SetupConfig) -> Result<ScenarioRuntime, TestError> {
+    let work_dir = setup_temp_dir(setup)?;
+    let data_dir = prepare_data_dir(work_dir.path())?;
+    Ok(ScenarioRuntime { work_dir, data_dir })
+}
+
+fn prepare_data_dir(work_dir: &Path) -> Result<TempDir, TestError> {
+    let data_dir = TempDir::new()?;
+    copy_runtime_state(&source_data_dir()?, data_dir.path())?;
+    patch_runtime_config(data_dir.path(), work_dir)?;
+    Ok(data_dir)
+}
+
+fn source_data_dir() -> Result<PathBuf, TestError> {
+    if let Ok(path) = std::env::var("FAWX_TEST_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| TestError::Validation("HOME not set; set FAWX_TEST_DATA_DIR".to_string()))?;
+    Ok(PathBuf::from(home).join(".fawx"))
+}
+
+fn copy_runtime_state(source: &Path, dest: &Path) -> Result<(), TestError> {
+    for name in SCENARIO_DATA_FILES {
+        let src = source.join(name);
+        if src.exists() {
+            std::fs::copy(&src, dest.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn patch_runtime_config(data_dir: &Path, work_dir: &Path) -> Result<(), TestError> {
+    let config_path = data_dir.join("config.toml");
+    let config_text = std::fs::read_to_string(&config_path)?;
+    let mut config: toml::Value = toml::from_str(&config_text)?;
+    let table = config
+        .as_table_mut()
+        .ok_or_else(|| TestError::Validation("config.toml must be a table".to_string()))?;
+    let tools = table
+        .entry("tools")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| TestError::Validation("[tools] must be a table".to_string()))?;
+    tools.insert(
+        "working_dir".to_string(),
+        toml::Value::String(work_dir.display().to_string()),
+    );
+    std::fs::write(config_path, toml::to_string(&config)?)?;
+    Ok(())
+}
+
 // ── Fawx subprocess ─────────────────────────────────────────────────────────
 
 fn find_fawx_binary() -> Result<PathBuf, TestError> {
@@ -208,12 +295,21 @@ fn spawn_fawx(
     bin: &Path,
     prompt: &str,
     work_dir: &Path,
+    data_dir: &Path,
     timeout: u64,
 ) -> Result<FawxOutput, TestError> {
     let mut child = Command::new(bin)
-        .args(["serve", "--single", "--json"])
-        .env("FAWX_PROMPT", prompt)
+        .args([
+            "serve",
+            "--single",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().ok_or_else(|| {
+                TestError::Validation("data dir path must be valid UTF-8".to_string())
+            })?,
+        ])
         .current_dir(work_dir)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -223,6 +319,7 @@ fn spawn_fawx(
                 format!("failed to spawn fawx: {e}"),
             ))
         })?;
+    write_json_input(&mut child, prompt)?;
 
     let status = wait_with_timeout(&mut child, timeout)?;
 
@@ -242,6 +339,16 @@ fn spawn_fawx(
     }
 
     parse_fawx_output(&stdout)
+}
+
+fn write_json_input(child: &mut std::process::Child, prompt: &str) -> Result<(), TestError> {
+    let payload = format!("{}\n", serde_json::json!({ "message": prompt }));
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| TestError::Validation("fawx stdin unavailable".to_string()))?;
+    stdin.write_all(payload.as_bytes())?;
+    Ok(())
 }
 
 fn wait_with_timeout(
@@ -268,37 +375,22 @@ fn wait_with_timeout(
 }
 
 fn parse_fawx_output(raw: &str) -> Result<FawxOutput, TestError> {
-    let mut output = FawxOutput::default();
-
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            match value.get("type").and_then(|t| t.as_str()) {
-                Some("tool_call") => {
-                    if let Some(name) = value.get("name").and_then(|n| n.as_str()) {
-                        output.tool_calls.push(name.to_string());
-                    }
-                }
-                Some("response") => {
-                    if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
-                        output.response_text.push_str(text);
-                    }
-                }
-                Some("tool_error") => {
-                    let msg = value
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown tool error");
-                    output.tool_errors.push(msg.to_string());
-                }
-                _ => {} // Ignore unknown event types
-            }
-        }
-    }
-    Ok(output)
+    let line = raw
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| TestError::Validation("fawx emitted no JSON output".to_string()))?;
+    let output: HeadlessJsonOutput = serde_json::from_str(line).map_err(|e| {
+        TestError::Validation(format!(
+            "failed to parse fawx JSON output: {e}; raw={raw:?}"
+        ))
+    })?;
+    Ok(FawxOutput {
+        tool_calls: output.tool_calls,
+        tool_inputs: output.tool_inputs,
+        response_text: output.response,
+        tool_errors: output.tool_errors,
+    })
 }
 
 // ── Expectation checking ────────────────────────────────────────────────────
@@ -307,6 +399,7 @@ fn check_expectations(output: &FawxOutput, expect: &Expectations) -> Vec<String>
     let mut failures = Vec::new();
 
     check_tool_calls(output, expect, &mut failures);
+    check_tool_input_contains(output, expect, &mut failures);
     check_output_contains(output, expect, &mut failures);
     check_output_not_contains(output, expect, &mut failures);
     check_no_tool_errors(output, expect, &mut failures);
@@ -322,6 +415,23 @@ fn check_tool_calls(output: &FawxOutput, expect: &Expectations, failures: &mut V
                 failures.push(format!(
                     "Expected tool_calls to include \"{tool}\", got: {:?}",
                     output.tool_calls
+                ));
+            }
+        }
+    }
+}
+
+fn check_tool_input_contains(
+    output: &FawxOutput,
+    expect: &Expectations,
+    failures: &mut Vec<String>,
+) {
+    if let Some(patterns) = &expect.tool_input_contains {
+        let joined_inputs = output.tool_inputs.join("\n").to_lowercase();
+        for pattern in patterns {
+            if !joined_inputs.contains(&pattern.to_lowercase()) {
+                failures.push(format!(
+                    "Expected tool inputs to contain \"{pattern}\", not found"
                 ));
             }
         }
@@ -393,11 +503,12 @@ fn run_scenario(scenario: &ScenarioFile, fawx_bin: &Path) -> ScenarioResult {
 }
 
 fn run_scenario_inner(scenario: &ScenarioFile, fawx_bin: &Path) -> Result<Vec<String>, TestError> {
-    let tmp = setup_temp_dir(&scenario.setup)?;
+    let runtime = prepare_scenario_runtime(&scenario.setup)?;
     let output = spawn_fawx(
         fawx_bin,
         &scenario.input.prompt,
-        tmp.path(),
+        runtime.work_dir.path(),
+        runtime.data_dir.path(),
         scenario.scenario.timeout_seconds,
     )?;
     Ok(check_expectations(&output, &scenario.expect))
@@ -637,12 +748,14 @@ prompt = ""
     fn check_expectations_passes_on_match() {
         let output = FawxOutput {
             tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
             response_text: "The file contains hello world".to_string(),
             tool_errors: vec![],
         };
 
         let expect = Expectations {
             tool_calls: Some(vec!["read_file".to_string()]),
+            tool_input_contains: Some(vec!["readme".to_string()]),
             output_contains: Some(vec!["hello world".to_string()]),
             output_not_contains: Some(vec!["error".to_string()]),
             no_tool_errors: Some(true),
@@ -659,19 +772,21 @@ prompt = ""
     fn check_expectations_fails_on_mismatch() {
         let output = FawxOutput {
             tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
             response_text: "Something went wrong".to_string(),
             tool_errors: vec!["file not found".to_string()],
         };
 
         let expect = Expectations {
             tool_calls: Some(vec!["memory_write".to_string()]),
+            tool_input_contains: Some(vec!["blue".to_string()]),
             output_contains: Some(vec!["hello".to_string()]),
             output_not_contains: Some(vec!["wrong".to_string()]),
             no_tool_errors: Some(true),
         };
 
         let failures = check_expectations(&output, &expect);
-        assert_eq!(failures.len(), 4);
+        assert_eq!(failures.len(), 5);
     }
 
     #[test]
@@ -702,12 +817,14 @@ prompt = ""
     fn output_contains_is_case_insensitive() {
         let output = FawxOutput {
             tool_calls: vec![],
+            tool_inputs: vec![],
             response_text: "Hello World".to_string(),
             tool_errors: vec![],
         };
 
         let expect = Expectations {
             tool_calls: None,
+            tool_input_contains: None,
             output_contains: Some(vec!["hello world".to_string()]),
             output_not_contains: None,
             no_tool_errors: None,
@@ -722,12 +839,14 @@ prompt = ""
         // Also check that uppercase pattern matches lowercase output
         let output2 = FawxOutput {
             tool_calls: vec![],
+            tool_inputs: vec![],
             response_text: "hello world".to_string(),
             tool_errors: vec![],
         };
 
         let expect2 = Expectations {
             tool_calls: None,
+            tool_input_contains: None,
             output_contains: Some(vec!["Hello World".to_string()]),
             output_not_contains: None,
             no_tool_errors: None,
@@ -738,5 +857,44 @@ prompt = ""
             failures2.is_empty(),
             "Case-insensitive match should pass (reverse), got: {failures2:?}"
         );
+    }
+
+    #[test]
+    fn parse_fawx_output_reads_headless_json_envelope() {
+        let raw = r#"{"response":"hello","tool_calls":["read_file"],"tool_errors":["missing"]}"#;
+
+        let output = parse_fawx_output(raw).unwrap();
+
+        assert_eq!(output.response_text, "hello");
+        assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert!(output.tool_inputs.is_empty());
+        assert_eq!(output.tool_errors, vec!["missing"]);
+    }
+
+    #[test]
+    fn spawn_fawx_writes_json_input_to_stdin() {
+        let dir = TempDir::new().unwrap();
+        let capture_path = dir.path().join("input.json");
+        let script_path = dir.path().join("mock-fawx.sh");
+        let script = format!(
+            "#!/bin/sh\ncat > \"{}\"\nprintf '%s\\n' '{}' \n",
+            capture_path.display(),
+            r#"{"response":"ok","tool_calls":["read_file"],"tool_errors":[]}"#
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let output = spawn_fawx(&script_path, "hello world", dir.path(), dir.path(), 5).unwrap();
+        let captured = fs::read_to_string(capture_path).unwrap();
+
+        assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert!(output.tool_inputs.is_empty());
+        assert_eq!(captured.trim(), r#"{"message":"hello world"}"#);
     }
 }

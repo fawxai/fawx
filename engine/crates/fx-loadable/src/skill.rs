@@ -5,9 +5,10 @@
 //! which dispatches tool calls to the appropriate skill.
 
 use async_trait::async_trait;
-use fx_kernel::act::ToolCacheability;
+use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
-use fx_llm::ToolDefinition;
+use fx_kernel::ToolAuthoritySurface;
+use fx_llm::{ToolCall, ToolDefinition};
 
 /// Error type for skill execution failures.
 ///
@@ -46,6 +47,24 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         let _ = tool_name;
         ToolCacheability::NeverCache
+    }
+
+    /// Permission/ripcord category for the given tool name.
+    fn action_category(&self, tool_name: &str) -> &'static str {
+        let _ = tool_name;
+        "unknown"
+    }
+
+    /// Authority-relevant surface for the given tool call.
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        let _ = call;
+        ToolAuthoritySurface::Other
+    }
+
+    /// Extract a ripcord journal action for a material tool call.
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        let _ = (call, result);
+        None
     }
 
     /// Execute a tool call by name.
@@ -121,6 +140,26 @@ mod tests {
         assert_eq!(skill.cacheability("greet"), ToolCacheability::NeverCache);
     }
 
+    #[test]
+    fn skill_default_metadata_is_inert() {
+        let skill = TestSkill;
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "greet".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "hello".to_string(),
+        };
+
+        assert_eq!(skill.action_category("greet"), "unknown");
+        assert_eq!(skill.authority_surface(&call), ToolAuthoritySurface::Other);
+        assert_eq!(skill.journal_action(&call, &result), None);
+    }
+
     #[tokio::test]
     async fn mock_skill_handles_known_call() {
         let skill = TestSkill;
@@ -168,6 +207,9 @@ mod tests {
         //   - name(&self) -> &str
         //   - tool_definitions(&self) -> Vec<ToolDefinition>
         //   - cacheability(&self, &str) -> ToolCacheability
+        //   - action_category(&self, &str) -> &'static str
+        //   - journal_action(&self, &ToolCall, &ToolResult)
+        //       -> Option<JournalAction>
         //   - execute(&self, &str, &str, Option<&CancellationToken>)
         //       -> Option<Result<String, SkillError>>
         //

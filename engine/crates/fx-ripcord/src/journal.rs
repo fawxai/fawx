@@ -1,7 +1,8 @@
 use crate::snapshot::SnapshotStore;
+pub use fx_kernel::act::JournalAction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -42,64 +43,6 @@ pub struct JournalEntry {
     pub tool_call_id: String,
     pub action: JournalAction,
     pub reversible: bool,
-}
-
-/// The specific action that was journaled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum JournalAction {
-    FileWrite {
-        path: PathBuf,
-        snapshot_hash: Option<String>,
-        size_bytes: u64,
-        created: bool,
-    },
-    FileDelete {
-        path: PathBuf,
-        snapshot_hash: String,
-    },
-    FileMove {
-        from: PathBuf,
-        to: PathBuf,
-    },
-    GitCommit {
-        repo: PathBuf,
-        pre_ref: String,
-        commit_sha: String,
-    },
-    GitBranchCreate {
-        repo: PathBuf,
-        branch: String,
-    },
-    GitPush {
-        repo: PathBuf,
-        remote: String,
-        branch: String,
-        pre_ref: String,
-    },
-    ShellCommand {
-        command: String,
-        exit_code: i32,
-    },
-    NetworkRequest {
-        url: String,
-        method: String,
-        status_code: u16,
-    },
-}
-
-impl JournalAction {
-    /// Whether this action type can be mechanically reversed.
-    pub fn is_reversible(&self) -> bool {
-        matches!(
-            self,
-            Self::FileWrite { .. }
-                | Self::FileDelete { .. }
-                | Self::FileMove { .. }
-                | Self::GitCommit { .. }
-                | Self::GitBranchCreate { .. }
-        )
-    }
 }
 
 impl RipcordJournal {

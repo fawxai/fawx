@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn create_device_returns_hashed_token() {
         let mut store = DeviceStore::new();
-        let (raw_token, device) = store.create_device("Example MacBook");
+        let (raw_token, device) = store.create_device("Alice's MacBook");
 
         assert!(raw_token.starts_with(DEVICE_TOKEN_PREFIX));
         assert_eq!(
@@ -235,18 +235,18 @@ mod tests {
     #[test]
     fn list_device_info_excludes_token_hash() {
         let mut store = DeviceStore::new();
-        let _ = store.create_device("Example MacBook");
+        let _ = store.create_device("Alice's MacBook");
 
         let json = serde_json::to_value(store.list_device_info()).expect("serialize device info");
 
         assert!(json[0].get("token_hash").is_none());
-        assert_eq!(json[0]["device_name"], "Example MacBook");
+        assert_eq!(json[0]["device_name"], "Alice's MacBook");
     }
 
     #[test]
     fn authenticate_works() {
         let mut store = DeviceStore::new();
-        let (raw_token, device) = store.create_device("Example MacBook");
+        let (raw_token, device) = store.create_device("Alice's MacBook");
         store.list_devices_mut()[0].last_used_at = 0;
 
         assert_eq!(store.authenticate(&raw_token), Some(device.id));
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn revoke_invalidates_device() {
         let mut store = DeviceStore::new();
-        let (raw_token, device) = store.create_device("Example MacBook");
+        let (raw_token, device) = store.create_device("Alice's MacBook");
 
         assert_eq!(store.revoke(&device.id), Some(device.clone()));
         assert!(store.revoke(&device.id).is_none());
@@ -269,7 +269,7 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("devices.json");
         let mut store = DeviceStore::new();
-        let (raw_token, _) = store.create_device("Example MacBook");
+        let (raw_token, _) = store.create_device("Alice's MacBook");
 
         store.save(&path).expect("save device store");
         let mut loaded = DeviceStore::load(&path);
@@ -286,7 +286,7 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("devices.json");
         let mut store = DeviceStore::new();
-        let _ = store.create_device("Example MacBook");
+        let _ = store.create_device("Alice's MacBook");
 
         store.save(&path).expect("save device store");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
@@ -302,7 +302,7 @@ mod tests {
             devices: vec![DeviceToken {
                 id: "dev-123".to_string(),
                 token_hash: "hash".to_string(),
-                device_name: "Example MacBook".to_string(),
+                device_name: "Alice's MacBook".to_string(),
                 created_at: 1_700_000_000_000,
                 last_used_at: 1_700_000_005_000,
             }],

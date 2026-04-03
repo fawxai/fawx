@@ -45,8 +45,8 @@ mod tests {
 
     fn sample_identity() -> FleetIdentity {
         FleetIdentity {
-            node_id: "node-a-a1b2c3".to_string(),
-            primary_endpoint: "http://203.0.113.20:8400".to_string(),
+            node_id: "build-node-a1b2c3".to_string(),
+            primary_endpoint: "http://192.0.2.1:8400".to_string(),
             bearer_token: "tok_secret_123".to_string(),
             registered_at_ms: 12345,
         }

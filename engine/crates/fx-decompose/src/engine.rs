@@ -148,16 +148,19 @@ fn push_fitness_stats(lines: &mut Vec<String>, stats: &crate::context::FitnessSt
 mod tests {
     use super::*;
     use crate::AggregationStrategy;
+    use crate::SubGoalContract;
     use fx_core::signals::{LoopStep, SignalKind};
 
     fn simple_plan(count: usize) -> DecompositionPlan {
         DecompositionPlan {
             sub_goals: (0..count)
-                .map(|index| SubGoal {
-                    description: format!("Goal {index}"),
-                    required_tools: vec![],
-                    expected_output: None,
-                    complexity_hint: Some(ComplexityHint::Moderate),
+                .map(|index| {
+                    SubGoal::new(
+                        format!("Goal {index}"),
+                        vec![],
+                        SubGoalContract::default(),
+                        Some(ComplexityHint::Moderate),
+                    )
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,

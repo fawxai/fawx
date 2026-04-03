@@ -955,6 +955,7 @@ mod tests {
         fs::write(proposals_dir.join(format!("{stem}.md")), markdown).expect("write markdown");
         let sidecar = ProposalSidecar {
             version: 1,
+            action: "write_file".to_string(),
             timestamp: parse_timestamp(stem),
             title: format!("Update {}", target_path.display()),
             description: description.to_string(),
@@ -1223,18 +1224,18 @@ mod tests {
     }
 
     #[test]
-    fn approve_rejects_tier3_targets() {
+    fn approve_rejects_sovereign_targets() {
         let temp = TempDir::new().expect("tempdir");
         let proposals_dir = temp.path().join("proposals");
         fs::create_dir_all(&proposals_dir).expect("create proposals dir");
-        let stem = format!("{}-kernel", epoch_seconds());
+        let stem = format!("{}-ripcord", epoch_seconds());
         write_sidecar_proposal(
             &proposals_dir,
             &stem,
-            Path::new("engine/crates/fx-kernel/src/lib.rs"),
+            Path::new("engine/crates/fx-ripcord/src/lib.rs"),
             "bad",
             None,
-            "kernel write",
+            "sovereign write",
         );
         let id = proposal_id_for(&stem);
 
@@ -1253,15 +1254,22 @@ mod tests {
     }
 
     #[test]
-    fn approve_rejects_absolute_tier3_targets() {
+    fn approve_rejects_absolute_sovereign_targets() {
         let temp = TempDir::new().expect("tempdir");
         let working_dir = temp.path().join("repo");
         let proposals_dir = temp.path().join("proposals");
-        let target = working_dir.join("engine/crates/fx-kernel/src/lib.rs");
+        let target = working_dir.join("engine/crates/fx-ripcord/src/lib.rs");
         fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
         fs::create_dir_all(&proposals_dir).expect("create proposals dir");
-        let stem = format!("{}-kernel-absolute", epoch_seconds());
-        write_sidecar_proposal(&proposals_dir, &stem, &target, "bad", None, "kernel write");
+        let stem = format!("{}-ripcord-absolute", epoch_seconds());
+        write_sidecar_proposal(
+            &proposals_dir,
+            &stem,
+            &target,
+            "bad",
+            None,
+            "sovereign write",
+        );
         let id = proposal_id_for(&stem);
 
         let output = approve_pending(

@@ -20,6 +20,7 @@
 //! - **ab_slots** — A/B slot lifecycle (pending → active → fallback)
 
 pub mod builtin;
+pub mod lifecycle;
 pub mod loader;
 pub mod notify_skill;
 pub mod registry;
@@ -39,6 +40,12 @@ pub(crate) mod strategies;
 pub(crate) mod templates;
 
 pub use builtin::BuiltinSkill;
+pub use lifecycle::{
+    find_revision_snapshot_dir, read_activation_record, read_revision_source_metadata,
+    read_statuses as read_skill_statuses, revision_snapshot_dir, write_source_metadata,
+    SignatureStatus, SkillActivation, SkillLifecycleConfig, SkillLifecycleManager, SkillRevision,
+    SkillSource, SkillStatusSummary, SOURCE_METADATA_FILE,
+};
 pub use loader::{SkillLoader, SkillManifest};
 pub use notify_skill::{NotificationSender, NotifySkill};
 pub use registry::SkillRegistry;

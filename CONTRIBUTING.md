@@ -130,8 +130,8 @@ Fawx skills are WASM modules that extend the engine's capabilities. To create
 a new skill:
 
 1. Use the skill template: `cargo generate fawxai/skill-template`
-2. Implement the `Skill` trait
-3. Test locally with `fawx skill install --path ./target/wasm32-wasi/release/`
+2. Build and install locally with `fawx skill build .`
+3. Test a prebuilt artifact with `fawx skill install ./target/wasm32-wasip1/release/<skill>.wasm`
 4. Publish to the marketplace (coming soon)
 
 See [docs/skills/](docs/skills/) for the full SDK reference.

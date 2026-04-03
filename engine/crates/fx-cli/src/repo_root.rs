@@ -19,7 +19,7 @@ pub(crate) fn resolve_repo_root(current_dir: &Path, current_exe: &Path) -> anyho
         })
 }
 
-fn find_repo_root(current_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_repo_root(current_dir: &Path) -> Option<PathBuf> {
     current_dir
         .ancestors()
         .find(|path| is_repo_root(path))

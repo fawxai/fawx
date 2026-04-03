@@ -7,43 +7,21 @@
 //! executing; writes to allow-tier paths pass through.
 
 use crate::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
+    ToolExecutor, ToolExecutorError, ToolResult,
+};
+use crate::authority::{
+    AuthorityCoordinator, AuthorityDecision, AuthorityVerdict, ToolAuthoritySurface,
 };
 use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
-use fx_core::self_modify::{classify_path, PathTier, SelfModifyConfig};
+use fx_core::self_modify::{classify_write_domain, SelfModifyConfig, WriteDomain};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Tool names that represent write operations subject to gating.
-const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "git_checkpoint"];
-
-/// Tier 3 immutable paths — blocked regardless of configuration.
-/// These are compiled kernel invariants that cannot be overridden.
-const TIER3_PATHS: &[&str] = &[
-    "engine/crates/fx-kernel/",
-    "engine/crates/fx-auth/src/crypto/",
-    ".github/",
-    "fawx-ripcord/",
-    "tests/invariant/",
-    "prompt-ledger/",
-    "snapshots/",
-];
-
-/// Kernel-blind paths — blocked for agent read access when enforcement is on.
-/// These are compiled invariants and cannot be overridden.
-const KERNEL_BLIND_PATHS: &[&str] = &[
-    "engine/crates/fx-kernel/",
-    "engine/crates/fx-auth/",
-    "engine/crates/fx-security/",
-    "engine/crates/fx-consensus/",
-    "fawx-ripcord/",
-    "tests/invariant/",
-];
 
 /// An approved proposal that allows writes to specific paths.
 #[derive(Debug, Clone)]
@@ -83,6 +61,22 @@ impl ProposalGateState {
     pub fn clear_active_proposal(&mut self) {
         self.active = None;
     }
+
+    pub(crate) fn active_proposal(&self) -> Option<&ActiveProposal> {
+        self.active.as_ref()
+    }
+
+    pub(crate) fn config(&self) -> &SelfModifyConfig {
+        &self.config
+    }
+
+    pub(crate) fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+
+    pub(crate) fn proposals_dir(&self) -> &Path {
+        &self.proposals_dir
+    }
 }
 
 /// A `ToolExecutor` wrapper that enforces the self-modification proposal gate.
@@ -98,16 +92,13 @@ impl ProposalGateState {
 #[derive(Debug)]
 pub struct ProposalGateExecutor<T: ToolExecutor> {
     inner: T,
-    state: std::sync::Mutex<ProposalGateState>,
+    authority: Arc<AuthorityCoordinator>,
 }
 
 impl<T: ToolExecutor> ProposalGateExecutor<T> {
     #[must_use]
-    pub fn new(inner: T, state: ProposalGateState) -> Self {
-        Self {
-            inner,
-            state: std::sync::Mutex::new(state),
-        }
+    pub fn new(inner: T, authority: Arc<AuthorityCoordinator>) -> Self {
+        Self { inner, authority }
     }
 }
 
@@ -121,53 +112,8 @@ enum GateDecision {
     Propose(ToolResult),
 }
 
-fn is_write_tool(name: &str) -> bool {
-    WRITE_TOOLS.contains(&name)
-}
-
 pub fn is_tier3_path(relative_path: &str) -> bool {
-    let normalized = normalize_relative(relative_path);
-    TIER3_PATHS
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-}
-
-pub fn is_kernel_blind_path(relative_path: &str) -> bool {
-    let normalized = normalize_relative(relative_path);
-    KERNEL_BLIND_PATHS
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-}
-
-fn is_kernel_blind_enforced() -> bool {
-    cfg!(feature = "kernel-blind")
-}
-
-fn normalize_relative(path: &str) -> String {
-    let unified = path.replace('\\', "/");
-    // Strip leading ./ prefix
-    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
-    // Strip leading / (absolute paths treated as relative to working dir)
-    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
-    // Collapse ../ segments
-    let mut parts: Vec<&str> = Vec::new();
-    for segment in stripped.split('/') {
-        match segment {
-            "" | "." => continue,
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
-}
-
-fn extract_path_argument(call: &ToolCall) -> Option<String> {
-    call.arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
+    classify_write_domain(Path::new(relative_path), Path::new(".")) == WriteDomain::Sovereign
 }
 
 fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
@@ -220,6 +166,7 @@ fn build_proposal(
     file_hash: Option<String>,
 ) -> Result<Proposal, String> {
     Ok(Proposal {
+        action: call.name.clone(),
         title: format!("Write to {path}"),
         description: format!("Agent requested {tool} on {path}", tool = call.name),
         target_path: PathBuf::from(path),
@@ -326,192 +273,144 @@ fn replace_exact_match(content: &str, start: usize, old_text: &str, new_text: &s
     updated
 }
 
-fn classify_and_gate(
-    call: &ToolCall,
-    config: &SelfModifyConfig,
-    working_dir: &Path,
-    proposals_dir: &Path,
-    active: &Option<ActiveProposal>,
-) -> GateDecision {
-    if let Some(decision) = classify_read_call(call) {
-        return decision;
-    }
-    if let Some(decision) = classify_shell_blind(call) {
-        return decision;
-    }
-    classify_write_call(call, config, working_dir, proposals_dir, active)
-}
-
-fn classify_read_call(call: &ToolCall) -> Option<GateDecision> {
-    if !is_kernel_blind_enforced() {
-        return None;
-    }
-
-    let is_read_tool = matches!(
-        call.name.as_str(),
-        "read_file" | "search_text" | "list_directory"
-    );
-    if !is_read_tool {
-        return None;
-    }
-
-    let Some(path) = extract_path_argument(call) else {
-        return Some(GateDecision::PassThrough);
-    };
-
-    if is_kernel_blind_path(&path) {
-        return Some(GateDecision::Block(blind_read_result(call)));
-    }
-
-    Some(GateDecision::PassThrough)
-}
-
-#[cfg_attr(not(feature = "kernel-blind"), allow(dead_code))]
-fn classify_shell_blind(call: &ToolCall) -> Option<GateDecision> {
-    if !is_kernel_blind_enforced() {
-        return None;
-    }
-    if !matches!(call.name.as_str(), "shell" | "bash" | "execute_command") {
-        return None;
-    }
-    let command = call
-        .arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)?;
-
-    if shell_targets_kernel_path(command) {
-        return Some(GateDecision::Block(blind_read_result(call)));
-    }
-    None
-}
-
-#[cfg_attr(not(feature = "kernel-blind"), allow(dead_code))]
-fn shell_targets_kernel_path(command: &str) -> bool {
-    let read_commands = ["cat ", "head ", "tail ", "less ", "more ", "bat "];
-    let search_commands = ["grep ", "rg ", "ag ", "find "];
-    let git_commands = ["git show ", "git log -p", "git diff ", "git blame "];
-    let re_tools = [
-        "strings ", "objdump ", "otool ", "nm ", "readelf ", "hexdump ", "xxd ",
-    ];
-
-    for cmd_prefix in read_commands
-        .iter()
-        .chain(search_commands.iter())
-        .chain(git_commands.iter())
-        .chain(re_tools.iter())
-    {
-        if command.contains(cmd_prefix) {
-            for path in KERNEL_BLIND_PATHS {
-                if command.contains(path) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    if command.contains("/proc/self/exe") || command.contains("/proc/self/maps") {
-        return true;
-    }
-
-    false
-}
-
-fn classify_write_call(
-    call: &ToolCall,
-    config: &SelfModifyConfig,
-    working_dir: &Path,
-    proposals_dir: &Path,
-    active: &Option<ActiveProposal>,
-) -> GateDecision {
-    if !is_write_tool(&call.name) {
-        return GateDecision::PassThrough;
-    }
-
-    let Some(path) = extract_path_argument(call) else {
-        return GateDecision::PassThrough;
-    };
-
-    // Tier 3 always blocked — compiled kernel invariant that cannot be
-    // disabled by config or overridden by active proposals.
-    if is_tier3_path(&path) {
-        return GateDecision::Block(blocked_result(
-            call,
-            &path,
-            "Tier 3 immutable path (kernel invariant).",
-        ));
-    }
-
-    // Active proposal covers this path → allow
-    if covers_path(active, &path) {
-        return GateDecision::PassThrough;
-    }
-
-    let tier = classify_path(Path::new(&path), working_dir, config);
-    apply_tier(call, &path, tier, working_dir, proposals_dir)
-}
-
-fn covers_path(active: &Option<ActiveProposal>, path: &str) -> bool {
-    let Some(proposal) = active else {
-        return false;
-    };
-    // Reject expired proposals
-    if let Some(expires) = proposal.expires_at {
-        if epoch_seconds() > expires {
-            return false;
-        }
-    }
-    let normalized = normalize_relative(path);
-    proposal
-        .allowed_paths
-        .iter()
-        .any(|p| normalize_relative(&p.to_string_lossy()) == normalized)
-}
-
-fn apply_tier(
-    call: &ToolCall,
-    path: &str,
-    tier: PathTier,
-    working_dir: &Path,
-    proposals_dir: &Path,
-) -> GateDecision {
-    match tier {
-        PathTier::Allow => GateDecision::PassThrough,
-        PathTier::Deny => {
-            GateDecision::Block(blocked_result(call, path, "Path is in the deny tier."))
-        }
-        PathTier::Propose => create_proposal_decision(call, path, working_dir, proposals_dir),
-    }
-}
-
 fn create_proposal_decision(
     call: &ToolCall,
-    path: &str,
+    decision: &AuthorityDecision,
     working_dir: &Path,
     proposals_dir: &Path,
 ) -> GateDecision {
-    let file_hash = match current_file_hash(working_dir, Path::new(path)) {
-        Ok(hash) => hash,
-        Err(err) => {
+    let proposal = match build_authority_proposal(call, decision, working_dir) {
+        Ok(proposal) => proposal,
+        Err(error) => {
             return GateDecision::Block(blocked_result(
                 call,
-                path,
-                &format!("Failed to inspect target file: {err}"),
+                &decision.request.target_summary,
+                &error,
             ));
         }
     };
-
-    let proposal = match build_proposal(call, path, working_dir, file_hash) {
-        Ok(proposal) => proposal,
-        Err(error) => return GateDecision::Block(blocked_result(call, path, &error)),
-    };
     let writer = ProposalWriter::new(proposals_dir.to_path_buf());
     match writer.write(&proposal) {
-        Ok(proposal_path) => GateDecision::Propose(proposal_result(call, path, &proposal_path)),
+        Ok(proposal_path) => GateDecision::Propose(proposal_result(
+            call,
+            &decision.request.target_summary,
+            &proposal_path,
+        )),
         Err(err) => GateDecision::Block(blocked_result(
             call,
-            path,
+            &decision.request.target_summary,
             &format!("Failed to create proposal: {err}"),
         )),
+    }
+}
+
+fn build_authority_proposal(
+    call: &ToolCall,
+    decision: &AuthorityDecision,
+    working_dir: &Path,
+) -> Result<Proposal, String> {
+    match call.name.as_str() {
+        "git_checkpoint" => build_git_checkpoint_proposal(call, decision, working_dir),
+        _ => {
+            let path = decision
+                .request
+                .paths
+                .first()
+                .ok_or_else(|| "Missing proposal target path.".to_string())?;
+            let file_hash = current_file_hash(working_dir, Path::new(path))
+                .map_err(|error| format!("Failed to inspect target file: {error}"))?;
+            build_proposal(call, path, working_dir, file_hash)
+        }
+    }
+}
+
+fn build_git_checkpoint_proposal(
+    call: &ToolCall,
+    decision: &AuthorityDecision,
+    working_dir: &Path,
+) -> Result<Proposal, String> {
+    let message = required_string_argument(call, "message")?;
+    let diff = git_checkpoint_diff(working_dir)?;
+    Ok(Proposal {
+        action: "git_checkpoint".to_string(),
+        title: format!("Git checkpoint: {message}"),
+        description: format!(
+            "Agent requested git_checkpoint for {}",
+            decision.request.target_summary
+        ),
+        target_path: PathBuf::from(".git/index"),
+        proposed_content: diff,
+        risk: DEFAULT_RISK_LEVEL.to_string(),
+        timestamp: epoch_seconds(),
+        file_hash: None,
+    })
+}
+
+fn git_checkpoint_diff(working_dir: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(working_dir)
+        .args(["diff", "--binary", "HEAD"])
+        .output()
+        .map_err(|error| format!("failed to inspect git diff: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn gate_decision_for_call(
+    authority: &AuthorityCoordinator,
+    inner: &dyn ToolExecutor,
+    call: &ToolCall,
+) -> GateDecision {
+    let cached = authority.consume_decision(&call.id);
+    let decision = match cached.as_ref() {
+        Some(entry) => entry.decision.clone(),
+        None => {
+            let fallback = inner.action_category(call);
+            let surface = inner.authority_surface(call);
+            let request = authority.classify_call(call, fallback, surface);
+            authority.resolve_request(request, false)
+        }
+    };
+    decision_to_gate(call, &decision, cached.as_ref(), authority)
+}
+
+fn decision_to_gate(
+    call: &ToolCall,
+    decision: &AuthorityDecision,
+    cached: Option<&crate::authority::CachedAuthorityDecision>,
+    authority: &AuthorityCoordinator,
+) -> GateDecision {
+    match decision.verdict {
+        AuthorityVerdict::Allow => GateDecision::PassThrough,
+        AuthorityVerdict::Prompt if cached.is_some_and(|entry| entry.prompt_satisfied) => {
+            GateDecision::PassThrough
+        }
+        AuthorityVerdict::Prompt => GateDecision::Block(prompt_required_result(call)),
+        AuthorityVerdict::Deny => GateDecision::Block(denied_result(call, decision)),
+        AuthorityVerdict::Propose => {
+            let working_dir = authority.working_dir();
+            let proposals_dir = authority.proposals_dir();
+            create_proposal_decision(call, decision, &working_dir, &proposals_dir)
+        }
+    }
+}
+
+fn prompt_required_result(call: &ToolCall) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success: false,
+        output: "This operation requires approval before it can run.".to_string(),
+    }
+}
+
+fn denied_result(call: &ToolCall, decision: &AuthorityDecision) -> ToolResult {
+    match decision.reason.as_str() {
+        "kernel blind invariant" => blind_read_result(call),
+        _ => blocked_result(call, &decision.request.target_summary, &decision.reason),
     }
 }
 
@@ -535,6 +434,22 @@ impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
         self.inner.cacheability(tool_name)
     }
 
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.inner.classify_call(call)
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.inner.action_category(call)
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.inner.authority_surface(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
+    }
+
     fn clear_cache(&self) {
         self.inner.clear_cache();
     }
@@ -550,22 +465,15 @@ impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
 
 impl<T: ToolExecutor> ProposalGateExecutor<T> {
     fn classify_calls(&self, calls: &[ToolCall]) -> (Vec<GateDecision>, Vec<ToolCall>) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut decisions = Vec::with_capacity(calls.len());
         let mut pass_through = Vec::new();
 
         for call in calls {
-            let decision = classify_and_gate(
-                call,
-                &state.config,
-                &state.working_dir,
-                &state.proposals_dir,
-                &state.active,
-            );
-            if matches!(decision, GateDecision::PassThrough) {
+            let gate = gate_decision_for_call(&self.authority, &self.inner, call);
+            if matches!(gate, GateDecision::PassThrough) {
                 pass_through.push(call.clone());
             }
-            decisions.push(decision);
+            decisions.push(gate);
         }
 
         (decisions, pass_through)
@@ -619,6 +527,9 @@ fn assemble_results(
 mod tests {
     use super::*;
     use crate::act::{ToolCacheStats, ToolCacheability, ToolExecutorError, ToolResult};
+    use crate::kernel_blind::{
+        is_kernel_blind_enforced, is_kernel_blind_path, normalize_relative_path,
+    };
     use async_trait::async_trait;
     use fx_llm::ToolCall;
     use fx_propose::{extract_proposed_content, sha256_hex};
@@ -675,6 +586,16 @@ mod tests {
             ToolCacheability::NeverCache
         }
 
+        fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+            match call.name.as_str() {
+                "write_file" | "edit_file" => ToolAuthoritySurface::PathWrite,
+                "read_file" | "search_text" | "list_directory" => ToolAuthoritySurface::PathRead,
+                "git_checkpoint" => ToolAuthoritySurface::GitCheckpoint,
+                "shell" => ToolAuthoritySurface::Command,
+                _ => ToolAuthoritySurface::Other,
+            }
+        }
+
         fn clear_cache(&self) {}
 
         fn cache_stats(&self) -> Option<ToolCacheStats> {
@@ -716,7 +637,11 @@ mod tests {
         let inner = MockInner::new();
         let probe = inner.clone();
         let state = ProposalGateState::new(config, working_dir, proposals_dir);
-        (ProposalGateExecutor::new(inner, state), probe)
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            state,
+        ));
+        (ProposalGateExecutor::new(inner, authority), probe)
     }
 
     fn write_call(id: &str, path: &str, content: &str) -> ToolCall {
@@ -799,22 +724,15 @@ mod tests {
         assert_eq!(result.output, "This file is not available.");
     }
 
-    // Test 1: Tier 3 path always blocked regardless of config
+    // Test 1: Sovereign path always blocked regardless of config
     #[tokio::test]
-    async fn tier3_path_always_blocked_regardless_of_config() {
+    async fn sovereign_path_always_blocked_regardless_of_config() {
         let mut config = enabled_config();
         config.allow_paths = vec!["**".to_string()];
         let (executor, probe) = make_executor(config);
 
         let results = executor
-            .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
-                None,
-            )
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
             .await
             .unwrap();
 
@@ -853,7 +771,7 @@ mod tests {
             .unwrap();
 
         assert!(results[0].success);
-        let sidecar_path = std::fs::read_dir(executor.state.lock().unwrap().proposals_dir.clone())
+        let sidecar_path = std::fs::read_dir(executor.authority.proposals_dir())
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -899,7 +817,7 @@ mod tests {
             .unwrap();
 
         assert!(results[0].success);
-        let sidecar_path = std::fs::read_dir(executor.state.lock().unwrap().proposals_dir.clone())
+        let sidecar_path = std::fs::read_dir(executor.authority.proposals_dir())
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -1335,21 +1253,14 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 7b: Tier 3 blocked even when config disabled (regression for bypass bug)
+    // Test 7b: Sovereign path blocked even when config disabled
     #[tokio::test]
-    async fn tier3_blocked_even_when_config_disabled() {
+    async fn sovereign_path_blocked_even_when_config_disabled() {
         let config = SelfModifyConfig::default(); // enabled=false
         let (executor, probe) = make_executor(config);
 
         let results = executor
-            .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
-                None,
-            )
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
             .await
             .unwrap();
 
@@ -1426,7 +1337,11 @@ mod tests {
             approved_at: epoch_seconds(),
             expires_at: None,
         });
-        let executor = ProposalGateExecutor::new(inner, state);
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            state,
+        ));
+        let executor = ProposalGateExecutor::new(inner, authority);
 
         let results = executor
             .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
@@ -1436,6 +1351,26 @@ mod tests {
         assert!(results[0].success);
         assert!(results[0].output.contains("executed:write_file"));
         assert_eq!(probe.call_count(), 1);
+    }
+
+    #[test]
+    fn permission_and_proposal_gate_share_cached_propose_verdict() {
+        let proposals_dir =
+            std::env::temp_dir().join(format!("fx-proposal-gate-shared-{}", epoch_seconds()));
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            ProposalGateState::new(enabled_config(), PathBuf::from(""), proposals_dir),
+        ));
+        let inner = MockInner::new();
+        let call = write_call("shared-1", "config/settings.toml", "data");
+        let request = authority.classify_call(&call, "file_write", ToolAuthoritySurface::PathWrite);
+        let decision = authority.resolve_request(request, false);
+
+        assert_eq!(decision.verdict, AuthorityVerdict::Propose);
+        authority.cache_decision(&call.id, decision, true);
+
+        let gate = gate_decision_for_call(&authority, &inner, &call);
+        assert!(matches!(gate, GateDecision::Propose(_)));
     }
 
     // Test 12: Active proposal does not cover other paths
@@ -1452,7 +1387,11 @@ mod tests {
             approved_at: epoch_seconds(),
             expires_at: None,
         });
-        let executor = ProposalGateExecutor::new(inner, state);
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            state,
+        ));
+        let executor = ProposalGateExecutor::new(inner, authority);
 
         let results = executor
             .execute_tools(&[write_call("1", "config/b.toml", "data")], None)
@@ -1479,7 +1418,11 @@ mod tests {
             approved_at: 1000,
             expires_at: Some(1001), // expired in the past
         });
-        let executor = ProposalGateExecutor::new(inner, state);
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            state,
+        ));
+        let executor = ProposalGateExecutor::new(inner, authority);
 
         let results = executor
             .execute_tools(&[write_call("1", "config/settings.toml", "data")], None)
@@ -1492,9 +1435,9 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 14: Tier 3 blocked even with active proposal
+    // Test 14: Sovereign path blocked even with active proposal
     #[tokio::test]
-    async fn tier3_blocked_even_with_active_proposal() {
+    async fn sovereign_path_blocked_even_with_active_proposal() {
         let inner = MockInner::new();
         let probe = inner.clone();
         let tmp = std::env::temp_dir().join(format!(
@@ -1504,11 +1447,33 @@ mod tests {
         let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
         state.set_active_proposal(ActiveProposal {
             id: "p-1".to_string(),
-            allowed_paths: vec![PathBuf::from("engine/crates/fx-kernel/src/lib.rs")],
+            allowed_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             approved_at: epoch_seconds(),
             expires_at: None,
         });
-        let executor = ProposalGateExecutor::new(inner, state);
+        let authority = Arc::new(AuthorityCoordinator::new(
+            crate::permission_gate::PermissionPolicy::allow_all(),
+            state,
+        ));
+        let executor = ProposalGateExecutor::new(inner, authority);
+
+        let results = executor
+            .execute_tools(&[write_call("1", ".github/workflows/ci.yml", "data")], None)
+            .await
+            .unwrap();
+
+        assert_operation_not_permitted(&results[0]);
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kernel_source_path_is_not_tier3_when_config_allows_it() {
+        let config = SelfModifyConfig {
+            enabled: true,
+            allow_paths: vec!["**/engine/crates/fx-kernel/**".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let (executor, probe) = make_executor(config);
 
         let results = executor
             .execute_tools(
@@ -1522,22 +1487,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_operation_not_permitted(&results[0]);
-        assert_eq!(probe.call_count(), 0);
+        assert!(results[0].success);
+        assert_eq!(probe.call_count(), 1);
     }
 
-    // Test 15: Tier 3 caught via ../ path traversal
+    // Test 15: Sovereign path caught via ../ path traversal
     #[tokio::test]
-    async fn tier3_caught_via_dotdot_traversal() {
+    async fn sovereign_path_caught_via_dotdot_traversal() {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
             .execute_tools(
-                &[write_call(
-                    "1",
-                    "engine/../engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
+                &[write_call("1", "repo/../.github/workflows/ci.yml", "data")],
                 None,
             )
             .await
@@ -1547,18 +1508,14 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 16: Tier 3 caught via absolute path
+    // Test 16: Sovereign path caught via absolute path
     #[tokio::test]
-    async fn tier3_caught_via_absolute_path() {
+    async fn sovereign_path_caught_via_absolute_path() {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
             .execute_tools(
-                &[write_call(
-                    "1",
-                    "/engine/crates/fx-kernel/src/lib.rs",
-                    "data",
-                )],
+                &[write_call("1", "/.github/workflows/ci.yml", "data")],
                 None,
             )
             .await
@@ -1569,21 +1526,9 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_is_treated_as_write_tool() {
-        assert!(is_write_tool("edit_file"));
-    }
-
-    // Test 17: normalize_relative unit tests
-    #[test]
-    fn normalize_relative_handles_variants() {
-        assert_eq!(normalize_relative("./foo/bar"), "foo/bar");
-        assert_eq!(normalize_relative("a/../b/c"), "b/c");
-        assert_eq!(normalize_relative("/absolute/path"), "absolute/path");
-        assert_eq!(
-            normalize_relative("engine/../engine/crates/fx-kernel/src/lib.rs"),
-            "engine/crates/fx-kernel/src/lib.rs"
-        );
-        assert_eq!(normalize_relative("a/./b/../c"), "a/c");
-        assert_eq!(normalize_relative("foo\\bar\\baz"), "foo/bar/baz");
+    fn proposal_gate_tests_use_shared_normalization() {
+        assert_eq!(normalize_relative_path("./foo/bar"), "foo/bar");
+        assert_eq!(normalize_relative_path("a/../b/c"), "b/c");
+        assert_eq!(normalize_relative_path("/absolute/path"), "absolute/path");
     }
 }

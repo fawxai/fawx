@@ -1,4 +1,4 @@
-use crate::runtime_info::SkillInfo;
+use crate::runtime_info::{AuthorityRuntimeInfo, SkillInfo};
 use fx_config::{CapabilityMode, PermissionsConfig, SandboxConfig};
 use serde::Serialize;
 
@@ -12,6 +12,8 @@ pub struct KernelManifest {
     pub preset: Option<String>,
     pub model: ModelInfo,
     pub permissions: PermissionManifest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<AuthorityManifest>,
     pub budget: BudgetManifest,
     pub sandbox: SandboxManifest,
     pub self_modify: SelfModifyManifest,
@@ -32,6 +34,32 @@ pub struct PermissionManifest {
     pub restricted: Vec<String>,
     pub default_policy: String,
     pub can_request_capabilities: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorityManifest {
+    pub resolver: String,
+    pub approval_scope: String,
+    pub path_policy_source: String,
+    pub capability_mode_mutates_path_policy: bool,
+    pub kernel_blind_enabled: bool,
+    pub sovereign_boundary_enforced: bool,
+    pub active_session_approvals: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_proposal_override: Option<String>,
+    pub recent_decisions: Vec<AuthorityDecisionManifest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorityDecisionManifest {
+    pub tool_name: String,
+    pub capability: String,
+    pub effect: String,
+    pub target_kind: String,
+    pub domain: String,
+    pub target_summary: String,
+    pub verdict: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +115,7 @@ pub struct ManifestSources<'a> {
     pub provider: &'a str,
     pub preset: Option<&'a str>,
     pub permissions: &'a PermissionsConfig,
+    pub authority: Option<&'a AuthorityRuntimeInfo>,
     pub budget: &'a BudgetSummary,
     pub sandbox: &'a SandboxConfig,
     pub self_modify_enabled: bool,
@@ -110,6 +139,7 @@ pub fn build_kernel_manifest(sources: &ManifestSources<'_>) -> KernelManifest {
             sources.permissions,
             sources.can_request_capabilities,
         ),
+        authority: sources.authority.map(build_authority_manifest),
         budget: build_budget_manifest(sources.budget),
         sandbox: SandboxManifest {
             allow_network: sources.sandbox.allow_network,
@@ -163,6 +193,33 @@ fn build_permission_manifest(config: &PermissionsConfig, can_request: bool) -> P
     }
 }
 
+fn build_authority_manifest(info: &AuthorityRuntimeInfo) -> AuthorityManifest {
+    AuthorityManifest {
+        resolver: info.resolver.clone(),
+        approval_scope: info.approval_scope.clone(),
+        path_policy_source: info.path_policy_source.clone(),
+        capability_mode_mutates_path_policy: info.capability_mode_mutates_path_policy,
+        kernel_blind_enabled: info.kernel_blind_enabled,
+        sovereign_boundary_enforced: info.sovereign_boundary_enforced,
+        active_session_approvals: info.active_session_approvals,
+        active_proposal_override: info.active_proposal_override.clone(),
+        recent_decisions: info
+            .recent_decisions
+            .iter()
+            .map(|decision| AuthorityDecisionManifest {
+                tool_name: decision.tool_name.clone(),
+                capability: decision.capability.clone(),
+                effect: decision.effect.clone(),
+                target_kind: decision.target_kind.clone(),
+                domain: decision.domain.clone(),
+                target_summary: decision.target_summary.clone(),
+                verdict: decision.verdict.clone(),
+                reason: decision.reason.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn build_budget_manifest(config: &BudgetSummary) -> BudgetManifest {
     BudgetManifest {
         max_llm_calls: config.max_llm_calls,
@@ -206,6 +263,7 @@ mod tests {
                 provider: "openai",
                 preset: Some("power"),
                 permissions: &self.permissions,
+                authority: None,
                 budget: &self.budget,
                 sandbox: &self.sandbox,
                 self_modify_enabled: true,
@@ -254,12 +312,26 @@ mod tests {
                     description: Some("Built-in tools".to_string()),
                     tool_names: vec!["read_file".to_string(), "kernel_manifest".to_string()],
                     capabilities: Vec::new(),
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
                 },
                 SkillInfo {
                     name: "web".to_string(),
                     description: None,
                     tool_names: vec!["web_search".to_string()],
                     capabilities: vec!["search".to_string()],
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
                 },
             ],
         }
