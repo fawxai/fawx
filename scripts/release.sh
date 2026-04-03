@@ -95,6 +95,45 @@ if ! command -v gh &>/dev/null; then
     exit 1
 fi
 
+resolve_site_default_branch() {
+    local branch=""
+
+    branch="$(gh repo view "$RELEASE_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
+    if [[ -z "$branch" ]]; then
+        branch="$(git -C "$FAWX_SITE_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+    fi
+
+    if [[ -z "$branch" ]]; then
+        echo "Error: Could not determine default branch for $RELEASE_REPO" >&2
+        exit 1
+    fi
+
+    echo "$branch"
+}
+
+SITE_DEFAULT_BRANCH="$(resolve_site_default_branch)"
+SITE_WORKTREE_BRANCH="$(git -C "$FAWX_SITE_DIR" rev-parse --abbrev-ref HEAD)"
+
+if [[ "$SITE_WORKTREE_BRANCH" != "$SITE_DEFAULT_BRANCH" ]]; then
+    echo "Error: fawx-site checkout must be on '$SITE_DEFAULT_BRANCH' (currently on '$SITE_WORKTREE_BRANCH')" >&2
+    exit 1
+fi
+
+if ! git -C "$FAWX_SITE_DIR" diff --quiet HEAD -- || ! git -C "$FAWX_SITE_DIR" diff --cached --quiet; then
+    echo "Error: fawx-site checkout has tracked or staged changes; release would branch-switch inside that repo." >&2
+    exit 1
+fi
+
+git -C "$FAWX_SITE_DIR" fetch origin "$SITE_DEFAULT_BRANCH" >/dev/null 2>&1 || true
+SITE_REMOTE_HEAD="$(git -C "$FAWX_SITE_DIR" rev-parse --verify "origin/$SITE_DEFAULT_BRANCH" 2>/dev/null || true)"
+SITE_LOCAL_HEAD="$(git -C "$FAWX_SITE_DIR" rev-parse HEAD)"
+
+if [[ -n "$SITE_REMOTE_HEAD" && "$SITE_LOCAL_HEAD" != "$SITE_REMOTE_HEAD" ]]; then
+    echo "Error: fawx-site checkout is not up to date with origin/$SITE_DEFAULT_BRANCH" >&2
+    echo "Run: git -C \"$FAWX_SITE_DIR\" pull --ff-only origin $SITE_DEFAULT_BRANCH" >&2
+    exit 1
+fi
+
 # Check tag doesn't exist
 if git -C "$REPO_ROOT" tag -l "$TAG" | grep -q "$TAG"; then
     echo "Error: Tag $TAG already exists" >&2
@@ -106,6 +145,7 @@ echo "   Version:   $VERSION"
 echo "   Tag:       $TAG"
 echo "   DMG repo:  $RELEASE_REPO"
 echo "   Site dir:  $FAWX_SITE_DIR"
+echo "   Site br.:  $SITE_DEFAULT_BRANCH"
 echo ""
 
 if $DRY_RUN; then
@@ -320,12 +360,11 @@ if $DRY_RUN; then
     echo "   Vercel auto-deploys on push"
 else
     cd "$FAWX_SITE_DIR"
-    SITE_DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)"
     SITE_RELEASE_BRANCH="release/appcast-$VERSION"
     git checkout -b "$SITE_RELEASE_BRANCH"
     git add appcast.xml
     git commit -m "release: appcast $VERSION"
-    if git push origin "$SITE_DEFAULT_BRANCH" 2>/dev/null; then
+    if git push origin HEAD:"$SITE_DEFAULT_BRANCH" 2>/dev/null; then
         echo "   ✅ Pushed directly to fawx-site; Vercel will auto-deploy"
     else
         echo "   Branch protection detected; creating PR..."
