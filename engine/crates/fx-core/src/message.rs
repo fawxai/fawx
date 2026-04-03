@@ -4,11 +4,46 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolRoundCall {
+    /// Tool call identifier.
+    pub call_id: String,
+    /// Provider-specific output item identifier, when distinct from `call_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Tool/function name.
+    pub name: String,
+    /// Structured arguments.
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolRoundResult {
+    /// Tool call identifier.
+    pub call_id: String,
+    /// Tool/function name.
+    pub name: String,
+    /// Whether the tool call succeeded.
+    pub success: bool,
+    /// Human-readable output.
+    pub content: String,
+}
+
 /// Which LLM phase is streaming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamPhase {
     Reason,
     Synthesize,
+}
+
+/// Root-owned public progress states for a streaming turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    Researching,
+    WritingArtifact,
+    Implementing,
+    AwaitingDirection,
 }
 
 /// Internal message sent between crates via the event bus.
@@ -72,10 +107,21 @@ pub enum InternalMessage {
         phase: StreamPhase,
     },
 
+    /// Root-owned public progress update for the current turn.
+    ProgressUpdate {
+        /// Typed progress state.
+        kind: ProgressKind,
+        /// Human-readable progress message for the UI.
+        message: String,
+    },
+
     /// A tool call is about to be executed.
     ToolUse {
         /// Tool call identifier.
         call_id: String,
+        /// Provider-specific output item identifier, when distinct from `call_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
         /// Tool/function name.
         name: String,
         /// Structured arguments.
@@ -92,6 +138,14 @@ pub enum InternalMessage {
         success: bool,
         /// Human-readable output.
         content: String,
+    },
+
+    /// A full tool round emitted in causal order.
+    ToolRound {
+        /// Tool uses executed in this round.
+        calls: Vec<ToolRoundCall>,
+        /// Tool results produced for the round.
+        results: Vec<ToolRoundResult>,
     },
 
     /// A sub-goal has started execution within a decomposition plan.
@@ -205,9 +259,27 @@ mod tests {
     }
 
     #[test]
+    fn progress_update_roundtrip_serde() {
+        let msg = InternalMessage::ProgressUpdate {
+            kind: ProgressKind::Implementing,
+            message: "Implementing the committed plan.".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::ProgressUpdate {
+                kind: ProgressKind::Implementing,
+                message
+            } if message == "Implementing the committed plan."
+        ));
+    }
+
+    #[test]
     fn tool_use_roundtrip_serde() {
         let msg = InternalMessage::ToolUse {
             call_id: "call-1".to_string(),
+            provider_id: Some("fc-1".to_string()),
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "src/main.rs"}),
         };
@@ -217,9 +289,11 @@ mod tests {
             decoded,
             InternalMessage::ToolUse {
                 call_id,
+                provider_id,
                 name,
                 arguments
             } if call_id == "call-1"
+                && provider_id.as_deref() == Some("fc-1")
                 && name == "read_file"
                 && arguments == serde_json::json!({"path": "src/main.rs"})
         ));
@@ -246,6 +320,43 @@ mod tests {
                 && name == "read_file"
                 && !success
                 && content == "fn main() {}"
+        ));
+    }
+
+    #[test]
+    fn tool_round_roundtrip_serde() {
+        let msg = InternalMessage::ToolRound {
+            calls: vec![ToolRoundCall {
+                call_id: "call-1".to_string(),
+                provider_id: Some("fc-1".to_string()),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }],
+            results: vec![ToolRoundResult {
+                call_id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                success: true,
+                content: "ok".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::ToolRound { calls, results }
+                if calls == vec![ToolRoundCall {
+                    call_id: "call-1".to_string(),
+                    provider_id: Some("fc-1".to_string()),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                }]
+                && results == vec![ToolRoundResult {
+                    call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    success: true,
+                    content: "ok".to_string(),
+                }]
         ));
     }
 }

@@ -44,7 +44,10 @@ use fx_core::channel::{Channel, ResponseContext};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
-use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
+use fx_kernel::{
+    ChannelRegistry, HttpChannel, PermissionPromptState, ResponseRouter, StreamCallback,
+    StreamEvent,
+};
 use fx_llm::{
     CompletionResponse, CompletionStream, ContentBlock, DocumentAttachment, ImageAttachment,
     Message, StreamChunk,
@@ -62,6 +65,109 @@ use tokio::sync::{mpsc, Mutex};
 use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-secret-token-abc123";
+
+struct PromptStateApp {
+    prompt_state: Arc<PermissionPromptState>,
+}
+
+#[async_trait]
+impl AppEngine for PromptStateApp {
+    async fn process_message(
+        &mut self,
+        _input: &str,
+        _images: Vec<ImageAttachment>,
+        _documents: Vec<DocumentAttachment>,
+        _source: InputSource,
+        _callback: Option<StreamCallback>,
+    ) -> Result<ApiCycleResult, anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    async fn process_message_with_context(
+        &mut self,
+        _input: &str,
+        _images: Vec<ImageAttachment>,
+        _documents: Vec<DocumentAttachment>,
+        _context: Vec<Message>,
+        _source: InputSource,
+        _callback: Option<StreamCallback>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    fn active_model(&self) -> &str {
+        "mock-model"
+    }
+
+    fn available_models(&self) -> Vec<ModelInfoDto> {
+        Vec::new()
+    }
+
+    fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+        unreachable!("not used in prompt state tests")
+    }
+
+    fn thinking_level(&self) -> ThinkingLevelDto {
+        ThinkingLevelDto {
+            level: "normal".to_string(),
+            budget_tokens: None,
+            available: Vec::new(),
+        }
+    }
+
+    fn context_info(&self) -> ContextInfoDto {
+        ContextInfoDto {
+            used_tokens: 0,
+            max_tokens: 4_096,
+            percentage: 0.0,
+            compaction_threshold: 0.8,
+        }
+    }
+
+    fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+        self.context_info()
+    }
+
+    fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+        Ok(self.thinking_level())
+    }
+
+    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+        Vec::new()
+    }
+
+    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+        Vec::new()
+    }
+
+    fn config_manager(&self) -> Option<ConfigManagerHandle> {
+        None
+    }
+
+    fn session_bus(&self) -> Option<&SessionBus> {
+        None
+    }
+
+    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
+        Some(Arc::clone(&self.prompt_state))
+    }
+
+    fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn app_permission_prompts_reuses_app_owned_prompt_state() {
+    let prompt_state = Arc::new(PermissionPromptState::new());
+    let app = PromptStateApp {
+        prompt_state: Arc::clone(&prompt_state),
+    };
+
+    let resolved = crate::app_permission_prompts(&app);
+
+    assert!(Arc::ptr_eq(&resolved, &prompt_state));
+}
 
 impl ContextInfoSnapshotLike for fx_cli::headless::ContextInfoSnapshot {
     fn used_tokens(&self) -> usize {
@@ -196,7 +302,18 @@ impl AppEngine for HeadlessApp {
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         HeadlessApp::skill_summaries(self)
             .into_iter()
-            .map(SkillSummaryDto::from)
+            .map(|summary| SkillSummaryDto {
+                name: summary.name,
+                description: summary.description,
+                tools: summary.tools,
+                capabilities: summary.capabilities,
+                version: summary.version,
+                source: summary.source,
+                revision_hash: summary.revision_hash,
+                activated_at_ms: summary.activated_at_ms,
+                signature_status: summary.signature_status,
+                stale_source: summary.stale_source,
+            })
             .collect()
     }
 
@@ -264,6 +381,7 @@ fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
             max_history: 20,
             memory_enabled: false,
         },
+        authority: None,
         version: "test".to_string(),
     }))
 }
@@ -380,7 +498,7 @@ async fn mock_status() -> Json<StatusResponse> {
         model: "test-model".to_string(),
         skills: vec!["skill-a".to_string()],
         memory_entries: 10,
-        tailscale_ip: Some("100.64.0.30".to_string()),
+        tailscale_ip: Some("192.0.2.10".to_string()),
         config: None,
     })
 }
@@ -425,7 +543,7 @@ fn tailscale_ip_accepts_valid_range() {
         Ipv4Addr::new(100, 127, 255, 255)
     )));
     assert!(crate::tailscale::is_tailscale_ip(&IpAddr::V4(
-        Ipv4Addr::new(100, 64, 0, 42)
+        Ipv4Addr::new(100, 100, 100, 2)
     )));
 }
 
@@ -450,14 +568,14 @@ fn tailscale_ip_rejects_ipv6() {
 
 #[test]
 fn listen_targets_bind_localhost_and_tailscale() {
-    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42))));
+    let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 2))));
     let tailscale = plan.tailscale.expect("tailscale target");
 
     assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
     assert_eq!(plan.local.label, "local");
     assert_eq!(
         tailscale.addr,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42)), 8400)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 2)), 8400)
     );
     assert_eq!(tailscale.label, "Tailscale");
 }
@@ -515,7 +633,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
+            addr: SocketAddr::from(([192, 0, 2, 1], 8400)),
             label: "Tailscale",
         }),
         true,
@@ -523,7 +641,7 @@ fn startup_target_lines_use_https_for_tailscale_when_enabled() {
 
     assert_eq!(lines[0], "Fawx API listening on:");
     assert_eq!(lines[1], "  http://127.0.0.1:8400 (local)");
-    assert_eq!(lines[2], "  https://100.64.0.42:8400 (Tailscale)");
+    assert_eq!(lines[2], "  https://192.0.2.1:8400 (Tailscale)");
 }
 
 #[test]
@@ -534,14 +652,14 @@ fn startup_target_lines_use_http_for_tailscale_when_tls_disabled() {
             label: "local",
         },
         Some(ListenTarget {
-            addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
+            addr: SocketAddr::from(([192, 0, 2, 1], 8400)),
             label: "Tailscale",
         }),
         false,
     );
 
     assert_eq!(lines[0], "Fawx HTTP API listening on:");
-    assert_eq!(lines[2], "  http://100.64.0.42:8400 (Tailscale)");
+    assert_eq!(lines[2], "  http://192.0.2.1:8400 (Tailscale)");
 }
 
 #[tokio::test]
@@ -555,7 +673,7 @@ async fn tailscale_bind_failure_falls_back_to_localhost_server() {
         .expect("bind localhost");
     let local_addr = local_listener.local_addr().expect("local addr");
     let tailscale_target = ListenTarget {
-        addr: SocketAddr::from(([100, 64, 0, 42], 8400)),
+        addr: SocketAddr::from(([192, 0, 2, 1], 8400)),
         label: "Tailscale",
     };
     let listeners = BoundListeners {
@@ -615,9 +733,9 @@ async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
 
 #[test]
 fn extract_ip_parses_ip_addr_output() {
-    let line = "4: tailscale0    inet 100.64.0.42/32 scope global tailscale0";
+    let line = "4: tailscale0    inet 100.100.100.2/32 scope global tailscale0";
     let ip = crate::tailscale::extract_ip_from_line(line);
-    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 42))));
+    assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 2))));
 }
 
 #[test]
@@ -715,13 +833,13 @@ fn status_response_has_expected_fields() {
         model: "claude-3".to_string(),
         skills: vec!["read_file".to_string()],
         memory_entries: 42,
-        tailscale_ip: Some("100.64.0.20".to_string()),
+        tailscale_ip: Some("192.0.2.1".to_string()),
         config: None,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize")).expect("parse");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["tailscale_ip"], "100.64.0.20");
+    assert_eq!(json["tailscale_ip"], "192.0.2.1");
     assert_eq!(json["memory_entries"], 42);
     assert!(json["skills"].is_array());
 }
@@ -805,7 +923,7 @@ async fn status_endpoint_returns_ok() {
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["tailscale_ip"], "100.64.0.30");
+    assert_eq!(json["tailscale_ip"], "192.0.2.10");
     assert!(json["skills"].is_array());
 }
 
@@ -1053,6 +1171,23 @@ fn serialize_stream_event_serializes_error_event_payload() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_tool_result_payload() {
+    let frame = serialize_stream_event(StreamEvent::ToolResult {
+        id: "call-1".to_string(),
+        tool_name: "read_file".to_string(),
+        output: "file contents".to_string(),
+        is_error: false,
+    })
+    .expect("tool result frame");
+
+    assert!(frame.contains("event: tool_result"));
+    assert!(frame.contains("\"id\":\"call-1\""));
+    assert!(frame.contains("\"tool_name\":\"read_file\""));
+    assert!(frame.contains("\"output\":\"file contents\""));
+    assert!(frame.contains("\"is_error\":false"));
+}
+
+#[test]
 fn serialize_stream_event_serializes_tool_error_payload() {
     let frame = serialize_stream_event(StreamEvent::ToolError {
         tool_name: "read_file".to_string(),
@@ -1217,9 +1352,9 @@ mod routing_and_status {
         ProviderCapabilities, ProviderError as LlmError,
     };
     use fx_session::{
-        MessageRole as SessionMessageRole, SessionConfig, SessionContentBlock, SessionError,
-        SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry, SessionStatus,
-        SessionStore,
+        MessageRole as SessionMessageRole, Session, SessionConfig, SessionContentBlock,
+        SessionError, SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry,
+        SessionStatus, SessionStore,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
@@ -1291,6 +1426,17 @@ mod routing_and_status {
         models: Vec<&'static str>,
     }
 
+    fn static_provider_thinking_levels(name: &str, model: &str) -> &'static [&'static str] {
+        match (name, model) {
+            ("anthropic", "claude-opus-4-6") => {
+                &["off", "adaptive", "low", "medium", "high", "max"]
+            }
+            ("anthropic", "claude-sonnet-4-6") => &["off", "adaptive", "low", "medium", "high"],
+            ("openai", "gpt-5.4") => &["none", "low", "medium", "high", "xhigh"],
+            _ => &["off"],
+        }
+    }
+
     #[async_trait]
     impl CompletionProvider for StaticProvider {
         async fn complete(
@@ -1320,6 +1466,10 @@ mod routing_and_status {
                 supports_temperature: false,
                 requires_streaming: false,
             }
+        }
+
+        fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+            static_provider_thinking_levels(self.name, model)
         }
     }
 
@@ -1441,6 +1591,7 @@ mod routing_and_status {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -1661,6 +1812,13 @@ mod routing_and_status {
                     description: (*description).map(ToString::to_string),
                     tool_names: tools.iter().map(ToString::to_string).collect(),
                     capabilities: Vec::new(),
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
                 },
             )
             .collect();
@@ -1845,6 +2003,72 @@ mod routing_and_status {
         serde_json::from_slice(&body).expect("json")
     }
 
+    async fn response_text(response: axum::response::Response) -> String {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    fn listed_session_keys(json: &serde_json::Value) -> Vec<String> {
+        json["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .map(|session| session["key"].as_str().expect("session key").to_string())
+            .collect()
+    }
+
+    fn listed_session<'a>(json: &'a serde_json::Value, key: &SessionKey) -> &'a serde_json::Value {
+        json["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|session| session["key"] == key.as_str())
+            .expect("session entry")
+    }
+
+    fn assert_archive_metadata(json: &serde_json::Value, archived: bool) {
+        assert_eq!(json["archived"], archived);
+        if archived {
+            assert!(json["archived_at"].as_u64().is_some());
+        } else {
+            assert!(json["archived_at"].is_null());
+        }
+    }
+
+    fn exported_message_texts(json: &serde_json::Value) -> Vec<String> {
+        json["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| {
+                message["content"][0]["text"]
+                    .as_str()
+                    .expect("message text")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    async fn expect_ok_json(app: Router, method: &str, uri: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(authed_request(method, uri))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn assert_list_membership(app: Router, uri: &str, key: &SessionKey, present: bool) {
+        let json = expect_ok_json(app, "GET", uri).await;
+        let keys = listed_session_keys(&json);
+        assert_eq!(keys.contains(&key.to_string()), present);
+    }
+
     #[tokio::test]
     async fn telemetry_consent_endpoint_returns_defaults() {
         let app = build_router(test_state(None, Vec::new()), None);
@@ -1976,8 +2200,8 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_returns_device_list() {
         let mut devices = DeviceStore::new();
-        let (_, first) = devices.create_device("Example MacBook");
-        let (_, second) = devices.create_device("Example iPhone");
+        let (_, first) = devices.create_device("Joe's MacBook");
+        let (_, second) = devices.create_device("Joe's iPhone");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -1996,7 +2220,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn get_devices_excludes_token_hash() {
         let mut devices = DeviceStore::new();
-        let _ = devices.create_device("Example MacBook");
+        let _ = devices.create_device("Joe's MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let response = app
@@ -2011,7 +2235,7 @@ mod routing_and_status {
     #[tokio::test]
     async fn delete_device_revokes_token() {
         let mut devices = DeviceStore::new();
-        let (raw_token, device) = devices.create_device("Example MacBook");
+        let (raw_token, device) = devices.create_device("Joe's MacBook");
         let app = build_router(test_state_with_devices(devices), None);
 
         let before_delete = Request::builder()
@@ -2332,6 +2556,15 @@ mod routing_and_status {
         SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
     }
 
+    fn make_poisoned_session_registry(key: &str) -> SessionRegistry {
+        let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+        let store = SessionStore::new(storage.clone());
+        store
+            .save(&poisoned_session(key))
+            .expect("save poisoned session");
+        SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+    }
+
     fn make_session_bus() -> (SessionBus, BusStore) {
         let store =
             BusStore::new(fx_storage::Storage::open_in_memory().expect("in-memory storage"));
@@ -2360,6 +2593,75 @@ mod routing_and_status {
             .set_status(&key, SessionStatus::Idle)
             .expect("set idle");
         key
+    }
+
+    fn seed_archived_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = seed_session(registry, key);
+        registry.archive(&key).expect("archive session");
+        key
+    }
+
+    fn record_session_messages(
+        registry: &SessionRegistry,
+        key: &SessionKey,
+        messages: &[(SessionMessageRole, &str)],
+    ) {
+        for (role, content) in messages {
+            registry
+                .record_message(key, *role, content)
+                .expect("record session message");
+        }
+    }
+
+    fn seed_export_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+        let key = seed_session(registry, key);
+        record_session_messages(
+            registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "first message"),
+                (SessionMessageRole::Assistant, "second message"),
+                (SessionMessageRole::User, "third message"),
+            ],
+        );
+        key
+    }
+
+    fn poisoned_session(key: &str) -> Session {
+        Session {
+            key: SessionKey::new(key).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "mock-model".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            archived_at: None,
+            messages: vec![
+                SessionMessage::structured(
+                    SessionMessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    SessionMessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
+        }
     }
 
     #[test]
@@ -2443,7 +2745,7 @@ allowed_chat_ids = [123]
         let temp = TempDir::new().expect("tempdir");
         let mut manager = FleetManager::init(temp.path()).expect("fleet init");
         let token = manager
-            .add_node("node-a", "203.0.113.10", 8400)
+            .add_node("macmini", "198.51.100.19", 8400)
             .expect("node should add");
         let app = build_router(
             test_state(None, Vec::new()),
@@ -2455,7 +2757,7 @@ allowed_chat_ids = [123]
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&fx_fleet::FleetRegistrationRequest {
-                    node_name: "node-a".to_string(),
+                    node_name: "macmini".to_string(),
                     bearer_token: token.secret,
                     capabilities: vec!["agentic_loop".to_string()],
                     rust_version: None,
@@ -2613,29 +2915,84 @@ allowed_chat_ids = [123]
         assert_eq!(json["label"], "Primary");
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["message_count"], 0);
+        assert_archive_metadata(&json, false);
     }
 
     #[tokio::test]
-    async fn list_sessions_returns_array() {
+    async fn list_sessions_defaults_to_active_only() {
         let registry = make_session_registry();
-        seed_session(&registry, "sess-one");
-        seed_session(&registry, "sess-two");
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
         let app = build_router(test_state_with_sessions(registry), None);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/sessions")
-            .header("authorization", format!("Bearer {TEST_TOKEN}"))
-            .body(Body::empty())
-            .expect("request");
+        let resp = app
+            .oneshot(authed_request("GET", "/v1/sessions"))
+            .await
+            .expect("response");
 
-        let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.expect("body").to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let json = response_json(resp).await;
+        assert_eq!(json["total"], 1);
+        assert_eq!(listed_session_keys(&json), vec![active.to_string()]);
+        assert!(!listed_session_keys(&json).contains(&archived.to_string()));
+        assert_archive_metadata(listed_session(&json, &active), false);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_archived_all_includes_archived_sessions() {
+        let registry = make_session_registry();
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=all"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let keys = listed_session_keys(&json);
         assert_eq!(json["total"], 2);
+        assert!(keys.contains(&active.to_string()));
+        assert!(keys.contains(&archived.to_string()));
+        assert_archive_metadata(listed_session(&json, &active), false);
+        assert_archive_metadata(listed_session(&json, &archived), true);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_archived_only_excludes_active_sessions() {
+        let registry = make_session_registry();
+        let active = seed_session(&registry, "sess-active");
+        let archived = seed_archived_session(&registry, "sess-archived");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=only"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 1);
+        assert_eq!(listed_session_keys(&json), vec![archived.to_string()]);
+        assert!(!listed_session_keys(&json).contains(&active.to_string()));
+    }
+
+    #[tokio::test]
+    async fn invalid_archived_filter_returns_400() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions?archived=maybe"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
         assert_eq!(
-            json["sessions"].as_array().expect("sessions array").len(),
-            2
+            json["error"],
+            "invalid archived filter 'maybe'; expected one of: active, all, only"
         );
     }
 
@@ -2658,6 +3015,439 @@ allowed_chat_ids = [123]
         assert_eq!(json["key"], key.as_str());
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["label"], "label-sess-info");
+        assert_archive_metadata(&json, false);
+    }
+
+    #[tokio::test]
+    async fn archive_route_archives_session_and_returns_success_payload() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-archive");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let first = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("first response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json = response_json(first).await;
+        assert_eq!(first_json["key"], key.as_str());
+        assert_eq!(first_json["status"], "idle");
+        assert_archive_metadata(&first_json, true);
+
+        let second = app
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("second response");
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_json = response_json(second).await;
+        assert_eq!(second_json["key"], key.as_str());
+        assert_archive_metadata(&second_json, true);
+        assert!(registry.get_info(&key).expect("session info").is_archived());
+    }
+
+    #[tokio::test]
+    async fn unarchive_route_restores_active_state_and_returns_success_payload() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-unarchive");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let first = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("first response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json = response_json(first).await;
+        assert_eq!(first_json["key"], key.as_str());
+        assert_eq!(first_json["status"], "idle");
+        assert_archive_metadata(&first_json, false);
+
+        let second = app
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            ))
+            .await
+            .expect("second response");
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_json = response_json(second).await;
+        assert_eq!(second_json["key"], key.as_str());
+        assert_archive_metadata(&second_json, false);
+        assert!(!registry.get_info(&key).expect("session info").is_archived());
+    }
+
+    #[tokio::test]
+    async fn get_session_info_includes_archive_metadata_for_archived_session() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-archived-info");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert_archive_metadata(&json, true);
+    }
+
+    #[tokio::test]
+    async fn missing_session_on_archive_and_unarchive_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let archive = app
+            .clone()
+            .oneshot(authed_request("POST", "/v1/sessions/sess-missing/archive"))
+            .await
+            .expect("archive response");
+
+        assert_eq!(archive.status(), StatusCode::NOT_FOUND);
+        let archive_json = response_json(archive).await;
+        assert_eq!(archive_json["error"], "session not found: sess-missing");
+
+        let unarchive = app
+            .oneshot(authed_request(
+                "DELETE",
+                "/v1/sessions/sess-missing/archive",
+            ))
+            .await
+            .expect("unarchive response");
+
+        assert_eq!(unarchive.status(), StatusCode::NOT_FOUND);
+        let unarchive_json = response_json(unarchive).await;
+        assert_eq!(unarchive_json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn export_active_session_as_text() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-active-text");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "First question"),
+                (SessionMessageRole::Assistant, "First answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/export")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
+            "text/plain; charset=utf-8"
+        );
+        let text = response_text(response).await;
+        let question_index = text.find("First question").expect("question text");
+        let answer_index = text.find("First answer").expect("answer text");
+        assert!(text.contains(&format!("Session: {key}")));
+        assert!(text.contains("Messages: 2"));
+        assert!(question_index < answer_index);
+    }
+
+    #[tokio::test]
+    async fn export_archived_session_as_text() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archived-text");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Archived question"),
+                (SessionMessageRole::Assistant, "Archived answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{key}/export")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(text.contains(&format!("Session: {key}")));
+        assert!(text.contains("Archived: yes"));
+        assert!(text.contains("Archived question"));
+        assert!(text.contains("Archived answer"));
+    }
+
+    #[tokio::test]
+    async fn export_active_session_as_json() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-active-json");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Active json question"),
+                (SessionMessageRole::Assistant, "Active json answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["session"]["kind"], "main");
+        assert_eq!(json["session"]["status"], "idle");
+        assert_archive_metadata(&json["archive"], false);
+        assert_eq!(json["total_messages"], 2);
+        assert_eq!(
+            json["messages"][0]["content"][0]["text"],
+            "Active json question"
+        );
+        assert_eq!(
+            json["messages"][1]["content"][0]["text"],
+            "Active json answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_archived_session_as_json() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archived-json");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "Archived json question"),
+                (SessionMessageRole::Assistant, "Archived json answer"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], key.as_str());
+        assert_eq!(json["session"]["kind"], "main");
+        assert_archive_metadata(&json["archive"], true);
+        assert_eq!(json["total_messages"], 2);
+        assert_eq!(
+            json["messages"][0]["content"][0]["text"],
+            "Archived json question"
+        );
+        assert_eq!(
+            json["messages"][1]["content"][0]["text"],
+            "Archived json answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_export_format_returns_400() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-export-invalid-format");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=markdown"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "invalid export format 'markdown'; expected one of: text, json"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_export_returns_404() {
+        let registry = make_session_registry();
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/sessions/sess-missing/export"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn archived_json_export_includes_archive_metadata() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-archive-metadata");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_archive_metadata(&json["archive"], true);
+    }
+
+    #[tokio::test]
+    async fn export_preserves_stored_message_order() {
+        let registry = make_session_registry();
+        let key = seed_archived_session(&registry, "sess-export-message-order");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "first message"),
+                (SessionMessageRole::Assistant, "second message"),
+                (SessionMessageRole::User, "third message"),
+            ],
+        );
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/export?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            exported_message_texts(&json),
+            vec![
+                "first message".to_string(),
+                "second message".to_string(),
+                "third message".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_export_lifecycle_restores_default_list_membership() {
+        let registry = make_session_registry();
+        let key = seed_export_session(&registry, "sess-archive-lifecycle");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        assert_list_membership(app.clone(), "/v1/sessions", &key, true).await;
+        assert_archive_metadata(
+            &expect_ok_json(app.clone(), "POST", &format!("/v1/sessions/{key}/archive")).await,
+            true,
+        );
+        assert_list_membership(app.clone(), "/v1/sessions", &key, false).await;
+        let archived_only = expect_ok_json(app.clone(), "GET", "/v1/sessions?archived=only").await;
+        assert_eq!(listed_session_keys(&archived_only), vec![key.to_string()]);
+        assert_archive_metadata(listed_session(&archived_only, &key), true);
+        let info = expect_ok_json(app.clone(), "GET", &format!("/v1/sessions/{key}")).await;
+        assert_archive_metadata(&info, true);
+        let export = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/sessions/{key}/export?format=json"),
+        )
+        .await;
+        assert_archive_metadata(&export["archive"], true);
+        assert_eq!(
+            exported_message_texts(&export),
+            vec![
+                "first message".to_string(),
+                "second message".to_string(),
+                "third message".to_string()
+            ]
+        );
+        assert_archive_metadata(
+            &expect_ok_json(
+                app.clone(),
+                "DELETE",
+                &format!("/v1/sessions/{key}/archive"),
+            )
+            .await,
+            false,
+        );
+        assert_list_membership(app, "/v1/sessions", &key, true).await;
+    }
+
+    #[tokio::test]
+    async fn clear_and_delete_stay_distinct_after_archive_round_trip() {
+        let registry = make_session_registry();
+        let clear_key = seed_export_session(&registry, "sess-clear-contract");
+        let delete_key = seed_session(&registry, "sess-delete-contract");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let archive_uri = format!("/v1/sessions/{clear_key}/archive");
+        expect_ok_json(app.clone(), "POST", &archive_uri).await;
+        expect_ok_json(app.clone(), "DELETE", &archive_uri).await;
+        let clear = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/sessions/{clear_key}/clear"),
+            ))
+            .await
+            .expect("clear response");
+        assert_eq!(clear.status(), StatusCode::OK);
+        let cleared =
+            expect_ok_json(app.clone(), "GET", &format!("/v1/sessions/{clear_key}")).await;
+        assert_eq!(cleared["message_count"], 0);
+        assert_archive_metadata(&cleared, false);
+        assert_list_membership(app.clone(), "/v1/sessions", &clear_key, true).await;
+        let delete = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/sessions/{delete_key}"),
+            ))
+            .await
+            .expect("delete response");
+        assert_eq!(delete.status(), StatusCode::OK);
+        assert_list_membership(app.clone(), "/v1/sessions", &delete_key, false).await;
+        let deleted = app
+            .oneshot(authed_request("GET", &format!("/v1/sessions/{delete_key}")))
+            .await
+            .expect("deleted session response");
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2727,6 +3517,64 @@ allowed_chat_ids = [123]
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = response_json(response).await;
         assert_eq!(json["error"], "session not found: sess-missing");
+    }
+
+    #[tokio::test]
+    async fn context_endpoint_rejects_poisoned_stored_history_before_replay() {
+        let key = "sess-poisoned-context";
+        let registry = make_poisoned_session_registry(key);
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/context"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            format!(
+                "corrupted session '{key}': invalid tool history: tool result 'call_bad' at message 0 block 0 has no matching earlier tool_use"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_poisoned_stored_history_before_provider_execution() {
+        let key = SessionKey::new("sess-poisoned-send").expect("session key");
+        let registry = make_poisoned_session_registry(key.as_str());
+        let (app, app_state) =
+            session_memory_test_router(registry, SessionMemory::default(), Some(key.clone()));
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                r#"{"message":"continue"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            format!(
+                "corrupted session '{key}': invalid tool history: tool result 'call_bad' at message 0 block 0 has no matching earlier tool_use"
+            )
+        );
+        assert!(
+            app_state
+                .lock()
+                .expect("state lock")
+                .loaded_memories
+                .is_empty(),
+            "provider execution must not start for poisoned sessions"
+        );
     }
 
     #[tokio::test]
@@ -2871,6 +3719,93 @@ allowed_chat_ids = [123]
         assert_eq!(json["messages"][1]["role"], "tool");
         assert_eq!(json["messages"][1]["content"][0]["type"], "tool_result");
         assert_eq!(json["messages"][1]["content"][0]["is_error"], false);
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_returns_turn_scoped_grouped_tool_history() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-grouped-history");
+        registry
+            .record_turn(
+                &key,
+                vec![
+                    SessionMessage::structured(
+                        SessionMessageRole::Assistant,
+                        vec![
+                            SessionContentBlock::ToolUse {
+                                id: "call_1".to_string(),
+                                provider_id: Some("fc_1".to_string()),
+                                name: "read_file".to_string(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            },
+                            SessionContentBlock::ToolUse {
+                                id: "call_2".to_string(),
+                                provider_id: Some("fc_2".to_string()),
+                                name: "list_dir".to_string(),
+                                input: serde_json::json!({"path": "."}),
+                            },
+                        ],
+                        1,
+                        Some(21),
+                    ),
+                    SessionMessage::structured(
+                        SessionMessageRole::Tool,
+                        vec![
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_1".to_string(),
+                                content: serde_json::json!("file contents"),
+                                is_error: Some(false),
+                            },
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_2".to_string(),
+                                content: serde_json::json!(["Cargo.toml"]),
+                                is_error: Some(false),
+                            },
+                        ],
+                        2,
+                        None,
+                    ),
+                    SessionMessage::text(SessionMessageRole::Assistant, "Done.", 3),
+                ],
+                SessionMemory::default(),
+            )
+            .expect("record turn");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(
+            json["messages"][0]["content"]
+                .as_array()
+                .expect("tool uses")
+                .len(),
+            2
+        );
+        assert_eq!(json["messages"][0]["content"][0]["provider_id"], "fc_1");
+        assert_eq!(json["messages"][0]["content"][1]["provider_id"], "fc_2");
+        assert_eq!(json["messages"][0]["token_count"], 21);
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(
+            json["messages"][1]["content"]
+                .as_array()
+                .expect("tool results")
+                .len(),
+            2
+        );
+        assert_eq!(json["messages"][2]["role"], "assistant");
+        assert_eq!(json["messages"][2]["content"][0]["text"], "Done.");
     }
 
     #[tokio::test]
@@ -3455,6 +4390,7 @@ allowed_chat_ids = [123]
                 cron_store: None,
                 startup_warnings: vec![startup_warning],
                 stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                permission_prompt_state: None,
                 ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                     std::env::temp_dir().as_path(),
                 )),
@@ -4881,6 +5817,7 @@ mod telegram_update {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),

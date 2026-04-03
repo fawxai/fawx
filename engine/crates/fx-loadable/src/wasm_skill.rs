@@ -1,19 +1,21 @@
 //! WASM skill adapter — bridges [`fx_skills::SkillRuntime`] into the
 //! [`Skill`] trait consumed by [`SkillRegistry`].
 //!
-//! Each installed WASM skill becomes a single tool whose name matches the
-//! skill's manifest name. The kernel dispatches tool calls to the adapter,
-//! which forwards them to the WASM runtime with a [`LiveHostApi`].
+//! Each installed WASM skill can expose one or more tools declared in its
+//! manifest. The kernel dispatches tool calls to the adapter, which forwards
+//! normalized JSON input to the WASM runtime with a [`LiveHostApi`].
 
+use crate::lifecycle::{current_time_millis, hash_string, SignatureStatus, SkillRevision};
 use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
 use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
-use fx_llm::ToolDefinition;
+use fx_kernel::ToolAuthoritySurface;
+use fx_llm::{ToolCall, ToolDefinition};
 use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
-use fx_skills::manifest::SkillManifest;
+use fx_skills::manifest::{SkillManifest, SkillToolAuthoritySurface, SkillToolManifest};
 use fx_skills::runtime::SkillRuntime;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -48,6 +50,14 @@ pub struct WasmSkill {
     manifest: SkillManifest,
     runtime: Arc<Mutex<SkillRuntime>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+}
+
+pub struct LoadedWasmArtifact {
+    pub skill: WasmSkill,
+    pub revision: SkillRevision,
+    pub manifest_toml: String,
+    pub wasm_bytes: Vec<u8>,
+    pub signature_bytes: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -87,12 +97,11 @@ impl WasmSkill {
         &self.manifest.version
     }
 
-    /// Build a [`ToolDefinition`] from the skill manifest.
+    /// Build the legacy single-tool [`ToolDefinition`] from the skill manifest.
     ///
-    /// Each WASM skill exposes exactly one tool. The parameters schema
-    /// accepts a single `input` string — the raw JSON payload forwarded
-    /// to the WASM entry point via the host API.
-    fn build_tool_definition(&self) -> ToolDefinition {
+    /// Skills without manifest-declared tools still expose one compatibility
+    /// tool whose `input` string is forwarded directly to the WASM entrypoint.
+    fn build_legacy_tool_definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.manifest.name.clone(),
             description: self.manifest.description.clone(),
@@ -108,6 +117,190 @@ impl WasmSkill {
             }),
         }
     }
+
+    fn build_manifest_tool_definition(tool: &SkillToolManifest) -> ToolDefinition {
+        let properties = tool
+            .parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.name.clone(),
+                    serde_json::json!({
+                        "type": parameter.kind,
+                        "description": parameter.description,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        let required = tool
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.required)
+            .map(|parameter| serde_json::Value::String(parameter.name.clone()))
+            .collect::<Vec<_>>();
+
+        let mut parameters = serde_json::Map::new();
+        parameters.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        parameters.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(properties),
+        );
+        parameters.insert("required".to_string(), serde_json::Value::Array(required));
+        if tool.direct_utility {
+            parameters.insert(
+                "x-fawx-direct-utility".to_string(),
+                serde_json::json!({
+                    "enabled": true,
+                    "profile": tool.name,
+                    "trigger_patterns": tool.trigger_patterns,
+                }),
+            );
+        }
+
+        ToolDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: serde_json::Value::Object(parameters),
+        }
+    }
+
+    fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
+        if self.manifest.tools.is_empty() {
+            vec![self.build_legacy_tool_definition()]
+        } else {
+            self.manifest
+                .tools
+                .iter()
+                .map(Self::build_manifest_tool_definition)
+                .collect()
+        }
+    }
+
+    fn handles_tool(&self, tool_name: &str) -> bool {
+        tool_name == self.manifest.name
+            || self
+                .manifest
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_name)
+    }
+
+    fn manifest_tool(&self, tool_name: &str) -> Option<&SkillToolManifest> {
+        self.manifest
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+    }
+
+    fn authority_surface_for_tool(&self, tool_name: &str) -> ToolAuthoritySurface {
+        self.manifest_tool(tool_name)
+            .and_then(|tool| tool.authority_surface.clone())
+            .map(map_manifest_authority_surface)
+            .unwrap_or(ToolAuthoritySurface::Other)
+    }
+
+    fn encode_runtime_input(&self, tool_name: &str, arguments: &str) -> Result<String, SkillError> {
+        let value = serde_json::from_str::<serde_json::Value>(arguments)
+            .map_err(|error| format!("invalid arguments JSON: {error}"))?;
+
+        if self.manifest.tools.is_empty() {
+            return Ok(extract_legacy_input(value));
+        }
+
+        if let Some(tool) = self.manifest_tool(tool_name) {
+            return self.encode_manifest_tool_input(tool, value);
+        }
+
+        if tool_name == self.manifest.name {
+            return self.encode_manifest_alias_input(value);
+        }
+
+        Err(format!("unknown manifest tool: {tool_name}"))
+    }
+
+    fn encode_manifest_alias_input(&self, value: serde_json::Value) -> Result<String, SkillError> {
+        match self.manifest.tools.as_slice() {
+            [tool] => self.encode_manifest_tool_input(tool, value),
+            _ => normalize_legacy_router_input(value),
+        }
+    }
+
+    fn encode_manifest_tool_input(
+        &self,
+        tool: &SkillToolManifest,
+        value: serde_json::Value,
+    ) -> Result<String, SkillError> {
+        let serde_json::Value::Object(mut object) = value else {
+            return Err("tool arguments must be a JSON object".to_string());
+        };
+        if self.manifest.tools.len() > 1 {
+            object.insert(
+                "tool".to_string(),
+                serde_json::Value::String(tool.name.clone()),
+            );
+        }
+        Ok(serde_json::Value::Object(object).to_string())
+    }
+}
+
+fn extract_legacy_input(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(mut object) => match object.remove("input") {
+            Some(serde_json::Value::String(input)) => input,
+            Some(other) => other.to_string(),
+            None if object.is_empty() => String::new(),
+            None => serde_json::Value::Object(object).to_string(),
+        },
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_legacy_router_input(value: serde_json::Value) -> Result<String, SkillError> {
+    match value {
+        serde_json::Value::Object(mut object) => {
+            if let Some(input) = object.remove("input") {
+                normalize_legacy_router_payload(input)
+            } else {
+                normalize_legacy_router_payload(serde_json::Value::Object(object))
+            }
+        }
+        other => normalize_legacy_router_payload(other),
+    }
+}
+
+fn normalize_legacy_router_payload(value: serde_json::Value) -> Result<String, SkillError> {
+    match value {
+        serde_json::Value::String(raw) => {
+            if raw.trim().is_empty() {
+                Ok(raw)
+            } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                normalize_legacy_router_payload(parsed)
+            } else {
+                Ok(raw)
+            }
+        }
+        serde_json::Value::Object(mut object) => {
+            if !object.contains_key("tool") {
+                if let Some(action) = object.remove("action") {
+                    if let Some(action_name) = action.as_str() {
+                        object.insert(
+                            "tool".to_string(),
+                            serde_json::Value::String(action_name.to_string()),
+                        );
+                    } else {
+                        object.insert("action".to_string(), action);
+                    }
+                }
+            }
+            Ok(serde_json::Value::Object(object).to_string())
+        }
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 #[async_trait]
@@ -121,7 +314,7 @@ impl Skill for WasmSkill {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![self.build_tool_definition()]
+        self.build_tool_definitions()
     }
 
     fn capabilities(&self) -> Vec<String> {
@@ -135,6 +328,10 @@ impl Skill for WasmSkill {
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
         // WASM skills may have arbitrary side effects we can't predict.
         ToolCacheability::NeverCache
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.authority_surface_for_tool(&call.name)
     }
 
     /// Execute the WASM skill via `spawn_blocking` to avoid blocking the
@@ -151,18 +348,13 @@ impl Skill for WasmSkill {
         arguments: &str,
         _cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
-        if tool_name != self.manifest.name {
+        if !self.handles_tool(tool_name) {
             return None;
         }
 
-        // Extract the "input" field from the arguments JSON.
-        let input = match serde_json::from_str::<serde_json::Value>(arguments) {
-            Ok(val) => val
-                .get("input")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Err(e) => return Some(Err(format!("invalid arguments JSON: {e}"))),
+        let input = match self.encode_runtime_input(tool_name, arguments) {
+            Ok(input) => input,
+            Err(error) => return Some(Err(error)),
         };
 
         let skill_name = self.manifest.name.clone();
@@ -196,6 +388,18 @@ impl Skill for WasmSkill {
     }
 }
 
+fn map_manifest_authority_surface(surface: SkillToolAuthoritySurface) -> ToolAuthoritySurface {
+    match surface {
+        SkillToolAuthoritySurface::PathRead => ToolAuthoritySurface::PathRead,
+        SkillToolAuthoritySurface::PathWrite => ToolAuthoritySurface::PathWrite,
+        SkillToolAuthoritySurface::PathDelete => ToolAuthoritySurface::PathDelete,
+        SkillToolAuthoritySurface::GitCheckpoint => ToolAuthoritySurface::GitCheckpoint,
+        SkillToolAuthoritySurface::Command => ToolAuthoritySurface::Command,
+        SkillToolAuthoritySurface::Network => ToolAuthoritySurface::Network,
+        SkillToolAuthoritySurface::Other => ToolAuthoritySurface::Other,
+    }
+}
+
 /// Load a single WASM skill from a directory.
 ///
 /// Reads `manifest.toml` and `{name}.wasm` from `skill_dir`, computes
@@ -209,14 +413,25 @@ pub fn load_wasm_skill_from_dir(
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     policy: &SignaturePolicy,
 ) -> Result<(WasmSkill, [u8; 32]), SkillError> {
-    let manifest = read_manifest(skill_dir)?;
+    let artifact = load_wasm_artifact_from_dir(skill_dir, credential_provider, policy)?;
+    let hash = compute_wasm_hash(&artifact.wasm_bytes);
+    Ok((artifact.skill, hash))
+}
+
+pub fn load_wasm_artifact_from_dir(
+    skill_dir: &Path,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
+) -> Result<LoadedWasmArtifact, SkillError> {
+    let manifest_toml = read_manifest_toml(skill_dir)?;
+    let manifest = fx_skills::manifest::parse_manifest(&manifest_toml)
+        .map_err(|error| format!("invalid manifest in {}: {error}", skill_dir.display()))?;
     let wasm_bytes = read_wasm_bytes(skill_dir, &manifest.name)?;
-    let hash = compute_wasm_hash(&wasm_bytes);
     let signature = read_signature_file(skill_dir, &manifest.name)?;
-    validate_signature_policy(&signature, policy, &manifest.name)?;
-    // Only pass signature to the loader when we actually have keys to verify against.
-    // validate_signature_policy already warned if signature is present but no keys.
+    let signature = normalize_signature_status(&wasm_bytes, &signature, policy);
+    validate_signature_policy(&signature.bytes, policy, &manifest.name)?;
     let effective_signature = signature
+        .bytes
         .as_deref()
         .filter(|_| !policy.trusted_keys.is_empty());
     let loaded = compile_skill(
@@ -225,21 +440,38 @@ pub fn load_wasm_skill_from_dir(
         effective_signature,
         &policy.trusted_keys,
     )?;
-    let wasm_skill = WasmSkill::new(loaded, credential_provider)?;
-    Ok((wasm_skill, hash))
+    let skill = WasmSkill::new(loaded, credential_provider)?;
+    let revision = build_revision(
+        &skill,
+        &manifest,
+        &manifest_toml,
+        signature.status,
+        &wasm_bytes,
+    );
+    Ok(LoadedWasmArtifact {
+        skill,
+        revision,
+        manifest_toml,
+        wasm_bytes,
+        signature_bytes: signature.bytes,
+    })
 }
 
 /// Read and parse `manifest.toml` from a skill directory.
 pub(crate) fn read_manifest(skill_dir: &Path) -> Result<SkillManifest, SkillError> {
-    let manifest_path = skill_dir.join("manifest.toml");
-    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        format!(
-            "failed to read manifest at {}: {e}",
-            manifest_path.display()
-        )
-    })?;
+    let content = read_manifest_toml(skill_dir)?;
     fx_skills::manifest::parse_manifest(&content)
         .map_err(|e| format!("invalid manifest in {}: {e}", skill_dir.display()))
+}
+
+pub(crate) fn read_manifest_toml(skill_dir: &Path) -> Result<String, SkillError> {
+    let manifest_path = skill_dir.join("manifest.toml");
+    std::fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "failed to read manifest at {}: {error}",
+            manifest_path.display()
+        )
+    })
 }
 
 /// Read `{name}.wasm` from a skill directory.
@@ -254,6 +486,43 @@ pub fn compute_wasm_hash(wasm_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(wasm_bytes);
     hasher.finalize().into()
+}
+
+fn build_revision(
+    skill: &WasmSkill,
+    manifest: &SkillManifest,
+    manifest_toml: &str,
+    signature: SignatureStatus,
+    wasm_bytes: &[u8],
+) -> SkillRevision {
+    SkillRevision {
+        content_hash: hash_wasm_bytes(wasm_bytes),
+        manifest_hash: hash_string(manifest_toml),
+        version: manifest.version.clone(),
+        signature,
+        tool_contracts: skill.tool_definitions(),
+        staged_at: current_time_millis(),
+    }
+}
+
+fn hash_wasm_bytes(wasm_bytes: &[u8]) -> String {
+    encode_hash_bytes(&compute_wasm_hash(wasm_bytes))
+}
+
+fn encode_hash_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(nibble_to_hex(byte >> 4));
+        output.push(nibble_to_hex(byte & 0x0f));
+    }
+    output
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + (value - 10)) as char,
+    }
 }
 
 /// Compile a WASM skill from bytes and manifest, with optional signature verification.
@@ -280,6 +549,11 @@ fn read_signature_file(skill_dir: &Path, name: &str) -> Result<Option<Vec<u8>>, 
             sig_path.display()
         )),
     }
+}
+
+struct NormalizedSignature {
+    bytes: Option<Vec<u8>>,
+    status: SignatureStatus,
 }
 
 /// Load Ed25519 public keys from `~/.fawx/trusted_keys/*.pub`.
@@ -376,20 +650,57 @@ fn validate_signature_policy(
     }
 }
 
-/// Load all installed WASM skills from `~/.fawx/skills/` and return
-/// them as [`Arc<dyn Skill>`] trait objects ready for registry insertion.
+fn normalize_signature_status(
+    wasm_bytes: &[u8],
+    signature: &Option<Vec<u8>>,
+    policy: &SignaturePolicy,
+) -> NormalizedSignature {
+    let Some(bytes) = signature.clone() else {
+        return NormalizedSignature {
+            bytes: None,
+            status: SignatureStatus::Unsigned,
+        };
+    };
+    let status = matching_signer(wasm_bytes, &bytes, &policy.trusted_keys)
+        .map(|signer| SignatureStatus::Valid { signer })
+        .unwrap_or(SignatureStatus::Invalid);
+    NormalizedSignature {
+        bytes: Some(bytes),
+        status,
+    }
+}
+
+fn matching_signer(
+    wasm_bytes: &[u8],
+    signature: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Option<String> {
+    trusted_keys
+        .iter()
+        .find_map(|key| signature_matches(wasm_bytes, signature, key))
+}
+
+fn signature_matches(wasm_bytes: &[u8], signature: &[u8], key: &[u8]) -> Option<String> {
+    match fx_skills::signing::verify_skill(wasm_bytes, signature, key) {
+        Ok(true) => Some(format!("ed25519:{}", encode_hash_bytes(key))),
+        Ok(false) | Err(_) => None,
+    }
+}
+
+/// Load all installed WASM skills from `skills_dir` and return them as
+/// [`Arc<dyn Skill>`] trait objects ready for registry insertion.
 ///
 /// The optional `credential_provider` bridges the encrypted credential
 /// store so skills can retrieve secrets (e.g., GitHub PAT) via `kv_get`.
 ///
 /// Errors from individual skills are logged and skipped; only a
 /// directory-level failure propagates as an error.
-pub fn load_wasm_skills(
+pub fn load_wasm_skills_from(
+    skills_dir: &Path,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     policy: &SignaturePolicy,
 ) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
-    let skills_dir = skills_directory()?;
-    let entries = read_skill_directories(&skills_dir)?;
+    let entries = read_skill_directories(skills_dir)?;
 
     let mut skills: Vec<Arc<dyn Skill>> = Vec::new();
 
@@ -407,6 +718,16 @@ pub fn load_wasm_skills(
     }
 
     Ok(skills)
+}
+
+/// Load all installed WASM skills from `~/.fawx/skills/` and return
+/// them as [`Arc<dyn Skill>`] trait objects ready for registry insertion.
+pub fn load_wasm_skills(
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
+) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
+    let skills_dir = skills_directory()?;
+    load_wasm_skills_from(&skills_dir, credential_provider, policy)
 }
 
 /// Resolve the `~/.fawx/skills/` directory path.
@@ -457,6 +778,7 @@ mod tests {
             author: "Test".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         }
     }
@@ -483,6 +805,196 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
         assert_eq!(defs[0].description, "echo skill");
+    }
+
+    #[test]
+    fn wasm_skill_exposes_manifest_declared_tools() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_search".to_string(),
+                description: "Search".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "query".to_string(),
+                    kind: "string".to_string(),
+                    description: "Search query".to_string(),
+                    required: true,
+                }],
+            },
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![],
+            },
+        ];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let defs = skill.tool_definitions();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "web_search");
+        assert_eq!(defs[1].name, "web_fetch");
+        assert_eq!(defs[0].parameters["required"], serde_json::json!(["query"]));
+    }
+
+    #[test]
+    fn wasm_skill_reports_manifest_authority_surface() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "web_search".to_string(),
+            description: "Search".to_string(),
+            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+            direct_utility: false,
+            trigger_patterns: Vec::new(),
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "query".to_string(),
+                kind: "string".to_string(),
+                description: "Search query".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "web_search".to_string(),
+            arguments: serde_json::json!({"query":"rust"}),
+        };
+
+        assert_eq!(
+            skill.authority_surface(&call),
+            ToolAuthoritySurface::Network
+        );
+    }
+
+    #[tokio::test]
+    async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
+        let mut manifest = test_manifest("weather");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "weather".to_string(),
+            description: "Weather".to_string(),
+            authority_surface: None,
+            direct_utility: true,
+            trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "location".to_string(),
+                kind: "string".to_string(),
+                description: "City or location".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let defs = skill.tool_definitions();
+        assert_eq!(defs[0].name, "weather");
+        assert!(defs[0].parameters["properties"].get("location").is_some());
+        assert!(defs[0].parameters["properties"].get("input").is_none());
+        assert_eq!(
+            defs[0].parameters["x-fawx-direct-utility"]["trigger_patterns"],
+            serde_json::json!(["weather", "forecast"])
+        );
+
+        let result = skill
+            .execute("weather", r#"{"location":"Denver, CO"}"#, None)
+            .await;
+        assert!(result.is_some());
+        assert!(result.expect("known tool").is_ok());
+    }
+
+    #[test]
+    fn single_manifest_tool_keeps_structured_arguments_without_tool_wrapper() {
+        let mut manifest = test_manifest("calculator");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "calculate".to_string(),
+            description: "Calculate".to_string(),
+            authority_surface: None,
+            direct_utility: false,
+            trigger_patterns: Vec::new(),
+            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                name: "expression".to_string(),
+                kind: "string".to_string(),
+                description: "Expression".to_string(),
+                required: true,
+            }],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let encoded = skill
+            .encode_runtime_input("calculate", r#"{"expression":"2 + 2"}"#)
+            .expect("encode");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("json"),
+            serde_json::json!({"expression":"2 + 2"})
+        );
+    }
+
+    #[test]
+    fn multi_tool_manifest_inserts_explicit_tool_name_for_runtime_routing() {
+        let mut manifest = test_manifest("canvas");
+        manifest.tools = vec![
+            fx_skills::manifest::SkillToolManifest {
+                name: "render_table".to_string(),
+                description: "Render table".to_string(),
+                authority_surface: None,
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "headers".to_string(),
+                    kind: "string".to_string(),
+                    description: "Headers".to_string(),
+                    required: true,
+                }],
+            },
+            fx_skills::manifest::SkillToolManifest {
+                name: "render_chart".to_string(),
+                description: "Render chart".to_string(),
+                authority_surface: None,
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
+                    name: "data".to_string(),
+                    kind: "string".to_string(),
+                    description: "Data".to_string(),
+                    required: true,
+                }],
+            },
+        ];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let encoded = skill
+            .encode_runtime_input("render_table", r#"{"headers":"Name,Score"}"#)
+            .expect("encode");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("json"),
+            serde_json::json!({
+                "tool": "render_table",
+                "headers": "Name,Score"
+            })
+        );
     }
 
     #[test]
@@ -538,10 +1050,59 @@ mod tests {
     }
 
     #[test]
+    fn legacy_router_input_normalizes_nested_action_payload() {
+        let normalized = normalize_legacy_router_input(serde_json::json!({
+            "input": {
+                "action": "web_search",
+                "query": "rust async",
+                "count": "3"
+            }
+        }))
+        .expect("normalize");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).expect("json"),
+            serde_json::json!({
+                "tool": "web_search",
+                "query": "rust async",
+                "count": "3"
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_router_input_normalizes_embedded_json_string() {
+        let normalized = normalize_legacy_router_input(serde_json::json!({
+            "input": "{\"action\":\"web_fetch\",\"url\":\"https://example.com\"}"
+        }))
+        .expect("normalize");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).expect("json"),
+            serde_json::json!({
+                "tool": "web_fetch",
+                "url": "https://example.com"
+            })
+        );
+    }
+
+    #[test]
     fn load_wasm_skills_empty_dir() {
-        // Default ~/.fawx/skills/ may be empty or have skills — just verify no panic
-        let result = load_wasm_skills(None, &SignaturePolicy::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = load_wasm_skills_from(tmp.path(), None, &SignaturePolicy::default());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_wasm_skills_from_reads_requested_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "dirskill");
+
+        let skills = load_wasm_skills_from(tmp.path(), None, &SignaturePolicy::default())
+            .expect("skills should load");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name(), "dirskill");
     }
 
     fn setup_skill_dir(dir: &std::path::Path, name: &str) {

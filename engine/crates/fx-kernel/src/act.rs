@@ -1,10 +1,13 @@
 //! Act-step execution result types.
 
+use crate::authority::ToolAuthoritySurface;
 use crate::cancellation::CancellationToken;
 use crate::decide::Decision;
 use async_trait::async_trait;
+use fx_llm::Message;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 /// Token accounting for loop steps that call an LLM.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -59,6 +62,15 @@ pub enum ToolCacheability {
     SideEffect,
 }
 
+/// Classifies the effect of a specific tool invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallClassification {
+    /// The invocation only observes existing state.
+    Observation,
+    /// The invocation may mutate state or trigger side effects.
+    Mutation,
+}
+
 /// Cache counters exposed by caching-capable executors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolCacheStats {
@@ -79,6 +91,73 @@ pub struct ToolResult {
     pub success: bool,
     /// Human-readable tool output.
     pub output: String,
+}
+
+/// The specific tool action that should be journaled for ripcord.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalAction {
+    FileWrite {
+        path: PathBuf,
+        snapshot_hash: Option<String>,
+        size_bytes: u64,
+        created: bool,
+    },
+    FileDelete {
+        path: PathBuf,
+        snapshot_hash: String,
+    },
+    FileMove {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    GitCommit {
+        repo: PathBuf,
+        pre_ref: String,
+        commit_sha: String,
+    },
+    GitBranchCreate {
+        repo: PathBuf,
+        branch: String,
+    },
+    GitPush {
+        repo: PathBuf,
+        remote: String,
+        branch: String,
+        pre_ref: String,
+    },
+    ShellCommand {
+        command: String,
+        exit_code: i32,
+    },
+    NetworkRequest {
+        url: String,
+        method: String,
+        status_code: u16,
+    },
+}
+
+impl JournalAction {
+    /// Whether this action type can be mechanically reversed.
+    pub fn is_reversible(&self) -> bool {
+        matches!(
+            self,
+            Self::FileWrite { .. }
+                | Self::FileDelete { .. }
+                | Self::FileMove { .. }
+                | Self::GitCommit { .. }
+                | Self::GitBranchCreate { .. }
+        )
+    }
+}
+
+/// Executor-facing request to materialize a direct tool call from a sub-goal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubGoalToolRoutingRequest {
+    /// Human-readable description of the sub-goal.
+    pub description: String,
+    /// Required tools declared by the sub-goal in priority order.
+    pub required_tools: Vec<String>,
 }
 
 /// Returns true when the optional cancellation token has been cancelled.
@@ -142,6 +221,56 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
         ToolCacheability::NeverCache
     }
 
+    /// Classifies the effect of an individual tool call.
+    ///
+    /// The default implementation derives from [`Self::cacheability`], but
+    /// executors with mixed-mode tools (for example `run_command`) should
+    /// override this and classify using the call arguments.
+    fn classify_call(&self, call: &fx_llm::ToolCall) -> ToolCallClassification {
+        match self.cacheability(&call.name) {
+            ToolCacheability::SideEffect => ToolCallClassification::Mutation,
+            ToolCacheability::Cacheable | ToolCacheability::NeverCache => {
+                ToolCallClassification::Observation
+            }
+        }
+    }
+
+    /// Classifies the permission/ripcord action category for a tool call.
+    fn action_category(&self, call: &fx_llm::ToolCall) -> &'static str {
+        let _ = call;
+        "unknown"
+    }
+
+    /// Declares the authority-relevant surface for a tool call.
+    fn authority_surface(&self, call: &fx_llm::ToolCall) -> ToolAuthoritySurface {
+        let _ = call;
+        ToolAuthoritySurface::Other
+    }
+
+    /// Extracts a journal action for ripcord when the tool call is material.
+    fn journal_action(
+        &self,
+        call: &fx_llm::ToolCall,
+        result: &ToolResult,
+    ) -> Option<JournalAction> {
+        let _ = (call, result);
+        None
+    }
+
+    /// Materialize a direct tool call for a decomposed sub-goal when the
+    /// executor can do so safely from the tool's declared contract.
+    ///
+    /// Returning `None` means the tool cannot be safely invoked from the
+    /// sub-goal alone, and the runner should keep normal decomposition.
+    fn route_sub_goal_call(
+        &self,
+        request: &SubGoalToolRoutingRequest,
+        call_id: &str,
+    ) -> Option<fx_llm::ToolCall> {
+        let _ = (request, call_id);
+        None
+    }
+
     /// Clears any tool-result cache state for the current cycle.
     fn clear_cache(&self) {}
 
@@ -151,6 +280,134 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Terminal disposition for a single Act step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionTerminal {
+    /// Act produced a final user-visible response.
+    Complete { response: String },
+    /// Act cannot continue this turn and should end incomplete.
+    Incomplete {
+        partial_response: Option<String>,
+        reason: String,
+    },
+}
+
+/// Tool-surface restriction applied to the next root reasoning pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContinuationToolScope {
+    /// Keep the full root tool surface available.
+    Full,
+    /// Restrict the next reasoning pass to side-effect-capable tools only.
+    MutationOnly,
+    /// Restrict the next reasoning pass to an explicit set of tool names.
+    Only(Vec<String>),
+}
+
+/// A constrained execution commitment carried into the next root reasoning pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProceedUnderConstraints {
+    /// High-level goal the next pass should continue pursuing.
+    pub goal: String,
+    /// Concrete definition of successful next progress, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_target: Option<String>,
+    /// Items that remain provisional or unsupported under this commitment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_items: Vec<String>,
+    /// Assumptions the loop is proceeding under for this commitment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
+    /// Optional constraint on the tools available while this commitment is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<ContinuationToolScope>,
+}
+
+/// A typed request for the next root reasoning pass to ask for one blocking choice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeedsDirection {
+    /// Concise user-facing question that resolves the blocker.
+    pub question: String,
+    /// Short description of the concrete decision that is blocking execution.
+    pub blocking_choice: String,
+}
+
+/// Root turn commitment preserved across continuation iterations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TurnCommitment {
+    /// Continue the turn under a constrained execution contract.
+    ProceedUnderConstraints(ProceedUnderConstraints),
+    /// Ask the user one precise question before continuing.
+    NeedsDirection(NeedsDirection),
+}
+
+/// Continuation payload for an Act step that needs another outer-loop pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionContinuation {
+    /// Partial user-visible progress to preserve if the run is interrupted.
+    pub partial_response: Option<String>,
+    /// Context to append before the next reasoning pass.
+    pub context_message: Option<String>,
+    /// Structured context to append before the next reasoning pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_messages: Vec<Message>,
+    /// Optional constraint on the next public tool surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_tool_scope: Option<ContinuationToolScope>,
+    /// Optional typed turn commitment to preserve into the next root pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_commitment: Option<TurnCommitment>,
+    /// Optional artifact path that should be written before broader execution continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_write_target: Option<String>,
+}
+
+impl ActionContinuation {
+    #[must_use]
+    pub fn new(partial_response: Option<String>, context_message: Option<String>) -> Self {
+        Self {
+            partial_response,
+            context_message,
+            context_messages: Vec::new(),
+            next_tool_scope: None,
+            turn_commitment: None,
+            artifact_write_target: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context_messages(mut self, context_messages: Vec<Message>) -> Self {
+        self.context_messages = context_messages;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_scope(mut self, next_tool_scope: ContinuationToolScope) -> Self {
+        self.next_tool_scope = Some(next_tool_scope);
+        self
+    }
+
+    #[must_use]
+    pub fn with_turn_commitment(mut self, turn_commitment: TurnCommitment) -> Self {
+        self.turn_commitment = Some(turn_commitment);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_write_target(mut self, artifact_write_target: String) -> Self {
+        self.artifact_write_target = Some(artifact_write_target);
+        self
+    }
+}
+
+/// Explicit next-step disposition selected by the Act step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionNextStep {
+    /// The outer loop should reason again with updated context.
+    Continue(ActionContinuation),
+    /// The outer loop should finish with a typed terminal result.
+    Finish(ActionTerminal),
+}
+
 /// Result of the Act step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionResult {
@@ -158,15 +415,48 @@ pub struct ActionResult {
     pub decision: Decision,
     /// Outputs from executed tools.
     pub tool_results: Vec<ToolResult>,
-    /// User-visible text response.
+    /// Latest model-produced text for this action.
+    ///
+    /// This may become the final user-visible response, or it may remain
+    /// internal context when the action continues the outer loop.
     pub response_text: String,
     /// Tokens consumed while producing this action output.
     pub tokens_used: TokenUsage,
+    /// Explicit continuation or terminal disposition for this step.
+    pub next_step: ActionNextStep,
+}
+
+impl ActionResult {
+    /// Returns true when this action reflects tool execution activity.
+    #[must_use]
+    pub fn has_tool_activity(&self) -> bool {
+        self.is_tool_continuation() || !self.tool_results.is_empty()
+    }
+
+    fn is_tool_continuation(&self) -> bool {
+        matches!(self.decision, Decision::UseTools(_))
+            && matches!(self.next_step, ActionNextStep::Continue(_))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_decompose::{AggregationStrategy, DecompositionPlan};
+
+    #[derive(Debug)]
+    struct NoMetadataExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for NoMetadataExecutor {
+        async fn execute_tools(
+            &self,
+            _calls: &[fx_llm::ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn concurrency_policy_default_is_unlimited() {
@@ -200,5 +490,92 @@ mod tests {
         assert_eq!(usage.input_tokens, 17);
         assert_eq!(usage.output_tokens, 23);
         assert_eq!(usage.total_tokens(), 40);
+    }
+
+    #[test]
+    fn tool_executor_default_action_category_is_unknown_without_metadata() {
+        let executor = NoMetadataExecutor;
+        let call = fx_llm::ToolCall {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello",
+            }),
+        };
+
+        assert_eq!(executor.action_category(&call), "unknown");
+    }
+
+    #[test]
+    fn tool_executor_default_journal_action_is_none_without_metadata() {
+        let executor = NoMetadataExecutor;
+        let call = fx_llm::ToolCall {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "content": "hello",
+            }),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        assert_eq!(executor.journal_action(&call, &result), None);
+    }
+
+    #[test]
+    fn tool_continuation_without_results_still_has_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                Some("Still working".to_string()),
+                Some("Tool execution continues".to_string()),
+            )),
+        };
+
+        assert!(action.has_tool_activity());
+    }
+
+    #[test]
+    fn decomposition_continuation_without_results_is_not_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::Decompose(DecompositionPlan {
+                sub_goals: Vec::new(),
+                strategy: AggregationStrategy::Sequential,
+                truncated_from: None,
+            }),
+            tool_results: Vec::new(),
+            response_text: "Task decomposition results: none".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Continue(ActionContinuation::new(
+                None,
+                Some("Task decomposition results: none".to_string()),
+            )),
+        };
+
+        assert!(!action.has_tool_activity());
+    }
+
+    #[test]
+    fn blocked_tool_decision_without_results_is_not_tool_activity() {
+        let action = ActionResult {
+            decision: Decision::UseTools(Vec::new()),
+            tool_results: Vec::new(),
+            response_text: "tool dispatch was not executed".to_string(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Complete {
+                response: "tool dispatch was not executed".to_string(),
+            }),
+        };
+
+        assert!(!action.has_tool_activity());
     }
 }

@@ -25,14 +25,58 @@ mod startup;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::{Arc, Once},
+    sync::Once,
 };
 
 pub use confirmation::ConfirmationUi;
+
+const SKILL_COMMAND_AFTER_HELP: &str = concat!(
+    "Recommended workflows:\n",
+    "  Local dev project:  fawx skill build <project>\n",
+    "  Repo built-in set:  skills/build.sh --install\n",
+    "  Prebuilt artifact:  fawx skill install <path>\n",
+    "\n",
+    "Use `fawx sign <skill>` only when an already-installed skill still needs a signature.\n",
+);
+const SKILL_BUILD_AFTER_HELP: &str = concat!(
+    "Recommended local-dev path.\n",
+    "Builds the project for wasm32-wasip1, installs it into ~/.fawx/skills/, and signs it when a signing key exists.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx skill build <project>\n",
+    "  fawx skill build <project> --no-install\n",
+    "\n",
+    "Use `fawx sign <skill>` only if you need to sign an already-installed skill.\n",
+);
+const SKILL_INSTALL_AFTER_HELP: &str = concat!(
+    "Use this for prebuilt local artifacts or skill directories.\n",
+    "Any argument containing `/`, `\\`, or ending in `.wasm` is treated as a local path.\n",
+    "Bare names go through the marketplace install flow.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx skill install <path>\n",
+    "  fawx skill install <marketplace-name>\n",
+);
+const SIGN_COMMAND_AFTER_HELP: &str = concat!(
+    "Use this after a skill is already installed, or after building with --no-sign.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx sign <skill>\n",
+    "  fawx sign --all\n",
+);
+const KEYS_COMMAND_AFTER_HELP: &str = concat!(
+    "Manage local WASM signing keys.\n",
+    "Generate writes ~/.fawx/keys/signing_key.pem and trusts the matching public key locally.\n",
+    "\n",
+    "Examples:\n",
+    "  fawx keys generate\n",
+    "  fawx keys list\n",
+    "  fawx keys trust /path/to/key.pub\n",
+    "  fawx keys revoke <fingerprint>\n",
+);
 
 #[derive(Parser)]
 #[command(name = "fawx")]
@@ -179,11 +223,23 @@ enum Commands {
         command: AuditCommands,
     },
 
+    /// Manage WASM signing keys
+    #[command(after_long_help = KEYS_COMMAND_AFTER_HELP)]
+    Keys {
+        #[command(subcommand)]
+        command: commands::keys::KeysCommands,
+    },
+
     /// Manage skills
+    #[command(after_long_help = SKILL_COMMAND_AFTER_HELP)]
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
     },
+
+    /// Sign installed WASM skills
+    #[command(after_long_help = SIGN_COMMAND_AFTER_HELP)]
+    Sign(commands::skill_sign::SignArgs),
 
     /// Search the skill registry
     Search {
@@ -299,7 +355,11 @@ enum AuditCommands {
 #[derive(Subcommand)]
 enum SkillCommands {
     /// List installed skills
-    List,
+    List {
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 
     /// Search the skill registry
     Search {
@@ -307,19 +367,27 @@ enum SkillCommands {
         query: Option<String>,
     },
 
-    /// Install a skill
+    /// Install a skill by marketplace name or local path
+    #[command(after_long_help = SKILL_INSTALL_AFTER_HELP)]
     Install {
-        /// Skill name or path to WASM file
+        /// Marketplace name or local path to a .wasm file / skill directory
         name_or_path: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Remove a skill
     Remove {
         /// Skill name
         name: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Build a skill from source (compile, sign, install)
+    #[command(after_long_help = SKILL_BUILD_AFTER_HELP)]
     Build {
         /// Path to skill project directory
         path: String,
@@ -329,6 +397,25 @@ enum SkillCommands {
         /// Build only, don't install to ~/.fawx/skills/
         #[arg(long)]
         no_install: bool,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Show active skill lifecycle metadata
+    Status {
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Prepare a rollback to the previous active revision
+    Rollback {
+        /// Skill name
+        name: String,
+        /// Override data directory (default: ~/.fawx)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Scaffold a new skill project
@@ -368,58 +455,6 @@ enum TailscaleCommands {
 
 const FAWX_TUI_NOT_FOUND_MESSAGE: &str =
     "fawx-tui binary not found. Build it with: cargo build --release -p fawx-tui";
-
-fn build_config_manager(
-    config: &fx_config::FawxConfig,
-) -> Arc<std::sync::Mutex<fx_config::manager::ConfigManager>> {
-    let data_dir = config
-        .general
-        .data_dir
-        .clone()
-        .unwrap_or_else(startup::fawx_data_dir);
-    let config_path = data_dir.join("config.toml");
-    let manager = fx_config::manager::ConfigManager::from_config(config.clone(), config_path);
-    Arc::new(std::sync::Mutex::new(manager))
-}
-
-fn build_subagent_manager(
-    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
-    config: &fx_config::FawxConfig,
-    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
-    session_bus: Option<fx_bus::SessionBus>,
-    credential_store: Option<startup::SharedCredentialStore>,
-) -> Arc<fx_subagent::SubagentManager> {
-    let token_broker = startup::build_token_broker(config, credential_store.as_ref());
-    let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
-        router,
-        config: config.clone(),
-        improvement_provider,
-        session_bus,
-        token_broker,
-    });
-    Arc::new(fx_subagent::SubagentManager::new(
-        fx_subagent::SubagentManagerDeps {
-            factory: Arc::new(factory),
-            limits: fx_subagent::SubagentLimits::default(),
-        },
-    ))
-}
-
-fn parent_loop_build_options(
-    subagent_manager: &Arc<fx_subagent::SubagentManager>,
-    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
-    session_bus: Option<fx_bus::SessionBus>,
-) -> startup::HeadlessLoopBuildOptions {
-    startup::HeadlessLoopBuildOptions {
-        memory_enabled: true,
-        subagent_control: Some(
-            Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
-        ),
-        config_manager,
-        session_bus,
-        ..startup::HeadlessLoopBuildOptions::default()
-    }
-}
 
 fn launch_fawx_tui(args: &[String]) -> anyhow::Result<i32> {
     let tui_binary = find_fawx_tui_binary()?;
@@ -480,193 +515,33 @@ fn fawx_tui_binary_name() -> &'static str {
     }
 }
 
-struct HeadlessStartup {
-    app: headless::HeadlessApp,
-    _logging_guard: tracing_appender::non_blocking::WorkerGuard,
-    #[cfg(feature = "http")]
-    http_config: fx_config::HttpConfig,
-    #[cfg(feature = "http")]
-    telegram_config: fx_config::TelegramChannelConfig,
-    #[cfg(feature = "http")]
-    webhook_config: fx_config::WebhookConfig,
-    #[cfg(feature = "http")]
-    data_dir: std::path::PathBuf,
-    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
-}
+type HeadlessStartup = headless::startup::HeadlessStartup;
 
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
     skip_session_db: bool,
     #[cfg(feature = "http")] wire_experiment_registry: bool,
 ) -> anyhow::Result<HeadlessStartup> {
-    let config = startup::load_config()?;
-    let logging_guard = headless::init_serve_logging(&config)?;
-    let auth_manager = startup::load_auth_manager()?;
-    let mut router = startup::build_router(&auth_manager)?;
-    headless::seed_headless_router_active_model(&mut router, &config);
-    let router = Arc::new(std::sync::RwLock::new(router));
-    #[cfg(feature = "http")]
-    let http_config = config.http.clone();
-    #[cfg(feature = "http")]
-    let telegram_config = config.telegram.clone();
-    #[cfg(feature = "http")]
-    let webhook_config = config.webhook.clone();
-    let data_dir = startup::fawx_data_dir();
-    let config_manager = Some(build_config_manager(&config));
-    let improvement_provider = startup::build_improvement_provider(&auth_manager, &config);
-    let improvement_provider_for_http = improvement_provider.clone();
-    #[cfg(feature = "http")]
-    let experiment_registry = if wire_experiment_registry {
-        let registry_data_dir = startup::configured_data_dir(&data_dir, &config);
-        Some(startup::build_shared_experiment_registry(
-            &registry_data_dir,
-        )?)
-    } else {
-        None
-    };
-    let app = build_headless_app(
-        router,
-        config,
-        improvement_provider,
+    headless::startup::build_headless_startup(headless::startup::HeadlessStartupRequest {
         system_prompt,
-        config_manager,
-        data_dir.clone(),
         skip_session_db,
         #[cfg(feature = "http")]
-        experiment_registry,
-    )?;
-    Ok(HeadlessStartup {
-        app,
-        _logging_guard: logging_guard,
-        #[cfg(feature = "http")]
-        http_config,
-        #[cfg(feature = "http")]
-        telegram_config,
-        #[cfg(feature = "http")]
-        webhook_config,
-        #[cfg(feature = "http")]
-        data_dir,
-        improvement_provider: improvement_provider_for_http,
+        wire_experiment_registry,
     })
 }
 
-#[allow(clippy::too_many_arguments)] // Pre-existing constructor shape; follow-up will bundle args into a config struct.
-fn build_headless_app(
-    router: Arc<std::sync::RwLock<fx_llm::ModelRouter>>,
-    config: fx_config::FawxConfig,
-    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
-    system_prompt: Option<std::path::PathBuf>,
-    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
-    data_dir: PathBuf,
-    skip_session_db: bool,
-    #[cfg(feature = "http")] experiment_registry: Option<fx_api::SharedExperimentRegistry>,
-) -> anyhow::Result<headless::HeadlessApp> {
-    let session_bus = startup::build_session_bus_for_data_dir(&data_dir);
-    let credential_store = startup::open_credential_store(&data_dir).ok();
-    let subagent_manager = build_subagent_manager(
-        Arc::clone(&router),
-        &config,
-        improvement_provider.clone(),
-        session_bus.clone(),
-        credential_store.clone(),
-    );
-    let session_registry = (!skip_session_db)
-        .then(|| startup::open_session_registry(&data_dir))
-        .flatten();
-    let options = startup::HeadlessLoopBuildOptions {
-        session_registry,
-        credential_store: credential_store.clone(),
-        #[cfg(feature = "http")]
-        experiment_registry: experiment_registry.clone(),
-        ..parent_loop_build_options(
-            &subagent_manager,
-            config_manager.clone(),
-            session_bus.clone(),
-        )
-    };
-    let bundle =
-        startup::build_headless_loop_engine_bundle(&config, improvement_provider, options)?;
-    headless::HeadlessApp::new(headless::HeadlessAppDeps {
-        loop_engine: bundle.engine,
-        router,
-        runtime_info: bundle.runtime_info,
-        config,
-        memory: bundle.memory,
-        embedding_index_persistence: bundle.embedding_index_persistence,
-        system_prompt_path: system_prompt,
-        config_manager,
-        system_prompt_text: None,
-        subagent_manager,
-        canary_monitor: Some(build_canary_monitor(&data_dir)),
-        session_bus,
-        session_key: Some(headless::main_session_key()),
-        cron_store: bundle.cron_store,
-        startup_warnings: bundle.startup_warnings,
-        stream_callback_slot: bundle.stream_callback_slot,
-        ripcord_journal: bundle.ripcord_journal,
-        #[cfg(feature = "http")]
-        experiment_registry,
-    })
-}
-
-fn build_canary_monitor(data_dir: &Path) -> CanaryMonitor {
-    let trigger = resolve_ripcord_path(data_dir).map(|path| {
-        Arc::new(RipcordTrigger::new(path, data_dir.to_path_buf())) as Arc<dyn RollbackTrigger>
-    });
-    if trigger.is_none() {
-        tracing::warn!(
-            data_dir = %data_dir.display(),
-            "fawx-ripcord not found; automatic rollback is disabled"
-        );
-    }
-    CanaryMonitor::new(CanaryConfig::default(), trigger)
-}
-
-fn resolve_ripcord_path(data_dir: &Path) -> Option<PathBuf> {
-    resolve_ripcord_path_with(
-        ripcord_current_exe_candidate(),
-        data_dir,
-        std::env::var_os("PATH"),
-    )
-}
-
+#[cfg(test)]
 fn resolve_ripcord_path_with(
     current_exe_candidate: Option<PathBuf>,
     data_dir: &Path,
     path_env: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    current_exe_candidate
-        .into_iter()
-        .chain(std::iter::once(
-            data_dir.join("bin").join(ripcord_binary_name()),
-        ))
-        .chain(path_candidates_from(path_env))
-        .find(|path| path.is_file())
+    headless::startup::resolve_ripcord_path_with(current_exe_candidate, data_dir, path_env)
 }
 
-fn ripcord_current_exe_candidate() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join(ripcord_binary_name()))
-}
-
-fn path_candidates_from(path_env: Option<std::ffi::OsString>) -> Vec<PathBuf> {
-    let Some(paths) = path_env else {
-        return Vec::new();
-    };
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(ripcord_binary_name()))
-        .collect()
-}
-
+#[cfg(test)]
 fn ripcord_binary_name() -> &'static str {
-    #[cfg(windows)]
-    {
-        "fawx-ripcord.exe"
-    }
-    #[cfg(not(windows))]
-    {
-        "fawx-ripcord"
-    }
+    headless::startup::ripcord_binary_name()
 }
 
 async fn run_headless(
@@ -915,19 +790,25 @@ fn looks_like_local_skill_path(name_or_path: &str) -> bool {
     name_or_path.contains('/') || name_or_path.contains('\\') || name_or_path.ends_with(".wasm")
 }
 
-async fn dispatch_skill_install(name_or_path: &str) -> anyhow::Result<i32> {
+async fn dispatch_skill_install(
+    name_or_path: &str,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<i32> {
     if looks_like_local_skill_path(name_or_path) {
-        commands::skills::install(name_or_path).await?;
+        commands::skills::install(name_or_path, data_dir).await?;
     } else {
-        println!("{}", commands::marketplace::install_output(name_or_path)?);
+        println!(
+            "{}",
+            commands::marketplace::install_output(name_or_path, data_dir)?
+        );
     }
     Ok(0)
 }
 
 async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
     match command {
-        SkillCommands::List => {
-            println!("{}", commands::marketplace::list_output()?);
+        SkillCommands::List { data_dir } => {
+            commands::skills::list(data_dir.as_deref()).await?;
             Ok(0)
         }
         SkillCommands::Search { query } => {
@@ -937,17 +818,32 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
             );
             Ok(0)
         }
-        SkillCommands::Install { name_or_path } => dispatch_skill_install(&name_or_path).await,
-        SkillCommands::Remove { name } => {
-            commands::skills::remove(&name).await?;
+        SkillCommands::Install {
+            name_or_path,
+            data_dir,
+        } => dispatch_skill_install(&name_or_path, data_dir.as_deref()).await,
+        SkillCommands::Remove { name, data_dir } => {
+            commands::skills::remove(&name, data_dir.as_deref()).await?;
             Ok(0)
         }
         SkillCommands::Build {
             path,
             no_sign,
             no_install,
+            data_dir,
         } => {
-            commands::skills::build(&path, no_sign, no_install)?;
+            commands::skills::build(&path, no_sign, no_install, data_dir.as_deref())?;
+            Ok(0)
+        }
+        SkillCommands::Status { data_dir } => {
+            println!("{}", commands::skills::status_output(data_dir.as_deref())?);
+            Ok(0)
+        }
+        SkillCommands::Rollback { name, data_dir } => {
+            println!(
+                "{}",
+                commands::skills::rollback(&name, data_dir.as_deref())?
+            );
             Ok(0)
         }
         SkillCommands::Create {
@@ -1076,13 +972,18 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Reset(args) => commands::reset::run(&args),
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
+        Commands::Keys { command } => commands::keys::run(command),
         Commands::Skill { command } => dispatch_skill(command).await,
+        Commands::Sign(args) => {
+            commands::skill_sign::run(&args)?;
+            Ok(0)
+        }
         Commands::Search { query } => {
             println!("{}", commands::marketplace::search_output(&query)?);
             Ok(0)
         }
         Commands::Install { name } => {
-            println!("{}", commands::marketplace::install_output(&name)?);
+            println!("{}", commands::marketplace::install_output(&name, None)?);
             Ok(0)
         }
         Commands::List => {
@@ -1208,14 +1109,14 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        cleanup_stale_pid_file_at, dispatch_command, ensure_headless_chat_model_available,
-        fawx_tui_binary_name, find_fawx_tui_binary_from, looks_like_local_skill_path,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SessionsCommands,
-        SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        cleanup_stale_pid_file_at, dispatch_command, dispatch_skill_install,
+        ensure_headless_chat_model_available, fawx_tui_binary_name, find_fawx_tui_binary_from,
+        looks_like_local_skill_path, resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands,
+        SessionsCommands, SkillCommands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use clap_complete::Shell;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1394,9 +1295,25 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Skill {
-                command: SkillCommands::Install { name_or_path }
+                command: SkillCommands::Install { name_or_path, .. }
             }) if name_or_path == "github"
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_skill_install_forwards_data_dir_to_marketplace_installs() {
+        crate::commands::marketplace::set_test_install_output(Some("installed".to_string()));
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+
+        let exit_code = dispatch_skill_install("weather", Some(temp_dir.path()))
+            .await
+            .expect("dispatch");
+        let request =
+            crate::commands::marketplace::take_last_install_request().expect("install request");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(request.0, "weather");
+        assert_eq!(request.1, Some(temp_dir.path().to_path_buf()));
     }
 
     #[test]
@@ -1419,6 +1336,116 @@ mod tests {
                 command: SkillCommands::Search { query: Some(query) }
             }) if query == "weather"
         ));
+    }
+
+    #[test]
+    fn cli_parses_sign_single_skill_command() {
+        let cli = Cli::parse_from(["fawx", "sign", "weather"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sign(args))
+                if args.selection().expect("selection")
+                    == crate::commands::skill_sign::SignSelection::Skill("weather".to_string())
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sign_all_command() {
+        let cli = Cli::parse_from(["fawx", "sign", "--all"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sign(args))
+                if args.selection().expect("selection")
+                    == crate::commands::skill_sign::SignSelection::All
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_generate_command() {
+        let cli = Cli::parse_from(["fawx", "keys", "generate", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Keys {
+                command: crate::commands::keys::KeysCommands::Generate(args)
+            }) if args.force
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_trust_command() {
+        let cli = Cli::parse_from(["fawx", "keys", "trust", "/tmp/demo.pub"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Keys {
+                command: crate::commands::keys::KeysCommands::Trust(args)
+            }) if args.path == std::path::Path::new("/tmp/demo.pub")
+        ));
+    }
+
+    fn render_subcommand_help(mut command: clap::Command, path: &[&str]) -> String {
+        let mut current = &mut command;
+        for segment in path {
+            current = current
+                .find_subcommand_mut(segment)
+                .unwrap_or_else(|| panic!("missing subcommand: {segment}"));
+        }
+        let mut help = Vec::new();
+        current.write_long_help(&mut help).expect("write help");
+        String::from_utf8(help).expect("utf8 help")
+    }
+
+    #[test]
+    fn cli_sign_help_matches_slash_help_surface() {
+        let help = render_subcommand_help(Cli::command(), &["sign"]);
+        let slash_help = crate::commands::slash::help_text();
+
+        assert!(help.contains("SKILL"));
+        assert!(help.contains("--all"));
+        assert!(slash_help.contains("/sign <skill>"));
+        assert!(slash_help.contains("/sign --all"));
+    }
+
+    #[test]
+    fn cli_keys_help_matches_slash_help_surface() {
+        let help = render_subcommand_help(Cli::command(), &["keys"]);
+        let slash_help = crate::commands::slash::help_text();
+
+        assert!(help.contains("generate"));
+        assert!(help.contains("list"));
+        assert!(help.contains("trust"));
+        assert!(help.contains("revoke"));
+        assert!(slash_help.contains("/keys generate [--force]"));
+        assert!(slash_help.contains("/keys list"));
+        assert!(slash_help.contains("/keys trust <path>"));
+        assert!(slash_help.contains("/keys revoke <fingerprint>"));
+    }
+
+    #[test]
+    fn cli_skill_help_describes_recommended_workflows() {
+        let help = render_subcommand_help(Cli::command(), &["skill"]);
+
+        assert!(help.contains("fawx skill build <project>"));
+        assert!(help.contains("skills/build.sh --install"));
+        assert!(help.contains("fawx skill install <path>"));
+    }
+
+    #[test]
+    fn cli_skill_build_help_calls_out_wasip1_path() {
+        let help = render_subcommand_help(Cli::command(), &["skill", "build"]);
+
+        assert!(help.contains("wasm32-wasip1"));
+        assert!(help.contains("fawx skill build <project>"));
+        assert!(help.contains("fawx sign <skill>"));
+    }
+
+    #[test]
+    fn cli_skill_install_help_explains_path_vs_marketplace_routing() {
+        let help = render_subcommand_help(Cli::command(), &["skill", "install"]);
+
+        assert!(help.contains("ending in `.wasm` is treated as a local path"));
+        assert!(help.contains("Bare names go through the marketplace install flow"));
+        assert!(help.contains("fawx skill install <path>"));
+        assert!(help.contains("fawx skill install <marketplace-name>"));
     }
 
     #[test]

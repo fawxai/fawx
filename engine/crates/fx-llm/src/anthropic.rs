@@ -10,9 +10,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::Duration;
 
-use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::provider::{
+    insert_bearer_authorization, insert_header_value, null_loop_harness,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
+    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
+};
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
+use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
@@ -28,8 +33,91 @@ const MAX_THINKING_BUDGET: u32 = 32_000;
 /// when thinking is enabled. Ensures max_tokens > budget_tokens.
 const MIN_RESPONSE_TOKENS: u32 = 1024;
 const VALID_ANTHROPIC_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const ANTHROPIC_THINKING_LEVELS: &[&str] = &["off", "low", "adaptive", "high"];
+const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
+    "claude-opus-4-6-20250929",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6-20250929",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
+];
+const ANTHROPIC_SETUP_TOKEN_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 const CLAUDE_CODE_SYSTEM_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_REASONING_OVERLAY: &str = "\n\nModel-family guidance for Claude models: \
+Prefer answering from the evidence already in context instead of extending the tool loop. \
+If a tool pattern is repeating or failing without new information, stop, explain the blocker, and ask for direction instead of retrying variations.";
+
+const CLAUDE_TOOL_CONTINUATION_OVERLAY: &str = "\n\nModel-family guidance for Claude models: \
+When continuing after tool calls, either answer from the current evidence or name the specific missing fact that justifies another tool call. \
+Avoid repeating near-identical tool calls once the evidence trend is clear.";
+
+#[derive(Debug)]
+struct AnthropicMessagesLoopHarness {
+    use_claude_overlays: bool,
+}
+
+impl LoopHarness for AnthropicMessagesLoopHarness {
+    fn prompt_overlay(&self, context: LoopPromptOverlayContext) -> Option<&'static str> {
+        if !self.use_claude_overlays {
+            return None;
+        }
+
+        match context {
+            LoopPromptOverlayContext::Reasoning => Some(CLAUDE_REASONING_OVERLAY),
+            LoopPromptOverlayContext::ToolContinuation => Some(CLAUDE_TOOL_CONTINUATION_OVERLAY),
+        }
+    }
+
+    fn is_truncated(&self, stop_reason: Option<&str>) -> bool {
+        matches!(
+            stop_reason
+                .map(|reason| reason.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("max_tokens" | "incomplete")
+        )
+    }
+}
+
+static ANTHROPIC_MESSAGES_LOOP_HARNESS: AnthropicMessagesLoopHarness =
+    AnthropicMessagesLoopHarness {
+        use_claude_overlays: false,
+    };
+
+static ANTHROPIC_CLAUDE_MESSAGES_LOOP_HARNESS: AnthropicMessagesLoopHarness =
+    AnthropicMessagesLoopHarness {
+        use_claude_overlays: true,
+    };
+
+static ANTHROPIC_CLAUDE_MESSAGES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "anthropic_claude",
+    matcher: LoopModelMatch::Prefix("claude-"),
+    harness: &ANTHROPIC_CLAUDE_MESSAGES_LOOP_HARNESS,
+};
+
+static ANTHROPIC_DEFAULT_MESSAGES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "anthropic_default",
+    matcher: LoopModelMatch::Any,
+    harness: &ANTHROPIC_MESSAGES_LOOP_HARNESS,
+};
+
+static ANTHROPIC_MESSAGES_LOOP_PROFILES: [&'static dyn LoopModelProfile; 2] = [
+    &ANTHROPIC_CLAUDE_MESSAGES_LOOP_PROFILE,
+    &ANTHROPIC_DEFAULT_MESSAGES_LOOP_PROFILE,
+];
+
+fn anthropic_messages_loop_harness(model: &str) -> &'static dyn LoopHarness {
+    resolve_loop_harness_from_profiles(
+        &ANTHROPIC_MESSAGES_LOOP_PROFILES,
+        model,
+        null_loop_harness(),
+    )
+}
 
 /// Anthropic auth mode — determines how credentials are sent.
 #[derive(Clone)]
@@ -68,6 +156,7 @@ impl AnthropicAuthMode {
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     base_url: String,
+    models_endpoint: String,
     auth_mode: AnthropicAuthMode,
     api_version: String,
     supported_models: Vec<String>,
@@ -135,6 +224,10 @@ fn build_anthropic_thinking(
 }
 
 impl AnthropicProvider {
+    pub const fn default_base_url() -> &'static str {
+        DEFAULT_BASE_URL
+    }
+
     /// Create a new Anthropic provider. Auto-detects auth mode from the credential.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
         let base_url = base_url.into();
@@ -154,9 +247,11 @@ impl AnthropicProvider {
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
+        let models_endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
 
         Ok(Self {
             base_url,
+            models_endpoint,
             auth_mode,
             api_version: "2023-06-01".to_string(),
             supported_models: Vec::new(),
@@ -180,12 +275,8 @@ impl AnthropicProvider {
         format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
     }
 
-    fn models_endpoint(&self) -> String {
-        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
-    }
-
     async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
-        let mut url = Url::parse(&self.models_endpoint())
+        let mut url = Url::parse(&self.models_endpoint)
             .map_err(|error| LlmError::Config(format!("invalid anthropic models url: {error}")))?;
         let mut model_ids = Vec::new();
 
@@ -793,6 +884,74 @@ impl LlmProvider for AnthropicProvider {
             requires_streaming: false,
         }
     }
+
+    fn supported_thinking_levels(&self) -> &'static [&'static str] {
+        ANTHROPIC_THINKING_LEVELS
+    }
+
+    fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+        valid_thinking_levels(model)
+    }
+
+    fn models_endpoint(&self) -> Option<&str> {
+        Some(&self.models_endpoint)
+    }
+
+    fn auth_method(&self) -> &'static str {
+        match self.auth_mode {
+            AnthropicAuthMode::ApiKey(_) => "api_key",
+            AnthropicAuthMode::SetupToken(_) => "setup_token",
+        }
+    }
+
+    fn catalog_auth_headers(
+        &self,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Result<reqwest::header::HeaderMap, String> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-version",
+            reqwest::header::HeaderValue::from_static("2023-06-01"),
+        );
+
+        match auth_mode {
+            "api_key" => {
+                insert_header_value(&mut headers, "x-api-key", api_key, "api key")?;
+            }
+            "setup_token" => {
+                insert_bearer_authorization(&mut headers, api_key)?;
+                headers.insert(
+                    "anthropic-beta",
+                    reqwest::header::HeaderValue::from_static(ANTHROPIC_SETUP_TOKEN_BETA),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "unsupported auth mode '{other}' for provider '{}'",
+                    self.name()
+                ));
+            }
+        }
+
+        Ok(headers)
+    }
+
+    fn is_chat_capable(&self, model_id: &str) -> bool {
+        model_id.to_ascii_lowercase().starts_with("claude-")
+    }
+
+    fn fallback_models(&self) -> Vec<&'static str> {
+        ANTHROPIC_FALLBACK_MODELS.to_vec()
+    }
+
+    fn context_window(&self, _model: &str) -> usize {
+        200_000
+    }
+
+    fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
+        anthropic_messages_loop_harness(model)
+    }
 }
 
 async fn parse_model_response(
@@ -1243,6 +1402,64 @@ mod tests {
         let models = provider.list_models().await.expect("list models");
 
         assert_eq!(models, vec!["claude-opus-4-1-20250805".to_string()]);
+    }
+
+    #[test]
+    fn anthropic_metadata_reports_supported_thinking_levels() {
+        let provider =
+            AnthropicProvider::new(AnthropicProvider::default_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "adaptive", "high"]
+        );
+        assert_eq!(
+            provider.thinking_levels("claude-opus-4-6"),
+            &["off", "adaptive", "low", "medium", "high", "max"]
+        );
+        assert_eq!(provider.auth_method(), "api_key");
+        assert_eq!(provider.context_window("claude-sonnet-4-6"), 200_000);
+    }
+
+    #[test]
+    fn anthropic_catalog_auth_headers_match_supported_modes() {
+        let provider =
+            AnthropicProvider::new(AnthropicProvider::default_base_url(), "test-key").unwrap();
+
+        let api_key_headers = provider
+            .catalog_auth_headers("test-key", "api_key")
+            .expect("api key headers");
+        assert_eq!(api_key_headers.get("x-api-key").unwrap(), "test-key");
+        assert_eq!(
+            api_key_headers.get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
+
+        let setup_headers = provider
+            .catalog_auth_headers("setup-token", "setup_token")
+            .expect("setup token headers");
+        assert_eq!(
+            setup_headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer setup-token"
+        );
+        assert_eq!(
+            setup_headers.get("anthropic-beta").unwrap(),
+            ANTHROPIC_SETUP_TOKEN_BETA
+        );
+    }
+
+    #[test]
+    fn anthropic_catalog_metadata_matches_expected_contract() {
+        let provider =
+            AnthropicProvider::new(AnthropicProvider::default_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.anthropic.com/v1/models")
+        );
+        assert!(provider.is_chat_capable("claude-sonnet-4-20250514"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), ANTHROPIC_FALLBACK_MODELS);
     }
 
     #[test]

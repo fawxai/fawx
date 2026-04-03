@@ -20,8 +20,18 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use crate::document::document_text_fallback;
+use crate::openai::{
+    is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
+    OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
+};
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
-use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::provider::{
+    bearer_auth_headers, insert_header_value, null_loop_harness,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
+    LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch, LoopModelProfile,
+    LoopPromptOverlayContext, LoopStreamingRecoveryStrategy, ProviderCapabilities,
+    StaticLoopModelProfile,
+};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
@@ -32,11 +42,108 @@ use crate::validation::validate_tool_message_sequence;
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
 const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
+const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
+When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
+If the user names an exact command or workflow, execute that exact path before exploring alternatives unless you hit a concrete blocker. \
+If you are blocked, state the blocker plainly and ask for direction rather than ending on promise language like \"Let me...\" without taking the next action.";
+
+const GPT_TOOL_CONTINUATION_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
+After tool calls, turn the evidence into either a direct answer or an explicit blocker. \
+Do not emit planning-only text or future-tense promises unless you are also making the next tool call in the same response.";
+
+#[derive(Debug)]
+struct OpenAiResponsesLoopHarness {
+    use_reasoning_overlays: bool,
+}
+
+impl LoopHarness for OpenAiResponsesLoopHarness {
+    fn buffered_completion_strategy(&self) -> LoopBufferedCompletionStrategy {
+        LoopBufferedCompletionStrategy::SingleResponse
+    }
+
+    fn prompt_overlay(&self, context: LoopPromptOverlayContext) -> Option<&'static str> {
+        if !self.use_reasoning_overlays {
+            return None;
+        }
+
+        match context {
+            LoopPromptOverlayContext::Reasoning => Some(GPT_REASONING_OVERLAY),
+            LoopPromptOverlayContext::ToolContinuation => Some(GPT_TOOL_CONTINUATION_OVERLAY),
+        }
+    }
+
+    fn is_truncated(&self, stop_reason: Option<&str>) -> bool {
+        matches!(
+            stop_reason
+                .map(|reason| reason.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("length" | "incomplete")
+        )
+    }
+
+    fn streaming_recovery(
+        &self,
+        _error: &LlmError,
+        emitted_text: bool,
+    ) -> LoopStreamingRecoveryStrategy {
+        if emitted_text {
+            LoopStreamingRecoveryStrategy::Fail
+        } else {
+            LoopStreamingRecoveryStrategy::RetryWithSingleResponse
+        }
+    }
+}
+
+static OPENAI_RESPONSES_LOOP_HARNESS: OpenAiResponsesLoopHarness = OpenAiResponsesLoopHarness {
+    use_reasoning_overlays: false,
+};
+
+static OPENAI_REASONING_RESPONSES_LOOP_HARNESS: OpenAiResponsesLoopHarness =
+    OpenAiResponsesLoopHarness {
+        use_reasoning_overlays: true,
+    };
+
+static OPENAI_REASONING_RESPONSES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "openai_responses_reasoning",
+    matcher: LoopModelMatch::AnyPrefix(&["gpt-5.4", "gpt-5.2", "gpt-5", "codex-", "o1", "o3"]),
+    harness: &OPENAI_REASONING_RESPONSES_LOOP_HARNESS,
+};
+
+static OPENAI_DEFAULT_RESPONSES_LOOP_PROFILE: StaticLoopModelProfile = StaticLoopModelProfile {
+    label: "openai_responses_default",
+    matcher: LoopModelMatch::Any,
+    harness: &OPENAI_RESPONSES_LOOP_HARNESS,
+};
+
+static OPENAI_RESPONSES_LOOP_PROFILES: [&'static dyn LoopModelProfile; 2] = [
+    &OPENAI_REASONING_RESPONSES_LOOP_PROFILE,
+    &OPENAI_DEFAULT_RESPONSES_LOOP_PROFILE,
+];
+
+fn openai_responses_loop_harness(model: &str) -> &'static dyn LoopHarness {
+    resolve_loop_harness_from_profiles(&OPENAI_RESPONSES_LOOP_PROFILES, model, null_loop_harness())
+}
+
+fn responses_models_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.contains("chatgpt.com") {
+        return openai_models_endpoint("https://api.openai.com");
+    }
+    if base.ends_with("/responses") {
+        return format!(
+            "{}/models",
+            base.trim_end_matches("/responses")
+                .trim_end_matches("/codex")
+        );
+    }
+    openai_models_endpoint(base)
+}
 
 /// OpenAI Responses API provider for ChatGPT subscription auth.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesProvider {
     base_url: String,
+    models_endpoint: String,
     access_token: String,
     account_id: String,
     provider_name: String,
@@ -68,9 +175,11 @@ impl OpenAiResponsesProvider {
             .timeout(std::time::Duration::from_secs(1800))
             .build()
             .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
+        let models_endpoint = responses_models_endpoint(DEFAULT_CODEX_BASE_URL);
 
         Ok(Self {
             base_url: DEFAULT_CODEX_BASE_URL.to_string(),
+            models_endpoint,
             access_token,
             account_id,
             provider_name: "openai".to_string(),
@@ -82,6 +191,7 @@ impl OpenAiResponsesProvider {
     /// Override the base URL (for testing or alternative endpoints).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self.models_endpoint = responses_models_endpoint(&self.base_url);
         self
     }
 
@@ -102,40 +212,15 @@ impl OpenAiResponsesProvider {
         }
     }
 
-    /// Model discovery endpoint.
-    ///
-    /// For `chatgpt.com` subscription flows, uses the canonical
-    /// `api.openai.com/v1/models` endpoint (the backend-api/models
-    /// path doesn't return all available models). For all other base
-    /// URLs (including api.openai.com and test servers), derives the
-    /// models path from the base.
-    fn models_endpoint(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.contains("chatgpt.com") {
-            return "https://api.openai.com/v1/models".to_string();
-        }
-        if base.ends_with("/responses") {
-            return format!(
-                "{}/models",
-                base.trim_end_matches("/responses")
-                    .trim_end_matches("/codex")
-            );
-        }
-        if base.ends_with("/v1") {
-            return format!("{base}/models");
-        }
-        format!("{base}/v1/models")
-    }
-
     async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
         let response = self
             .client
-            .get(self.models_endpoint())
+            .get(&self.models_endpoint)
             .bearer_auth(&self.access_token)
             .header("chatgpt-account-id", &self.account_id)
             .send()
             .await?;
-        parse_model_response(response, &self.supported_models).await
+        parse_model_response(response, self, &self.supported_models).await
     }
 
     /// Validate the OAuth token by performing a live model-catalog fetch.
@@ -1029,10 +1114,58 @@ impl LlmProvider for OpenAiResponsesProvider {
             requires_streaming: true,
         }
     }
+
+    fn supported_thinking_levels(&self) -> &'static [&'static str] {
+        OPENAI_THINKING_LEVELS
+    }
+
+    fn thinking_levels(&self, model: &str) -> &'static [&'static str] {
+        openai_thinking_levels(model)
+    }
+
+    fn models_endpoint(&self) -> Option<&str> {
+        Some(&self.models_endpoint)
+    }
+
+    fn auth_method(&self) -> &'static str {
+        "subscription"
+    }
+
+    fn catalog_auth_headers(
+        &self,
+        api_key: &str,
+        _auth_mode: &str,
+    ) -> Result<reqwest::header::HeaderMap, String> {
+        let mut headers = bearer_auth_headers(api_key)?;
+        insert_header_value(
+            &mut headers,
+            "chatgpt-account-id",
+            &self.account_id,
+            "account id",
+        )?;
+        Ok(headers)
+    }
+
+    fn is_chat_capable(&self, model_id: &str) -> bool {
+        is_openai_chat_capable(model_id)
+    }
+
+    fn fallback_models(&self) -> Vec<&'static str> {
+        OPENAI_FALLBACK_MODELS.to_vec()
+    }
+
+    fn context_window(&self, model: &str) -> usize {
+        openai_context_window(model)
+    }
+
+    fn loop_harness(&self, model: &str) -> &'static dyn LoopHarness {
+        openai_responses_loop_harness(model)
+    }
 }
 
 async fn parse_model_response(
     response: reqwest::Response,
+    provider: &OpenAiResponsesProvider,
     supported_models: &[String],
 ) -> Result<Vec<String>, LlmError> {
     let status = response.status();
@@ -1050,7 +1183,11 @@ async fn parse_model_response(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
-    Ok(filter_model_ids(parsed.data, supported_models))
+    Ok(filter_model_ids(
+        parsed.data,
+        supported_models,
+        |model_id| provider.is_chat_capable(model_id),
+    ))
 }
 
 // =====================================================================
@@ -1529,6 +1666,44 @@ mod tests {
         let models = provider.list_models().await.expect("list models");
 
         assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[test]
+    fn responses_catalog_metadata_matches_expected_contract() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123").unwrap();
+
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert_eq!(
+            provider.thinking_levels("gpt-5.4"),
+            &["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert_eq!(provider.auth_method(), "subscription");
+        assert_eq!(provider.context_window("gemini-2.5-pro"), 1_000_000);
+    }
+
+    #[test]
+    fn responses_catalog_auth_headers_include_account_context() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123").unwrap();
+
+        let headers = provider
+            .catalog_auth_headers("oauth-token-123", "oauth")
+            .expect("headers");
+
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer oauth-token-123"
+        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
     }
 
     #[test]

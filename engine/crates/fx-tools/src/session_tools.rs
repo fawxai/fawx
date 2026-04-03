@@ -232,7 +232,10 @@ struct SessionSendArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_session::{SessionConfig, SessionStore};
+    use fx_session::{
+        MessageRole, Session, SessionConfig, SessionContentBlock, SessionMemory, SessionMessage,
+        SessionStatus, SessionStore,
+    };
     use fx_storage::Storage;
 
     fn test_skill() -> SessionToolsSkill {
@@ -267,6 +270,116 @@ mod tests {
             )
             .expect("create sub");
         SessionToolsSkill::new(registry)
+    }
+
+    fn skill_with_grouped_tool_history() -> SessionToolsSkill {
+        let storage = Storage::open_in_memory().expect("storage");
+        let store = SessionStore::new(storage);
+        let registry = SessionRegistry::new(store).expect("registry");
+        let key = SessionKey::new("main-1").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("primary".to_string()),
+                    model: "gpt-4".to_string(),
+                },
+            )
+            .expect("create session");
+        registry
+            .record_turn(
+                &key,
+                vec![
+                    SessionMessage::structured(
+                        MessageRole::Assistant,
+                        vec![
+                            SessionContentBlock::ToolUse {
+                                id: "call_1".to_string(),
+                                provider_id: Some("fc_1".to_string()),
+                                name: "read_file".to_string(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            },
+                            SessionContentBlock::ToolUse {
+                                id: "call_2".to_string(),
+                                provider_id: Some("fc_2".to_string()),
+                                name: "list_dir".to_string(),
+                                input: serde_json::json!({"path": "."}),
+                            },
+                        ],
+                        1,
+                        None,
+                    ),
+                    SessionMessage::structured(
+                        MessageRole::Tool,
+                        vec![
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_1".to_string(),
+                                content: serde_json::json!("read ok"),
+                                is_error: Some(false),
+                            },
+                            SessionContentBlock::ToolResult {
+                                tool_use_id: "call_2".to_string(),
+                                content: serde_json::json!(["Cargo.toml"]),
+                                is_error: Some(false),
+                            },
+                        ],
+                        2,
+                        None,
+                    ),
+                    SessionMessage::text(MessageRole::Assistant, "Done.", 3),
+                ],
+                SessionMemory::default(),
+            )
+            .expect("record turn");
+        SessionToolsSkill::new(registry)
+    }
+
+    fn skill_with_poisoned_session() -> SessionToolsSkill {
+        let storage = Storage::open_in_memory().expect("storage");
+        let store = SessionStore::new(storage.clone());
+        store
+            .save(&poisoned_session("poisoned"))
+            .expect("save poisoned session");
+        let registry = SessionRegistry::new(SessionStore::new(storage)).expect("registry");
+        SessionToolsSkill::new(registry)
+    }
+
+    fn poisoned_session(id: &str) -> Session {
+        Session {
+            key: SessionKey::new(id).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Idle,
+            label: Some("poisoned".to_string()),
+            model: "gpt-4".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            archived_at: None,
+            messages: vec![
+                SessionMessage::structured(
+                    MessageRole::Tool,
+                    vec![SessionContentBlock::ToolResult {
+                        tool_use_id: "call_bad".to_string(),
+                        content: serde_json::json!("bad"),
+                        is_error: Some(false),
+                    }],
+                    1,
+                    None,
+                ),
+                SessionMessage::structured(
+                    MessageRole::Assistant,
+                    vec![SessionContentBlock::ToolUse {
+                        id: "call_bad".to_string(),
+                        provider_id: Some("fc_bad".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "bad.txt"}),
+                    }],
+                    2,
+                    None,
+                ),
+            ],
+            memory: SessionMemory::default(),
+        }
     }
 
     #[test]
@@ -326,6 +439,38 @@ mod tests {
         let skill = test_skill();
         let result = skill.execute_tool("session_history", r#"{"session_key": "missing"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn history_returns_turn_scoped_grouped_tool_history() {
+        let skill = skill_with_grouped_tool_history();
+        let result = skill
+            .execute_tool("session_history", r#"{"session_key": "main-1"}"#)
+            .expect("history should succeed");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("history json");
+
+        assert_eq!(json.as_array().expect("messages").len(), 3);
+        assert_eq!(json[0]["role"], "assistant");
+        assert_eq!(json[0]["content"].as_array().expect("tool uses").len(), 2);
+        assert_eq!(json[0]["content"][0]["provider_id"], "fc_1");
+        assert_eq!(json[0]["content"][1]["provider_id"], "fc_2");
+        assert_eq!(json[1]["role"], "tool");
+        assert_eq!(
+            json[1]["content"].as_array().expect("tool results").len(),
+            2
+        );
+        assert_eq!(json[2]["role"], "assistant");
+        assert_eq!(json[2]["content"][0]["text"], "Done.");
+    }
+
+    #[test]
+    fn history_rejects_corrupted_session_history() {
+        let skill = skill_with_poisoned_session();
+        let result = skill.execute_tool("session_history", r#"{"session_key": "poisoned"}"#);
+
+        let error = result.expect_err("corrupted history should fail");
+        assert!(error.contains("corrupted session 'poisoned'"));
+        assert!(error.contains("call_bad"));
     }
 
     #[test]

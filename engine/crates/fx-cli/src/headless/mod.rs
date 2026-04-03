@@ -5,6 +5,15 @@
 //! responses to stdout. All diagnostic/error output goes to stderr so
 //! downstream consumers can safely pipe stdout.
 
+mod auth;
+mod command;
+mod engine;
+mod keys;
+mod model;
+mod output;
+mod session;
+pub mod startup;
+
 use async_trait::async_trait;
 use futures::Stream;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
@@ -29,18 +38,18 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::{ErrorCategory, StreamCallback, StreamEvent};
+use fx_kernel::{ErrorCategory, PermissionPromptState, StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{
-    valid_thinking_levels, CompletionRequest, CompletionResponse, CompletionStream,
-    DocumentAttachment, ImageAttachment, Message, ModelInfo, ModelRouter, ProviderError,
-    StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall, ToolUseDelta, Usage,
+    CompletionRequest, CompletionResponse, CompletionStream, DocumentAttachment, ImageAttachment,
+    Message, ModelInfo, ModelRouter, ProviderError, StreamCallback as ProviderStreamCallback,
+    StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 use fx_memory::SignalStore;
 use fx_session::{
-    MessageRole as SessionRecordRole, SessionContentBlock, SessionKey, SessionMessage,
+    prune_unresolved_tool_history, MessageRole as SessionRecordRole, SessionContentBlock,
+    SessionKey, SessionMessage,
 };
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -54,22 +63,40 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 
+#[cfg(test)]
+use self::auth::StoredAuthProviderEntry;
+use self::auth::{
+    auth_provider_dto, auth_provider_statuses, handle_headless_auth_command,
+    stored_auth_provider_entries,
+};
+#[cfg(test)]
+use self::command::process_command_input;
+use self::keys::handle_headless_keys_command;
+use self::model::{
+    active_model_thinking_levels, apply_headless_active_model, handle_headless_synthesis_command,
+    preferred_supported_budget, resolve_headless_model_selector, sync_headless_model_from_config,
+    thinking_adjustment_reason, update_context_limit_for_active_model,
+};
+#[cfg(test)]
+use self::output::json_output_from_cycle;
+#[cfg(test)]
+use self::session::is_quit_command;
+pub use self::session::{process_input_with_commands, process_input_with_commands_streaming};
 use crate::auth_store::AuthStore;
+#[cfg(test)]
+use crate::commands::slash::CommandHost;
 use crate::commands::slash::{
-    apply_thinking_budget, client_only_command_message, config_reload_success_message,
-    execute_command, init_default_config, is_command_input, parse_command, persist_default_model,
-    reload_runtime_config, render_budget_text, render_debug_dump, render_loop_status,
-    render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
+    apply_thinking_budget, is_command_input, persist_default_model, ImproveFlags,
     DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
 use crate::context::load_context_files;
+#[cfg(test)]
+use crate::helpers::render_model_menu_text;
 use crate::helpers::{
-    available_provider_names, fetch_shared_available_models, format_memory_for_prompt, read_router,
-    render_model_menu_text, render_status_text, resolve_model_alias,
-    thinking_config_for_active_model, trim_history, write_router, AnalysisCompletionProvider,
-    RouterLoopLlmProvider, SharedModelRouter,
+    format_memory_for_prompt, read_router, resolve_model_alias, trim_history, write_router,
+    AnalysisCompletionProvider, RouterLoopLlmProvider, SharedModelRouter,
 };
-use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
+use crate::proposal_review::ReviewContext;
 use crate::startup::{
     build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
     configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,
@@ -121,6 +148,12 @@ struct JsonOutput {
     response: String,
     model: String,
     iterations: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_errors: Vec<String>,
 }
 
 // ── CycleResult ─────────────────────────────────────────────────────────────
@@ -214,6 +247,7 @@ pub struct HeadlessAppDeps {
     pub cron_store: Option<fx_cron::SharedCronStore>,
     pub startup_warnings: Vec<StartupWarning>,
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
     pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
@@ -251,6 +285,7 @@ pub struct HeadlessApp {
     last_session_messages: Vec<SessionMessage>,
     /// Shared callback slot for executor-triggered SSE stream events.
     stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
+    permission_prompt_state: Option<Arc<PermissionPromptState>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
@@ -265,6 +300,7 @@ pub struct HeadlessSubagentFactoryDeps {
     pub config: FawxConfig,
     pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
     pub session_bus: Option<SessionBus>,
+    pub credential_store: Option<crate::startup::SharedCredentialStore>,
     pub token_broker: Option<SharedTokenBroker>,
 }
 
@@ -466,6 +502,14 @@ struct RecordedAssistantTurn {
     has_tool_use: bool,
 }
 
+struct FinalizeTurnContext<'a> {
+    images: &'a [ImageAttachment],
+    documents: &'a [DocumentAttachment],
+    collector: Option<&'a SessionTurnCollector>,
+    user_timestamp: u64,
+    assistant_timestamp: u64,
+}
+
 impl SessionTurnCollector {
     fn record_response(&self, response: &CompletionResponse) {
         match self.responses.lock() {
@@ -494,22 +538,34 @@ impl SessionTurnCollector {
         images: &[ImageAttachment],
         documents: &[DocumentAttachment],
         fallback_response: &str,
+        user_timestamp: u64,
+        assistant_timestamp: u64,
     ) -> Vec<SessionMessage> {
         self.flush_pending_tool_results();
+        let snapshot = self.snapshot();
 
-        let timestamp = current_epoch_secs();
         let mut messages = vec![user_session_message(
-            user_text, images, documents, timestamp,
+            user_text,
+            images,
+            documents,
+            user_timestamp,
         )];
-        let assistant_messages = build_assistant_turn_messages(self.snapshot(), timestamp);
-
-        if assistant_messages.is_empty() {
-            messages.push(fallback_assistant_message(fallback_response, timestamp));
-        } else {
-            messages.extend(assistant_messages);
+        let mut assistant_messages = build_turn_tool_history_messages(
+            SessionTurnSnapshot {
+                responses: snapshot.responses.clone(),
+                tool_result_rounds: snapshot.tool_result_rounds,
+            },
+            assistant_timestamp,
+        );
+        if let Some(terminal_message) =
+            terminal_assistant_message(&snapshot.responses, fallback_response, assistant_timestamp)
+        {
+            assistant_messages.push(terminal_message);
         }
 
-        messages
+        messages.extend(assistant_messages);
+
+        prune_unresolved_tool_history(&messages)
     }
 
     fn observe(&self, event: &StreamEvent) {
@@ -519,6 +575,7 @@ impl SessionTurnCollector {
             }
             StreamEvent::ToolResult {
                 id,
+                tool_name: _,
                 output,
                 is_error,
             } => match self.pending_tool_results.lock() {
@@ -538,6 +595,7 @@ impl SessionTurnCollector {
             }
             StreamEvent::ToolError { .. }
             | StreamEvent::TextDelta { .. }
+            | StreamEvent::Progress { .. }
             | StreamEvent::Notification { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. }
@@ -631,25 +689,164 @@ fn fallback_assistant_message(fallback_response: &str, timestamp: u64) -> Sessio
     )
 }
 
-fn build_assistant_turn_messages(
+fn fallback_assistant_message_from_template(
+    fallback_response: &str,
+    timestamp: u64,
+    template: Option<&SessionMessage>,
+) -> SessionMessage {
+    if let Some(template) = template {
+        return SessionMessage {
+            role: SessionRecordRole::Assistant,
+            content: vec![SessionContentBlock::Text {
+                text: fallback_response.to_string(),
+            }],
+            timestamp,
+            token_count: template.token_count,
+            input_token_count: template.input_token_count,
+            output_token_count: template.output_token_count,
+        };
+    }
+
+    fallback_assistant_message(fallback_response, timestamp)
+}
+
+fn last_visible_assistant_text(message: &SessionMessage) -> Option<String> {
+    if message.role != SessionRecordRole::Assistant {
+        return None;
+    }
+
+    let text = message.render_text().trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn normalize_session_message_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_turn_tool_history_messages(
     snapshot: SessionTurnSnapshot,
     timestamp: u64,
 ) -> Vec<SessionMessage> {
-    let mut messages = Vec::new();
-    let mut tool_result_rounds = snapshot.tool_result_rounds.into_iter();
+    let tool_turns = tool_turn_messages(snapshot.responses, timestamp);
+    let Some(tool_use_message) = aggregate_tool_use_message(&tool_turns, timestamp) else {
+        return Vec::new();
+    };
+    let tool_results = aggregate_tool_result_blocks(&tool_turns, snapshot.tool_result_rounds);
+    let mut messages = vec![tool_use_message];
+    if !tool_results.is_empty() {
+        messages.push(tool_result_message(tool_results, timestamp));
+    }
+    messages
+}
 
-    for response in snapshot.responses {
-        let Some(recorded_turn) = assistant_turn_from_response(response, timestamp) else {
-            continue;
-        };
+fn tool_turn_messages(responses: Vec<CompletionResponse>, timestamp: u64) -> Vec<SessionMessage> {
+    responses
+        .into_iter()
+        .filter_map(|response| assistant_turn_from_response(response, timestamp))
+        .filter(|turn| turn.has_tool_use)
+        .map(|turn| turn.message)
+        .collect()
+}
 
-        messages.push(recorded_turn.message);
-        if recorded_turn.has_tool_use {
-            append_tool_result_round(&mut messages, &mut tool_result_rounds, timestamp);
-        }
+fn aggregate_tool_use_message(
+    tool_turns: &[SessionMessage],
+    timestamp: u64,
+) -> Option<SessionMessage> {
+    let content = tool_turns
+        .iter()
+        .flat_map(|message| message.content.iter().cloned())
+        .collect::<Vec<_>>();
+    if content.is_empty() {
+        return None;
     }
 
-    messages
+    let mut message = SessionMessage::structured_with_usage(
+        SessionRecordRole::Assistant,
+        content,
+        timestamp,
+        aggregate_message_usage(tool_turns),
+    );
+    if message.token_count.is_none() {
+        message.token_count = aggregate_total_token_count(tool_turns);
+    }
+    Some(message)
+}
+
+fn aggregate_tool_result_blocks(
+    tool_turns: &[SessionMessage],
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+) -> Vec<SessionContentBlock> {
+    assign_tool_results_to_turns(tool_turns, tool_result_rounds)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn tool_result_message(content: Vec<SessionContentBlock>, timestamp: u64) -> SessionMessage {
+    SessionMessage::structured(SessionRecordRole::Tool, content, timestamp, None)
+}
+
+fn aggregate_message_usage(messages: &[SessionMessage]) -> Option<Usage> {
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
+    let mut saw_usage = false;
+
+    for message in messages {
+        let (Some(input), Some(output)) = (message.input_token_count, message.output_token_count)
+        else {
+            continue;
+        };
+        input_tokens = input_tokens.saturating_add(input);
+        output_tokens = output_tokens.saturating_add(output);
+        saw_usage = true;
+    }
+
+    saw_usage.then_some(Usage {
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn aggregate_total_token_count(messages: &[SessionMessage]) -> Option<u32> {
+    let mut total: u32 = 0;
+    let mut saw_tokens = false;
+
+    for message in messages {
+        let Some(message_total) = message.total_token_count() else {
+            continue;
+        };
+        total = total.saturating_add(message_total);
+        saw_tokens = true;
+    }
+
+    saw_tokens.then_some(total)
+}
+
+fn terminal_assistant_message(
+    responses: &[CompletionResponse],
+    fallback_response: &str,
+    timestamp: u64,
+) -> Option<SessionMessage> {
+    let recorded_terminal = responses.iter().rev().find_map(|response| {
+        let recorded_turn = assistant_turn_from_response(response.clone(), timestamp)?;
+        (!recorded_turn.has_tool_use).then_some(recorded_turn.message)
+    });
+
+    if has_meaningful_response(Some(fallback_response)) {
+        let matching_terminal = recorded_terminal.as_ref().filter(|message| {
+            last_visible_assistant_text(message).is_some_and(|existing| {
+                normalize_session_message_text(&existing)
+                    == normalize_session_message_text(fallback_response)
+            })
+        });
+        return Some(fallback_assistant_message_from_template(
+            fallback_response,
+            timestamp,
+            matching_terminal,
+        ));
+    }
+
+    recorded_terminal
 }
 
 fn assistant_turn_from_response(
@@ -675,24 +872,42 @@ fn assistant_turn_from_response(
     })
 }
 
-fn append_tool_result_round(
-    messages: &mut Vec<SessionMessage>,
-    tool_result_rounds: &mut impl Iterator<Item = Vec<SessionContentBlock>>,
-    timestamp: u64,
-) {
-    let Some(tool_results) = tool_result_rounds.next() else {
-        return;
-    };
-    if tool_results.is_empty() {
-        return;
+fn assign_tool_results_to_turns(
+    tool_turns: &[SessionMessage],
+    tool_result_rounds: Vec<Vec<SessionContentBlock>>,
+) -> Vec<Vec<SessionContentBlock>> {
+    let mut turn_indices = HashMap::new();
+    for (index, message) in tool_turns.iter().enumerate() {
+        for block in &message.content {
+            if let SessionContentBlock::ToolUse { id, .. } = block {
+                let trimmed = id.trim();
+                if !trimmed.is_empty() {
+                    turn_indices.entry(trimmed.to_string()).or_insert(index);
+                }
+            }
+        }
     }
 
-    messages.push(SessionMessage::structured(
-        SessionRecordRole::Tool,
-        tool_results,
-        timestamp,
-        None,
-    ));
+    let mut assigned = vec![Vec::new(); tool_turns.len()];
+    for block in tool_result_rounds.into_iter().flatten() {
+        let SessionContentBlock::ToolResult { tool_use_id, .. } = &block else {
+            continue;
+        };
+        let trimmed = tool_use_id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(index) = turn_indices.get(trimmed).copied() else {
+            tracing::warn!(
+                tool_use_id = trimmed,
+                "dropping orphaned session tool result without matching tool_use"
+            );
+            continue;
+        };
+        assigned[index].push(block);
+    }
+
+    assigned
 }
 
 fn session_blocks_from_response(
@@ -703,9 +918,12 @@ fn session_blocks_from_response(
         .into_iter()
         .filter_map(session_block_from_content)
         .collect::<Vec<_>>();
-    let has_tool_use_blocks = blocks
+    let mut has_tool_use_blocks = blocks
         .iter()
         .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    if has_tool_use_blocks {
+        blocks.retain(|block| !matches!(block, SessionContentBlock::Text { .. }));
+    }
     if !has_tool_use_blocks {
         blocks.extend(
             tool_calls
@@ -717,6 +935,12 @@ fn session_blocks_from_response(
                     input: call.arguments,
                 }),
         );
+        has_tool_use_blocks = blocks
+            .iter()
+            .any(|block| matches!(block, SessionContentBlock::ToolUse { .. }));
+    }
+    if has_tool_use_blocks {
+        blocks.retain(|block| !matches!(block, SessionContentBlock::Text { .. }));
     }
     blocks
 }
@@ -904,13 +1128,6 @@ impl fx_api::ContextInfoSnapshotLike for ContextInfoSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrustedKeyEntry {
-    file_name: String,
-    fingerprint: String,
-    file_size: u64,
-}
-
 pub fn init_serve_logging(
     config: &FawxConfig,
 ) -> Result<WorkerGuard, crate::startup::StartupError> {
@@ -1003,13 +1220,13 @@ impl HeadlessApp {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: deps.stream_callback_slot,
+            permission_prompt_state: deps.permission_prompt_state,
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
         };
         app.seed_runtime_info();
         if !app.active_model.is_empty() {
-            app.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
+            update_context_limit_for_active_model(&mut app);
         }
         app.record_startup_warning_history();
         Ok(app)
@@ -1100,159 +1317,6 @@ impl HeadlessApp {
             .collect()
     }
 
-    /// REPL mode: read lines from stdin, run the loop, print to stdout.
-    pub async fn run(&mut self, json_mode: bool) -> Result<i32, anyhow::Error> {
-        install_sigpipe_handler();
-        self.apply_custom_system_prompt();
-        self.print_startup_info();
-
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
-
-            let input = if json_mode {
-                match self.parse_json_input(&line) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("error: invalid JSON input: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                line.trim().to_string()
-            };
-
-            if input.is_empty() {
-                continue;
-            }
-
-            if is_quit_command(&input) {
-                break;
-            }
-
-            self.process_input(&input, json_mode).await?;
-        }
-
-        Ok(0)
-    }
-
-    /// Single-shot mode: one input, one response, exit.
-    pub async fn run_single(&mut self, json_mode: bool) -> Result<i32, anyhow::Error> {
-        install_sigpipe_handler();
-        self.apply_custom_system_prompt();
-
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-
-        let input = if json_mode {
-            self.parse_json_input(&line)?
-        } else {
-            line.trim().to_string()
-        };
-
-        if input.is_empty() {
-            return Ok(0);
-        }
-
-        self.process_input(&input, json_mode).await?;
-        Ok(0)
-    }
-
-    /// Process a single message and return the result.
-    ///
-    /// Shared by the stdin REPL, single-shot mode, and the HTTP server.
-    /// Updates memory context, runs a loop cycle, records the turn in
-    /// conversation history, and returns the extracted response.
-    pub async fn process_message(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
-        let source = InputSource::Text;
-        self.process_message_for_source(input, &source).await
-    }
-
-    pub async fn process_message_streaming(
-        &mut self,
-        input: &str,
-        callback: StreamCallback,
-    ) -> Result<CycleResult, anyhow::Error> {
-        let source = InputSource::Text;
-        self.process_message_for_source_streaming(input, &source, callback)
-            .await
-    }
-
-    pub async fn process_message_for_source(
-        &mut self,
-        input: &str,
-        source: &InputSource,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result(input, source).await
-    }
-
-    pub async fn process_message_with_attachments(
-        &mut self,
-        input: &str,
-        images: &[ImageAttachment],
-        documents: &[DocumentAttachment],
-        source: &InputSource,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_attachments(input, images, documents, source, None)
-            .await
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub async fn process_message_with_images(
-        &mut self,
-        input: &str,
-        images: &[ImageAttachment],
-        source: &InputSource,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.process_message_with_attachments(input, images, &[], source)
-            .await
-    }
-
-    pub async fn process_message_with_context(
-        &mut self,
-        input: &str,
-        images: Vec<ImageAttachment>,
-        documents: Vec<DocumentAttachment>,
-        context: Vec<Message>,
-        source: &InputSource,
-        callback: Option<StreamCallback>,
-    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
-        let original_history = std::mem::replace(&mut self.conversation_history, context);
-        let result = match (images.is_empty() && documents.is_empty(), callback) {
-            (true, Some(callback)) => {
-                process_input_with_commands_streaming(self, input, Some(source), callback).await
-            }
-            (true, None) => process_input_with_commands(self, input, Some(source)).await,
-            (false, _) => {
-                self.process_message_with_attachments(input, &images, &documents, source)
-                    .await
-            }
-        };
-        let updated_history = self.conversation_history.clone();
-        self.conversation_history = original_history;
-        result.map(|cycle| (cycle, updated_history))
-    }
-
-    pub async fn process_message_for_source_streaming(
-        &mut self,
-        input: &str,
-        source: &InputSource,
-        callback: StreamCallback,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_streaming(input, source, callback)
-            .await
-    }
-
     /// Return the active model identifier.
     pub fn active_model(&self) -> &str {
         &self.active_model
@@ -1285,6 +1349,10 @@ impl HeadlessApp {
         self.config_manager.as_ref()
     }
 
+    pub fn permission_prompt_state(&self) -> Option<&Arc<PermissionPromptState>> {
+        self.permission_prompt_state.as_ref()
+    }
+
     pub fn ripcord_journal(&self) -> &Arc<fx_ripcord::RipcordJournal> {
         &self.ripcord_journal
     }
@@ -1307,10 +1375,7 @@ impl HeadlessApp {
     }
 
     pub fn thinking_available_levels(&self) -> Vec<String> {
-        valid_thinking_levels(&self.active_model)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
+        active_model_thinking_levels(&self.router, &self.active_model)
     }
 
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
@@ -1482,9 +1547,9 @@ impl HeadlessApp {
         ContextInfoDto::from_snapshot(&self.context_info_snapshot())
     }
 
-    pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
+    pub fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         match self.runtime_info.read() {
-            Ok(info) => runtime_skill_summaries(&info),
+            Ok(info) => runtime_skill_summary_dtos(&info),
             Err(error) => {
                 tracing::warn!(error = %error, "runtime info lock poisoned");
                 Vec::new()
@@ -1559,8 +1624,7 @@ impl HeadlessApp {
 
         if let Some(active_model) = active_model {
             self.active_model = active_model.clone();
-            self.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
+            update_context_limit_for_active_model(self);
             if self.config.model.default_model.is_none() {
                 self.config.model.default_model = Some(active_model);
             }
@@ -1579,8 +1643,7 @@ impl HeadlessApp {
         if let Some(active_model) = next_active_model {
             router.set_active(&active_model)?;
             self.active_model = active_model;
-            self.loop_engine
-                .update_context_limit(fx_llm::context_window_for_model(&self.active_model));
+            update_context_limit_for_active_model(self);
         } else {
             self.active_model.clear();
         }
@@ -1594,279 +1657,6 @@ impl HeadlessApp {
         let auth_manager = crate::startup::load_auth_manager()?;
         let router = crate::startup::build_router(&auth_manager)?;
         self.apply_reloaded_router(router)
-    }
-
-    // ── internal helpers ────────────────────────────────────────────────
-
-    async fn process_input(&mut self, input: &str, json_mode: bool) -> Result<(), anyhow::Error> {
-        let result = self.process_message(input).await?;
-        if json_mode {
-            let output = JsonOutput {
-                response: result.response,
-                model: result.model,
-                iterations: result.iterations,
-            };
-            let json = serde_json::to_string(&output)?;
-            println!("{json}");
-            io::stdout().flush()?;
-        } else {
-            println!("{}", result.response);
-            io::stdout().flush()?;
-        }
-        Ok(())
-    }
-
-    async fn run_cycle_result(
-        &mut self,
-        input: &str,
-        source: &InputSource,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_attachments(input, &[], &[], source, None)
-            .await
-    }
-
-    async fn run_cycle_result_streaming(
-        &mut self,
-        input: &str,
-        source: &InputSource,
-        callback: StreamCallback,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result_with_attachments(input, &[], &[], source, Some(callback))
-            .await
-    }
-
-    fn report_stream_error(event: &StreamEvent) {
-        if let StreamEvent::Error {
-            category,
-            message,
-            recoverable,
-        } = event
-        {
-            let level = if *recoverable { "warning" } else { "error" };
-            eprintln!("[{level}] [{category}] {message}");
-        }
-    }
-
-    #[cfg(test)]
-    fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
-        self.finalize_cycle_with_turn_messages(input, &[], &[], result, None)
-    }
-
-    fn finalize_cycle_with_turn_messages(
-        &mut self,
-        input: &str,
-        images: &[ImageAttachment],
-        documents: &[DocumentAttachment],
-        result: &LoopResult,
-        collector: Option<&SessionTurnCollector>,
-    ) -> CycleResult {
-        let response = extract_response_text(result);
-        let result_kind = extract_result_kind(result);
-        let iterations = extract_iterations(result);
-        let tokens_used = extract_token_usage(result);
-        self.cumulative_tokens.input_tokens = self
-            .cumulative_tokens
-            .input_tokens
-            .saturating_add(tokens_used.input_tokens);
-        self.cumulative_tokens.output_tokens = self
-            .cumulative_tokens
-            .output_tokens
-            .saturating_add(tokens_used.output_tokens);
-        self.last_signals = result.signals().to_vec();
-        let signals = self.last_signals.clone();
-        persist_headless_signals(self, &signals);
-        let session_messages = collector
-            .map(|collector| {
-                collector.session_messages_for_turn(input, images, documents, &response)
-            })
-            .unwrap_or_else(|| text_turn_messages(input, &response));
-        self.record_session_turn_messages(session_messages);
-        CycleResult {
-            response,
-            model: self.active_model.clone(),
-            iterations,
-            tokens_used,
-            result_kind,
-        }
-    }
-
-    async fn run_cycle_result_with_attachments(
-        &mut self,
-        input: &str,
-        images: &[ImageAttachment],
-        documents: &[DocumentAttachment],
-        source: &InputSource,
-        callback: Option<StreamCallback>,
-    ) -> Result<CycleResult, anyhow::Error> {
-        self.last_session_messages.clear();
-        let callback = callback.map(headless_stream_callback);
-        let should_emit_startup_warnings = callback.is_some();
-        let collector = SessionTurnCollector::default();
-        let combined_callback = collector.callback(callback);
-        self.set_stream_callback(Some(Arc::clone(&combined_callback)));
-        if should_emit_startup_warnings {
-            self.emit_startup_warnings(Some(&combined_callback));
-        } else {
-            self.clear_startup_warnings();
-        }
-        self.update_memory_context(input);
-        let snapshot =
-            self.build_perception_snapshot_with_attachments(input, source, images, documents);
-        let llm = RecordingLoopLlmProvider::new(
-            RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone()),
-            collector.clone(),
-        );
-        let result = self
-            .loop_engine
-            .run_cycle_streaming(snapshot, &llm, Some(combined_callback))
-            .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-        self.set_stream_callback(None);
-        self.evaluate_canary(&result);
-        Ok(self.finalize_cycle_with_turn_messages(
-            input,
-            images,
-            documents,
-            &result,
-            Some(&collector),
-        ))
-    }
-
-    fn set_stream_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
-        if let Ok(mut guard) = self.stream_callback_slot.lock() {
-            *guard = callback;
-        }
-    }
-
-    fn evaluate_canary(&mut self, result: &LoopResult) {
-        let Some(monitor) = self.canary_monitor.as_mut() else {
-            return;
-        };
-        if let Some(verdict) = monitor.on_cycle_complete(result.signals().to_vec()) {
-            tracing::info!(?verdict, "canary verdict");
-        }
-    }
-
-    fn apply_custom_system_prompt(&mut self) {
-        if self.custom_system_prompt.is_some() {
-            // Initial memory context injection; update_memory_context()
-            // will re-inject the custom prompt on each cycle.
-            self.update_memory_context("");
-        }
-    }
-
-    fn print_startup_info(&self) {
-        eprintln!("fawx serve — headless mode");
-        eprintln!("model: {}", self.active_model);
-        if self.custom_system_prompt.is_some() {
-            eprintln!("system prompt: custom prompt/context loaded");
-        }
-        eprintln!("ready (type /quit to exit)");
-    }
-
-    fn update_memory_context(&mut self, input: &str) {
-        let mut context_parts: Vec<String> = Vec::new();
-
-        if let Some(prompt) = &self.custom_system_prompt {
-            context_parts.push(prompt.clone());
-        }
-
-        if let Some(mem) = self.relevant_memory_context(input) {
-            context_parts.push(mem);
-        }
-
-        let combined = context_parts.join("\n\n");
-        self.loop_engine.set_memory_context(combined);
-    }
-
-    fn relevant_memory_context(&self, input: &str) -> Option<String> {
-        let entries = self.search_memory_entries(input)?;
-        format_memory_for_prompt(&entries, self.config.memory.max_snapshot_chars)
-    }
-
-    fn search_memory_entries(&self, input: &str) -> Option<Vec<(String, String)>> {
-        let memory = self.memory.as_ref()?;
-        match memory.lock() {
-            Ok(store) => {
-                let max = self.config.memory.max_relevant_results;
-                Some((*store).search_relevant(input, max))
-            }
-            Err(e) => {
-                eprintln!("warning: failed to lock memory store: {e}");
-                None
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
-        self.build_perception_snapshot_with_attachments(input, source, &[], &[])
-    }
-
-    fn build_perception_snapshot_with_attachments(
-        &self,
-        input: &str,
-        source: &InputSource,
-        images: &[ImageAttachment],
-        documents: &[DocumentAttachment],
-    ) -> PerceptionSnapshot {
-        let timestamp_ms = current_time_ms();
-        let image_pairs = images.to_vec();
-        let document_pairs = documents.to_vec();
-        PerceptionSnapshot {
-            screen: ScreenState {
-                current_app: "fawx.headless".to_string(),
-                elements: Vec::new(),
-                text_content: input.to_string(),
-            },
-            notifications: Vec::new(),
-            active_app: "fawx.headless".to_string(),
-            timestamp_ms,
-            sensor_data: None,
-            user_input: Some(UserInput {
-                text: input.to_string(),
-                source: source.clone(),
-                timestamp: timestamp_ms,
-                context_id: None,
-                images: image_pairs,
-                documents: document_pairs,
-            }),
-            conversation_history: self.conversation_history.clone(),
-            steer_context: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn record_turn(&mut self, user_text: &str, assistant_text: &str) {
-        self.record_session_turn_messages(text_turn_messages(user_text, assistant_text));
-    }
-
-    fn record_session_turn_messages(&mut self, session_messages: Vec<SessionMessage>) {
-        self.last_session_messages = session_messages.clone();
-        self.conversation_history
-            .extend(session_messages.iter().map(SessionMessage::to_llm_message));
-        trim_history(&mut self.conversation_history, self.max_history);
-    }
-
-    fn parse_json_input(&self, raw: &str) -> Result<String, serde_json::Error> {
-        let parsed: JsonInput = serde_json::from_str(raw)?;
-        Ok(parsed.message)
-    }
-
-    async fn list_models_dynamic(&self) -> anyhow::Result<String> {
-        let models = self.dynamic_models_or_fallback().await?;
-        Ok(render_model_menu_text(
-            Some(self.active_model.as_str()),
-            &models,
-        ))
-    }
-
-    async fn dynamic_models_or_fallback(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        let models = fetch_shared_available_models(&self.router).await;
-        if models.is_empty() {
-            return Ok(self.available_models());
-        }
-        Ok(models)
     }
 }
 
@@ -1899,13 +1689,17 @@ fn user_message_blocks(
     blocks
 }
 
-fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessage> {
-    let timestamp = current_epoch_secs();
+fn text_turn_messages(
+    user_text: &str,
+    assistant_text: &str,
+    user_timestamp: u64,
+    assistant_timestamp: u64,
+) -> Vec<SessionMessage> {
     vec![
         SessionMessage::structured(
             SessionRecordRole::User,
             user_message_blocks(user_text, &[], &[]),
-            timestamp,
+            user_timestamp,
             None,
         ),
         SessionMessage::structured(
@@ -1913,7 +1707,7 @@ fn text_turn_messages(user_text: &str, assistant_text: &str) -> Vec<SessionMessa
             vec![SessionContentBlock::Text {
                 text: assistant_text.to_string(),
             }],
-            timestamp,
+            assistant_timestamp,
             None,
         ),
     ]
@@ -2015,9 +1809,6 @@ impl AppEngine for HeadlessApp {
 
     fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
         HeadlessApp::skill_summaries(self)
-            .into_iter()
-            .map(SkillSummaryDto::from)
-            .collect()
     }
 
     fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
@@ -2033,6 +1824,10 @@ impl AppEngine for HeadlessApp {
 
     fn session_bus(&self) -> Option<&SessionBus> {
         HeadlessApp::session_bus(self)
+    }
+
+    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
+        HeadlessApp::permission_prompt_state(self).cloned()
     }
 
     fn reload_providers(&mut self) -> Result<(), anyhow::Error> {
@@ -2082,297 +1877,20 @@ impl AppEngine for HeadlessApp {
     }
 }
 
-impl CommandHost for HeadlessApp {
-    fn supports_embedded_slash_commands(&self) -> bool {
-        true
-    }
-
-    fn list_models(&self) -> String {
-        render_model_menu_text(Some(self.active_model.as_str()), &self.available_models())
-    }
-
-    fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
-        HeadlessApp::set_active_model(self, selector)
-    }
-
-    fn proposals(&self, selector: Option<&str>) -> anyhow::Result<String> {
-        render_pending(headless_review_context(&self.config), selector).map_err(anyhow::Error::new)
-    }
-
-    fn approve(&self, selector: &str, force: bool) -> anyhow::Result<String> {
-        approve_pending(headless_review_context(&self.config), selector, force)
-            .map_err(anyhow::Error::new)
-    }
-
-    fn reject(&self, selector: &str) -> anyhow::Result<String> {
-        reject_pending(headless_review_context(&self.config), selector).map_err(anyhow::Error::new)
-    }
-
-    fn show_config(&self) -> anyhow::Result<String> {
-        let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
-        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
-        let json = headless_config_json(&self.config, self.config_manager.as_ref())?;
-        render_headless_config(&config_path, &data_dir, &self.active_model, &json)
-    }
-
-    fn init_config(&mut self) -> anyhow::Result<String> {
-        init_default_config(&fawx_data_dir())
-    }
-
-    fn reload_config(&mut self) -> anyhow::Result<String> {
-        let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
-        self.config = reload_runtime_config(self.config_manager.as_ref(), &config_path)?;
-        self.max_history = self.config.general.max_history;
-        let thinking_budget = self.config.general.thinking.unwrap_or_default();
-        sync_headless_model_from_config(self, self.config.model.default_model.clone())?;
-        self.loop_engine
-            .set_thinking_config(thinking_config_for_active_model(
-                &thinking_budget,
-                &self.active_model,
-            ));
-        Ok(config_reload_success_message(&config_path))
-    }
-
-    fn show_status(&self) -> String {
-        let providers = read_router(&self.router, available_provider_names);
-        render_status_text(
-            &self.active_model,
-            &providers,
-            self.loop_engine.status(current_time_ms()),
-        )
-    }
-
-    fn show_budget_status(&self) -> String {
-        render_budget_text(self.loop_engine.status(current_time_ms()))
-    }
-
-    fn show_signals_summary(&self) -> String {
-        render_signals_summary(&self.last_signals)
-    }
-
-    fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
-        HeadlessApp::handle_thinking(self, level)
-    }
-
-    fn show_history(&self) -> anyhow::Result<String> {
-        Ok(format!(
-            "Conversation history: {} messages in current session",
-            self.conversation_history.len()
-        ))
-    }
-
-    fn new_conversation(&mut self) -> anyhow::Result<String> {
-        self.conversation_history.clear();
-        Ok("Started a new conversation.".to_string())
-    }
-
-    fn show_loop_status(&self) -> anyhow::Result<String> {
-        Ok(render_loop_status(
-            self.loop_engine.status(current_time_ms()),
-        ))
-    }
-
-    fn show_debug(&self) -> anyhow::Result<String> {
-        Ok(render_debug_dump(&self.last_signals))
-    }
-
-    fn handle_synthesis(&mut self, instruction: Option<&str>) -> anyhow::Result<String> {
-        handle_headless_synthesis_command(&mut self.loop_engine, instruction)
-    }
-
-    fn handle_auth(
-        &self,
-        subcommand: Option<&str>,
-        action: Option<&str>,
-        value: Option<&str>,
-        has_extra_args: bool,
-    ) -> anyhow::Result<String> {
-        read_router(&self.router, |router| {
-            handle_headless_auth_command(router, subcommand, action, value, has_extra_args)
-        })
-    }
-
-    fn handle_keys(
-        &self,
-        subcommand: Option<&str>,
-        value: Option<&str>,
-        option: Option<&str>,
-        has_extra_args: bool,
-    ) -> anyhow::Result<String> {
-        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
-        handle_headless_keys_command(&data_dir, subcommand, value, option, has_extra_args)
-    }
-
-    fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
-        Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
-    }
-
-    fn list_skills(&self) -> anyhow::Result<String> {
-        crate::commands::marketplace::list_output()
-    }
-
-    fn install_skill(&self, name: &str) -> anyhow::Result<String> {
-        crate::commands::marketplace::install_output(name)
-    }
-
-    fn search_skills(&self, query: &str) -> anyhow::Result<String> {
-        crate::commands::marketplace::search_output(query)
-    }
-}
-
-fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {
-    for budget in [
-        ThinkingBudget::High,
-        ThinkingBudget::Adaptive,
-        ThinkingBudget::Low,
-        ThinkingBudget::Off,
-    ] {
-        if levels.iter().any(|level| level == &budget.to_string()) {
-            return budget;
-        }
-    }
-    ThinkingBudget::Off
-}
-
-#[cfg(feature = "http")]
-fn thinking_adjustment_reason(
-    from: ThinkingBudget,
-    to: ThinkingBudget,
-    provider: Option<&str>,
-) -> String {
-    let provider = provider.unwrap_or("unknown");
-    format!("{} not supported by {}; adjusted to {}", from, provider, to)
-}
-
-fn handle_headless_synthesis_command(
-    loop_engine: &mut LoopEngine,
-    instruction: Option<&str>,
-) -> anyhow::Result<String> {
-    match instruction {
-        None => Ok("Usage: /synthesis <instruction> or /synthesis reset".to_string()),
-        Some(value) if value.trim().is_empty() => {
-            Ok("Synthesis instruction cannot be empty.".to_string())
-        }
-        Some(value) if value.eq_ignore_ascii_case("reset") => {
-            loop_engine
-                .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string())
-                .map_err(|error| anyhow::anyhow!(error.reason))?;
-            Ok("Synthesis instruction reset to default.".to_string())
-        }
-        Some(value) => update_headless_synthesis_instruction(loop_engine, value),
-    }
-}
-
-fn update_headless_synthesis_instruction(
-    loop_engine: &mut LoopEngine,
-    value: &str,
-) -> anyhow::Result<String> {
-    if value.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
-        return Ok(format!(
-            "Synthesis instruction exceeds {} characters.",
-            MAX_SYNTHESIS_INSTRUCTION_LENGTH
-        ));
-    }
-    loop_engine
-        .set_synthesis_instruction(value.to_string())
-        .map_err(|error| anyhow::anyhow!(error.reason))?;
-    Ok(format!("Synthesis instruction updated: {}", value.trim()))
-}
-
-fn handle_headless_auth_command(
-    router: &ModelRouter,
-    subcommand: Option<&str>,
-    action: Option<&str>,
-    value: Option<&str>,
-    has_extra_args: bool,
-) -> anyhow::Result<String> {
-    if is_auth_write_action(action) {
-        return Ok("Use `fawx setup` to manage credentials.".to_string());
-    }
-    match (subcommand, action, value, has_extra_args) {
-        (None, None, None, false) | (Some("list-providers"), None, None, false) => {
-            Ok(render_auth_overview(router))
-        }
-        (Some(provider), Some("show-status"), None, false) => {
-            Ok(render_auth_provider_status(router, provider))
-        }
-        _ => Ok(auth_usage_message()),
-    }
-}
-
-fn is_auth_write_action(action: Option<&str>) -> bool {
-    matches!(action, Some("set-token") | Some("clear-token"))
-}
-
-fn auth_usage_message() -> String {
-    "Usage: /auth {provider} <set-token|show-status|clear-token> [TOKEN]".to_string()
-}
-
-fn render_auth_overview(router: &ModelRouter) -> String {
-    let statuses = auth_provider_statuses(router.available_models(), Vec::new());
-    if statuses.is_empty() {
-        return "No credentials configured.".to_string();
-    }
-    let mut lines = vec!["Configured credentials:".to_string()];
-    lines.extend(statuses.iter().map(render_auth_status_line));
-    lines.join("\n")
-}
-
-fn render_auth_status_line(status: &AuthProviderStatus) -> String {
-    let state_label = match status.status.as_str() {
-        "saved" => "saved",
-        _ => "configured",
-    };
-    format!(
-        "  ✓ {}: {} ({}) — {}",
-        status.provider,
-        state_label,
-        format_auth_methods(&status.auth_methods),
-        model_count_label(status.model_count)
-    )
-}
-
-fn render_auth_provider_status(router: &ModelRouter, provider: &str) -> String {
-    let provider = normalize_provider_name(provider);
-    match auth_provider_statuses(router.available_models(), Vec::new())
-        .into_iter()
-        .find(|status| status.provider == provider)
-    {
-        Some(status) => format!(
-            "{} auth status:\n  Status: {} ({})\n  Models available: {}",
-            status.provider,
-            status.status,
-            format_auth_methods(&status.auth_methods),
-            status.model_count
-        ),
-        None => format!("{provider} auth status:\n  Status: not configured"),
-    }
-}
-
-fn auth_provider_statuses(
-    models: Vec<ModelInfo>,
-    stored_auth_entries: Vec<StoredAuthProviderEntry>,
-) -> Vec<AuthProviderStatus> {
-    let mut statuses = BTreeMap::new();
-    for entry in stored_auth_entries {
-        update_saved_auth_provider_status(&mut statuses, entry);
-    }
-    for model in models {
-        update_auth_provider_status(&mut statuses, model);
-    }
-    statuses.into_values().collect()
-}
-
-fn runtime_skill_summaries(info: &RuntimeInfo) -> Vec<(String, String, Vec<String>, Vec<String>)> {
+fn runtime_skill_summary_dtos(info: &RuntimeInfo) -> Vec<SkillSummaryDto> {
     info.skills
         .iter()
-        .map(|skill| {
-            (
-                skill.name.clone(),
-                skill.description.clone().unwrap_or_default(),
-                skill.tool_names.clone(),
-                skill.capabilities.clone(),
-            )
+        .map(|skill| SkillSummaryDto {
+            name: skill.name.clone(),
+            description: skill.description.clone().unwrap_or_default(),
+            tools: skill.tool_names.clone(),
+            capabilities: skill.capabilities.clone(),
+            version: skill.version.clone(),
+            source: skill.source.clone(),
+            revision_hash: skill.revision_hash.clone(),
+            activated_at_ms: skill.activated_at_ms,
+            signature_status: skill.signature_status.clone(),
+            stale_source: skill.stale_source.clone(),
         })
         .collect()
 }
@@ -2383,266 +1901,6 @@ fn context_usage_percentage(used_tokens: usize, max_tokens: usize) -> f32 {
     } else {
         (used_tokens as f32 / max_tokens as f32) * 100.0
     }
-}
-
-#[cfg(feature = "http")]
-fn auth_provider_dto(status: AuthProviderStatus) -> AuthProviderDto {
-    AuthProviderDto {
-        provider: status.provider,
-        auth_methods: status.auth_methods.into_iter().collect(),
-        model_count: status.model_count,
-        status: status.status,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredAuthProviderEntry {
-    provider: String,
-    auth_method: String,
-}
-
-fn stored_auth_provider_entries(data_dir: &Path) -> Vec<StoredAuthProviderEntry> {
-    let store = match AuthStore::open(data_dir) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to open auth store while building auth statuses");
-            return Vec::new();
-        }
-    };
-    let auth_manager = match store.load_auth_manager() {
-        Ok(auth_manager) => auth_manager,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to load auth manager while building auth statuses");
-            return Vec::new();
-        }
-    };
-
-    auth_manager
-        .providers()
-        .into_iter()
-        .filter_map(|provider| {
-            let auth_method = auth_manager
-                .get(&provider)
-                .map(stored_auth_method_label)?
-                .to_string();
-            Some(StoredAuthProviderEntry {
-                provider: normalize_provider_name(&provider),
-                auth_method,
-            })
-        })
-        .collect()
-}
-
-fn stored_auth_method_label(auth_method: &fx_auth::auth::AuthMethod) -> &'static str {
-    match auth_method {
-        fx_auth::auth::AuthMethod::ApiKey { .. } => "api_key",
-        fx_auth::auth::AuthMethod::SetupToken { .. } => "setup_token",
-        fx_auth::auth::AuthMethod::OAuth { .. } => "oauth",
-    }
-}
-
-fn update_saved_auth_provider_status(
-    statuses: &mut BTreeMap<String, AuthProviderStatus>,
-    entry: StoredAuthProviderEntry,
-) {
-    let status = statuses
-        .entry(entry.provider.clone())
-        .or_insert_with(|| AuthProviderStatus {
-            provider: entry.provider,
-            auth_methods: BTreeSet::new(),
-            model_count: 0,
-            status: "saved".to_string(),
-        });
-    status.auth_methods.insert(entry.auth_method);
-    if status.model_count == 0 {
-        status.status = "saved".to_string();
-    }
-}
-
-fn update_auth_provider_status(
-    statuses: &mut BTreeMap<String, AuthProviderStatus>,
-    model: ModelInfo,
-) {
-    let provider = normalize_provider_name(&model.provider_name);
-    let status = statuses
-        .entry(provider.clone())
-        .or_insert_with(|| AuthProviderStatus {
-            provider,
-            auth_methods: BTreeSet::new(),
-            model_count: 0,
-            status: "registered".to_string(),
-        });
-    status.auth_methods.insert(model.auth_method);
-    status.model_count += 1;
-    // GitHub models use the same PAT-backed auth path as the dedicated
-    // settings card, so keep a persisted token visible as "saved" instead of
-    // collapsing it back to the generic "registered" model-provider state.
-    if status.provider == "github" && status.status == "saved" {
-        return;
-    }
-    status.status = "registered".to_string();
-}
-
-fn format_auth_methods(auth_methods: &BTreeSet<String>) -> String {
-    auth_methods
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn model_count_label(model_count: usize) -> String {
-    match model_count {
-        1 => "1 model".to_string(),
-        count => format!("{count} models"),
-    }
-}
-
-fn normalize_provider_name(value: &str) -> String {
-    let lower = value.trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "gh" => "github".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn handle_headless_keys_command(
-    base_dir: &Path,
-    subcommand: Option<&str>,
-    value: Option<&str>,
-    option: Option<&str>,
-    has_extra_args: bool,
-) -> anyhow::Result<String> {
-    match subcommand {
-        Some("list") if value.is_none() && option.is_none() && !has_extra_args => {
-            render_trusted_key_list(base_dir)
-        }
-        Some("list") => Ok("Usage: /keys list".to_string()),
-        Some(other) => Ok(keys_redirect_message(other)),
-        None => Ok("Usage: /keys list".to_string()),
-    }
-}
-
-fn keys_redirect_message(subcommand: &str) -> String {
-    format!("Use `fawx keys {subcommand}` CLI for key management.")
-}
-
-fn render_trusted_key_list(base_dir: &Path) -> anyhow::Result<String> {
-    let keys = trusted_key_entries_from_dir(&trusted_keys_dir(base_dir))?;
-    if keys.is_empty() {
-        return Ok("No trusted public keys.".to_string());
-    }
-    let mut lines = vec!["Trusted public keys:".to_string()];
-    lines.extend(keys.into_iter().map(render_trusted_key_line));
-    Ok(lines.join("\n"))
-}
-
-fn render_trusted_key_line(key: TrustedKeyEntry) -> String {
-    format!(
-        "  {} {} {} bytes",
-        key.file_name, key.fingerprint, key.file_size
-    )
-}
-
-fn trusted_keys_dir(base_dir: &Path) -> PathBuf {
-    base_dir.join("trusted_keys")
-}
-
-fn trusted_key_entries_from_dir(trusted_dir: &Path) -> anyhow::Result<Vec<TrustedKeyEntry>> {
-    let mut keys = Vec::new();
-    if !trusted_dir.exists() {
-        return Ok(keys);
-    }
-    for entry in std::fs::read_dir(trusted_dir)? {
-        let path = entry?.path();
-        if is_public_key_path(&path) {
-            keys.push(trusted_key_entry_from_path(&path)?);
-        }
-    }
-    keys.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-    Ok(keys)
-}
-
-fn trusted_key_entry_from_path(path: &Path) -> anyhow::Result<TrustedKeyEntry> {
-    let public_key = read_public_key_file(path)?;
-    let file_name = display_file_name(path);
-    Ok(TrustedKeyEntry {
-        file_name,
-        fingerprint: public_key_fingerprint(&public_key),
-        file_size: std::fs::metadata(path)?.len(),
-    })
-}
-
-fn read_public_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let public_key = std::fs::read(path)?;
-    if public_key.len() != 32 {
-        return Err(anyhow::anyhow!(
-            "invalid public key length at {}: expected 32 bytes, found {}",
-            path.display(),
-            public_key.len()
-        ));
-    }
-    Ok(public_key)
-}
-
-fn is_public_key_path(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("pub")
-}
-
-fn public_key_fingerprint(public_key: &[u8]) -> String {
-    let digest = Sha256::digest(public_key);
-    hex_encode(&digest[..8])
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn display_file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-fn resolve_headless_model_selector(router: &ModelRouter, selector: &str) -> anyhow::Result<String> {
-    let model_ids = router
-        .available_models()
-        .into_iter()
-        .map(|model| model.model_id)
-        .collect::<Vec<_>>();
-    if model_ids.iter().any(|model_id| model_id == selector) {
-        return Ok(selector.to_string());
-    }
-    resolve_model_alias(selector, &model_ids)
-        .ok_or_else(|| anyhow::anyhow!("model not found: {selector}"))
-}
-
-fn sync_headless_model_from_config(
-    app: &mut HeadlessApp,
-    default_model: Option<String>,
-) -> anyhow::Result<()> {
-    let resolved = read_router(&app.router, |router| {
-        resolve_requested_model(router, default_model.as_deref())
-    })?;
-    apply_headless_active_model(app, &resolved);
-    Ok(())
-}
-
-fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
-    let error_message = write_router(&app.router, |router| {
-        if let Err(error) = router.set_active(model) {
-            tracing::warn!(error = %error, model, "failed to apply reloaded model to router");
-            Some(format!("Model reload failed after config change: {error}"))
-        } else {
-            None
-        }
-    });
-    if let Some(message) = error_message {
-        app.record_error(ErrorCategory::System, message, true);
-    }
-    app.active_model = model.to_string();
-    app.loop_engine
-        .update_context_limit(fx_llm::context_window_for_model(&app.active_model));
 }
 
 fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
@@ -2906,13 +2164,23 @@ impl HeadlessSubagentFactory {
         }
     }
 
+    fn subagent_build_options(
+        &self,
+        config: &SpawnConfig,
+        cancel_token: CancellationToken,
+    ) -> HeadlessLoopBuildOptions {
+        let mut options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
+        options.credential_store = self.deps.credential_store.clone();
+        options.token_broker = self.deps.token_broker.clone();
+        options
+    }
+
     fn build_app(
         &self,
         config: &SpawnConfig,
         cancel_token: CancellationToken,
     ) -> Result<HeadlessApp, SubagentError> {
-        let mut options = HeadlessLoopBuildOptions::subagent(config.cwd.clone(), cancel_token);
-        options.token_broker = self.deps.token_broker.clone();
+        let options = self.subagent_build_options(config, cancel_token);
         let bundle = build_headless_loop_engine_bundle(
             &self.deps.config,
             self.deps.improvement_provider.clone(),
@@ -2936,6 +2204,7 @@ impl HeadlessSubagentFactory {
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
             stream_callback_slot: bundle.stream_callback_slot,
+            permission_prompt_state: Some(bundle.permission_prompt_state),
             ripcord_journal: bundle.ripcord_journal,
             #[cfg(feature = "http")]
             experiment_registry: None,
@@ -3016,93 +2285,7 @@ impl SubagentSession for HeadlessSubagentSession {
     }
 }
 
-pub async fn process_input_with_commands(
-    app: &mut HeadlessApp,
-    input: &str,
-    source: Option<&InputSource>,
-) -> Result<CycleResult, anyhow::Error> {
-    if is_command_input(input) {
-        return process_command_input(app, input).await;
-    }
-    match source {
-        Some(source) => app.process_message_for_source(input, source).await,
-        None => app.process_message(input).await,
-    }
-}
-
-pub async fn process_input_with_commands_streaming(
-    app: &mut HeadlessApp,
-    input: &str,
-    source: Option<&InputSource>,
-    callback: StreamCallback,
-) -> Result<CycleResult, anyhow::Error> {
-    if is_command_input(input) {
-        let result = process_command_input(app, input).await?;
-        callback(fx_kernel::StreamEvent::Done {
-            response: result.response.clone(),
-        });
-        return Ok(result);
-    }
-    match source {
-        Some(source) => {
-            app.process_message_for_source_streaming(input, source, callback)
-                .await
-        }
-        None => app.process_message_streaming(input, callback).await,
-    }
-}
-
-async fn process_command_input(
-    app: &mut HeadlessApp,
-    input: &str,
-) -> Result<CycleResult, anyhow::Error> {
-    app.last_session_messages.clear();
-    let parsed = parse_command(input);
-    let response = match execute_headless_async_command(app, &parsed).await? {
-        Some(response) => response,
-        None => run_sync_command(app, &parsed)?,
-    };
-    Ok(command_cycle_result(app, response))
-}
-
-fn run_sync_command(
-    app: &mut HeadlessApp,
-    parsed: &ParsedCommand,
-) -> Result<String, anyhow::Error> {
-    match execute_command(&mut CommandContext { app }, parsed) {
-        Some(result) => result.map(|value| value.response),
-        None => Ok(client_only_command_message(parsed)
-            .unwrap_or_else(|| "This command is only available in the TUI.".to_string())),
-    }
-}
-
-async fn execute_headless_async_command(
-    app: &mut HeadlessApp,
-    parsed: &ParsedCommand,
-) -> Result<Option<String>, anyhow::Error> {
-    match parsed {
-        ParsedCommand::Model(None) => app.list_models_dynamic().await.map(Some),
-        ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
-        ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
-        _ => Ok(None),
-    }
-}
-
-fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
-    CycleResult {
-        response,
-        model: app.active_model().to_string(),
-        iterations: 0,
-        tokens_used: TokenUsage::default(),
-        result_kind: ResultKind::Complete,
-    }
-}
-
 // ── Free functions ──────────────────────────────────────────────────────────
-
-fn is_quit_command(input: &str) -> bool {
-    matches!(input, "/quit" | "/exit")
-}
 
 fn current_time_ms() -> u64 {
     SystemTime::now()
@@ -3258,6 +2441,17 @@ fn extract_response_text(result: &LoopResult) -> String {
                 BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string()
             }
         }
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            ..
+        } => {
+            if has_meaningful_response(partial_response.as_deref()) {
+                partial_response.clone().unwrap_or_default()
+            } else {
+                reason.clone()
+            }
+        }
         LoopResult::UserStopped {
             partial_response, ..
         } => partial_response.clone().unwrap_or_default(),
@@ -3269,6 +2463,9 @@ fn extract_result_kind(result: &LoopResult) -> ResultKind {
     match result {
         LoopResult::Complete { .. } => ResultKind::Complete,
         LoopResult::BudgetExhausted {
+            partial_response, ..
+        }
+        | LoopResult::Incomplete {
             partial_response, ..
         }
         | LoopResult::UserStopped {
@@ -3319,6 +2516,7 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     match result {
         LoopResult::Complete { iterations, .. }
         | LoopResult::BudgetExhausted { iterations, .. }
+        | LoopResult::Incomplete { iterations, .. }
         | LoopResult::UserStopped { iterations, .. } => *iterations,
         LoopResult::Error { .. } => 0,
     }
@@ -3348,6 +2546,7 @@ mod tests {
     use fx_session::SessionKey;
     use fx_subagent::SpawnConfig;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::time::Duration;
 
@@ -3428,11 +2627,32 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
             bus_receiver: None,
         }
+    }
+
+    fn write_test_signing_key(data_dir: &Path) {
+        let (private_key, _) = fx_skills::signing::generate_keypair().expect("generate keypair");
+        let keys_dir = data_dir.join("keys");
+        std::fs::create_dir_all(&keys_dir).expect("create keys dir");
+        std::fs::write(keys_dir.join("signing_key.pem"), private_key).expect("write signing key");
+    }
+
+    fn install_test_skill(data_dir: &Path, name: &str, wasm_bytes: &[u8]) {
+        let skill_dir = data_dir.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"test\"\nauthor = \"tester\"\napi_version = \"host_api_v1\"\ncapabilities = []\n"
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(skill_dir.join(format!("{name}.wasm")), wasm_bytes).expect("write wasm");
     }
 
     #[derive(Debug)]
@@ -3479,6 +2699,78 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ReplaySafeCaptureProvider {
+        captured: Arc<std::sync::Mutex<Vec<fx_llm::CompletionRequest>>>,
+    }
+
+    impl ReplaySafeCaptureProvider {
+        fn capture_request(
+            &self,
+            request: &fx_llm::CompletionRequest,
+        ) -> Result<(), fx_llm::ProviderError> {
+            if request_replays_tool_use(request, "call_orphan") {
+                return Err(fx_llm::ProviderError::Provider(
+                    "No tool output found for function call fc_orphan".to_string(),
+                ));
+            }
+
+            self.captured
+                .lock()
+                .expect("capture lock")
+                .push(request.clone());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ReplaySafeCaptureProvider {
+        async fn complete(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            self.capture_request(&request)?;
+            Ok(mock_completion_response())
+        }
+
+        async fn complete_stream(
+            &self,
+            request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            self.capture_request(&request)?;
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(mock_completion_text()),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            "replay-safe-capture"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec!["replay-safe-model".to_string()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    fn request_replays_tool_use(request: &fx_llm::CompletionRequest, id: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, fx_llm::ContentBlock::ToolUse { id: block_id, .. } if block_id == id))
+        })
+    }
+
     fn mock_completion_response() -> fx_llm::CompletionResponse {
         fx_llm::CompletionResponse {
             content: vec![fx_llm::ContentBlock::Text {
@@ -3519,6 +2811,52 @@ mod tests {
         }
     }
 
+    fn seed_resolved_and_orphaned_tool_history(
+        collector: &SessionTurnCollector,
+        resolved_name: &str,
+    ) {
+        record_tool_use_response(
+            collector,
+            "call_resolved",
+            "fc_resolved",
+            resolved_name,
+            serde_json::json!({"path": "README.md"}),
+        );
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_resolved".to_string(),
+            tool_name: resolved_name.to_string(),
+            output: "patched".to_string(),
+            is_error: false,
+        });
+        record_tool_use_response(
+            collector,
+            "call_orphan",
+            "fc_orphan",
+            "git_status",
+            serde_json::json!({}),
+        );
+    }
+
+    fn record_tool_use_response(
+        collector: &SessionTurnCollector,
+        id: &str,
+        provider_id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) {
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: id.to_string(),
+                provider_id: Some(provider_id.to_string()),
+                name: name.to_string(),
+                input,
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
+    }
+
     #[test]
     fn session_turn_collector_builds_structured_turn_messages() {
         let collector = SessionTurnCollector::default();
@@ -3543,6 +2881,7 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_1".to_string(),
+            tool_name: "read_file".to_string(),
             output: "file contents".to_string(),
             is_error: false,
         });
@@ -3558,19 +2897,31 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         });
 
-        let messages = collector.session_messages_for_turn("open the readme", &[], &[], "fallback");
+        let messages =
+            collector.session_messages_for_turn("open the readme", &[], &[], "Done.", 10, 20);
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, SessionRecordRole::User);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
         assert_eq!(messages[2].role, SessionRecordRole::Tool);
         assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[0].timestamp, 10);
+        assert_eq!(messages[1].timestamp, 20);
+        assert_eq!(messages[2].timestamp, 20);
+        assert_eq!(messages[3].timestamp, 20);
         assert_eq!(messages[1].token_count, Some(15));
         assert_eq!(messages[1].input_token_count, Some(10));
         assert_eq!(messages[1].output_token_count, Some(5));
         assert_eq!(messages[3].token_count, Some(10));
         assert_eq!(messages[3].input_token_count, Some(7));
         assert_eq!(messages[3].output_token_count, Some(3));
+        assert!(
+            !messages[1]
+                .content
+                .iter()
+                .any(|block| matches!(block, SessionContentBlock::Text { .. })),
+            "mixed tool turns should not persist assistant narration text"
+        );
         assert!(messages[1].content.iter().any(
             |block| matches!(block, SessionContentBlock::ToolUse { id, .. } if id == "call_1")
         ));
@@ -3580,6 +2931,28 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, SessionContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "call_1" && *is_error == Some(false)))
         );
+    }
+
+    #[test]
+    fn session_turn_collector_preserves_distinct_user_and_assistant_timestamps() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages =
+            collector.session_messages_for_turn("open the readme", &[], &[], "Done.", 100, 700);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[0].timestamp, 100);
+        assert_eq!(messages[1].timestamp, 700);
     }
 
     #[test]
@@ -3601,11 +2974,13 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_err".to_string(),
+            tool_name: "read_file".to_string(),
             output: "missing".to_string(),
             is_error: true,
         });
 
-        let messages = collector.session_messages_for_turn("open missing", &[], &[], "fallback");
+        let messages =
+            collector.session_messages_for_turn("open missing", &[], &[], "fallback", 10, 20);
 
         assert!(
             messages[2]
@@ -3635,13 +3010,21 @@ mod tests {
         });
         collector.observe(&StreamEvent::ToolResult {
             id: "call_2".to_string(),
+            tool_name: "search".to_string(),
             output: "results".to_string(),
             is_error: false,
         });
 
-        let messages = collector.session_messages_for_turn("search rust", &[], &[], "fallback");
+        let messages = collector.session_messages_for_turn(
+            "search rust",
+            &[],
+            &[],
+            "Rust search results are ready.",
+            10,
+            20,
+        );
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, SessionRecordRole::Assistant);
         assert_eq!(messages[1].token_count, Some(12));
         assert!(messages[1].content.iter().any(|block| matches!(
@@ -3653,6 +3036,48 @@ mod tests {
             block,
             SessionContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_2"
         )));
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[3].render_text(), "Rust search results are ready.");
+    }
+
+    #[test]
+    fn session_turn_collector_omits_text_when_tool_calls_are_reconstructed() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Let me search for that.".to_string(),
+            }],
+            tool_calls: vec![fx_llm::ToolCall {
+                id: "call_legacy".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "x api"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 6,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "search the X API",
+            &[],
+            &[],
+            "Search results are ready.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].render_text(), "Search results are ready.");
+        assert!(!messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_legacy"
+            )));
     }
 
     #[test]
@@ -3677,32 +3102,433 @@ mod tests {
             stop_reason: Some("tool_use".to_string()),
         });
 
-        let messages =
-            collector.session_messages_for_turn("weather in denver", &[], &[], "fallback");
+        let messages = collector.session_messages_for_turn(
+            "weather in denver",
+            &[],
+            &[],
+            "Weather lookup requires executing the recorded tool call.",
+            10,
+            20,
+        );
 
         assert_eq!(messages.len(), 2);
-        let tool_use_blocks = messages[1]
-            .content
+        assert_eq!(
+            messages[1].render_text(),
+            "Weather lookup requires executing the recorded tool call."
+        );
+        assert!(!messages
             .iter()
-            .filter_map(|block| match block {
-                SessionContentBlock::ToolUse {
-                    id,
-                    provider_id,
-                    name,
-                    input,
-                } => Some((id, provider_id, name, input)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tool_use_blocks.len(), 1);
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_3"
+            )));
+    }
+
+    #[test]
+    fn session_turn_collector_appends_terminal_summary_after_tool_only_history() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_4".to_string(),
+                provider_id: None,
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "X API POST /2/tweets"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_4".to_string(),
+            tool_name: "web_search".to_string(),
+            output: "search results".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "Research the X API",
+            &[],
+            &[],
+            "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(
+            messages[3].render_text(),
+            "Task decomposition results:\n1. Research X API => budget exhausted\n   Partial response: enough research to proceed with implementation."
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_aggregates_multi_round_tool_history_into_single_group() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_a".to_string(),
+                provider_id: Some("fc_a".to_string()),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 4,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_a".to_string(),
+            tool_name: "read_file".to_string(),
+            output: "first result".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_b".to_string(),
+                provider_id: Some("fc_b".to_string()),
+                name: "list_dir".to_string(),
+                input: serde_json::json!({"path": "."}),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 5,
+                output_tokens: 3,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_b".to_string(),
+            tool_name: "list_dir".to_string(),
+            output: "second result".to_string(),
+            is_error: false,
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Done.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 6,
+                output_tokens: 4,
+            }),
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let messages =
+            collector.session_messages_for_turn("inspect repo", &[], &[], "Done.", 10, 20);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, SessionRecordRole::User);
+        assert_eq!(messages[1].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[2].role, SessionRecordRole::Tool);
+        assert_eq!(messages[3].role, SessionRecordRole::Assistant);
+        assert_eq!(messages[1].token_count, Some(14));
+        assert_eq!(messages[1].input_token_count, Some(9));
+        assert_eq!(messages[1].output_token_count, Some(5));
         assert!(matches!(
-            tool_use_blocks.as_slice(),
-            [(id, Some(provider_id), name, input)]
-                if *id == "call_3"
-                    && *provider_id == "fc_3"
-                    && *name == "weather"
-                    && **input == serde_json::json!({"location": "Denver, CO"})
+            messages[1].content.as_slice(),
+            [
+                SessionContentBlock::ToolUse { id: first_id, provider_id: first_provider, .. },
+                SessionContentBlock::ToolUse { id: second_id, provider_id: second_provider, .. },
+            ] if first_id == "call_a"
+                && first_provider.as_deref() == Some("fc_a")
+                && second_id == "call_b"
+                && second_provider.as_deref() == Some("fc_b")
         ));
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [
+                SessionContentBlock::ToolResult { tool_use_id: first_id, .. },
+                SessionContentBlock::ToolResult { tool_use_id: second_id, .. },
+            ] if first_id == "call_a" && second_id == "call_b"
+        ));
+        assert_eq!(messages[3].render_text(), "Done.");
+    }
+
+    #[test]
+    fn session_turn_collector_omits_intermediate_text_only_synthesis_between_tool_rounds() {
+        let collector = SessionTurnCollector::default();
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_a".to_string(),
+                provider_id: None,
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "~/.fawx/x.md"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_a".to_string(),
+            tool_name: "read_file".to_string(),
+            output: "spec contents".to_string(),
+            is_error: false,
+        });
+        collector.observe(&StreamEvent::ToolCallStart {
+            id: "call_b".to_string(),
+            name: "run_command".to_string(),
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text {
+                text: "Current state: the spec file already exists and is complete.".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        });
+        collector.record_response(&fx_llm::CompletionResponse {
+            content: vec![fx_llm::ContentBlock::ToolUse {
+                id: "call_b".to_string(),
+                provider_id: None,
+                name: "run_command".to_string(),
+                input: serde_json::json!({"command": "fawx skill create x-post"}),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        });
+        collector.observe(&StreamEvent::ToolResult {
+            id: "call_b".to_string(),
+            tool_name: "run_command".to_string(),
+            output: "working directory is set there".to_string(),
+            is_error: false,
+        });
+
+        let messages = collector.session_messages_for_turn(
+            "Research and implement the X skill",
+            &[],
+            &[],
+            "I can't complete the file creation from here because the required paths are outside my working directory.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == SessionRecordRole::Assistant)
+                .count(),
+            2,
+            "one aggregated tool-use assistant message plus one terminal assistant message should persist",
+        );
+        assert!(
+            !messages.iter().any(|message| {
+                message.role == SessionRecordRole::Assistant
+                    && message
+                        .render_text()
+                        .contains("Current state: the spec file already exists")
+            }),
+            "intermediate text-only synthesis should remain internal to the turn",
+        );
+        assert!(
+            matches!(messages.last(), Some(message) if message.render_text().contains("outside my working directory"))
+        );
+    }
+
+    #[test]
+    fn session_turn_collector_drops_unresolved_tool_use_from_partial_turn_history() {
+        let collector = SessionTurnCollector::default();
+        seed_resolved_and_orphaned_tool_history(&collector, "read_file");
+
+        let messages = collector.session_messages_for_turn(
+            "Read README then make a small improvement to it.",
+            &[],
+            &[],
+            "Updated README.md but could not finish follow-up verification.",
+            10,
+            20,
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, provider_id, .. }]
+                if id == "call_resolved"
+                    && provider_id.as_deref() == Some("fc_resolved")
+        ));
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }]
+                if tool_use_id == "call_resolved"
+        ));
+        assert!(!messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                SessionContentBlock::ToolUse { id, .. } if id == "call_orphan"
+            )));
+        assert!(matches!(
+            messages.last(),
+            Some(message)
+                if message
+                    .render_text()
+                    .contains("could not finish follow-up verification")
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
+    }
+
+    #[tokio::test]
+    async fn follow_up_turn_does_not_replay_unresolved_tool_use() {
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReplaySafeCaptureProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("replay-safe-model")
+            .expect("set active replay-safe model");
+
+        let mut app = test_app();
+        app.router = shared_router(router);
+        app.active_model = "replay-safe-model".to_string();
+
+        let collector = SessionTurnCollector::default();
+        seed_resolved_and_orphaned_tool_history(&collector, "edit_file");
+
+        let session_messages = collector.session_messages_for_turn(
+            "Read README then make a small improvement to it.",
+            &[],
+            &[],
+            "Updated README.md and stopped after the applied change.",
+            10,
+            20,
+        );
+        app.record_session_turn_messages(session_messages);
+
+        app.process_message("What changed?")
+            .await
+            .expect("follow-up turn should succeed");
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+
+        assert!(request_replays_tool_use(&captured_request, "call_resolved"));
+        assert!(!request_replays_tool_use(&captured_request, "call_orphan"));
+    }
+
+    #[test]
+    fn build_turn_tool_history_messages_reassigns_tool_results_by_tool_use_id() {
+        let snapshot = SessionTurnSnapshot {
+            responses: vec![
+                fx_llm::CompletionResponse {
+                    content: vec![fx_llm::ContentBlock::ToolUse {
+                        id: "call_a".to_string(),
+                        provider_id: Some("fc_a".to_string()),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                },
+                fx_llm::CompletionResponse {
+                    content: vec![fx_llm::ContentBlock::ToolUse {
+                        id: "call_b".to_string(),
+                        provider_id: Some("fc_b".to_string()),
+                        name: "edit_file".to_string(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                },
+            ],
+            tool_result_rounds: vec![
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_b".to_string(),
+                    content: serde_json::Value::String("edit ok".to_string()),
+                    is_error: Some(false),
+                }],
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_a".to_string(),
+                    content: serde_json::Value::String("read ok".to_string()),
+                    is_error: Some(false),
+                }],
+            ],
+        };
+
+        let messages = build_turn_tool_history_messages(snapshot, 20);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [
+                SessionContentBlock::ToolUse { id: first_id, provider_id: first_provider, .. },
+                SessionContentBlock::ToolUse { id: second_id, provider_id: second_provider, .. },
+            ] if first_id == "call_a"
+                && first_provider.as_deref() == Some("fc_a")
+                && second_id == "call_b"
+                && second_provider.as_deref() == Some("fc_b")
+        ));
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [
+                SessionContentBlock::ToolResult { tool_use_id: first_id, .. },
+                SessionContentBlock::ToolResult { tool_use_id: second_id, .. },
+            ] if first_id == "call_a" && second_id == "call_b"
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
+    }
+
+    #[test]
+    fn build_turn_tool_history_messages_drops_orphaned_tool_results() {
+        let snapshot = SessionTurnSnapshot {
+            responses: vec![fx_llm::CompletionResponse {
+                content: vec![fx_llm::ContentBlock::ToolUse {
+                    id: "call_real".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }],
+            tool_result_rounds: vec![
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_real".to_string(),
+                    content: serde_json::Value::String("read ok".to_string()),
+                    is_error: Some(false),
+                }],
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_orphan".to_string(),
+                    content: serde_json::Value::String("orphan".to_string()),
+                    is_error: Some(false),
+                }],
+            ],
+        };
+
+        let messages = build_turn_tool_history_messages(snapshot, 20);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [SessionContentBlock::ToolUse { id, .. }] if id == "call_real"
+        ));
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [SessionContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_real"
+        ));
+        assert!(fx_session::validate_tool_message_order(&messages).is_ok());
     }
 
     #[test]
@@ -4052,6 +3878,7 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4070,6 +3897,7 @@ mod tests {
                 max_history: 20,
                 memory_enabled: false,
             },
+            authority: None,
             version: "test".to_string(),
         }))
     }
@@ -4344,6 +4172,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4568,12 +4397,60 @@ mod tests {
             response: "hello".to_string(),
             model: "gpt-4".to_string(),
             iterations: 2,
+            tool_calls: vec!["read_file".to_string()],
+            tool_inputs: vec![r#"{"path":"README.md"}"#.to_string()],
+            tool_errors: vec!["missing file".to_string()],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
+        assert_eq!(json["tool_calls"], serde_json::json!(["read_file"]));
+        assert_eq!(
+            json["tool_inputs"],
+            serde_json::json!([r#"{"path":"README.md"}"#])
+        );
+        assert_eq!(json["tool_errors"], serde_json::json!(["missing file"]));
+    }
+
+    #[test]
+    fn json_output_collects_tool_metadata_from_session_messages() {
+        let result = CycleResult {
+            response: "done".to_string(),
+            model: "mock-model".to_string(),
+            iterations: 3,
+            tokens_used: TokenUsage::default(),
+            result_kind: ResultKind::Complete,
+        };
+        let messages = vec![
+            SessionMessage::structured(
+                SessionRecordRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    provider_id: None,
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+                1,
+                None,
+            ),
+            SessionMessage::structured(
+                SessionRecordRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: serde_json::json!("missing"),
+                    is_error: Some(true),
+                }],
+                2,
+                None,
+            ),
+        ];
+
+        let output = json_output_from_cycle(result, &messages);
+        assert_eq!(output.tool_calls, vec!["read_file"]);
+        assert_eq!(output.tool_inputs, vec![r#"{"path":"README.md"}"#]);
+        assert_eq!(output.tool_errors, vec!["missing"]);
     }
 
     #[test]
@@ -4700,6 +4577,9 @@ mod tests {
             [7_u8; 32],
         )
         .expect("write trusted key");
+        write_test_signing_key(temp.path());
+        install_test_skill(temp.path(), "demo", b"demo-wasm");
+        install_test_skill(temp.path(), "weather", b"weather-wasm");
 
         let mut app = test_app();
         app.config.general.data_dir = Some(temp.path().to_path_buf());
@@ -4743,10 +4623,15 @@ mod tests {
         let sign = process_input_with_commands(&mut app, "/sign demo", None)
             .await
             .expect("process sign command");
-        assert_eq!(
-            sign.response,
-            "Use `fawx sign <skill>` CLI to sign WASM packages."
-        );
+        assert!(sign.response.contains("Signed skill 'demo'"));
+        assert!(temp.path().join("skills/demo/demo.wasm.sig").exists());
+
+        let sign_all = process_input_with_commands(&mut app, "/sign --all", None)
+            .await
+            .expect("process sign all command");
+        assert!(sign_all.response.contains("Signed skill 'demo'"));
+        assert!(sign_all.response.contains("Signed skill 'weather'"));
+        assert!(temp.path().join("skills/weather/weather.wasm.sig").exists());
     }
 
     #[cfg(feature = "http")]
@@ -4816,6 +4701,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -4873,6 +4759,7 @@ mod tests {
             cumulative_tokens: TokenUsage::default(),
             last_session_messages: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
@@ -5321,6 +5208,7 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: Some(bus.clone()),
+            credential_store: None,
             token_broker: None,
         });
         let app = factory
@@ -5364,10 +5252,37 @@ mod tests {
             config: FawxConfig::default(),
             improvement_provider: None,
             session_bus: None,
+            credential_store: None,
             token_broker: None,
         };
         let factory = HeadlessSubagentFactory::new(deps);
         let debug = format!("{factory:?}");
         assert!(debug.contains("HeadlessSubagentFactory"));
+    }
+
+    #[test]
+    fn subagent_build_options_inherit_shared_credential_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let credential_store =
+            crate::startup::open_credential_store(&data_dir).expect("open shared credential store");
+        let factory = HeadlessSubagentFactory::new(HeadlessSubagentFactoryDeps {
+            router: shared_router(ModelRouter::new()),
+            config: FawxConfig::default(),
+            improvement_provider: None,
+            session_bus: None,
+            credential_store: Some(Arc::clone(&credential_store)),
+            token_broker: None,
+        });
+        let options = factory
+            .subagent_build_options(&SpawnConfig::new("check bridge"), CancellationToken::new());
+
+        let inherited = options
+            .credential_store
+            .as_ref()
+            .expect("credential store should be inherited");
+
+        assert!(Arc::ptr_eq(inherited, &credential_store));
     }
 }

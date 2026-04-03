@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx — Expectation-Verification</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px 20px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.8em; margin-bottom: 6px; color: #fff; }
+  h2 { font-size: 1.3em; margin: 48px 0 16px; color: #fff; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
+  h3 { font-size: 1.05em; margin: 28px 0 12px; color: #c9d1d9; }
+  .subtitle { color: #8b949e; font-size: 0.95em; margin-bottom: 48px; line-height: 1.5; }
+  p { font-size: 0.88em; color: #8b949e; line-height: 1.6; margin-bottom: 14px; max-width: 760px; }
+
+  .callout {
+    background: #161b22; border-left: 3px solid #d29922; border-radius: 0 8px 8px 0;
+    padding: 16px 20px; margin: 24px 0; font-size: 0.88em; color: #e6edf3; line-height: 1.5;
+  }
+  .callout strong { color: #d29922; }
+
+  .spec-table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.82em; }
+  .spec-table th { text-align: left; padding: 10px 14px; background: #161b22; color: #e6edf3; border-bottom: 2px solid #30363d; }
+  .spec-table td { padding: 10px 14px; border-bottom: 1px solid #21262d; color: #8b949e; vertical-align: top; }
+
+  pre {
+    background: rgba(0,0,0,0.3); padding: 16px; border-radius: 8px;
+    font-size: 0.8em; color: #e6edf3; overflow-x: auto; line-height: 1.5;
+    margin: 12px 0;
+  }
+
+  .layer-tag {
+    display: inline-block; font-size: 0.68em; font-weight: 600;
+    padding: 2px 8px; border-radius: 10px; margin-right: 6px;
+  }
+  .tag-kernel { background: #da3633; color: #fff; }
+  .tag-loadable { background: #238636; color: #fff; }
+
+  .invariant {
+    display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px;
+    background: #161b22; border-left: 3px solid #da3633; margin-bottom: 8px;
+    border-radius: 0 8px 8px 0;
+  }
+  .invariant .icon { font-size: 1.2em; flex-shrink: 0; }
+  .invariant .text { font-size: 0.82em; color: #e6edf3; line-height: 1.4; }
+  .invariant .text strong { color: #ff7b72; }
+
+  .note { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin: 24px 0; font-size: 0.82em; color: #8b949e; line-height: 1.5; }
+  .note strong { color: #e6edf3; }
+
+  .flow-row { display: flex; align-items: center; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+  .flow-box {
+    padding: 8px 14px; border-radius: 8px; font-size: 0.78em; font-weight: 600;
+    border: 2px solid;
+  }
+  .flow-arrow { color: #484f58; font-size: 1.2em; }
+
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+  .compare-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 18px;
+  }
+  .compare-card h4 { font-size: 0.9em; margin-bottom: 8px; }
+  .compare-card p { font-size: 0.78em; }
+  .c-without { border-color: rgba(218,54,51,0.3); }
+  .c-without h4 { color: #ff7b72; }
+  .c-with { border-color: rgba(63,185,80,0.3); }
+  .c-with h4 { color: #3fb950; }
+</style>
+</head>
+<body>
+
+<h1>Expectation-Verification</h1>
+<p class="subtitle">
+  The agent predicts what should happen before acting, then compares prediction to reality.
+  Makes verification faster, catches subtle failures, and generates a powerful learning signal.
+</p>
+
+<div class="callout">
+  <strong>The insight:</strong> Current verification checks evidence against static contracts — "did a confirmation dialog appear?" But the agent has context the contract doesn't: it knows what app is open, what screen it's on, what the expected next screen should look like. A prediction generated before the action is a much richer verification target than a generic contract. When prediction matches reality, verification is instant. When it doesn't, the mismatch is itself a valuable signal.
+</div>
+
+<!-- ============ HOW IT WORKS ============ -->
+<h2>How It Works</h2>
+
+<h3>Modified Intent Structure</h3>
+<pre>
+Intent {
+  action:               Action,          // What to do
+  params:               Params,          // How to do it
+  evidence_requirements: EvidenceReqs,   // What "done" looks like (existing)
+  expected_outcome:     Option&lt;ExpectedOutcome&gt;,  // NEW: what the agent predicts will happen
+}
+
+ExpectedOutcome {
+  screen_state:   Option&lt;ScreenPrediction&gt;,  // What the screen should look like after
+  app_state:      Option&lt;AppPrediction&gt;,     // What app state should change
+  side_effects:   Vec&lt;SideEffectPrediction&gt;, // Expected side effects (message sent, file created)
+  confidence:     f32,                        // How confident the agent is in this prediction
+  format:         PredictionFormat,           // structured | natural_language | embedding
+}
+</pre>
+
+<h3>Modified Verification Flow</h3>
+<div class="flow-row">
+  <span class="flow-box" style="color: #bc8cff; border-color: #8957e5;">Reason: generate intent + prediction</span>
+  <span class="flow-arrow">→</span>
+  <span class="flow-box" style="color: #3fb950; border-color: #238636;">Act: execute</span>
+  <span class="flow-arrow">→</span>
+  <span class="flow-box" style="color: #d29922; border-color: #9e6a03;">Verify: two-pass check</span>
+</div>
+
+<pre>
+fn verify(result: ActionResult, intent: Intent) → VerificationOutcome:
+  // PASS 1: Artifact contract check (KERNEL-ENFORCED, HARD GATE)
+  // This is the existing verification — does evidence meet the contract?
+  contract_result = check_artifact_contracts(result, intent.evidence_requirements)
+
+  if contract_result == Failed:
+    return VerificationOutcome::Failed(contract_result.reason)
+
+  // PASS 2: Prediction comparison (LOADABLE, SOFT SIGNAL)
+  // Compare actual outcome to predicted outcome
+  if let Some(prediction) = intent.expected_outcome:
+    prediction_match = compare_prediction(prediction, result.post_action_state)
+
+    match prediction_match:
+      Match(score > 0.8) →
+        // Prediction was accurate — strong confidence in success
+        // Learning signal: boost this intent type's prediction accuracy
+        record_prediction_accuracy(intent, PredictionAccurate)
+        return VerificationOutcome::Verified(confidence: High)
+
+      PartialMatch(score 0.4-0.8) →
+        // Prediction partially matched — something unexpected happened
+        // Don't fail, but flag the surprise for learning
+        record_prediction_accuracy(intent, PredictionPartial, delta: mismatch_details)
+        return VerificationOutcome::Verified(confidence: Medium, surprise: mismatch_details)
+
+      Mismatch(score < 0.4) →
+        // Prediction was wrong — the world looks different than expected
+        // Contract passed but prediction failed. This is a surprise.
+        // Escalate to evidence-gathering sub-loop
+        record_prediction_accuracy(intent, PredictionMismatch, delta: mismatch_details)
+        return VerificationOutcome::Inconclusive(reason: PredictionMismatch)
+
+  // No prediction generated — fall back to contract-only result
+  return VerificationOutcome::from_contract(contract_result)
+</pre>
+
+<!-- ============ TWO PASS COMPARISON ============ -->
+<h2>The Two-Pass Architecture</h2>
+
+<div class="compare-grid">
+  <div class="compare-card c-without">
+    <h4>Pass 1: Artifact Contract (Kernel)</h4>
+    <p><strong>Purpose:</strong> Hard safety gate. Does the evidence meet the minimum requirements for "done"?</p>
+    <p><strong>Examples:</strong> Confirmation dialog appeared. File exists at expected path. HTTP 200 received. Element with expected text is present.</p>
+    <p><strong>Properties:</strong> Deterministic. Static. Same contract for every "tap button" action regardless of context. Cannot be bypassed.</p>
+    <p><strong>Failure mode:</strong> If Pass 1 fails, the action failed. Period. Prediction is not consulted.</p>
+  </div>
+  <div class="compare-card c-with">
+    <h4>Pass 2: Prediction Comparison (Loadable)</h4>
+    <p><strong>Purpose:</strong> Intelligent verification. Does the world look like the agent expected? Catches subtle failures that pass contracts but indicate something is wrong.</p>
+    <p><strong>Examples:</strong> Expected to see the home screen after pressing back, but see a dialog instead. Expected the message to appear in the conversation, but the conversation is empty. Expected the search to return restaurant results, but got an error page.</p>
+    <p><strong>Properties:</strong> Context-dependent. Different prediction for every action based on the agent's understanding of the current state. Soft signal — informs learning, doesn't hard-gate.</p>
+    <p><strong>Failure mode:</strong> If Pass 2 mismatches, it doesn't mean the action failed — it means something unexpected happened. Could be: (a) the agent's model of the world was wrong, (b) a subtle failure the contract didn't catch, or (c) a benign UI variation. The mismatch triggers investigation, not automatic failure.</p>
+  </div>
+</div>
+
+<div class="note">
+  <strong>Why two passes instead of one:</strong> Safety and intelligence have different requirements. The artifact contract is a hard floor — it prevents the agent from falsely claiming success. The prediction comparison is a soft ceiling — it tells the agent "yes, you succeeded, but was it what you expected?" Combining them gives both reliability (never miss a real failure) and intelligence (catch subtle failures and learn from them).
+</div>
+
+<!-- ============ PREDICTION FORMATS ============ -->
+<h2>Prediction Formats</h2>
+<p>Predictions can be expressed in multiple formats depending on the action type and the available compute.</p>
+
+<table class="spec-table">
+  <thead>
+    <tr><th>Format</th><th>When to use</th><th>Comparison method</th><th>Cost</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Structured diff</strong></td>
+      <td>Screen state predictions where elements are identifiable (element IDs, text content, hierarchy position)</td>
+      <td>Deterministic comparison: expected elements present? Expected text matches? Expected hierarchy position correct?</td>
+      <td>Low (no LLM needed for comparison)</td>
+    </tr>
+    <tr>
+      <td><strong>Natural language</strong></td>
+      <td>Complex predictions where the expected state is hard to express structurally ("the conversation should show my sent message with a delivery indicator")</td>
+      <td>LLM-based comparison: give the model the prediction + actual state, ask if they match</td>
+      <td>Medium (LLM call for comparison)</td>
+    </tr>
+    <tr>
+      <td><strong>Embedding similarity</strong></td>
+      <td>Visual predictions where overall screen appearance matters more than specific elements</td>
+      <td>Embedding distance between predicted screen state and actual screen state. Threshold-based match.</td>
+      <td>Low-Medium (embedding generation, vector comparison)</td>
+    </tr>
+  </tbody>
+</table>
+
+<pre>
+// Example: Structured prediction for "tap Send button"
+ExpectedOutcome {
+  screen_state: Some(ScreenPrediction {
+    // After tapping Send, the message should appear in the chat
+    expected_elements: vec![
+      ElementPrediction {
+        type: "message_bubble",
+        content_contains: "Happy birthday Mom!",
+        position: Bottom,
+      },
+      ElementPrediction {
+        type: "delivery_indicator",
+        content: AnyOf(["Sent", "Delivered", "✓"]),
+        near: "message_bubble",
+      },
+    ],
+    // The compose box should be empty
+    expected_absent: vec!["draft text in compose field"],
+  }),
+  confidence: 0.85,
+  format: PredictionFormat::Structured,
+}
+</pre>
+
+<!-- ============ LEARNING SIGNAL ============ -->
+<h2>Learning Signal: Prediction Accuracy as Intelligence Metric</h2>
+<p>Prediction accuracy over time is one of the most powerful metrics for agent intelligence. An agent that can predict the outcome of its actions accurately <em>understands its environment</em>. One that can't is guessing.</p>
+
+<h3>What Prediction Accuracy Tells Us</h3>
+<table class="spec-table">
+  <thead>
+    <tr><th>Pattern</th><th>Meaning</th><th>Response</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>High accuracy across the board</strong></td>
+      <td>Agent has a good model of the environment and apps it operates in</td>
+      <td>Increase prediction confidence thresholds. Start using predictions to skip unnecessary verification steps.</td>
+    </tr>
+    <tr>
+      <td><strong>Low accuracy for specific app</strong></td>
+      <td>Agent doesn't understand this app's behavior well</td>
+      <td>Weight this app's actions toward more conservative verification (full screen reads). Feed app-specific prediction errors into dreaming for pattern extraction.</td>
+    </tr>
+    <tr>
+      <td><strong>Accuracy was high, now dropping</strong></td>
+      <td>Something changed — app updated, workflow changed, or environment shifted</td>
+      <td>Flag as anomaly. Reset prediction confidence for this action type. Gather more evidence for upcoming actions.</td>
+    </tr>
+    <tr>
+      <td><strong>High accuracy for user-specific patterns</strong></td>
+      <td>Agent is learning the user's specific environment (not just generic app behavior)</td>
+      <td>This is the sign of genuine personalization. The identity model is working.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Feeding the Dreaming Cycle</h3>
+<pre>
+// Prediction accuracy metrics are stored in episodic memory:
+PredictionRecord {
+  intent_type:   IntentType,         // "tap_element", "type_text", "navigate_to", etc.
+  app:           Option&lt;AppId&gt;,      // Which app this happened in
+  prediction:    ExpectedOutcome,     // What the agent predicted
+  actual:        PostActionState,     // What actually happened
+  match_score:   f32,                 // How well prediction matched reality
+  task_outcome:  Outcome,            // Did the overall task succeed?
+  timestamp:     Instant,
+}
+
+// During dreaming, the consolidation engine:
+// 1. Clusters prediction records by (intent_type, app)
+// 2. Computes accuracy trend per cluster
+// 3. If accuracy is consistently low → proposes strategy update:
+//    "For app X, use structured prediction instead of NL"
+//    "For navigation, include scroll check in predictions"
+// 4. Strategy updates go through A/B slots
+</pre>
+
+<!-- ============ COST ANALYSIS ============ -->
+<h2>Cost Analysis</h2>
+<p>Generating predictions adds cost. Here's the analysis:</p>
+
+<table class="spec-table">
+  <thead>
+    <tr><th>Concern</th><th>Impact</th><th>Mitigation</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Token cost for prediction generation</strong></td>
+      <td>~50-200 extra tokens per intent during Reason step</td>
+      <td>Prediction generation is part of the Reason prompt — marginal cost when the LLM is already reasoning about what to do. Structured predictions cost fewer tokens than NL.</td>
+    </tr>
+    <tr>
+      <td><strong>Token cost for NL comparison</strong></td>
+      <td>~100-300 tokens per NL comparison during Verify step</td>
+      <td>Only used for NL-format predictions. Structured and embedding comparisons are free (local compute). Default to structured predictions; use NL only when structured is insufficient.</td>
+    </tr>
+    <tr>
+      <td><strong>Latency for verification</strong></td>
+      <td>Structured: ~0ms. NL: ~500ms. Embedding: ~50ms.</td>
+      <td>Structured comparison is instant. NL comparison can run async while the loop continues to the next intent. Only block on mismatch.</td>
+    </tr>
+    <tr>
+      <td><strong>Overall budget impact</strong></td>
+      <td>~5-15% increase in per-action token cost</td>
+      <td>Offset by: (a) fewer retries (mismatches caught early), (b) faster verification (prediction match = instant verify), (c) better strategies over time (prediction accuracy learning).</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ============ KERNEL vs LOADABLE ============ -->
+<h2>Kernel vs Loadable Split</h2>
+
+<table class="spec-table">
+  <thead>
+    <tr><th>Component</th><th>Layer</th><th>Rationale</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Artifact contract checking (Pass 1)</td>
+      <td><span class="layer-tag tag-kernel">Kernel</span></td>
+      <td>Safety gate. Must always run. Cannot be bypassed or weakened.</td>
+    </tr>
+    <tr>
+      <td>Prediction generation</td>
+      <td><span class="layer-tag tag-loadable">Loadable</span></td>
+      <td>Intelligence. Different strategies for different action types. Should evolve via A/B slots.</td>
+    </tr>
+    <tr>
+      <td>Prediction comparison</td>
+      <td><span class="layer-tag tag-loadable">Loadable</span></td>
+      <td>Intelligence. Comparison method should be configurable (structured/NL/embedding).</td>
+    </tr>
+    <tr>
+      <td>Prediction accuracy tracking</td>
+      <td><span class="layer-tag tag-kernel">Kernel</span></td>
+      <td>Data collection. Kernel records every prediction result for the learning pipeline. Cannot be disabled.</td>
+    </tr>
+    <tr>
+      <td>Mismatch escalation policy</td>
+      <td><span class="layer-tag tag-kernel">Kernel</span></td>
+      <td>Mismatch → Inconclusive is kernel-decided. What happens next (evidence gathering sub-loop) is kernel-orchestrated.</td>
+    </tr>
+    <tr>
+      <td>Prediction format selection</td>
+      <td><span class="layer-tag tag-loadable">Loadable</span></td>
+      <td>Strategy for which format to use per action type. Should adapt based on accuracy data.</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ============ INVARIANTS ============ -->
+<h2>Invariants</h2>
+
+<div class="invariant">
+  <span class="icon">🔒</span>
+  <span class="text"><strong>Artifact contracts are never weakened by predictions.</strong> Pass 1 (artifact contract) is the hard gate. A successful prediction cannot override a failed contract. Predictions only add intelligence on top of safety, never replace it.</span>
+</div>
+<div class="invariant">
+  <span class="icon">🔒</span>
+  <span class="text"><strong>Prediction accuracy is always recorded.</strong> Even if predictions are disabled for a category, the comparison data (when available) is logged for the learning pipeline. This data is too valuable to discard.</span>
+</div>
+<div class="invariant">
+  <span class="icon">🔒</span>
+  <span class="text"><strong>Predictions are optional per-intent.</strong> The system works without predictions (falls back to contract-only verification). A failed or missing prediction never blocks the loop.</span>
+</div>
+
+<div class="note">
+  <strong>Design principle:</strong> Expectation-verification transforms the agent from "did it work?" to "did it work the way I expected?" That's a fundamentally different question — and the gap between prediction and reality is where learning happens. An agent that can predict accurately understands its environment. An agent that tracks its prediction accuracy knows how well it understands. An agent that feeds both into its learning cycle improves at an accelerating rate.
+</div>
+
+</body>
+</html>

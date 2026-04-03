@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx — Agentic Loop Specification</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px 20px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.8em; margin-bottom: 6px; color: #fff; }
+  h2 { font-size: 1.3em; margin: 48px 0 16px; color: #fff; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
+  h3 { font-size: 1.05em; margin: 28px 0 12px; color: #c9d1d9; }
+  .subtitle { color: #8b949e; font-size: 0.95em; margin-bottom: 48px; }
+  p { font-size: 0.88em; color: #8b949e; line-height: 1.6; margin-bottom: 14px; max-width: 760px; }
+
+  /* Loop steps */
+  .loop-container { position: relative; margin: 40px 0; }
+  .loop-step {
+    display: flex; gap: 20px; margin-bottom: 4px; position: relative;
+  }
+  .step-marker {
+    flex-shrink: 0; width: 56px; height: 56px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.1em; font-weight: 700; position: relative; z-index: 2;
+  }
+  .step-content {
+    flex: 1; padding: 16px 24px; border-radius: 12px;
+    background: #161b22; border: 1px solid #30363d;
+    margin-bottom: 16px;
+  }
+  .step-content h4 { font-size: 0.95em; margin-bottom: 8px; }
+  .step-content p { font-size: 0.82em; margin-bottom: 8px; }
+  .step-content .layer-tag {
+    display: inline-block; font-size: 0.68em; font-weight: 600;
+    padding: 2px 8px; border-radius: 10px; margin-right: 6px; margin-bottom: 4px;
+  }
+
+  .tag-kernel { background: #da3633; color: #fff; }
+  .tag-loadable { background: #238636; color: #fff; }
+  .tag-platform { background: #1f6feb; color: #fff; }
+  .tag-storage { background: #9e6a03; color: #fff; }
+  .tag-llm { background: #8957e5; color: #fff; }
+
+  .step-connector {
+    position: absolute; left: 27px; top: 56px; bottom: -4px;
+    width: 2px; background: #21262d; z-index: 1;
+  }
+
+  /* Step colors */
+  .s-perceive .step-marker { background: #1f6feb; color: #fff; }
+  .s-reason .step-marker { background: #8957e5; color: #fff; }
+  .s-decide .step-marker { background: #da3633; color: #fff; }
+  .s-act .step-marker { background: #238636; color: #fff; }
+  .s-verify .step-marker { background: #d29922; color: #fff; }
+  .s-learn .step-marker { background: #f778ba; color: #fff; }
+  .s-continue .step-marker { background: #388bfd; color: #fff; }
+
+  .s-perceive .step-content { border-color: rgba(31,111,235,0.3); }
+  .s-reason .step-content { border-color: rgba(137,87,229,0.3); }
+  .s-decide .step-content { border-color: rgba(218,54,51,0.3); }
+  .s-act .step-content { border-color: rgba(35,134,54,0.3); }
+  .s-verify .step-content { border-color: rgba(210,153,34,0.3); }
+  .s-learn .step-content { border-color: rgba(247,120,186,0.3); }
+  .s-continue .step-content { border-color: rgba(56,139,253,0.3); }
+
+  .s-perceive .step-content h4 { color: #58a6ff; }
+  .s-reason .step-content h4 { color: #bc8cff; }
+  .s-decide .step-content h4 { color: #ff7b72; }
+  .s-act .step-content h4 { color: #3fb950; }
+  .s-verify .step-content h4 { color: #d29922; }
+  .s-learn .step-content h4 { color: #f778ba; }
+  .s-continue .step-content h4 { color: #58a6ff; }
+
+  /* Data flow table */
+  .flow-table { width: 100%; border-collapse: collapse; margin: 24px 0; font-size: 0.82em; }
+  .flow-table th { text-align: left; padding: 10px 14px; background: #161b22; color: #e6edf3; border-bottom: 2px solid #30363d; }
+  .flow-table td { padding: 10px 14px; border-bottom: 1px solid #21262d; color: #8b949e; vertical-align: top; }
+
+  /* Interrupt handling */
+  .interrupt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+  .interrupt-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 18px;
+  }
+  .interrupt-card h4 { font-size: 0.88em; color: #e6edf3; margin-bottom: 8px; }
+  .interrupt-card p { font-size: 0.78em; }
+  .interrupt-card .when { color: #d29922; font-size: 0.72em; font-weight: 600; margin-bottom: 6px; }
+  .interrupt-card .action { color: #58a6ff; font-size: 0.72em; font-weight: 600; margin-top: 8px; }
+
+  /* Loop back arrow */
+  .loop-back {
+    text-align: center; margin: 16px 0 32px; padding: 12px;
+    border: 1px dashed #30363d; border-radius: 8px;
+    font-size: 0.82em; color: #8b949e;
+  }
+  .loop-back strong { color: #58a6ff; }
+
+  /* State machine */
+  .state-flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; margin: 24px 0; }
+  .state {
+    padding: 8px 16px; border-radius: 8px; font-size: 0.78em; font-weight: 600;
+    border: 2px solid;
+  }
+  .state-idle { color: #8b949e; border-color: #30363d; }
+  .state-perceiving { color: #58a6ff; border-color: #1f6feb; }
+  .state-reasoning { color: #bc8cff; border-color: #8957e5; }
+  .state-deciding { color: #ff7b72; border-color: #da3633; }
+  .state-executing { color: #3fb950; border-color: #238636; }
+  .state-verifying { color: #d29922; border-color: #9e6a03; }
+  .state-learning { color: #f778ba; border-color: #f778ba; }
+  .state-arrow { color: #484f58; font-size: 1.2em; }
+  .state-completed { color: #3fb950; border-color: #238636; background: rgba(35,134,54,0.1); }
+
+  .note { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin: 24px 0; font-size: 0.82em; color: #8b949e; line-height: 1.5; }
+  .note strong { color: #e6edf3; }
+
+  /* Retry */
+  .retry-box {
+    background: #1f1510; border: 1px solid rgba(210,153,34,0.3); border-radius: 10px;
+    padding: 18px; margin: 16px 0;
+  }
+  .retry-box h4 { color: #d29922; font-size: 0.9em; margin-bottom: 8px; }
+  .retry-box p { font-size: 0.8em; }
+
+  /* Memory interaction diagram */
+  .mem-interact { display: flex; gap: 16px; margin: 24px 0; flex-wrap: wrap; }
+  .mem-card {
+    flex: 1; min-width: 200px; background: #161b22;
+    border-radius: 10px; padding: 16px; border: 1px solid #30363d;
+  }
+  .mem-card h4 { font-size: 0.85em; margin-bottom: 8px; }
+  .mem-card .reads, .mem-card .writes { font-size: 0.75em; margin-bottom: 6px; }
+  .mem-card .reads { color: #58a6ff; }
+  .mem-card .writes { color: #3fb950; }
+  .mem-card .policy { font-size: 0.72em; color: #ff7b72; font-weight: 600; margin-top: 8px; }
+
+  .m-working h4 { color: #58a6ff; }
+  .m-episodic h4 { color: #d29922; }
+  .m-semantic h4 { color: #bc8cff; }
+  .m-procedural h4 { color: #3fb950; }
+</style>
+</head>
+<body>
+
+<h1>Agentic Loop Specification</h1>
+<p class="subtitle">The execution cycle that drives every agent action — from perception through verification to memory</p>
+
+<!-- ============ OVERVIEW ============ -->
+<h2>Loop Overview</h2>
+<p>Every agent action follows the same seven-step cycle. The kernel orchestrates the loop; loadable strategies influence decisions within it; the platform shell provides perception and executes physical actions.</p>
+
+<!-- State machine -->
+<h3>State Machine</h3>
+<div class="state-flow">
+  <span class="state state-idle">Idle</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-perceiving">Perceiving</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-reasoning">Reasoning</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-deciding">Deciding</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-executing">Executing</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-verifying">Verifying</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-learning">Learning</span>
+  <span class="state-arrow">→</span>
+  <span class="state state-completed">Continue / Complete</span>
+</div>
+
+<!-- ============ THE SEVEN STEPS ============ -->
+<h2>The Seven Steps</h2>
+
+<div class="loop-container">
+
+  <!-- Step 1: PERCEIVE -->
+  <div class="loop-step s-perceive">
+    <div class="step-marker">1</div>
+    <div class="step-content">
+      <h4>Perceive</h4>
+      <span class="layer-tag tag-platform">Platform Shell</span>
+      <span class="layer-tag tag-kernel">Kernel</span>
+      <span class="layer-tag tag-storage">Storage</span>
+      <p><strong>What the agent knows right now.</strong> The platform shell provides raw perception data. The kernel assembles it into a coherent context snapshot. Memory retrieval (loadable strategy) enriches the snapshot with relevant past context.</p>
+      <p><strong>Inputs:</strong> Screen state, sensor data (battery, network, location), notification queue, conversation history, user message</p>
+      <p><strong>Memory interaction:</strong> Retrieve relevant episodic + semantic memories. Working memory (conversation context) is already present. Retrieval strategy is loadable — the kernel calls it but doesn't dictate how it searches.</p>
+      <p><strong>Output:</strong> <code>PerceptionSnapshot</code> — structured bundle of everything the agent knows at this moment</p>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 2: REASON -->
+  <div class="loop-step s-reason">
+    <div class="step-marker">2</div>
+    <div class="step-content">
+      <h4>Reason</h4>
+      <span class="layer-tag tag-llm">LLM Inference</span>
+      <span class="layer-tag tag-loadable">Loadable</span>
+      <p><strong>What should the agent do?</strong> The perception snapshot is formatted into a prompt (loadable prompt template + strategy), sent to the LLM (model selection is loadable config), and the response is parsed into typed intents.</p>
+      <p><strong>Inputs:</strong> <code>PerceptionSnapshot</code>, active prompt template, model routing config</p>
+      <p><strong>Process:</strong></p>
+      <p>1. Prompt construction — loadable strategy assembles system prompt + context + user message<br>
+         2. Model selection — loadable config picks provider and model<br>
+         3. LLM inference — kernel manages the API call, timeout, retry<br>
+         4. Response parsing — extract tool calls as typed <code>Intent[]</code></p>
+      <p><strong>Output:</strong> <code>Intent[]</code> — typed action intents with expected evidence requirements. If no intents (pure text reply), skip to step 7 (Complete).</p>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 3: DECIDE -->
+  <div class="loop-step s-decide">
+    <div class="step-marker">3</div>
+    <div class="step-content">
+      <h4>Decide</h4>
+      <span class="layer-tag tag-kernel">Kernel — Policy Engine</span>
+      <span class="layer-tag tag-kernel">Kernel — Budget Enforcer</span>
+      <span class="layer-tag tag-kernel">Kernel — Permission Registry</span>
+      <p><strong>Is the agent allowed to do this?</strong> Every intent passes through three kernel-enforced gates. No loadable code can bypass these.</p>
+      <p><strong>Gate 1 — Policy:</strong> Does this intent match an allow/deny/confirm rule? If deny → reject intent, return to Reason with constraint. If confirm → surface to user via platform shell, wait for approval.</p>
+      <p><strong>Gate 2 — Budget:</strong> Can the agent afford this action? Check token budget, API cost estimate, task cost accumulator. If over budget → reject with budget exhaustion reason.</p>
+      <p><strong>Gate 3 — Permission:</strong> Does the intent modify a protected layer? Check permission registry. If the layer is locked or requires approval → gate accordingly.</p>
+      <p><strong>Output:</strong> <code>Decision</code> per intent — <code>Approved</code>, <code>Denied(reason)</code>, or <code>PendingConfirmation</code></p>
+      <div class="retry-box">
+        <h4>On Denial</h4>
+        <p>Denied intents are fed back to the Reason step with the denial reason as context. The agent gets a chance to reformulate. This is not a retry — it's a new reasoning step with additional constraints. Max reformulation depth is kernel-configured (default: 2).</p>
+      </div>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 4: ACT -->
+  <div class="loop-step s-act">
+    <div class="step-marker">4</div>
+    <div class="step-content">
+      <h4>Act</h4>
+      <span class="layer-tag tag-loadable">WASM Skill</span>
+      <span class="layer-tag tag-platform">Platform Shell</span>
+      <span class="layer-tag tag-kernel">Kernel — State Machine</span>
+      <p><strong>Execute the approved intent.</strong> The kernel dispatches the intent to the appropriate skill (WASM module) or platform capability. The state machine transitions to <code>Executing</code>.</p>
+      <p><strong>Process:</strong></p>
+      <p>1. Kernel resolves intent → skill (tool registry lookup)<br>
+         2. Kernel checkpoints state (pre-action) for crash recovery<br>
+         3. Skill executes — may call platform shell (e.g., tap element, read screen)<br>
+         4. Skill returns <code>ActionResult</code> with evidence artifacts<br>
+         5. Platform shell provides post-action state (screen content, etc.)</p>
+      <p><strong>Inputs:</strong> Approved <code>Intent</code>, pre-action state</p>
+      <p><strong>Output:</strong> <code>ActionResult</code> — success/failure indicator + evidence artifacts (screenshots, element state, page content, etc.)</p>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 5: VERIFY -->
+  <div class="loop-step s-verify">
+    <div class="step-marker">5</div>
+    <div class="step-content">
+      <h4>Verify</h4>
+      <span class="layer-tag tag-kernel">Kernel — Verification Engine</span>
+      <span class="layer-tag tag-kernel">Kernel — State Machine</span>
+      <p><strong>Did it actually work?</strong> The tool said "success" — prove it. The verification engine checks evidence artifacts against the intent's expected outcomes. This is kernel-enforced, not optional.</p>
+      <p><strong>Checks:</strong></p>
+      <p>• Artifact contracts — does the evidence match what "done" looks like for this intent type?<br>
+         • Screen state diff — did the screen actually change in the expected way?<br>
+         • Side-effect guards — did the action claim success without evidence of the side effect?</p>
+      <p><strong>Outcomes:</strong></p>
+      <p><code>Verified</code> → state transitions to Learning<br>
+         <code>Failed</code> → recovery strategy consulted (loadable), may retry or escalate<br>
+         <code>Inconclusive</code> → additional evidence gathering (e.g., take screenshot, re-read screen)</p>
+      <div class="retry-box">
+        <h4>Retry / Recovery</h4>
+        <p>On failure, the kernel consults the active recovery strategy (loadable). The strategy may recommend: retry same action, try alternative approach, escalate to user, or abort. Retry budget is kernel-enforced (max retries per intent, max consecutive failures across intents). Recovery strategies can suggest, but cannot override the budget.</p>
+      </div>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 6: LEARN -->
+  <div class="loop-step s-learn">
+    <div class="step-marker">6</div>
+    <div class="step-content">
+      <h4>Learn</h4>
+      <span class="layer-tag tag-kernel">Kernel — Memory Policy</span>
+      <span class="layer-tag tag-loadable">Memory Strategies</span>
+      <span class="layer-tag tag-storage">Storage Layer</span>
+      <p><strong>What should the agent remember?</strong> After each action, the agent updates its memory systems. What gets stored is gated by kernel-enforced memory policies (user-controlled). How it's stored and indexed is determined by loadable memory strategies.</p>
+      <p><strong>Updates by memory type:</strong></p>
+      <p><strong>Working memory:</strong> Append action result to conversation context. Run compaction if context window is approaching limits (compaction strategy is loadable).</p>
+      <p><strong>Episodic memory:</strong> Record what happened — intent, action, outcome, timestamp. Gated by retention policy (user-controlled: "don't remember browsing history").</p>
+      <p><strong>Semantic memory:</strong> Extract durable facts if applicable ("user's dentist is Dr. Smith on Oak St"). Gated by privacy policy. Indexing strategy is loadable.</p>
+      <p><strong>Procedural memory:</strong> If a novel strategy worked (or a standard strategy failed repeatedly), propose updating the strategy. This goes through the A/B slot lifecycle with permission gating.</p>
+    </div>
+    <div class="step-connector"></div>
+  </div>
+
+  <!-- Step 7: CONTINUE -->
+  <div class="loop-step s-continue">
+    <div class="step-marker">7</div>
+    <div class="step-content">
+      <h4>Continue or Complete</h4>
+      <span class="layer-tag tag-kernel">Kernel — State Machine</span>
+      <p><strong>Are there more intents?</strong> The kernel evaluates whether the task is complete.</p>
+      <p><strong>Continue:</strong> More intents from the same reasoning step → back to step 3 (Decide) for next intent. All intents processed but task not done → back to step 1 (Perceive) for fresh context + new reasoning.</p>
+      <p><strong>Complete:</strong> Goal achieved (verified), max steps reached, user cancelled, or unrecoverable failure. Checkpoint final state, respond to user.</p>
+      <p><strong>Completion gate:</strong> The kernel checks whether the final text response actually addresses the user's request (completion contract). A response that says "I opened the app" when the user asked "send a message to Chris" is not complete — the loop continues.</p>
+    </div>
+  </div>
+
+</div>
+
+<div class="loop-back">
+  <strong>↺ Loop back:</strong> Step 7 → Step 1 (fresh perception for next action cycle) or Step 7 → Step 3 (more intents from same reasoning)
+</div>
+
+<!-- ============ DATA FLOW ============ -->
+<h2>Data Flow Between Steps</h2>
+
+<table class="flow-table">
+  <thead>
+    <tr>
+      <th>From</th>
+      <th>To</th>
+      <th>Data</th>
+      <th>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>Platform Shell</td><td>1. Perceive</td><td>Screen state, sensors, notifications</td><td><code>RawPerception</code></td></tr>
+    <tr><td>Storage</td><td>1. Perceive</td><td>Relevant memories (episodic + semantic)</td><td><code>MemoryHits[]</code></td></tr>
+    <tr><td>1. Perceive</td><td>2. Reason</td><td>Assembled context snapshot</td><td><code>PerceptionSnapshot</code></td></tr>
+    <tr><td>2. Reason</td><td>3. Decide</td><td>Typed action intents</td><td><code>Intent[]</code></td></tr>
+    <tr><td>3. Decide</td><td>4. Act</td><td>Approved intents</td><td><code>ApprovedIntent[]</code></td></tr>
+    <tr><td>3. Decide</td><td>2. Reason</td><td>Denied intents + reasons (reformulation)</td><td><code>DeniedIntent[]</code></td></tr>
+    <tr><td>4. Act</td><td>5. Verify</td><td>Action results + evidence</td><td><code>ActionResult</code></td></tr>
+    <tr><td>5. Verify</td><td>6. Learn</td><td>Verified outcome</td><td><code>VerifiedOutcome</code></td></tr>
+    <tr><td>5. Verify</td><td>4. Act (retry)</td><td>Recovery directive</td><td><code>RecoveryAction</code></td></tr>
+    <tr><td>6. Learn</td><td>Storage</td><td>Memory updates (gated by policy)</td><td><code>MemoryWrite[]</code></td></tr>
+    <tr><td>7. Continue</td><td>1. Perceive</td><td>Loop continuation signal</td><td><code>ContinueSignal</code></td></tr>
+    <tr><td>7. Complete</td><td>Platform Shell</td><td>Final response to user</td><td><code>CompletionResult</code></td></tr>
+  </tbody>
+</table>
+
+<!-- ============ INTERRUPTS ============ -->
+<h2>Interrupt Handling</h2>
+<p>The loop must handle external events at any point — user messages, cancellation, accessibility loss, budget exhaustion. The kernel checks for interrupts at defined boundary points.</p>
+
+<div class="interrupt-grid">
+  <div class="interrupt-card">
+    <h4>User Steer (new message mid-task)</h4>
+    <div class="when">Checked at: pre-batch boundary, post-action boundary</div>
+    <p>User sent a new message while the agent is working. The message is delivered to conversation history. The current action completes, then the loop re-enters Perceive with the new context.</p>
+    <div class="action">Action: Complete current action → deliver steer → re-Perceive</div>
+  </div>
+  <div class="interrupt-card">
+    <h4>User Cancel</h4>
+    <div class="when">Checked at: every boundary point + mid-action for composite actions</div>
+    <p>User pressed Stop. The kernel halts execution at the nearest atomic boundary and assesses rollback.</p>
+    <p><strong>Atomic actions</strong> (single tap, keystroke, API call): Already in-flight at the OS level — let it land, but do not proceed to the next step. No rollback needed.<br>
+       <strong>Composite actions</strong> (multi-step: typing a paragraph, filling a form): Stop at the current atomic boundary. Roll back to pre-action checkpoint if partial state is worse than pre-action state.<br>
+       <strong>Side-effect actions</strong> (message sent, form submitted, purchase made): If the side effect already fired, it cannot be recalled — log what completed and inform the user. If not yet fired, cancel prevents it.</p>
+    <p>After halt: restore from pre-action checkpoint (unless the action completed atomically and cleanly). Exit with <code>cancelled</code> reason. Checkpoint final state for potential resume.</p>
+    <div class="action">Action: Halt at atomic boundary → assess rollback → restore checkpoint if partial → inform user what completed → exit</div>
+  </div>
+  <div class="interrupt-card">
+    <h4>Accessibility Lost</h4>
+    <div class="when">Checked at: post-action boundary</div>
+    <p>The perception source detached (shell disconnected, service killed). The agent cannot perceive or act on the environment. Loop exits with <code>perception_lost</code>.</p>
+    <div class="action">Action: Exit loop → notify user → wait for re-attachment</div>
+  </div>
+  <div class="interrupt-card">
+    <h4>Budget Exhausted</h4>
+    <div class="when">Checked at: Decide step (Gate 2)</div>
+    <p>The task has exceeded its cost budget. No more API calls allowed. The agent responds with what it has so far and explains the budget limit.</p>
+    <div class="action">Action: Exit loop with partial result → explain budget limit</div>
+  </div>
+</div>
+
+<!-- ============ MEMORY INTERACTION ============ -->
+<h2>Memory System Interactions</h2>
+<p>Each loop step interacts with memory differently. The kernel enforces what CAN be stored; loadable strategies determine HOW.</p>
+
+<div class="mem-interact">
+  <div class="mem-card m-working">
+    <h4>Working Memory</h4>
+    <div class="reads">📖 Read at: every step (it IS the conversation context)</div>
+    <div class="writes">✏️ Written at: Step 4 (action results appended), Step 6 (compaction)</div>
+    <p style="font-size:0.75em; color:#8b949e;">In-kernel, ephemeral. Compaction strategy (loadable) decides what to keep vs summarize vs drop when approaching context limits.</p>
+    <div class="policy">Policy: Kernel manages size. No user gate needed (ephemeral).</div>
+  </div>
+  <div class="mem-card m-episodic">
+    <h4>Episodic Memory</h4>
+    <div class="reads">📖 Read at: Step 1 (Perceive — retrieve relevant past interactions)</div>
+    <div class="writes">✏️ Written at: Step 6 (Learn — record what happened)</div>
+    <p style="font-size:0.75em; color:#8b949e;">Persistent, encrypted. Time-decaying relevance. Used for "last time you asked about X" and task outcome history.</p>
+    <div class="policy">Policy: User controls retention categories. "Forget all browsing." "Keep task outcomes for 30 days."</div>
+  </div>
+  <div class="mem-card m-semantic">
+    <h4>Semantic Memory</h4>
+    <div class="reads">📖 Read at: Step 1 (Perceive — enrich context with known facts/preferences)</div>
+    <div class="writes">✏️ Written at: Step 6 (Learn — extract durable facts from interactions)</div>
+    <p style="font-size:0.75em; color:#8b949e;">Persistent, indexed, curated. "Joe's timezone is Mountain." "Preferred airline is United." User can view, edit, and delete entries.</p>
+    <div class="policy">Policy: User controls what categories are stored. Can review and delete any entry.</div>
+  </div>
+  <div class="mem-card m-procedural">
+    <h4>Procedural Memory</h4>
+    <div class="reads">📖 Read at: Step 2 (Reason — which strategy to use), Step 5 (Verify — recovery approach)</div>
+    <div class="writes">✏️ Written at: Step 6 (Learn — propose strategy updates via A/B slots)</div>
+    <p style="font-size:0.75em; color:#8b949e;">Persistent, versionable. The agent's learned behaviors — prompt strategies, recovery patterns, tool preferences. Changes go through A/B slot lifecycle.</p>
+    <div class="policy">Policy: Agent proposes → user approves (or auto-approve if permission is "free").</div>
+  </div>
+</div>
+
+<!-- ============ KERNEL vs LOADABLE ============ -->
+<h2>What the Kernel Owns vs What's Loadable</h2>
+
+<table class="flow-table">
+  <thead>
+    <tr>
+      <th>Concern</th>
+      <th>Kernel (compiled, immutable)</th>
+      <th>Loadable (hot-swappable)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>Loop orchestration</td><td>Step sequencing, state transitions, boundary checks</td><td>—</td></tr>
+    <tr><td>Perception</td><td>Assembling the snapshot, managing working memory</td><td>Memory retrieval strategy, attention prioritization</td></tr>
+    <tr><td>Reasoning</td><td>Managing LLM call, timeout, retry</td><td>Prompt templates, model selection, strategy choice</td></tr>
+    <tr><td>Decision</td><td>Policy enforcement, budget enforcement, permission checks</td><td>—</td></tr>
+    <tr><td>Action</td><td>Dispatch, checkpointing, state transitions</td><td>Tool implementations (WASM skills)</td></tr>
+    <tr><td>Verification</td><td>Artifact contract checking, retry budget enforcement</td><td>Recovery strategies, verification heuristics</td></tr>
+    <tr><td>Learning</td><td>Memory policy enforcement, write gating</td><td>What to extract, how to index, compaction strategy</td></tr>
+    <tr><td>Completion</td><td>Completion contract checking, final state checkpoint</td><td>Completion heuristics (what counts as "done")</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>The invariant:</strong> The kernel guarantees the loop runs correctly, safely, and within policy. Loadable strategies make the loop run <em>well</em> — they determine intelligence, not safety. If every loadable module were replaced with a no-op, the loop would still run (doing nothing useful, but never doing anything harmful).
+</div>
+
+<!-- ============ EXTENSIONS ============ -->
+<h2>Loop Extensions</h2>
+<p>Six extensions build on the core loop. Each is fully specified in its own document. Together they transform the base loop from a reactive executor into a proactive, self-improving, recursive intelligence.</p>
+
+<div style="display: flex; flex-direction: column; gap: 12px; margin: 24px 0;">
+
+  <a href="anticipation-loop.html" style="display: flex; gap: 16px; padding: 18px 22px; background: #161b22; border: 1px solid rgba(56,139,253,0.3); border-radius: 10px; text-decoration: none; color: inherit; transition: border-color 0.15s;">
+    <div style="flex-shrink: 0; width: 40px; height: 40px; border-radius: 8px; background: #1f6feb; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff;">A</div>
+    <div style="flex: 1;">
+      <h4 style="font-size: 0.9em; color: #58a6ff; margin-bottom: 4px;">Anticipation Loop — Proactive Perception</h4>
+      <p style="font-size: 0.78em; margin: 0;">Background perception during idle. Trigger classification, three-tier suggestions (time-critical / contextual / passive), power management, fatigue prevention. The agent offers help before you ask — carefully.</p>
+    </div>
+  </a>
+
+  <a href="expectation-verification.html" style="display: flex; gap: 16px; padding: 18px 22px; background: #161b22; border: 1px solid rgba(210,153,34,0.3); border-radius: 10px; text-decoration: none; color: inherit; transition: border-color 0.15s;">
+    <div style="flex-shrink: 0; width: 40px; height: 40px; border-radius: 8px; background: #d29922; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff;">B</div>
+    <div style="flex: 1;">
+      <h4 style="font-size: 0.9em; color: #d29922; margin-bottom: 4px;">Expectation-Verification — Sensory Prediction</h4>
+      <p style="font-size: 0.78em; margin: 0;">Agent predicts post-action state before acting, then compares prediction to reality. Two-pass verification (contract + prediction). Prediction accuracy feeds learning. Catches subtle failures that pass static contracts.</p>
+    </div>
+  </a>
+
+  <a href="recursive-loop.html" style="display: flex; gap: 16px; padding: 18px 22px; background: #161b22; border: 1px solid rgba(218,54,51,0.3); border-radius: 10px; text-decoration: none; color: inherit; transition: border-color 0.15s;">
+    <div style="flex-shrink: 0; width: 40px; height: 40px; border-radius: 8px; background: #da3633; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff;">C</div>
+    <div style="flex: 1;">
+      <h4 style="font-size: 0.9em; color: #ff7b72; margin-bottom: 4px;">Recursive Loop & Task Decomposition</h4>
+      <p style="font-size: 0.78em; margin: 0;"><code>Loop(goal, context, depth)</code> — the loop as a recursive function. Task decomposition, evidence gathering, navigation prerequisites, recovery escalation. Managed stack, scoped context, independent checkpointing, budget partitioning.</p>
+    </div>
+  </a>
+
+  <a href="memory-dreaming.html" style="display: flex; gap: 16px; padding: 18px 22px; background: #161b22; border: 1px solid rgba(247,120,186,0.3); border-radius: 10px; text-decoration: none; color: inherit; transition: border-color 0.15s;">
+    <div style="flex-shrink: 0; width: 40px; height: 40px; border-radius: 8px; background: #f778ba; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #0d1117;">D</div>
+    <div style="flex: 1;">
+      <h4 style="font-size: 0.9em; color: #f778ba; margin-bottom: 4px;">Memory Consolidation ("Dreaming")</h4>
+      <p style="font-size: 0.78em; margin: 0;">Six-phase consolidation: Score → Consolidate → Strengthen → Prune → Identity → Audit. Pre-dream checkpoints, importance-weighted decay, episodic→semantic promotion, dream reports. The agent gets smarter while you sleep.</p>
+    </div>
+  </a>
+
+  <a href="memory-augmented-intelligence.html" style="display: flex; gap: 16px; padding: 18px 22px; background: #161b22; border: 1px solid rgba(137,87,229,0.3); border-radius: 10px; text-decoration: none; color: inherit; transition: border-color 0.15s;">
+    <div style="flex-shrink: 0; width: 40px; height: 40px; border-radius: 8px; background: #8957e5; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff;">E</div>
+    <div style="flex: 1;">
+      <h4 style="font-size: 0.9em; color: #bc8cff; margin-bottom: 4px;">Memory-Augmented Intelligence</h4>
+      <p style="font-size: 0.78em; margin: 0;">Four ascending layers: RAG → Behavioral conditioning → Learned retrieval attention (MANN) → On-device fine-tuning. Each makes the agent measurably smarter. Architecture supports all four from day one.</p>
+    </div>
+  </a>
+
+</div>
+
+<div class="note">
+  <strong>Note:</strong> Task decomposition (originally proposed as a separate extension) is subsumed by the recursive loop — decomposition is one of four recursion triggers, not a standalone feature. See <a href="recursive-loop.html" style="color: #ff7b72;">Recursive Loop</a> for the full treatment.
+</div>
+
+</body>
+</html>

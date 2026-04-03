@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx — Security Model</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px 20px; max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 2em; margin-bottom: 6px; color: #fff; }
+  .subtitle { color: #8b949e; font-size: 1em; margin-bottom: 48px; line-height: 1.5; }
+  h2 { font-size: 1.2em; margin: 40px 0 16px; color: #8b949e; text-transform: uppercase; letter-spacing: 2px; font-weight: 600; }
+  h3 { font-size: 1.1em; margin: 32px 0 12px; color: #fff; }
+  h4 { font-size: 1em; margin: 24px 0 8px; color: #58a6ff; }
+  p { line-height: 1.6; margin-bottom: 16px; }
+  ul, ol { margin: 16px 0 16px 32px; line-height: 1.6; }
+  li { margin-bottom: 8px; }
+  strong { color: #58a6ff; }
+  em { color: #f78166; }
+  code { background: #161b22; padding: 2px 6px; border-radius: 6px; font-size: 0.9em; color: #79c0ff; }
+
+  .nav-back { margin-bottom: 32px; }
+  .nav-back a { color: #58a6ff; text-decoration: none; font-size: 0.9em; }
+  .nav-back a:hover { text-decoration: underline; }
+
+  .principles { margin: 32px 0; }
+  .principle {
+    display: flex; align-items: flex-start; gap: 14px; padding: 14px 18px;
+    background: #161b22; border-left: 3px solid #58a6ff; margin-bottom: 8px;
+    border-radius: 0 8px 8px 0;
+  }
+  .principle .icon { font-size: 1.2em; flex-shrink: 0; }
+  .principle .text { font-size: 0.85em; color: #e6edf3; line-height: 1.45; }
+  .principle .text strong { color: #58a6ff; }
+
+  .warning-box {
+    background: #1a0f0f; border-left: 3px solid #da3633; margin: 24px 0;
+    padding: 16px 20px; border-radius: 0 8px 8px 0;
+  }
+  .warning-box .title { color: #da3633; font-weight: 600; margin-bottom: 8px; font-size: 0.9em; }
+  .warning-box .text { font-size: 0.85em; line-height: 1.5; color: #e6edf3; }
+
+  .note { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin: 32px 0; font-size: 0.85em; color: #8b949e; line-height: 1.5; }
+  .note strong { color: #e6edf3; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 24px 0;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    overflow: hidden;
+  }
+  th {
+    background: #21262d; color: #e6edf3; padding: 12px 16px;
+    text-align: left; font-weight: 600; font-size: 0.85em;
+    border-bottom: 1px solid #30363d;
+  }
+  td {
+    padding: 12px 16px; font-size: 0.85em; line-height: 1.4;
+    border-bottom: 1px solid #30363d; color: #e6edf3;
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) { background: #0d1117; }
+
+  .surface-unique { color: #ff7b72; font-weight: 600; }
+  .priority-immediate { color: #238636; font-weight: 600; }
+  .priority-nearterm { color: #d29922; font-weight: 600; }
+  .priority-future { color: #8b949e; font-weight: 600; }
+
+  .invariant-list {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 20px 24px; margin: 24px 0;
+  }
+  .invariant-list ol { margin: 0; padding-left: 20px; }
+  .invariant-list li { margin-bottom: 12px; font-size: 0.9em; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<div class="nav-back">
+  <a href="index.html">← Back to Architecture Index</a>
+</div>
+
+<h1>Fawx — Security Model</h1>
+<p class="subtitle">
+  A personal computer that happens to be AI-native. Your machine, your data, your rules.
+</p>
+
+<!-- ============ CORE SECURITY PRINCIPLES ============ -->
+<div class="principles">
+  <div class="principle">
+    <span class="icon">🔒</span>
+    <span class="text"><strong>Closed by default.</strong> No listening ports on public internet. No API endpoints. No webhooks from strangers. Information flows outbound on user permission, inbound only through hardened messaging channels with strict allowlists.</span>
+  </div>
+  <div class="principle">
+    <span class="icon">🏠</span>
+    <span class="text"><strong>No trusted networks.</strong> Not the home LAN, not 5G, not the coffee shop WiFi. The phone leaves the house. A smart TV gets compromised. Fawx assumes every network is hostile, always. Zero-trust at every boundary.</span>
+  </div>
+  <div class="principle">
+    <span class="icon">🎯</span>
+    <span class="text"><strong>Messaging is the attack surface.</strong> Attackers can't SSH in, can't hit an API, can't open a WebSocket — but they CAN send a message. Every inbound message is a potential prompt injection attempt. Channel hardening is critical path.</span>
+  </div>
+  <div class="principle">
+    <span class="icon">🧠</span>
+    <span class="text"><strong>AI-native threats are unique.</strong> Memory poisoning, self-modification compromise, LLM provider MITM, time-delayed injection, multi-agent escalation. Traditional security models don't account for these.</span>
+  </div>
+</div>
+
+<h2>Identity Model</h2>
+
+<p>Fawx serves <strong>one human</strong>. There is no multi-tenant architecture, no authentication tiers, no concept of "admin vs user." One owner, one agent, one relationship. Identity is implicit — the person sitting at the machine, sending messages to the agent, is the owner by definition.</p>
+
+<p>The <strong>engine IS the OS kernel</strong>. Traditional shells (TUI, desktop GUI, mobile app) are just peripherals — different ways to interface with the same underlying agentic system. The agent's identity and relationship exist at the kernel level, not at the shell level.</p>
+
+<p>This simplifies the <em>user-facing</em> security model enormously. There are no user-to-user authorization bypasses because there is only one user. However, <strong>internal privilege boundaries exist and are critical</strong> — the self-development lifecycle enforces typed, locked subagent roles (implementer, reviewer, fixer) with distinct permissions, and git authorization tiers separate what the agent can do (branches, staging) from what only the owner can do (main). These are not user-facing auth — they are kernel-enforced architectural constraints that prevent the agent's own subsystems from escalating beyond their designated roles.</p>
+
+<h2>Network Posture</h2>
+
+<h3>Closed by Default</h3>
+
+<p>Fawx runs <strong>no listening services</strong> on the public internet. No HTTP servers, no API endpoints, no webhook receivers, no WebSocket listeners. The attack surface from network services is zero because there are no network services.</p>
+
+<p>Information flow is primarily <strong>outbound</strong>. The agent makes HTTP requests to fetch web pages, calls APIs, downloads content — but only when explicitly permitted by user-defined policy. The agent reaches out to the world; the world cannot reach in.</p>
+
+<h3>Zero-Trust Networking</h3>
+
+<p>There is <strong>no concept of "trusted network."</strong> Not the home LAN where a smart TV could be compromised. Not the 5G connection where cellular spoofing is possible. Not the coffee shop WiFi that's obviously hostile. The phone leaves the house and connects to arbitrary networks.</p>
+
+<p>All connections are authenticated and encrypted regardless of network type. Certificate pinning matters especially on mobile where DNS and routing can be manipulated. DNS-over-HTTPS or pinned resolvers prevent DNS poisoning attacks that could redirect <code>api.anthropic.com</code> to an attacker endpoint.</p>
+
+<div class="warning-box">
+  <div class="title">Critical Threat: DNS Poisoning</div>
+  <div class="text">DNS poisoning redirects api.anthropic.com to attacker endpoint. The agent's brain is now controlled by the attacker. Especially dangerous on mobile/public networks where DNS cannot be trusted.</div>
+</div>
+
+<h2>Threat Model — Fourteen Attack Surfaces</h2>
+
+<p>Traditional security models focus on network perimeter, user authentication, and data access control. AI-native systems have <em>fundamentally different</em> attack surfaces. Eight of these fourteen surfaces are unique to systems where the "user" is an autonomous agent that processes external content and modifies itself.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width: 5%;">#</th>
+      <th style="width: 25%;">Surface</th>
+      <th style="width: 15%;">Direction</th>
+      <th>The Scary Part</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Messaging inbound</td>
+      <td>External → Fawx</td>
+      <td>Prompt injection via trusted channels (Telegram, email, SMS, calls, push notifications)</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Passive pull content</td>
+      <td>Fawx → External</td>
+      <td>Adversarial content in EVERYTHING fetched — websites, APIs, streamed music, images, short/long form video, code, documents. Not just text/code.</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Remote access</td>
+      <td>User → Fawx</td>
+      <td>Session hijacking on tailnet</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Network layer</td>
+      <td>Adjacent → Fawx</td>
+      <td>Compromised device on LAN, ARP spoofing, rogue WiFi, 5G/6G MITM, public hotspots, cellular spoofing</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Physical/peripheral</td>
+      <td>Hardware → Fawx</td>
+      <td>Bluetooth keyboard injection, malicious HID devices, USB attacks, NFC, compromised pairing protocols</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td class="surface-unique">Supply chain / self-modification ✦</td>
+      <td>Internal</td>
+      <td>Agent tricked into writing malicious code during self-development cycles. Compromised crates/dependencies. Poisoned git repos.</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td class="surface-unique">Memory poisoning ✦</td>
+      <td>Internal</td>
+      <td>One successful injection → persistent compromise. Poisoned memory loads every future session. Episodic, semantic, config, taste — anything persisted.</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td class="surface-unique">LLM provider channel ✦</td>
+      <td>Fawx ↔ Cloud</td>
+      <td>The brain is remote. MITM on API calls, provider compromise, response tampering at CDN, certificate pinning matters especially on mobile. Data exfiltration via prompts.</td>
+    </tr>
+    <tr>
+      <td>9</td>
+      <td class="surface-unique">Sensor inputs ✦</td>
+      <td>Physical → Fawx</td>
+      <td>Camera (visual prompt injection, QR codes, text in images), microphone (ultrasonic commands, adversarial audio), GPS (location spoofing), accelerometer</td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td class="surface-unique">Time-delayed attacks ✦</td>
+      <td>Internal</td>
+      <td>Attacker achieves momentary injection, schedules cron/delayed task, plants "note to self" in memory. Payload fires after injection context is gone. Sleeper instructions.</td>
+    </tr>
+    <tr>
+      <td>11</td>
+      <td class="surface-unique">Multi-agent escalation ✦</td>
+      <td>Internal</td>
+      <td>Compromised subagent injects instructions in output consumed by orchestrator. Claims elevated permissions. This is why typed roles with locked permissions are doctrine.</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td>DNS resolution</td>
+      <td>Network</td>
+      <td>DNS poisoning redirects api.anthropic.com to attacker endpoint. Agent's brain now controlled. Especially dangerous on mobile/public networks. DNS-over-HTTPS or pinned resolvers required.</td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td class="surface-unique">Loadable layer → kernel inputs ✦</td>
+      <td>Internal</td>
+      <td>Tools/skills inject crafted content into model context (prompt injection via tool result), write false memory signals, trigger budget-exhausting decomposition spirals. Self-improvement (#1055) amplifies: poisoned signals → poisoned proposals. <em>Reserved for #1102.</em></td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td class="surface-unique">Budget manipulation / resource exhaustion ✦</td>
+      <td>Internal</td>
+      <td>Crafted prompts or poisoned state drain the agent’s budget through decompose spirals, retry amplification, fan-out explosion, or doomed iterations from false memories. Budget exhaustion = agent disabled.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>✦ Unique to AI-native systems:</strong> Surfaces 6, 7, 8, 9, 10, 11, 13, and 14 do not exist in traditional security models. They emerge from having an autonomous agent that processes external content, modifies itself, operates through recursive sub-processes, and manages finite computational budgets.
+</div>
+
+<h3>Surface Breakdown</h3>
+
+<h4>1. Messaging Inbound — The Primary Attack Vector</h4>
+<p>This is where prompt injection lives <strong>today</strong>. An attacker cannot SSH into your Fawx, cannot hit an API endpoint, cannot open a WebSocket connection — but they <em>can</em> send you a message on Telegram, email you a document, send you an SMS, or trigger a push notification.</p>
+
+<p>Every message is processed by the agent as potential instruction. A carefully crafted message can override system prompts, extract information, or cause malicious actions. Defense requires sender allowlists, content filtering, rate limiting, and treating every inbound message as untrusted until proven safe.</p>
+
+<h4>6. Supply Chain / Self-Modification (AI-Native)</h4>
+<p>Traditional systems don't modify themselves. Fawx does. The agent can write code, update dependencies, modify its own configuration. If an attacker achieves even momentary prompt injection during a self-development cycle, they can embed persistent backdoors in the code that <em>the agent itself writes and deploys</em>.</p>
+
+<p>This requires test gates, user merge gates, and careful sandboxing of self-modification workflows. The agent cannot merge its own PRs into production branches.</p>
+
+<h4>7. Memory Poisoning (AI-Native)</h4>
+<p>If an attacker successfully injects malicious content into the agent's persistent memory — episodic experiences, semantic knowledge, configuration, or learned preferences — every future session is compromised. The agent loads poisoned memory and acts on false information or malicious instructions that seem to come from its own learned experience.</p>
+
+<p>Memory writes from externally-triggered actions must be flagged and quarantined. Memory consolidation ("dreaming") processes require careful validation to prevent promotion of malicious content into long-term storage.</p>
+
+<h4>8. LLM Provider Channel (AI-Native)</h4>
+<p>The agent's "brain" runs in someone else's cloud. Every reasoning step, every decision, every plan passes through API calls to Anthropic, OpenAI, or other providers. A man-in-the-middle attack on these connections gives the attacker complete control over the agent's thoughts and actions.</p>
+
+<p>Certificate pinning is critical, especially on mobile where DNS and routing can be compromised. API request/response integrity checks prevent response tampering. Data exfiltration via prompts is also a risk — malicious prompts that cause the agent to include sensitive information in API requests.</p>
+
+<h4>11. Multi-Agent Escalation (AI-Native)</h4>
+<p>Fawx uses recursive subagent spawning for complex tasks. If a subagent is compromised (through any of the above attack surfaces), it can inject malicious instructions in its output that gets processed by the orchestrating agent. The compromised subagent might claim elevated permissions it doesn't have, or provide false information that causes the orchestrator to take harmful actions.</p>
+
+<p>This is why subagent roles have <strong>typed, locked permissions</strong> — implementers cannot post reviews, reviewers cannot push code, and no subagent can escalate its own permissions or modify the permission system.</p>
+
+<h4>14. Budget Manipulation / Resource Exhaustion (AI-Native)</h4>
+<p>The agent operates under a computational budget — LLM calls, tool invocations, tokens, cost in cents, and wall-clock time. When any resource is exhausted, the loop terminates. An attacker who can manipulate the agent’s budget consumption can effectively disable it — a denial-of-service attack that doesn’t require network access, authentication bypass, or code execution.</p>
+
+<p>Budget manipulation attacks work through the agent’s own decision-making:</p>
+
+<ul>
+  <li><strong>Decompose spirals:</strong> Craft prompts that trigger recursive decomposition, burning budget on planning overhead. Adaptive depth cap (<code>effective_max_depth()</code>) scales with remaining LLM calls, preventing deep trees. Cost gate rejects plans exceeding 150% of remaining budget. Batch detection and complexity floor prevent trivial decomposition overhead.</li>
+  <li><strong>Retry amplification:</strong> Cause persistent tool failures that the model retries, draining invocation and LLM call budgets. Per-tool retry cap (default 2 retries = 3 total attempts per tool name per cycle) escalates to <code>SignalKind::Blocked</code>.</li>
+  <li><strong>Fan-out explosion:</strong> Request operations that generate many parallel tool calls, inflating context and consuming invocation budget. Fan-out cap (default 4 per LLM response) defers excess calls. Tool result truncation (16KB) and aggregate result bytes tracking (400KB) cap context consumption.</li>
+  <li><strong>Poisoned state:</strong> False information in persistent memory causes the model to attempt impossible tasks, wasting budget on doomed iterations. Primary defense is upstream (memory system hardening, surface #7); budget guardrails are defense-in-depth.</li>
+</ul>
+
+<p>Defense is multi-layered and kernel-enforced: budget soft-ceiling forces graceful wrap-up at 80% cost consumption, fan-out caps limit parallel tool calls per turn, per-tool retry caps prevent retry loops, decompose cost gates reject expensive plans, and adaptive depth caps scale decomposition depth with remaining budget. The agent cannot disable or circumvent these mechanisms. <code>BudgetConfig::conservative()</code> provides a significantly tighter profile (8 LLM calls, 16 tool invocations, 100 cents, 2-minute wall time) for autonomous/background actions, drastically reducing the attack surface for non-user-initiated loops.</p>
+
+<p><strong>Residual risk:</strong> Low for most vectors after Wave 4 (#1098, #1100, #1101). Medium for memory poisoning → budget waste (primary fix is in memory system, surface #7) and cross-tool cycling (model rotates tool names to bypass per-tool retry cap, but soft-ceiling at 80% is the backstop regardless of cycling pattern). No budget attack vector has severity above Medium. See <a href="../specs/1104-budget-attack-surface.md">budget attack surface spec</a> for full threat analysis.</p>
+
+<h2>Tool Execution Security</h2>
+
+<p>The tool executor runs locally with the user's permissions. This design recognizes two distinct threat scenarios:</p>
+
+<h3>Scenario 1: Owner Command Execution</h3>
+<p>When the <strong>owner directly asks</strong> the agent to do something — "delete this file," "send this email," "install this package" — the tool sandbox does not prevent the action. The owner has the right to control their own machine through their agent.</p>
+
+<h3>Scenario 2: External Input Processing</h3>
+<p>When the agent processes <strong>external input</strong> (messages, web content, API responses, sensor data) that might contain adversarial content, the sandbox protects against unintended consequences. The agent being <em>tricked</em> by external content should not be able to perform destructive actions.</p>
+
+<h3>Sandbox Controls</h3>
+<ul>
+  <li><strong>Working directory jail:</strong> Tool execution is constrained to approved directories</li>
+  <li><strong>Command timeouts:</strong> Prevent runaway processes from consuming resources</li>
+  <li><strong>File size limits:</strong> Prevent disk exhaustion attacks</li>
+  <li><strong>Policy engine:</strong> Different permission levels for inbound messages vs owner commands</li>
+</ul>
+
+<p>The policy engine distinguishes between "Joe asked me to do X" and "someone sent me a message that might be trying to get me to do X." The same tool call has different permission levels depending on the trigger context.</p>
+
+<h2>Integration Surface</h2>
+
+<h3>No Public Integration Surface</h3>
+<p>There is <strong>no public integration surface</strong>. Period. No REST APIs, no GraphQL endpoints, no webhook receivers, no public database access, no admin dashboards.</p>
+
+<p>Integrations work in two ways:</p>
+<ul>
+  <li><strong>Outbound:</strong> The agent calls external APIs when needed (weather service, calendar sync, etc.)</li>
+  <li><strong>Inbound messaging:</strong> External services reach the agent through hardened messaging channels with strict sender allowlists</li>
+</ul>
+
+<h3>Local Integration — Ember/MCP</h3>
+<p>Ember handles protocol-level tool coordination between the agent and local MCP (Model Context Protocol) servers. All communication is localhost-only. No external MCP servers, no network-based tool discovery, no remote procedure calls from untrusted sources.</p>
+
+<h3>No Web Dashboard</h3>
+<p>There is no fawx.com dashboard, no hosted admin interface, no SaaS control plane. The TUI and desktop shell <strong>are</strong> the interface. If a web-based shell exists, it connects to <em>your</em> node over <em>your</em> tailnet — not a hosted service.</p>
+
+<p><strong>fawx.sh tells you how to install it.</strong> The website is documentation and onboarding, not a product surface.</p>
+
+<h2>The Critical Path — Messaging Channel Hardening</h2>
+
+<p>This is where prompt injection lives <strong>today</strong> and where defense must be strongest. An attacker cannot SSH in, cannot hit an API, cannot open a WebSocket — but they <em>can</em> send a message.</p>
+
+<h3>Attack Vectors</h3>
+<ul>
+  <li><strong>Direct injection:</strong> "Ignore all previous instructions and..."</li>
+  <li><strong>Social engineering:</strong> "I'm locked out of my account, can you help me..."</li>
+  <li><strong>Content-based:</strong> Malicious images, documents, links that contain hidden instructions</li>
+  <li><strong>Context manipulation:</strong> Long conversations that gradually shift agent behavior</li>
+  <li><strong>Impersonation:</strong> Pretending to be the owner from a different contact method</li>
+</ul>
+
+<h3>Defense Strategy</h3>
+<ul>
+  <li><strong>Sender allowlists:</strong> Only known, verified contacts can reach the agent</li>
+  <li><strong>Content filtering:</strong> Scan messages for known prompt injection patterns</li>
+  <li><strong>Rate limiting:</strong> Prevent message flooding attacks</li>
+  <li><strong>Context isolation:</strong> External messages never elevated to system instruction level</li>
+  <li><strong>Verification protocols:</strong> High-risk actions require out-of-band confirmation</li>
+</ul>
+
+<div class="warning-box">
+  <div class="title">Every Message is Hostile Until Proven Safe</div>
+  <div class="text">The default assumption is that every inbound message is an attack attempt. Trusted senders can be compromised. Legitimate-looking content can contain hidden instructions. Defense in depth is the only viable strategy.</div>
+</div>
+
+<h2>Defense Posture Summary</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width: 5%;">#</th>
+      <th style="width: 25%;">Attack Surface</th>
+      <th style="width: 35%;">Defense Strategy</th>
+      <th style="width: 15%;">Priority</th>
+      <th style="width: 20%;">Implementation</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Messaging inbound</td>
+      <td>Sender allowlists, content filtering, rate limiting, context isolation</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Channel policies</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Passive pull content</td>
+      <td>Content sandboxing, never elevate to system instructions</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Tool execution policy</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Remote access</td>
+      <td>Tailnet-only, mutual authentication, session management</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Network configuration</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Network layer</td>
+      <td>Zero-trust, encrypted connections, certificate pinning</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>TLS configuration</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Physical/peripheral</td>
+      <td>Device allowlists, pairing verification, input validation</td>
+      <td class="priority-nearterm">Near-term</td>
+      <td>Hardware policies</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>Supply chain / self-mod</td>
+      <td>Test gates, user merge gates, sandbox self-development</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Development workflow</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>Memory poisoning</td>
+      <td>Memory write quarantine, consolidation validation</td>
+      <td class="priority-nearterm">Near-term</td>
+      <td>Memory system</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>LLM provider channel</td>
+      <td>Certificate pinning, request/response integrity</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>API client hardening</td>
+    </tr>
+    <tr>
+      <td>9</td>
+      <td>Sensor inputs</td>
+      <td>Input validation, sensor allowlists, content analysis</td>
+      <td class="priority-future">Future</td>
+      <td>Sensor framework</td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td>Time-delayed attacks</td>
+      <td>Cron/task validation, memory source tracking</td>
+      <td class="priority-nearterm">Near-term</td>
+      <td>Scheduler hardening</td>
+    </tr>
+    <tr>
+      <td>11</td>
+      <td>Multi-agent escalation</td>
+      <td>Typed roles, locked permissions, output validation</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Subagent architecture</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td>DNS resolution</td>
+      <td>DNS-over-HTTPS, pinned resolvers, DNS validation</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Network stack</td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td>Loadable layer → kernel inputs</td>
+      <td>Input validation, context isolation, memory provenance tracking</td>
+      <td class="priority-nearterm">Near-term</td>
+      <td>Kernel boundary hardening (#1102)</td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td>Budget manipulation</td>
+      <td>Soft-ceiling wrap-up, fan-out cap, per-tool retry limit, decompose cost gate, adaptive depth cap</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Budget system (#1098, #1100, #1101)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Remote Access</h2>
+
+<p>Users access their Fawx remotely through a <strong>private overlay network</strong> (Tailscale tailnet or equivalent). This provides:</p>
+
+<ul>
+  <li><strong>User-only access:</strong> No port forwarding to the public internet, no public URLs</li>
+  <li><strong>Mutual authentication:</strong> Both endpoints verify each other's identity</li>
+  <li><strong>Encrypted transport:</strong> All communication encrypted end-to-end</li>
+  <li><strong>Network isolation:</strong> Overlay network is isolated from untrusted networks</li>
+</ul>
+
+<p>The tailnet provides an <strong>authenticated private overlay for transport access</strong> — but it is not a "trusted network." It reduces the network attack surface for remote shell connections. External content is still treated as untrusted even when accessed over the tailnet, and zero-trust principles apply to all layers above transport.</p>
+
+<h2>Cloud / SuperFawx (Future)</h2>
+
+<p>The current design focuses on <strong>single-node self-sufficiency</strong>. There is no cloud component, no central coordination, no multi-node abstractions. Each Fawx node operates independently.</p>
+
+<p>Future multi-node coordination (SuperFawx) is deliberately not prevented by current architectural decisions, but it's also not designed for yet. The principle: <em>don't add multi-node complexity until there's a concrete need for it.</em></p>
+
+<p><strong>fawx.sh is onramp, not product surface.</strong> The landing page helps users install their node, but the product lives entirely on the user's machine. There is no hosted service component.</p>
+
+<h2>Security Invariants</h2>
+
+<p>The following security invariants <strong>MUST hold</strong> at all times. These are compiled into the system architecture and cannot be modified by the agent at runtime:</p>
+
+<div class="invariant-list">
+  <ol>
+    <li><strong>No listening ports on public internet</strong> — Zero network services exposed to untrusted networks</li>
+    <li><strong>All external content treated as untrusted</strong> — Never elevated to system instruction level</li>
+    <li><strong>Messaging channels have sender allowlists</strong> — No anonymous inbound communication</li>
+    <li><strong>Memory writes from external-triggered actions are flagged with provenance</strong> — Tagged with source channel, sender, and trigger context</li>
+    <li><strong>Self-modification requires test gate + user merge gate</strong> — Agent cannot deploy its own code without validation</li>
+    <li><strong>Subagent permissions are typed and locked</strong> — Cannot self-escalate or modify permission system</li>
+    <li><strong>LLM API connections use certificate pinning on mobile</strong> — Prevent MITM on the agent's "brain" connection</li>
+    <li><strong>No "trusted LAN"</strong> — Zero-trust at every network boundary</li>
+    <li><strong>Tool sandbox cannot be disabled by the agent</strong> — Safety constraints are architectural, not configurable</li>
+    <li><strong>DNS resolution hardened against poisoning</strong> — DNS-over-HTTPS or pinned resolvers required</li>
+    <li><strong>Kernel is immutable at runtime</strong> — Cannot be modified by the agent, loadable modules, or any external input</li>
+    <li><strong>Scheduled tasks from externally-triggered sessions require user confirmation</strong> — Cron jobs and delayed tasks created during external input processing are quarantined until approved</li>
+    <li><strong>Budget guardrails are kernel-enforced and cannot be bypassed by the agent</strong> — Soft-ceiling, fan-out cap, per-tool retry limit, decompose cost gate, and depth cap are compiled into the kernel. The agent cannot modify budget limits, disable enforcement, or reset consumed budget counters. Budget soft-ceiling at 80% forces graceful wrap-up regardless of consumption pattern.</li>
+  </ol>
+</div>
+
+<p>The canonical invariant list is maintained in <a href="../../DOCTRINE.md">DOCTRINE.md §10</a>. This security model provides the threat context; DOCTRINE.md is the enforceable source of truth.</p>
+
+<h3>Enforcement</h3>
+
+<p>These invariants are <strong>compiled doctrine</strong> — enforced by the Fawx kernel at runtime, not by convention or documentation. The agent cannot modify these constraints through any combination of self-modification, memory manipulation, or subagent coordination. See <a href="../../DOCTRINE.md">DOCTRINE.md</a> for the canonical enforcement specification.</p>
+
+<p>Violation of any invariant triggers system-level protection mechanisms: operation blocking, session termination, memory quarantine, or complete system isolation depending on the severity and context of the violation.</p>
+
+<div class="note">
+  <strong>Living Document:</strong> This security model evolves as we build and learn. Breaking changes to security invariants require explicit architecture review and cannot be deployed without user approval. The threat landscape for AI-native systems is still emerging.
+</div>
+
+</body>
+</html>

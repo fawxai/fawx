@@ -106,10 +106,10 @@ mod tests {
 
     #[test]
     fn parse_dns_name_trims_trailing_dot() {
-        let hostname = parse_dns_name(br#"{"Self":{"DNSName":"node.example.ts.net."}}"#)
+        let hostname = parse_dns_name(br#"{"Self":{"DNSName":"fawx.tail123.ts.net."}}"#)
             .expect("hostname should parse");
 
-        assert_eq!(hostname, "node.example.ts.net");
+        assert_eq!(hostname, "fawx.tail123.ts.net");
     }
 
     #[test]
