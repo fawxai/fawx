@@ -67,6 +67,19 @@ impl FromStr for Capability {
     }
 }
 
+/// Authority-relevant tool surface declared by a manifest-defined tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillToolAuthoritySurface {
+    PathRead,
+    PathWrite,
+    PathDelete,
+    GitCheckpoint,
+    Command,
+    Network,
+    Other,
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -89,9 +102,38 @@ pub struct SkillManifest {
     /// Required capabilities
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Optional tool definitions declared by the skill.
+    #[serde(default)]
+    pub tools: Vec<SkillToolManifest>,
     /// Entry point function name
     #[serde(default = "default_entry_point")]
     pub entry_point: String,
+}
+
+/// Tool metadata declared by a skill manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillToolManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub authority_surface: Option<SkillToolAuthoritySurface>,
+    #[serde(default)]
+    pub direct_utility: bool,
+    #[serde(default)]
+    pub trigger_patterns: Vec<String>,
+    #[serde(default)]
+    pub parameters: Vec<SkillToolParameterManifest>,
+}
+
+/// Parameter metadata declared by a manifest-defined tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillToolParameterManifest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
 }
 
 fn default_entry_point() -> String {
@@ -164,12 +206,75 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
+    validate_tools(&manifest.tools)?;
+
+    Ok(())
+}
+
+fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
+    let mut seen_tool_names = std::collections::BTreeSet::new();
+    for tool in tools {
+        if tool.name.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(
+                "tool name cannot be empty".to_string(),
+            ));
+        }
+        if tool.description.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "tool '{}' description cannot be empty",
+                tool.name
+            )));
+        }
+        if tool.direct_utility && tool.trigger_patterns.is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "direct utility tool '{}' must declare at least one trigger pattern",
+                tool.name
+            )));
+        }
+        if !seen_tool_names.insert(tool.name.clone()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "duplicate tool name '{}'",
+                tool.name
+            )));
+        }
+
+        let mut seen_parameter_names = std::collections::BTreeSet::new();
+        for parameter in &tool.parameters {
+            if parameter.name.trim().is_empty() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "tool '{}' parameter name cannot be empty",
+                    tool.name
+                )));
+            }
+            if parameter.kind.trim().is_empty() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "tool '{}' parameter '{}' type cannot be empty",
+                    tool.name, parameter.name
+                )));
+            }
+            if parameter.description.trim().is_empty() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "tool '{}' parameter '{}' description cannot be empty",
+                    tool.name, parameter.name
+                )));
+            }
+            if !seen_parameter_names.insert(parameter.name.clone()) {
+                return Err(SkillError::InvalidManifest(format!(
+                    "duplicate parameter '{}' in tool '{}'",
+                    parameter.name, tool.name
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_valid_manifest() {
@@ -188,7 +293,81 @@ entry_point = "run"
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.api_version, "host_api_v1");
         assert_eq!(manifest.capabilities, vec![Capability::Network]);
+        assert!(manifest.tools.is_empty());
         assert_eq!(manifest.entry_point, "run");
+    }
+
+    #[test]
+    fn test_parse_manifest_with_tools() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"
+
+[[tools]]
+name = "web_search"
+description = "Search the web"
+authority_surface = "network"
+direct_utility = true
+trigger_patterns = ["search the web"]
+
+[[tools.parameters]]
+name = "query"
+type = "string"
+description = "Search query"
+required = true
+        "#;
+
+        let manifest = parse_manifest(toml).expect("Should parse manifest with tools");
+        assert_eq!(manifest.tools.len(), 1);
+        assert_eq!(manifest.tools[0].name, "web_search");
+        assert_eq!(
+            manifest.tools[0].authority_surface,
+            Some(SkillToolAuthoritySurface::Network)
+        );
+        assert!(manifest.tools[0].direct_utility);
+        assert_eq!(
+            manifest.tools[0].trigger_patterns,
+            vec!["search the web".to_string()]
+        );
+        assert_eq!(manifest.tools[0].parameters.len(), 1);
+        assert_eq!(manifest.tools[0].parameters[0].name, "query");
+        assert_eq!(manifest.tools[0].parameters[0].kind, "string");
+        assert!(manifest.tools[0].parameters[0].required);
+    }
+
+    #[test]
+    fn test_validate_direct_utility_requires_trigger_patterns() {
+        let manifest = SkillManifest {
+            name: "weather".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Weather".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "weather".to_string(),
+                description: "Weather".to_string(),
+                authority_surface: None,
+                direct_utility: true,
+                trigger_patterns: Vec::new(),
+                parameters: vec![SkillToolParameterManifest {
+                    name: "location".to_string(),
+                    kind: "string".to_string(),
+                    description: "Location".to_string(),
+                    required: true,
+                }],
+            }],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::InvalidManifest(_))));
     }
 
     #[test]
@@ -211,6 +390,7 @@ name = "broken
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -228,6 +408,7 @@ name = "broken
             author: "Fawx".to_string(),
             api_version: "host_api_v2".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
         assert!(validate_manifest(&manifest).is_ok());
@@ -242,6 +423,7 @@ name = "broken
             author: "Fawx".to_string(),
             api_version: "v2".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -297,6 +479,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -312,6 +495,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -384,6 +568,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -399,6 +584,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -414,6 +600,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -433,10 +620,119 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             author: "Fawx".to_string(),
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
+            tools: vec![],
             entry_point: "run".to_string(),
         };
 
         let result = validate_manifest(&manifest);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_duplicate_tool_name_rejected() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![
+                SkillToolManifest {
+                    name: "web_search".to_string(),
+                    description: "Search".to_string(),
+                    authority_surface: None,
+                    direct_utility: false,
+                    trigger_patterns: Vec::new(),
+                    parameters: vec![],
+                },
+                SkillToolManifest {
+                    name: "web_search".to_string(),
+                    description: "Duplicate".to_string(),
+                    authority_surface: None,
+                    direct_utility: false,
+                    trigger_patterns: Vec::new(),
+                    parameters: vec![],
+                },
+            ],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicate tool name"))
+        );
+    }
+
+    #[test]
+    fn test_validate_duplicate_tool_parameter_rejected() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "web_search".to_string(),
+                description: "Search".to_string(),
+                authority_surface: None,
+                direct_utility: false,
+                trigger_patterns: Vec::new(),
+                parameters: vec![
+                    SkillToolParameterManifest {
+                        name: "query".to_string(),
+                        kind: "string".to_string(),
+                        description: "Search query".to_string(),
+                        required: true,
+                    },
+                    SkillToolParameterManifest {
+                        name: "query".to_string(),
+                        kind: "string".to_string(),
+                        description: "Duplicate".to_string(),
+                        required: false,
+                    },
+                ],
+            }],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicate parameter"))
+        );
+    }
+
+    #[test]
+    fn migrated_skill_manifests_expose_visible_structured_tools() {
+        for skill_dir in ["calculator-skill", "github-skill", "canvas-skill"] {
+            let manifest_path = repo_root()
+                .join("skills")
+                .join(skill_dir)
+                .join("manifest.toml");
+            let manifest_text = fs::read_to_string(&manifest_path).expect("read manifest");
+            let manifest = parse_manifest(&manifest_text).expect("parse manifest");
+
+            validate_manifest(&manifest).expect("validate manifest");
+            assert!(
+                !manifest.tools.is_empty(),
+                "{skill_dir} should expose manifest tools"
+            );
+            for tool in &manifest.tools {
+                assert!(
+                    tool.parameters
+                        .iter()
+                        .all(|parameter| parameter.name != "input"),
+                    "{skill_dir} should expose real structured parameters"
+                );
+            }
+        }
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root")
     }
 }

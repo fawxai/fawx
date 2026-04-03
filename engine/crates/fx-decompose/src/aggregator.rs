@@ -397,7 +397,7 @@ impl WorkspaceProvider for DefaultWorkspaceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComplexityHint, SubGoal};
+    use crate::{ComplexityHint, SubGoal, SubGoalContract};
 
     fn sample_experiment() -> Experiment {
         Experiment {
@@ -406,12 +406,12 @@ mod tests {
     }
 
     fn goal(description: &str) -> SubGoal {
-        SubGoal {
-            description: description.to_owned(),
-            required_tools: vec![],
-            expected_output: None,
-            complexity_hint: Some(ComplexityHint::Trivial),
-        }
+        SubGoal::new(
+            description.to_owned(),
+            vec![],
+            SubGoalContract::default(),
+            Some(ComplexityHint::Trivial),
+        )
     }
 
     fn completed(description: &str, patch: &str) -> SubGoalResult {

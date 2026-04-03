@@ -1,8 +1,9 @@
 use crate::act::{
-    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    ConcurrencyPolicy, JournalAction, ToolCacheStats, ToolCacheability, ToolCallClassification,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use crate::cancellation::CancellationToken;
+use crate::ToolAuthoritySurface;
 use async_trait::async_trait;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde_json::Value;
@@ -415,6 +416,22 @@ impl<T: ToolExecutor> ToolExecutor for CachingExecutor<T> {
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.inner.cacheability(tool_name)
+    }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        self.inner.classify_call(call)
+    }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.inner.action_category(call)
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.inner.authority_surface(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.inner.journal_action(call, result)
     }
 
     fn clear_cache(&self) {

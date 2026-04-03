@@ -15,7 +15,7 @@ use std::{
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HTTP_PORT: u16 = 8400;
-const SKILL_WASM_TARGET: &str = "wasm32-unknown-unknown";
+const SKILL_WASM_TARGET: &str = "wasm32-wasip1";
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UpdateArgs {

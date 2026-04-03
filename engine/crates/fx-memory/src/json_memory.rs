@@ -198,6 +198,23 @@ impl JsonFileMemory {
         }
         pruned
     }
+
+    fn snapshot_at(&self, now: u64) -> Vec<(String, String)> {
+        let decay = &self.config.decay_config;
+        let mut entries: Vec<_> = self
+            .data
+            .iter()
+            .map(|(key, entry)| {
+                let weight = decayed_weight(entry, now, decay);
+                (key.clone(), entry.value.clone(), weight)
+            })
+            .collect();
+        entries.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        entries
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect()
+    }
 }
 
 impl MemoryProvider for JsonFileMemory {
@@ -303,25 +320,7 @@ impl MemoryProvider for JsonFileMemory {
     }
 
     fn snapshot(&self) -> Vec<(String, String)> {
-        let now = now_ms();
-        let decay = &self.config.decay_config;
-        let mut entries: Vec<_> = self
-            .data
-            .iter()
-            .map(|(key, entry)| {
-                let weight = decayed_weight(entry, now, decay);
-                (key.clone(), entry.value.clone(), weight)
-            })
-            .collect();
-        entries.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        entries
-            .into_iter()
-            .map(|(key, value, _)| (key, value))
-            .collect()
+        self.snapshot_at(now_ms())
     }
 }
 
@@ -710,20 +709,23 @@ mod tests {
     fn snapshot_sorted_by_decayed_weight() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
-        memory.write("a", "1").expect("write");
-        memory.write("b", "2").expect("write");
-        memory.write("c", "3").expect("write");
+        let now = 1_700_000_000_000u64;
+        let day_ms = 86_400_000u64;
+        memory
+            .data
+            .insert("a".to_string(), make_entry(0, 0, now - (7 * day_ms)));
+        memory
+            .data
+            .insert("b".to_string(), make_entry(2, now, now - (10 * day_ms)));
+        memory
+            .data
+            .insert("c".to_string(), make_entry(1, now, now - day_ms));
 
-        memory.touch("b").expect("touch b1");
-        memory.touch("b").expect("touch b2");
-        memory.touch("c").expect("touch c1");
-
-        let snapshot = memory.snapshot();
+        let snapshot = memory.snapshot_at(now);
         let keys: Vec<_> = snapshot.iter().map(|(key, _)| key.as_str()).collect();
         // b: access_count=2, weight≈2.0 (highest)
         // c: access_count=1, last_accessed=now, weight≈1.0
-        // a: access_count=0, base_weight=max(1)=1, created slightly before c,
-        //    so marginally more elapsed time → marginally lower weight
+        // a: access_count=0, created seven days ago, so its base weight 1.0 has decayed
         assert_eq!(keys, vec!["b", "c", "a"]);
     }
 

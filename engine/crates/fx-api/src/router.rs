@@ -15,9 +15,10 @@ use crate::handlers::phase4::{
     handle_server_restart, handle_server_status, handle_server_stop, handle_setup_status,
 };
 use crate::handlers::sessions::{
-    handle_clear_session, handle_create_session, handle_delete_session, handle_get_context,
-    handle_get_messages, handle_get_session, handle_get_session_memory, handle_list_sessions,
-    handle_send_message, handle_send_to_session, handle_update_session_memory,
+    handle_archive_session, handle_clear_session, handle_create_session, handle_delete_session,
+    handle_export_session, handle_get_context, handle_get_messages, handle_get_session,
+    handle_get_session_memory, handle_list_sessions, handle_send_message, handle_send_to_session,
+    handle_unarchive_session, handle_update_session_memory,
 };
 use crate::handlers::settings::{
     handle_get_thinking, handle_list_auth, handle_list_models, handle_list_skills,
@@ -47,6 +48,11 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/sessions/{id}",
             get(handle_get_session).delete(handle_delete_session),
         )
+        .route(
+            "/sessions/{id}/archive",
+            post(handle_archive_session).delete(handle_unarchive_session),
+        )
+        .route("/sessions/{id}/export", get(handle_export_session))
         .route("/sessions/{id}/clear", post(handle_clear_session))
         .route(
             "/sessions/{id}/messages",

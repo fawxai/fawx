@@ -89,6 +89,28 @@ impl fmt::Display for SessionStatus {
     }
 }
 
+/// Filter for including active and/or archived sessions in registry listings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionArchiveFilter {
+    /// Return active sessions only.
+    #[default]
+    ActiveOnly,
+    /// Return both active and archived sessions.
+    All,
+    /// Return archived sessions only.
+    ArchivedOnly,
+}
+
+impl SessionArchiveFilter {
+    pub fn matches(self, is_archived: bool) -> bool {
+        match self {
+            Self::ActiveOnly => !is_archived,
+            Self::All => true,
+            Self::ArchivedOnly => is_archived,
+        }
+    }
+}
+
 /// Summary metadata for a session (returned by list operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -112,8 +134,17 @@ pub struct SessionInfo {
     pub created_at: u64,
     /// Unix epoch seconds of last activity.
     pub updated_at: u64,
+    /// Unix epoch seconds when the session was archived, if archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     /// Number of messages in the conversation.
     pub message_count: usize,
+}
+
+impl SessionInfo {
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
 }
 
 /// Role of a message in a conversation.
@@ -175,6 +206,22 @@ pub struct SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_session_info(key: &str, archived_at: Option<u64>) -> SessionInfo {
+        SessionInfo {
+            key: SessionKey::new(key).expect("session key"),
+            kind: SessionKind::Main,
+            status: SessionStatus::Active,
+            label: Some("primary".to_string()),
+            title: Some("Hello world".to_string()),
+            preview: Some("Latest message".to_string()),
+            model: "gpt-4".to_string(),
+            created_at: 1000,
+            updated_at: 2000,
+            archived_at,
+            message_count: 5,
+        }
+    }
 
     #[test]
     fn session_key_display_shows_inner_value() {
@@ -278,29 +325,19 @@ mod tests {
 
     #[test]
     fn session_info_serializes_to_json() {
-        let info = SessionInfo {
-            key: SessionKey::new("sess-1").unwrap(),
-            kind: SessionKind::Main,
-            status: SessionStatus::Active,
-            label: Some("primary".to_string()),
-            title: Some("Hello world".to_string()),
-            preview: Some("Latest message".to_string()),
-            model: "gpt-4".to_string(),
-            created_at: 1000,
-            updated_at: 2000,
-            message_count: 5,
-        };
+        let info = sample_session_info("sess-1", Some(3000));
         let json = serde_json::to_string(&info).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["kind"], "main");
         assert_eq!(parsed["status"], "active");
         assert_eq!(parsed["title"], "Hello world");
         assert_eq!(parsed["preview"], "Latest message");
+        assert_eq!(parsed["archived_at"], 3000);
         assert_eq!(parsed["message_count"], 5);
     }
 
     #[test]
-    fn session_info_round_trips_through_json() {
+    fn archived_session_metadata_round_trips_through_json() {
         let info = SessionInfo {
             key: SessionKey::new("sess-rt").unwrap(),
             kind: SessionKind::Subagent,
@@ -311,6 +348,7 @@ mod tests {
             model: "claude-3".to_string(),
             created_at: 100,
             updated_at: 200,
+            archived_at: Some(1234),
             message_count: 10,
         };
         let json = serde_json::to_string(&info).expect("serialize");
@@ -321,10 +359,12 @@ mod tests {
         assert_eq!(restored.title, info.title);
         assert_eq!(restored.preview, info.preview);
         assert_eq!(restored.model, info.model);
+        assert_eq!(restored.archived_at, info.archived_at);
+        assert!(restored.is_archived());
     }
 
     #[test]
-    fn session_info_deserializes_without_title_and_preview() {
+    fn legacy_active_session_deserializes_with_no_archive_timestamp() {
         let json = r#"{
             "key":"sess-legacy",
             "kind":"main",
@@ -340,5 +380,34 @@ mod tests {
 
         assert!(info.title.is_none());
         assert!(info.preview.is_none());
+        assert!(info.archived_at.is_none());
+        assert!(!info.is_archived());
+    }
+
+    #[test]
+    fn is_archived_reports_metadata_presence() {
+        let active = sample_session_info("sess-active", None);
+        let archived = sample_session_info("sess-archived", Some(42));
+
+        assert!(!active.is_archived());
+        assert!(archived.is_archived());
+    }
+
+    #[test]
+    fn archive_filter_defaults_to_active_only() {
+        assert_eq!(
+            SessionArchiveFilter::default(),
+            SessionArchiveFilter::ActiveOnly
+        );
+    }
+
+    #[test]
+    fn archive_filter_matches_expected_archive_states() {
+        assert!(SessionArchiveFilter::ActiveOnly.matches(false));
+        assert!(!SessionArchiveFilter::ActiveOnly.matches(true));
+        assert!(SessionArchiveFilter::All.matches(false));
+        assert!(SessionArchiveFilter::All.matches(true));
+        assert!(!SessionArchiveFilter::ArchivedOnly.matches(false));
+        assert!(SessionArchiveFilter::ArchivedOnly.matches(true));
     }
 }

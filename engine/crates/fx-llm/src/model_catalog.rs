@@ -1,9 +1,14 @@
 //! Dynamic model discovery with provider-aware filtering and cache fallback.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::anthropic::AnthropicProvider;
+use crate::openai::OpenAiProvider;
+use crate::provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
+use crate::types::{CompletionRequest, CompletionResponse, LlmError};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum model age in seconds (~180 days). Models older than this are filtered out.
@@ -11,11 +16,6 @@ const MODEL_AGE_CUTOFF_SECS: u64 = 180 * 24 * 60 * 60;
 /// Minimum input price per token (USD) to filter out weak-tier models.
 /// $3/M tokens = 0.000003 per token. Roughly sonnet-tier floor.
 const MIN_INPUT_PRICE_PER_TOKEN: f64 = 0.000003;
-const ANTHROPIC_MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models";
-const OPENAI_MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
-const OPENROUTER_MODELS_ENDPOINT: &str = "https://openrouter.ai/api/v1/models";
-
-const ANTHROPIC_SETUP_TOKEN_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 
 /// A discovered model entry from a provider catalog endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,54 @@ pub struct ModelCatalog {
 struct CacheEntry {
     models: Vec<CatalogModel>,
     fetched_at: Instant,
+}
+
+#[derive(Debug)]
+struct UnknownCatalogProvider {
+    name: String,
+}
+
+impl UnknownCatalogProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            name: normalize_provider(name),
+        }
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for UnknownCatalogProvider {
+    async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        Err(LlmError::Provider(format!(
+            "provider '{}' does not support completions",
+            self.name
+        )))
+    }
+
+    async fn complete_stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionStream, LlmError> {
+        Err(LlmError::Provider(format!(
+            "provider '{}' does not support streaming completions",
+            self.name
+        )))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_temperature: false,
+            requires_streaming: false,
+        }
+    }
 }
 
 impl ModelCatalog {
@@ -64,9 +112,9 @@ impl ModelCatalog {
         api_key: &str,
         auth_mode: &str,
     ) -> Result<usize, String> {
-        let provider_key = normalize_provider(provider);
-        let models = self.fetch_models(&provider_key, api_key, auth_mode).await?;
-        Ok(models.len())
+        let provider = catalog_provider(provider, api_key)?;
+        self.verify_provider_credentials(provider.as_ref(), api_key, auth_mode)
+            .await
     }
 
     /// Fetch models for a provider. Uses cache if fresh, falls back on error.
@@ -76,15 +124,13 @@ impl ModelCatalog {
         api_key: &str,
         auth_mode: &str,
     ) -> Vec<CatalogModel> {
-        let provider_key = normalize_provider(provider);
-
-        if let Some(entry) = self.cache.get(&provider_key) {
-            if Self::is_cache_fresh(entry) {
-                return entry.models.clone();
+        match catalog_provider(provider, api_key) {
+            Ok(provider) => {
+                self.get_provider_models(provider.as_ref(), api_key, auth_mode)
+                    .await
             }
+            Err(_) => self.cached_or_fallback_models(&UnknownCatalogProvider::new(provider)),
         }
-
-        self.refresh_models(&provider_key, api_key, auth_mode).await
     }
 
     /// Force refresh models for a provider.
@@ -94,20 +140,64 @@ impl ModelCatalog {
         api_key: &str,
         auth_mode: &str,
     ) -> Vec<CatalogModel> {
-        let provider_key = normalize_provider(provider);
-        let fetch_result = self.fetch_models(&provider_key, api_key, auth_mode).await;
-        self.apply_fetch_result(&provider_key, fetch_result)
+        match catalog_provider(provider, api_key) {
+            Ok(provider) => {
+                self.refresh_provider_models(provider.as_ref(), api_key, auth_mode)
+                    .await
+            }
+            Err(_) => self.cached_or_fallback_models(&UnknownCatalogProvider::new(provider)),
+        }
+    }
+
+    async fn verify_provider_credentials(
+        &self,
+        provider: &dyn CompletionProvider,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Result<usize, String> {
+        let models = self
+            .fetch_provider_models(provider, api_key, auth_mode)
+            .await?;
+        Ok(models.len())
+    }
+
+    async fn get_provider_models(
+        &mut self,
+        provider: &dyn CompletionProvider,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Vec<CatalogModel> {
+        if let Some(entry) = self.cache.get(&provider_key(provider)) {
+            if Self::is_cache_fresh(entry) {
+                return entry.models.clone();
+            }
+        }
+
+        self.refresh_provider_models(provider, api_key, auth_mode)
+            .await
+    }
+
+    async fn refresh_provider_models(
+        &mut self,
+        provider: &dyn CompletionProvider,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Vec<CatalogModel> {
+        let fetch_result = self
+            .fetch_provider_models(provider, api_key, auth_mode)
+            .await;
+        self.apply_fetch_result(provider, fetch_result)
     }
 
     fn apply_fetch_result(
         &mut self,
-        provider_key: &str,
+        provider: &dyn CompletionProvider,
         fetch_result: Result<Vec<CatalogModel>, String>,
     ) -> Vec<CatalogModel> {
         match fetch_result {
             Ok(models) => {
                 self.cache.insert(
-                    provider_key.to_string(),
+                    provider_key(provider),
                     CacheEntry {
                         models: models.clone(),
                         fetched_at: Instant::now(),
@@ -115,20 +205,33 @@ impl ModelCatalog {
                 );
                 models
             }
-            Err(_) => self.cached_or_fallback_models(provider_key),
+            Err(_) => self.cached_or_fallback_models(provider),
         }
     }
 
-    fn cached_or_fallback_models(&self, provider_key: &str) -> Vec<CatalogModel> {
+    fn cached_or_fallback_models(&self, provider: &dyn CompletionProvider) -> Vec<CatalogModel> {
         self.cache
-            .get(provider_key)
+            .get(&provider_key(provider))
             .map(|entry| entry.models.clone())
-            .unwrap_or_else(|| Self::hardcoded_fallback(provider_key))
+            .unwrap_or_else(|| Self::provider_fallback_models(provider))
     }
 
-    async fn fetch_models(
+    fn provider_fallback_models(provider: &dyn CompletionProvider) -> Vec<CatalogModel> {
+        let provider_key = provider_key(provider);
+        provider
+            .fallback_models()
+            .into_iter()
+            .map(|id| CatalogModel {
+                id: id.to_string(),
+                display_name: None,
+                provider: provider_key.clone(),
+            })
+            .collect()
+    }
+
+    async fn fetch_provider_models(
         &self,
-        provider: &str,
+        provider: &dyn CompletionProvider,
         api_key: &str,
         auth_mode: &str,
     ) -> Result<Vec<CatalogModel>, String> {
@@ -154,59 +257,14 @@ impl ModelCatalog {
 
     fn build_models_request(
         &self,
-        provider: &str,
+        provider: &dyn CompletionProvider,
         api_key: &str,
         auth_mode: &str,
     ) -> Result<reqwest::Request, String> {
-        let provider = normalize_provider(provider);
-        let endpoint = models_endpoint(&provider)?;
-
-        let mut headers = HeaderMap::new();
-
-        match provider.as_str() {
-            "anthropic" => {
-                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
-                match auth_mode {
-                    "api_key" => {
-                        let key = HeaderValue::from_str(api_key)
-                            .map_err(|error| format!("invalid api key header: {error}"))?;
-                        headers.insert("x-api-key", key);
-                    }
-                    "setup_token" => {
-                        let bearer = format!("Bearer {api_key}");
-                        let bearer = HeaderValue::from_str(&bearer)
-                            .map_err(|error| format!("invalid authorization header: {error}"))?;
-                        headers.insert(AUTHORIZATION, bearer);
-                        headers.insert(
-                            "anthropic-beta",
-                            HeaderValue::from_static(ANTHROPIC_SETUP_TOKEN_BETA),
-                        );
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported auth mode '{other}' for provider '{provider}'"
-                        ));
-                    }
-                }
-            }
-            "openai" | "openrouter" => match auth_mode {
-                "bearer" | "oauth" => {
-                    let bearer = format!("Bearer {api_key}");
-                    let bearer = HeaderValue::from_str(&bearer)
-                        .map_err(|error| format!("invalid authorization header: {error}"))?;
-                    headers.insert(AUTHORIZATION, bearer);
-                }
-                other => {
-                    return Err(format!(
-                        "unsupported auth mode '{other}' for provider '{provider}'"
-                    ));
-                }
-            },
-            _ => {
-                return Err(format!("unsupported provider '{provider}'"));
-            }
-        }
+        let endpoint = provider
+            .models_endpoint()
+            .ok_or_else(|| format!("unsupported provider '{}'", provider.name()))?;
+        let headers = provider.catalog_auth_headers(api_key, auth_mode)?;
 
         self.client
             .get(endpoint)
@@ -215,7 +273,10 @@ impl ModelCatalog {
             .map_err(|error| format!("failed to build request: {error}"))
     }
 
-    fn parse_models(provider: &str, json_body: &str) -> Result<Vec<CatalogModel>, String> {
+    fn parse_models(
+        provider: &dyn CompletionProvider,
+        json_body: &str,
+    ) -> Result<Vec<CatalogModel>, String> {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -224,11 +285,11 @@ impl ModelCatalog {
     }
 
     fn parse_models_with_now(
-        provider: &str,
+        provider: &dyn CompletionProvider,
         json_body: &str,
         now_secs: u64,
     ) -> Result<Vec<CatalogModel>, String> {
-        let provider = normalize_provider(provider);
+        let provider_key = provider_key(provider);
         let parsed = serde_json::from_str::<ModelsEnvelope>(json_body)
             .map_err(|error| format!("invalid models payload: {error}"))?;
 
@@ -236,21 +297,16 @@ impl ModelCatalog {
         let mut models = Vec::new();
 
         for model in parsed.data {
-            let Some(id) = model.id else {
+            let Some(id) = model.id.as_ref() else {
                 continue;
             };
 
-            if !Self::is_chat_capable(provider.as_str(), &id) {
+            if !provider.is_chat_capable(id) {
                 continue;
             }
 
-            if provider == "openrouter" {
-                if !is_model_recent_enough(model.created, now_secs) {
-                    continue;
-                }
-                if !is_model_capable_enough(&model.pricing) {
-                    continue;
-                }
+            if !quality_filters_allow(provider, &model, now_secs) {
+                continue;
             }
 
             if !seen.insert(id.clone()) {
@@ -258,9 +314,9 @@ impl ModelCatalog {
             }
 
             models.push(CatalogModel {
-                id,
+                id: id.clone(),
                 display_name: model.display_name.or(model.name),
-                provider: provider.clone(),
+                provider: provider_key.clone(),
             });
         }
 
@@ -268,87 +324,55 @@ impl ModelCatalog {
         Ok(models)
     }
 
-    fn is_chat_capable(provider: &str, model_id: &str) -> bool {
-        let id = model_id.to_ascii_lowercase();
-        match provider {
-            "anthropic" => id.starts_with("claude-"),
-            "openai" => {
-                let includes = id.starts_with("gpt-")
-                    || id.starts_with("gpt-5")
-                    || id.starts_with("o1")
-                    || id.starts_with("o3")
-                    || id.starts_with("o4");
-
-                let excludes = id.contains("embedding")
-                    || id.contains("tts")
-                    || id.contains("whisper")
-                    || id.contains("dall-e")
-                    || id.contains("moderation")
-                    || id.contains("audio")
-                    || id.contains("realtime")
-                    || id.contains("search")
-                    || id.contains("instruct");
-
-                includes && !excludes
-            }
-            "openrouter" => {
-                id.contains("claude")
-                    || id.contains("gpt-")
-                    || id.contains("o4")
-                    || id.contains("grok")
-                    || id.contains("qwen")
-                    || id.contains("minimax")
-                    || id.contains("liquidai")
-                    || id.contains("lfm")
-                    || id.contains("deepseek")
-            }
-            _ => false,
-        }
-    }
-
     fn is_cache_fresh(entry: &CacheEntry) -> bool {
         entry.fetched_at.elapsed() <= CACHE_TTL
     }
+}
 
-    fn hardcoded_fallback(provider: &str) -> Vec<CatalogModel> {
-        let provider = normalize_provider(provider);
-        let ids: Vec<&str> = match provider.as_str() {
-            "anthropic" => vec![
-                "claude-opus-4-6-20250929",
-                "claude-opus-4-6",
-                "claude-sonnet-4-6-20250929",
-                "claude-sonnet-4-6",
-                "claude-opus-4-5-20251101",
-                "claude-sonnet-4-5-20250929",
-                "claude-haiku-4-5-20251001",
-                "claude-opus-4-20250514",
-                "claude-sonnet-4-20250514",
-            ],
-            "openai" => vec![
-                "gpt-5.4",
-                "gpt-4.1",
-                "o3",
-                "o4-mini",
-                "gpt-4o",
-                "gpt-4o-mini",
-            ],
-            "openrouter" => vec![
-                "anthropic/claude-sonnet-4",
-                "openai/gpt-4o",
-                "x-ai/grok-3",
-                "qwen/qwen-2.5-72b-instruct",
-                "deepseek/deepseek-chat-v3",
-            ],
-            _ => vec!["gpt-4o-mini"],
-        };
+fn provider_key(provider: &dyn CompletionProvider) -> String {
+    normalize_provider(provider.name())
+}
 
-        ids.into_iter()
-            .map(|id| CatalogModel {
-                id: id.to_string(),
-                display_name: None,
-                provider: provider.clone(),
-            })
-            .collect()
+fn quality_filters_allow(
+    provider: &dyn CompletionProvider,
+    model: &ModelEntry,
+    now_secs: u64,
+) -> bool {
+    if !provider.catalog_filters().apply_recency_and_price_floor {
+        return true;
+    }
+    is_model_recent_enough(model.created, now_secs) && is_model_capable_enough(&model.pricing)
+}
+
+fn metadata_credential(credential: &str) -> &str {
+    if credential.trim().is_empty() {
+        "placeholder-token"
+    } else {
+        credential
+    }
+}
+
+/// Provider-name matching is intentional here: this factory chooses which
+/// explicit provider contract type to instantiate for catalog operations.
+fn catalog_provider(
+    provider_name: &str,
+    credential: &str,
+) -> Result<Box<dyn CompletionProvider>, String> {
+    let provider_name = normalize_provider(provider_name);
+    let credential = metadata_credential(credential);
+    match provider_name.as_str() {
+        "anthropic" => AnthropicProvider::new(AnthropicProvider::default_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+            .map_err(|error| format!("failed to build provider metadata: {error}")),
+        "openai" => OpenAiProvider::openai(OpenAiProvider::default_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+            .map_err(|error| format!("failed to build provider metadata: {error}")),
+        "openrouter" => {
+            OpenAiProvider::openrouter(OpenAiProvider::openrouter_base_url(), credential)
+                .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+                .map_err(|error| format!("failed to build provider metadata: {error}"))
+        }
+        _ => Ok(Box::new(UnknownCatalogProvider::new(&provider_name))),
     }
 }
 
@@ -378,15 +402,6 @@ fn is_model_capable_enough(pricing: &Option<ModelPricing>) -> bool {
 
 fn normalize_provider(provider: &str) -> String {
     provider.trim().to_ascii_lowercase()
-}
-
-fn models_endpoint(provider: &str) -> Result<&'static str, String> {
-    match provider {
-        "anthropic" => Ok(ANTHROPIC_MODELS_ENDPOINT),
-        "openai" => Ok(OPENAI_MODELS_ENDPOINT),
-        "openrouter" => Ok(OPENROUTER_MODELS_ENDPOINT),
-        _ => Err(format!("unsupported provider '{provider}'")),
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +461,10 @@ fn parse_price_value(value: PriceValue) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+    use crate::types::{CompletionRequest, CompletionResponse, LlmError};
+    use async_trait::async_trait;
+    use reqwest::header::AUTHORIZATION;
 
     fn make_model(id: &str, provider: &str) -> CatalogModel {
         CatalogModel {
@@ -455,8 +474,87 @@ mod tests {
         }
     }
 
+    fn test_provider(name: &str) -> Box<dyn CompletionProvider> {
+        catalog_provider(name, "test-key").expect("provider")
+    }
+
+    fn parse_models(provider: &dyn CompletionProvider, json_body: &str) -> Vec<CatalogModel> {
+        ModelCatalog::parse_models(provider, json_body).expect("parse models")
+    }
+
+    fn parse_models_with_now(
+        provider: &dyn CompletionProvider,
+        json_body: &str,
+        now_secs: u64,
+    ) -> Vec<CatalogModel> {
+        ModelCatalog::parse_models_with_now(provider, json_body, now_secs).expect("parse models")
+    }
+
+    #[derive(Debug)]
+    struct CustomCatalogProvider;
+
+    #[async_trait]
+    impl CompletionProvider for CustomCatalogProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, LlmError> {
+            Err(LlmError::Provider("unused".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            "custom"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+
+        fn models_endpoint(&self) -> Option<&str> {
+            Some("https://catalog.example.test/v1/models")
+        }
+
+        fn catalog_auth_headers(
+            &self,
+            api_key: &str,
+            auth_mode: &str,
+        ) -> Result<reqwest::header::HeaderMap, String> {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let token = reqwest::header::HeaderValue::from_str(api_key)
+                .map_err(|error| format!("invalid catalog token header: {error}"))?;
+            let mode = reqwest::header::HeaderValue::from_str(auth_mode)
+                .map_err(|error| format!("invalid auth mode header: {error}"))?;
+            headers.insert("x-catalog-token", token);
+            headers.insert("x-auth-mode", mode);
+            Ok(headers)
+        }
+
+        fn is_chat_capable(&self, model_id: &str) -> bool {
+            model_id.starts_with("assistant-")
+        }
+
+        fn fallback_models(&self) -> Vec<&'static str> {
+            vec!["assistant-fallback"]
+        }
+    }
+
     #[test]
     fn parse_models_supports_anthropic_payload_shape() {
+        let provider = test_provider("anthropic");
         let json = r#"{
             "data": [
                 {"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4"},
@@ -465,7 +563,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed = ModelCatalog::parse_models("anthropic", json).unwrap();
+        let parsed = parse_models(provider.as_ref(), json);
 
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].id, "claude-opus-4-20250514");
@@ -476,6 +574,7 @@ mod tests {
 
     #[test]
     fn parse_models_supports_openai_payload_shape() {
+        let provider = test_provider("openai");
         let json = r#"{
             "data": [
                 {"id": "gpt-4o", "display_name": "GPT-4o"},
@@ -484,7 +583,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed = ModelCatalog::parse_models("openai", json).unwrap();
+        let parsed = parse_models(provider.as_ref(), json);
 
         assert_eq!(parsed.len(), 2);
         assert!(parsed.iter().all(|model| model.id.starts_with("gpt-4o")));
@@ -492,6 +591,7 @@ mod tests {
 
     #[test]
     fn parse_models_supports_openrouter_payload_shape() {
+        let provider = test_provider("openrouter");
         let json = r#"{
             "data": [
                 {"id": "anthropic/claude-sonnet-4"},
@@ -500,7 +600,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed = ModelCatalog::parse_models("openrouter", json).unwrap();
+        let parsed = parse_models(provider.as_ref(), json);
 
         assert_eq!(parsed.len(), 2);
         assert!(parsed
@@ -511,68 +611,81 @@ mod tests {
 
     #[test]
     fn is_chat_model_accepts_openrouter_xai() {
-        assert!(ModelCatalog::is_chat_capable("openrouter", "x-ai/grok-3"));
-        assert!(ModelCatalog::is_chat_capable(
-            "openrouter",
-            "x-ai/grok-3-mini"
-        ));
+        let provider = test_provider("openrouter");
+        assert!(provider.is_chat_capable("x-ai/grok-3"));
+        assert!(provider.is_chat_capable("x-ai/grok-3-mini"));
     }
 
     #[test]
     fn is_chat_model_accepts_openrouter_qwen() {
-        assert!(ModelCatalog::is_chat_capable(
-            "openrouter",
-            "qwen/qwen-2.5-72b-instruct"
-        ));
+        let provider = test_provider("openrouter");
+        assert!(provider.is_chat_capable("qwen/qwen-2.5-72b-instruct"));
     }
 
     #[test]
     fn is_chat_model_accepts_openrouter_deepseek() {
-        assert!(ModelCatalog::is_chat_capable(
-            "openrouter",
-            "deepseek/deepseek-chat-v3"
-        ));
+        let provider = test_provider("openrouter");
+        assert!(provider.is_chat_capable("deepseek/deepseek-chat-v3"));
     }
 
     #[test]
     fn is_chat_model_accepts_openrouter_o4() {
-        assert!(ModelCatalog::is_chat_capable(
-            "openrouter",
-            "openai/o4-mini"
-        ));
+        let provider = test_provider("openrouter");
+        assert!(provider.is_chat_capable("openai/o4-mini"));
     }
 
     #[test]
     fn is_chat_capable_filters_each_provider() {
-        assert!(ModelCatalog::is_chat_capable(
-            "anthropic",
-            "claude-sonnet-4"
-        ));
-        assert!(!ModelCatalog::is_chat_capable(
-            "anthropic",
-            "text-embedding-3-large"
-        ));
+        let anthropic = test_provider("anthropic");
+        let openai = test_provider("openai");
+        let openrouter = test_provider("openrouter");
 
-        assert!(ModelCatalog::is_chat_capable("openai", "gpt-4o"));
-        assert!(ModelCatalog::is_chat_capable("openai", "o3-mini-high"));
-        assert!(!ModelCatalog::is_chat_capable(
-            "openai",
-            "text-embedding-3-large"
-        ));
-        assert!(!ModelCatalog::is_chat_capable(
-            "openai",
-            "gpt-4o-realtime-preview"
-        ));
-        assert!(!ModelCatalog::is_chat_capable(
-            "openai",
-            "gpt-4o-audio-preview"
-        ));
+        assert!(anthropic.is_chat_capable("claude-sonnet-4"));
+        assert!(!anthropic.is_chat_capable("text-embedding-3-large"));
 
-        assert!(ModelCatalog::is_chat_capable("openrouter", "x-ai/grok-3"));
-        assert!(!ModelCatalog::is_chat_capable(
-            "openrouter",
-            "openai/text-embedding-3-large"
-        ));
+        assert!(openai.is_chat_capable("gpt-4o"));
+        assert!(openai.is_chat_capable("o3-mini-high"));
+        assert!(!openai.is_chat_capable("text-embedding-3-large"));
+        assert!(!openai.is_chat_capable("gpt-4o-realtime-preview"));
+        assert!(!openai.is_chat_capable("gpt-4o-audio-preview"));
+
+        assert!(openrouter.is_chat_capable("x-ai/grok-3"));
+        assert!(!openrouter.is_chat_capable("openai/text-embedding-3-large"));
+    }
+
+    #[test]
+    fn custom_provider_metadata_drives_request_building() {
+        let catalog = ModelCatalog::new();
+        let provider = CustomCatalogProvider;
+
+        let request = catalog
+            .build_models_request(&provider, "secret-token", "custom-mode")
+            .expect("request");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://catalog.example.test/v1/models"
+        );
+        assert_eq!(
+            request.headers().get("x-catalog-token").unwrap(),
+            "secret-token"
+        );
+        assert_eq!(request.headers().get("x-auth-mode").unwrap(), "custom-mode");
+    }
+
+    #[test]
+    fn custom_provider_metadata_drives_parsing_and_fallback() {
+        let provider = CustomCatalogProvider;
+        let parsed = parse_models(
+            &provider,
+            r#"{"data":[{"id":"assistant-pro"},{"id":"embeddings-v1"}]}"#,
+        );
+
+        assert_eq!(parsed, vec![make_model("assistant-pro", "custom")]);
+        assert_eq!(
+            ModelCatalog::provider_fallback_models(&provider),
+            vec![make_model("assistant-fallback", "custom")]
+        );
     }
 
     #[tokio::test]
@@ -607,7 +720,7 @@ mod tests {
 
     #[test]
     fn fallback_defaults_match_expected_lists() {
-        let anthropic = ModelCatalog::hardcoded_fallback("anthropic")
+        let anthropic = ModelCatalog::provider_fallback_models(test_provider("anthropic").as_ref())
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
@@ -626,7 +739,7 @@ mod tests {
             ]
         );
 
-        let openai = ModelCatalog::hardcoded_fallback("openai")
+        let openai = ModelCatalog::provider_fallback_models(test_provider("openai").as_ref())
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
@@ -642,10 +755,11 @@ mod tests {
             ]
         );
 
-        let openrouter = ModelCatalog::hardcoded_fallback("openrouter")
-            .into_iter()
-            .map(|model| model.id)
-            .collect::<Vec<_>>();
+        let openrouter =
+            ModelCatalog::provider_fallback_models(test_provider("openrouter").as_ref())
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>();
         assert_eq!(
             openrouter,
             vec![
@@ -659,8 +773,9 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_fallback_openrouter_includes_new_providers() {
-        let fallback = ModelCatalog::hardcoded_fallback("openrouter");
+    fn provider_fallback_openrouter_includes_new_providers() {
+        let provider = test_provider("openrouter");
+        let fallback = ModelCatalog::provider_fallback_models(provider.as_ref());
         let ids: Vec<&str> = fallback.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.iter().any(|id| id.contains("grok")));
@@ -671,9 +786,11 @@ mod tests {
     #[test]
     fn auth_headers_match_expected_modes() {
         let catalog = ModelCatalog::new();
+        let anthropic = test_provider("anthropic");
+        let openai = test_provider("openai");
 
         let anthropic_api_key = catalog
-            .build_models_request("anthropic", "anthropic-key", "api_key")
+            .build_models_request(anthropic.as_ref(), "anthropic-key", "api_key")
             .unwrap();
         let headers = anthropic_api_key.headers();
         assert_eq!(headers.get("x-api-key").unwrap(), "anthropic-key");
@@ -681,18 +798,18 @@ mod tests {
         assert!(headers.get(AUTHORIZATION).is_none());
 
         let anthropic_setup = catalog
-            .build_models_request("anthropic", "setup-token", "setup_token")
+            .build_models_request(anthropic.as_ref(), "setup-token", "setup_token")
             .unwrap();
         let headers = anthropic_setup.headers();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer setup-token");
         assert_eq!(
             headers.get("anthropic-beta").unwrap(),
-            ANTHROPIC_SETUP_TOKEN_BETA
+            "claude-code-20250219,oauth-2025-04-20"
         );
         assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
 
         let openai_bearer = catalog
-            .build_models_request("openai", "openai-key", "bearer")
+            .build_models_request(openai.as_ref(), "openai-key", "bearer")
             .unwrap();
         let headers = openai_bearer.headers();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer openai-key");
@@ -702,9 +819,10 @@ mod tests {
     #[test]
     fn apply_fetch_result_updates_cache_on_successful_fetch() {
         let mut catalog = ModelCatalog::new();
+        let provider = test_provider("openai");
         let expected = vec![make_model("gpt-4o", "openai")];
 
-        let models = catalog.apply_fetch_result("openai", Ok(expected.clone()));
+        let models = catalog.apply_fetch_result(provider.as_ref(), Ok(expected.clone()));
 
         assert_eq!(models, expected);
         let cached = catalog.cache.get("openai").expect("cache entry");
@@ -714,6 +832,7 @@ mod tests {
     #[test]
     fn apply_fetch_result_uses_cached_models_when_fetch_fails() {
         let mut catalog = ModelCatalog::new();
+        let provider = test_provider("openai");
         let cached_models = vec![make_model("gpt-4o-mini", "openai")];
         catalog.cache.insert(
             "openai".to_string(),
@@ -723,8 +842,10 @@ mod tests {
             },
         );
 
-        let models =
-            catalog.apply_fetch_result("openai", Err("simulated network failure".to_string()));
+        let models = catalog.apply_fetch_result(
+            provider.as_ref(),
+            Err("simulated network failure".to_string()),
+        );
 
         assert_eq!(models, cached_models);
     }
@@ -732,8 +853,9 @@ mod tests {
     #[test]
     fn apply_fetch_result_returns_empty_when_fetch_succeeds_with_empty_payload() {
         let mut catalog = ModelCatalog::new();
+        let provider = test_provider("openai");
 
-        let models = catalog.apply_fetch_result("openai", Ok(Vec::new()));
+        let models = catalog.apply_fetch_result(provider.as_ref(), Ok(Vec::new()));
 
         assert!(models.is_empty());
         let cached = catalog.cache.get("openai").expect("cache entry");
@@ -768,6 +890,7 @@ mod tests {
 
     #[test]
     fn parse_models_openrouter_enforces_180_day_age_boundary() {
+        let provider = test_provider("openrouter");
         let now_secs = 1_900_000_000_u64;
         let within_cutoff = now_secs - (179 * 24 * 60 * 60);
         let beyond_cutoff = now_secs - (181 * 24 * 60 * 60);
@@ -788,7 +911,7 @@ mod tests {
             }}"#
         );
 
-        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+        let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "anthropic/claude-sonnet-within-cutoff");
@@ -858,6 +981,7 @@ mod tests {
 
     #[test]
     fn parse_models_openrouter_filters_old_and_cheap_models() {
+        let provider = test_provider("openrouter");
         let now_secs = 1_900_000_000_u64;
         let recent = now_secs - (30 * 24 * 60 * 60);
         let old = now_secs - (181 * 24 * 60 * 60);
@@ -883,7 +1007,7 @@ mod tests {
             }}"#
         );
 
-        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+        let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
@@ -891,6 +1015,7 @@ mod tests {
 
     #[test]
     fn parse_models_openrouter_allows_model_with_malformed_price() {
+        let provider = test_provider("openrouter");
         let now_secs = 1_900_000_000_u64;
         let created_recent = now_secs - (30 * 24 * 60 * 60);
         let json = format!(
@@ -905,7 +1030,7 @@ mod tests {
             }}"#
         );
 
-        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+        let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
     }
@@ -913,9 +1038,10 @@ mod tests {
     #[test]
     fn build_models_request_accepts_oauth_for_openai() {
         let catalog = ModelCatalog::new();
+        let provider = test_provider("openai");
 
         let request = catalog
-            .build_models_request("openai", "oauth-token-123", "oauth")
+            .build_models_request(provider.as_ref(), "oauth-token-123", "oauth")
             .expect("oauth auth mode should be accepted for openai");
 
         let headers = request.headers();
@@ -926,8 +1052,9 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_fallback_includes_modern_models() {
-        let fallback = ModelCatalog::hardcoded_fallback("openai");
+    fn provider_fallback_includes_modern_models() {
+        let provider = test_provider("openai");
+        let fallback = ModelCatalog::provider_fallback_models(provider.as_ref());
         let ids: Vec<&str> = fallback.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.contains(&"gpt-5.4"), "fallback should include gpt-5.4");
@@ -937,6 +1064,7 @@ mod tests {
 
     #[test]
     fn parse_models_anthropic_ignores_age_and_pricing_filters() {
+        let provider = test_provider("anthropic");
         // Anthropic direct API models should not be filtered by age/pricing
         let json = r#"{
             "data": [
@@ -947,7 +1075,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed = ModelCatalog::parse_models("anthropic", json).unwrap();
+        let parsed = parse_models(provider.as_ref(), json);
         assert_eq!(parsed.len(), 1);
     }
 }

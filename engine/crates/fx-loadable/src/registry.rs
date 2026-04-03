@@ -11,22 +11,29 @@
 
 use async_trait::async_trait;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ToolCacheability, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, JournalAction, ToolCacheability,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
+use crate::lifecycle::{builtin_activation, SkillActivation, SkillStatusSummary};
 use crate::skill::Skill;
+
+struct RegisteredSkill {
+    skill: Arc<dyn Skill>,
+    activation: SkillActivation,
+}
 
 /// Registry that holds skills and dispatches tool calls.
 ///
 /// Uses interior mutability (`RwLock`) so `register`, `replace_skill`, and
 /// `remove_skill` take `&self` — safe to call through `Arc<SkillRegistry>`.
 pub struct SkillRegistry {
-    skills: RwLock<Vec<Arc<dyn Skill>>>,
+    skills: RwLock<Vec<RegisteredSkill>>,
 }
 
 /// Manual `Debug` impl because `RwLock<Vec<Arc<dyn Skill>>>` doesn't derive
@@ -54,9 +61,13 @@ impl SkillRegistry {
     /// Logs a warning if any of the skill's tools collide with already-registered
     /// tool names. The first-registered skill wins at dispatch time.
     pub fn register(&self, skill: Arc<dyn Skill>) {
+        self.register_with_activation(Arc::clone(&skill), builtin_activation(&*skill));
+    }
+
+    pub fn register_with_activation(&self, skill: Arc<dyn Skill>, activation: SkillActivation) {
         let mut skills = self.skills.write().unwrap_or_else(|p| p.into_inner());
         log_collisions(&skills, &*skill);
-        skills.push(skill);
+        skills.push(RegisteredSkill { skill, activation });
     }
 
     /// Replace a skill by name, returning the old skill if found.
@@ -65,25 +76,53 @@ impl SkillRegistry {
     /// the new skill is NOT inserted — use `register()` for that.
     /// Logs warnings for any tool name collisions with other registered skills.
     pub fn replace_skill(&self, name: &str, skill: Arc<dyn Skill>) -> Option<Arc<dyn Skill>> {
+        let activation = self
+            .activation(name)
+            .unwrap_or_else(|| builtin_activation(&*skill));
+        self.replace_skill_with_activation(name, skill, activation)
+    }
+
+    pub fn replace_skill_with_activation(
+        &self,
+        name: &str,
+        skill: Arc<dyn Skill>,
+        activation: SkillActivation,
+    ) -> Option<Arc<dyn Skill>> {
         let mut skills = self.skills.write().unwrap_or_else(|p| p.into_inner());
-        let pos = skills.iter().position(|s| s.name() == name)?;
-        let old = std::mem::replace(&mut skills[pos], skill);
+        let pos = skills.iter().position(|entry| entry.skill.name() == name)?;
+        let old = std::mem::replace(&mut skills[pos], RegisteredSkill { skill, activation });
         // Log collisions between the new skill and all OTHER skills
         let others: Vec<_> = skills
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != pos)
-            .map(|(_, s)| s.clone())
+            .map(|(_, entry)| RegisteredSkill {
+                skill: Arc::clone(&entry.skill),
+                activation: entry.activation.clone(),
+            })
             .collect();
-        log_collisions(&others, &*skills[pos]);
-        Some(old)
+        log_collisions(&others, &*skills[pos].skill);
+        Some(old.skill)
+    }
+
+    pub fn upsert_with_activation(
+        &self,
+        name: &str,
+        skill: Arc<dyn Skill>,
+        activation: SkillActivation,
+    ) -> Option<Arc<dyn Skill>> {
+        self.replace_skill_with_activation(name, Arc::clone(&skill), activation.clone())
+            .or_else(|| {
+                self.register_with_activation(skill, activation);
+                None
+            })
     }
 
     /// Remove a skill by name, returning the removed skill if found.
     pub fn remove_skill(&self, name: &str) -> Option<Arc<dyn Skill>> {
         let mut skills = self.skills.write().unwrap_or_else(|p| p.into_inner());
-        let pos = skills.iter().position(|s| s.name() == name)?;
-        Some(skills.remove(pos))
+        let pos = skills.iter().position(|entry| entry.skill.name() == name)?;
+        Some(skills.remove(pos).skill)
     }
 
     /// Aggregate tool definitions from all registered skills.
@@ -91,29 +130,54 @@ impl SkillRegistry {
         let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
         skills
             .iter()
-            .flat_map(|skill| skill.tool_definitions())
+            .flat_map(|entry| entry.skill.tool_definitions())
             .collect()
     }
 
     /// Return a summary of each registered skill, description, tool names, and declared capabilities.
     pub fn skill_summaries(&self) -> Vec<(String, String, Vec<String>, Vec<String>)> {
+        self.skill_statuses()
+            .into_iter()
+            .map(|status| {
+                (
+                    status.name,
+                    status.description,
+                    status.tool_names,
+                    status.capabilities,
+                )
+            })
+            .collect()
+    }
+
+    pub fn skill_statuses(&self) -> Vec<SkillStatusSummary> {
         let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
         skills
             .iter()
-            .map(|skill| {
-                let tools = skill
+            .map(|entry| {
+                let tools = entry
+                    .skill
                     .tool_definitions()
                     .into_iter()
                     .map(|definition| definition.name)
                     .collect();
-                (
-                    skill.name().to_string(),
-                    skill.description().to_string(),
-                    tools,
-                    skill.capabilities(),
-                )
+                SkillStatusSummary {
+                    name: entry.skill.name().to_string(),
+                    description: entry.skill.description().to_string(),
+                    tool_names: tools,
+                    capabilities: entry.skill.capabilities(),
+                    activation: entry.activation.clone(),
+                    source_drift: None,
+                }
             })
             .collect()
+    }
+
+    pub fn activation(&self, name: &str) -> Option<SkillActivation> {
+        let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
+        skills
+            .iter()
+            .find(|entry| entry.skill.name() == name)
+            .map(|entry| entry.activation.clone())
     }
 
     /// Find the first skill that handles the given tool name.
@@ -122,14 +186,42 @@ impl SkillRegistry {
         let skills = self.skills.read().unwrap_or_else(|p| p.into_inner());
         skills
             .iter()
-            .find(|s| s.tool_definitions().iter().any(|d| d.name == tool_name))
-            .cloned()
+            .find(|entry| {
+                entry
+                    .skill
+                    .tool_definitions()
+                    .iter()
+                    .any(|definition| definition.name == tool_name)
+            })
+            .map(|entry| Arc::clone(&entry.skill))
     }
 
     fn owning_skill_cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.find_skill(tool_name)
             .map(|skill| skill.cacheability(tool_name))
             .unwrap_or(ToolCacheability::NeverCache)
+    }
+
+    fn owning_skill_action_category(&self, tool_name: &str) -> &'static str {
+        self.find_skill(tool_name)
+            .map(|skill| skill.action_category(tool_name))
+            .unwrap_or("unknown")
+    }
+
+    fn owning_skill_authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.find_skill(&call.name)
+            .map_or(ToolAuthoritySurface::Other, |skill| {
+                skill.authority_surface(call)
+            })
+    }
+
+    fn owning_skill_journal_action(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Option<JournalAction> {
+        self.find_skill(&call.name)
+            .and_then(|skill| skill.journal_action(call, result))
     }
 
     /// Execute a single tool call: read lock → find skill → clone Arc → drop
@@ -261,21 +353,22 @@ const _: () = {
 };
 
 /// Log warnings for tool name collisions when registering a new skill.
-fn log_collisions(existing: &[Arc<dyn Skill>], new_skill: &dyn Skill) {
+fn log_collisions(existing: &[RegisteredSkill], new_skill: &dyn Skill) {
     for new_def in new_skill.tool_definitions() {
         for existing_skill in existing {
             if existing_skill
+                .skill
                 .tool_definitions()
                 .iter()
                 .any(|d| d.name == new_def.name)
             {
                 warn!(
                     tool = %new_def.name,
-                    existing_skill = %existing_skill.name(),
+                    existing_skill = %existing_skill.skill.name(),
                     new_skill = %new_skill.name(),
                     "tool name collision: '{}' already registered by skill '{}'",
                     new_def.name,
-                    existing_skill.name(),
+                    existing_skill.skill.name(),
                 );
                 break;
             }
@@ -356,13 +449,25 @@ impl ToolExecutor for SkillRegistry {
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         self.owning_skill_cacheability(tool_name)
     }
+
+    fn action_category(&self, call: &ToolCall) -> &'static str {
+        self.owning_skill_action_category(&call.name)
+    }
+
+    fn authority_surface(&self, call: &ToolCall) -> ToolAuthoritySurface {
+        self.owning_skill_authority_surface(call)
+    }
+
+    fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
+        self.owning_skill_journal_action(call, result)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skill::Skill;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     /// A deterministic mock skill for testing.
     #[derive(Debug)]
@@ -371,6 +476,9 @@ mod tests {
         description: String,
         tools: Vec<ToolDefinition>,
         cacheability: ToolCacheability,
+        action_category: &'static str,
+        authority_surface: ToolAuthoritySurface,
+        journal_action: Option<JournalAction>,
     }
 
     impl MockSkill {
@@ -396,7 +504,32 @@ mod tests {
                 description: format!("{name} skill"),
                 tools,
                 cacheability,
+                action_category: "unknown",
+                authority_surface: ToolAuthoritySurface::Other,
+                journal_action: None,
             }
+        }
+
+        fn with_metadata(
+            name: &str,
+            tool_names: &[&str],
+            action_category: &'static str,
+            journal_action: JournalAction,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.action_category = action_category;
+            skill.journal_action = Some(journal_action);
+            skill
+        }
+
+        fn with_authority_surface(
+            name: &str,
+            tool_names: &[&str],
+            authority_surface: ToolAuthoritySurface,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.authority_surface = authority_surface;
+            skill
         }
     }
 
@@ -416,6 +549,18 @@ mod tests {
 
         fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
             self.cacheability
+        }
+
+        fn action_category(&self, _tool_name: &str) -> &'static str {
+            self.action_category
+        }
+
+        fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
+            self.authority_surface
+        }
+
+        fn journal_action(&self, _call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+            self.journal_action.clone()
         }
 
         async fn execute(
@@ -518,6 +663,27 @@ mod tests {
         assert_eq!(summaries[1].0, "net");
         assert_eq!(summaries[1].1, "net skill");
         assert_eq!(summaries[1].2, vec!["http_get"]);
+    }
+
+    #[test]
+    fn authority_surface_comes_from_owning_skill_metadata() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_authority_surface(
+            "fs",
+            &["custom_writer"],
+            ToolAuthoritySurface::PathWrite,
+        )));
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "custom_writer".to_string(),
+            arguments: serde_json::json!({"path":"notes.txt","content":"hello"}),
+        };
+
+        assert_eq!(
+            reg.authority_surface(&call),
+            ToolAuthoritySurface::PathWrite
+        );
     }
 
     #[tokio::test]
@@ -705,6 +871,49 @@ mod tests {
             reg.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn skill_registry_action_category_delegates_to_owner() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_metadata(
+            "git",
+            &["create_branch"],
+            "metadata_owned",
+            JournalAction::GitBranchCreate {
+                repo: PathBuf::from("."),
+                branch: "feature/test".to_string(),
+            },
+        )));
+
+        assert_eq!(
+            reg.action_category(&make_tool_call("create_branch")),
+            "metadata_owned"
+        );
+    }
+
+    #[test]
+    fn skill_registry_journal_action_delegates_to_owner() {
+        let reg = SkillRegistry::new();
+        let expected = JournalAction::GitBranchCreate {
+            repo: PathBuf::from("."),
+            branch: "feature/test".to_string(),
+        };
+        reg.register(Arc::new(MockSkill::with_metadata(
+            "git",
+            &["create_branch"],
+            "metadata_owned",
+            expected.clone(),
+        )));
+        let call = make_tool_call("create_branch");
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        };
+
+        assert_eq!(reg.journal_action(&call, &result), Some(expected));
     }
 
     #[test]

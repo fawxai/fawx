@@ -18,8 +18,63 @@ pub enum PathTier {
     Deny,
 }
 
+/// Semantic write domains used to map filesystem writes onto capability
+/// permissions. This keeps project edits, loadable self-modification, kernel
+/// source modification, and sovereign runtime boundaries distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDomain {
+    Project,
+    SelfLoadable,
+    KernelSource,
+    Sovereign,
+    External,
+}
+
+impl WriteDomain {
+    #[must_use]
+    pub const fn permission_category(self) -> &'static str {
+        match self {
+            Self::Project => "file_write",
+            Self::SelfLoadable => "self_modify",
+            Self::KernelSource | Self::Sovereign => "kernel_modify",
+            Self::External => "outside_workspace",
+        }
+    }
+}
+
+/// Loadable/self-surface paths that belong to Fawx's mutable extension layer.
+pub const SELF_LOADABLE_PATH_PATTERNS: &[&str] = &[
+    "**/engine/crates/fx-loadable/**",
+    "**/engine/crates/fx-skills/**",
+    "**/.fawx/skills/**",
+    "**/.fawx/prompts/**",
+    "**/.fawx/config.toml",
+];
+
+/// Kernel-source paths that require the `kernel_modify` capability but are not
+/// themselves the live runtime.
+pub const KERNEL_SOURCE_PATH_PATTERNS: &[&str] = &[
+    "**/engine/crates/fx-kernel/**",
+    "**/engine/crates/fx-cli/**",
+    "**/engine/crates/fx-core/**",
+    "**/engine/crates/fx-security/**",
+    "**/engine/crates/fx-llm/**",
+];
+
+/// Non-negotiable sovereign boundaries that remain compiled invariants even if
+/// `kernel_modify` is granted.
+const SOVEREIGN_WRITE_PATH_PATTERNS: &[&str] = &[
+    "**/.github/**",
+    "**/engine/crates/fx-auth/src/crypto/**",
+    "**/engine/crates/fx-ripcord/**",
+    "**/fawx-ripcord/**",
+    "**/tests/invariant/**",
+    "**/prompt-ledger/**",
+    "**/snapshots/**",
+];
+
 /// Default deny patterns shared between core and CLI configs.
-pub const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
+pub use fx_config::DEFAULT_DENY_PATHS;
 
 /// Paths that always require proposal+approval, regardless of `self_modify.enabled`.
 /// These are security-sensitive data files that the agent should never modify freely.
@@ -113,6 +168,33 @@ pub fn classify_path(path: &Path, base_dir: &Path, config: &SelfModifyConfig) ->
     PathTier::Deny
 }
 
+/// Classify a write target into a semantic permission domain.
+#[must_use]
+pub fn classify_write_domain(path: &Path, base_dir: &Path) -> WriteDomain {
+    let normalized = normalize_absolute_for_policy(path, base_dir);
+    if !is_within_base(&normalized, base_dir) {
+        return WriteDomain::External;
+    }
+
+    let relative = relativize_to_base(&normalized, base_dir);
+    let filename = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    if matches_static_patterns(&relative, filename, SOVEREIGN_WRITE_PATH_PATTERNS) {
+        return WriteDomain::Sovereign;
+    }
+    if matches_static_patterns(&relative, filename, KERNEL_SOURCE_PATH_PATTERNS) {
+        return WriteDomain::KernelSource;
+    }
+    if matches_static_patterns(&relative, filename, SELF_LOADABLE_PATH_PATTERNS) {
+        return WriteDomain::SelfLoadable;
+    }
+
+    WriteDomain::Project
+}
+
 /// Format a consistent self-modification policy violation error message.
 #[must_use]
 pub fn format_tier_violation(path: &Path, tier: PathTier) -> Option<String> {
@@ -161,6 +243,14 @@ fn matches_any(path: &Path, filename: &str, patterns: &[String]) -> bool {
     })
 }
 
+fn matches_static_patterns(path: &Path, filename: &str, patterns: &[&str]) -> bool {
+    let path_str = path.to_string_lossy();
+    patterns.iter().any(|pattern| {
+        matches_literal_suffix(path, filename, pattern)
+            || matches_glob(&path_str, filename, pattern)
+    })
+}
+
 fn matches_always_propose(path: &Path, filename: &str) -> bool {
     let path_str = path.to_string_lossy();
     ALWAYS_PROPOSE_PATTERNS.iter().any(|pattern| {
@@ -181,16 +271,35 @@ fn matches_glob(path_str: &str, filename: &str, pattern: &str) -> bool {
 }
 
 fn normalize_for_classification(path: &Path, base_dir: &Path) -> PathBuf {
+    let absolute_path = normalize_absolute_for_policy(path, base_dir);
+    relativize_to_base(&absolute_path, base_dir)
+}
+
+fn normalize_absolute_for_policy(path: &Path, base_dir: &Path) -> PathBuf {
     let absolute_path = as_absolute(path, base_dir);
     // Security requirement: when the target exists, canonicalize first so
     // symlinks are resolved before tier checks. For not-yet-created paths,
     // canonicalize cannot succeed, so we fall back to lexical `..` collapse.
-    let normalized_path = if absolute_path.exists() {
+    if absolute_path.exists() {
         fs::canonicalize(&absolute_path).unwrap_or_else(|_| collapse_dot_dot(&absolute_path))
     } else {
         collapse_dot_dot(&absolute_path)
-    };
-    relativize_to_base(&normalized_path, base_dir)
+    }
+}
+
+fn is_within_base(path: &Path, base_dir: &Path) -> bool {
+    let lexical_base = collapse_dot_dot(base_dir);
+    if path.strip_prefix(&lexical_base).is_ok() {
+        return true;
+    }
+
+    if let Ok(canonical_base) = fs::canonicalize(base_dir) {
+        if path.strip_prefix(&canonical_base).is_ok() {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn relativize_to_base(path: &Path, base_dir: &Path) -> PathBuf {
@@ -539,6 +648,53 @@ mod tests {
     }
 
     #[test]
+    fn classify_write_domain_project_within_base() {
+        let domain = classify_write_domain(
+            Path::new("/Users/joseph/project/src/main.rs"),
+            Path::new("/Users/joseph/project"),
+        );
+        assert_eq!(domain, WriteDomain::Project);
+        assert_eq!(domain.permission_category(), "file_write");
+    }
+
+    #[test]
+    fn classify_write_domain_self_loadable_with_nested_repo_prefix() {
+        let domain = classify_write_domain(
+            Path::new("/Users/joseph/fawx/.fawx/skills/demo/SKILL.md"),
+            Path::new("/Users/joseph"),
+        );
+        assert_eq!(domain, WriteDomain::SelfLoadable);
+        assert_eq!(domain.permission_category(), "self_modify");
+    }
+
+    #[test]
+    fn classify_write_domain_kernel_source_with_nested_repo_prefix() {
+        let domain = classify_write_domain(
+            Path::new("/Users/joseph/fawx/engine/crates/fx-kernel/src/lib.rs"),
+            Path::new("/Users/joseph"),
+        );
+        assert_eq!(domain, WriteDomain::KernelSource);
+        assert_eq!(domain.permission_category(), "kernel_modify");
+    }
+
+    #[test]
+    fn classify_write_domain_sovereign_path() {
+        let domain = classify_write_domain(
+            Path::new("/Users/joseph/fawx/.github/workflows/ci.yml"),
+            Path::new("/Users/joseph"),
+        );
+        assert_eq!(domain, WriteDomain::Sovereign);
+        assert_eq!(domain.permission_category(), "kernel_modify");
+    }
+
+    #[test]
+    fn classify_write_domain_external_path() {
+        let domain = classify_write_domain(Path::new("/etc/hosts"), Path::new("/Users/joseph"));
+        assert_eq!(domain, WriteDomain::External);
+        assert_eq!(domain.permission_category(), "outside_workspace");
+    }
+
+    #[test]
     fn format_tier_violation_messages_are_consistent() {
         let deny = format_tier_violation(Path::new("secret.key"), PathTier::Deny)
             .expect("deny should produce a message");
@@ -567,6 +723,21 @@ mod tests {
         let config = SelfModifyConfig::default();
         let result = validate_glob_patterns(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_deny_paths_are_shared_with_cli_defaults() {
+        let expected: Vec<String> = fx_config::DEFAULT_DENY_PATHS
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect();
+
+        assert_eq!(DEFAULT_DENY_PATHS, fx_config::DEFAULT_DENY_PATHS);
+        assert_eq!(SelfModifyConfig::default().deny_paths, expected);
+        assert_eq!(
+            fx_config::SelfModifyPathsCliConfig::default().deny,
+            expected
+        );
     }
 
     #[test]
