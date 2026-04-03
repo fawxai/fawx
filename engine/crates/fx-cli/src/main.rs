@@ -1123,7 +1123,7 @@ mod tests {
     use std::{
         ffi::OsString,
         fs,
-        path::{Path, PathBuf},
+        path::Path,
         sync::{Mutex, OnceLock},
     };
 
