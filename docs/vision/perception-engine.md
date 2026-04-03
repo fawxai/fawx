@@ -396,7 +396,7 @@ This is where fx-forge connects — same training infrastructure, same signal fl
 
 1. **Capture settings:** 2560x1440 @ 30fps, H.265 CRF 22, YUV 4:2:0. ~1-2 GB/hour. 4TB SSD for a year.
 
-2. **Privacy:** Device-local only. Auto-purge raw video after N days. No input event capture — model learns from visual consequences. FileVault for physical access.
+2. **Privacy:** Device-local only. Planned: auto-purge raw video after N days (not yet implemented). No input event capture — model learns from visual consequences. FileVault for physical access. See privacy section above for full list of planned controls.
 
 3. **Video tokenizer architecture:** Frozen SigLIP encoder → Mamba temporal model → embedding-space prediction loss. Mamba chosen for linear scaling and "carry forward slowly, react to change fast" fit with screen content.
 
@@ -406,7 +406,7 @@ This is where fx-forge connects — same training infrastructure, same signal fl
 
 6. **Multi-monitor:** Primary display only. Add later if the planner needs cross-display context.
 
-7. **Accessibility tree sync:** Separate thread polls at 1-2 Hz. Timestamped JSONL. Offline alignment to video frames at +/- 500ms.
+7. **Accessibility tree sync:** Separate thread polls at 1-2 Hz as a starting point. Timestamped JSONL. Optimal cadence and alignment tolerance are open — likely needs hybrid polling + event-triggered snapshots (see Supervision section).
 
 8. **Latent dimensionality:** Mamba hidden state: model dim 1024, state expansion 16, 4 layers = ~256KB world state. Tune empirically — smallest latent that lets perception head produce accurate scene state.
 
@@ -416,7 +416,7 @@ This is where fx-forge connects — same training infrastructure, same signal fl
 
 - **Skills:** The perception sidecar is consumed via a skill. The planner could be a skill. The LLM decomposition is the existing agentic loop.
 - **fx-forge:** Training pipeline for the tokenizer, perception head, and planner. Same infrastructure as signal flywheel.
-- **AX security model:** Perception data is sensitive. Tripwire boundaries apply. Ripcord can undo actions the planner takes and wipe training data.
+- **AX security model:** Perception data is sensitive. Tripwire boundaries apply. Ripcord can undo planner-initiated file/git actions. Training data purge is a separate control surface to build (see privacy section).
 - **Kernel safety:** The planner's actions go through the same permission/capability gates as any tool call.
 - **WASM skills:** The planner itself could be a WASM skill (if lightweight enough) or a sidecar (if it needs GPU).
 
