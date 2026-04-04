@@ -504,7 +504,17 @@ struct RootTurnCompletionBlock {
     pending_artifact_paths: Vec<String>,
 }
 
-const ROOT_TURN_COMPLETION_RETRY_LIMIT: u8 = 2;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnContractExtraction {
+    contract: Option<RootTurnContract>,
+    deliverable_block_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliverableSectionParse {
+    labels: Vec<String>,
+    block_count: usize,
+}
 
 /// Core orchestrator for the 7-step agentic loop.
 ///
@@ -1969,6 +1979,7 @@ impl LoopEngine {
         let ActionTerminal::Complete { response } = terminal else {
             return ActionNextStep::Finish(terminal);
         };
+        let retry_limit = self.root_turn_completion_retry_limit();
 
         let Some(contract) = self.root_turn_contract.as_mut() else {
             return ActionNextStep::Finish(ActionTerminal::Complete { response });
@@ -1978,8 +1989,7 @@ impl LoopEngine {
             return ActionNextStep::Finish(ActionTerminal::Complete { response });
         };
 
-        let allow_incomplete_terminal =
-            contract.blocked_terminal_attempts >= ROOT_TURN_COMPLETION_RETRY_LIMIT;
+        let allow_incomplete_terminal = contract.blocked_terminal_attempts >= retry_limit;
         let blocked_attempts = if allow_incomplete_terminal {
             contract.blocked_terminal_attempts
         } else {
@@ -1987,7 +1997,7 @@ impl LoopEngine {
                 contract.blocked_terminal_attempts.saturating_add(1);
             contract.blocked_terminal_attempts
         };
-        let retries_remaining = ROOT_TURN_COMPLETION_RETRY_LIMIT.saturating_sub(blocked_attempts);
+        let retries_remaining = retry_limit.saturating_sub(blocked_attempts);
 
         if allow_incomplete_terminal {
             self.emit_signal(
@@ -1996,7 +2006,7 @@ impl LoopEngine {
                 "root turn completion retry cap reached; allowing incomplete terminal response",
                 serde_json::json!({
                     "blocked_attempts": blocked_attempts,
-                    "retry_limit": ROOT_TURN_COMPLETION_RETRY_LIMIT,
+                    "retry_limit": retry_limit,
                     "missing_response_sections": &block.missing_response_sections,
                     "pending_artifact_paths": &block.pending_artifact_paths,
                 }),
@@ -2010,7 +2020,7 @@ impl LoopEngine {
             "blocked terminal completion until root turn deliverables are satisfied",
             serde_json::json!({
                 "blocked_attempts": blocked_attempts,
-                "retry_limit": ROOT_TURN_COMPLETION_RETRY_LIMIT,
+                "retry_limit": retry_limit,
                 "retries_remaining": retries_remaining,
                 "missing_response_sections": &block.missing_response_sections,
                 "pending_artifact_paths": &block.pending_artifact_paths,
@@ -2063,6 +2073,11 @@ impl LoopEngine {
                 "Immediate next action: write the requested artifact to {path} using write_file. Do not do more observation, search, or shell inspection before attempting this write unless the write itself is blocked."
             )
         })
+    }
+
+    fn root_turn_completion_retry_limit(&self) -> u8 {
+        self.current_termination_config()
+            .root_turn_completion_retry_limit
     }
 
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
@@ -2326,29 +2341,49 @@ impl LoopEngine {
             TurnExecutionProfile::Standard => {}
         }
         self.requested_artifact_target = extract_requested_write_target(&user_message);
-        self.root_turn_contract = extract_root_turn_contract(&user_message);
+        let root_turn_contract = extract_root_turn_contract(&user_message);
+        self.root_turn_contract = root_turn_contract.contract;
+        if root_turn_contract.deliverable_block_count > 1 {
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Friction,
+                "multiple Deliverables blocks detected; using the first block only",
+                serde_json::json!({
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                }),
+            );
+        }
         if let Some(contract) = &self.root_turn_contract {
+            let response_sections = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ResponseSection { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::ArtifactWrite { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let artifact_paths = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ArtifactWrite { path, .. } => Some(path.clone()),
+                    RootTurnDeliverable::ResponseSection { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                deliverable_block_count = root_turn_contract.deliverable_block_count,
+                response_sections = ?response_sections,
+                artifact_paths = ?artifact_paths,
+                "extracted root turn completion contract"
+            );
             self.emit_signal(
                 LoopStep::Perceive,
                 SignalKind::Trace,
                 "extracted root turn completion contract",
                 serde_json::json!({
-                    "response_sections": contract
-                        .deliverables
-                        .iter()
-                        .filter_map(|deliverable| match deliverable {
-                            RootTurnDeliverable::ResponseSection { label, .. } => Some(label),
-                            RootTurnDeliverable::ArtifactWrite { .. } => None,
-                        })
-                        .collect::<Vec<_>>(),
-                    "artifact_paths": contract
-                        .deliverables
-                        .iter()
-                        .filter_map(|deliverable| match deliverable {
-                            RootTurnDeliverable::ArtifactWrite { path, .. } => Some(path),
-                            RootTurnDeliverable::ResponseSection { .. } => None,
-                        })
-                        .collect::<Vec<_>>(),
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                    "response_sections": response_sections,
+                    "artifact_paths": artifact_paths,
                 }),
             );
         }
@@ -3709,8 +3744,10 @@ fn prefix_context_contains_recent_write_verb(prefix_context: &str) -> bool {
         .any(|token| VERBS.contains(&token))
 }
 
-fn extract_root_turn_contract(user_message: &str) -> Option<RootTurnContract> {
-    let mut deliverables = extract_deliverable_response_sections(user_message)
+fn extract_root_turn_contract(user_message: &str) -> RootTurnContractExtraction {
+    let deliverable_parse = extract_deliverable_response_sections(user_message);
+    let mut deliverables = deliverable_parse
+        .labels
         .into_iter()
         .map(|label| RootTurnDeliverable::ResponseSection {
             normalized_label: normalize_contract_label(&label),
@@ -3735,49 +3772,64 @@ fn extract_root_turn_contract(user_message: &str) -> Option<RootTurnContract> {
         }
     }
 
-    if deliverables.is_empty() {
-        None
-    } else {
-        Some(RootTurnContract {
+    RootTurnContractExtraction {
+        contract: (!deliverables.is_empty()).then_some(RootTurnContract {
             deliverables,
             blocked_terminal_attempts: 0,
-        })
+        }),
+        deliverable_block_count: deliverable_parse.block_count,
     }
 }
 
 // Only the first explicit `Deliverables:` block becomes the root-turn contract.
 // Later blocks are ignored so the kernel has a single deterministic checklist.
-fn extract_deliverable_response_sections(user_message: &str) -> Vec<String> {
+fn extract_deliverable_response_sections(user_message: &str) -> DeliverableSectionParse {
     let mut lines = user_message.lines().peekable();
+    let mut first_labels = None;
+    let mut block_count = 0;
     while let Some(line) = lines.next() {
         if !line.trim().eq_ignore_ascii_case("deliverables:") {
             continue;
         }
 
-        let mut items = Vec::new();
-        while let Some(next_line) = lines.peek() {
-            let trimmed = next_line.trim();
-            if trimmed.is_empty() {
-                lines.next();
-                if !items.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            let Some(item) = parse_list_item(trimmed) else {
-                break;
-            };
-            items.push(item.to_string());
-            lines.next();
+        block_count += 1;
+        let items = parse_deliverables_block(&mut lines);
+        if first_labels.is_none() {
+            first_labels = Some(items);
         }
-
-        return items
+    }
+    DeliverableSectionParse {
+        labels: first_labels
+            .unwrap_or_default()
             .into_iter()
             .map(|item| sanitize_deliverable_label(&item))
             .filter(|label| !label.is_empty())
-            .collect();
+            .collect(),
+        block_count,
     }
-    Vec::new()
+}
+
+fn parse_deliverables_block<'a, I>(lines: &mut std::iter::Peekable<I>) -> Vec<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut items = Vec::new();
+    while let Some(next_line) = lines.peek() {
+        let trimmed = next_line.trim();
+        if trimmed.is_empty() {
+            lines.next();
+            if !items.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let Some(item) = parse_list_item(trimmed) else {
+            break;
+        };
+        items.push(item.to_string());
+        lines.next();
+    }
+    items
 }
 
 fn parse_list_item(line: &str) -> Option<&str> {

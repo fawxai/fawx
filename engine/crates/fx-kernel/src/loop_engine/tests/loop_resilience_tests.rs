@@ -1836,6 +1836,84 @@ async fn root_turn_contract_retry_cap_allows_incomplete_terminal_response_after_
     );
 }
 
+#[tokio::test]
+async fn root_turn_contract_retry_limit_uses_budget_config() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            root_turn_completion_retry_limit: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine = run_command_observation_engine(config);
+    let incomplete_response = "Still working on it.";
+    let llm = RecordingLlm::ok(vec![
+        text_response(incomplete_response),
+        text_response(incomplete_response),
+    ]);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot(
+                "Continue the milestone.\n\nDeliverables:\n- Plan\n- Verification Report",
+            ),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(complete_response(result), incomplete_response);
+    assert_eq!(
+        llm.requests().len(),
+        2,
+        "a configured retry limit of 1 should allow the second incomplete terminal response"
+    );
+}
+
+#[tokio::test]
+async fn multiple_deliverables_blocks_emit_friction_signal_and_use_first_block_only() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+
+    let _ = engine
+        .perceive(&test_snapshot(
+            "Deliverables:\n- Plan\n\nDeliverables:\n- Verification Report",
+        ))
+        .await
+        .expect("perceive");
+
+    let contract = engine
+        .root_turn_contract
+        .as_ref()
+        .expect("root turn contract");
+    let response_sections = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ResponseSection { label, .. } => Some(label.as_str()),
+            RootTurnDeliverable::ArtifactWrite { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(response_sections, vec!["Plan"]);
+
+    let signals = engine.signals.drain_all();
+    let multiple_blocks = signals
+        .iter()
+        .find(|signal| {
+            signal.step == LoopStep::Perceive
+                && signal.kind == SignalKind::Friction
+                && signal
+                    .message
+                    .contains("multiple Deliverables blocks detected")
+        })
+        .expect("multiple deliverables blocks signal");
+    assert_eq!(
+        multiple_blocks.metadata["deliverable_block_count"]
+            .as_u64()
+            .expect("block count"),
+        2
+    );
+}
+
 #[test]
 fn recent_write_verb_matcher_ignores_substring_hits() {
     assert!(prefix_context_contains_recent_write_verb(
@@ -1859,6 +1937,57 @@ fn extract_requested_write_target_requires_a_standalone_write_verb() {
     assert_eq!(
         extract_requested_write_target("This is unsafe to ~/.fawx/test-note.md"),
         None
+    );
+}
+
+#[test]
+fn root_turn_contract_progress_handles_partial_multi_artifact_writes() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.root_turn_contract = Some(RootTurnContract {
+        deliverables: vec![
+            RootTurnDeliverable::ArtifactWrite {
+                path: "~/.fawx/first.md".to_string(),
+                satisfied: false,
+            },
+            RootTurnDeliverable::ArtifactWrite {
+                path: "~/.fawx/second.md".to_string(),
+                satisfied: false,
+            },
+        ],
+        blocked_terminal_attempts: 0,
+    });
+
+    engine.record_root_turn_contract_progress(&[
+        ToolResult {
+            tool_call_id: "write-1".to_string(),
+            tool_name: "write_file".to_string(),
+            success: true,
+            output: "wrote 14 bytes to ~/.fawx/first.md".to_string(),
+        },
+        ToolResult {
+            tool_call_id: "write-2".to_string(),
+            tool_name: "write_file".to_string(),
+            success: true,
+            output: "wrote 7 bytes to ./unrelated.txt".to_string(),
+        },
+    ]);
+
+    let contract = engine
+        .root_turn_contract
+        .as_ref()
+        .expect("root turn contract");
+    assert_eq!(
+        contract.deliverables,
+        vec![
+            RootTurnDeliverable::ArtifactWrite {
+                path: "~/.fawx/first.md".to_string(),
+                satisfied: true,
+            },
+            RootTurnDeliverable::ArtifactWrite {
+                path: "~/.fawx/second.md".to_string(),
+                satisfied: false,
+            },
+        ]
     );
 }
 
