@@ -206,6 +206,10 @@ impl OpenAiProvider {
         "https://openrouter.ai/api"
     }
 
+    pub const fn fireworks_base_url() -> &'static str {
+        "https://api.fireworks.ai/inference"
+    }
+
     /// Create a new OpenAI-compatible provider.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
         Self::compatible(base_url, api_key, "openai-compatible")
@@ -245,6 +249,18 @@ impl OpenAiProvider {
             api_key.into(),
             OpenAiCatalogKind::OpenRouter,
             "openrouter".to_string(),
+        )
+    }
+
+    pub fn fireworks(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::Compatible,
+            "fireworks".to_string(),
         )
     }
 

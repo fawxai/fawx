@@ -372,6 +372,9 @@ fn catalog_provider(
                 .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
                 .map_err(|error| format!("failed to build provider metadata: {error}"))
         }
+        "fireworks" => OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+            .map_err(|error| format!("failed to build provider metadata: {error}")),
         _ => Ok(Box::new(UnknownCatalogProvider::new(&provider_name))),
     }
 }

@@ -14,6 +14,7 @@ enum SetupStep: Int, CaseIterable, Identifiable, Sendable {
 enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
     case anthropic
     case openai
+    case fireworks
 
     var id: String { rawValue }
 
@@ -23,6 +24,8 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
             "Claude"
         case .openai:
             "ChatGPT"
+        case .fireworks:
+            "Fireworks"
         }
     }
 
@@ -32,6 +35,8 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
             "Anthropic"
         case .openai:
             "OpenAI"
+        case .fireworks:
+            "Fireworks AI"
         }
     }
 
@@ -173,6 +178,8 @@ final class SetupViewModel {
             "Paste your Anthropic API key"
         case (.openai, _):
             "Paste your OpenAI API key"
+        case (.fireworks, _):
+            "Paste your Fireworks API key"
         }
     }
 

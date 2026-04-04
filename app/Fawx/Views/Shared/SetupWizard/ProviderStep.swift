@@ -16,7 +16,7 @@ struct ProviderStep: View {
                 ForEach(SetupProvider.allCases) { provider in
                     SetupChoiceCard(
                         isSelected: viewModel.selectedProvider == provider,
-                        iconText: provider == .anthropic ? "A" : "O",
+                        iconText: providerIconText(provider),
                         title: provider.displayName,
                         subtitle: provider.companyName,
                         action: {
@@ -155,5 +155,16 @@ struct ProviderStep: View {
             }
             .disabled(viewModel.isRefreshing)
         }
+    }
+}
+
+private func providerIconText(_ provider: SetupProvider) -> String {
+    switch provider {
+    case .anthropic:
+        "A"
+    case .openai:
+        "O"
+    case .fireworks:
+        "F"
     }
 }
