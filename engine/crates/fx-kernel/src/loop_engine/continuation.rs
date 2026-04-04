@@ -38,7 +38,13 @@ pub(super) fn render_turn_commitment_directive(commitment: &TurnCommitment) -> S
             );
             directive.push_str(&format!("Committed goal: {}\n", commitment.goal));
             directive.push_str(
-                "Required behavior:\n- Continue with concrete action instead of reopening broad research or re-verifying already-established facts.\n- Stay within the committed tool surface.\n- Ask the user one concise blocking question only if you cannot proceed within these constraints.\n",
+                "Required behavior:\n- Continue with concrete action instead of reopening broad research or re-verifying already-established facts.\n",
+            );
+            if commitment.allowed_tools.is_some() {
+                directive.push_str("- Stay within the committed tool surface.\n");
+            }
+            directive.push_str(
+                "- Ask the user one concise blocking question only if you cannot proceed within these constraints.\n",
             );
             if let Some(scope) = &commitment.allowed_tools {
                 directive.push_str(&format!(
@@ -119,8 +125,7 @@ fn decision_execution_goal(decision: &Decision) -> String {
 fn constrained_execution_success_target(scope: &ContinuationToolScope) -> String {
     match scope {
         ContinuationToolScope::Full => {
-            "Continue making concrete progress on the active task without reopening broad research."
-                .to_string()
+            "Use the current tool evidence to either complete the user's request or take the next concrete execution step. Do not stop at a progress-only summary.".to_string()
         }
         ContinuationToolScope::MutationOnly => {
             "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research."
@@ -137,16 +142,20 @@ pub(super) fn tool_continuation_turn_commitment(
     decision: &Decision,
     next_tool_scope: Option<&ContinuationToolScope>,
 ) -> Option<TurnCommitment> {
-    let allowed_tools = next_tool_scope
+    let scope = next_tool_scope
         .cloned()
-        .filter(|scope| !matches!(scope, ContinuationToolScope::Full))?;
+        .unwrap_or(ContinuationToolScope::Full);
+    let allowed_tools = match &scope {
+        ContinuationToolScope::Full => None,
+        _ => Some(scope.clone()),
+    };
     Some(TurnCommitment::ProceedUnderConstraints(
         ProceedUnderConstraints {
             goal: decision_execution_goal(decision),
-            success_target: Some(constrained_execution_success_target(&allowed_tools)),
+            success_target: Some(constrained_execution_success_target(&scope)),
             unsupported_items: Vec::new(),
             assumptions: Vec::new(),
-            allowed_tools: Some(allowed_tools),
+            allowed_tools,
         },
     ))
 }

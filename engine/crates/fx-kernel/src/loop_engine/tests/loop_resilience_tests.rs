@@ -1627,6 +1627,279 @@ async fn observation_tool_continuation_requests_mutation_only_next() {
 }
 
 #[tokio::test]
+async fn mutation_tool_continuation_commits_next_turn_without_restricting_tool_surface() {
+    let mut engine = run_command_observation_engine(BudgetConfig::default());
+    let decision = Decision::UseTools(vec![ToolCall {
+        id: "call-1".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({"command":"git pull"}),
+    }]);
+    let llm = SequentialMockLlm::new(vec![text_response(
+        "The repo is updated; I'll continue with the milestone.",
+    )]);
+
+    let action = engine
+        .act(
+            &decision,
+            &llm,
+            &[Message::user(
+                "Switch to dev, pull, and continue working on the milestone.",
+            )],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act should succeed");
+
+    match action.next_step {
+        ActionNextStep::Continue(continuation) => {
+            assert_eq!(continuation.next_tool_scope, None);
+            assert_eq!(
+                continuation.turn_commitment,
+                Some(TurnCommitment::ProceedUnderConstraints(
+                    ProceedUnderConstraints {
+                        goal: "Continue the active task with concrete execution using the selected tools: run_command".to_string(),
+                        success_target: Some(
+                            "Use the current tool evidence to either complete the user's request or take the next concrete execution step. Do not stop at a progress-only summary.".to_string()
+                        ),
+                        unsupported_items: Vec::new(),
+                        assumptions: Vec::new(),
+                        allowed_tools: None,
+                    }
+                ))
+            );
+        }
+        other => panic!("expected continuation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mutation_follow_up_injects_full_scope_turn_commitment_into_next_reasoning_pass() {
+    let mut engine = run_command_observation_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![ToolCall {
+            id: "cmd-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command":"git pull"}),
+        }]),
+        text_response("The repo is updated; I'll continue with the milestone."),
+        text_response("done"),
+    ]);
+
+    let _ = engine
+        .run_cycle(
+            test_snapshot("Switch to dev, pull, and continue working on the milestone."),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3);
+    let system_prompt = requests[2].system_prompt.as_deref().expect("system prompt");
+    assert!(system_prompt.contains("Turn commitment:"));
+    assert!(system_prompt.contains(
+        "Continue the active task with concrete execution using the selected tools: run_command"
+    ));
+    assert!(system_prompt.contains(
+        "Use the current tool evidence to either complete the user's request or take the next concrete execution step."
+    ));
+    assert!(
+        requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_command"),
+        "full-scope continuation should preserve the broader tool surface"
+    );
+}
+
+#[tokio::test]
+async fn observation_follow_up_still_injects_mutation_commitment_into_next_reasoning_pass() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![ToolCall {
+            id: "cmd-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]),
+        text_response("I have enough context to implement the next step."),
+        text_response("done"),
+    ]);
+
+    let _ = engine
+        .run_cycle(
+            test_snapshot("Inspect README.md, then continue with implementation."),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3);
+    let system_prompt = requests[2].system_prompt.as_deref().expect("system prompt");
+    assert!(system_prompt.contains("Turn commitment:"));
+    assert!(system_prompt.contains(
+        "Use a side-effect-capable tool to make concrete forward progress before doing any more broad research."
+    ));
+    assert!(
+        requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "write_file"),
+        "mutation tools should stay available under the carried commitment"
+    );
+    assert!(
+        !requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file"),
+        "read-only inspection should stay hidden under the carried mutation-only commitment"
+    );
+}
+
+#[tokio::test]
+async fn explicit_deliverables_block_progress_only_terminal_response_after_tool_continuation() {
+    let mut engine = run_command_observation_engine(BudgetConfig::default());
+    let final_response = "\
+**Plan**
+- Implement the root-turn completion gate.
+
+**Decision Log**
+- Persist an explicit root-turn contract.
+
+**Delegation Log If Any**
+- None.
+
+**Verification Report**
+- Focused regression coverage passed.
+
+**Final Milestone Judgment**
+- fixed";
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![ToolCall {
+            id: "cmd-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command":"git pull"}),
+        }]),
+        text_response("The repo is updated; I'll continue with the milestone."),
+        text_response(final_response),
+    ]);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot(
+                "Switch to dev, pull, and continue the milestone.\n\nDeliverables:\n- Plan\n- Decision Log\n- Delegation Log If Any\n- Verification Report\n- Final Milestone Judgment",
+            ),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(complete_response(result), final_response);
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the progress-only summary should not terminate the turn"
+    );
+    let system_prompt = requests[2].system_prompt.as_deref().expect("system prompt");
+    assert!(system_prompt.contains("Root turn completion contract:"));
+    assert!(system_prompt.contains("Plan"));
+    assert!(system_prompt.contains("Final Milestone Judgment"));
+}
+
+#[tokio::test]
+async fn requested_artifact_write_blocks_terminal_response_until_file_is_written() {
+    #[derive(Debug, Default)]
+    struct ArtifactAwareWriteExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ArtifactAwareWriteExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| {
+                    let output = match call.name.as_str() {
+                        "write_file" => {
+                            let path = call
+                                .arguments
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .expect("write_file path");
+                            format!("wrote 14 bytes to {path}")
+                        }
+                        other => format!("unsupported tool: {other}"),
+                    };
+                    ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output,
+                    }
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+            match tool_name {
+                "write_file" => crate::act::ToolCacheability::SideEffect,
+                _ => crate::act::ToolCacheability::NeverCache,
+            }
+        }
+    }
+
+    let mut engine = mixed_tool_engine_with_executor(
+        BudgetConfig::default(),
+        Arc::new(ArtifactAwareWriteExecutor),
+    );
+    let llm = RecordingLlm::ok(vec![
+        text_response("I'll write the note next."),
+        tool_use_response(vec![ToolCall {
+            id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"~/.fawx/test-note.md",
+                "content":"artifact note",
+            }),
+        }]),
+        text_response("Wrote the note."),
+        text_response("Wrote the note."),
+    ]);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot("Write a short note to ~/.fawx/test-note.md and tell me when it's done."),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(complete_response(result), "Wrote the note.");
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "the turn should continue until the requested artifact is written"
+    );
+    assert!(requests[1]
+        .system_prompt
+        .as_deref()
+        .expect("system prompt")
+        .contains("~/.fawx/test-note.md"));
+}
+
+#[tokio::test]
 async fn read_only_follow_up_uses_structured_tool_evidence_for_root_reasoning() {
     let baseline = "README intro\nACTUAL FINAL LINE";
     let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
