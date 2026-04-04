@@ -10,19 +10,21 @@ final class SetupViewModelTests: XCTestCase {
 
         let sut = SetupViewModel(
             appState: appState,
-            completeLocalSetupAction: { progress in
-                bootstrapCallCount += 1
-                progress("Starting Fawx server...")
-                try await appState.savePairing(
-                    serverURLString: "http://127.0.0.1:8400",
-                    token: "local-token",
-                    deviceName: "Setup Test Mac",
-                    connectionMode: .local
-                )
-            },
             refreshPhase4StateAction: {
                 refreshCallCount += 1
                 appState.setupStatus = Self.makeSetupStatus(providersConfigured: [])
+            },
+            providerBootstrapAction: { progress in
+                bootstrapCallCount += 1
+                progress("Starting Fawx server...")
+                return BootstrapResult(
+                    port: 8400,
+                    host: "127.0.0.1",
+                    bearerToken: "local-token",
+                    dataDir: "/Users/test/.fawx",
+                    configPath: "/Users/test/.fawx/config.toml",
+                    created: true
+                )
             }
         )
         sut.step = .provider
@@ -33,7 +35,6 @@ final class SetupViewModelTests: XCTestCase {
 
         XCTAssertEqual(bootstrapCallCount, 1)
         XCTAssertEqual(refreshCallCount, 1)
-        XCTAssertTrue(appState.isConfigured)
         XCTAssertEqual(sut.providerStatusKind, .idle)
         XCTAssertNil(sut.providerStatusMessage)
         XCTAssertNil(sut.bootstrapProgress)
@@ -76,11 +77,11 @@ final class SetupViewModelTests: XCTestCase {
 
         let sut = SetupViewModel(
             appState: appState,
-            completeLocalSetupAction: { _ in
-                throw TestError()
-            },
             refreshPhase4StateAction: {
                 refreshCallCount += 1
+            },
+            providerBootstrapAction: { _ in
+                throw TestError()
             }
         )
         sut.step = .provider
@@ -91,6 +92,28 @@ final class SetupViewModelTests: XCTestCase {
         XCTAssertEqual(sut.providerStatusKind, .failure)
         XCTAssertEqual(sut.providerStatusMessage, "Could not start the server: Network unavailable")
         XCTAssertNil(sut.bootstrapProgress)
+    }
+
+    func testSelectingFireworksForcesAPIKeyAuthMethod() {
+        let sut = SetupViewModel(appState: makeAppState())
+
+        sut.selectProvider(.fireworks)
+
+        XCTAssertEqual(sut.selectedAuthMethod, .apiKey)
+        XCTAssertEqual(sut.availableAuthMethods, [.apiKey])
+        XCTAssertFalse(sut.supportsSubscriptionFlow)
+        XCTAssertEqual(sut.providerActionTitle, "Save API Key")
+        XCTAssertEqual(sut.providerFieldTitle, "API Key")
+        XCTAssertEqual(sut.providerFieldPrompt, "Paste your Fireworks API key")
+    }
+
+    func testSelectingUnsupportedAuthMethodFallsBackToProviderDefault() {
+        let sut = SetupViewModel(appState: makeAppState())
+        sut.selectProvider(.fireworks)
+
+        sut.selectAuthMethod(.subscription)
+
+        XCTAssertEqual(sut.selectedAuthMethod, .apiKey)
     }
 
     private func makeAppState() -> AppState {

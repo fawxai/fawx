@@ -9,7 +9,7 @@ struct ProviderStep: View {
         SetupWizardCard(maxWidth: 520) {
             SetupWizardHeader(
                 title: "Add an AI Provider",
-                detail: "Connect Claude or ChatGPT so your local server is ready to chat."
+                detail: "Connect Claude, ChatGPT, or Fireworks so your local server is ready to chat."
             )
 
             VStack(spacing: FawxSpacing.paddingMD) {
@@ -32,7 +32,7 @@ struct ProviderStep: View {
                     .font(FawxTypography.sidebarTitle)
                     .foregroundStyle(Color.fawxText)
 
-                ForEach(SetupProviderAuthMethod.allCases) { method in
+                ForEach(viewModel.availableAuthMethods) { method in
                     SetupRadioRow(
                         isSelected: viewModel.selectedAuthMethod == method,
                         title: method.title,

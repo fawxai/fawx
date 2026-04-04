@@ -24,7 +24,7 @@ struct WelcomeStep: View {
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
 
-                    Text("Fawx runs on your Mac and connects to Claude or ChatGPT. Your conversations stay on your hardware. No cloud required.")
+                    Text("Fawx runs on your Mac and connects to Claude, ChatGPT, or Fireworks. Your conversations stay on your hardware. No cloud required.")
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
                         .multilineTextAlignment(.center)

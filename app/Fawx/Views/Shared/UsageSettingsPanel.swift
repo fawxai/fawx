@@ -177,6 +177,8 @@ struct UsageSettingsPanel: View {
             "Google"
         case "openrouter":
             "OpenRouter"
+        case "fireworks":
+            "Fireworks"
         default:
             provider
                 .replacingOccurrences(of: "-", with: " ")

@@ -19,6 +19,8 @@ struct AuthProvider: Codable, Identifiable, Sendable, Hashable {
             return "Google"
         case "openrouter":
             return "OpenRouter"
+        case "fireworks":
+            return "Fireworks"
         default:
             return provider
                 .replacingOccurrences(of: "-", with: " ")

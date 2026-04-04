@@ -40,7 +40,7 @@ struct AuthStatusList: View {
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxText)
 
-                    Text("Add Claude or ChatGPT credentials here instead of dropping to setup commands. GitHub PAT management lives below for git push and pull request creation.")
+                    Text("Add Claude, ChatGPT, or Fireworks credentials here instead of dropping to setup commands. GitHub PAT management lives below for git push and pull request creation.")
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
                 }
@@ -689,7 +689,7 @@ private struct ProviderManagementSheet: View {
         self.appState = appState
         self.initialProvider = initialProvider
         _selectedProvider = State(initialValue: initialProvider)
-        _selectedAuthMethod = State(initialValue: .subscription)
+        _selectedAuthMethod = State(initialValue: initialProvider.defaultAuthMethod)
         _configuredProviderIDs = State(
             initialValue: Set(appState.authProviders.filter(\.isConfigured).map { $0.provider.lowercased() })
         )
@@ -722,7 +722,7 @@ private struct ProviderManagementSheet: View {
                         .foregroundStyle(Color.fawxText)
 
                     Picker("Authentication", selection: $selectedAuthMethod) {
-                        ForEach(SetupProviderAuthMethod.allCases) { method in
+                        ForEach(selectedProvider.supportedAuthMethods) { method in
                             Text(method.title).tag(method)
                         }
                     }
@@ -757,6 +757,9 @@ private struct ProviderManagementSheet: View {
             }
         }
         .frame(minWidth: 460, minHeight: 420)
+        .onChange(of: selectedProvider) { _, newProvider in
+            selectedAuthMethod = normalizedAuthMethod(for: newProvider, requested: selectedAuthMethod)
+        }
     }
 
     private var isConfigured: Bool {
@@ -848,6 +851,8 @@ private struct ProviderManagementSheet: View {
             return "Paste the Anthropic setup token"
         } else if selectedProvider == .anthropic {
             return "Paste your Anthropic API key"
+        } else if selectedProvider == .fireworks {
+            return "Paste your Fireworks API key"
         }
         return "Paste your OpenAI API key"
     }
@@ -881,16 +886,16 @@ private struct ProviderManagementSheet: View {
 
         do {
             let response: ProviderAuthActionResponse
-            switch (selectedProvider, selectedAuthMethod) {
-            case (.anthropic, .subscription):
+            switch selectedAuthMethod {
+            case .subscription where selectedProvider == .anthropic:
                 response = try await appState.storeAnthropicSetupToken(trimmedCredential)
-            case (_, .apiKey):
+            case .subscription where selectedProvider == .openai:
+                return
+            case .subscription, .apiKey:
                 response = try await appState.storeProviderAPIKey(
                     provider: selectedProvider.providerID,
                     apiKey: trimmedCredential
                 )
-            case (.openai, .subscription):
-                return
             }
 
             configuredProviderIDs.insert(selectedProvider.providerID)
@@ -911,6 +916,13 @@ private struct ProviderManagementSheet: View {
             appState.showToast(message: error.localizedDescription, style: .error)
             await appState.noteRecoverableRequestFailure(error)
         }
+    }
+
+    private func normalizedAuthMethod(
+        for provider: SetupProvider,
+        requested method: SetupProviderAuthMethod
+    ) -> SetupProviderAuthMethod {
+        provider.supportsAuthMethod(method) ? method : provider.defaultAuthMethod
     }
 
     private func verifySelectedProvider() async {

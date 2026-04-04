@@ -43,6 +43,23 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
     var providerID: String {
         rawValue
     }
+
+    var supportedAuthMethods: [SetupProviderAuthMethod] {
+        switch self {
+        case .anthropic, .openai:
+            [.subscription, .apiKey]
+        case .fireworks:
+            [.apiKey]
+        }
+    }
+
+    var defaultAuthMethod: SetupProviderAuthMethod {
+        supportedAuthMethods[0]
+    }
+
+    func supportsAuthMethod(_ method: SetupProviderAuthMethod) -> Bool {
+        supportedAuthMethods.contains(method)
+    }
 }
 
 enum SetupProviderAuthMethod: String, CaseIterable, Identifiable, Sendable {
@@ -66,6 +83,7 @@ enum SetupProviderAuthMethod: String, CaseIterable, Identifiable, Sendable {
 final class SetupViewModel {
     typealias LocalSetupAction = (@escaping @MainActor @Sendable (String) -> Void) async throws -> Void
     typealias Phase4StateRefreshAction = () async -> Void
+    typealias ProviderBootstrapAction = (@escaping @MainActor @Sendable (String) -> Void) async throws -> BootstrapResult
 
     var step: SetupStep = .welcome
     var selectedProvider: SetupProvider = .anthropic
@@ -86,12 +104,14 @@ final class SetupViewModel {
     private let appState: AppState
     private let completeLocalSetupAction: LocalSetupAction
     private let refreshPhase4StateAction: Phase4StateRefreshAction
+    private let providerBootstrapAction: ProviderBootstrapAction
     private var attemptedCertificateHostname: String?
 
     init(
         appState: AppState,
         completeLocalSetupAction: LocalSetupAction? = nil,
-        refreshPhase4StateAction: Phase4StateRefreshAction? = nil
+        refreshPhase4StateAction: Phase4StateRefreshAction? = nil,
+        providerBootstrapAction: ProviderBootstrapAction? = nil
     ) {
         self.appState = appState
         self.completeLocalSetupAction = completeLocalSetupAction ?? { progress in
@@ -99,6 +119,10 @@ final class SetupViewModel {
         }
         self.refreshPhase4StateAction = refreshPhase4StateAction ?? {
             await appState.refreshPhase4State()
+        }
+        self.providerBootstrapAction = providerBootstrapAction ?? { progress in
+            let service = LocalBootstrapService()
+            return try await service.performFullBootstrap(progress: progress)
         }
     }
 
@@ -129,7 +153,7 @@ final class SetupViewModel {
     }
 
     var supportsSubscriptionFlow: Bool {
-        selectedProvider == .anthropic || selectedProvider == .openai
+        selectedProvider.supportsAuthMethod(.subscription)
     }
 
     var usesOAuthSubscriptionFlow: Bool {
@@ -149,36 +173,40 @@ final class SetupViewModel {
     }
 
     var providerActionTitle: String {
-        switch (selectedProvider, selectedAuthMethod) {
-        case (.anthropic, .subscription):
-            "Save Setup Token"
-        case (_, .apiKey):
+        switch selectedAuthMethod {
+        case .apiKey:
             "Save API Key"
-        case (.openai, .subscription):
+        case .subscription where selectedProvider == .anthropic:
+            "Save Setup Token"
+        case .subscription where selectedProvider == .openai:
             "Sign in with ChatGPT"
+        case .subscription:
+            "Save API Key"
         }
     }
 
     var providerFieldTitle: String {
-        switch (selectedProvider, selectedAuthMethod) {
-        case (.anthropic, .subscription):
-            "Setup Token"
-        case (_, .apiKey):
+        switch selectedAuthMethod {
+        case .apiKey:
             "API Key"
-        case (.openai, .subscription):
+        case .subscription where selectedProvider == .anthropic:
+            "Setup Token"
+        case .subscription where selectedProvider == .openai:
+            "API Key"
+        case .subscription:
             "API Key"
         }
     }
 
     var providerFieldPrompt: String {
-        switch (selectedProvider, selectedAuthMethod) {
-        case (.anthropic, .subscription):
+        switch selectedProvider {
+        case .anthropic where selectedAuthMethod == .subscription:
             "Paste the Anthropic setup token"
-        case (.anthropic, .apiKey):
+        case .anthropic:
             "Paste your Anthropic API key"
-        case (.openai, _):
+        case .openai:
             "Paste your OpenAI API key"
-        case (.fireworks, _):
+        case .fireworks:
             "Paste your Fireworks API key"
         }
     }
@@ -244,13 +272,14 @@ final class SetupViewModel {
 
     func selectProvider(_ provider: SetupProvider) {
         selectedProvider = provider
+        selectedAuthMethod = normalizedAuthMethod(for: provider, requested: selectedAuthMethod)
         credentialInput = ""
         providerStatusKind = .idle
         providerStatusMessage = nil
     }
 
     func selectAuthMethod(_ method: SetupProviderAuthMethod) {
-        selectedAuthMethod = method
+        selectedAuthMethod = normalizedAuthMethod(for: selectedProvider, requested: method)
         credentialInput = ""
         providerStatusKind = .idle
         providerStatusMessage = nil
@@ -269,14 +298,14 @@ final class SetupViewModel {
 
         do {
             let response: ProviderAuthActionResponse
-            switch (selectedProvider, selectedAuthMethod) {
-            case (.anthropic, .subscription):
+            switch selectedAuthMethod {
+            case .subscription where selectedProvider == .anthropic:
                 response = try await appState.storeAnthropicSetupToken(trimmedCredential)
-            case (.openai, .subscription):
+            case .subscription where selectedProvider == .openai:
                 providerStatusKind = .warning
                 providerStatusMessage = "Use Sign in with ChatGPT to connect your subscription."
                 return
-            case (_, .apiKey):
+            case .subscription, .apiKey:
                 response = try await appState.storeProviderAPIKey(
                     provider: selectedProvider.providerID,
                     apiKey: trimmedCredential
@@ -507,8 +536,7 @@ final class SetupViewModel {
         bootstrapProgress = "Starting Fawx server..."
 
         do {
-            let service = LocalBootstrapService()
-            let result = try await service.performFullBootstrap { [weak self] message in
+            let result = try await providerBootstrapAction { [weak self] message in
                 self?.bootstrapProgress = message
             }
             try await appState.configureClientForBootstrap(
@@ -536,5 +564,16 @@ final class SetupViewModel {
         let nsError = error as NSError
         return nsError.domain == ASWebAuthenticationSessionErrorDomain
             && nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
+    }
+
+    var availableAuthMethods: [SetupProviderAuthMethod] {
+        selectedProvider.supportedAuthMethods
+    }
+
+    private func normalizedAuthMethod(
+        for provider: SetupProvider,
+        requested method: SetupProviderAuthMethod
+    ) -> SetupProviderAuthMethod {
+        provider.supportsAuthMethod(method) ? method : provider.defaultAuthMethod
     }
 }
