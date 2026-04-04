@@ -114,6 +114,7 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "google/gemini-2.0-flash-001",
 ];
 const DEFAULT_FIREWORKS_MODELS: &[&str] = &[
+    "accounts/fireworks/models/kimi-k2-5-turbo",
     "accounts/fireworks/models/llama-v3p1-405b-instruct",
     "accounts/fireworks/models/llama-v3p1-70b-instruct",
     "accounts/fireworks/models/deepseek-v3",
