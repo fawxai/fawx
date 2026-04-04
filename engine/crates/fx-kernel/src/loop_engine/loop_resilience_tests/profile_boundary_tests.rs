@@ -55,6 +55,7 @@ fn tightened_termination_config_values_match_expected() {
         tool_round_strip_after_nudge: 100,
         observation_only_round_nudge_after: 100,
         observation_only_round_strip_after_nudge: 100,
+        root_turn_completion_retry_limit: 100,
     };
 
     let bounded = TurnExecutionProfile::BoundedLocal

@@ -480,6 +480,42 @@ enum ExecutionVisibility {
     Internal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnContract {
+    deliverables: Vec<RootTurnDeliverable>,
+    blocked_terminal_attempts: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootTurnDeliverable {
+    ResponseSection {
+        label: String,
+        normalized_label: String,
+    },
+    ArtifactWrite {
+        path: String,
+        satisfied: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnCompletionBlock {
+    missing_response_sections: Vec<String>,
+    pending_artifact_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnContractExtraction {
+    contract: Option<RootTurnContract>,
+    deliverable_block_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliverableSectionParse {
+    labels: Vec<String>,
+    block_count: usize,
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but context compaction
@@ -540,6 +576,8 @@ pub struct LoopEngine {
     pending_tool_scope: Option<ContinuationToolScope>,
     /// Optional typed turn commitment for the next root reasoning pass.
     pending_turn_commitment: Option<TurnCommitment>,
+    /// Typed completion contract for the active root turn, when the prompt declares one.
+    root_turn_contract: Option<RootTurnContract>,
     /// Explicit artifact path requested by the user for this turn, if any.
     requested_artifact_target: Option<String>,
     /// Active gate requiring the next root pass to write the requested artifact first.
@@ -594,6 +632,7 @@ impl std::fmt::Debug for LoopEngine {
             )
             .field("pending_tool_scope", &self.pending_tool_scope)
             .field("pending_turn_commitment", &self.pending_turn_commitment)
+            .field("root_turn_contract", &self.root_turn_contract)
             .field("requested_artifact_target", &self.requested_artifact_target)
             .field(
                 "pending_artifact_write_target",
@@ -881,6 +920,7 @@ impl LoopEngineBuilder {
             pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
+            root_turn_contract: None,
             requested_artifact_target: None,
             pending_artifact_write_target: None,
             last_turn_state_progress: None,
@@ -1422,16 +1462,23 @@ impl LoopEngine {
                 self.budget.record(&action_cost);
             }
 
+            self.record_root_turn_contract_progress(&action.tool_results);
+
             let continuation = match action.next_step.clone() {
                 ActionNextStep::Finish(terminal) => {
                     let terminal = self.apply_decomposition_terminal_fallback(
                         terminal,
                         processed.context_window.last(),
                     );
-                    return Ok(self.finish_streaming_result(
-                        self.loop_result_from_action_terminal(terminal, state.tokens),
-                        stream,
-                    ));
+                    match self.guard_root_turn_terminal_completion(terminal) {
+                        ActionNextStep::Finish(terminal) => {
+                            return Ok(self.finish_streaming_result(
+                                self.loop_result_from_action_terminal(terminal, state.tokens),
+                                stream,
+                            ));
+                        }
+                        ActionNextStep::Continue(continuation) => continuation,
+                    }
                 }
                 ActionNextStep::Continue(continuation) => continuation,
             };
@@ -1710,6 +1757,7 @@ impl LoopEngine {
         self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
+        self.root_turn_contract = None;
         self.requested_artifact_target = None;
         self.pending_artifact_write_target = None;
         self.last_turn_state_progress = None;
@@ -1900,6 +1948,95 @@ impl LoopEngine {
         }
     }
 
+    fn record_root_turn_contract_progress(&mut self, tool_results: &[ToolResult]) {
+        let Some(contract) = self.root_turn_contract.as_mut() else {
+            return;
+        };
+
+        let mut satisfied_paths = Vec::new();
+        for deliverable in &mut contract.deliverables {
+            let RootTurnDeliverable::ArtifactWrite { path, satisfied } = deliverable else {
+                continue;
+            };
+            if *satisfied || !artifact_write_completed(path, tool_results) {
+                continue;
+            }
+            *satisfied = true;
+            satisfied_paths.push(path.clone());
+        }
+
+        if !satisfied_paths.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "root turn artifact deliverable satisfied",
+                serde_json::json!({ "paths": satisfied_paths }),
+            );
+        }
+    }
+
+    fn guard_root_turn_terminal_completion(&mut self, terminal: ActionTerminal) -> ActionNextStep {
+        let ActionTerminal::Complete { response } = terminal else {
+            return ActionNextStep::Finish(terminal);
+        };
+        let retry_limit = self.root_turn_completion_retry_limit();
+
+        let Some(contract) = self.root_turn_contract.as_mut() else {
+            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+        };
+
+        let Some(block) = root_turn_completion_block(contract, &response) else {
+            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+        };
+
+        let allow_incomplete_terminal = contract.blocked_terminal_attempts >= retry_limit;
+        let blocked_attempts = if allow_incomplete_terminal {
+            contract.blocked_terminal_attempts
+        } else {
+            contract.blocked_terminal_attempts =
+                contract.blocked_terminal_attempts.saturating_add(1);
+            contract.blocked_terminal_attempts
+        };
+        let retries_remaining = retry_limit.saturating_sub(blocked_attempts);
+
+        if allow_incomplete_terminal {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "root turn completion retry cap reached; allowing incomplete terminal response",
+                serde_json::json!({
+                    "blocked_attempts": blocked_attempts,
+                    "retry_limit": retry_limit,
+                    "missing_response_sections": &block.missing_response_sections,
+                    "pending_artifact_paths": &block.pending_artifact_paths,
+                }),
+            );
+            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+        }
+
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "blocked terminal completion until root turn deliverables are satisfied",
+            serde_json::json!({
+                "blocked_attempts": blocked_attempts,
+                "retry_limit": retry_limit,
+                "retries_remaining": retries_remaining,
+                "missing_response_sections": &block.missing_response_sections,
+                "pending_artifact_paths": &block.pending_artifact_paths,
+            }),
+        );
+
+        let mut context_messages = vec![Message::assistant(response.clone())];
+        context_messages.push(Message::system(render_root_turn_retry_directive(
+            &block,
+            retries_remaining,
+        )));
+        ActionNextStep::Continue(
+            ActionContinuation::new(Some(response), None).with_context_messages(context_messages),
+        )
+    }
+
     fn current_reasoning_tool_definitions(&self, should_strip_tools: bool) -> Vec<ToolDefinition> {
         let base = if should_strip_tools {
             let limited_tools = self.progress_limited_tool_definitions();
@@ -1924,12 +2061,23 @@ impl LoopEngine {
             .map(render_turn_commitment_directive)
     }
 
+    fn root_turn_contract_directive(&self) -> Option<String> {
+        self.root_turn_contract
+            .as_ref()
+            .map(render_root_turn_contract_directive)
+    }
+
     fn pending_artifact_write_directive(&self) -> Option<String> {
         self.pending_artifact_write_target.as_ref().map(|path| {
             format!(
                 "Immediate next action: write the requested artifact to {path} using write_file. Do not do more observation, search, or shell inspection before attempting this write unless the write itself is blocked."
             )
         })
+    }
+
+    fn root_turn_completion_retry_limit(&self) -> u8 {
+        self.current_termination_config()
+            .root_turn_completion_retry_limit
     }
 
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
@@ -2193,6 +2341,52 @@ impl LoopEngine {
             TurnExecutionProfile::Standard => {}
         }
         self.requested_artifact_target = extract_requested_write_target(&user_message);
+        let root_turn_contract = extract_root_turn_contract(&user_message);
+        self.root_turn_contract = root_turn_contract.contract;
+        if root_turn_contract.deliverable_block_count > 1 {
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Friction,
+                "multiple Deliverables blocks detected; using the first block only",
+                serde_json::json!({
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                }),
+            );
+        }
+        if let Some(contract) = &self.root_turn_contract {
+            let response_sections = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ResponseSection { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::ArtifactWrite { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let artifact_paths = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ArtifactWrite { path, .. } => Some(path.clone()),
+                    RootTurnDeliverable::ResponseSection { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                deliverable_block_count = root_turn_contract.deliverable_block_count,
+                response_sections = ?response_sections,
+                artifact_paths = ?artifact_paths,
+                "extracted root turn completion contract"
+            );
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Trace,
+                "extracted root turn completion contract",
+                serde_json::json!({
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                    "response_sections": response_sections,
+                    "artifact_paths": artifact_paths,
+                }),
+            );
+        }
         self.last_reasoning_messages = build_reasoning_messages(&processed);
 
         Ok(processed)
@@ -2236,6 +2430,12 @@ impl LoopEngine {
         if let Some(directive) = self.pending_turn_commitment_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str("\n\nTurn commitment:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.root_turn_contract_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nRoot turn completion contract:\n");
                 system_prompt.push_str(&directive);
             }
         }
@@ -3513,7 +3713,300 @@ fn extract_requested_write_target(user_message: &str) -> Option<String> {
             return Some(cleaned.to_string());
         }
     }
+
+    for (start, _) in lower.match_indices(" to ") {
+        let prefix_context = lower[..start].trim_end();
+        if !prefix_context_contains_recent_write_verb(prefix_context) {
+            continue;
+        }
+        let raw = user_message[start + 4..].split_whitespace().next()?;
+        let cleaned = raw
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '>' | ',' | ';'))
+            .trim_end_matches('.')
+            .trim();
+        if looks_like_artifact_path(cleaned) {
+            return Some(cleaned.to_string());
+        }
+    }
     None
+}
+
+// Keep the fallback matcher precise: only recent standalone write verbs should
+// activate it, so substring hits like "unsafe" and distant earlier verbs do
+// not accidentally create an artifact gate.
+fn prefix_context_contains_recent_write_verb(prefix_context: &str) -> bool {
+    const VERBS: [&str; 4] = ["write", "save", "append", "create"];
+    prefix_context
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .rev()
+        .take(8)
+        .any(|token| VERBS.contains(&token))
+}
+
+fn extract_root_turn_contract(user_message: &str) -> RootTurnContractExtraction {
+    let deliverable_parse = extract_deliverable_response_sections(user_message);
+    let mut deliverables = deliverable_parse
+        .labels
+        .into_iter()
+        .map(|label| RootTurnDeliverable::ResponseSection {
+            normalized_label: normalize_contract_label(&label),
+            label,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(path) = extract_requested_write_target(user_message) {
+        if !deliverables.iter().any(|deliverable| {
+            matches!(
+                deliverable,
+                RootTurnDeliverable::ArtifactWrite {
+                    path: existing,
+                    ..
+                } if existing == &path
+            )
+        }) {
+            deliverables.push(RootTurnDeliverable::ArtifactWrite {
+                path,
+                satisfied: false,
+            });
+        }
+    }
+
+    RootTurnContractExtraction {
+        contract: (!deliverables.is_empty()).then_some(RootTurnContract {
+            deliverables,
+            blocked_terminal_attempts: 0,
+        }),
+        deliverable_block_count: deliverable_parse.block_count,
+    }
+}
+
+// Only the first explicit `Deliverables:` block becomes the root-turn contract.
+// Later blocks are ignored so the kernel has a single deterministic checklist.
+fn extract_deliverable_response_sections(user_message: &str) -> DeliverableSectionParse {
+    let mut lines = user_message.lines().peekable();
+    let mut first_labels = None;
+    let mut block_count = 0;
+    while let Some(line) = lines.next() {
+        if !line.trim().eq_ignore_ascii_case("deliverables:") {
+            continue;
+        }
+
+        block_count += 1;
+        let items = parse_deliverables_block(&mut lines);
+        if first_labels.is_none() {
+            first_labels = Some(items);
+        }
+    }
+    DeliverableSectionParse {
+        labels: first_labels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| sanitize_deliverable_label(&item))
+            .filter(|label| !label.is_empty())
+            .collect(),
+        block_count,
+    }
+}
+
+fn parse_deliverables_block<'a, I>(lines: &mut std::iter::Peekable<I>) -> Vec<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut items = Vec::new();
+    while let Some(next_line) = lines.peek() {
+        let trimmed = next_line.trim();
+        if trimmed.is_empty() {
+            lines.next();
+            if !items.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let Some(item) = parse_list_item(trimmed) else {
+            break;
+        };
+        items.push(item.to_string());
+        lines.next();
+    }
+    items
+}
+
+fn parse_list_item(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim());
+        }
+    }
+
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let suffix = trimmed[digit_count..].chars().next()?;
+    if !matches!(suffix, '.' | ')') {
+        return None;
+    }
+    Some(trimmed[digit_count + suffix.len_utf8()..].trim())
+}
+
+fn sanitize_deliverable_label(item: &str) -> String {
+    item.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '`'))
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
+fn normalize_contract_label(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
+    let mut directive =
+        String::from("Do not finish this turn until the root-turn deliverables are satisfied.\n");
+
+    let response_sections = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ResponseSection { label, .. } => Some(label.as_str()),
+            RootTurnDeliverable::ArtifactWrite { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !response_sections.is_empty() {
+        directive.push_str(
+            "Produce one consolidated final response with these explicit section headings:\n",
+        );
+        for label in response_sections {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
+
+    let pending_artifacts = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ArtifactWrite { path, satisfied } if !satisfied => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !pending_artifacts.is_empty() {
+        directive.push_str("Do not finish until these artifacts are written:\n");
+        for path in pending_artifacts {
+            directive.push_str("- ");
+            directive.push_str(path);
+            directive.push('\n');
+        }
+    }
+
+    directive.push_str(
+        "If a deliverable is still missing, continue the turn instead of stopping at a progress-only update.",
+    );
+    directive.trim_end().to_string()
+}
+
+fn root_turn_completion_block(
+    contract: &RootTurnContract,
+    response: &str,
+) -> Option<RootTurnCompletionBlock> {
+    let missing_response_sections = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ResponseSection {
+                label,
+                normalized_label,
+            } if !response_satisfies_required_section(response, normalized_label) => {
+                Some(label.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let pending_artifact_paths = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ArtifactWrite { path, satisfied } if !satisfied => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if missing_response_sections.is_empty() && pending_artifact_paths.is_empty() {
+        None
+    } else {
+        Some(RootTurnCompletionBlock {
+            missing_response_sections,
+            pending_artifact_paths,
+        })
+    }
+}
+
+// Heading matching is intentionally lenient: exact normalized matches pass, and
+// a required label may also be satisfied by a longer heading that starts with
+// the same words, such as `Plan for Phase 2` for the deliverable `Plan`.
+fn response_satisfies_required_section(response: &str, required_label: &str) -> bool {
+    response.lines().any(|line| {
+        let normalized = normalize_contract_label(
+            line.trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_matches(|c: char| matches!(c, '*' | '_' | '`'))
+                .trim_end_matches(':')
+                .trim(),
+        );
+        normalized == required_label
+            || normalized
+                .strip_prefix(required_label)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+fn render_root_turn_retry_directive(
+    block: &RootTurnCompletionBlock,
+    retries_remaining: u8,
+) -> String {
+    let mut directive = String::from(
+        "The previous response is not terminal yet because required root-turn deliverables are still missing.\n",
+    );
+    if !block.missing_response_sections.is_empty() {
+        directive.push_str("Missing response sections:\n");
+        for label in &block.missing_response_sections {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
+    if !block.pending_artifact_paths.is_empty() {
+        directive.push_str("Pending artifact writes:\n");
+        for path in &block.pending_artifact_paths {
+            directive.push_str("- ");
+            directive.push_str(path);
+            directive.push('\n');
+        }
+    }
+    directive.push_str(&format!(
+        "Continue the same turn and produce one consolidated final response that satisfies all remaining deliverables. Remaining contract retries before the kernel falls back to the current response: {retries_remaining}.",
+    ));
+    directive.trim_end().to_string()
 }
 
 fn looks_like_artifact_path(path: &str) -> bool {

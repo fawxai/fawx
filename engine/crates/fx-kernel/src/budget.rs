@@ -201,6 +201,12 @@ pub struct TerminationConfig {
     /// loop strips observation-only tools, leaving only side-effecting tools.
     #[serde(default = "default_observation_only_round_strip_after_nudge")]
     pub observation_only_round_strip_after_nudge: u16,
+
+    /// Maximum times the kernel will block an incomplete terminal response for
+    /// unmet root-turn deliverables before allowing the current response
+    /// through with a warning signal.
+    #[serde(default = "default_root_turn_completion_retry_limit")]
+    pub root_turn_completion_retry_limit: u8,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -224,6 +230,9 @@ fn default_observation_only_round_nudge_after() -> u16 {
 fn default_observation_only_round_strip_after_nudge() -> u16 {
     1
 }
+fn default_root_turn_completion_retry_limit() -> u8 {
+    2
+}
 
 impl Default for TerminationConfig {
     fn default() -> Self {
@@ -236,6 +245,7 @@ impl Default for TerminationConfig {
             observation_only_round_nudge_after: default_observation_only_round_nudge_after(),
             observation_only_round_strip_after_nudge:
                 default_observation_only_round_strip_after_nudge(),
+            root_turn_completion_retry_limit: default_root_turn_completion_retry_limit(),
         }
     }
 }
@@ -1856,6 +1866,24 @@ mod tests {
         };
 
         assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn budget_config_deserializes_root_turn_completion_retry_limit() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "termination": {
+                "root_turn_completion_retry_limit": 5
+            }
+        }"#;
+        let config: BudgetConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.termination.root_turn_completion_retry_limit, 5);
     }
 
     #[test]
