@@ -1324,6 +1324,23 @@ mod tests {
     }
 
     #[test]
+    fn fireworks_catalog_metadata_uses_compatible_contract() {
+        let provider =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        assert_eq!(provider.supported_thinking_levels(), &["off", "low", "high"]);
+        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
+        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(!provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
     fn compatible_provider_name_does_not_change_catalog_contract() {
         let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
             .unwrap()

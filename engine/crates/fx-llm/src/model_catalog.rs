@@ -613,6 +613,18 @@ mod tests {
     }
 
     #[test]
+    fn catalog_provider_creates_fireworks_provider() {
+        let provider = test_provider("fireworks");
+        assert_eq!(provider.name(), "fireworks");
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
+        assert!(provider.is_chat_capable("gpt-4o"));
+    }
+
+    #[test]
     fn is_chat_model_accepts_openrouter_xai() {
         let provider = test_provider("openrouter");
         assert!(provider.is_chat_capable("x-ai/grok-3"));
