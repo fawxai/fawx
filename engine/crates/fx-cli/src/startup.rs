@@ -113,6 +113,13 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "anthropic/claude-3.5-sonnet",
     "google/gemini-2.0-flash-001",
 ];
+const DEFAULT_FIREWORKS_MODELS: &[&str] = &[
+    "accounts/fireworks/models/kimi-k2-5-turbo",
+    "accounts/fireworks/models/llama-v3p1-405b-instruct",
+    "accounts/fireworks/models/llama-v3p1-70b-instruct",
+    "accounts/fireworks/models/deepseek-v3",
+    "accounts/fireworks/models/deepseek-r1",
+];
 const DEFAULT_FILE_LEVEL: &str = "info";
 const DEFAULT_STDERR_LEVEL: &str = "warn";
 const DEFAULT_MAX_LOG_FILES: usize = 7;
@@ -2003,6 +2010,7 @@ fn build_openai_provider(
     let provider = match provider {
         "openai" => OpenAiProvider::openai(base_url, credential.to_string())?,
         "openrouter" => OpenAiProvider::openrouter(base_url, credential.to_string())?,
+        "fireworks" => OpenAiProvider::fireworks(base_url, credential.to_string())?,
         _ => OpenAiProvider::compatible(base_url, credential.to_string(), provider.to_string())?,
     };
     Ok(provider
@@ -2061,6 +2069,7 @@ fn base_url_for_provider(provider: &str) -> String {
         "anthropic" => "https://api.anthropic.com".to_string(),
         "openrouter" => "https://openrouter.ai/api".to_string(),
         "openai" => "https://api.openai.com".to_string(),
+        "fireworks" => "https://api.fireworks.ai/inference".to_string(),
         _ => std::env::var("FAWX_OPENAI_COMPAT_BASE_URL")
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -2073,6 +2082,7 @@ fn models_for_provider(provider: &str) -> Vec<String> {
         "anthropic" => to_strings(DEFAULT_ANTHROPIC_MODELS),
         "openrouter" => to_strings(DEFAULT_OPENROUTER_MODELS),
         "openai" => to_strings(DEFAULT_OPENAI_MODELS),
+        "fireworks" => to_strings(DEFAULT_FIREWORKS_MODELS),
         _ => vec!["gpt-4o-mini".to_string()],
     }
 }

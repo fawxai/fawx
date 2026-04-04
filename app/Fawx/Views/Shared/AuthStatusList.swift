@@ -365,6 +365,9 @@ struct AuthStatusList: View {
         if !configuredProviders.contains(SetupProvider.anthropic.providerID) {
             return .anthropic
         }
+        if !configuredProviders.contains(SetupProvider.fireworks.providerID) {
+            return .fireworks
+        }
         return .openai
     }
 
@@ -374,6 +377,8 @@ struct AuthStatusList: View {
             .openai
         case SetupProvider.anthropic.providerID:
             .anthropic
+        case SetupProvider.fireworks.providerID:
+            .fireworks
         default:
             nil
         }

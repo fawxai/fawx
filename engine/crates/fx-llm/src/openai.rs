@@ -206,6 +206,10 @@ impl OpenAiProvider {
         "https://openrouter.ai/api"
     }
 
+    pub const fn fireworks_base_url() -> &'static str {
+        "https://api.fireworks.ai/inference"
+    }
+
     /// Create a new OpenAI-compatible provider.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
         Self::compatible(base_url, api_key, "openai-compatible")
@@ -245,6 +249,18 @@ impl OpenAiProvider {
             api_key.into(),
             OpenAiCatalogKind::OpenRouter,
             "openrouter".to_string(),
+        )
+    }
+
+    pub fn fireworks(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::Compatible,
+            "fireworks".to_string(),
         )
     }
 
@@ -1305,6 +1321,23 @@ mod tests {
         assert!(!provider.is_chat_capable("openai/text-embedding-3-large"));
         assert_eq!(provider.fallback_models(), OPENROUTER_FALLBACK_MODELS);
         assert!(provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
+    fn fireworks_catalog_metadata_uses_compatible_contract() {
+        let provider =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        assert_eq!(provider.supported_thinking_levels(), &["off", "low", "high"]);
+        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
+        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(!provider.catalog_filters().apply_recency_and_price_floor);
     }
 
     #[test]

@@ -372,6 +372,9 @@ fn catalog_provider(
                 .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
                 .map_err(|error| format!("failed to build provider metadata: {error}"))
         }
+        "fireworks" => OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+            .map_err(|error| format!("failed to build provider metadata: {error}")),
         _ => Ok(Box::new(UnknownCatalogProvider::new(&provider_name))),
     }
 }
@@ -607,6 +610,18 @@ mod tests {
             .iter()
             .any(|model| model.id == "anthropic/claude-sonnet-4"));
         assert!(parsed.iter().any(|model| model.id == "x-ai/grok-3"));
+    }
+
+    #[test]
+    fn catalog_provider_creates_fireworks_provider() {
+        let provider = test_provider("fireworks");
+        assert_eq!(provider.name(), "fireworks");
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
+        assert!(provider.is_chat_capable("gpt-4o"));
     }
 
     #[test]
