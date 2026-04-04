@@ -483,6 +483,7 @@ enum ExecutionVisibility {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootTurnContract {
     deliverables: Vec<RootTurnDeliverable>,
+    blocked_terminal_attempts: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +503,8 @@ struct RootTurnCompletionBlock {
     missing_response_sections: Vec<String>,
     pending_artifact_paths: Vec<String>,
 }
+
+const ROOT_TURN_COMPLETION_RETRY_LIMIT: u8 = 2;
 
 /// Core orchestrator for the 7-step agentic loop.
 ///
@@ -1967,7 +1970,7 @@ impl LoopEngine {
             return ActionNextStep::Finish(terminal);
         };
 
-        let Some(contract) = self.root_turn_contract.as_ref() else {
+        let Some(contract) = self.root_turn_contract.as_mut() else {
             return ActionNextStep::Finish(ActionTerminal::Complete { response });
         };
 
@@ -1975,18 +1978,50 @@ impl LoopEngine {
             return ActionNextStep::Finish(ActionTerminal::Complete { response });
         };
 
+        let allow_incomplete_terminal =
+            contract.blocked_terminal_attempts >= ROOT_TURN_COMPLETION_RETRY_LIMIT;
+        let blocked_attempts = if allow_incomplete_terminal {
+            contract.blocked_terminal_attempts
+        } else {
+            contract.blocked_terminal_attempts =
+                contract.blocked_terminal_attempts.saturating_add(1);
+            contract.blocked_terminal_attempts
+        };
+        let retries_remaining = ROOT_TURN_COMPLETION_RETRY_LIMIT.saturating_sub(blocked_attempts);
+
+        if allow_incomplete_terminal {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "root turn completion retry cap reached; allowing incomplete terminal response",
+                serde_json::json!({
+                    "blocked_attempts": blocked_attempts,
+                    "retry_limit": ROOT_TURN_COMPLETION_RETRY_LIMIT,
+                    "missing_response_sections": &block.missing_response_sections,
+                    "pending_artifact_paths": &block.pending_artifact_paths,
+                }),
+            );
+            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+        }
+
         self.emit_signal(
             LoopStep::Act,
             SignalKind::Trace,
             "blocked terminal completion until root turn deliverables are satisfied",
             serde_json::json!({
+                "blocked_attempts": blocked_attempts,
+                "retry_limit": ROOT_TURN_COMPLETION_RETRY_LIMIT,
+                "retries_remaining": retries_remaining,
                 "missing_response_sections": &block.missing_response_sections,
                 "pending_artifact_paths": &block.pending_artifact_paths,
             }),
         );
 
         let mut context_messages = vec![Message::assistant(response.clone())];
-        context_messages.push(Message::system(render_root_turn_retry_directive(&block)));
+        context_messages.push(Message::system(render_root_turn_retry_directive(
+            &block,
+            retries_remaining,
+        )));
         ActionNextStep::Continue(
             ActionContinuation::new(Some(response), None).with_context_messages(context_messages),
         )
@@ -3627,7 +3662,6 @@ fn message_content_to_text(message: &Message) -> String {
 
 fn extract_requested_write_target(user_message: &str) -> Option<String> {
     const PREFIXES: [&str; 4] = ["save it to ", "save to ", "write it to ", "write to "];
-    const VERBS: [&str; 4] = ["write", "save", "append", "create"];
     let lower = user_message.to_lowercase();
     for prefix in PREFIXES {
         let Some(start) = lower.find(prefix) else {
@@ -3647,7 +3681,7 @@ fn extract_requested_write_target(user_message: &str) -> Option<String> {
 
     for (start, _) in lower.match_indices(" to ") {
         let prefix_context = lower[..start].trim_end();
-        if !VERBS.iter().any(|verb| prefix_context.contains(verb)) {
+        if !prefix_context_contains_recent_write_verb(prefix_context) {
             continue;
         }
         let raw = user_message[start + 4..].split_whitespace().next()?;
@@ -3660,6 +3694,19 @@ fn extract_requested_write_target(user_message: &str) -> Option<String> {
         }
     }
     None
+}
+
+// Keep the fallback matcher precise: only recent standalone write verbs should
+// activate it, so substring hits like "unsafe" and distant earlier verbs do
+// not accidentally create an artifact gate.
+fn prefix_context_contains_recent_write_verb(prefix_context: &str) -> bool {
+    const VERBS: [&str; 4] = ["write", "save", "append", "create"];
+    prefix_context
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .rev()
+        .take(8)
+        .any(|token| VERBS.contains(&token))
 }
 
 fn extract_root_turn_contract(user_message: &str) -> Option<RootTurnContract> {
@@ -3691,10 +3738,15 @@ fn extract_root_turn_contract(user_message: &str) -> Option<RootTurnContract> {
     if deliverables.is_empty() {
         None
     } else {
-        Some(RootTurnContract { deliverables })
+        Some(RootTurnContract {
+            deliverables,
+            blocked_terminal_attempts: 0,
+        })
     }
 }
 
+// Only the first explicit `Deliverables:` block becomes the root-turn contract.
+// Later blocks are ignored so the kernel has a single deterministic checklist.
 fn extract_deliverable_response_sections(user_message: &str) -> Vec<String> {
     let mut lines = user_message.lines().peekable();
     while let Some(line) = lines.next() {
@@ -3856,6 +3908,9 @@ fn root_turn_completion_block(
     }
 }
 
+// Heading matching is intentionally lenient: exact normalized matches pass, and
+// a required label may also be satisfied by a longer heading that starts with
+// the same words, such as `Plan for Phase 2` for the deliverable `Plan`.
 fn response_satisfies_required_section(response: &str, required_label: &str) -> bool {
     response.lines().any(|line| {
         let normalized = normalize_contract_label(
@@ -3873,7 +3928,10 @@ fn response_satisfies_required_section(response: &str, required_label: &str) -> 
     })
 }
 
-fn render_root_turn_retry_directive(block: &RootTurnCompletionBlock) -> String {
+fn render_root_turn_retry_directive(
+    block: &RootTurnCompletionBlock,
+    retries_remaining: u8,
+) -> String {
     let mut directive = String::from(
         "The previous response is not terminal yet because required root-turn deliverables are still missing.\n",
     );
@@ -3893,9 +3951,9 @@ fn render_root_turn_retry_directive(block: &RootTurnCompletionBlock) -> String {
             directive.push('\n');
         }
     }
-    directive.push_str(
-        "Continue the same turn and produce one consolidated final response that satisfies all remaining deliverables.",
-    );
+    directive.push_str(&format!(
+        "Continue the same turn and produce one consolidated final response that satisfies all remaining deliverables. Remaining contract retries before the kernel falls back to the current response: {retries_remaining}.",
+    ));
     directive.trim_end().to_string()
 }
 

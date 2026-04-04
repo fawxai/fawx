@@ -1808,6 +1808,61 @@ async fn explicit_deliverables_block_progress_only_terminal_response_after_tool_
 }
 
 #[tokio::test]
+async fn root_turn_contract_retry_cap_allows_incomplete_terminal_response_after_limit() {
+    let mut engine = run_command_observation_engine(BudgetConfig::default());
+    let incomplete_response = "Still working on it.";
+    let llm = RecordingLlm::ok(vec![
+        text_response(incomplete_response),
+        text_response(incomplete_response),
+        text_response(incomplete_response),
+    ]);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot(
+                "Continue the milestone.\n\nDeliverables:\n- Plan\n- Verification Report",
+            ),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(complete_response(result), incomplete_response);
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the kernel should stop retrying after the contract retry cap is exhausted"
+    );
+}
+
+#[test]
+fn recent_write_verb_matcher_ignores_substring_hits() {
+    assert!(prefix_context_contains_recent_write_verb(
+        "please write a short note"
+    ));
+    assert!(prefix_context_contains_recent_write_verb(
+        "please save the note"
+    ));
+    assert!(!prefix_context_contains_recent_write_verb(
+        "please rewrite the note"
+    ));
+    assert!(!prefix_context_contains_recent_write_verb("this is unsafe"));
+}
+
+#[test]
+fn extract_requested_write_target_requires_a_standalone_write_verb() {
+    assert_eq!(
+        extract_requested_write_target("Write a short note to ~/.fawx/test-note.md"),
+        Some("~/.fawx/test-note.md".to_string())
+    );
+    assert_eq!(
+        extract_requested_write_target("This is unsafe to ~/.fawx/test-note.md"),
+        None
+    );
+}
+
+#[tokio::test]
 async fn requested_artifact_write_blocks_terminal_response_until_file_is_written() {
     #[derive(Debug, Default)]
     struct ArtifactAwareWriteExecutor;
