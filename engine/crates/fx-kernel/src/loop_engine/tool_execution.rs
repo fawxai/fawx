@@ -1070,52 +1070,51 @@ impl LoopEngine {
             };
         }
 
-        let mut observations = Vec::new();
-        let mut mutations = Vec::new();
-        for call in calls {
-            match self.tool_executor.classify_call(call) {
-                ToolCallClassification::Observation => observations.push(call.clone()),
-                ToolCallClassification::Mutation => mutations.push(call.clone()),
-            }
-        }
-
-        if mutations.is_empty() {
+        let first_mutation_index = calls.iter().position(|call| {
+            matches!(
+                self.tool_executor.classify_call(call),
+                ToolCallClassification::Mutation
+            )
+        });
+        let Some(first_mutation_index) = first_mutation_index else {
             return SerializedToolRoundCalls {
                 execute: calls.to_vec(),
                 deferred: Vec::new(),
                 deferred_message: None,
             };
-        }
+        };
 
-        if !observations.is_empty() {
+        if first_mutation_index > 0 {
+            let execute = calls[..first_mutation_index].to_vec();
+            let deferred = calls[first_mutation_index..].to_vec();
             let deferred_names: Vec<String> =
-                mutations.iter().map(|call| call.name.clone()).collect();
+                deferred.iter().map(|call| call.name.clone()).collect();
             let deferred_names_csv = deferred_names.join(", ");
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Friction,
                 format!(
-                    "mutation barrier: ran {} observation call(s), deferred mutation call(s): {}",
-                    observations.len(),
+                    "mutation barrier: ran {} leading observation call(s), deferred remaining call(s): {}",
+                    execute.len(),
                     deferred_names_csv
                 ),
                 serde_json::json!({
-                    "executed_observations": observations.len(),
-                    "deferred_mutations": deferred_names.clone(),
+                    "executed_observations": execute.len(),
+                    "deferred_calls": deferred_names.clone(),
                 }),
             );
             return SerializedToolRoundCalls {
-                execute: observations,
-                deferred: mutations,
+                execute,
+                deferred,
                 deferred_message: Some(format!(
-                    "Mutation-capable tool calls were deferred until after you review the observation results: {}. Re-request in your next turn if still needed.",
+                    "Calls from the first mutation onward were deferred until after you review the observation results: {}. Re-request in your next turn if still needed.",
                     deferred_names.join(", ")
                 )),
             };
         }
 
-        let execute = vec![mutations[0].clone()];
-        let deferred = mutations[1..].to_vec();
+        let execute = vec![calls[0].clone()];
+        let deferred = calls[1..].to_vec();
         if deferred.is_empty() {
             return SerializedToolRoundCalls {
                 execute,
@@ -1126,27 +1125,39 @@ impl LoopEngine {
 
         let deferred_names: Vec<String> = deferred.iter().map(|call| call.name.clone()).collect();
         let deferred_names_csv = deferred_names.join(", ");
+        let deferred_are_all_mutations = deferred.iter().all(|call| {
+            matches!(
+                self.tool_executor.classify_call(call),
+                ToolCallClassification::Mutation
+            )
+        });
         self.emit_signal(
             LoopStep::Act,
             SignalKind::Friction,
             format!(
-                "mutation serialization: executing 1/{}, deferring: {}",
-                mutations.len(),
+                "mutation serialization: executing first mutation, deferring following call(s): {}",
                 deferred_names_csv
             ),
             serde_json::json!({
                 "executed_mutations": 1,
-                "total_mutations": mutations.len(),
-                "deferred_mutations": deferred_names.clone(),
+                "total_calls": calls.len(),
+                "deferred_calls": deferred_names.clone(),
             }),
         );
         SerializedToolRoundCalls {
             execute,
             deferred,
-            deferred_message: Some(format!(
-                "Mutation-capable tool calls are executed one at a time. Deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
-                deferred_names.join(", ")
-            )),
+            deferred_message: Some(if deferred_are_all_mutations {
+                format!(
+                    "Mutation-capable tool calls are executed one at a time. Deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
+                    deferred_names.join(", ")
+                )
+            } else {
+                format!(
+                    "Calls after the first mutation were deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
+                    deferred_names.join(", ")
+                )
+            }),
         }
     }
 

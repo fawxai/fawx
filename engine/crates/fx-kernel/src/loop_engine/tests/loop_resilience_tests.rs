@@ -333,7 +333,10 @@ impl LlmProvider for MixedBatchMutationBarrierLlm {
                     "only the observation call should have executed in the first round"
                 );
                 assert!(
-                    request_contains_text(&request, "Mutation-capable tool calls were deferred"),
+                    request_contains_text(
+                        &request,
+                        "Calls from the first mutation onward were deferred",
+                    ),
                     "next reasoning pass should be told that mutation calls were deferred"
                 );
                 tool_use_response(vec![ToolCall {
@@ -2383,6 +2386,69 @@ async fn mutation_batches_execute_one_call_per_round() {
 
     assert_eq!(complete_response(result), "Applied both writes safely.");
     assert_eq!(executor.readme_contents(), "second write");
+}
+
+#[tokio::test]
+async fn mutation_first_mixed_batch_preserves_original_order() {
+    let executor = Arc::new(StatefulReadWriteExecutor::new(
+        "README intro\nACTUAL FINAL LINE",
+    ));
+    let mut engine = stateful_mixed_tool_engine(executor.clone());
+    let decision = Decision::UseTools(vec![
+        ToolCall {
+            id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md","content":"first write"}),
+        },
+        ToolCall {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        },
+    ]);
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![ToolCall {
+            id: "read-2".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]),
+        text_response("done after ordered read"),
+    ]);
+
+    let action = engine
+        .act(
+            &decision,
+            &llm,
+            &[Message::user(
+                "Update README.md, then verify the final contents.",
+            )],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act should succeed");
+
+    assert_eq!(action.response_text, "done after ordered read");
+    assert_eq!(executor.readme_contents(), "first write");
+
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected one follow-up read and one final synthesis"
+    );
+    assert_eq!(
+        request_tool_use_names(&requests[0]),
+        vec!["write_file".to_string()],
+        "the trailing read should not execute before the leading mutation"
+    );
+    assert!(
+        request_contains_text(&requests[0], "Calls after the first mutation were deferred"),
+        "the continuation should explain why later calls were deferred"
+    );
+    assert!(
+        request_contains_tool_result_text(&requests[1], "first write"),
+        "the follow-up read should observe the post-mutation contents"
+    );
 }
 
 #[tokio::test]
