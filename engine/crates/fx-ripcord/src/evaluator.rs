@@ -250,12 +250,7 @@ mod tests {
     }
 
     fn executed_result(call: &ToolCall) -> ToolResult {
-        ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            success: true,
-            output: "executed".to_string(),
-        }
+        ToolResult::success(call.id.clone(), call.name.clone(), "executed")
     }
 
     fn test_action_category(tool_name: &str) -> &'static str {
@@ -513,12 +508,12 @@ mod tests {
     #[tokio::test]
     async fn results_pass_through_unchanged() {
         let call = test_call("shell", serde_json::json!({"command": "rm -rf tmp"}));
-        let expected = vec![ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            success: false,
-            output: "exit_code: 9\nstderr:\nboom".into(),
-        }];
+        let expected = vec![ToolResult::failure(
+            call.id.clone(),
+            call.name.clone(),
+            "exit_code: 9\nstderr:\nboom",
+            fx_kernel::FailureClass::Permanent,
+        )];
         let plain = PassthroughExecutor::with_outputs(expected.clone())
             .execute_tools(std::slice::from_ref(&call), None)
             .await
@@ -539,12 +534,11 @@ mod tests {
     #[test]
     fn journal_action_builds_shell_entry() {
         let call = test_call("shell", serde_json::json!({"command": "echo hi"}));
-        let result = ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            success: true,
-            output: "exit_code: 0\nstdout:\nhi".into(),
-        };
+        let result = ToolResult::success(
+            call.id.clone(),
+            call.name.clone(),
+            "exit_code: 0\nstdout:\nhi",
+        );
         let executor = PassthroughExecutor::executed();
 
         let action = executor

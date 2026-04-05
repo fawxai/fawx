@@ -316,20 +316,38 @@ mod tests {
     fn signal_kind_default_severity() {
         // Low severity
         assert_eq!(SignalKind::Trace.default_severity(), SignalSeverity::Low);
-        assert_eq!(SignalKind::Observation.default_severity(), SignalSeverity::Low);
+        assert_eq!(
+            SignalKind::Observation.default_severity(),
+            SignalSeverity::Low
+        );
         assert_eq!(SignalKind::Thinking.default_severity(), SignalSeverity::Low);
         assert_eq!(SignalKind::Success.default_severity(), SignalSeverity::Low);
         assert_eq!(SignalKind::Decision.default_severity(), SignalSeverity::Low);
-        assert_eq!(SignalKind::UserInput.default_severity(), SignalSeverity::Low);
+        assert_eq!(
+            SignalKind::UserInput.default_severity(),
+            SignalSeverity::Low
+        );
 
         // Medium severity
-        assert_eq!(SignalKind::Friction.default_severity(), SignalSeverity::Medium);
-        assert_eq!(SignalKind::Performance.default_severity(), SignalSeverity::Medium);
-        assert_eq!(SignalKind::UserFeedback.default_severity(), SignalSeverity::Medium);
+        assert_eq!(
+            SignalKind::Friction.default_severity(),
+            SignalSeverity::Medium
+        );
+        assert_eq!(
+            SignalKind::Performance.default_severity(),
+            SignalSeverity::Medium
+        );
+        assert_eq!(
+            SignalKind::UserFeedback.default_severity(),
+            SignalSeverity::Medium
+        );
 
         // High severity
         assert_eq!(SignalKind::Blocked.default_severity(), SignalSeverity::High);
-        assert_eq!(SignalKind::UserIntervention.default_severity(), SignalSeverity::High);
+        assert_eq!(
+            SignalKind::UserIntervention.default_severity(),
+            SignalSeverity::High
+        );
     }
 
     #[test]

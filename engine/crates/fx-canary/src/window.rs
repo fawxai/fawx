@@ -64,13 +64,14 @@ mod tests {
     use fx_kernel::{LoopStep, SignalKind};
 
     fn mk_signal(message: &str, timestamp_ms: u64) -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Success,
-            message: message.to_string(),
-            metadata: serde_json::json!({}),
+        Signal::new(
+            timestamp_ms.max(1),
+            LoopStep::Act,
+            SignalKind::Success,
+            message.to_string(),
+            serde_json::json!({}),
             timestamp_ms,
-        }
+        )
     }
 
     fn now_ms() -> u64 {

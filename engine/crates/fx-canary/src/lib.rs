@@ -238,23 +238,25 @@ mod tests {
     use fx_kernel::LoopStep;
 
     fn mk(kind: SignalKind) -> Signal {
-        Signal {
-            step: LoopStep::Act,
+        Signal::new(
+            1,
+            LoopStep::Act,
             kind,
-            message: String::new(),
-            metadata: serde_json::json!({}),
-            timestamp_ms: 0,
-        }
+            String::new(),
+            serde_json::json!({}),
+            0,
+        )
     }
 
     fn mk_friction(severity: f64) -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Friction,
-            message: String::new(),
-            metadata: serde_json::json!({ "severity": severity }),
-            timestamp_ms: 0,
-        }
+        Signal::new(
+            1,
+            LoopStep::Act,
+            SignalKind::Friction,
+            String::new(),
+            serde_json::json!({ "severity": severity }),
+            0,
+        )
     }
 
     fn mk_signals(success: usize, friction: usize, decision: usize) -> Vec<Signal> {

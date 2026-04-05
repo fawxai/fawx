@@ -1,5 +1,6 @@
 pub use fx_core::signals::{LoopStep, Signal, SignalKind, SignalSeverity};
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Accumulates signals for a single loop cycle.
@@ -56,12 +57,39 @@ impl SignalCollector {
         // Assign monotonic ID if not already set (id == 0 means unassigned)
         if signal.id == 0 {
             signal.id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.advance_next_id_past(signal.id);
         }
 
-        if self.signals.len() >= self.max_signals {
-            self.drop_signal_for_capacity();
+        self.push_signal(signal);
+    }
+
+    /// Import signals from another collector, remapping IDs into this collector's namespace.
+    ///
+    /// Any causal links that point at another imported signal are rewritten to the new IDs.
+    /// Cause IDs that do not refer to a signal in the imported batch are preserved as-is.
+    pub fn import_signals(&mut self, signals: &[Signal]) {
+        let assigned_ids = signals
+            .iter()
+            .map(|_| self.next_id.fetch_add(1, Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        let remapped_ids = signals
+            .iter()
+            .zip(assigned_ids.iter().copied())
+            .filter_map(|(signal, new_id)| (signal.id != 0).then_some((signal.id, new_id)))
+            .collect::<HashMap<_, _>>();
+
+        for (signal, new_id) in signals.iter().zip(assigned_ids) {
+            let mut imported = signal.clone();
+            imported.id = new_id;
+            if let Some(remapped_cause_id) = signal
+                .cause_id
+                .and_then(|cause_id| remapped_ids.get(&cause_id).copied())
+            {
+                imported.cause_id = Some(remapped_cause_id);
+            }
+            self.push_signal(imported);
         }
-        self.signals.push(signal);
     }
 
     /// Emit a signal with the given parameters, assigning a monotonic ID.
@@ -76,6 +104,29 @@ impl SignalCollector {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let signal = Signal::new(id, step, kind, message, metadata, timestamp_ms);
         self.emit(signal);
+    }
+
+    fn push_signal(&mut self, signal: Signal) {
+        if self.signals.len() >= self.max_signals {
+            self.drop_signal_for_capacity();
+        }
+        self.signals.push(signal);
+    }
+
+    fn advance_next_id_past(&self, id: u64) {
+        let reserved_next = id.saturating_add(1);
+        let mut current = self.next_id.load(Ordering::SeqCst);
+        while current < reserved_next {
+            match self.next_id.compare_exchange(
+                current,
+                reserved_next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn drop_signal_for_capacity(&mut self) {
@@ -219,34 +270,73 @@ mod tests {
     #[test]
     fn signal_collector_assigns_monotonic_ids() {
         let mut collector = SignalCollector::new(10);
-        
+
         // First signal gets id=1
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "first", 1));
         assert_eq!(collector.signals()[0].id, 1);
-        
+
         // Second signal gets id=2
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "second", 2));
         assert_eq!(collector.signals()[1].id, 2);
-        
+
         // Third signal gets id=3
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "third", 3));
         assert_eq!(collector.signals()[2].id, 3);
     }
 
     #[test]
-    fn signal_collector_preserves_existing_id() {
+    fn signal_collector_preserves_existing_id_and_advances_counter() {
         let mut collector = SignalCollector::new(10);
-        
+
         // Signal with pre-set ID is preserved
         let mut signal = mk_signal(LoopStep::Act, SignalKind::Success, "preset", 1);
         signal.id = 42;
         collector.emit(signal);
-        
+
         assert_eq!(collector.signals()[0].id, 42);
-        
-        // Next signal gets next available ID (not 1, since we started at 1)
+
+        // Next signal continues after the highest explicit ID.
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "next", 2));
-        assert_eq!(collector.signals()[1].id, 1); // First assigned ID
+        assert_eq!(collector.signals()[1].id, 43);
+        assert_eq!(collector.next_id(), 44);
+    }
+
+    #[test]
+    fn import_signals_remaps_ids_and_causal_links() {
+        let mut collector = SignalCollector::new(10);
+        collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "parent", 1));
+
+        let child_signals = vec![
+            Signal::new(
+                1,
+                LoopStep::Act,
+                SignalKind::Trace,
+                "child-start",
+                serde_json::json!({}),
+                2,
+            ),
+            Signal::new(
+                2,
+                LoopStep::Act,
+                SignalKind::Success,
+                "child-done",
+                serde_json::json!({}),
+                3,
+            )
+            .with_cause_id(1),
+        ];
+
+        collector.import_signals(&child_signals);
+
+        let signals = collector.signals();
+        assert_eq!(
+            signals.iter().map(|signal| signal.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(signals[1].message, "child-start");
+        assert_eq!(signals[2].message, "child-done");
+        assert_eq!(signals[2].cause_id, Some(2));
+        assert_eq!(collector.next_id(), 4);
     }
 
     #[test]
@@ -381,16 +471,30 @@ mod tests {
     #[test]
     fn from_signals_preserves_ids_and_sets_next_id() {
         let signals = vec![
-            Signal::new(5, LoopStep::Act, SignalKind::Success, "s1", serde_json::json!({}), 1),
-            Signal::new(10, LoopStep::Act, SignalKind::Success, "s2", serde_json::json!({}), 2),
+            Signal::new(
+                5,
+                LoopStep::Act,
+                SignalKind::Success,
+                "s1",
+                serde_json::json!({}),
+                1,
+            ),
+            Signal::new(
+                10,
+                LoopStep::Act,
+                SignalKind::Success,
+                "s2",
+                serde_json::json!({}),
+                2,
+            ),
         ];
-        
+
         let collector = SignalCollector::from_signals(signals);
-        
+
         // IDs preserved
         assert_eq!(collector.signals()[0].id, 5);
         assert_eq!(collector.signals()[1].id, 10);
-        
+
         // Next ID set to max + 1
         assert_eq!(collector.next_id(), 11);
     }
@@ -400,12 +504,12 @@ mod tests {
         let mut collector = SignalCollector::new(10);
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "s1", 1));
         collector.emit(mk_signal(LoopStep::Act, SignalKind::Success, "s2", 2));
-        
+
         assert_eq!(collector.signals().len(), 2);
         assert_eq!(collector.next_id(), 3);
-        
+
         collector.clear();
-        
+
         assert!(collector.signals().is_empty());
         assert_eq!(collector.next_id(), 1);
     }
@@ -420,7 +524,7 @@ mod tests {
             serde_json::json!({"key": "value"}),
             1000,
         );
-        
+
         let signals = collector.signals();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].id, 1);

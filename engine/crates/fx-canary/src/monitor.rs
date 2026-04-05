@@ -182,13 +182,15 @@ mod tests {
     }
 
     fn mk_signal(kind: SignalKind) -> Signal {
-        Signal {
-            step: LoopStep::Act,
+        let timestamp_ms = current_epoch_secs().saturating_mul(1_000);
+        Signal::new(
+            timestamp_ms.max(1),
+            LoopStep::Act,
             kind,
-            message: String::new(),
-            metadata: serde_json::json!({}),
-            timestamp_ms: current_epoch_secs() * 1_000,
-        }
+            String::new(),
+            serde_json::json!({}),
+            timestamp_ms,
+        )
     }
 
     #[test]

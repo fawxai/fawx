@@ -577,13 +577,14 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let store = SignalStore::new(&data_dir, "test-session").expect("signal store");
         store
-            .persist(&[Signal {
-                step: LoopStep::Act,
-                kind: SignalKind::Friction,
-                message: "test friction".to_string(),
-                metadata: serde_json::json!({}),
-                timestamp_ms: 1000,
-            }])
+            .persist(&[Signal::new(
+                1,
+                LoopStep::Act,
+                SignalKind::Friction,
+                "test friction",
+                serde_json::json!({}),
+                1000,
+            )])
             .expect("persist signal");
 
         let config = ImprovementToolsConfig {
