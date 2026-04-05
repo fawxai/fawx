@@ -2415,6 +2415,7 @@ async fn mutation_first_mixed_batch_preserves_original_order() {
         text_response("done after ordered read"),
     ]);
 
+    // Use `act()` directly so we can assert the barrier's intermediate continuation requests.
     let action = engine
         .act(
             &decision,

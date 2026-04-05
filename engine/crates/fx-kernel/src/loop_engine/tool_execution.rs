@@ -399,6 +399,10 @@ impl LoopEngine {
 
         match self.run_tool_loop(decision, llm, state, stream).await? {
             ToolLoopExit::Exhausted(state) => {
+                debug_assert!(
+                    state.pending_round_notices.is_empty(),
+                    "pending_round_notices not flushed"
+                );
                 self.finish_tool_loop_on_exhaustion(decision, state, llm, stream)
                     .await
             }
@@ -413,7 +417,8 @@ impl LoopEngine {
     ) -> ToolRoundState {
         let initial_text = self.pending_tool_response_text.take();
         let mut state = ToolRoundState::new(calls, context_messages, initial_text);
-        self.stage_tool_calls_for_round(&mut state, calls);
+        let initial_calls = std::mem::take(&mut state.current_calls);
+        self.stage_tool_calls_for_round(&mut state, initial_calls);
         state
     }
 
@@ -685,7 +690,7 @@ impl LoopEngine {
         }
 
         self.record_tool_round_response_state(&mut state, &response);
-        self.stage_tool_calls_for_round(&mut state, &response.tool_calls);
+        self.stage_tool_calls_for_round(&mut state, response.tool_calls);
         Ok(ToolLoopStep::Continue(state))
     }
 
@@ -1011,13 +1016,21 @@ impl LoopEngine {
         &mut self,
         calls: &[ToolCall],
     ) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        self.apply_fan_out_cap_owned(calls.to_vec())
+    }
+
+    fn apply_fan_out_cap_owned(
+        &mut self,
+        mut calls: Vec<ToolCall>,
+    ) -> (Vec<ToolCall>, Vec<ToolCall>) {
         let max_fan_out = self.budget.config().max_fan_out;
         if calls.len() <= max_fan_out {
-            return (calls.to_vec(), Vec::new());
+            return (calls, Vec::new());
         }
 
-        let execute = calls[..max_fan_out].to_vec();
-        let deferred = calls[max_fan_out..].to_vec();
+        let total = calls.len();
+        let deferred = calls.split_off(max_fan_out);
+        let execute = calls;
         let deferred_names: Vec<&str> = deferred.iter().map(|call| call.name.as_str()).collect();
         self.emit_signal(
             LoopStep::Act,
@@ -1025,25 +1038,26 @@ impl LoopEngine {
             format!(
                 "fan-out cap: executing {}/{}, deferring: {}",
                 max_fan_out,
-                calls.len(),
+                total,
                 deferred_names.join(", ")
             ),
             serde_json::json!({
                 "executed": max_fan_out,
-                "total": calls.len(),
+                "total": total,
                 "deferred_tools": deferred_names,
             }),
         );
         (execute, deferred)
     }
 
-    fn stage_tool_calls_for_round(&mut self, state: &mut ToolRoundState, calls: &[ToolCall]) {
-        let (capped, fan_out_deferred) = self.apply_fan_out_cap(calls);
+    fn stage_tool_calls_for_round(&mut self, state: &mut ToolRoundState, calls: Vec<ToolCall>) {
+        let total_calls = calls.len();
+        let (capped, fan_out_deferred) = self.apply_fan_out_cap_owned(calls);
         if !fan_out_deferred.is_empty() {
-            self.append_deferred_tool_results(state, &fan_out_deferred, calls.len());
+            self.append_deferred_tool_results(state, &fan_out_deferred, total_calls);
         }
 
-        let serialized = self.apply_mutation_serialization_policy(&capped);
+        let serialized = self.apply_mutation_serialization_policy(capped);
         state.current_calls = serialized.execute;
         if !serialized.deferred.is_empty() {
             let message = serialized
@@ -1060,33 +1074,41 @@ impl LoopEngine {
 
     fn apply_mutation_serialization_policy(
         &mut self,
-        calls: &[ToolCall],
+        calls: Vec<ToolCall>,
     ) -> SerializedToolRoundCalls {
         if calls.len() <= 1 {
             return SerializedToolRoundCalls {
-                execute: calls.to_vec(),
+                execute: calls,
                 deferred: Vec::new(),
                 deferred_message: None,
             };
         }
 
-        let first_mutation_index = calls.iter().position(|call| {
-            matches!(
-                self.tool_executor.classify_call(call),
-                ToolCallClassification::Mutation
-            )
-        });
+        let mut first_mutation_index = None;
+        let mut has_trailing_observations = false;
+        for (index, call) in calls.iter().enumerate() {
+            match self.tool_executor.classify_call(call) {
+                ToolCallClassification::Observation => {
+                    if first_mutation_index.is_some() {
+                        has_trailing_observations = true;
+                    }
+                }
+                ToolCallClassification::Mutation => {
+                    first_mutation_index.get_or_insert(index);
+                }
+            }
+        }
         let Some(first_mutation_index) = first_mutation_index else {
             return SerializedToolRoundCalls {
-                execute: calls.to_vec(),
+                execute: calls,
                 deferred: Vec::new(),
                 deferred_message: None,
             };
         };
 
         if first_mutation_index > 0 {
-            let execute = calls[..first_mutation_index].to_vec();
-            let deferred = calls[first_mutation_index..].to_vec();
+            let mut execute = calls;
+            let deferred = execute.split_off(first_mutation_index);
             let deferred_names: Vec<String> =
                 deferred.iter().map(|call| call.name.clone()).collect();
             let deferred_names_csv = deferred_names.join(", ");
@@ -1113,8 +1135,9 @@ impl LoopEngine {
             };
         }
 
-        let execute = vec![calls[0].clone()];
-        let deferred = calls[1..].to_vec();
+        let total_calls = calls.len();
+        let mut execute = calls;
+        let deferred = execute.split_off(1);
         if deferred.is_empty() {
             return SerializedToolRoundCalls {
                 execute,
@@ -1125,12 +1148,6 @@ impl LoopEngine {
 
         let deferred_names: Vec<String> = deferred.iter().map(|call| call.name.clone()).collect();
         let deferred_names_csv = deferred_names.join(", ");
-        let deferred_are_all_mutations = deferred.iter().all(|call| {
-            matches!(
-                self.tool_executor.classify_call(call),
-                ToolCallClassification::Mutation
-            )
-        });
         self.emit_signal(
             LoopStep::Act,
             SignalKind::Friction,
@@ -1140,21 +1157,21 @@ impl LoopEngine {
             ),
             serde_json::json!({
                 "executed_mutations": 1,
-                "total_calls": calls.len(),
+                "total_calls": total_calls,
                 "deferred_calls": deferred_names.clone(),
             }),
         );
         SerializedToolRoundCalls {
             execute,
             deferred,
-            deferred_message: Some(if deferred_are_all_mutations {
+            deferred_message: Some(if has_trailing_observations {
                 format!(
-                    "Mutation-capable tool calls are executed one at a time. Deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
+                    "Calls after the first mutation were deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
                     deferred_names.join(", ")
                 )
             } else {
                 format!(
-                    "Calls after the first mutation were deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
+                    "Mutation-capable tool calls are executed one at a time. Deferred until after you review the latest mutation result: {}. Re-request in your next turn if still needed.",
                     deferred_names.join(", ")
                 )
             }),
