@@ -238,14 +238,11 @@ impl SkillRegistry {
         let skill = self.find_skill(tool_name);
 
         if let Some(skill) = skill {
-            return match skill.execute(tool_name, arguments, cancel).await {
-                Some(Ok(output)) => ToolResult::success(tool_call_id, tool_name, output),
-                Some(Err(err)) => ToolResult::failure(
-                    tool_call_id,
-                    tool_name,
-                    err,
-                    fx_kernel::FailureClass::Unknown,
-                ),
+            return match skill
+                .execute_tool_result(tool_call_id, tool_name, arguments, cancel)
+                .await
+            {
+                Some(result) => result,
                 None => ToolResult::failure(
                     tool_call_id,
                     tool_name,

@@ -7,17 +7,16 @@
 use async_trait::async_trait;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::FailureClass;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 
 /// Error type for skill execution failures.
 ///
-/// V1 uses a plain `String` because skill errors are surfaced directly as
-/// human-readable text in `ToolResult::output`. There is no programmatic
-/// dispatch on error variants today — the agent simply reads the message.
-/// When we add retry logic or structured error handling, this should become
-/// an enum with proper variants. For now, a type alias makes the intent
-/// explicit and provides a single point to swap in a real type later.
+/// Most skills still surface failures as human-readable strings. Skills that
+/// already have richer execution semantics should override
+/// [`Skill::execute_tool_result`] so the kernel can see their typed result
+/// contract directly instead of flattening through this alias.
 pub type SkillError = String;
 
 /// A pluggable skill that provides tool definitions and handles tool calls.
@@ -89,6 +88,28 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
         arguments: &str,
         cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>>;
+
+    /// Execute a tool call and return the kernel-visible [`ToolResult`].
+    ///
+    /// The default implementation preserves the legacy string-only contract and
+    /// classifies failures as unknown. Skills with richer failure semantics
+    /// should override this method.
+    async fn execute_tool_result(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<ToolResult> {
+        self.execute(tool_name, arguments, cancel)
+            .await
+            .map(|result| match result {
+                Ok(output) => ToolResult::success(tool_call_id, tool_name, output),
+                Err(error) => {
+                    ToolResult::failure(tool_call_id, tool_name, error, FailureClass::Unknown)
+                }
+            })
+    }
 }
 
 #[cfg(test)]
