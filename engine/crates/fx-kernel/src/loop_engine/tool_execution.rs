@@ -1011,6 +1011,7 @@ impl LoopEngine {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_fan_out_cap(
         &mut self,
         calls: &[ToolCall],
@@ -1528,7 +1529,7 @@ impl LoopEngine {
         let observation_nudge = u32::from(config.observation_only_round_nudge_after);
         let observation_strip = observation_nudge
             .saturating_add(u32::from(config.observation_only_round_strip_after_nudge));
-        let observation_rounds = u32::from(self.consecutive_observation_only_rounds);
+        let observation_rounds = u32::from(self.observation_round_tracker.repetitive_rounds);
         let all_tools = self.tool_executor.tool_definitions();
         let profile_owns_surface = self.turn_execution_profile.owns_tool_surface();
 
@@ -1575,19 +1576,36 @@ impl LoopEngine {
         let strip_threshold = nudge_threshold
             .saturating_add(u32::from(config.observation_only_round_strip_after_nudge));
         nudge_threshold > 0
-            && u32::from(self.consecutive_observation_only_rounds) >= strip_threshold
+            && u32::from(self.observation_round_tracker.repetitive_rounds) >= strip_threshold
     }
 
     pub(super) fn record_tool_round_kind(&mut self, calls: &[ToolCall]) {
-        let observation_only = !calls.is_empty()
-            && calls.iter().all(|call| {
-                self.tool_executor.classify_call(call) == ToolCallClassification::Observation
-            });
-        if observation_only {
-            self.consecutive_observation_only_rounds =
-                self.consecutive_observation_only_rounds.saturating_add(1);
+        let mut saw_observation_call = false;
+        let mut saw_mutation_call = false;
+        let mut saw_new_fingerprint = false;
+
+        for call in calls {
+            match self.tool_executor.classify_call(call) {
+                ToolCallClassification::Observation => {
+                    saw_observation_call = true;
+                    saw_new_fingerprint |= self
+                        .observation_round_tracker
+                        .seen_observation_fingerprints
+                        .insert(observation_tool_fingerprint(call));
+                }
+                ToolCallClassification::Mutation => {
+                    saw_mutation_call = true;
+                }
+            }
+        }
+
+        if !saw_observation_call || saw_mutation_call || saw_new_fingerprint {
+            self.observation_round_tracker.repetitive_rounds = 0;
         } else {
-            self.consecutive_observation_only_rounds = 0;
+            self.observation_round_tracker.repetitive_rounds = self
+                .observation_round_tracker
+                .repetitive_rounds
+                .saturating_add(1);
         }
     }
 
@@ -1733,6 +1751,37 @@ pub(super) fn build_uniform_blocked_calls(
             failure_class: Some(FailureClass::Permanent),
         })
         .collect()
+}
+
+fn observation_tool_fingerprint(call: &ToolCall) -> String {
+    format!(
+        "{}:{}",
+        call.name,
+        canonicalized_tool_arguments(&call.arguments)
+    )
+}
+
+fn canonicalized_tool_arguments(arguments: &serde_json::Value) -> String {
+    serde_json::to_string(&canonicalize_json_value(arguments))
+        .unwrap_or_else(|_| arguments.to_string())
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut canonical = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonicalize_json_value(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 pub(super) fn blocked_tool_message(tool_name: &str, reason: &str) -> String {

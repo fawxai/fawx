@@ -683,7 +683,7 @@ async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_s
     let config = BudgetConfig {
         termination: TerminationConfig {
             observation_only_round_nudge_after: 1,
-            observation_only_round_strip_after_nudge: 1,
+            observation_only_round_strip_after_nudge: 0,
             ..TerminationConfig::default()
         },
         ..BudgetConfig::default()
@@ -691,8 +691,8 @@ async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_s
     let mut engine = p4_engine_with_config(config, 6);
     let llm = Phase4MockLlm::new(vec![
         tool_use_response(vec![read_file_call("call-1", "a.txt")]),
-        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
-        tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+        tool_use_response(vec![read_file_call("call-2", "a.txt")]),
+        tool_use_response(vec![read_file_call("call-3", "a.txt")]),
     ]);
 
     let result = engine
