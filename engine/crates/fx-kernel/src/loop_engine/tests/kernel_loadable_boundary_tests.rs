@@ -20,6 +20,7 @@ impl crate::act::ToolExecutor for StubExecutor {
                 tool_name: c.name.clone(),
                 success: true,
                 output: "ok".into(),
+                failure_class: None,
             })
             .collect())
     }
@@ -47,6 +48,7 @@ fn make_tool_result(id: &str, name: &str, output: &str, success: bool) -> ToolRe
         tool_name: name.into(),
         success,
         output: output.into(),
+        failure_class: None,
     }
 }
 
@@ -180,12 +182,14 @@ fn t8_truncate_tool_results_batch() {
             tool_name: "a".into(),
             success: true,
             output: "x".repeat(max + 100),
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "2".into(),
             tool_name: "b".into(),
             success: true,
             output: "short".into(),
+            failure_class: None,
         },
     ];
     let t = truncate_tool_results(results, max);
@@ -256,6 +260,7 @@ fn t11_tool_failure_emits_friction_signal() {
             tool_name: "dangerous_tool".into(),
             success: false,
             output: "permission denied".into(),
+            failure_class: None,
         }],
     );
 
@@ -284,6 +289,7 @@ fn t11_tool_success_emits_success_signal() {
             tool_name: "read_file".into(),
             success: true,
             output: "content".into(),
+            failure_class: None,
         }],
     );
 

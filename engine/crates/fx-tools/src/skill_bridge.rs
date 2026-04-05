@@ -2,6 +2,7 @@ use crate::tools::FawxToolExecutor;
 use async_trait::async_trait;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolExecutor, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::FailureClass;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::ToolCall;
 #[cfg(test)]
@@ -33,13 +34,17 @@ impl BuiltinToolsSkill {
         self.tool_names.contains(tool_name)
     }
 
-    fn build_tool_call(tool_name: &str, arguments: &str) -> Result<ToolCall, SkillError> {
+    fn build_tool_call(
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<ToolCall, SkillError> {
         let parsed_args: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(value) => value,
             Err(error) => return Err(format!("malformed tool arguments: {error}")),
         };
         Ok(ToolCall {
-            id: String::new(),
+            id: tool_call_id.to_string(),
             name: tool_name.to_string(),
             arguments: parsed_args,
         })
@@ -99,7 +104,7 @@ impl Skill for BuiltinToolsSkill {
         if !self.handles_tool(tool_name) {
             return None;
         }
-        let call = match Self::build_tool_call(tool_name, arguments) {
+        let call = match Self::build_tool_call("", tool_name, arguments) {
             Ok(call) => call,
             Err(error) => return Some(Err(error)),
         };
@@ -109,6 +114,30 @@ impl Skill for BuiltinToolsSkill {
         } else {
             Err(result.output)
         })
+    }
+
+    async fn execute_tool_result(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<ToolResult> {
+        if !self.handles_tool(tool_name) {
+            return None;
+        }
+        let call = match Self::build_tool_call(tool_call_id, tool_name, arguments) {
+            Ok(call) => call,
+            Err(error) => {
+                return Some(ToolResult::failure(
+                    tool_call_id,
+                    tool_name,
+                    error,
+                    FailureClass::Permanent,
+                ));
+            }
+        };
+        Some(self.executor.execute_call(&call, cancel).await)
     }
 }
 
@@ -229,6 +258,7 @@ mod tests {
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         assert_eq!(
@@ -257,6 +287,32 @@ mod tests {
 
         let result = skill.execute("nonexistent_tool", "{}", None).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_preserves_builtin_failure_classification() {
+        let temp = TempDir::new().expect("tempdir");
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default());
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "fawx_issue_1705_missing_binary"
+            }),
+        };
+
+        let results = registry
+            .execute_tools(&[call], None)
+            .await
+            .expect("registry execution");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].failure_classification(),
+            Some(FailureClass::Permanent)
+        );
     }
 
     #[tokio::test]

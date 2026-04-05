@@ -37,6 +37,7 @@ impl ToolExecutor for CountingToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             });
             // Cancel after first tool call to test partial execution
             if let Some(token) = cancel {
@@ -76,6 +77,7 @@ impl ToolExecutor for Phase4StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -113,6 +115,7 @@ impl ToolExecutor for Phase4NoDecomposeExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -928,6 +931,7 @@ fn append_tool_round_messages_appends_assistant_then_tool_messages() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
     let mut messages = vec![Message::user("prompt")];
 
@@ -955,12 +959,14 @@ fn build_tool_result_message_creates_correct_blocks() {
             tool_name: "run_command".to_string(),
             success: false,
             output: "permission denied".to_string(),
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "call-1".to_string(),
             tool_name: "read_file".to_string(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         },
     ];
 
@@ -980,6 +986,7 @@ fn build_tool_result_message_uses_tool_role() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
 
     let message = build_tool_result_message(&calls, &results).expect("build_tool_result_message");
@@ -995,6 +1002,7 @@ fn build_tool_result_message_formats_error_with_prefix() {
         tool_name: "read_file".to_string(),
         success: false,
         output: "permission denied".to_string(),
+        failure_class: None,
     }];
 
     let message = build_tool_result_message(&calls, &results).expect("build_tool_result_message");
@@ -1011,6 +1019,7 @@ fn build_tool_result_message_rejects_unmatched_tool_call_id() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
 
     let error = build_tool_result_message(&calls, &results)

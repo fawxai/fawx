@@ -20,6 +20,7 @@ impl ToolExecutor for ObsNoopExecutor {
                 tool_name: c.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -58,6 +59,7 @@ fn emits_tool_failure_with_response_signal() {
             tool_name: "read_file".to_string(),
             success: false,
             output: "file not found".to_string(),
+            failure_class: None,
         }],
         response_text: "I couldn't find that file.".to_string(),
         tokens_used: TokenUsage::default(),
@@ -120,6 +122,7 @@ fn emits_tool_only_turn_signal() {
             tool_name: "read_file".to_string(),
             success: true,
             output: "contents".to_string(),
+            failure_class: None,
         }],
         response_text: String::new(),
         tokens_used: TokenUsage::default(),

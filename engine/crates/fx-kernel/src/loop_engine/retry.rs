@@ -1,4 +1,4 @@
-use crate::act::ToolResult;
+use crate::act::{FailureClass, ToolResult};
 use crate::budget::RetryPolicyConfig;
 use fx_llm::ToolCall;
 use std::collections::HashMap;
@@ -11,9 +11,15 @@ struct NoProgressState {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct RetryTracker {
-    signature_failures: HashMap<ToolCallKey, u16>,
+    signature_failures: HashMap<ToolCallKey, FailureState>,
     cycle_total_failures: u16,
     no_progress: HashMap<ToolCallKey, NoProgressState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FailureState {
+    consecutive_failures: u16,
+    last_failure_class: Option<FailureClass>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -25,20 +31,32 @@ struct ToolCallKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RetryVerdict {
     Allow,
-    Block { reason: String },
+    Block {
+        reason: String,
+        failure_class: Option<FailureClass>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct BlockedToolCall {
     pub(super) call: ToolCall,
     pub(super) reason: String,
+    pub(super) failure_class: Option<FailureClass>,
 }
 
 impl RetryTracker {
     fn should_allow(&self, call: &ToolCall, config: &RetryPolicyConfig) -> RetryVerdict {
+        if let Some(FailureClass::Permanent) = self.last_failure_class_for(call) {
+            return RetryVerdict::Block {
+                reason: permanent_failure_reason(),
+                failure_class: Some(FailureClass::Permanent),
+            };
+        }
+
         if self.cycle_total_failures >= config.max_cycle_failures {
             return RetryVerdict::Block {
                 reason: cycle_failure_limit_reason(),
+                failure_class: None,
             };
         }
 
@@ -46,6 +64,7 @@ impl RetryTracker {
         if failures >= config.max_consecutive_failures {
             return RetryVerdict::Block {
                 reason: same_call_failure_reason(failures),
+                failure_class: self.last_failure_class_for(call),
             };
         }
 
@@ -54,6 +73,7 @@ impl RetryTracker {
             if state.consecutive_same >= config.max_no_progress {
                 return RetryVerdict::Block {
                     reason: no_progress_reason(&call.name, state.consecutive_same),
+                    failure_class: None,
                 };
             }
         }
@@ -68,7 +88,11 @@ impl RetryTracker {
             .collect();
         for call in calls {
             if let Some(result) = result_map.get(call.id.as_str()) {
-                self.record_result(call, result.success);
+                self.record_result_with_class(
+                    call,
+                    result.success,
+                    result.failure_classification(),
+                );
                 if result.success {
                     self.record_progress(call, &result.output);
                 }
@@ -94,23 +118,41 @@ impl RetryTracker {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn record_result(&mut self, call: &ToolCall, success: bool) {
+        self.record_result_with_class(call, success, (!success).then_some(FailureClass::Unknown));
+    }
+
+    pub(super) fn record_result_with_class(
+        &mut self,
+        call: &ToolCall,
+        success: bool,
+        failure_class: Option<FailureClass>,
+    ) {
         let signature = ToolCallKey::from_call(call);
+        let entry = self.signature_failures.entry(signature).or_default();
         if success {
-            self.signature_failures.insert(signature, 0);
+            entry.consecutive_failures = 0;
+            entry.last_failure_class = None;
             return;
         }
 
-        let failures = self.signature_failures.entry(signature).or_insert(0);
-        *failures = failures.saturating_add(1);
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_failure_class = Some(failure_class.unwrap_or(FailureClass::Unknown));
         self.cycle_total_failures = self.cycle_total_failures.saturating_add(1);
     }
 
     pub(super) fn consecutive_failures_for(&self, call: &ToolCall) -> u16 {
         self.signature_failures
             .get(&ToolCallKey::from_call(call))
-            .copied()
+            .map(|state| state.consecutive_failures)
             .unwrap_or(0)
+    }
+
+    pub(super) fn last_failure_class_for(&self, call: &ToolCall) -> Option<FailureClass> {
+        self.signature_failures
+            .get(&ToolCallKey::from_call(call))
+            .and_then(|state| state.last_failure_class)
     }
 
     pub(super) fn cycle_total_failures(&self) -> u16 {
@@ -143,9 +185,13 @@ pub(super) fn partition_by_retry_policy(
     for call in calls {
         match tracker.should_allow(call, config) {
             RetryVerdict::Allow => allowed.push(call.clone()),
-            RetryVerdict::Block { reason } => blocked.push(BlockedToolCall {
+            RetryVerdict::Block {
+                reason,
+                failure_class,
+            } => blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason,
+                failure_class,
             }),
         }
     }
@@ -158,6 +204,10 @@ pub(super) fn same_call_failure_reason(failures: u16) -> String {
 
 fn cycle_failure_limit_reason() -> String {
     "too many total failures this cycle".to_string()
+}
+
+fn permanent_failure_reason() -> String {
+    "previous identical call failed permanently".to_string()
 }
 
 fn no_progress_reason(tool_name: &str, count: u16) -> String {
@@ -198,6 +248,18 @@ mod tests {
     use fx_llm::{CompletionResponse, Message};
     use std::sync::Arc;
 
+    fn success_result(call: &ToolCall, output: impl Into<String>) -> ToolResult {
+        ToolResult::success(call.id.clone(), call.name.clone(), output)
+    }
+
+    fn failure_result(
+        call: &ToolCall,
+        output: impl Into<String>,
+        class: FailureClass,
+    ) -> ToolResult {
+        ToolResult::failure(call.id.clone(), call.name.clone(), output, class)
+    }
+
     #[derive(Debug)]
     struct AlwaysSucceedExecutor;
 
@@ -210,12 +272,7 @@ mod tests {
         ) -> Result<Vec<ToolResult>, ToolExecutorError> {
             Ok(calls
                 .iter()
-                .map(|call| ToolResult {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    success: true,
-                    output: format!("ok: {}", call.name),
-                })
+                .map(|call| success_result(call, format!("ok: {}", call.name)))
                 .collect())
         }
 
@@ -238,12 +295,35 @@ mod tests {
         ) -> Result<Vec<ToolResult>, ToolExecutorError> {
             Ok(calls
                 .iter()
-                .map(|call| ToolResult {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    success: false,
-                    output: format!("err: {}", call.name),
+                .map(|call| {
+                    failure_result(call, format!("err: {}", call.name), FailureClass::Unknown)
                 })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn clear_cache(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct ClassifiedFailExecutor {
+        class: FailureClass,
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ClassifiedFailExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| failure_result(call, self.message, self.class))
                 .collect())
         }
 
@@ -302,6 +382,10 @@ mod tests {
 
     fn block_message(tool_name: &str, failures: u16) -> String {
         blocked_tool_message(tool_name, &same_call_failure_reason(failures))
+    }
+
+    fn permanent_block_message(tool_name: &str) -> String {
+        blocked_tool_message(tool_name, &permanent_failure_reason())
     }
 
     fn block_signature(engine: &mut LoopEngine, call: &ToolCall) {
@@ -419,6 +503,84 @@ mod tests {
             blocked_signals[0].metadata["cycle_total_failures"],
             serde_json::json!(3)
         );
+        assert_eq!(blocked_signals[0].metadata["failure_class"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_blocks_next_attempt_without_spending_retry_budget() {
+        let mut engine = retry_engine_with_executor(
+            retry_config(3),
+            Arc::new(ClassifiedFailExecutor {
+                class: FailureClass::Permanent,
+                message: "binary not found",
+            }),
+        );
+        let first = make_call("1", "run_command");
+        let first_results = engine
+            .execute_tool_calls(std::slice::from_ref(&first))
+            .await
+            .expect("execute first failure");
+
+        assert!(!first_results[0].success);
+        assert_eq!(
+            first_results[0].failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 1);
+
+        let second = make_call("2", "run_command");
+        let second_results = engine
+            .execute_tool_calls(std::slice::from_ref(&second))
+            .await
+            .expect("execute blocked retry");
+
+        assert_eq!(
+            second_results[0].output,
+            permanent_block_message("run_command")
+        );
+        assert_eq!(engine.tool_retry_tracker.cycle_total_failures, 1);
+        assert_eq!(
+            engine.tool_retry_tracker.consecutive_failures_for(&second),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_blocked_signal_includes_failure_class_metadata() {
+        let mut engine = retry_engine_with_executor(
+            retry_config(3),
+            Arc::new(ClassifiedFailExecutor {
+                class: FailureClass::Permanent,
+                message: "binary not found",
+            }),
+        );
+        let first = make_call("1", "run_command");
+        let second = make_call("2", "run_command");
+
+        let first_results = engine
+            .execute_tool_calls(std::slice::from_ref(&first))
+            .await
+            .expect("execute first failure");
+        engine.emit_action_signals(&[first.clone()], &first_results);
+
+        engine
+            .execute_tool_calls(std::slice::from_ref(&second))
+            .await
+            .expect("execute blocked retry");
+
+        let signals = engine.signals.drain_all();
+        let friction = signals
+            .iter()
+            .find(|signal| signal.kind == crate::signals::SignalKind::Friction)
+            .expect("friction signal");
+        assert_eq!(friction.metadata["failure_class"], "permanent");
+
+        let blocked = signals
+            .iter()
+            .find(|signal| signal.kind == crate::signals::SignalKind::Blocked)
+            .expect("blocked signal");
+        assert_eq!(blocked.metadata["failure_class"], "permanent");
+        assert_eq!(blocked.metadata["signature_failures"], 1);
     }
 
     #[tokio::test]
@@ -520,6 +682,76 @@ mod tests {
     }
 
     #[test]
+    fn permanent_failure_blocks_next_identical_attempt() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 5,
+            max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "run_command");
+        let mut tracker = RetryTracker::default();
+
+        tracker.record_result_with_class(&call, false, Some(FailureClass::Permanent));
+
+        assert_eq!(tracker.consecutive_failures_for(&call), 1);
+        assert_eq!(
+            tracker.last_failure_class_for(&call),
+            Some(FailureClass::Permanent)
+        );
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Block {
+                ref reason,
+                failure_class: Some(FailureClass::Permanent),
+            } if reason == &permanent_failure_reason()
+        ));
+    }
+
+    #[test]
+    fn transient_failure_remains_retryable_until_threshold() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "run_command");
+        let mut tracker = RetryTracker::default();
+
+        tracker.record_result_with_class(&call, false, Some(FailureClass::Transient));
+
+        assert_eq!(
+            tracker.last_failure_class_for(&call),
+            Some(FailureClass::Transient)
+        );
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn unknown_failure_remains_retryable_until_threshold() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            max_cycle_failures: 10,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "run_command");
+        let mut tracker = RetryTracker::default();
+
+        tracker.record_result_with_class(&call, false, Some(FailureClass::Unknown));
+
+        assert_eq!(
+            tracker.last_failure_class_for(&call),
+            Some(FailureClass::Unknown)
+        );
+        assert!(matches!(
+            tracker.should_allow(&call, &config),
+            RetryVerdict::Allow
+        ));
+    }
+
+    #[test]
     fn different_args_tracked_independently() {
         let config = RetryPolicyConfig {
             max_consecutive_failures: 2,
@@ -537,7 +769,7 @@ mod tests {
         assert_eq!(tracker.consecutive_failures_for(&call_b), 0);
         assert!(matches!(
             tracker.should_allow(&call_a, &config),
-            RetryVerdict::Block { ref reason } if reason == &same_call_failure_reason(2)
+            RetryVerdict::Block { ref reason, .. } if reason == &same_call_failure_reason(2)
         ));
         assert!(matches!(
             tracker.should_allow(&call_b, &config),
@@ -563,7 +795,7 @@ mod tests {
         assert_eq!(tracker.cycle_total_failures, 2);
         assert!(matches!(
             tracker.should_allow(&fresh_call, &config),
-            RetryVerdict::Block { ref reason } if reason == &cycle_failure_limit_reason()
+            RetryVerdict::Block { ref reason, .. } if reason == &cycle_failure_limit_reason()
         ));
     }
 
@@ -582,7 +814,7 @@ mod tests {
 
         assert!(matches!(
             tracker.should_allow(&call, &config),
-            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+            RetryVerdict::Block { ref reason, .. } if reason.contains("no progress detected")
         ));
     }
 
@@ -903,12 +1135,14 @@ mod tests {
                 tool_name: "read_file".to_string(),
                 success: true,
                 output: "same output".to_string(),
+                failure_class: None,
             },
             ToolResult {
                 tool_call_id: "c2".to_string(),
                 tool_name: "write_file".to_string(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             },
         ];
 
@@ -918,11 +1152,11 @@ mod tests {
 
         assert!(matches!(
             tracker.should_allow(&calls[0], &config),
-            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+            RetryVerdict::Block { ref reason, .. } if reason.contains("no progress detected")
         ));
         assert!(matches!(
             tracker.should_allow(&calls[1], &config),
-            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+            RetryVerdict::Block { ref reason, .. } if reason.contains("no progress detected")
         ));
     }
 
@@ -936,6 +1170,7 @@ mod tests {
             tool_name: "read_file".to_string(),
             success: false,
             output: "error: not found".to_string(),
+            failure_class: None,
         }];
 
         for _ in 0..5 {
@@ -962,12 +1197,14 @@ mod tests {
                 tool_name: "read_file".to_string(),
                 success: true,
                 output: "same output".to_string(),
+                failure_class: None,
             },
             ToolResult {
                 tool_call_id: "c2".to_string(),
                 tool_name: "write_file".to_string(),
                 success: false,
                 output: "error: permission denied".to_string(),
+                failure_class: None,
             },
         ];
 
@@ -977,7 +1214,7 @@ mod tests {
 
         assert!(matches!(
             tracker.should_allow(&calls[0], &config),
-            RetryVerdict::Block { ref reason } if reason.contains("no progress detected")
+            RetryVerdict::Block { ref reason, .. } if reason.contains("no progress detected")
         ));
         assert!(!tracker
             .no_progress

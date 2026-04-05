@@ -29,6 +29,7 @@ impl ToolExecutor for StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -93,6 +94,7 @@ impl ToolExecutor for StatefulReadWriteExecutor {
                     tool_name: call.name.clone(),
                     success,
                     output,
+                    failure_class: None,
                 }
             })
             .collect())
@@ -276,6 +278,7 @@ impl ToolExecutor for ObservationMixedToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -325,6 +328,7 @@ impl ToolExecutor for DirectUtilityToolExecutor {
                     "current_time" => "2026-03-28T07:05:00-06:00".to_string(),
                     other => format!("{other} ok"),
                 },
+                failure_class: None,
             })
             .collect())
     }
@@ -438,6 +442,7 @@ impl ToolExecutor for FailingDirectWeatherExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "No weather results found for 'Denver, CO'.".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -492,6 +497,7 @@ impl ToolExecutor for LegacyWrappedWeatherExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -536,6 +542,7 @@ impl ToolExecutor for UnannotatedStructuredWeatherExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -583,6 +590,7 @@ impl ToolExecutor for ObservationMixedNoDecomposeExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -628,6 +636,7 @@ impl ToolExecutor for ObservationRunCommandExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -687,6 +696,7 @@ impl ToolExecutor for FailingBoundedLocalEditExecutor {
                     "read_file" | "search_text" => "ok".to_string(),
                     _ => "blocked".to_string(),
                 },
+                failure_class: None,
             })
             .collect())
     }
@@ -745,6 +755,7 @@ impl ToolExecutor for LargeOutputToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "x".repeat(self.output_size),
+                failure_class: None,
             })
             .collect())
     }
@@ -1963,12 +1974,14 @@ fn root_turn_contract_progress_handles_partial_multi_artifact_writes() {
             tool_name: "write_file".to_string(),
             success: true,
             output: "wrote 14 bytes to ~/.fawx/first.md".to_string(),
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "write-2".to_string(),
             tool_name: "write_file".to_string(),
             success: true,
             output: "wrote 7 bytes to ./unrelated.txt".to_string(),
+            failure_class: None,
         },
     ]);
 
@@ -2022,6 +2035,7 @@ async fn requested_artifact_write_blocks_terminal_response_until_file_is_written
                         tool_name: call.name.clone(),
                         success: true,
                         output,
+                        failure_class: None,
                     }
                 })
                 .collect())
@@ -2386,6 +2400,7 @@ async fn artifact_gate_clears_after_successful_write_and_preserves_broader_commi
             tool_name: "write_file".to_string(),
             success: true,
             output: format!("wrote 64 bytes to {home}/.fawx/x.md"),
+            failure_class: None,
         }],
     );
 
@@ -2554,6 +2569,7 @@ fn tool_action(response_text: &str) -> ActionResult {
             tool_name: "read_file".to_string(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         }],
         response_text: response_text.to_string(),
         tokens_used: TokenUsage::default(),

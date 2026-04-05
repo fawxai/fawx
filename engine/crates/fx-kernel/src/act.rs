@@ -40,6 +40,29 @@ pub struct ToolExecutorError {
     pub recoverable: bool,
 }
 
+/// Typed classification for a failed tool invocation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// Retrying the same call is not expected to succeed.
+    Permanent,
+    /// Retrying may succeed without changing the call.
+    Transient,
+    /// The tool failed, but the tool layer could not classify why.
+    Unknown,
+}
+
+impl FailureClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::Transient => "transient",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Controls parallel execution of tool calls.
 #[derive(Debug, Clone, Default)]
 pub struct ConcurrencyPolicy {
@@ -91,6 +114,51 @@ pub struct ToolResult {
     pub success: bool,
     /// Human-readable tool output.
     pub output: String,
+    /// Typed failure classification for failed tool results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+}
+
+impl ToolResult {
+    #[must_use]
+    pub fn success(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            success: true,
+            output: output.into(),
+            failure_class: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failure(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        output: impl Into<String>,
+        failure_class: FailureClass,
+    ) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            success: false,
+            output: output.into(),
+            failure_class: Some(failure_class),
+        }
+    }
+
+    #[must_use]
+    pub fn failure_classification(&self) -> Option<FailureClass> {
+        if self.success {
+            None
+        } else {
+            Some(self.failure_class.unwrap_or(FailureClass::Unknown))
+        }
+    }
 }
 
 /// The specific tool action that should be journaled for ripcord.
@@ -169,23 +237,23 @@ pub fn is_cancelled(cancel: Option<&CancellationToken>) -> bool {
 /// Standardized tool result for cancellation.
 #[must_use]
 pub fn cancelled_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
-        success: false,
-        output: "tool execution cancelled".to_string(),
-    }
+    ToolResult::failure(
+        tool_call_id,
+        tool_name,
+        "tool execution cancelled",
+        FailureClass::Unknown,
+    )
 }
 
 /// Standardized tool result for per-call timeout.
 #[must_use]
 pub fn timed_out_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
-        success: false,
-        output: "tool execution timed out".to_string(),
-    }
+    ToolResult::failure(
+        tool_call_id,
+        tool_name,
+        "tool execution timed out",
+        FailureClass::Transient,
+    )
 }
 
 /// Tool execution abstraction for kernel act step.
@@ -523,6 +591,7 @@ mod tests {
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         assert_eq!(executor.journal_action(&call, &result), None);

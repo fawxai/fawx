@@ -24,6 +24,7 @@ impl ToolExecutor for StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -54,6 +55,7 @@ impl ToolExecutor for FailingToolExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "path escapes working directory".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -93,6 +95,7 @@ impl ToolExecutor for CacheAwareToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }

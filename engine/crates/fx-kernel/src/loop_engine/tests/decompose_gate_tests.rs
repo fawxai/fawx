@@ -24,6 +24,7 @@ impl ToolExecutor for PassiveToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -109,6 +110,7 @@ fn unroutable_gate_engine(config: BudgetConfig) -> LoopEngine {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -360,6 +362,7 @@ fn internal_child_suppresses_public_event_bus_messages() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     });
     child.publish_stream_finished(StreamPhase::Reason);
 
@@ -388,6 +391,7 @@ async fn child_engine_scopes_tool_surface_to_required_tools() {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }

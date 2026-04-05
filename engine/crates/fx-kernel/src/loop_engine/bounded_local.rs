@@ -9,7 +9,7 @@ use super::{
     BOUNDED_LOCAL_TERMINAL_PHASE_DIRECTIVE, BOUNDED_LOCAL_VERIFICATION_BLOCK_REASON,
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
 };
-use crate::act::ToolResult;
+use crate::act::{FailureClass, ToolResult};
 use crate::budget::TerminationConfig;
 use crate::loop_engine::direct_inspection::{
     direct_inspection_block_reason, direct_inspection_directive, direct_inspection_tool_names,
@@ -351,6 +351,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
+                failure_class: Some(FailureClass::Permanent),
             });
         } else {
             allowed.push(call.clone());
@@ -788,4 +789,27 @@ pub(super) fn bounded_local_terminal_partial_response(
     let next_step =
         "Next best step: point me to the exact file/function to edit, or give a more specific target for the code change so I can retry with grounded context.";
     format!("{headline}\n\n{access_note}\n\n{tool_summary}\n\n{next_step}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_local_policy_blocks_are_classified_permanent() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "list_directory".to_string(),
+            arguments: serde_json::json!({"path":"."}),
+        }];
+
+        let (_allowed, blocked) = partition_by_bounded_local_phase_semantics(
+            &calls,
+            BoundedLocalPhase::Verification,
+            None,
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
+    }
 }

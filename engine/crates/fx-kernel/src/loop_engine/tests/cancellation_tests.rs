@@ -315,6 +315,7 @@ fn success_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }
 }
 
@@ -756,6 +757,7 @@ fn bounded_local_phase_change_refreshes_turn_state_progress_before_activity_expi
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(

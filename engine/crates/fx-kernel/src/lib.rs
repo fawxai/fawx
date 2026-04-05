@@ -58,8 +58,8 @@ pub mod watchdog;
 pub mod yield_primitive;
 
 pub use act::{
-    cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
-    ToolCacheStats, ToolCacheability, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy,
+    FailureClass, TokenUsage, ToolCacheStats, ToolCacheability, ToolResult,
 };
 pub use authority::{
     ApprovalScope, AuthorityCoordinator, AuthorityDecision, AuthorityEffect,
