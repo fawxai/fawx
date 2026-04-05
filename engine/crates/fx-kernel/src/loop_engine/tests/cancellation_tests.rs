@@ -1704,7 +1704,7 @@ async fn execute_tool_calls_emits_stream_error_when_retry_budget_blocks_tool() {
             message,
             recoverable: true,
         } if message
-            == &blocked_tool_message("read_file", &same_call_failure_reason(1))
+            == &blocked_tool_message("read_file", &same_call_failure_reason(1), None)
     )));
 }
 

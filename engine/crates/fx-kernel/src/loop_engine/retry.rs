@@ -34,6 +34,7 @@ enum RetryVerdict {
     Block {
         reason: String,
         failure_class: Option<FailureClass>,
+        guidance: Option<String>,
     },
 }
 
@@ -42,6 +43,7 @@ pub(super) struct BlockedToolCall {
     pub(super) call: ToolCall,
     pub(super) reason: String,
     pub(super) failure_class: Option<FailureClass>,
+    pub(super) guidance: Option<String>,
 }
 
 impl RetryTracker {
@@ -50,6 +52,10 @@ impl RetryTracker {
             return RetryVerdict::Block {
                 reason: permanent_failure_reason(),
                 failure_class: Some(FailureClass::Permanent),
+                guidance: blocked_run_command_guidance(
+                    call.name.as_str(),
+                    Some(FailureClass::Permanent),
+                ),
             };
         }
 
@@ -57,6 +63,7 @@ impl RetryTracker {
             return RetryVerdict::Block {
                 reason: cycle_failure_limit_reason(),
                 failure_class: None,
+                guidance: blocked_run_command_guidance(call.name.as_str(), None),
             };
         }
 
@@ -65,6 +72,10 @@ impl RetryTracker {
             return RetryVerdict::Block {
                 reason: same_call_failure_reason(failures),
                 failure_class: self.last_failure_class_for(call),
+                guidance: blocked_run_command_guidance(
+                    call.name.as_str(),
+                    self.last_failure_class_for(call),
+                ),
             };
         }
 
@@ -74,6 +85,7 @@ impl RetryTracker {
                 return RetryVerdict::Block {
                     reason: no_progress_reason(&call.name, state.consecutive_same),
                     failure_class: None,
+                    guidance: blocked_run_command_guidance(call.name.as_str(), None),
                 };
             }
         }
@@ -188,10 +200,12 @@ pub(super) fn partition_by_retry_policy(
             RetryVerdict::Block {
                 reason,
                 failure_class,
+                guidance,
             } => blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason,
                 failure_class,
+                guidance,
             }),
         }
     }
@@ -218,11 +232,25 @@ fn no_progress_reason(tool_name: &str, count: u16) -> String {
     )
 }
 
+fn blocked_run_command_guidance(
+    tool_name: &str,
+    failure_class: Option<FailureClass>,
+) -> Option<String> {
+    if tool_name != "run_command" {
+        return None;
+    }
+
+    Some(match failure_class {
+        Some(FailureClass::Permanent) => "Stop retrying this command; inspect the repo/files directly or use a different installed tool/command.".to_string(),
+        _ => "Stop repeating the same command; try a different command or proceed with the current findings.".to_string(),
+    })
+}
+
 fn hash_tool_arguments(arguments: &serde_json::Value) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let canonical = serde_json::to_string(arguments).unwrap_or_default();
+    let canonical = super::tool_execution::canonicalized_tool_arguments(arguments);
     canonical.hash(&mut hasher);
     hasher.finish()
 }
@@ -239,14 +267,16 @@ fn hash_string(text: &str) -> u64 {
 mod tests {
     use super::super::{blocked_tool_message, CycleStream, LlmProvider, LoopEngine};
     use super::*;
-    use crate::act::{ToolExecutor, ToolExecutorError};
+    use crate::act::{
+        RunCommandDiagnostics, ToolExecutionDiagnostics, ToolExecutor, ToolExecutorError,
+    };
     use crate::budget::{BudgetConfig, BudgetState, BudgetTracker};
     use crate::cancellation::CancellationToken;
     use crate::context_manager::ContextCompactor;
     use crate::decide::Decision;
     use async_trait::async_trait;
     use fx_llm::{CompletionResponse, Message};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn success_result(call: &ToolCall, output: impl Into<String>) -> ToolResult {
         ToolResult::success(call.id.clone(), call.name.clone(), output)
@@ -312,6 +342,7 @@ mod tests {
     struct ClassifiedFailExecutor {
         class: FailureClass,
         message: &'static str,
+        diagnostics: Mutex<Option<ToolExecutionDiagnostics>>,
     }
 
     #[async_trait]
@@ -329,6 +360,10 @@ mod tests {
 
         fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
             Vec::new()
+        }
+
+        fn take_execution_diagnostics(&self, _call_id: &str) -> Option<ToolExecutionDiagnostics> {
+            self.diagnostics.lock().expect("diagnostics lock").take()
         }
 
         fn clear_cache(&self) {}
@@ -381,11 +416,19 @@ mod tests {
     }
 
     fn block_message(tool_name: &str, failures: u16) -> String {
-        blocked_tool_message(tool_name, &same_call_failure_reason(failures))
+        blocked_tool_message(
+            tool_name,
+            &same_call_failure_reason(failures),
+            blocked_run_command_guidance(tool_name, None).as_deref(),
+        )
     }
 
     fn permanent_block_message(tool_name: &str) -> String {
-        blocked_tool_message(tool_name, &permanent_failure_reason())
+        blocked_tool_message(
+            tool_name,
+            &permanent_failure_reason(),
+            blocked_run_command_guidance(tool_name, Some(FailureClass::Permanent)).as_deref(),
+        )
     }
 
     fn block_signature(engine: &mut LoopEngine, call: &ToolCall) {
@@ -507,12 +550,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_repeated_run_command_includes_guidance_and_failure_class_metadata() {
+        let mut engine = failure_engine(0);
+        let first = make_call_with_args(
+            "1",
+            "run_command",
+            serde_json::json!({"command":"false","shell":false}),
+        );
+        let second = make_call_with_args(
+            "2",
+            "run_command",
+            serde_json::json!({"shell":false,"command":"false"}),
+        );
+
+        let first_results = engine
+            .execute_tool_calls(std::slice::from_ref(&first))
+            .await
+            .expect("execute first run_command failure");
+        assert_eq!(
+            first_results[0].failure_classification(),
+            Some(FailureClass::Unknown)
+        );
+
+        let second_results = engine
+            .execute_tool_calls(std::slice::from_ref(&second))
+            .await
+            .expect("execute blocked run_command retry");
+
+        assert_eq!(second_results[0].output, block_message("run_command", 1));
+
+        let blocked = engine
+            .signals
+            .drain_all()
+            .into_iter()
+            .find(|signal| signal.kind == crate::signals::SignalKind::Blocked)
+            .expect("blocked signal");
+
+        assert_eq!(blocked.metadata["failure_class"], "unknown");
+        assert_eq!(
+            blocked.metadata["guidance"],
+            serde_json::json!(
+                "Stop repeating the same command; try a different command or proceed with the current findings."
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn permanent_failure_blocks_next_attempt_without_spending_retry_budget() {
         let mut engine = retry_engine_with_executor(
             retry_config(3),
             Arc::new(ClassifiedFailExecutor {
                 class: FailureClass::Permanent,
                 message: "binary not found",
+                diagnostics: Mutex::new(None),
             }),
         );
         let first = make_call("1", "run_command");
@@ -552,6 +642,7 @@ mod tests {
             Arc::new(ClassifiedFailExecutor {
                 class: FailureClass::Permanent,
                 message: "binary not found",
+                diagnostics: Mutex::new(None),
             }),
         );
         let first = make_call("1", "run_command");
@@ -580,7 +671,60 @@ mod tests {
             .find(|signal| signal.kind == crate::signals::SignalKind::Blocked)
             .expect("blocked signal");
         assert_eq!(blocked.metadata["failure_class"], "permanent");
+        assert_eq!(
+            blocked.metadata["guidance"],
+            serde_json::json!(
+                "Stop retrying this command; inspect the repo/files directly or use a different installed tool/command."
+            )
+        );
         assert_eq!(blocked.metadata["signature_failures"], 1);
+    }
+
+    #[tokio::test]
+    async fn failed_run_command_friction_signal_includes_structured_diagnostics_metadata() {
+        let diagnostics = ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+            exit_code: Some(127),
+            stderr_snippet: Some("command not found".to_string()),
+            duration_ms: 24,
+            shell: false,
+            timed_out: false,
+        });
+        let mut engine = retry_engine_with_executor(
+            retry_config(3),
+            Arc::new(ClassifiedFailExecutor {
+                class: FailureClass::Permanent,
+                message: "binary not found",
+                diagnostics: Mutex::new(Some(diagnostics)),
+            }),
+        );
+        let call = make_call_with_args(
+            "1",
+            "run_command",
+            serde_json::json!({"command":"missingcmd"}),
+        );
+
+        let results = engine
+            .execute_tool_calls(std::slice::from_ref(&call))
+            .await
+            .expect("execute failed run_command");
+        engine.emit_action_signals(&[call], &results);
+
+        let friction = engine
+            .signals
+            .drain_all()
+            .into_iter()
+            .find(|signal| signal.kind == crate::signals::SignalKind::Friction)
+            .expect("friction signal");
+
+        assert_eq!(friction.metadata["diagnostics"]["kind"], "run_command");
+        assert_eq!(friction.metadata["diagnostics"]["exit_code"], 127);
+        assert_eq!(
+            friction.metadata["diagnostics"]["stderr_snippet"],
+            "command not found"
+        );
+        assert_eq!(friction.metadata["diagnostics"]["duration_ms"], 24);
+        assert_eq!(friction.metadata["diagnostics"]["shell"], false);
+        assert_eq!(friction.metadata["diagnostics"]["timed_out"], false);
     }
 
     #[tokio::test]
@@ -703,6 +847,7 @@ mod tests {
             RetryVerdict::Block {
                 ref reason,
                 failure_class: Some(FailureClass::Permanent),
+                ..
             } if reason == &permanent_failure_reason()
         ));
     }

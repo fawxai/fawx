@@ -1,23 +1,25 @@
 use super::{
-    canonicalize_existing_or_parent, parse_args, to_tool_result, tool_failure_from_io,
-    validate_path, ToolFailure, ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, tool_failure_from_io, validate_path, ToolFailure,
+    ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
 use fx_kernel::act::{
-    FailureClass, JournalAction, ToolCacheability, ToolCallClassification, ToolResult,
+    FailureClass, JournalAction, RunCommandDiagnostics, ToolCacheability, ToolCallClassification,
+    ToolExecutionDiagnostics, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::CharIndices;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolContext>) {
@@ -26,13 +28,39 @@ pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolCont
 
 struct RunCommandTool {
     context: Arc<ToolContext>,
+    diagnostics: Arc<Mutex<HashMap<String, ToolExecutionDiagnostics>>>,
 }
 
 impl RunCommandTool {
     fn new(context: &Arc<ToolContext>) -> Self {
         Self {
             context: Arc::clone(context),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn store_execution_diagnostics(
+        &self,
+        call_id: &str,
+        diagnostics: Option<ToolExecutionDiagnostics>,
+    ) {
+        let mut guard = self
+            .diagnostics
+            .lock()
+            .expect("run_command diagnostics lock");
+        if let Some(diagnostics) = diagnostics {
+            guard.insert(call_id.to_string(), diagnostics);
+        } else {
+            guard.remove(call_id);
+        }
+    }
+
+    fn clear_execution_diagnostics(&self, call_id: &str) {
+        let _ = self
+            .diagnostics
+            .lock()
+            .expect("run_command diagnostics lock")
+            .remove(call_id);
     }
 }
 
@@ -59,11 +87,16 @@ impl Tool for RunCommandTool {
     }
 
     async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
-        to_tool_result(
-            &call.id,
-            self.name(),
-            self.context.handle_run_command(&call.arguments).await,
-        )
+        match self.context.handle_run_command(&call.arguments).await {
+            Ok(output) => {
+                self.clear_execution_diagnostics(&call.id);
+                ToolResult::success(&call.id, self.name(), output)
+            }
+            Err(error) => {
+                self.store_execution_diagnostics(&call.id, error.diagnostics().cloned());
+                ToolResult::failure(&call.id, self.name(), error.message, error.class)
+            }
+        }
     }
 
     fn cacheability(&self) -> ToolCacheability {
@@ -88,6 +121,13 @@ impl Tool for RunCommandTool {
 
     fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
         ToolAuthoritySurface::Command
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.diagnostics
+            .lock()
+            .expect("run_command diagnostics lock")
+            .remove(call_id)
     }
 }
 
@@ -119,25 +159,99 @@ impl ToolContext {
         &self,
         args: &serde_json::Value,
     ) -> Result<String, ToolFailure> {
-        let parsed: RunCommandArgs = parse_args(args).map_err(ToolFailure::permanent)?;
+        let started_at = Instant::now();
+        let parsed: RunCommandArgs = parse_args(args).map_err(|error| {
+            let message = error.clone();
+            ToolFailure::permanent(error).with_diagnostics(run_command_failure_diagnostics(
+                started_at,
+                false,
+                None,
+                false,
+                Some(message.as_str()),
+            ))
+        })?;
+        let shell = parsed.shell.unwrap_or(false);
         let command = parsed.command.trim();
         if command.is_empty() {
-            return Err(ToolFailure::permanent("command cannot be empty"));
+            return Err(
+                ToolFailure::permanent("command cannot be empty").with_diagnostics(
+                    run_command_failure_diagnostics(
+                        started_at,
+                        shell,
+                        None,
+                        false,
+                        Some("command cannot be empty"),
+                    ),
+                ),
+            );
         }
-        let shell = parsed.shell.unwrap_or(false);
-        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
-        self.guard_push_command(command)?;
-        let child = build_command(command, shell, &working_dir)?
+        let working_dir = self
+            .resolve_command_dir(parsed.working_dir.as_deref())
+            .map_err(|error| {
+                let message = error.message.clone();
+                error.with_diagnostics(run_command_failure_diagnostics(
+                    started_at,
+                    shell,
+                    None,
+                    false,
+                    Some(message.as_str()),
+                ))
+            })?;
+        self.guard_push_command(command).map_err(|error| {
+            let message = error.message.clone();
+            error.with_diagnostics(run_command_failure_diagnostics(
+                started_at,
+                shell,
+                None,
+                false,
+                Some(message.as_str()),
+            ))
+        })?;
+        let child = build_command(command, shell, &working_dir)
+            .map_err(|error| {
+                let message = error.message.clone();
+                error.with_diagnostics(run_command_failure_diagnostics(
+                    started_at,
+                    shell,
+                    None,
+                    false,
+                    Some(message.as_str()),
+                ))
+            })?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(tool_failure_from_io)?;
-        let output = wait_with_timeout(child, self.config.command_timeout).await?;
+            .map_err(|error| {
+                let message = error.to_string();
+                tool_failure_from_io(error).with_diagnostics(run_command_failure_diagnostics(
+                    started_at,
+                    shell,
+                    None,
+                    false,
+                    Some(message.as_str()),
+                ))
+            })?;
+        let output = wait_with_timeout(child, self.config.command_timeout)
+            .await
+            .map_err(|error| {
+                let message = error.message.clone();
+                error.with_diagnostics(run_command_failure_diagnostics(
+                    started_at,
+                    shell,
+                    None,
+                    true,
+                    Some(message.as_str()),
+                ))
+            })?;
         let formatted = format_command_output(&output, shell);
         if output.status.success() {
             Ok(formatted)
         } else {
-            Err(ToolFailure::new(formatted, classify_command_exit(&output)))
+            Err(
+                ToolFailure::new(formatted, classify_command_exit(&output)).with_diagnostics(
+                    run_command_failure_diagnostics(started_at, shell, Some(&output), false, None),
+                ),
+            )
         }
     }
 
@@ -198,6 +312,53 @@ async fn wait_with_timeout(
         Ok(result) => result.map_err(tool_failure_from_io),
         Err(_) => Err(ToolFailure::transient("command timed out")),
     }
+}
+
+fn run_command_failure_diagnostics(
+    started_at: Instant,
+    shell: bool,
+    output: Option<&std::process::Output>,
+    timed_out: bool,
+    fallback_stderr: Option<&str>,
+) -> ToolExecutionDiagnostics {
+    ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+        exit_code: output.and_then(|process_output| process_output.status.code()),
+        stderr_snippet: output
+            .and_then(|process_output| stderr_snippet(&process_output.stderr))
+            .or_else(|| fallback_stderr.and_then(stderr_snippet_from_text)),
+        duration_ms: elapsed_ms(started_at),
+        shell,
+        timed_out,
+    })
+}
+
+fn stderr_snippet(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    stderr_snippet_from_text(text.as_ref())
+}
+
+fn stderr_snippet_from_text(text: &str) -> Option<String> {
+    let snippet = text.trim();
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(truncate_snippet(snippet, 240))
+    }
+}
+
+fn truncate_snippet(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let prefix = text.chars().take(max_chars).collect::<String>();
+    format!("{prefix}...")
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    let millis = started_at.elapsed().as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 fn format_command_output(output: &std::process::Output, shell: bool) -> String {

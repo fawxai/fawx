@@ -197,12 +197,38 @@ impl LoopEngine {
         });
     }
 
-    pub(super) fn record_tool_execution_cost(&mut self, tool_count: usize) {
+    pub(super) fn record_tool_execution_cost(
+        &mut self,
+        calls: &[ToolCall],
+        results: &[ToolResult],
+        blocked_count: usize,
+    ) {
+        let mut signature_failures: HashMap<String, u16> = HashMap::new();
+        let result_map: HashMap<&str, &ToolResult> = results
+            .iter()
+            .map(|result| (result.tool_call_id.as_str(), result))
+            .collect();
+        let mut tool_invocations = blocked_count as u32;
+        let mut cost_cents = blocked_count as u64;
+
+        for call in calls {
+            let Some(result) = result_map.get(call.id.as_str()) else {
+                continue;
+            };
+            tool_invocations = tool_invocations.saturating_add(1);
+            cost_cents = cost_cents.saturating_add(tool_result_cost_cents(
+                self.tool_retry_tracker.consecutive_failures_for(call),
+                call,
+                result,
+                &mut signature_failures,
+            ));
+        }
+
         self.budget.record(&ActionCost {
             llm_calls: 0,
-            tool_invocations: tool_count as u32,
+            tool_invocations,
             tokens: 0,
-            cost_cents: tool_count as u64,
+            cost_cents,
         });
     }
 
@@ -249,6 +275,8 @@ impl LoopEngine {
         let mut results = self
             .execute_allowed_tool_calls(&prepared.allowed, stream)
             .await?;
+        self.capture_tool_execution_diagnostics(&results);
+        self.record_tool_execution_cost(&prepared.allowed, &results, prepared.blocked.len());
         self.tool_retry_tracker
             .record_results(&prepared.allowed, &results);
         results.extend(build_blocked_tool_results(&prepared.blocked));
@@ -335,13 +363,18 @@ impl LoopEngine {
                     "tool": call.name,
                     "reason": blocked_call.reason,
                     "failure_class": blocked_call.failure_class.map(|class| class.as_str()),
+                    "guidance": blocked_call.guidance.clone(),
                     "signature_failures": signature_failures,
                     "cycle_total_failures": self.tool_retry_tracker.cycle_total_failures(),
                 }),
             );
             stream.emit_error(
                 ErrorCategory::ToolExecution,
-                blocked_tool_message(&call.name, &blocked_call.reason),
+                blocked_tool_message(
+                    &call.name,
+                    &blocked_call.reason,
+                    blocked_call.guidance.as_deref(),
+                ),
                 true,
             );
         }
@@ -415,6 +448,7 @@ impl LoopEngine {
         calls: &[ToolCall],
         context_messages: &[Message],
     ) -> ToolRoundState {
+        self.pending_tool_result_diagnostics.clear();
         let initial_text = self.pending_tool_response_text.take();
         let mut state = ToolRoundState::new_empty_calls(context_messages, initial_text);
         self.stage_tool_calls_for_round(&mut state, calls.to_vec());
@@ -1375,7 +1409,6 @@ impl LoopEngine {
         let results = self.execute_tool_calls_with_stream(&calls, stream).await?;
         self.publish_tool_round(&calls, &results, stream);
         let has_tool_errors = self.emit_tool_errors(&results, stream);
-        self.record_tool_execution_cost(results.len());
         Ok(ExecutedToolRound {
             calls,
             results,
@@ -1711,6 +1744,7 @@ pub(super) fn partition_by_call_classification(
                 call: call.clone(),
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
+                guidance: None,
             });
         }
     }
@@ -1733,6 +1767,7 @@ pub(super) fn partition_by_allowed_tool_names(
                 call: call.clone(),
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
+                guidance: None,
             });
         }
     }
@@ -1750,6 +1785,7 @@ pub(super) fn build_uniform_blocked_calls(
             call,
             reason: reason.to_string(),
             failure_class: Some(FailureClass::Permanent),
+            guidance: None,
         })
         .collect()
 }
@@ -1764,9 +1800,50 @@ fn observation_tool_fingerprint(call: &ToolCall) -> String {
     )
 }
 
-fn canonicalized_tool_arguments(arguments: &serde_json::Value) -> String {
+pub(super) fn canonicalized_tool_arguments(arguments: &serde_json::Value) -> String {
     serde_json::to_string(&canonicalize_json_value(arguments))
         .unwrap_or_else(|_| arguments.to_string())
+}
+
+fn tool_execution_signature(call: &ToolCall) -> String {
+    format!(
+        "{}:{}",
+        call.name,
+        canonicalized_tool_arguments(&call.arguments)
+    )
+}
+
+fn tool_result_cost_cents(
+    prior_failures: u16,
+    call: &ToolCall,
+    result: &ToolResult,
+    signature_failures: &mut HashMap<String, u16>,
+) -> u64 {
+    if call.name != "run_command" {
+        return 1;
+    }
+
+    let signature = tool_execution_signature(call);
+    let consecutive_failures = signature_failures
+        .entry(signature)
+        .or_insert(prior_failures);
+    if result.success {
+        *consecutive_failures = 0;
+        return 1;
+    }
+
+    let multiplier = run_command_failure_cost_multiplier(*consecutive_failures);
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    multiplier
+}
+
+fn run_command_failure_cost_multiplier(consecutive_failures: u16) -> u64 {
+    match consecutive_failures {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    }
 }
 
 fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
@@ -1787,11 +1864,18 @@ fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-pub(super) fn blocked_tool_message(tool_name: &str, reason: &str) -> String {
-    format!(
-        "Tool '{}' blocked: {}. Try a different approach.",
-        tool_name, reason
-    )
+pub(super) fn blocked_tool_message(
+    tool_name: &str,
+    reason: &str,
+    guidance: Option<&str>,
+) -> String {
+    match guidance {
+        Some(guidance) => format!("Tool '{}' blocked: {}. {}", tool_name, reason, guidance),
+        None => format!(
+            "Tool '{}' blocked: {}. Try a different approach.",
+            tool_name, reason
+        ),
+    }
 }
 
 fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> String {
@@ -1815,7 +1899,11 @@ pub(super) fn build_blocked_tool_results(blocked: &[BlockedToolCall]) -> Vec<Too
             ToolResult::failure(
                 blocked_call.call.id.clone(),
                 blocked_call.call.name.clone(),
-                blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
+                blocked_tool_message(
+                    &blocked_call.call.name,
+                    &blocked_call.reason,
+                    blocked_call.guidance.as_deref(),
+                ),
                 blocked_call
                     .failure_class
                     .unwrap_or(crate::act::FailureClass::Unknown),
@@ -2165,6 +2253,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailureCostExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailureCostExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| {
+                    ToolResult::failure(
+                        call.id.clone(),
+                        call.name.clone(),
+                        format!("failed: {}", call.name),
+                        FailureClass::Unknown,
+                    )
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition("run_command"), tool_definition("read_file")]
+        }
+
+        fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+            match tool_name {
+                "run_command" => ToolCacheability::SideEffect,
+                _ => ToolCacheability::Cacheable,
+            }
+        }
+    }
+
     fn tool_definition(name: &str) -> ToolDefinition {
         ToolDefinition {
             name: name.to_string(),
@@ -2227,6 +2350,90 @@ mod tests {
         assert_eq!(results[1].tool_call_id, "call-2");
         assert!(!results[0].success);
         assert!(results[1].success);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_identical_run_command_costs_more_than_flat_failures() {
+        let mut run_command_engine = tool_execution_engine(Arc::new(FailureCostExecutor));
+        let first_run = ToolCall {
+            id: "run-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command":"false","shell":false}),
+        };
+        let second_run = ToolCall {
+            id: "run-2".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"shell":false,"command":"false"}),
+        };
+        let third_run = ToolCall {
+            id: "run-3".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command":"false","shell":false}),
+        };
+
+        run_command_engine
+            .execute_tool_calls_with_stream(&[first_run], CycleStream::disabled())
+            .await
+            .expect("execute first run_command failure");
+        let first_run_cost = run_command_engine.budget.cost_cents_used();
+
+        run_command_engine
+            .execute_tool_calls_with_stream(&[second_run], CycleStream::disabled())
+            .await
+            .expect("execute second run_command failure");
+        let second_run_cost = run_command_engine.budget.cost_cents_used() - first_run_cost;
+
+        run_command_engine
+            .execute_tool_calls_with_stream(&[third_run], CycleStream::disabled())
+            .await
+            .expect("execute third run_command failure");
+        let third_run_cost =
+            run_command_engine.budget.cost_cents_used() - first_run_cost - second_run_cost;
+
+        let mut read_file_engine = tool_execution_engine(Arc::new(FailureCostExecutor));
+        let first_read = ToolCall {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        };
+        let second_read = ToolCall {
+            id: "read-2".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        };
+        let third_read = ToolCall {
+            id: "read-3".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        };
+
+        read_file_engine
+            .execute_tool_calls_with_stream(&[first_read], CycleStream::disabled())
+            .await
+            .expect("execute first read_file failure");
+        let first_read_cost = read_file_engine.budget.cost_cents_used();
+
+        read_file_engine
+            .execute_tool_calls_with_stream(&[second_read], CycleStream::disabled())
+            .await
+            .expect("execute second read_file failure");
+        let second_read_cost = read_file_engine.budget.cost_cents_used() - first_read_cost;
+
+        read_file_engine
+            .execute_tool_calls_with_stream(&[third_read], CycleStream::disabled())
+            .await
+            .expect("execute third read_file failure");
+        let third_read_cost =
+            read_file_engine.budget.cost_cents_used() - first_read_cost - second_read_cost;
+
+        assert_eq!(first_run_cost, 1);
+        assert_eq!(second_run_cost, 2);
+        assert_eq!(third_run_cost, 4);
+        assert_eq!(first_read_cost, 1);
+        assert_eq!(second_read_cost, 1);
+        assert_eq!(third_read_cost, 1);
+        assert_eq!(run_command_engine.budget.cost_cents_used(), 7);
+        assert_eq!(read_file_engine.budget.cost_cents_used(), 3);
     }
 
     #[test]
