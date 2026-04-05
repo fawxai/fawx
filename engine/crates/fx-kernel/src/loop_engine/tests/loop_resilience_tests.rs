@@ -264,6 +264,177 @@ impl LlmProvider for AppendEvidenceLlm {
     }
 }
 
+#[derive(Debug)]
+struct MixedBatchMutationBarrierLlm {
+    call_count: AtomicUsize,
+    baseline_readme: String,
+    verification_line: String,
+}
+
+impl MixedBatchMutationBarrierLlm {
+    fn new(baseline_readme: &str, verification_line: &str) -> Self {
+        Self {
+            call_count: AtomicUsize::new(0),
+            baseline_readme: baseline_readme.to_string(),
+            verification_line: verification_line.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MixedBatchMutationBarrierLlm {
+    async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+        Ok("summary".to_string())
+    }
+
+    async fn generate_streaming(
+        &self,
+        _: &str,
+        _: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, CoreLlmError> {
+        callback("summary".to_string());
+        Ok("summary".to_string())
+    }
+
+    fn model_name(&self) -> &str {
+        "mixed-mutation-barrier"
+    }
+
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(match index {
+            0 => tool_use_response(vec![
+                ToolCall {
+                    id: "read-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                },
+                ToolCall {
+                    id: "write-1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path":"README.md",
+                        "content":"SHOULD NOT RUN BEFORE REVIEW",
+                    }),
+                },
+            ]),
+            1 => {
+                assert!(
+                    request_contains_tool_result_text(&request, &self.baseline_readme),
+                    "second reasoning pass should see the read_file result"
+                );
+                assert_eq!(
+                    request_tool_use_names(&request),
+                    vec!["read_file".to_string()],
+                    "only the observation call should have executed in the first round"
+                );
+                assert!(
+                    request_contains_text(&request, "Mutation-capable tool calls were deferred"),
+                    "next reasoning pass should be told that mutation calls were deferred"
+                );
+                tool_use_response(vec![ToolCall {
+                    id: "write-2".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path":"README.md",
+                        "content": format!("{}\n{}", self.baseline_readme, self.verification_line),
+                    }),
+                }])
+            }
+            2 | 3 => text_response("Applied the write after reviewing the file."),
+            other => {
+                return Err(ProviderError::Provider(format!(
+                    "unexpected completion call {other}"
+                )))
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SequentialMutationBarrierLlm {
+    call_count: AtomicUsize,
+}
+
+impl SequentialMutationBarrierLlm {
+    fn new() -> Self {
+        Self {
+            call_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SequentialMutationBarrierLlm {
+    async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+        Ok("summary".to_string())
+    }
+
+    async fn generate_streaming(
+        &self,
+        _: &str,
+        _: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, CoreLlmError> {
+        callback("summary".to_string());
+        Ok("summary".to_string())
+    }
+
+    fn model_name(&self) -> &str {
+        "sequential-mutation-barrier"
+    }
+
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(match index {
+            0 => tool_use_response(vec![
+                ToolCall {
+                    id: "write-1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md","content":"first write"}),
+                },
+                ToolCall {
+                    id: "write-2".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md","content":"second write"}),
+                },
+            ]),
+            1 => {
+                assert_eq!(
+                    request_tool_use_names(&request),
+                    vec!["write_file".to_string()],
+                    "only one mutation should execute per round"
+                );
+                assert!(
+                    request_contains_text(
+                        &request,
+                        "Mutation-capable tool calls are executed one at a time.",
+                    ),
+                    "next reasoning pass should be told the remaining mutation was deferred"
+                );
+                tool_use_response(vec![ToolCall {
+                    id: "write-3".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md","content":"second write"}),
+                }])
+            }
+            2 | 3 => text_response("Applied both writes safely."),
+            other => {
+                return Err(ProviderError::Provider(format!(
+                    "unexpected completion call {other}"
+                )))
+            }
+        })
+    }
+}
+
 #[async_trait]
 impl ToolExecutor for ObservationMixedToolExecutor {
     async fn execute_tools(
@@ -948,6 +1119,30 @@ fn request_contains_tool_result_text(request: &CompletionRequest, needle: &str) 
             _ => false,
         })
     })
+}
+
+fn request_contains_text(request: &CompletionRequest, needle: &str) -> bool {
+    request.messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains(needle),
+            ContentBlock::ToolResult { content, .. } => {
+                content.as_str().is_some_and(|text| text.contains(needle))
+            }
+            _ => false,
+        })
+    })
+}
+
+fn request_tool_use_names(request: &CompletionRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn complete_response(result: LoopResult) -> String {
@@ -2141,6 +2336,53 @@ async fn append_follow_up_uses_actual_file_body_instead_of_summary_rewrite() {
         executor.readme_contents(),
         format!("{baseline}\n{verification}")
     );
+}
+
+#[tokio::test]
+async fn mixed_observation_and_mutation_batch_defers_mutation_until_review() {
+    let baseline = "README intro\nACTUAL FINAL LINE";
+    let verification = "[verification] appended after review";
+    let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
+    let mut engine = stateful_mixed_tool_engine(executor.clone());
+    let llm = MixedBatchMutationBarrierLlm::new(baseline, verification);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot(
+                "Read README.md and then update it, but only after reviewing what you found.",
+            ),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(
+        complete_response(result),
+        "Applied the write after reviewing the file."
+    );
+    assert_eq!(
+        executor.readme_contents(),
+        format!("{baseline}\n{verification}")
+    );
+}
+
+#[tokio::test]
+async fn mutation_batches_execute_one_call_per_round() {
+    let baseline = "README intro\nACTUAL FINAL LINE";
+    let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
+    let mut engine = stateful_mixed_tool_engine(executor.clone());
+    let llm = SequentialMutationBarrierLlm::new();
+
+    let result = engine
+        .run_cycle(
+            test_snapshot("Apply two sequential writes to README.md."),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    assert_eq!(complete_response(result), "Applied both writes safely.");
+    assert_eq!(executor.readme_contents(), "second write");
 }
 
 #[tokio::test]
