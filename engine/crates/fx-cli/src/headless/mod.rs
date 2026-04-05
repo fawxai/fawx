@@ -4527,13 +4527,13 @@ mod tests {
     #[tokio::test]
     async fn loop_and_debug_commands_work_in_headless_mode() {
         let mut app = test_app();
-        app.last_signals.push(Signal {
-            step: fx_core::signals::LoopStep::Act,
-            kind: fx_core::signals::SignalKind::Friction,
-            message: "tool timed out".to_string(),
-            metadata: serde_json::Value::Null,
-            timestamp_ms: 42,
-        });
+        app.last_signals.push(Signal::new(
+            fx_core::signals::LoopStep::Act,
+            fx_core::signals::SignalKind::Friction,
+            "tool timed out",
+            serde_json::Value::Null,
+            42,
+        ));
 
         let loop_status = process_input_with_commands(&mut app, "/loop", None)
             .await

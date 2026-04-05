@@ -1435,13 +1435,13 @@ mod tests {
 
     #[test]
     fn render_signals_summary_uses_shared_signal_collector_format() {
-        let signals = vec![Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Friction,
-            message: "tool timed out".to_string(),
-            metadata: serde_json::Value::Null,
-            timestamp_ms: 42,
-        }];
+        let signals = vec![Signal::new(
+            LoopStep::Act,
+            SignalKind::Friction,
+            "tool timed out",
+            serde_json::Value::Null,
+            42,
+        )];
 
         assert_eq!(
             render_signals_summary(&signals),

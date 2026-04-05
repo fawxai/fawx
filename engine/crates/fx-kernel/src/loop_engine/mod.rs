@@ -1313,13 +1313,8 @@ impl LoopEngine {
         message: impl Into<String>,
         metadata: serde_json::Value,
     ) {
-        self.signals.emit(Signal {
-            step,
-            kind,
-            message: message.into(),
-            metadata,
-            timestamp_ms: current_time_ms(),
-        });
+        self.signals
+            .emit_signal(step, kind, message, metadata, current_time_ms());
     }
 
     fn finalize_result(&mut self, result: LoopResult) -> LoopResult {
@@ -2918,9 +2913,7 @@ impl LoopEngine {
     }
 
     fn roll_up_sub_goal_signals(&mut self, signals: &[Signal]) {
-        for signal in signals {
-            self.signals.emit(signal.clone());
-        }
+        self.signals.import_signals(signals);
     }
 
     fn emit_reason_trace_and_perf(&mut self, latency_ms: u64, usage: Option<&fx_llm::Usage>) {

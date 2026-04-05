@@ -255,13 +255,13 @@ mod tests {
 
         let store = SignalStore::new(&data_dir, "planning-failure-session").unwrap();
         store
-            .persist(&[Signal {
-                step: LoopStep::Act,
-                kind: SignalKind::Friction,
-                message: "test friction".to_string(),
-                metadata: serde_json::json!({}),
-                timestamp_ms: 1000,
-            }])
+            .persist(&[Signal::new(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "test friction",
+                serde_json::json!({}),
+                1000,
+            )])
             .unwrap();
 
         let provider = QueueMockProvider::new(vec![

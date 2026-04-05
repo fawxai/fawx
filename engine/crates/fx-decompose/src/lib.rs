@@ -552,13 +552,13 @@ mod tests {
     }
 
     fn sample_signal() -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Success,
-            message: "sub-goal completed".to_string(),
-            metadata: serde_json::json!({"test": true}),
-            timestamp_ms: 42,
-        }
+        Signal::new(
+            LoopStep::Act,
+            SignalKind::Success,
+            "sub-goal completed",
+            serde_json::json!({"test": true}),
+            42,
+        )
     }
 
     #[test]

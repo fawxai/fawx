@@ -433,13 +433,13 @@ mod tests {
     }
 
     fn mk_signal(step: LoopStep, kind: SignalKind, message: &str, ts: u64) -> Signal {
-        Signal {
+        Signal::new(
             step,
             kind,
-            message: message.to_string(),
-            metadata: serde_json::json!({"tool": "search_text"}),
-            timestamp_ms: ts,
-        }
+            message.to_string(),
+            serde_json::json!({"tool": "search_text"}),
+            ts,
+        )
     }
 
     #[test]
