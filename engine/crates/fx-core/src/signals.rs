@@ -36,6 +36,37 @@ impl fmt::Display for LoopStep {
     }
 }
 
+/// Severity classification for signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalSeverity {
+    /// Trace-level, informational (memory hit, observation)
+    Low,
+    /// Normal friction (file not found, parse error)
+    Medium,
+    /// Repeated failures, budget pressure, retry exhaustion
+    High,
+    /// Provider down, budget exhausted, unrecoverable error
+    Critical,
+}
+
+impl SignalSeverity {
+    pub fn to_label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+impl fmt::Display for SignalSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.to_label())
+    }
+}
+
 /// Signal category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +111,26 @@ impl SignalKind {
             Self::Observation => "observation",
         }
     }
+
+    /// Returns the default severity for this signal kind.
+    /// Callers can override when context warrants escalation.
+    pub fn default_severity(self) -> SignalSeverity {
+        match self {
+            // Low severity: informational, trace-level
+            Self::Trace
+            | Self::Observation
+            | Self::Thinking
+            | Self::Success
+            | Self::Decision
+            | Self::UserInput => SignalSeverity::Low,
+
+            // Medium severity: normal friction, performance notes
+            Self::Friction | Self::Performance | Self::UserFeedback => SignalSeverity::Medium,
+
+            // High severity: blocked operations, user intervention required
+            Self::Blocked | Self::UserIntervention => SignalSeverity::High,
+        }
+    }
 }
 
 impl fmt::Display for SignalKind {
@@ -91,11 +142,94 @@ impl fmt::Display for SignalKind {
 /// A structured observation emitted by a loop step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Signal {
+    /// Monotonic signal ID (unique within a collector instance)
+    pub id: u64,
+    /// Request/subagent correlation ID for cross-boundary tracing
+    pub span_id: Option<String>,
+    /// Which loop step produced this signal
     pub step: LoopStep,
+    /// Signal category
     pub kind: SignalKind,
+    /// Severity classification
+    pub severity: SignalSeverity,
+    /// Human-readable message
     pub message: String,
+    /// Structured metadata (tool results, error details, etc.)
     pub metadata: serde_json::Value,
+    /// Unix timestamp in milliseconds
     pub timestamp_ms: u64,
+    /// ID of the signal that caused this one (causal chain)
+    pub cause_id: Option<u64>,
+    /// Wall time for the step that emitted this signal (milliseconds)
+    pub duration_ms: Option<u64>,
+}
+
+impl Signal {
+    /// Create a new signal with the given parameters.
+    /// Uses the default severity for the signal kind.
+    pub fn new(
+        id: u64,
+        step: LoopStep,
+        kind: SignalKind,
+        message: impl Into<String>,
+        metadata: serde_json::Value,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id,
+            span_id: None,
+            step,
+            kind,
+            severity: kind.default_severity(),
+            message: message.into(),
+            metadata,
+            timestamp_ms,
+            cause_id: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Create a signal with explicit severity override.
+    pub fn with_severity(
+        id: u64,
+        step: LoopStep,
+        kind: SignalKind,
+        severity: SignalSeverity,
+        message: impl Into<String>,
+        metadata: serde_json::Value,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id,
+            span_id: None,
+            step,
+            kind,
+            severity,
+            message: message.into(),
+            metadata,
+            timestamp_ms,
+            cause_id: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Set the span ID for cross-boundary correlation.
+    pub fn with_span_id(mut self, span_id: impl Into<String>) -> Self {
+        self.span_id = Some(span_id.into());
+        self
+    }
+
+    /// Set the cause ID for causal chain linking.
+    pub fn with_cause_id(mut self, cause_id: u64) -> Self {
+        self.cause_id = Some(cause_id);
+        self
+    }
+
+    /// Set the duration for the step that produced this signal.
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +257,27 @@ mod tests {
         let snake_case: LoopStep = serde_json::from_str("\"synthesize\"").expect("snake_case");
         assert_eq!(legacy, LoopStep::Synthesize);
         assert_eq!(snake_case, LoopStep::Synthesize);
+    }
+
+    #[test]
+    fn signal_severity_display_matches_label() {
+        assert_eq!(SignalSeverity::Low.to_string(), "low");
+        assert_eq!(SignalSeverity::Medium.to_string(), "medium");
+        assert_eq!(SignalSeverity::High.to_string(), "high");
+        assert_eq!(SignalSeverity::Critical.to_string(), "critical");
+    }
+
+    #[test]
+    fn signal_severity_serializes_to_snake_case() {
+        let encoded = serde_json::to_string(&SignalSeverity::High).expect("serialize");
+        assert_eq!(encoded, "\"high\"");
+    }
+
+    #[test]
+    fn signal_severity_ordering() {
+        assert!(SignalSeverity::Low < SignalSeverity::Medium);
+        assert!(SignalSeverity::Medium < SignalSeverity::High);
+        assert!(SignalSeverity::High < SignalSeverity::Critical);
     }
 
     #[test]
@@ -155,5 +310,96 @@ mod tests {
         let snake_case: SignalKind = serde_json::from_str("\"user_feedback\"").expect("snake_case");
         assert_eq!(legacy, SignalKind::UserFeedback);
         assert_eq!(snake_case, SignalKind::UserFeedback);
+    }
+
+    #[test]
+    fn signal_kind_default_severity() {
+        // Low severity
+        assert_eq!(SignalKind::Trace.default_severity(), SignalSeverity::Low);
+        assert_eq!(SignalKind::Observation.default_severity(), SignalSeverity::Low);
+        assert_eq!(SignalKind::Thinking.default_severity(), SignalSeverity::Low);
+        assert_eq!(SignalKind::Success.default_severity(), SignalSeverity::Low);
+        assert_eq!(SignalKind::Decision.default_severity(), SignalSeverity::Low);
+        assert_eq!(SignalKind::UserInput.default_severity(), SignalSeverity::Low);
+
+        // Medium severity
+        assert_eq!(SignalKind::Friction.default_severity(), SignalSeverity::Medium);
+        assert_eq!(SignalKind::Performance.default_severity(), SignalSeverity::Medium);
+        assert_eq!(SignalKind::UserFeedback.default_severity(), SignalSeverity::Medium);
+
+        // High severity
+        assert_eq!(SignalKind::Blocked.default_severity(), SignalSeverity::High);
+        assert_eq!(SignalKind::UserIntervention.default_severity(), SignalSeverity::High);
+    }
+
+    #[test]
+    fn signal_new_uses_default_severity() {
+        let signal = Signal::new(
+            1,
+            LoopStep::Act,
+            SignalKind::Friction,
+            "test message",
+            serde_json::json!({}),
+            1000,
+        );
+        assert_eq!(signal.id, 1);
+        assert_eq!(signal.severity, SignalSeverity::Medium); // Friction default
+        assert_eq!(signal.span_id, None);
+        assert_eq!(signal.cause_id, None);
+        assert_eq!(signal.duration_ms, None);
+    }
+
+    #[test]
+    fn signal_with_severity_override() {
+        let signal = Signal::with_severity(
+            2,
+            LoopStep::Act,
+            SignalKind::Friction,
+            SignalSeverity::Critical,
+            "critical failure",
+            serde_json::json!({"error": "oom"}),
+            2000,
+        );
+        assert_eq!(signal.id, 2);
+        assert_eq!(signal.severity, SignalSeverity::Critical);
+    }
+
+    #[test]
+    fn signal_builder_methods() {
+        let signal = Signal::new(
+            3,
+            LoopStep::Reason,
+            SignalKind::Trace,
+            "trace",
+            serde_json::json!({}),
+            3000,
+        )
+        .with_span_id("span-123")
+        .with_cause_id(2)
+        .with_duration_ms(150);
+
+        assert_eq!(signal.span_id, Some("span-123".to_string()));
+        assert_eq!(signal.cause_id, Some(2));
+        assert_eq!(signal.duration_ms, Some(150));
+    }
+
+    #[test]
+    fn signal_serialization_roundtrip() {
+        let original = Signal::new(
+            42,
+            LoopStep::Act,
+            SignalKind::Success,
+            "success",
+            serde_json::json!({"tool": "read_file"}),
+            1000,
+        )
+        .with_span_id("test-span")
+        .with_cause_id(41)
+        .with_duration_ms(250);
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: Signal = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original, deserialized);
     }
 }

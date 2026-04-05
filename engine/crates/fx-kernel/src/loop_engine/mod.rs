@@ -1313,13 +1313,13 @@ impl LoopEngine {
         message: impl Into<String>,
         metadata: serde_json::Value,
     ) {
-        self.signals.emit(Signal {
+        self.signals.emit_signal(
             step,
             kind,
-            message: message.into(),
+            message,
             metadata,
-            timestamp_ms: current_time_ms(),
-        });
+            current_time_ms(),
+        );
     }
 
     fn finalize_result(&mut self, result: LoopResult) -> LoopResult {

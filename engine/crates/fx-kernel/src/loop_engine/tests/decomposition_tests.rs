@@ -221,13 +221,14 @@ fn signals_from_result(result: &LoopResult) -> &[Signal] {
 }
 
 fn sample_signal(message: &str) -> Signal {
-    Signal {
-        step: LoopStep::Act,
-        kind: SignalKind::Success,
-        message: message.to_string(),
-        metadata: serde_json::json!({"source": "test"}),
-        timestamp_ms: 1,
-    }
+    Signal::new(
+        1,
+        LoopStep::Act,
+        SignalKind::Success,
+        message.to_string(),
+        serde_json::json!({"source": "test"}),
+        1,
+    )
 }
 
 fn assert_loop_result_signals(result: LoopResult, expected: Vec<Signal>) {
