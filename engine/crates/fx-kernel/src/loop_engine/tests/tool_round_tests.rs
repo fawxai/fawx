@@ -408,6 +408,50 @@ async fn act_with_tools_reprompts_on_follow_up_tool_calls() {
 }
 
 #[tokio::test]
+async fn act_with_tools_keeps_distinct_reads_available_under_observation_strip() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            observation_only_round_nudge_after: 1,
+            observation_only_round_strip_after_nudge: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine = p4_engine_with_config(config, 3);
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+        text_response("done after distinct reads"),
+    ]);
+    let context_messages = vec![Message::user("read files")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.tool_results.len(), 2);
+    assert_eq!(action.response_text, "done after distinct reads");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].tools.is_empty());
+    assert!(!requests[1].tools.is_empty());
+    assert!(!requests[1].messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains("Stop doing more read-only research"),
+            _ => false,
+        })
+    }));
+}
+
+#[tokio::test]
 async fn act_with_tools_intercepts_follow_up_decompose_before_executor() {
     let mut engine = p4_engine_with_executor(
         BudgetConfig::default(),

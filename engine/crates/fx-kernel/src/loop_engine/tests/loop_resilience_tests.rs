@@ -3235,6 +3235,35 @@ fn observation_only_round_tracker_clears_on_cycle_reset() {
         .is_empty());
 }
 
+#[test]
+fn observation_only_round_tracker_caps_fingerprint_memory() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.observation_round_tracker.repetitive_rounds = 1;
+    for index in 0..256 {
+        engine
+            .observation_round_tracker
+            .seen_observation_fingerprints
+            .insert(format!("read_file:{{\"path\":\"file-{index}.md\"}}"));
+    }
+
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "overflow.md",
+        }),
+    }]);
+
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 2);
+    assert_eq!(
+        engine
+            .observation_round_tracker
+            .seen_observation_fingerprints
+            .len(),
+        256
+    );
+}
+
 #[tokio::test]
 async fn observation_only_restriction_blocks_read_only_run_command_calls() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());

@@ -5875,7 +5875,15 @@ mod config_endpoint {
             router
         }
 
-        async fn spawn_live_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        struct LiveServerGuard(tokio::task::JoinHandle<()>);
+
+        impl Drop for LiveServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        async fn spawn_live_server(app: Router) -> (String, LiveServerGuard) {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind live server");
@@ -5884,7 +5892,7 @@ mod config_endpoint {
             let handle = tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
-            (base_url, handle)
+            (base_url, LiveServerGuard(handle))
         }
 
         async fn run_live_observation_scenario(
@@ -5914,7 +5922,7 @@ mod config_endpoint {
             state.session_registry = Some(registry);
             let app = build_router(state, None);
 
-            let (base_url, server) = spawn_live_server(app).await;
+            let (base_url, _server) = spawn_live_server(app).await;
             let client = reqwest::Client::new();
             let response = client
                 .post(format!("{base_url}/v1/sessions/{key}/messages"))
@@ -5931,7 +5939,6 @@ mod config_endpoint {
                 .json::<serde_json::Value>()
                 .await
                 .expect("json body");
-            server.abort();
 
             let requests = captured.lock().expect("capture lock").clone();
             (requests, body)

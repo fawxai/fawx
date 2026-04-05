@@ -1001,6 +1001,25 @@ struct ObservationRoundTracker {
     seen_observation_fingerprints: HashSet<String>,
 }
 
+// Keep the cycle-scoped fingerprint set bounded. Once full, new fingerprints
+// degrade to "seen" so extreme fan-out does not retain unbounded state.
+const MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE: usize = 256;
+
+impl ObservationRoundTracker {
+    fn record_observation_fingerprint(&mut self, fingerprint: String) -> bool {
+        if self.seen_observation_fingerprints.contains(&fingerprint) {
+            return true;
+        }
+
+        if self.seen_observation_fingerprints.len() >= MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE {
+            return true;
+        }
+
+        self.seen_observation_fingerprints.insert(fingerprint);
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ToolRoundState {
     all_tool_results: Vec<ToolResult>,

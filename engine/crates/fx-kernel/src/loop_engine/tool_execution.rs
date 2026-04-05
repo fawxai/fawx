@@ -1588,10 +1588,9 @@ impl LoopEngine {
             match self.tool_executor.classify_call(call) {
                 ToolCallClassification::Observation => {
                     saw_observation_call = true;
-                    saw_new_fingerprint |= self
+                    saw_new_fingerprint |= !self
                         .observation_round_tracker
-                        .seen_observation_fingerprints
-                        .insert(observation_tool_fingerprint(call));
+                        .record_observation_fingerprint(observation_tool_fingerprint(call));
                 }
                 ToolCallClassification::Mutation => {
                     saw_mutation_call = true;
@@ -1599,6 +1598,8 @@ impl LoopEngine {
             }
         }
 
+        // Mixed rounds still reset the counter. A side-effect call breaks the
+        // observation-only repetition contract even if the read fingerprints repeat.
         if !saw_observation_call || saw_mutation_call || saw_new_fingerprint {
             self.observation_round_tracker.repetitive_rounds = 0;
         } else {
@@ -1754,6 +1755,8 @@ pub(super) fn build_uniform_blocked_calls(
 }
 
 fn observation_tool_fingerprint(call: &ToolCall) -> String {
+    // The call ID is intentionally excluded because it is request-local and would
+    // make identical observation rounds look new.
     format!(
         "{}:{}",
         call.name,
