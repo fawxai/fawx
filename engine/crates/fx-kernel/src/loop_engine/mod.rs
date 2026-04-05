@@ -553,8 +553,8 @@ pub struct LoopEngine {
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
     consecutive_tool_turns: u16,
-    /// Consecutive tool rounds that used only non-side-effecting tools.
-    consecutive_observation_only_rounds: u16,
+    /// Cycle-scoped repetitive observation tracking for the observation-only gate.
+    observation_round_tracker: ObservationRoundTracker,
     /// Latest reasoning input messages for graceful budget-exhausted synthesis.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     last_reasoning_messages: Vec<Message>,
@@ -620,10 +620,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("consecutive_tool_turns", &self.consecutive_tool_turns)
-            .field(
-                "consecutive_observation_only_rounds",
-                &self.consecutive_observation_only_rounds,
-            )
+            .field("observation_round_tracker", &self.observation_round_tracker)
             .field("tool_retry_tracker", &self.tool_retry_tracker)
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
@@ -909,7 +906,7 @@ impl LoopEngineBuilder {
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             consecutive_tool_turns: 0,
-            consecutive_observation_only_rounds: 0,
+            observation_round_tracker: ObservationRoundTracker::default(),
             last_reasoning_messages: Vec::new(),
             tool_retry_tracker: RetryTracker::default(),
             notify_called_this_cycle: false,
@@ -996,6 +993,31 @@ fn configure_session_memory(memory: &Arc<Mutex<SessionMemory>>, context_limit: u
 #[derive(Debug, Default, Clone)]
 struct CycleState {
     tokens: TokenUsage,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ObservationRoundTracker {
+    repetitive_rounds: u16,
+    seen_observation_fingerprints: HashSet<String>,
+}
+
+// Keep the cycle-scoped fingerprint set bounded. Once full, new fingerprints
+// degrade to "seen" so extreme fan-out does not retain unbounded state.
+const MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE: usize = 256;
+
+impl ObservationRoundTracker {
+    fn record_observation_fingerprint(&mut self, fingerprint: String) -> bool {
+        if self.seen_observation_fingerprints.contains(&fingerprint) {
+            return true;
+        }
+
+        if self.seen_observation_fingerprints.len() >= MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE {
+            return true;
+        }
+
+        self.seen_observation_fingerprints.insert(fingerprint);
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1761,7 +1783,7 @@ impl LoopEngine {
         self.pending_steer = None;
         self.budget_low_signaled = false;
         self.consecutive_tool_turns = 0;
-        self.consecutive_observation_only_rounds = 0;
+        self.observation_round_tracker = ObservationRoundTracker::default();
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
         self.notify_called_this_cycle = false;

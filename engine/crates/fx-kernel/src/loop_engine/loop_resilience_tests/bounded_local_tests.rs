@@ -332,7 +332,7 @@ async fn standard_turns_keep_their_normal_tool_surface() {
 fn bounded_local_profile_ignores_generic_observation_round_stripping() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
-    engine.consecutive_observation_only_rounds = 1;
+    engine.observation_round_tracker.repetitive_rounds = 1;
 
     let tools = engine.apply_tool_round_progress_policy(1, &mut Vec::new());
     let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -694,7 +694,7 @@ async fn bounded_local_recovery_bypasses_generic_observation_only_restriction() 
     let mut engine = engine_with_budget(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
     engine.bounded_local_phase = BoundedLocalPhase::Recovery;
-    engine.consecutive_observation_only_rounds = 9;
+    engine.observation_round_tracker.repetitive_rounds = 9;
     engine.pending_tool_scope = Some(ContinuationToolScope::MutationOnly);
 
     let call = ToolCall {
@@ -728,7 +728,7 @@ async fn bounded_local_discovery_bypasses_generic_observation_only_restriction()
     let mut engine = engine_with_budget(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
     engine.bounded_local_phase = BoundedLocalPhase::Discovery;
-    engine.consecutive_observation_only_rounds = 9;
+    engine.observation_round_tracker.repetitive_rounds = 9;
 
     let call = ToolCall {
         id: "d1".to_string(),

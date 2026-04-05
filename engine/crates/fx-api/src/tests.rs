@@ -5557,6 +5557,432 @@ mod config_endpoint {
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    mod observation_round_restriction_live_api {
+        use super::*;
+        use axum::http::StatusCode;
+        use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+        use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+        use fx_kernel::cancellation::CancellationToken;
+        use fx_kernel::context_manager::ContextCompactor;
+        use fx_kernel::loop_engine::LoopEngine;
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ModelRouter, ProviderError as LlmError,
+        };
+        use fx_session::{
+            SessionConfig, SessionKey, SessionKind, SessionRegistry, SessionStatus, SessionStore,
+        };
+        use fx_subagent::{
+            test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
+            SubagentManagerDeps,
+        };
+        use std::sync::Arc;
+
+        fn live_test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
+            Arc::new(std::sync::RwLock::new(RuntimeInfo {
+                active_model: String::new(),
+                provider: String::new(),
+                skills: Vec::new(),
+                config_summary: ConfigSummary {
+                    max_iterations: 3,
+                    max_history: 20,
+                    memory_enabled: false,
+                },
+                authority: None,
+                version: "test".to_string(),
+            }))
+        }
+
+        fn live_make_session_registry() -> SessionRegistry {
+            let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+            SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+        }
+
+        fn live_seed_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+            let key = SessionKey::new(key).expect("session key");
+            registry
+                .create(
+                    key.clone(),
+                    SessionKind::Main,
+                    SessionConfig {
+                        label: Some(format!("label-{key}")),
+                        model: "mock-model".to_string(),
+                    },
+                )
+                .expect("create session");
+            registry
+                .set_status(&key, SessionStatus::Idle)
+                .expect("set idle");
+            key
+        }
+
+        fn live_test_state_with_app(
+            app: HeadlessApp,
+            webhooks: Vec<Arc<WebhookChannel>>,
+        ) -> HttpState {
+            let data_dir = app
+                .config()
+                .general
+                .data_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir);
+            let has_synthesis = app.config().model.synthesis_instruction.is_some();
+            let shared = Arc::new(SharedReadState::from_app(&app));
+            HttpState {
+                app: Arc::new(Mutex::new(app)),
+                shared,
+                config_manager: None,
+                session_registry: None,
+                start_time: Instant::now(),
+                server_runtime: ServerRuntime::local(8400),
+                tailscale_ip: None,
+                bearer_token: TEST_TOKEN.to_string(),
+                pairing: Arc::new(Mutex::new(PairingState::new())),
+                devices: Arc::new(Mutex::new(DeviceStore::new())),
+                devices_path: None,
+                channels: build_channel_runtime(None, webhooks),
+                data_dir,
+                synthesis: synthesis_state(has_synthesis),
+                oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+                permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+                ripcord: None,
+                fleet_manager: None,
+                cron_store: None,
+                experiment_registry: {
+                    let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                    Arc::new(tokio::sync::Mutex::new(registry))
+                },
+                improvement_provider: None,
+                telemetry: in_memory_telemetry(),
+            }
+        }
+
+        fn synthesis_state(
+            has_initial_value: bool,
+        ) -> Arc<crate::handlers::synthesis::SynthesisState> {
+            Arc::new(crate::handlers::synthesis::SynthesisState::new(
+                has_initial_value,
+            ))
+        }
+
+        fn live_build_test_app_with_engine(
+            router: ModelRouter,
+            loop_engine: LoopEngine,
+            mut config: fx_config::FawxConfig,
+        ) -> HeadlessApp {
+            if config.general.data_dir.is_none() {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let data_dir = std::env::temp_dir().join(format!("fawx-api-tests-{unique}"));
+                std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+                config.general.data_dir = Some(data_dir);
+            }
+
+            let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+                factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                limits: SubagentLimits::default(),
+            }));
+
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine,
+                router: Arc::new(std::sync::RwLock::new(router)),
+                runtime_info: live_test_runtime_info(),
+                config,
+                memory: None,
+                embedding_index_persistence: None,
+                system_prompt_path: None,
+                config_manager: None,
+                system_prompt_text: None,
+                subagent_manager,
+                canary_monitor: None,
+                session_bus: None,
+                session_key: None,
+                cron_store: None,
+                startup_warnings: Vec::new(),
+                stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                permission_prompt_state: None,
+                ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                    std::env::temp_dir().as_path(),
+                )),
+                experiment_registry: None,
+            })
+            .expect("test app")
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ObservationScenario {
+            DistinctReads,
+            RepeatedReads,
+        }
+
+        #[derive(Debug)]
+        struct ObservationRoundToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for ObservationRoundToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[fx_llm::ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                        failure_class: None,
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+                vec![fx_llm::ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }),
+                }]
+            }
+        }
+
+        #[derive(Debug)]
+        struct ObservationRoundProvider {
+            scenario: ObservationScenario,
+            requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        impl ObservationRoundProvider {
+            fn new(
+                scenario: ObservationScenario,
+                requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+            ) -> Self {
+                Self { scenario, requests }
+            }
+
+            fn request_has_nudge(request: &CompletionRequest) -> bool {
+                request.messages.iter().any(|message| {
+                    message.role == fx_llm::MessageRole::System
+                        && message.content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text { text } if text.contains("multiple tool rounds only gathering information"))
+                        })
+                })
+            }
+
+            fn tool_use_response(id: &str, path: &str) -> CompletionResponse {
+                CompletionResponse {
+                    content: Vec::new(),
+                    tool_calls: vec![fx_llm::ToolCall {
+                        id: id.to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": path }),
+                    }],
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl CompletionProvider for ObservationRoundProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                let mut requests = self.requests.lock().expect("capture lock");
+                let request_index = requests.len();
+                requests.push(request.clone());
+                drop(requests);
+
+                if request.tools.is_empty() {
+                    return Ok(mock_completion_response());
+                }
+
+                match (self.scenario, request_index) {
+                    (ObservationScenario::DistinctReads, 0) => {
+                        Ok(Self::tool_use_response("call-1", "a.txt"))
+                    }
+                    (ObservationScenario::DistinctReads, 1) => {
+                        Ok(Self::tool_use_response("call-2", "b.txt"))
+                    }
+                    (ObservationScenario::DistinctReads, _) => Ok(mock_completion_response()),
+                    (ObservationScenario::RepeatedReads, 0) => {
+                        Ok(Self::tool_use_response("call-1", "a.txt"))
+                    }
+                    (ObservationScenario::RepeatedReads, 1) => {
+                        Ok(Self::tool_use_response("call-2", "a.txt"))
+                    }
+                    (ObservationScenario::RepeatedReads, _) => {
+                        if request_index >= 8 {
+                            Ok(mock_completion_response())
+                        } else {
+                            Ok(Self::tool_use_response("call-3", "a.txt"))
+                        }
+                    }
+                }
+            }
+
+            async fn complete_stream(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                let response = self.complete(request).await?;
+                let stream = futures::stream::once(async move {
+                    Ok(fx_llm::StreamChunk {
+                        delta_content: response.content.iter().find_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        }),
+                        stop_reason: response.stop_reason.clone(),
+                        ..Default::default()
+                    })
+                });
+                Ok(Box::pin(stream))
+            }
+
+            fn name(&self) -> &str {
+                "observation-rounds"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        fn observation_round_router(
+            scenario: ObservationScenario,
+            requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        ) -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(ObservationRoundProvider::new(scenario, requests)));
+            router.set_active("mock-model").expect("set active");
+            router
+        }
+
+        struct LiveServerGuard(tokio::task::JoinHandle<()>);
+
+        impl Drop for LiveServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        async fn spawn_live_server(app: Router) -> (String, LiveServerGuard) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind live server");
+            let addr = listener.local_addr().expect("local addr");
+            let base_url = format!("http://{addr}");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            (base_url, LiveServerGuard(handle))
+        }
+
+        async fn run_live_observation_scenario(
+            scenario: ObservationScenario,
+        ) -> (Vec<CompletionRequest>, serde_json::Value) {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let router = observation_round_router(scenario, Arc::clone(&captured));
+
+            let mut config = fx_config::FawxConfig::default();
+            config.model.default_model = Some("mock-model".to_string());
+            let app = live_build_test_app_with_engine(
+                router,
+                LoopEngine::builder()
+                    .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                    .context(ContextCompactor::new(2048, 256))
+                    .max_iterations(8)
+                    .tool_executor(Arc::new(ObservationRoundToolExecutor))
+                    .synthesis_instruction("Summarize".to_string())
+                    .build()
+                    .expect("observation test engine"),
+                config,
+            );
+            let registry = live_make_session_registry();
+            let key = live_seed_session(&registry, "sess-observation-rounds");
+
+            let mut state = live_test_state_with_app(app, Vec::new());
+            state.session_registry = Some(registry);
+            let app = build_router(state, None);
+
+            let (base_url, _server) = spawn_live_server(app).await;
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!("{base_url}/v1/sessions/{key}/messages"))
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "message": "research two files and summarize the differences"
+                }))
+                .send()
+                .await
+                .expect("send live request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .expect("json body");
+
+            let requests = captured.lock().expect("capture lock").clone();
+            (requests, body)
+        }
+
+        #[tokio::test]
+        async fn live_headless_api_distinct_observation_rounds_keep_tools_available() {
+            let (requests, body) =
+                run_live_observation_scenario(ObservationScenario::DistinctReads).await;
+
+            assert_eq!(body["result_kind"], "complete");
+            assert!(
+                requests
+                    .iter()
+                    .take(3)
+                    .all(|request| !request.tools.is_empty()),
+                "distinct observation rounds should keep the tool surface available"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .take(3)
+                    .all(|request| !ObservationRoundProvider::request_has_nudge(request)),
+                "distinct research should not receive the repeated-observation nudge"
+            );
+        }
+
+        #[tokio::test]
+        async fn live_headless_api_repeated_observation_rounds_receive_nudge() {
+            let (requests, body) =
+                run_live_observation_scenario(ObservationScenario::RepeatedReads).await;
+
+            assert!(body["result_kind"] == "partial" || body["result_kind"] == "complete");
+            let nudged_request = requests
+                .iter()
+                .skip(2)
+                .find(|request| ObservationRoundProvider::request_has_nudge(request))
+                .expect("repeated observation rounds should receive the existing nudge text");
+            assert!(
+                !nudged_request.tools.is_empty(),
+                "the live API path should still surface the repeated-observation nudge before completion"
+            );
+        }
+    }
 }
 
 mod telegram_update {

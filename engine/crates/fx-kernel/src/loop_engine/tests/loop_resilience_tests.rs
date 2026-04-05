@@ -796,6 +796,9 @@ impl ToolExecutor for ObservationMixedNoDecomposeExecutor {
 #[derive(Debug, Default)]
 struct ObservationRunCommandExecutor;
 
+#[derive(Debug, Default)]
+struct ObservationRunCommandFingerprintExecutor;
+
 #[async_trait]
 impl ToolExecutor for ObservationRunCommandExecutor {
     async fn execute_tools(
@@ -842,6 +845,56 @@ impl ToolExecutor for ObservationRunCommandExecutor {
             && call.arguments.get("command")
                 == Some(&serde_json::Value::String("cat README.md".to_string()))
         {
+            ToolCallClassification::Observation
+        } else {
+            ToolCallClassification::Mutation
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ObservationRunCommandFingerprintExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: "ok".to_string(),
+                failure_class: None,
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "run_command".to_string(),
+                description: "Run a command".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            ToolDefinition {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ]
+    }
+
+    fn cacheability(&self, tool_name: &str) -> crate::act::ToolCacheability {
+        match tool_name {
+            "run_command" | "write_file" => crate::act::ToolCacheability::SideEffect,
+            _ => crate::act::ToolCacheability::NeverCache,
+        }
+    }
+
+    fn classify_call(&self, call: &ToolCall) -> ToolCallClassification {
+        if call.name == "run_command" {
             ToolCallClassification::Observation
         } else {
             ToolCallClassification::Mutation
@@ -1031,6 +1084,17 @@ fn run_command_observation_engine(config: BudgetConfig) -> LoopEngine {
         .context(ContextCompactor::new(2048, 256))
         .max_iterations(3)
         .tool_executor(Arc::new(ObservationRunCommandExecutor))
+        .synthesis_instruction("Summarize".to_string())
+        .build()
+        .expect("build")
+}
+
+fn fingerprint_run_command_engine(config: BudgetConfig) -> LoopEngine {
+    LoopEngine::builder()
+        .budget(BudgetTracker::new(config, 0, 0))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(3)
+        .tool_executor(Arc::new(ObservationRunCommandFingerprintExecutor))
         .synthesis_instruction("Summarize".to_string())
         .build()
         .expect("build")
@@ -2949,34 +3013,99 @@ fn default_termination_config_matches_current_behavior() {
 }
 
 #[test]
-fn observation_only_round_nudges_before_stripping() {
-    let config = BudgetConfig::default();
+fn distinct_read_file_rounds_do_not_strip_observation_tools() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            observation_only_round_nudge_after: 1,
+            observation_only_round_strip_after_nudge: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
     let mut engine = mixed_tool_engine(config);
-    engine.consecutive_observation_only_rounds = 2;
+    let first_round = vec![ToolCall {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"README.md"}),
+    }];
+    let second_round = vec![ToolCall {
+        id: "call-2".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"Cargo.toml"}),
+    }];
+
+    engine.record_tool_round_kind(&first_round);
     let mut continuation_messages = Vec::new();
+    let first_tools = engine.apply_tool_round_progress_policy(0, &mut continuation_messages);
+    assert_eq!(
+        first_tools.len(),
+        2,
+        "new read should keep the full surface"
+    );
+    assert!(
+        continuation_messages.is_empty(),
+        "new reads should not trigger the nudge"
+    );
 
-    let tools = engine.apply_tool_round_progress_policy(0, &mut continuation_messages);
+    engine.record_tool_round_kind(&second_round);
+    let mut continuation_messages = Vec::new();
+    let second_tools = engine.apply_tool_round_progress_policy(1, &mut continuation_messages);
 
-    assert_eq!(tools.len(), 2, "nudge threshold should not strip tools yet");
+    assert_eq!(
+        second_tools.len(),
+        2,
+        "distinct reads should keep the full surface"
+    );
+    assert!(
+        continuation_messages.is_empty(),
+        "distinct reads should not trigger the nudge"
+    );
+}
+
+#[test]
+fn repeated_read_file_rounds_nudge_then_strip_observation_tools() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            observation_only_round_nudge_after: 1,
+            observation_only_round_strip_after_nudge: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine = mixed_tool_engine(config);
+
+    let repeated_round = vec![ToolCall {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"README.md"}),
+    }];
+
+    engine.record_tool_round_kind(&repeated_round);
+    engine.record_tool_round_kind(&repeated_round);
+    let mut continuation_messages = Vec::new();
+    let nudged_tools = engine.apply_tool_round_progress_policy(1, &mut continuation_messages);
+    assert_eq!(
+        nudged_tools.len(),
+        2,
+        "the first repeated round should still keep tools"
+    );
     assert!(continuation_messages.iter().any(|msg| {
         msg.content.iter().any(|block| match block {
             ContentBlock::Text { text } => text.contains("Stop doing more read-only research"),
             _ => false,
         })
     }));
-}
 
-#[test]
-fn observation_only_rounds_strip_to_side_effect_tools() {
-    let config = BudgetConfig::default();
-    let mut engine = mixed_tool_engine(config);
-    engine.consecutive_observation_only_rounds = 3;
+    engine.record_tool_round_kind(&repeated_round);
     let mut continuation_messages = Vec::new();
+    let stripped_tools = engine.apply_tool_round_progress_policy(2, &mut continuation_messages);
 
-    let tools = engine.apply_tool_round_progress_policy(0, &mut continuation_messages);
-
-    assert_eq!(tools.len(), 1, "only side-effect tools should remain");
-    assert_eq!(tools[0].name, "write_file");
+    assert_eq!(
+        stripped_tools.len(),
+        1,
+        "repeated reads should strip to side-effect tools"
+    );
+    assert_eq!(stripped_tools[0].name, "write_file");
 }
 
 #[test]
@@ -3001,34 +3130,144 @@ fn tool_round_strip_preserves_mutation_tools_when_available() {
 #[test]
 fn record_tool_round_kind_resets_after_side_effect_round() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
-    engine.consecutive_observation_only_rounds = 2;
+    let repeated_read_round = [ToolCall {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"README.md"}),
+    }];
+
+    engine.record_tool_round_kind(&repeated_read_round);
+    engine.record_tool_round_kind(&repeated_read_round);
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 1);
 
     engine.record_tool_round_kind(&[ToolCall {
-        id: "call-1".to_string(),
+        id: "call-2".to_string(),
         name: "write_file".to_string(),
         arguments: serde_json::json!({"path":"/tmp/out.txt","content":"hi"}),
     }]);
 
-    assert_eq!(engine.consecutive_observation_only_rounds, 0);
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 0);
 }
 
 #[test]
-fn record_tool_round_kind_treats_read_only_run_command_as_observation() {
-    let mut engine = run_command_observation_engine(BudgetConfig::default());
+fn record_tool_round_kind_treats_distinct_observation_run_command_arguments_as_new() {
+    let mut engine = fingerprint_run_command_engine(BudgetConfig::default());
 
     engine.record_tool_round_kind(&[ToolCall {
         id: "call-1".to_string(),
         name: "run_command".to_string(),
-        arguments: serde_json::json!({"command":"cat README.md"}),
+        arguments: serde_json::json!({
+            "command": "cat README.md",
+            "cwd": "/Users/joseph/fawx",
+        }),
+    }]);
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 0);
+
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-2".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "cat Cargo.toml",
+            "cwd": "/Users/joseph/fawx",
+        }),
     }]);
 
-    assert_eq!(engine.consecutive_observation_only_rounds, 1);
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 0);
+}
+
+#[test]
+fn record_tool_round_kind_treats_identical_canonicalized_run_command_arguments_as_repetitive() {
+    let mut engine = fingerprint_run_command_engine(BudgetConfig::default());
+
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-1".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "cat README.md",
+            "cwd": "/Users/joseph/fawx",
+        }),
+    }]);
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-2".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "cwd": "/Users/joseph/fawx",
+            "command": "cat README.md",
+        }),
+    }]);
+
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 1);
+}
+
+#[test]
+fn observation_only_round_tracker_clears_on_cycle_reset() {
+    let mut engine = fingerprint_run_command_engine(BudgetConfig::default());
+
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-1".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "cat README.md",
+            "cwd": "/Users/joseph/fawx",
+        }),
+    }]);
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-2".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "cwd": "/Users/joseph/fawx",
+            "command": "cat README.md",
+        }),
+    }]);
+
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 1);
+    assert!(!engine
+        .observation_round_tracker
+        .seen_observation_fingerprints
+        .is_empty());
+
+    engine.prepare_cycle();
+
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 0);
+    assert!(engine
+        .observation_round_tracker
+        .seen_observation_fingerprints
+        .is_empty());
+}
+
+#[test]
+fn observation_only_round_tracker_caps_fingerprint_memory() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.observation_round_tracker.repetitive_rounds = 1;
+    for index in 0..256 {
+        engine
+            .observation_round_tracker
+            .seen_observation_fingerprints
+            .insert(format!("read_file:{{\"path\":\"file-{index}.md\"}}"));
+    }
+
+    engine.record_tool_round_kind(&[ToolCall {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "overflow.md",
+        }),
+    }]);
+
+    assert_eq!(engine.observation_round_tracker.repetitive_rounds, 2);
+    assert_eq!(
+        engine
+            .observation_round_tracker
+            .seen_observation_fingerprints
+            .len(),
+        256
+    );
 }
 
 #[tokio::test]
 async fn observation_only_restriction_blocks_read_only_run_command_calls() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
-    engine.consecutive_observation_only_rounds = 3;
+    engine.observation_round_tracker.repetitive_rounds = 3;
 
     let results = engine
         .execute_tool_calls(&[
@@ -3057,7 +3296,7 @@ async fn observation_only_restriction_blocks_read_only_run_command_calls() {
 #[tokio::test]
 async fn observation_only_restriction_returns_incomplete_after_replan_without_executing_tools() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
-    engine.consecutive_observation_only_rounds = 3;
+    engine.observation_round_tracker.repetitive_rounds = 3;
     let decision = Decision::UseTools(vec![ToolCall {
         id: "call-1".to_string(),
         name: "read_file".to_string(),
@@ -3103,7 +3342,7 @@ async fn observation_only_restriction_returns_incomplete_after_replan_without_ex
 #[tokio::test]
 async fn observation_only_restriction_replans_with_mutation_only_tools() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
-    engine.consecutive_observation_only_rounds = 3;
+    engine.observation_round_tracker.repetitive_rounds = 3;
     let decision = Decision::UseTools(vec![ToolCall {
         id: "call-1".to_string(),
         name: "read_file".to_string(),
@@ -3151,7 +3390,7 @@ async fn observation_only_replan_intercepts_follow_up_decompose_before_executor(
         BudgetConfig::default(),
         Arc::new(ObservationMixedNoDecomposeExecutor),
     );
-    engine.consecutive_observation_only_rounds = 3;
+    engine.observation_round_tracker.repetitive_rounds = 3;
     let decision = Decision::UseTools(vec![ToolCall {
         id: "call-1".to_string(),
         name: "read_file".to_string(),
