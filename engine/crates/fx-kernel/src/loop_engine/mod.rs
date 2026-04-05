@@ -1004,6 +1004,7 @@ struct ToolRoundState {
     current_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
     evidence_messages: Vec<Message>,
+    pending_round_notices: Vec<String>,
     accumulated_text: Vec<String>,
     tokens_used: TokenUsage,
     observation_replan_attempted: bool,
@@ -1018,6 +1019,22 @@ impl ToolRoundState {
             current_calls: calls.to_vec(),
             continuation_messages: context_messages.to_vec(),
             evidence_messages: Vec::new(),
+            pending_round_notices: Vec::new(),
+            accumulated_text: initial_text.into_iter().collect(),
+            tokens_used: TokenUsage::default(),
+            observation_replan_attempted: false,
+            used_observation_tools: false,
+            used_mutation_tools: false,
+        }
+    }
+
+    fn new_empty_calls(context_messages: &[Message], initial_text: Option<String>) -> Self {
+        Self {
+            all_tool_results: Vec::new(),
+            current_calls: Vec::new(),
+            continuation_messages: context_messages.to_vec(),
+            evidence_messages: Vec::new(),
+            pending_round_notices: Vec::new(),
             accumulated_text: initial_text.into_iter().collect(),
             tokens_used: TokenUsage::default(),
             observation_replan_attempted: false,
