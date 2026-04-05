@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::{
 use crate::document::document_text_fallback;
 use crate::openai::{
     is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
-    OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
+    OPENAI_THINKING_LEVELS,
 };
 use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
@@ -42,6 +42,14 @@ use crate::validation::validate_tool_message_sequence;
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
 const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
+const OPENAI_RESPONSES_FALLBACK_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1",
+    "o4-mini",
+];
 const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
 When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
 If the user names an exact command or workflow, execute that exact path before exploring alternatives unless you hit a concrete blocker. \
@@ -1151,7 +1159,7 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 
     fn fallback_models(&self) -> Vec<&'static str> {
-        OPENAI_FALLBACK_MODELS.to_vec()
+        OPENAI_RESPONSES_FALLBACK_MODELS.to_vec()
     }
 
     fn context_window(&self, model: &str) -> usize {
@@ -1686,7 +1694,7 @@ mod tests {
         );
         assert!(provider.is_chat_capable("gpt-4o"));
         assert!(!provider.is_chat_capable("text-embedding-3-small"));
-        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert_eq!(provider.fallback_models(), OPENAI_RESPONSES_FALLBACK_MODELS);
         assert_eq!(provider.auth_method(), "subscription");
         assert_eq!(provider.context_window("gemini-2.5-pro"), 1_000_000);
     }

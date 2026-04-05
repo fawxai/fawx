@@ -137,7 +137,8 @@ fn build_seeded_router(
     auth_manager: &fx_auth::auth::AuthManager,
     config: &FawxConfig,
 ) -> anyhow::Result<SharedModelRouter> {
-    let mut router = crate::startup::build_router(auth_manager)?;
+    let data_dir = crate::startup::configured_data_dir(&crate::startup::fawx_data_dir(), config);
+    let mut router = crate::startup::build_router_for_data_dir(auth_manager, &data_dir)?;
     seed_headless_router_active_model(&mut router, config);
     Ok(Arc::new(RwLock::new(router)))
 }

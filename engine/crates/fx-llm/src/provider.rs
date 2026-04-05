@@ -397,6 +397,11 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Provider-owned supplemental models to add when a live catalog is incomplete.
+    fn supplemental_catalog_model_ids(&self, _discovered_model_ids: &[String]) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Provider-specific catalog filtering knobs.
     fn catalog_filters(&self) -> ProviderCatalogFilters {
         ProviderCatalogFilters::default()

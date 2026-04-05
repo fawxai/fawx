@@ -1,4 +1,5 @@
 pub mod manager;
+mod provider_model_cache;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -11,6 +12,10 @@ mod types;
 mod validation;
 
 pub use defaults::{DEFAULT_CONFIG_TEMPLATE, DEFAULT_DENY_PATHS};
+pub use provider_model_cache::{
+    clear_provider_model_cache, load_provider_model_cache, save_provider_model_cache,
+    update_provider_model_cache, ProviderModelCache, ProviderModelCacheEntry,
+};
 pub use toml_io::{save_default_model, save_thinking_budget};
 pub use types::{
     AgentBehaviorConfig, AgentConfig, BorrowScope, BudgetConfig, CapabilityMode, FawxConfig,

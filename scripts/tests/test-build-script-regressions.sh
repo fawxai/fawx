@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/scripts/build.sh"
+BUILD_DMG_SCRIPT="$ROOT_DIR/scripts/build-dmg.sh"
+BUILD_MACOS_APP_SCRIPT="$ROOT_DIR/scripts/build-macos-app.sh"
 SKILLS_BUILD_SCRIPT="$ROOT_DIR/skills/build.sh"
 LIB_SCRIPT="$ROOT_DIR/scripts/lib.sh"
 SKILL_WASM_TARGET="wasm32-wasip1"
@@ -15,7 +17,7 @@ fail() {
 require_contains() {
   local file="$1"
   local expected="$2"
-  grep -Fq "$expected" "$file" || fail "$file missing: $expected"
+  grep -Fq -- "$expected" "$file" || fail "$file missing: $expected"
 }
 
 make_fake_command() {
@@ -82,6 +84,11 @@ require_contains "$BUILD_SCRIPT" 'local skills_args=(${CARGO_ARGS[@]+"${CARGO_AR
 require_contains "$BUILD_SCRIPT" './build.sh ${skills_args[@]+"${skills_args[@]}"}'
 require_contains "$BUILD_SCRIPT" 'clippy ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"} -- -D warnings'
 require_contains "$BUILD_SCRIPT" 'test ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"}'
+require_contains "$BUILD_DMG_SCRIPT" '--app-only'
+require_contains "$BUILD_DMG_SCRIPT" 'APP_ONLY=false'
+require_contains "$BUILD_DMG_SCRIPT" 'if $APP_ONLY; then'
+require_contains "$BUILD_DMG_SCRIPT" 'App bundle: $app_bundle'
+require_contains "$BUILD_MACOS_APP_SCRIPT" 'exec "$SCRIPT_DIR/build-dmg.sh" --app-only "$@"'
 require_contains "$SKILLS_BUILD_SCRIPT" 'source "$SCRIPT_DIR/../scripts/lib.sh"'
 require_contains "$SKILLS_BUILD_SCRIPT" "\"\$CARGO_BIN\" build --target $SKILL_WASM_TARGET -j \"\$CARGO_BUILD_JOBS_VALUE\" \${CARGO_ARGS[@]+\"\${CARGO_ARGS[@]}\"}"
 require_contains "$LIB_SCRIPT" 'detect_cpu_count()'

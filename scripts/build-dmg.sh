@@ -12,7 +12,10 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/build-dmg.sh                    # Build debug DMG
+#   ./scripts/build-dmg.sh --app-only         # Build debug app bundle only
 #   ./scripts/build-dmg.sh --release          # Build release DMG (signed + notarized)
+#   ./scripts/build-dmg.sh --app-only --release
+#                                           # Build release app bundle only
 #   ./scripts/build-dmg.sh --skip-notarize    # Build signed DMG without notarization
 #   ./scripts/build-dmg.sh --background PATH  # Build DMG with a custom Finder background image
 
@@ -31,6 +34,7 @@ DMG_NAME="Fawx"
 ENGINE_BINARY="fawx"
 RELEASE=false
 SKIP_NOTARIZE=false
+APP_ONLY=false
 SIGNING_IDENTITY="${FAWX_SIGNING_IDENTITY:-}"
 NOTARIZE_PROFILE="${FAWX_NOTARIZE_PROFILE:-fawx-notarize}"
 DMG_BACKGROUND_IMAGE="${FAWX_DMG_BACKGROUND_IMAGE:-}"
@@ -44,6 +48,7 @@ fi
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --app-only) APP_ONLY=true; shift ;;
         --release) RELEASE=true; shift ;;
         --skip-notarize) SKIP_NOTARIZE=true; shift ;;
         --identity) SIGNING_IDENTITY="$2"; shift 2 ;;
@@ -62,7 +67,7 @@ if $RELEASE; then
 fi
 
 echo "🦊 Fawx DMG Build Pipeline"
-echo "   Mode: $(if $RELEASE; then echo 'Release (signed + notarized)'; else echo 'Debug'; fi)"
+echo "   Mode: $(if $APP_ONLY; then if $RELEASE; then echo 'Release app bundle only'; else echo 'Debug app bundle only'; fi; else if $RELEASE; then echo 'Release (signed + notarized)'; else echo 'Debug'; fi; fi)"
 echo ""
 
 plist_value() {
@@ -259,6 +264,14 @@ end tell
 EOF
 }
 
+print_app_bundle_summary() {
+    local app_bundle="$BUILD_DIR/$APP_NAME.app"
+
+    echo ""
+    echo "🦊 Build complete!"
+    echo "   App bundle: $app_bundle"
+}
+
 # Step 5: Create DMG + notarize
 step_dmg() {
     echo "── Step 5/5: Creating DMG ──"
@@ -375,4 +388,8 @@ step_engine
 step_swift
 step_assemble
 step_sign
+if $APP_ONLY; then
+    print_app_bundle_summary
+    exit 0
+fi
 step_dmg

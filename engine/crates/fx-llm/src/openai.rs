@@ -109,10 +109,13 @@ const OPENROUTER_FALLBACK_MODELS: &[&str] = &[
     "qwen/qwen-2.5-72b-instruct",
     "deepseek/deepseek-chat-v3",
 ];
+const FIREWORKS_KIMI_MODEL_ID: &str = "accounts/fireworks/models/kimi-k2p5";
+const FIREWORKS_KIMI_TURBO_ROUTER_ID: &str = "accounts/fireworks/routers/kimi-k2p5-turbo";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiCatalogKind {
     Compatible,
+    Fireworks,
     OpenAi,
     OpenRouter,
 }
@@ -180,6 +183,62 @@ fn is_openrouter_chat_capable(model_id: &str) -> bool {
         || id.contains("liquidai")
         || id.contains("lfm")
         || id.contains("deepseek")
+}
+
+fn is_fireworks_chat_capable(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    let tail = id.rsplit('/').next().unwrap_or(id.as_str());
+    let excludes = [
+        "embed",
+        "embedding",
+        "rerank",
+        "reranker",
+        "tts",
+        "whisper",
+        "audio",
+        "moderation",
+        "realtime",
+        "search",
+    ];
+
+    if excludes.iter().any(|needle| tail.contains(needle)) {
+        return false;
+    }
+
+    if id.contains("/routers/") {
+        return true;
+    }
+
+    tail.contains("chat")
+        || tail.contains("instruct")
+        || tail.contains("kimi")
+        || tail.contains("deepseek")
+        || tail.contains("qwen")
+        || tail.contains("qwq")
+        || tail.contains("llama")
+        || tail.contains("mistral")
+        || tail.contains("mixtral")
+        || tail.contains("gemma")
+        || tail.contains("glm")
+        || tail.contains("gpt-")
+        || tail.starts_with("o1")
+        || tail.starts_with("o3")
+        || tail.starts_with("o4")
+}
+
+fn fireworks_supplemental_catalog_model_ids(discovered_model_ids: &[String]) -> Vec<String> {
+    let has_kimi_model = discovered_model_ids
+        .iter()
+        .any(|model_id| model_id == FIREWORKS_KIMI_MODEL_ID);
+    let has_kimi_router = discovered_model_ids
+        .iter()
+        .any(|model_id| model_id == FIREWORKS_KIMI_TURBO_ROUTER_ID);
+
+    if has_kimi_model && !has_kimi_router {
+        vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// OpenAI-compatible provider implementation.
@@ -259,7 +318,7 @@ impl OpenAiProvider {
         Self::build(
             base_url.into(),
             api_key.into(),
-            OpenAiCatalogKind::Compatible,
+            OpenAiCatalogKind::Fireworks,
             "fireworks".to_string(),
         )
     }
@@ -747,18 +806,31 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn is_chat_capable(&self, model_id: &str) -> bool {
-        if self.catalog_kind.is_openrouter() {
-            is_openrouter_chat_capable(model_id)
-        } else {
-            is_openai_chat_capable(model_id)
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => is_openrouter_chat_capable(model_id),
+            OpenAiCatalogKind::Fireworks => is_fireworks_chat_capable(model_id),
+            OpenAiCatalogKind::OpenAi | OpenAiCatalogKind::Compatible => {
+                is_openai_chat_capable(model_id)
+            }
         }
     }
 
     fn fallback_models(&self) -> Vec<&'static str> {
-        if self.catalog_kind.is_openrouter() {
-            OPENROUTER_FALLBACK_MODELS.to_vec()
-        } else {
-            OPENAI_FALLBACK_MODELS.to_vec()
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => OPENROUTER_FALLBACK_MODELS.to_vec(),
+            OpenAiCatalogKind::OpenAi => OPENAI_FALLBACK_MODELS.to_vec(),
+            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::Fireworks => Vec::new(),
+        }
+    }
+
+    fn supplemental_catalog_model_ids(&self, discovered_model_ids: &[String]) -> Vec<String> {
+        match self.catalog_kind {
+            OpenAiCatalogKind::Fireworks => {
+                fireworks_supplemental_catalog_model_ids(discovered_model_ids)
+            }
+            OpenAiCatalogKind::Compatible
+            | OpenAiCatalogKind::OpenAi
+            | OpenAiCatalogKind::OpenRouter => Vec::new(),
         }
     }
 
@@ -795,11 +867,13 @@ async fn parse_model_response(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
-    Ok(filter_model_ids(
-        parsed.data,
-        supported_models,
-        |model_id| provider.is_chat_capable(model_id),
-    ))
+    let mut model_ids = filter_model_ids(parsed.data, supported_models, |model_id| {
+        provider.is_chat_capable(model_id)
+    });
+    model_ids.extend(provider.supplemental_catalog_model_ids(&model_ids));
+    model_ids.sort();
+    model_ids.dedup();
+    Ok(model_ids)
 }
 
 fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
@@ -1324,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn fireworks_catalog_metadata_uses_compatible_contract() {
+    fn fireworks_catalog_metadata_uses_fireworks_contract() {
         let provider =
             OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
 
@@ -1332,12 +1406,32 @@ mod tests {
             provider.models_endpoint(),
             Some("https://api.fireworks.ai/inference/v1/models")
         );
-        assert_eq!(provider.supported_thinking_levels(), &["off", "low", "high"]);
-        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
-        assert!(provider.is_chat_capable("gpt-4o"));
-        assert!(!provider.is_chat_capable("text-embedding-3-small"));
-        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert!(provider.is_chat_capable("accounts/fireworks/routers/kimi-k2p5-turbo"));
+        assert!(provider.is_chat_capable("accounts/fireworks/models/llama-v3p1-8b-instruct"));
+        assert!(!provider.is_chat_capable("accounts/fireworks/models/nomic-embed-text-v1.5"));
+        assert!(provider.fallback_models().is_empty());
         assert!(!provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
+    fn fireworks_catalog_supplements_kimi_router_alias() {
+        let provider =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.supplemental_catalog_model_ids(&[FIREWORKS_KIMI_MODEL_ID.to_string()]),
+            vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
+        );
+        assert!(provider
+            .supplemental_catalog_model_ids(&[
+                FIREWORKS_KIMI_MODEL_ID.to_string(),
+                FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
+            ])
+            .is_empty());
     }
 
     #[test]
@@ -1354,7 +1448,9 @@ mod tests {
             provider.thinking_levels("gpt-5.4"),
             &["none", "low", "medium", "high", "xhigh"]
         );
-        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(provider.is_chat_capable("gpt-5.4"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert!(provider.fallback_models().is_empty());
         assert!(!provider.catalog_filters().apply_recency_and_price_floor);
     }
 
