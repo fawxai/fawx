@@ -416,9 +416,8 @@ impl LoopEngine {
         context_messages: &[Message],
     ) -> ToolRoundState {
         let initial_text = self.pending_tool_response_text.take();
-        let mut state = ToolRoundState::new(calls, context_messages, initial_text);
-        let initial_calls = std::mem::take(&mut state.current_calls);
-        self.stage_tool_calls_for_round(&mut state, initial_calls);
+        let mut state = ToolRoundState::new_empty_calls(context_messages, initial_text);
+        self.stage_tool_calls_for_round(&mut state, calls.to_vec());
         state
     }
 
