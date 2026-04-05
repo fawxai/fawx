@@ -46,24 +46,20 @@ pub enum SignalSeverity {
     Medium,
     /// Repeated failures, budget pressure, retry exhaustion
     High,
-    /// Provider down, budget exhausted, unrecoverable error
+    /// Provider down, budget exhausted, unrecoverable error.
+    ///
+    /// `Critical` is always an explicit escalation; no `SignalKind` defaults to it.
     Critical,
-}
-
-impl SignalSeverity {
-    pub fn to_label(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Critical => "critical",
-        }
-    }
 }
 
 impl fmt::Display for SignalSeverity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.to_label())
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        })
     }
 }
 
@@ -165,10 +161,13 @@ pub struct Signal {
 }
 
 impl Signal {
-    /// Create a new signal with the given parameters.
-    /// Uses the default severity for the signal kind.
+    /// Sentinel ID for signals that have not yet been collected.
+    pub const UNASSIGNED_ID: u64 = 0;
+
+    /// Create a new unregistered signal with the given parameters.
+    ///
+    /// The signal starts with `id = 0` and receives a real ID when a collector emits it.
     pub fn new(
-        id: u64,
         step: LoopStep,
         kind: SignalKind,
         message: impl Into<String>,
@@ -176,7 +175,7 @@ impl Signal {
         timestamp_ms: u64,
     ) -> Self {
         Self {
-            id,
+            id: Self::UNASSIGNED_ID,
             span_id: None,
             step,
             kind,
@@ -189,28 +188,16 @@ impl Signal {
         }
     }
 
-    /// Create a signal with explicit severity override.
-    pub fn with_severity(
-        id: u64,
-        step: LoopStep,
-        kind: SignalKind,
-        severity: SignalSeverity,
-        message: impl Into<String>,
-        metadata: serde_json::Value,
-        timestamp_ms: u64,
-    ) -> Self {
-        Self {
-            id,
-            span_id: None,
-            step,
-            kind,
-            severity,
-            message: message.into(),
-            metadata,
-            timestamp_ms,
-            cause_id: None,
-            duration_ms: None,
-        }
+    /// Override the collector-assigned ID when reconstructing an existing signal.
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Override the default severity for this signal.
+    pub fn with_severity(mut self, severity: SignalSeverity) -> Self {
+        self.severity = severity;
+        self
     }
 
     /// Set the span ID for cross-boundary correlation.
@@ -353,14 +340,13 @@ mod tests {
     #[test]
     fn signal_new_uses_default_severity() {
         let signal = Signal::new(
-            1,
             LoopStep::Act,
             SignalKind::Friction,
             "test message",
             serde_json::json!({}),
             1000,
         );
-        assert_eq!(signal.id, 1);
+        assert_eq!(signal.id, Signal::UNASSIGNED_ID);
         assert_eq!(signal.severity, SignalSeverity::Medium); // Friction default
         assert_eq!(signal.span_id, None);
         assert_eq!(signal.cause_id, None);
@@ -369,33 +355,33 @@ mod tests {
 
     #[test]
     fn signal_with_severity_override() {
-        let signal = Signal::with_severity(
-            2,
+        let signal = Signal::new(
             LoopStep::Act,
             SignalKind::Friction,
-            SignalSeverity::Critical,
             "critical failure",
             serde_json::json!({"error": "oom"}),
             2000,
-        );
-        assert_eq!(signal.id, 2);
+        )
+        .with_severity(SignalSeverity::Critical);
+        assert_eq!(signal.id, Signal::UNASSIGNED_ID);
         assert_eq!(signal.severity, SignalSeverity::Critical);
     }
 
     #[test]
     fn signal_builder_methods() {
         let signal = Signal::new(
-            3,
             LoopStep::Reason,
             SignalKind::Trace,
             "trace",
             serde_json::json!({}),
             3000,
         )
+        .with_id(3)
         .with_span_id("span-123")
         .with_cause_id(2)
         .with_duration_ms(150);
 
+        assert_eq!(signal.id, 3);
         assert_eq!(signal.span_id, Some("span-123".to_string()));
         assert_eq!(signal.cause_id, Some(2));
         assert_eq!(signal.duration_ms, Some(150));
@@ -404,13 +390,13 @@ mod tests {
     #[test]
     fn signal_serialization_roundtrip() {
         let original = Signal::new(
-            42,
             LoopStep::Act,
             SignalKind::Success,
             "success",
             serde_json::json!({"tool": "read_file"}),
             1000,
         )
+        .with_id(42)
         .with_span_id("test-span")
         .with_cause_id(41)
         .with_duration_ms(250);

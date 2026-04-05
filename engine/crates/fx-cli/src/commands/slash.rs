@@ -1436,7 +1436,6 @@ mod tests {
     #[test]
     fn render_signals_summary_uses_shared_signal_collector_format() {
         let signals = vec![Signal::new(
-            42,
             LoopStep::Act,
             SignalKind::Friction,
             "tool timed out",

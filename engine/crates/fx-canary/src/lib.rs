@@ -238,19 +238,11 @@ mod tests {
     use fx_kernel::LoopStep;
 
     fn mk(kind: SignalKind) -> Signal {
-        Signal::new(
-            1,
-            LoopStep::Act,
-            kind,
-            String::new(),
-            serde_json::json!({}),
-            0,
-        )
+        Signal::new(LoopStep::Act, kind, String::new(), serde_json::json!({}), 0)
     }
 
     fn mk_friction(severity: f64) -> Signal {
         Signal::new(
-            1,
             LoopStep::Act,
             SignalKind::Friction,
             String::new(),

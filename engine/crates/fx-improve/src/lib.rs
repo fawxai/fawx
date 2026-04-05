@@ -256,7 +256,6 @@ mod tests {
         let store = SignalStore::new(&data_dir, "planning-failure-session").unwrap();
         store
             .persist(&[Signal::new(
-                1,
                 LoopStep::Act,
                 SignalKind::Friction,
                 "test friction",

@@ -170,7 +170,6 @@ mod tests {
 
     fn sample_signal() -> Signal {
         Signal::new(
-            42,
             LoopStep::Act,
             SignalKind::Success,
             "test signal",

@@ -421,14 +421,7 @@ mod tests {
     }
 
     fn mk_signal(step: LoopStep, kind: SignalKind, message: &str, timestamp_ms: u64) -> Signal {
-        Signal::new(
-            timestamp_ms.max(1),
-            step,
-            kind,
-            message.to_string(),
-            json!({}),
-            timestamp_ms,
-        )
+        Signal::new(step, kind, message.to_string(), json!({}), timestamp_ms)
     }
 
     fn mk_session_signal(session_id: &str, signal: Signal) -> SessionSignal {

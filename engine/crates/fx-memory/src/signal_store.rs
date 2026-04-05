@@ -434,7 +434,6 @@ mod tests {
 
     fn mk_signal(step: LoopStep, kind: SignalKind, message: &str, ts: u64) -> Signal {
         Signal::new(
-            ts.max(1),
             step,
             kind,
             message.to_string(),

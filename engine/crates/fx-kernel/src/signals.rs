@@ -54,8 +54,7 @@ impl SignalCollector {
     /// Emit a signal. Drops oldest low-priority signals if at capacity.
     /// Assigns a monotonic ID to the signal.
     pub fn emit(&mut self, mut signal: Signal) {
-        // Assign monotonic ID if not already set (id == 0 means unassigned)
-        if signal.id == 0 {
+        if signal.id == Signal::UNASSIGNED_ID {
             signal.id = self.next_id.fetch_add(1, Ordering::SeqCst);
         } else {
             self.advance_next_id_past(signal.id);
@@ -101,9 +100,7 @@ impl SignalCollector {
         metadata: serde_json::Value,
         timestamp_ms: u64,
     ) {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let signal = Signal::new(id, step, kind, message, metadata, timestamp_ms);
-        self.emit(signal);
+        self.emit(Signal::new(step, kind, message, metadata, timestamp_ms));
     }
 
     fn push_signal(&mut self, signal: Signal) {
@@ -236,18 +233,13 @@ mod tests {
     use super::*;
 
     fn mk_signal(step: LoopStep, kind: SignalKind, message: &str, timestamp_ms: u64) -> Signal {
-        Signal {
-            id: 0, // Will be assigned by collector
-            span_id: None,
+        Signal::new(
             step,
             kind,
-            severity: kind.default_severity(),
-            message: message.to_string(),
-            metadata: serde_json::json!({"test": true}),
+            message.to_string(),
+            serde_json::json!({"test": true}),
             timestamp_ms,
-            cause_id: None,
-            duration_ms: None,
-        }
+        )
     }
 
     #[test]
@@ -289,8 +281,7 @@ mod tests {
         let mut collector = SignalCollector::new(10);
 
         // Signal with pre-set ID is preserved
-        let mut signal = mk_signal(LoopStep::Act, SignalKind::Success, "preset", 1);
-        signal.id = 42;
+        let signal = mk_signal(LoopStep::Act, SignalKind::Success, "preset", 1).with_id(42);
         collector.emit(signal);
 
         assert_eq!(collector.signals()[0].id, 42);
@@ -308,21 +299,21 @@ mod tests {
 
         let child_signals = vec![
             Signal::new(
-                1,
                 LoopStep::Act,
                 SignalKind::Trace,
                 "child-start",
                 serde_json::json!({}),
                 2,
-            ),
+            )
+            .with_id(1),
             Signal::new(
-                2,
                 LoopStep::Act,
                 SignalKind::Success,
                 "child-done",
                 serde_json::json!({}),
                 3,
             )
+            .with_id(2)
             .with_cause_id(1),
         ];
 
@@ -472,21 +463,21 @@ mod tests {
     fn from_signals_preserves_ids_and_sets_next_id() {
         let signals = vec![
             Signal::new(
-                5,
                 LoopStep::Act,
                 SignalKind::Success,
                 "s1",
                 serde_json::json!({}),
                 1,
-            ),
+            )
+            .with_id(5),
             Signal::new(
-                10,
                 LoopStep::Act,
                 SignalKind::Success,
                 "s2",
                 serde_json::json!({}),
                 2,
-            ),
+            )
+            .with_id(10),
         ];
 
         let collector = SignalCollector::from_signals(signals);

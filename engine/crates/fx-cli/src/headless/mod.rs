@@ -4528,7 +4528,6 @@ mod tests {
     async fn loop_and_debug_commands_work_in_headless_mode() {
         let mut app = test_app();
         app.last_signals.push(Signal::new(
-            42,
             fx_core::signals::LoopStep::Act,
             fx_core::signals::SignalKind::Friction,
             "tool timed out",

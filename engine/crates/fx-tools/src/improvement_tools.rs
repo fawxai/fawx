@@ -578,7 +578,6 @@ mod tests {
         let store = SignalStore::new(&data_dir, "test-session").expect("signal store");
         store
             .persist(&[Signal::new(
-                1,
                 LoopStep::Act,
                 SignalKind::Friction,
                 "test friction",

@@ -65,7 +65,6 @@ mod tests {
 
     fn mk_signal(message: &str, timestamp_ms: u64) -> Signal {
         Signal::new(
-            timestamp_ms.max(1),
             LoopStep::Act,
             SignalKind::Success,
             message.to_string(),

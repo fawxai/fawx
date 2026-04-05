@@ -222,7 +222,6 @@ fn signals_from_result(result: &LoopResult) -> &[Signal] {
 
 fn sample_signal(message: &str) -> Signal {
     Signal::new(
-        1,
         LoopStep::Act,
         SignalKind::Success,
         message.to_string(),
