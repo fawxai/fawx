@@ -82,6 +82,9 @@ pub(crate) fn classify_io_failure(error: &std::io::Error) -> FailureClass {
         std::io::ErrorKind::NotFound
         | std::io::ErrorKind::PermissionDenied
         | std::io::ErrorKind::InvalidInput
+        // A blind retry will not clear an occupied path. Tools that support
+        // overwrite/create-or-replace semantics should avoid surfacing this
+        // error by choosing the correct filesystem primitive up front.
         | std::io::ErrorKind::AlreadyExists => FailureClass::Permanent,
         std::io::ErrorKind::TimedOut
         | std::io::ErrorKind::Interrupted
@@ -1987,6 +1990,34 @@ three
         assert!(result.output.contains("exit_code: 1"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_classifies_signal_terminated_process_as_transient() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let script_path = temp.path().join("kill-self.sh");
+        fs::write(&script_path, "#!/bin/sh\nkill -9 $$\n").expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": script_path.to_string_lossy()}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Transient)
+        );
+        assert!(result.output.contains("exit_code: -1"));
+    }
+
     #[tokio::test]
     async fn run_command_classifies_missing_binary_as_permanent() {
         let temp = TempDir::new().expect("temp");
@@ -3172,6 +3203,18 @@ three
         let result = executor.execute_call(&call, None).await;
         assert!(!result.success);
         assert!(result.output.contains("model override is not supported"));
+    }
+
+    #[test]
+    fn run_command_definition_describes_nonzero_exit_failure_contract() {
+        let definition = tool_definitions(false, false)
+            .into_iter()
+            .find(|tool| tool.name == "run_command")
+            .expect("run_command definition");
+
+        assert!(definition.description.contains("exits with code 0"));
+        assert!(definition.description.contains("non-zero exit"));
+        assert!(definition.description.contains("failed tool result"));
     }
 
     #[test]

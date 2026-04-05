@@ -45,7 +45,7 @@ impl Tool for RunCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
+            description: "Run a command and capture exit code, stdout, and stderr. The tool succeeds only when the command exits with code 0; any non-zero exit returns a failed tool result with the captured output.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -219,7 +219,8 @@ fn format_command_output(output: &std::process::Output, shell: bool) -> String {
 fn classify_command_exit(output: &std::process::Output) -> FailureClass {
     match output.status.code() {
         Some(126 | 127) => FailureClass::Permanent,
-        Some(_) | None => FailureClass::Unknown,
+        Some(_) => FailureClass::Unknown,
+        None => FailureClass::Transient,
     }
 }
 

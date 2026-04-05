@@ -20,7 +20,7 @@ use super::{
 };
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
+    FailureClass, TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
 };
 use crate::budget::{truncate_tool_result, ActionCost, BudgetState};
 use crate::decide::Decision;
@@ -1541,7 +1541,7 @@ pub(super) fn partition_by_call_classification(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
-                failure_class: None,
+                failure_class: Some(FailureClass::Permanent),
             });
         }
     }
@@ -1563,7 +1563,7 @@ pub(super) fn partition_by_allowed_tool_names(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
-                failure_class: None,
+                failure_class: Some(FailureClass::Permanent),
             });
         }
     }
@@ -1580,7 +1580,7 @@ pub(super) fn build_uniform_blocked_calls(
         .map(|call| BlockedToolCall {
             call,
             reason: reason.to_string(),
-            failure_class: None,
+            failure_class: Some(FailureClass::Permanent),
         })
         .collect()
 }
@@ -2025,6 +2025,58 @@ mod tests {
         assert_eq!(results[1].tool_call_id, "call-2");
         assert!(!results[0].success);
         assert!(results[1].success);
+    }
+
+    #[test]
+    fn allowed_tool_name_blocks_are_classified_permanent() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md","content":"hi"}),
+        }];
+
+        let (_allowed, blocked) =
+            partition_by_allowed_tool_names(&calls, &["read_file".to_string()], "disallowed");
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
+        let results = build_blocked_tool_results(&blocked);
+        assert_eq!(
+            results[0].failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[test]
+    fn classification_blocks_are_classified_permanent() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }];
+
+        let (_allowed, blocked) = partition_by_call_classification(
+            &calls,
+            &DualToolExecutor,
+            ToolCallClassification::Mutation,
+            "mutation_only",
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
+    }
+
+    #[test]
+    fn uniform_policy_blocks_are_classified_permanent() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }];
+
+        let blocked = build_uniform_blocked_calls(&calls, "policy");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
     }
 
     #[test]
