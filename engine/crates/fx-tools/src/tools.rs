@@ -11,8 +11,9 @@ use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, JournalAction,
-    ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, FailureClass,
+    JournalAction, ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError,
+    ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -28,6 +29,78 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolFailure {
+    pub(crate) message: String,
+    pub(crate) class: FailureClass,
+}
+
+impl ToolFailure {
+    pub(crate) fn new(message: impl Into<String>, class: FailureClass) -> Self {
+        Self {
+            message: message.into(),
+            class,
+        }
+    }
+
+    pub(crate) fn permanent(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Permanent)
+    }
+
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Transient)
+    }
+
+    pub(crate) fn unknown(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Unknown)
+    }
+}
+
+impl std::fmt::Display for ToolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolFailure {}
+
+impl From<String> for ToolFailure {
+    fn from(message: String) -> Self {
+        Self::unknown(message)
+    }
+}
+
+impl From<&str> for ToolFailure {
+    fn from(message: &str) -> Self {
+        Self::unknown(message)
+    }
+}
+
+pub(crate) fn classify_io_failure(error: &std::io::Error) -> FailureClass {
+    match error.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::AlreadyExists => FailureClass::Permanent,
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::AddrInUse
+        | std::io::ErrorKind::AddrNotAvailable
+        | std::io::ErrorKind::BrokenPipe => FailureClass::Transient,
+        _ => FailureClass::Unknown,
+    }
+}
+
+pub(crate) fn tool_failure_from_io(error: std::io::Error) -> ToolFailure {
+    let class = classify_io_failure(&error);
+    ToolFailure::new(error.to_string(), class)
+}
 
 mod config;
 mod experiment;
@@ -277,7 +350,10 @@ impl FawxToolExecutor {
             None => to_tool_result(
                 &call.id,
                 &call.name,
-                Err(format!("unknown tool: {}", call.name)),
+                Err(ToolFailure::permanent(format!(
+                    "unknown tool: {}",
+                    call.name
+                ))),
             ),
         }
     }
@@ -286,23 +362,34 @@ impl FawxToolExecutor {
 #[cfg(test)]
 impl FawxToolExecutor {
     fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_read_file(args)
+        self.context
+            .handle_read_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_write_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_write_file(args)
+        self.context
+            .handle_write_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_edit_file(args)
+        self.context
+            .handle_edit_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_list_directory(args)
+        self.context
+            .handle_list_directory(args)
+            .map_err(|error| error.message)
     }
 
     async fn handle_run_command(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_run_command(args).await
+        self.context
+            .handle_run_command(args)
+            .await
+            .map_err(|error| error.message)
     }
 
     fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -318,7 +405,9 @@ impl FawxToolExecutor {
     }
 
     fn handle_search_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_search_text(args)
+        self.context
+            .handle_search_text(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_current_time(&self) -> Result<String, String> {
@@ -651,17 +740,17 @@ fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
     registry
 }
 
-pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
+pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, ToolFailure> {
     // NOTE: There is an unavoidable TOCTOU window between this validation and later
     // open/read/write calls that operate by path. Tightening this fully requires
     // fd-based operations end-to-end, which is not currently practical across all tools.
-    let base_canon = fs::canonicalize(base).map_err(|error| error.to_string())?;
+    let base_canon = fs::canonicalize(base).map_err(tool_failure_from_io)?;
     let candidate = resolve_candidate(&base_canon, requested);
     let requested_canon = canonicalize_existing_or_parent(&candidate)?;
     if requested_canon.starts_with(&base_canon) {
         return Ok(requested_canon);
     }
-    Err("path escapes working directory".to_string())
+    Err(ToolFailure::permanent("path escapes working directory"))
 }
 
 fn resolve_candidate(base: &Path, requested: &str) -> PathBuf {
@@ -673,9 +762,9 @@ fn resolve_candidate(base: &Path, requested: &str) -> PathBuf {
     }
 }
 
-fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
+fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, ToolFailure> {
     if path.exists() {
-        return fs::canonicalize(path).map_err(|error| error.to_string());
+        return fs::canonicalize(path).map_err(tool_failure_from_io);
     }
 
     let mut missing_parts = Vec::new();
@@ -683,38 +772,30 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
     while !cursor.exists() {
         let name = cursor
             .file_name()
-            .ok_or_else(|| "invalid target path".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("invalid target path"))?;
         missing_parts.push(name.to_os_string());
         cursor = cursor
             .parent()
-            .ok_or_else(|| "invalid target path".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("invalid target path"))?;
     }
 
-    let mut resolved = fs::canonicalize(cursor).map_err(|error| error.to_string())?;
+    let mut resolved = fs::canonicalize(cursor).map_err(tool_failure_from_io)?;
     while let Some(part) = missing_parts.pop() {
         resolved.push(part);
     }
     Ok(resolved)
 }
 
-fn to_tool_result(
-    tool_call_id: &str,
-    tool_name: &str,
-    output: Result<String, String>,
-) -> ToolResult {
+fn to_tool_result<E>(tool_call_id: &str, tool_name: &str, output: Result<String, E>) -> ToolResult
+where
+    E: Into<ToolFailure>,
+{
     match output {
-        Ok(content) => ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: true,
-            output: content,
-        },
-        Err(error) => ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: false,
-            output: error,
-        },
+        Ok(content) => ToolResult::success(tool_call_id, tool_name, content),
+        Err(error) => {
+            let error = error.into();
+            ToolResult::failure(tool_call_id, tool_name, error.message, error.class)
+        }
     }
 }
 
@@ -871,6 +952,7 @@ mod tests {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             }
         }
 
@@ -964,6 +1046,23 @@ mod tests {
 
     fn parse_json_output(output: &str) -> serde_json::Value {
         serde_json::from_str(output).expect("valid json output")
+    }
+
+    async fn execute_tool_result(
+        executor: &FawxToolExecutor,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> ToolResult {
+        executor
+            .execute_call(
+                &ToolCall {
+                    id: "call-1".to_string(),
+                    name: tool_name.to_string(),
+                    arguments,
+                },
+                None,
+            )
+            .await
     }
 
     fn executor_with_protected_branches(root: &Path, branches: &[&str]) -> FawxToolExecutor {
@@ -1852,7 +1951,7 @@ three
         let output = executor
             .handle_run_command(&serde_json::json!({"command": "false"}))
             .await
-            .expect("command");
+            .expect_err("command should fail");
         assert!(output.contains("exit_code: 1"));
     }
 
@@ -1873,6 +1972,105 @@ three
     }
 
     #[tokio::test]
+    async fn run_command_failure_result_marks_nonzero_exit_as_unknown_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "false"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(result.failure_classification(), Some(FailureClass::Unknown));
+        assert!(result.output.contains("exit_code: 1"));
+    }
+
+    #[tokio::test]
+    async fn run_command_classifies_missing_binary_as_permanent() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "definitely_missing_fawx_binary"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_classifies_shell_exit_127_as_permanent() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "definitely_missing_fawx_shell_binary",
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result.output.contains("exit_code: 127"));
+    }
+
+    #[tokio::test]
+    async fn run_command_timeout_result_is_transient() {
+        let temp = TempDir::new().expect("temp");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                command_timeout: Duration::from_millis(1),
+                ..ToolConfig::default()
+            },
+        );
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "sleep 1"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Transient)
+        );
+        assert!(result.output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn run_command_empty_command_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "   "}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[tokio::test]
     async fn run_command_validates_working_directory_override() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -1880,6 +2078,49 @@ three
             .handle_run_command(&serde_json::json!({"command": "echo hi", "working_dir": "../"}))
             .await;
         assert!(output.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_path_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "read_file",
+            serde_json::json!({"path": "missing.txt"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_permission_denied_is_permanent_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let path = temp.path().join("secret.txt");
+        fs::write(&path, "secret").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
     }
 
     #[tokio::test]
@@ -2521,6 +2762,7 @@ three
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         let action = executor
@@ -2555,6 +2797,7 @@ three
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         let action = executor

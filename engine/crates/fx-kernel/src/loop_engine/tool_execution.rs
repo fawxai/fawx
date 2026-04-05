@@ -328,6 +328,7 @@ impl LoopEngine {
                 serde_json::json!({
                     "tool": call.name,
                     "reason": blocked_call.reason,
+                    "failure_class": blocked_call.failure_class.map(|class| class.as_str()),
                     "signature_failures": signature_failures,
                     "cycle_total_failures": self.tool_retry_tracker.cycle_total_failures(),
                 }),
@@ -1061,6 +1062,7 @@ impl LoopEngine {
                 tool_name: call.name.clone(),
                 success: false,
                 output: message.clone(),
+                failure_class: None,
             });
         }
     }
@@ -1514,6 +1516,7 @@ fn collect_valid_tool_calls(
                     tool_name: call.name.clone(),
                     success: false,
                     output: "Tool call failed: arguments could not be parsed as valid JSON".into(),
+                    failure_class: None,
                 });
                 None
             } else {
@@ -1538,6 +1541,7 @@ pub(super) fn partition_by_call_classification(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
+                failure_class: None,
             });
         }
     }
@@ -1559,6 +1563,7 @@ pub(super) fn partition_by_allowed_tool_names(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
+                failure_class: None,
             });
         }
     }
@@ -1575,6 +1580,7 @@ pub(super) fn build_uniform_blocked_calls(
         .map(|call| BlockedToolCall {
             call,
             reason: reason.to_string(),
+            failure_class: None,
         })
         .collect()
 }
@@ -1603,11 +1609,15 @@ fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> St
 pub(super) fn build_blocked_tool_results(blocked: &[BlockedToolCall]) -> Vec<ToolResult> {
     blocked
         .iter()
-        .map(|blocked_call| ToolResult {
-            tool_call_id: blocked_call.call.id.clone(),
-            tool_name: blocked_call.call.name.clone(),
-            success: false,
-            output: blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
+        .map(|blocked_call| {
+            ToolResult::failure(
+                blocked_call.call.id.clone(),
+                blocked_call.call.name.clone(),
+                blocked_tool_message(&blocked_call.call.name, &blocked_call.reason),
+                blocked_call
+                    .failure_class
+                    .unwrap_or(crate::act::FailureClass::Unknown),
+            )
         })
         .collect()
 }
@@ -1936,6 +1946,7 @@ mod tests {
                     tool_name: call.name.clone(),
                     success: true,
                     output: format!("ok: {}", call.name),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -2028,6 +2039,7 @@ mod tests {
             tool_name: "read_file".to_string(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         }];
         let provider_item_ids =
             HashMap::from([(String::from("call-1"), String::from("provider-1"))]);

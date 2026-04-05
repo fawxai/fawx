@@ -28,6 +28,7 @@ impl ToolExecutor for PassiveToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -1286,6 +1287,7 @@ fn publish_tool_round_emits_atomic_event_with_provider_ids() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
 
     engine.publish_tool_round(&calls, &results, CycleStream::disabled());
@@ -1569,6 +1571,7 @@ async fn sub_goal_complete_without_required_side_effect_tool_is_rejected() {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -1642,6 +1645,7 @@ async fn sub_goal_missing_required_side_effect_tool_gets_bounded_retry() {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -1723,6 +1727,7 @@ async fn observation_only_run_command_does_not_satisfy_required_side_effect_tool
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }

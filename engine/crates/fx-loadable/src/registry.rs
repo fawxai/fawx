@@ -239,37 +239,32 @@ impl SkillRegistry {
 
         if let Some(skill) = skill {
             return match skill.execute(tool_name, arguments, cancel).await {
-                Some(Ok(output)) => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: true,
-                    output,
-                },
-                Some(Err(err)) => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: false,
-                    output: err,
-                },
-                None => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: false,
-                    output: format!(
+                Some(Ok(output)) => ToolResult::success(tool_call_id, tool_name, output),
+                Some(Err(err)) => ToolResult::failure(
+                    tool_call_id,
+                    tool_name,
+                    err,
+                    fx_kernel::FailureClass::Unknown,
+                ),
+                None => ToolResult::failure(
+                    tool_call_id,
+                    tool_name,
+                    format!(
                         "skill '{}' matched tool '{}' but declined to execute",
                         skill.name(),
                         tool_name
                     ),
-                },
+                    fx_kernel::FailureClass::Permanent,
+                ),
             };
         }
 
-        ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: false,
-            output: format!("no skill handles tool '{tool_name}'"),
-        }
+        ToolResult::failure(
+            tool_call_id,
+            tool_name,
+            format!("no skill handles tool '{tool_name}'"),
+            fx_kernel::FailureClass::Permanent,
+        )
     }
 
     async fn execute_single_call(
@@ -911,6 +906,7 @@ mod tests {
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         assert_eq!(reg.journal_action(&call, &result), Some(expected));

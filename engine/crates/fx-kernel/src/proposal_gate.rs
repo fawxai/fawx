@@ -123,6 +123,7 @@ fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This operation is not permitted.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -132,6 +133,7 @@ fn blind_read_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This file is not available.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -145,6 +147,7 @@ fn proposal_result(call: &ToolCall, path: &str, proposal_path: &Path) -> ToolRes
              Proposal saved to: {}",
             proposal_path.display()
         ),
+        failure_class: None,
     }
 }
 
@@ -404,6 +407,7 @@ fn prompt_required_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This operation requires approval before it can run.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -574,6 +578,7 @@ mod tests {
                     tool_name: c.name.clone(),
                     success: true,
                     output: format!("executed:{}", c.name),
+                    failure_class: None,
                 })
                 .collect())
         }

@@ -153,6 +153,7 @@ mod tests {
             tool_name: call.name.clone(),
             success: true,
             output: "hello".to_string(),
+            failure_class: None,
         };
 
         assert_eq!(skill.action_category("greet"), "unknown");

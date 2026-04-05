@@ -351,6 +351,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
             blocked.push(BlockedToolCall {
                 call: call.clone(),
                 reason: reason.to_string(),
+                failure_class: None,
             });
         } else {
             allowed.push(call.clone());

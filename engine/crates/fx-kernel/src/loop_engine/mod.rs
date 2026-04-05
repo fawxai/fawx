@@ -3046,6 +3046,7 @@ impl LoopEngine {
                 serde_json::json!({
                     "success": result.success,
                     "output": truncated_output,
+                    "failure_class": result.failure_classification().map(|class| class.as_str()),
                     "classification": tool_call_classification_label(classification),
                 }),
             );

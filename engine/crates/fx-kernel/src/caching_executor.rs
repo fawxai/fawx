@@ -273,6 +273,7 @@ impl<T: ToolExecutor> CachingExecutor<T> {
             tool_name: call.name.clone(),
             success: cached.success,
             output: cached.output,
+            failure_class: None,
         })
     }
 
@@ -468,6 +469,7 @@ fn result_for_deduplicated_call(source: &ToolResult, call: &ToolCall) -> ToolRes
         tool_name: call.name.clone(),
         success: source.success,
         output: source.output.clone(),
+        failure_class: source.failure_classification(),
     }
 }
 
@@ -805,6 +807,7 @@ mod tests {
                 tool_name: call.name.clone(),
                 success: !failed,
                 output,
+                failure_class: None,
             }
         }
     }

@@ -600,6 +600,7 @@ impl ToolExecutor for SizedToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: words(self.output_words),
+                failure_class: None,
             })
             .collect())
     }
@@ -630,6 +631,7 @@ impl ToolExecutor for FailingToolRoundExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "permission denied".to_string(),
+                failure_class: None,
             })
             .collect())
     }

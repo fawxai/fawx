@@ -1,9 +1,12 @@
 use super::{
-    canonicalize_existing_or_parent, parse_args, to_tool_result, validate_path, ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, to_tool_result, tool_failure_from_io,
+    validate_path, ToolFailure, ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
-use fx_kernel::act::{JournalAction, ToolCacheability, ToolCallClassification, ToolResult};
+use fx_kernel::act::{
+    FailureClass, JournalAction, ToolCacheability, ToolCallClassification, ToolResult,
+};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -115,32 +118,41 @@ impl ToolContext {
     pub(crate) async fn handle_run_command(
         &self,
         args: &serde_json::Value,
-    ) -> Result<String, String> {
-        let parsed: RunCommandArgs = parse_args(args)?;
+    ) -> Result<String, ToolFailure> {
+        let parsed: RunCommandArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         let command = parsed.command.trim();
         if command.is_empty() {
-            return Err("command cannot be empty".to_string());
+            return Err(ToolFailure::permanent("command cannot be empty"));
         }
+        let shell = parsed.shell.unwrap_or(false);
         let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
         self.guard_push_command(command)?;
-        let child = build_command(command, parsed.shell.unwrap_or(false), &working_dir)?
+        let child = build_command(command, shell, &working_dir)?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| error.to_string())?;
+            .map_err(tool_failure_from_io)?;
         let output = wait_with_timeout(child, self.config.command_timeout).await?;
-        Ok(format_command_output(output, parsed.shell.unwrap_or(false)))
+        let formatted = format_command_output(&output, shell);
+        if output.status.success() {
+            Ok(formatted)
+        } else {
+            Err(ToolFailure::new(formatted, classify_command_exit(&output)))
+        }
     }
 
-    pub(crate) fn guard_push_command(&self, command: &str) -> Result<(), String> {
+    pub(crate) fn guard_push_command(&self, command: &str) -> Result<(), ToolFailure> {
         let targets = extract_push_targets(command);
         if targets.is_empty() {
             return Ok(());
         }
-        check_push_allowed(&targets, &self.protected_branches)
+        check_push_allowed(&targets, &self.protected_branches).map_err(ToolFailure::permanent)
     }
 
-    pub(crate) fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
+    pub(crate) fn resolve_command_dir(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<PathBuf, ToolFailure> {
         let desired = requested.unwrap_or_else(|| self.working_dir.to_str().unwrap_or("."));
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(desired));
@@ -160,7 +172,7 @@ pub(super) fn classify_run_command_call(args: &serde_json::Value) -> ToolCallCla
     }
 }
 
-fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Command, String> {
+fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Command, ToolFailure> {
     if shell {
         let mut built = Command::new("/bin/sh");
         built.kill_on_drop(true);
@@ -170,7 +182,7 @@ fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Comma
     let mut parts = command.split_whitespace();
     let program = parts
         .next()
-        .ok_or_else(|| "command cannot be empty".to_string())?;
+        .ok_or_else(|| ToolFailure::permanent("command cannot be empty"))?;
     let mut built = Command::new(program);
     built.kill_on_drop(true);
     built.args(parts).current_dir(working_dir);
@@ -180,15 +192,15 @@ fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Comma
 async fn wait_with_timeout(
     child: tokio::process::Child,
     timeout: Duration,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::Output, ToolFailure> {
     let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
     match waited {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("command timed out".to_string()),
+        Ok(result) => result.map_err(tool_failure_from_io),
+        Err(_) => Err(ToolFailure::transient("command timed out")),
     }
 }
 
-fn format_command_output(output: std::process::Output, shell: bool) -> String {
+fn format_command_output(output: &std::process::Output, shell: bool) -> String {
     let mut lines = vec![format!("exit_code: {}", output.status.code().unwrap_or(-1))];
     if shell {
         lines.push("warning: command executed via shell=true".to_string());
@@ -202,6 +214,13 @@ fn format_command_output(output: std::process::Output, shell: bool) -> String {
         String::from_utf8_lossy(&output.stderr)
     ));
     lines.join("\n")
+}
+
+fn classify_command_exit(output: &std::process::Output) -> FailureClass {
+    match output.status.code() {
+        Some(126 | 127) => FailureClass::Permanent,
+        Some(_) | None => FailureClass::Unknown,
+    }
 }
 
 fn is_observational_command(command: &str, shell: bool) -> bool {

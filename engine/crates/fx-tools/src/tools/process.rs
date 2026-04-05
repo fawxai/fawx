@@ -187,8 +187,11 @@ impl ToolContext {
         args: &serde_json::Value,
     ) -> Result<String, String> {
         let parsed: ExecBackgroundArgs = parse_args(args)?;
-        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
-        self.guard_push_command(&parsed.command)?;
+        let working_dir = self
+            .resolve_command_dir(parsed.working_dir.as_deref())
+            .map_err(|error| error.message)?;
+        self.guard_push_command(&parsed.command)
+            .map_err(|error| error.message)?;
         let result = self
             .process_registry
             .spawn(parsed.command, working_dir, parsed.label)?;

@@ -21,6 +21,7 @@ impl ToolExecutor for NoopToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }

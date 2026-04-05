@@ -206,6 +206,7 @@ impl ToolExecutor for StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -233,6 +234,7 @@ impl ToolExecutor for AlwaysFailingToolExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "tool crashed: segfault".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -275,6 +277,7 @@ impl ToolExecutor for SlowToolExecutor {
                     tool_name: call.name.clone(),
                     success: false,
                     output: "cancelled mid-execution".to_string(),
+                    failure_class: None,
                 })
                 .collect());
         }
@@ -285,6 +288,7 @@ impl ToolExecutor for SlowToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "slow result".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -314,6 +318,7 @@ impl ToolExecutor for LargeOutputToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "X".repeat(self.output_size),
+                failure_class: None,
             })
             .collect())
     }

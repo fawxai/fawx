@@ -23,6 +23,7 @@ impl ToolExecutor for TestStubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -245,6 +246,7 @@ fn tool_synthesis_prompt_content_is_complete() {
         tool_name: "current_time".to_string(),
         output: "2026-02-28T14:00:00Z".to_string(),
         success: true,
+        failure_class: None,
     }];
     let prompt = tool_synthesis_prompt(&results, "Tell the user the time.");
     assert!(
@@ -298,12 +300,14 @@ fn synthesis_includes_all_results() {
             tool_name: "read_file".to_string(),
             output: "alpha".to_string(),
             success: true,
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "call-2".to_string(),
             tool_name: "search".to_string(),
             output: "beta".to_string(),
             success: true,
+            failure_class: None,
         },
     ];
 
@@ -335,12 +339,14 @@ fn synthesis_includes_failed_tool_results() {
             tool_name: "read_file".to_string(),
             output: "alpha".to_string(),
             success: true,
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "call-2".to_string(),
             tool_name: "run_command".to_string(),
             output: "permission denied".to_string(),
             success: false,
+            failure_class: None,
         },
     ];
 
@@ -357,6 +363,7 @@ fn synthesis_prompt_includes_error_relay_instruction_when_tool_failed() {
         tool_name: "read_file".to_string(),
         output: "file not found: /foo/bar".to_string(),
         success: false,
+        failure_class: None,
     }];
 
     let prompt = tool_synthesis_prompt(&results, "Combine outputs");
@@ -371,6 +378,7 @@ fn synthesis_prompt_omits_error_relay_when_all_tools_succeed() {
         tool_name: "read_file".to_string(),
         output: "alpha".to_string(),
         success: true,
+        failure_class: None,
     }];
 
     let prompt = tool_synthesis_prompt(&results, "Combine outputs");
@@ -386,12 +394,14 @@ fn synthesis_prompt_error_relay_with_mixed_results() {
             tool_name: "read_file".to_string(),
             output: "alpha".to_string(),
             success: true,
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "call-2".to_string(),
             tool_name: "run_command".to_string(),
             output: "permission denied".to_string(),
             success: false,
+            failure_class: None,
         },
     ];
 
