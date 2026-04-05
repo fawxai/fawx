@@ -1013,6 +1013,7 @@ struct ToolRoundState {
 }
 
 impl ToolRoundState {
+    #[cfg(test)]
     fn new(calls: &[ToolCall], context_messages: &[Message], initial_text: Option<String>) -> Self {
         Self {
             all_tool_results: Vec::new(),

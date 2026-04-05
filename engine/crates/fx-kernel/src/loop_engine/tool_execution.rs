@@ -1011,6 +1011,7 @@ impl LoopEngine {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_fan_out_cap(
         &mut self,
         calls: &[ToolCall],
