@@ -13,7 +13,8 @@ use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_bus::{BusStore, SessionBus};
 use fx_config::manager::ConfigManager;
 use fx_config::{
-    parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
+    load_provider_model_cache, parse_log_level as parse_config_log_level, FawxConfig,
+    ImprovementToolsConfig, LoggingConfig, ProviderModelCache,
 };
 use fx_consensus::ProgressCallback;
 use fx_core::memory::{MemoryProvider, MemoryStore};
@@ -34,7 +35,8 @@ use fx_kernel::{
     PermissionPromptState, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
 };
 use fx_llm::{
-    AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
+    AnthropicProvider, CompletionProvider, CompletionRequest, ModelRouter, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
 use fx_loadable::watcher::{ReloadEvent, SkillWatcher};
 use fx_loadable::{
@@ -78,48 +80,6 @@ const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
  raw value), use exactly that format — do not reformat into a 'friendlier' version unless \
  explicitly asked. If they asked a simple question, give a simple answer. If they asked \
  for a listing or search results, present it cleanly formatted.";
-const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
-    "claude-opus-4-6-20250929",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6-20250929",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-opus-4-20250514",
-    "claude-sonnet-4-20250514",
-];
-const DEFAULT_OPENAI_MODELS: &[&str] = &[
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "o3",
-    "o4-mini",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-    "gpt-4o",
-    "gpt-4o-mini",
-];
-const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] = &[
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.2",
-    "gpt-5.1",
-    "o4-mini",
-];
-const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
-    "openai/gpt-4o-mini",
-    "anthropic/claude-3.5-sonnet",
-    "google/gemini-2.0-flash-001",
-];
-const DEFAULT_FIREWORKS_MODELS: &[&str] = &[
-    "accounts/fireworks/models/kimi-k2-5-turbo",
-    "accounts/fireworks/models/llama-v3p1-405b-instruct",
-    "accounts/fireworks/models/llama-v3p1-70b-instruct",
-    "accounts/fireworks/models/deepseek-v3",
-    "accounts/fireworks/models/deepseek-r1",
-];
 const DEFAULT_FILE_LEVEL: &str = "info";
 const DEFAULT_STDERR_LEVEL: &str = "warn";
 const DEFAULT_MAX_LOG_FILES: usize = 7;
@@ -999,7 +959,7 @@ fn build_skill_registry(
         executor = executor.with_subagent_control(control);
     }
     if let Ok(auth_manager) = load_auth_manager() {
-        match build_router(&auth_manager) {
+        match build_router_for_data_dir(&auth_manager, data_dir) {
             Ok(router) => {
                 executor = executor.with_experiment(ExperimentToolState {
                     chain_path: data_dir.join("consensus").join("chain.json"),
@@ -1870,7 +1830,8 @@ pub fn build_improvement_provider(
     if !config.improvement.enabled {
         return None;
     }
-    match build_router(auth_manager) {
+    let data_dir = configured_data_dir(&fawx_data_dir(), config);
+    match build_router_for_data_dir(auth_manager, &data_dir) {
         Ok(router) => Some(Arc::new(OwnedRouterProvider { router })),
         Err(e) => {
             eprintln!("warning: improvement tools LLM unavailable: {e}");
@@ -1880,11 +1841,36 @@ pub fn build_improvement_provider(
 }
 
 pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupError> {
+    build_router_with_model_cache(auth_manager, &ProviderModelCache::default())
+}
+
+pub fn build_router_for_data_dir(
+    auth_manager: &AuthManager,
+    data_dir: &Path,
+) -> Result<ModelRouter, StartupError> {
+    let model_cache = match load_provider_model_cache(data_dir) {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::warn!(path = %data_dir.display(), error = %error, "failed to load provider model cache");
+            ProviderModelCache::default()
+        }
+    };
+    build_router_with_model_cache(auth_manager, &model_cache)
+}
+
+pub fn build_router_with_model_cache(
+    auth_manager: &AuthManager,
+    model_cache: &ProviderModelCache,
+) -> Result<ModelRouter, StartupError> {
     let mut router = ModelRouter::new();
 
     for provider in auth_manager.providers() {
         if let Some(auth_method) = auth_manager.get(&provider) {
-            register_auth_provider(&mut router, auth_method)?;
+            register_auth_provider(
+                &mut router,
+                auth_method,
+                model_cache.models_for(auth_method.provider_name()),
+            )?;
         }
     }
 
@@ -1894,25 +1880,24 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupEr
 fn register_auth_provider(
     router: &mut ModelRouter,
     auth_method: &AuthMethod,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
-    register_auth_provider_with_models(router, auth_method, default_supported_models(auth_method))
+    register_auth_provider_with_models(router, auth_method, supported_models)
 }
 
 fn register_auth_provider_with_models(
     router: &mut ModelRouter,
     auth_method: &AuthMethod,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
-    let models = ensure_supported_models(auth_method, supported_models);
-
     match auth_method {
         AuthMethod::SetupToken { token } => {
             // Setup tokens (sk-ant-oat...) are usable directly with the Messages API
             // via Bearer auth. AnthropicProvider::detect() handles the auth mode.
-            register_keyed_provider(router, "anthropic", token, "setup_token", models)?;
+            register_keyed_provider(router, "anthropic", token, "setup_token", supported_models)?;
         }
         AuthMethod::ApiKey { provider, key } => {
-            register_api_key_provider(router, provider, key, models)?;
+            register_api_key_provider(router, provider, key, supported_models)?;
         }
         AuthMethod::OAuth {
             provider,
@@ -1925,7 +1910,7 @@ fn register_auth_provider_with_models(
                 provider,
                 access_token,
                 account_id.as_deref(),
-                models,
+                supported_models,
             )?;
         }
     }
@@ -1937,7 +1922,7 @@ fn register_api_key_provider(
     router: &mut ModelRouter,
     provider: &str,
     key: &str,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     register_keyed_provider(router, provider, key, "api_key", supported_models)
 }
@@ -1947,24 +1932,27 @@ fn register_keyed_provider(
     provider: &str,
     key: &str,
     auth_label: &str,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     if provider == "anthropic" {
         let anthropic = AnthropicProvider::new(base_url_for_provider("anthropic"), key.to_string())
             .map_err(|error| {
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
-            })?
-            .with_supported_models(supported_models);
+            })?;
+        let resolved_models = resolve_supported_models(&anthropic, supported_models);
+        let anthropic = anthropic.with_supported_models(resolved_models);
         router.register_provider(Box::new(anthropic));
         return Ok(());
     }
 
-    let provider_client = build_openai_provider(provider, key, auth_label, supported_models)
-        .map_err(|error| {
-            StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-        })?;
+    let provider_client = build_openai_provider(provider, key, auth_label).map_err(|error| {
+        StartupError::Router(format!("failed to configure {provider} provider: {error}"))
+    })?;
+    let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-    router.register_provider(Box::new(provider_client));
+    router.register_provider(Box::new(
+        provider_client.with_supported_models(resolved_models),
+    ));
     Ok(())
 }
 
@@ -1973,7 +1961,7 @@ fn register_oauth_provider(
     provider: &str,
     access_token: &str,
     account_id: Option<&str>,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     if let Some(account_id) = account_id {
         let provider_client =
@@ -1982,21 +1970,24 @@ fn register_oauth_provider(
                     StartupError::Router(format!(
                         "failed to configure {provider} Responses provider: {error}"
                     ))
-                })?
-                .with_supported_models(supported_models);
+                })?;
+        let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-        router.register_provider(Box::new(provider_client));
+        router.register_provider(Box::new(
+            provider_client.with_supported_models(resolved_models),
+        ));
         return Ok(());
     }
 
     let provider_client =
-        build_openai_provider(provider, access_token, "subscription", supported_models).map_err(
-            |error| {
-                StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-            },
-        )?;
+        build_openai_provider(provider, access_token, "subscription").map_err(|error| {
+            StartupError::Router(format!("failed to configure {provider} provider: {error}"))
+        })?;
+    let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-    router.register_provider(Box::new(provider_client));
+    router.register_provider(Box::new(
+        provider_client.with_supported_models(resolved_models),
+    ));
     Ok(())
 }
 
@@ -2004,7 +1995,6 @@ fn build_openai_provider(
     provider: &str,
     credential: &str,
     auth_method: &str,
-    supported_models: Vec<String>,
 ) -> Result<OpenAiProvider, fx_llm::ProviderError> {
     let base_url = base_url_for_provider(provider);
     let provider = match provider {
@@ -2013,9 +2003,7 @@ fn build_openai_provider(
         "fireworks" => OpenAiProvider::fireworks(base_url, credential.to_string())?,
         _ => OpenAiProvider::compatible(base_url, credential.to_string(), provider.to_string())?,
     };
-    Ok(provider
-        .with_auth_method(canonical_auth_method(auth_method))
-        .with_supported_models(supported_models))
+    Ok(provider.with_auth_method(canonical_auth_method(auth_method)))
 }
 
 fn canonical_auth_method(auth_method: &str) -> &'static str {
@@ -2027,30 +2015,20 @@ fn canonical_auth_method(auth_method: &str) -> &'static str {
     }
 }
 
-fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
-    match auth_method {
-        AuthMethod::SetupToken { .. } => to_strings(DEFAULT_ANTHROPIC_MODELS),
-        AuthMethod::ApiKey { provider, .. } => models_for_provider(provider),
-        AuthMethod::OAuth {
-            account_id,
-            provider,
-            ..
-        } => {
-            if account_id.is_some() {
-                to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
-            } else {
-                models_for_provider(provider)
-            }
-        }
-    }
-}
-
-fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
-    if supported_models.is_empty() {
-        default_supported_models(auth_method)
-    } else {
-        supported_models
-    }
+fn resolve_supported_models(
+    provider: &dyn CompletionProvider,
+    supported_models: Option<Vec<String>>,
+) -> Vec<String> {
+    let mut models = supported_models.unwrap_or_else(|| {
+        provider
+            .fallback_models()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    });
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn base_url_for_provider(provider: &str) -> String {
@@ -2075,20 +2053,6 @@ fn base_url_for_provider(provider: &str) -> String {
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(|| "https://api.openai.com".to_string()),
     }
-}
-
-fn models_for_provider(provider: &str) -> Vec<String> {
-    match provider {
-        "anthropic" => to_strings(DEFAULT_ANTHROPIC_MODELS),
-        "openrouter" => to_strings(DEFAULT_OPENROUTER_MODELS),
-        "openai" => to_strings(DEFAULT_OPENAI_MODELS),
-        "fireworks" => to_strings(DEFAULT_FIREWORKS_MODELS),
-        _ => vec!["gpt-4o-mini".to_string()],
-    }
-}
-
-fn to_strings(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 fn current_time_ms() -> u64 {
@@ -3466,8 +3430,11 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_models_include_claude_opus_4_6() {
-        assert!(DEFAULT_ANTHROPIC_MODELS.contains(&"claude-opus-4-6"));
+    fn anthropic_provider_fallback_models_include_claude_opus_4_6() {
+        let provider =
+            AnthropicProvider::new(AnthropicProvider::default_base_url(), "test-key").unwrap();
+
+        assert!(provider.fallback_models().contains(&"claude-opus-4-6"));
     }
 
     #[test]
@@ -3572,6 +3539,55 @@ mod tests {
             !router.available_models().is_empty(),
             "setup token should register Anthropic models"
         );
+    }
+
+    #[test]
+    fn build_router_for_data_dir_registers_cached_fireworks_models() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let cached_models = vec!["accounts/fireworks/routers/kimi-k2p5-turbo".to_string()];
+        fx_config::update_provider_model_cache(temp_dir.path(), "fireworks", &cached_models)
+            .expect("write provider model cache");
+
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "fireworks",
+            AuthMethod::ApiKey {
+                provider: "fireworks".to_string(),
+                key: "fireworks-key".to_string(),
+            },
+        );
+
+        let router =
+            build_router_for_data_dir(&auth_manager, temp_dir.path()).expect("router should build");
+        let models = router
+            .available_models()
+            .into_iter()
+            .filter(|model| model.provider_name == "fireworks")
+            .map(|model| model.model_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(models, cached_models);
+    }
+
+    #[test]
+    fn build_router_without_cache_does_not_guess_fireworks_models() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "fireworks",
+            AuthMethod::ApiKey {
+                provider: "fireworks".to_string(),
+                key: "fireworks-key".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+        let fireworks_models = router
+            .available_models()
+            .into_iter()
+            .filter(|model| model.provider_name == "fireworks")
+            .collect::<Vec<_>>();
+
+        assert!(fireworks_models.is_empty());
     }
 
     #[test]

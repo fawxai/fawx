@@ -4,7 +4,7 @@ use crate::prompts::{
     prompt_choice_with_surface, prompt_line, prompt_non_empty_line_with_surface,
     prompt_non_empty_secret_with_surface, PromptSurface,
 };
-use crate::startup::{build_router, fawx_data_dir};
+use crate::startup::{build_router_for_data_dir, fawx_data_dir};
 use anyhow::{anyhow, Context};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::{
@@ -298,6 +298,8 @@ impl SetupWizard {
         self.auth_manager
             .store("anthropic", AuthMethod::SetupToken { token });
         self.persist_auth_manager()?;
+        fx_config::clear_provider_model_cache(&self.data_dir, "anthropic")
+            .map_err(anyhow::Error::msg)?;
         self.selected_provider = Some("anthropic".to_string());
         println!("  ✓ Claude setup token stored (encrypted)");
         Ok(())
@@ -319,6 +321,8 @@ impl SetupWizard {
         };
         self.auth_manager.store("openai", method);
         self.persist_auth_manager()?;
+        fx_config::clear_provider_model_cache(&self.data_dir, "openai")
+            .map_err(anyhow::Error::msg)?;
         self.selected_provider = Some("openai".to_string());
         println!("  ✓ ChatGPT subscription stored (encrypted)");
         Ok(())
@@ -338,6 +342,8 @@ impl SetupWizard {
         };
         self.auth_manager.store(&provider, method);
         self.persist_auth_manager()?;
+        fx_config::clear_provider_model_cache(&self.data_dir, &provider)
+            .map_err(anyhow::Error::msg)?;
         self.selected_provider = Some(provider.clone());
         println!("  ✓ {provider} API key stored (encrypted)");
         Ok(())
@@ -410,9 +416,11 @@ impl SetupWizard {
     async fn available_models(&self, provider: &str) -> anyhow::Result<Vec<String>> {
         let dynamic = fetch_catalog_models(provider, self.auth_manager.get(provider)).await?;
         if !dynamic.is_empty() {
+            fx_config::update_provider_model_cache(&self.data_dir, provider, &dynamic)
+                .map_err(anyhow::Error::msg)?;
             return Ok(dynamic);
         }
-        fallback_models(&self.auth_manager, provider)
+        fallback_models(&self.auth_manager, &self.data_dir, provider)
     }
 
     fn run_skills_phase(&mut self) -> anyhow::Result<SkillWizardState> {
@@ -590,8 +598,8 @@ impl SetupWizard {
             println!("  ⏭ Skipped (no model configured yet)");
             return Ok(());
         };
-        let mut router =
-            build_router(&self.auth_manager).map_err(|error| anyhow!(error.to_string()))?;
+        let mut router = build_router_for_data_dir(&self.auth_manager, &self.data_dir)
+            .map_err(|error| anyhow!(error.to_string()))?;
         router
             .set_active(model)
             .map_err(|error| anyhow!(error.to_string()))?;
@@ -1162,11 +1170,16 @@ async fn fetch_catalog_models(
     let Some(method) = method else {
         return Ok(Vec::new());
     };
-    let mut catalog = ModelCatalog::new();
+    let catalog = ModelCatalog::new();
     let auth_mode = auth_mode_for_method(method, provider)?;
     let credential = auth_credential_for_method(method)?;
-    let models = catalog.get_models(provider, &credential, auth_mode).await;
-    Ok(unique_catalog_model_ids(models))
+    match catalog
+        .fetch_live_models(provider, &credential, auth_mode)
+        .await
+    {
+        Ok(models) => Ok(unique_catalog_model_ids(models)),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 fn auth_mode_for_method(method: &AuthMethod, provider: &str) -> anyhow::Result<&'static str> {
@@ -1193,8 +1206,13 @@ fn unique_catalog_model_ids(models: Vec<fx_llm::CatalogModel>) -> Vec<String> {
     ids
 }
 
-fn fallback_models(auth_manager: &AuthManager, provider: &str) -> anyhow::Result<Vec<String>> {
-    let router = build_router(auth_manager).map_err(|error| anyhow!(error.to_string()))?;
+fn fallback_models(
+    auth_manager: &AuthManager,
+    data_dir: &Path,
+    provider: &str,
+) -> anyhow::Result<Vec<String>> {
+    let router = build_router_for_data_dir(auth_manager, data_dir)
+        .map_err(|error| anyhow!(error.to_string()))?;
     let models = router
         .available_models()
         .into_iter()

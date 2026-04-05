@@ -255,7 +255,7 @@ async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<String>
     match provider.list_models().await {
         Ok(models) => models,
         Err(error) => {
-            warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using static fallback");
+            warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using registered fallback");
             provider.supported_models()
         }
     }

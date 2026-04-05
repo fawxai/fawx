@@ -112,6 +112,18 @@ impl ModelCatalog {
         api_key: &str,
         auth_mode: &str,
     ) -> Result<usize, String> {
+        self.fetch_live_models(provider, api_key, auth_mode)
+            .await
+            .map(|models| models.len())
+    }
+
+    /// Fetch models directly from the provider catalog endpoint without using fallback state.
+    pub async fn fetch_live_models(
+        &self,
+        provider: &str,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Result<Vec<CatalogModel>, String> {
         let provider = catalog_provider(provider, api_key)?;
         self.verify_provider_credentials(provider.as_ref(), api_key, auth_mode)
             .await
@@ -154,11 +166,9 @@ impl ModelCatalog {
         provider: &dyn CompletionProvider,
         api_key: &str,
         auth_mode: &str,
-    ) -> Result<usize, String> {
-        let models = self
-            .fetch_provider_models(provider, api_key, auth_mode)
-            .await?;
-        Ok(models.len())
+    ) -> Result<Vec<CatalogModel>, String> {
+        self.fetch_provider_models(provider, api_key, auth_mode)
+            .await
     }
 
     async fn get_provider_models(
@@ -316,6 +326,22 @@ impl ModelCatalog {
             models.push(CatalogModel {
                 id: id.clone(),
                 display_name: model.display_name.or(model.name),
+                provider: provider_key.clone(),
+            });
+        }
+
+        let discovered_model_ids = models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        for supplemental_id in provider.supplemental_catalog_model_ids(&discovered_model_ids) {
+            if !seen.insert(supplemental_id.clone()) {
+                continue;
+            }
+
+            models.push(CatalogModel {
+                id: supplemental_id,
+                display_name: None,
                 provider: provider_key.clone(),
             });
         }
@@ -620,8 +646,29 @@ mod tests {
             provider.models_endpoint(),
             Some("https://api.fireworks.ai/inference/v1/models")
         );
-        // Fireworks uses Compatible variant, so is_chat_capable uses OpenAI detection
-        assert!(provider.is_chat_capable("gpt-4o"));
+        assert!(provider.is_chat_capable("accounts/fireworks/routers/kimi-k2p5-turbo"));
+        assert!(!provider.is_chat_capable("accounts/fireworks/models/nomic-embed-text-v1.5"));
+    }
+
+    #[test]
+    fn parse_models_supplements_fireworks_kimi_router_alias() {
+        let provider = test_provider("fireworks");
+        let json = r#"{
+            "data": [
+                {"id": "accounts/fireworks/models/kimi-k2p5"},
+                {"id": "accounts/fireworks/models/glm-5"}
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+        let ids = parsed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"accounts/fireworks/models/kimi-k2p5"));
+        assert!(ids.contains(&"accounts/fireworks/models/glm-5"));
+        assert!(ids.contains(&"accounts/fireworks/routers/kimi-k2p5-turbo"));
     }
 
     #[test]

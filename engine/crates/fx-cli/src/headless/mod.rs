@@ -1655,7 +1655,8 @@ impl HeadlessApp {
 
     pub fn reload_providers(&mut self) -> anyhow::Result<()> {
         let auth_manager = crate::startup::load_auth_manager()?;
-        let router = crate::startup::build_router(&auth_manager)?;
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        let router = crate::startup::build_router_for_data_dir(&auth_manager, &data_dir)?;
         self.apply_reloaded_router(router)
     }
 }

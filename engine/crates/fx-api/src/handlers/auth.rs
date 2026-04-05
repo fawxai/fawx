@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use fx_auth::auth::AuthMethod;
 use fx_auth::github::validate_github_pat;
-use fx_llm::{ModelCatalog, OpenAiResponsesProvider};
+use fx_llm::{CompletionProvider, ModelCatalog, OpenAiResponsesProvider};
 use std::time::Duration;
 use tokio::time;
 use zeroize::Zeroizing;
@@ -102,13 +102,25 @@ pub async fn handle_verify_provider(
     let timeout = Duration::from_secs(timeout_seconds);
 
     match verify_auth_method(&provider, &auth_method, timeout).await {
-        Ok(message) => Ok(Json(VerifyResponse {
-            provider,
-            verified: true,
-            status: "authenticated".to_string(),
-            message,
-            checked_at,
-        })),
+        Ok(verification) => {
+            if !verification.discovered_models.is_empty() {
+                fx_config::update_provider_model_cache(
+                    &state.data_dir,
+                    &provider,
+                    &verification.discovered_models,
+                )
+                .map_err(internal_error)?;
+                reload_app_providers(&state).await;
+            }
+
+            Ok(Json(VerifyResponse {
+                provider,
+                verified: true,
+                status: "authenticated".to_string(),
+                message: verification.message,
+                checked_at,
+            }))
+        }
         Err(message) => Ok(Json(VerifyResponse {
             provider,
             verified: false,
@@ -119,13 +131,23 @@ pub async fn handle_verify_provider(
     }
 }
 
+struct VerificationSuccess {
+    message: String,
+    discovered_models: Vec<String>,
+}
+
 async fn verify_auth_method(
     provider: &str,
     auth_method: &AuthMethod,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<VerificationSuccess, String> {
     match auth_method {
-        AuthMethod::ApiKey { key, .. } if provider == "github" => verify_github_token(key).await,
+        AuthMethod::ApiKey { key, .. } if provider == "github" => verify_github_token(key)
+            .await
+            .map(|message| VerificationSuccess {
+                message,
+                discovered_models: Vec::new(),
+            }),
         AuthMethod::OAuth {
             provider: stored_provider,
             access_token,
@@ -158,8 +180,15 @@ async fn verify_auth_method(
                     })?;
 
                 verification
-                    .map(|_| "Credentials verified successfully.".to_string())
-                    .map_err(|error| verification_error_message(provider, error.to_string()))
+                    .map_err(|error| verification_error_message(provider, error.to_string()))?;
+
+                let discovered_models = CompletionProvider::list_models(&provider_client)
+                    .await
+                    .unwrap_or_default();
+                Ok(VerificationSuccess {
+                    message: "Credentials verified successfully.".to_string(),
+                    discovered_models,
+                })
             } else {
                 verify_with_catalog(provider, access_token, "oauth", timeout).await
             }
@@ -176,13 +205,17 @@ async fn verify_with_catalog(
     token: &str,
     auth_mode: &str,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<VerificationSuccess, String> {
     let catalog = ModelCatalog::with_timeout(timeout);
-    catalog
-        .verify_credentials(provider, token, auth_mode)
+    let models = catalog
+        .fetch_live_models(provider, token, auth_mode)
         .await
-        .map(|_| "Credentials verified successfully.".to_string())
-        .map_err(|error| verification_error_message(provider, error))
+        .map(unique_catalog_model_ids)
+        .map_err(|error| verification_error_message(provider, error))?;
+    Ok(VerificationSuccess {
+        message: "Credentials verified successfully.".to_string(),
+        discovered_models: models,
+    })
 }
 
 async fn verify_github_token(token: &str) -> Result<String, String> {
@@ -262,6 +295,13 @@ fn verification_error_message(provider: &str, error: String) -> String {
     format!("{provider_label} verification failed: {error}")
 }
 
+fn unique_catalog_model_ids(models: Vec<fx_llm::CatalogModel>) -> Vec<String> {
+    let mut ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn provider_display_name(provider: &str) -> &str {
     match provider {
         "anthropic" => "Anthropic",
@@ -290,6 +330,7 @@ pub(super) async fn save_auth_method(
     store
         .save_auth_manager(&auth_manager)
         .map_err(internal_error)?;
+    fx_config::clear_provider_model_cache(&state.data_dir, provider).map_err(internal_error)?;
     reload_app_providers(state).await;
     Ok(())
 }
@@ -304,6 +345,7 @@ async fn delete_provider_auth(
     store
         .save_auth_manager(&auth_manager)
         .map_err(internal_error)?;
+    fx_config::clear_provider_model_cache(&state.data_dir, provider).map_err(internal_error)?;
     reload_app_providers(state).await;
     Ok(())
 }
