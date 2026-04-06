@@ -2087,6 +2087,13 @@ async fn single_input_reasoning_prompt_skips_task_plan_declaration() {
     assert!(!system_prompt.contains("Task plan:"));
 }
 
+#[test]
+fn declaration_heuristic_rejects_period_terminated_abbreviations() {
+    assert!(!should_request_task_contract_declaration(
+        "Check the U.S. and E.U. policies"
+    ));
+}
+
 #[tokio::test]
 async fn observation_follow_up_still_injects_mutation_commitment_into_next_reasoning_pass() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());

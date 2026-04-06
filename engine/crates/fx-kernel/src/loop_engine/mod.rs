@@ -4528,7 +4528,7 @@ fn looks_like_task_contract_reference(token: &str) -> bool {
         return false;
     };
     !stem.is_empty()
-        && !extension.is_empty()
+        && extension.len() >= 2
         && stem.chars().any(|ch| ch.is_ascii_alphanumeric())
         && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
