@@ -19,7 +19,7 @@ This is the core runtime. Steps 1–2 defined the data types and topology; this 
 
 ## Dependencies
 
-- `ThoughtState`, `ThoughtPool`, `ThoughtIdAllocator` from `thought.rs` (Step 1)
+- `ThoughtState`, `ThoughtPool`, `ThoughtIdAllocator`, `GraphNodeId` from `thought.rs` (Step 1)
 - `GraphOperation`, `ScoringStrategy`, `MergeStrategy`, `ValidationStrategy` from `operations.rs` (Step 1)
 - `GraphOfOperations`, `GraphNode` from `graph_topology.rs` (Step 2)
 - `fx-llm` — `ModelRouter` for LLM calls (Generate, LlmRating, LlmSynthesis, LlmJudge)
@@ -51,6 +51,8 @@ Reasoning:
 
 Respond with only a number between 0.0 and 1.0.
 ```
+
+**Implementation note:** Local models (27B–70B) frequently wrap the numeric response in prose (e.g., "I'd rate this 0.7 because..."). The implementation must use regex extraction (`r"(0\.\d+|1\.0|0|1)"`) to pull the first valid float from the response, not naive `parse::<f64>()`. Fall back to 0.5 if no number is found, with a `tracing::warn!` noting the unparseable response.
 
 2. **`HeuristicThoughtScorer`** — regex match: 1.0 if pattern matches content, 0.0 otherwise.
 
@@ -90,6 +92,22 @@ pub trait ThoughtMerger: Send + Sync {
 
 ---
 
+## Structured Tracing
+
+Each operation execution opens a `tracing::info_span!` with the node ID, operation type, and cycle count. This is critical for debugging multi-cycle GoT runs with branching and refinement, which would otherwise be opaque in logs.
+
+```rust
+let span = tracing::info_span!(
+    "got_operation",
+    node = %node.id.0,
+    op = %operation_name,
+    cycle = cycle_count,
+);
+let _guard = span.enter();
+```
+
+---
+
 ## `GraphDispatcher`
 
 ```rust
@@ -115,7 +133,7 @@ impl GraphDispatcher {
         &self,
         graph: &GraphOfOperations,
         initial_content: String,
-        initial_metadata: serde_json::Value,
+        initial_metadata: ThoughtMetadata,
         progress: Option<&DecompositionProgressCallback>,
     ) -> Result<GraphExecutionResult, DecomposeError>;
 }
@@ -154,6 +172,8 @@ for each active thought in pool:
 ```
 
 Fan-out: 1 thought becomes N thoughts.
+
+**Partial failure semantics:** If generation fails partway (e.g., 2 of 4 branches succeed before an error), the parent thought is preserved and the successful branches are discarded. This is an all-or-nothing operation per parent thought — partial branches would leave the pool in an ambiguous state where some parents have children and some don't, making subsequent Score/KeepBest operations unpredictable. The error propagates to the caller.
 
 ### `Score`
 
@@ -222,7 +242,7 @@ for each active thought in pool:
 
 ## Back-Edge Execution
 
-The dispatcher maintains a `HashMap<(usize, usize), usize>` counting traversals per back-edge:
+The dispatcher maintains a `HashMap<(GraphNodeId, GraphNodeId), usize>` counting traversals per back-edge:
 
 ```
 for (target, is_back_edge) in graph.all_successors(current_node):
@@ -242,12 +262,15 @@ If all successors are exhausted back-edges and there are no forward edges, execu
 
 - `GraphDispatcher::execute()` walks a graph from entry to terminal nodes
 - `Generate` fans out correctly (N branches per input thought)
+- `Generate` is all-or-nothing per parent (partial failures preserve parent, discard partial branches)
 - `Score` assigns scores to all active thoughts
+- `LlmThoughtScorer` uses regex extraction for score parsing, not naive `parse::<f64>()`
 - `KeepBest` prunes to top-N
 - `Merge` combines all active thoughts into one
 - `Refine` iterates up to max_iterations, stopping early if target_score is met
 - `Validate` assigns pass/fail scores
 - Back-edges respect iteration limits
+- Each operation execution emits a `tracing::info_span!` with node ID, operation type, and cycle count
 - `GraphExecutionResult` accurately reports llm_calls and operations_executed
 - Unit tests use mock implementations of all three traits (no real LLM calls in tests)
 - All existing tests pass unchanged

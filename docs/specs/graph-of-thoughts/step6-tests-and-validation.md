@@ -104,7 +104,7 @@ async fn tot_branches_and_prunes() {
     let result = execute_with_mocks(graph, "sort this list").await;
     assert_eq!(result.thoughts.len(), 1); // KeepBest(1)
     assert!(result.best.unwrap().score.unwrap() > 0.0);
-    assert!(result.llm_calls >= 5); // 4 generates + 4 scores + ... 
+    assert!(result.llm_calls >= 5); // 4 generates + 4 scores + ...
 }
 ```
 
@@ -244,6 +244,104 @@ async fn parent_ids_reference_existing_thoughts() {
 }
 ```
 
+### 12. Generate partial failure is all-or-nothing
+
+```rust
+#[tokio::test]
+async fn generate_partial_failure_preserves_parent() {
+    // MockGenerator that fails on the 3rd branch
+    let generator = FailingMockGenerator { fail_on_branch: 2 };
+
+    let graph = GraphBuilder::new(3)
+        .generate(4)
+        .build()
+        .unwrap();
+
+    let result = execute_with_custom_mocks(graph, "start", generator, default_scorer()).await;
+    // Parent should still be in the pool — partial branches discarded
+    assert_eq!(result.thoughts.len(), 1);
+    assert_eq!(result.thoughts[0].content, "start");
+}
+```
+
+### 13. GoT mode rejects sub_goals combination
+
+```rust
+#[tokio::test]
+async fn got_mode_rejects_sub_goals_combination() {
+    // Simulate a decompose tool call with both reasoning_mode=got_graph and sub_goals
+    let tool_args = serde_json::json!({
+        "reasoning_mode": "got_graph",
+        "got_criteria": "quality",
+        "sub_goals": [{"description": "step 1"}],
+    });
+    let result = invoke_decompose_tool(tool_args).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("cannot be combined"));
+}
+```
+
+### 14. Refine wires correctly when followed by another operation
+
+```rust
+#[test]
+fn refine_followed_by_validate_wires_correctly() {
+    let graph = GraphBuilder::new(3)
+        .generate(2)
+        .refine(2, 0.9, "quality")
+        .validate_exact("expected answer")
+        .build()
+        .unwrap();
+
+    // The validate node should be reachable from the last node of the refine cycle
+    // (not from the first node or disconnected)
+    let terminal = graph.terminal_nodes();
+    assert_eq!(terminal.len(), 1);
+    // Terminal node should be the Validate operation
+    let node = graph.node(terminal[0]).unwrap();
+    assert!(matches!(node.operation, GraphOperation::Validate { .. }));
+}
+```
+
+### 15. LLM score parsing with prose wrapper
+
+```rust
+#[test]
+fn llm_score_parsing_extracts_from_prose() {
+    // Simulates local model responses that wrap the number in text
+    assert_eq!(parse_llm_score("I'd rate this 0.7 because it's mostly correct"), 0.7);
+    assert_eq!(parse_llm_score("0.85"), 0.85);
+    assert_eq!(parse_llm_score("Score: 0.6/1.0"), 0.6);
+    assert_eq!(parse_llm_score("The quality is moderate"), 0.5); // fallback
+}
+```
+
+---
+
+## Additional Mock: `FailingMockGenerator`
+
+```rust
+/// Generator that fails after producing a certain number of branches.
+/// Used to test partial failure semantics (test case 12).
+struct FailingMockGenerator {
+    /// Fail when generating the branch at this index (0-based).
+    fail_on_branch: usize,
+}
+
+impl ThoughtGenerator for FailingMockGenerator {
+    async fn generate(&self, parent: &ThoughtState, num_branches: usize, _prompt: Option<&str>) -> Result<Vec<String>> {
+        if num_branches > self.fail_on_branch {
+            Err(DecomposeError::GenerationFailed("simulated failure".into()))
+        } else {
+            Ok((0..num_branches)
+                .map(|i| format!("{}-branch-{i}", parent.content))
+                .collect())
+        }
+    }
+}
+```
+
 ---
 
 ## Regression Safety
@@ -265,8 +363,9 @@ cargo test --workspace
 
 ## Acceptance Criteria
 
-- All 11+ test cases pass
+- All 15 test cases pass
 - Mock infrastructure is reusable (exported under `#[cfg(test)]` or `test-support` feature)
+- `FailingMockGenerator` is available for partial-failure testing
 - No flaky tests — all mocks are deterministic
 - Test execution time < 5 seconds (no real LLM calls, no I/O)
 - Full workspace test suite passes unchanged
@@ -282,4 +381,4 @@ cargo test -p fx-decompose -- got  # run only GoT tests
 
 ## Estimated Size
 
-~300 lines of test code + ~100 lines of mock infrastructure.
+~400 lines of test code + ~130 lines of mock infrastructure.

@@ -86,7 +86,7 @@ Five PR-sized slices, executed sequentially. Each slice uses **test-driven devel
 | 4 | [Builder API](step4-builder-api.md) | `graph_builder.rs` | Easy |
 | 5 | [Kernel Integration](step5-kernel-integration.md) | `reasoning_mode.rs` + kernel loop | Easy |
 
-**Estimated total:** ~1,400 lines of new code (including tests), 2–3 days of implementation.
+**Estimated total:** ~1,900 lines of new code (including tests), 2–3 days of implementation.
 
 ---
 
@@ -134,6 +134,8 @@ cargo test --workspace
 4. **Kernel safety unchanged.** GoT runs within the existing budget and proposal gate. No new kernel permissions needed. GoT mode is just a different strategy for constructing sub-goals — the execution still flows through the same gated tool executor.
 
 5. **Local-model friendly.** GoT's value proposition is strongest with smaller local models. The implementation must be efficient enough to run with 3–6 tok/s endpoints (no unnecessary round-trips, minimal prompt overhead).
+
+6. **Single budget mechanism.** Budget enforcement lives in the session-level `Arc<AtomicUsize>` counter passed into `GraphDispatcher`. There is no separate per-graph token budget — the session budget is the single source of truth. See Step 5 for details.
 
 ---
 

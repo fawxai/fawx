@@ -30,6 +30,49 @@ pub struct ThoughtId(pub u64);
 
 Use a monotonic counter within a single graph execution, not UUIDs. Cheap, debuggable, no allocations.
 
+### `GraphNodeId`
+
+```rust
+/// Typed wrapper for a node index in the operation graph.
+///
+/// Prevents raw `usize` indices from being confused with other integer
+/// quantities (thought IDs, branch counts, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GraphNodeId(pub usize);
+```
+
+Used by `ThoughtState::origin_operation` and throughout `graph_topology.rs` (Step 2) instead of bare `usize`.
+
+### `ThoughtMetadata`
+
+```rust
+/// Typed metadata carried by a thought.
+///
+/// This replaces an untyped `serde_json::Value` to satisfy ENGINEERING.md §2:
+/// "No `Any`, `Object`, or stringly-typed APIs where a concrete type or enum exists."
+///
+/// The variants cover all known use cases for v1. If future operations need
+/// additional metadata, add a variant here rather than falling back to a
+/// freeform map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum ThoughtMetadata {
+    /// No metadata (default for most operations).
+    #[default]
+    Empty,
+    /// Key-value pairs for domain-specific state (e.g., partial solutions).
+    /// Keys are constrained to `String` but values are typed.
+    Fields(HashMap<String, ThoughtMetadataValue>),
+}
+
+/// A single metadata value. Covers the types GoT operations actually produce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ThoughtMetadataValue {
+    Text(String),
+    Number(f64),
+    Bool(bool),
+}
+```
+
 ### `ThoughtState`
 
 ```rust
@@ -42,30 +85,37 @@ pub struct ThoughtState {
     pub content: String,
     /// Score assigned by a Score operation. None until scored.
     pub score: Option<f64>,
-    /// Arbitrary metadata for domain-specific state (e.g., partial solutions, intermediate data).
-    pub metadata: serde_json::Value,
+    /// Typed metadata for domain-specific state.
+    pub metadata: ThoughtMetadata,
     /// IDs of parent thoughts. Empty for root thoughts.
     pub parent_ids: Vec<ThoughtId>,
-    /// Which operation produced this thought.
-    pub origin_operation: Option<usize>,
-    /// Creation timestamp (monotonic, for ordering).
-    #[serde(skip)]
-    pub created_at: Option<std::time::Instant>,
+    /// Which graph operation produced this thought.
+    pub origin_operation: Option<GraphNodeId>,
 }
 ```
+
+**Design notes:**
+- `metadata` uses `ThoughtMetadata` instead of `serde_json::Value` — avoids stringly-typed `Any` escape hatch per ENGINEERING.md §2.
+- `origin_operation` uses `GraphNodeId` instead of raw `usize` — prevents index confusion and survives refactoring.
+- `created_at: Option<std::time::Instant>` was removed. `Instant` is not serializable (`#[serde(skip)]` would produce a ghost field always `None` after deserialization). `ThoughtId` already provides monotonic creation order since the allocator is sequential.
 
 ### `ThoughtIdAllocator`
 
 ```rust
 /// Allocator for thought IDs within a single graph execution.
+///
+/// Uses a plain `u64` counter — not `AtomicU64` — because `ThoughtPool`
+/// takes `&mut self` for all mutation, so this is always single-owner.
 #[derive(Debug, Default)]
 pub struct ThoughtIdAllocator {
-    next: AtomicU64,
+    next: u64,
 }
 
 impl ThoughtIdAllocator {
-    pub fn next(&self) -> ThoughtId {
-        ThoughtId(self.next.fetch_add(1, Ordering::Relaxed))
+    pub fn next(&mut self) -> ThoughtId {
+        let id = ThoughtId(self.next);
+        self.next += 1;
+        id
     }
 }
 ```
@@ -87,7 +137,7 @@ impl ThoughtPool {
         &mut self,
         content: String,
         parents: Vec<ThoughtId>,
-        metadata: serde_json::Value,
+        metadata: ThoughtMetadata,
     ) -> ThoughtId;
     pub fn get(&self, id: ThoughtId) -> Option<&ThoughtState>;
     pub fn get_mut(&mut self, id: ThoughtId) -> Option<&mut ThoughtState>;
@@ -218,7 +268,9 @@ pub enum ValidationStrategy {
 - `thought.rs` compiles with all types, derives, and helper methods
 - `operations.rs` compiles with all operation enums and strategy types
 - `ThoughtPool` has unit tests for: insert, create, get, remove, scored(), top_n()
-- All types implement `Debug, Clone, Serialize, Deserialize` (except `Instant` fields which are `#[serde(skip)]`)
+- `ThoughtMetadata` has unit tests for: default (Empty), Fields construction, serde round-trip
+- `GraphNodeId` is used instead of raw `usize` for operation references
+- All types implement `Debug, Clone, Serialize, Deserialize`
 - `lib.rs` exports both modules
 - All existing tests pass unchanged
 

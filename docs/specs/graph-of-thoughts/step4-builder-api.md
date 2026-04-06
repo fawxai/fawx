@@ -19,7 +19,7 @@ Manually calling `add_node`, `add_edge`, `add_back_edge` is tedious and error-pr
 
 ## Dependencies
 
-- `GraphOfOperations`, `GraphNode`, `GraphEdge` from `graph_topology.rs` (Step 2)
+- `GraphOfOperations`, `GraphNode`, `GraphEdge`, `GraphNodeId` from `graph_topology.rs` (Step 2)
 - `GraphOperation`, `ScoringStrategy`, `MergeStrategy`, `ValidationStrategy` from `operations.rs` (Step 1)
 
 ---
@@ -35,7 +35,7 @@ Manually calling `add_node`, `add_edge`, `add_back_edge` is tedious and error-pr
 pub struct GraphBuilder {
     graph: GraphOfOperations,
     /// Index of the last appended node (for auto-wiring sequential edges).
-    last_node: Option<usize>,
+    last_node: Option<GraphNodeId>,
 }
 ```
 
@@ -71,7 +71,11 @@ impl GraphBuilder {
     pub fn concat(self, separator: impl Into<String>) -> Self;
 
     /// Append a Refine operation: iterative score→improve loop.
-    /// This internally creates a Score + Generate cycle with a back-edge.
+    ///
+    /// This internally creates multiple nodes (Score + Generate) with a back-edge
+    /// from Generate → Score. After `refine()` returns, `last_node` points to the
+    /// **last internal node** (the Generate node), so subsequent chained methods
+    /// wire correctly from the end of the refinement cycle.
     pub fn refine(self, max_iterations: usize, target_score: f64, criteria: impl Into<String>) -> Self;
 
     /// Append a Validate operation with exact match.
@@ -85,9 +89,6 @@ impl GraphBuilder {
 
     /// Append a raw GraphOperation node (escape hatch for custom ops).
     pub fn operation(self, op: GraphOperation) -> Self;
-
-    /// Set the total token budget for the graph execution.
-    pub fn max_tokens(self, budget: usize) -> Self;
 
     /// Build and validate the final graph.
     pub fn build(self) -> Result<GraphOfOperations, GraphTopologyError>;
@@ -161,7 +162,7 @@ let graph = GraphBuilder::chain_of_thought("reasoning quality");
 
 1. The first node added becomes the entry node (index 0)
 2. Each subsequent node gets a forward edge from the previous node
-3. `refine()` creates two internal nodes (Score + Generate) with a back-edge from Generate → Score
+3. `refine()` creates two internal nodes (Score + Generate) with a back-edge from Generate → Score. After `refine()`, `last_node` points to the Generate node (the last one created), so the next chained method wires from the correct exit point of the cycle.
 4. `build()` calls `graph.validate()` before returning
 
 ---
@@ -171,11 +172,13 @@ let graph = GraphBuilder::chain_of_thought("reasoning quality");
 - Builder produces valid `GraphOfOperations` for all common patterns
 - Auto-wiring creates correct edge sequences (verified by inspecting `graph.successors()`)
 - `refine()` correctly creates a back-edge with appropriate iteration limit
+- `refine()` sets `last_node` to the last internal node, not the first
 - All four presets (`chain_of_thought`, `tree_of_thought`, `graph_of_thought`, `consensus`) build without error
 - Presets produce topologically valid graphs (pass `validate()`)
 - `build()` returns `Err` if the graph is empty or invalid
 - Builder methods are chainable (move semantics via `self`)
 - Unit tests for each preset and for manual construction
+- Unit test verifying that `refine()` followed by another operation wires correctly
 - All existing tests pass unchanged
 
 ## Validation

@@ -21,7 +21,7 @@ Steps 1–4 built the GoT engine inside `fx-decompose`. This step connects it to
 
 ## Dependencies
 
-- `GraphOfOperations`, `GraphDispatcher`, `GraphBuilder` from Steps 1–4
+- `GraphOfOperations`, `GraphDispatcher`, `GraphBuilder`, `GraphNodeId` from Steps 1–4
 - `fx-kernel` loop engine — the existing decomposition entry point
 - `fx-llm` — `ModelRouter` for constructing LLM-backed generator/scorer/merger
 
@@ -70,10 +70,21 @@ pub enum GraphOfOperationsSpec {
     /// Custom graph (advanced usage — raw operation list).
     Custom {
         operations: Vec<GraphOperation>,
-        /// DAG-like spec for operation ordering, or empty for linear chain.
-        edges: Vec<(usize, usize, bool)>,  // (from, to, is_back_edge)
+        /// Edge specifications for operation ordering, or empty for linear chain.
+        edges: Vec<EdgeSpec>,
         max_iterations_per_cycle: usize,
     },
+}
+
+/// A single edge in a custom graph specification.
+///
+/// Named struct instead of `(usize, usize, bool)` tuple per ENGINEERING.md
+/// naming standards — three unnamed positional fields are ambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeSpec {
+    pub from: GraphNodeId,
+    pub to: GraphNodeId,
+    pub is_back_edge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +111,7 @@ Extend the existing `decompose` tool to accept a `reasoning_mode` parameter:
     "reasoning_mode": {
       "type": "string",
       "enum": ["standard", "got_tree", "got_graph", "got_consensus"],
-      "description": "Reasoning strategy. Default: standard. GoT modes use Graph of Thoughts."
+      "description": "Reasoning strategy. Default: standard. GoT modes use Graph of Thoughts. When a GoT mode is selected, sub_goals and strategy must NOT be provided — the tool will reject the call if they are."
     },
     "got_branches": {
       "type": "integer",
@@ -114,12 +125,22 @@ Extend the existing `decompose` tool to accept a `reasoning_mode` parameter:
 }
 ```
 
-When `reasoning_mode` is a GoT variant, the tool:
-1. Ignores `sub_goals` and `strategy` (GoT constructs its own graph)
-2. Builds a `GraphOfOperations` from the preset + parameters
-3. Constructs a `GraphDispatcher` using the session's `ModelRouter`
-4. Executes the graph with the user's original task as the initial thought
-5. Returns the best thought from `GraphExecutionResult`
+### Parameter conflict handling
+
+When `reasoning_mode` is a GoT variant **and** `sub_goals` or `strategy` are also provided, the tool returns an error:
+
+```
+Error: `sub_goals` and `strategy` cannot be combined with GoT reasoning modes.
+GoT constructs its own execution graph — remove `sub_goals` and `strategy`, or use `reasoning_mode: "standard"`.
+```
+
+This avoids silently discarding parameters the agent explicitly provided, which would be a fail-quietly antipattern.
+
+When `reasoning_mode` is a GoT variant and only GoT parameters are provided, the tool:
+1. Builds a `GraphOfOperations` from the preset + parameters
+2. Constructs a `GraphDispatcher` using the session's `ModelRouter`
+3. Executes the graph with the user's original task as the initial thought
+4. Returns the best thought from `GraphExecutionResult`
 
 When `reasoning_mode` is `standard` (or absent), behavior is identical to today.
 
@@ -161,16 +182,20 @@ The `LlmThoughtGenerator`, `LlmThoughtScorer`, and `LlmThoughtMerger` structs wr
 
 ---
 
-## Budget Integration
+## Budget Integration — Single Mechanism
 
-GoT executes multiple LLM calls. Each call must count against the session's existing tool budget:
+GoT executes multiple LLM calls. Each call counts against the **session-level budget** — the single source of truth for cost control.
+
+There is no per-graph token budget. The `max_total_tokens` field that was originally proposed on `GraphOfOperations` was removed to avoid two competing budget mechanisms with ambiguous precedence. The session budget is sufficient.
+
+Per-operation LLM call counts:
 
 - Each `Generate` call = N LLM calls (N = num_branches × active thoughts)
 - Each `Score` with LlmRating = 1 LLM call per active thought
 - Each `Merge` with LlmSynthesis = 1 LLM call
 - Each `Validate` with LlmJudge = 1 LLM call per active thought
 
-The `GraphDispatcher` receives a budget counter (e.g., `Arc<AtomicUsize>`) and increments it per LLM call. If the session budget is exhausted mid-graph, execution terminates early and returns the best thought so far.
+The `GraphDispatcher` receives the session's budget counter (`Arc<AtomicUsize>`) and increments it per LLM call. If the session budget is exhausted mid-graph, execution terminates early and returns the best thought so far.
 
 ---
 
@@ -187,12 +212,15 @@ The `GraphDispatcher` receives a budget counter (e.g., `Arc<AtomicUsize>`) and i
 
 - `ReasoningMode` enum is defined and serializable
 - `GraphOfOperationsSpec` converts to a live `GraphOfOperations` via the builder presets
+- `EdgeSpec` is a named struct (not a tuple) with `GraphNodeId` fields
 - The `decompose` tool accepts `reasoning_mode` and GoT-specific parameters
+- The tool **rejects** calls that combine GoT `reasoning_mode` with `sub_goals`/`strategy`
 - When `reasoning_mode` is a GoT variant, the graph executes and returns a result
 - When `reasoning_mode` is absent or `standard`, existing behavior is unchanged
-- Budget counting works — each LLM call within GoT increments the session counter
+- Budget counting works — each LLM call within GoT increments the session counter (single budget mechanism)
 - Early termination on budget exhaustion returns partial results gracefully
 - Integration test: construct a GoT graph via the tool interface, execute with mock LLM, verify result
+- Integration test: verify that combining GoT mode with `sub_goals` returns an error
 - All existing decomposition tests pass unchanged
 
 ## Validation
