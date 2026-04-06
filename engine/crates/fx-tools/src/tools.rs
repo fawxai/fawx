@@ -197,13 +197,18 @@ impl ToolRegistry {
             .map(|tool| tool.definition())
             .collect()
     }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.ordered
+            .iter()
+            .find_map(|tool| tool.take_execution_diagnostics(call_id))
+    }
 }
 
 #[derive(Clone)]
 pub struct FawxToolExecutor {
     context: Arc<ToolContext>,
     tools: Arc<ToolRegistry>,
-    execution_diagnostics: Arc<Mutex<HashMap<String, ToolExecutionDiagnostics>>>,
     concurrency_policy: ConcurrencyPolicy,
 }
 
@@ -233,7 +238,6 @@ impl FawxToolExecutor {
         Self {
             tools: Arc::new(build_registry(&context)),
             context,
-            execution_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             concurrency_policy: ConcurrencyPolicy::default(),
         }
     }
@@ -362,25 +366,15 @@ impl FawxToolExecutor {
             return cancelled_result(&call.id, &call.name);
         }
         match self.tools.get(call.name.as_str()) {
-            Some(tool) => {
-                let result = tool.execute(call, cancel).await;
-                self.store_execution_diagnostics(
-                    &call.id,
-                    tool.take_execution_diagnostics(&call.id),
-                );
-                result
-            }
-            None => {
-                self.store_execution_diagnostics(&call.id, None);
-                to_tool_result(
-                    &call.id,
-                    &call.name,
-                    Err(ToolFailure::permanent(format!(
-                        "unknown tool: {}",
-                        call.name
-                    ))),
-                )
-            }
+            Some(tool) => tool.execute(call, cancel).await,
+            None => to_tool_result(
+                &call.id,
+                &call.name,
+                Err(ToolFailure::permanent(format!(
+                    "unknown tool: {}",
+                    call.name
+                ))),
+            ),
         }
     }
 }
@@ -624,10 +618,7 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
-        self.execution_diagnostics
-            .lock()
-            .expect("tool execution diagnostics lock")
-            .remove(call_id)
+        self.tools.take_execution_diagnostics(call_id)
     }
 
     fn route_sub_goal_call(
@@ -676,24 +667,6 @@ impl std::fmt::Debug for FawxToolExecutor {
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.context.improvement.is_some());
         debug.finish()
-    }
-}
-
-impl FawxToolExecutor {
-    fn store_execution_diagnostics(
-        &self,
-        call_id: &str,
-        diagnostics: Option<ToolExecutionDiagnostics>,
-    ) {
-        let mut guard = self
-            .execution_diagnostics
-            .lock()
-            .expect("tool execution diagnostics lock");
-        if let Some(diagnostics) = diagnostics {
-            guard.insert(call_id.to_string(), diagnostics);
-        } else {
-            guard.remove(call_id);
-        }
     }
 }
 
@@ -920,9 +893,9 @@ mod tests {
     use fx_consensus::ProgressEvent;
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
+    use fx_kernel::act::RunCommandDiagnostics;
     use fx_llm::ModelRouter;
     use fx_memory::embedding_index::EmbeddingIndex;
-    use fx_kernel::act::RunCommandDiagnostics;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
 

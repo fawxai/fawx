@@ -54,14 +54,6 @@ impl RunCommandTool {
             guard.remove(call_id);
         }
     }
-
-    fn clear_execution_diagnostics(&self, call_id: &str) {
-        let _ = self
-            .diagnostics
-            .lock()
-            .expect("run_command diagnostics lock")
-            .remove(call_id);
-    }
 }
 
 #[async_trait]
@@ -88,10 +80,7 @@ impl Tool for RunCommandTool {
 
     async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
         match self.context.handle_run_command(&call.arguments).await {
-            Ok(output) => {
-                self.clear_execution_diagnostics(&call.id);
-                ToolResult::success(&call.id, self.name(), output)
-            }
+            Ok(output) => ToolResult::success(&call.id, self.name(), output),
             Err(error) => {
                 self.store_execution_diagnostics(&call.id, error.diagnostics().cloned());
                 ToolResult::failure(&call.id, self.name(), error.message, error.class)
@@ -161,87 +150,51 @@ impl ToolContext {
     ) -> Result<String, ToolFailure> {
         let started_at = Instant::now();
         let parsed: RunCommandArgs = parse_args(args).map_err(|error| {
-            let message = error.clone();
-            ToolFailure::permanent(error).with_diagnostics(run_command_failure_diagnostics(
+            attach_run_command_diagnostics(
+                ToolFailure::permanent(error),
                 started_at,
                 false,
                 None,
                 false,
-                Some(message.as_str()),
-            ))
+            )
         })?;
         let shell = parsed.shell.unwrap_or(false);
         let command = parsed.command.trim();
         if command.is_empty() {
-            return Err(
-                ToolFailure::permanent("command cannot be empty").with_diagnostics(
-                    run_command_failure_diagnostics(
-                        started_at,
-                        shell,
-                        None,
-                        false,
-                        Some("command cannot be empty"),
-                    ),
-                ),
-            );
-        }
-        let working_dir = self
-            .resolve_command_dir(parsed.working_dir.as_deref())
-            .map_err(|error| {
-                let message = error.message.clone();
-                error.with_diagnostics(run_command_failure_diagnostics(
-                    started_at,
-                    shell,
-                    None,
-                    false,
-                    Some(message.as_str()),
-                ))
-            })?;
-        self.guard_push_command(command).map_err(|error| {
-            let message = error.message.clone();
-            error.with_diagnostics(run_command_failure_diagnostics(
+            return Err(attach_run_command_diagnostics(
+                ToolFailure::permanent("command cannot be empty"),
                 started_at,
                 shell,
                 None,
                 false,
-                Some(message.as_str()),
-            ))
+            ));
+        }
+        let working_dir = self
+            .resolve_command_dir(parsed.working_dir.as_deref())
+            .map_err(|error| {
+                attach_run_command_diagnostics(error, started_at, shell, None, false)
+            })?;
+        self.guard_push_command(command).map_err(|error| {
+            attach_run_command_diagnostics(error, started_at, shell, None, false)
         })?;
         let child = build_command(command, shell, &working_dir)
-            .map_err(|error| {
-                let message = error.message.clone();
-                error.with_diagnostics(run_command_failure_diagnostics(
-                    started_at,
-                    shell,
-                    None,
-                    false,
-                    Some(message.as_str()),
-                ))
-            })?
+            .map_err(|error| attach_run_command_diagnostics(error, started_at, shell, None, false))?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
-                let message = error.to_string();
-                tool_failure_from_io(error).with_diagnostics(run_command_failure_diagnostics(
+                attach_run_command_diagnostics(
+                    tool_failure_from_io(error),
                     started_at,
                     shell,
                     None,
                     false,
-                    Some(message.as_str()),
-                ))
+                )
             })?;
         let output = wait_with_timeout(child, self.config.command_timeout)
             .await
             .map_err(|error| {
-                let message = error.message.clone();
-                error.with_diagnostics(run_command_failure_diagnostics(
-                    started_at,
-                    shell,
-                    None,
-                    true,
-                    Some(message.as_str()),
-                ))
+                attach_run_command_diagnostics(error, started_at, shell, None, true)
             })?;
         let formatted = format_command_output(&output, shell);
         if output.status.success() {
@@ -330,6 +283,27 @@ fn run_command_failure_diagnostics(
         shell,
         timed_out,
     })
+}
+
+fn attach_run_command_diagnostics(
+    error: ToolFailure,
+    started_at: Instant,
+    shell: bool,
+    output: Option<&std::process::Output>,
+    timed_out: bool,
+) -> ToolFailure {
+    let fallback_stderr = if output.is_none() {
+        Some(error.message.clone())
+    } else {
+        None
+    };
+    error.with_diagnostics(run_command_failure_diagnostics(
+        started_at,
+        shell,
+        output,
+        timed_out,
+        fallback_stderr.as_deref(),
+    ))
 }
 
 fn stderr_snippet(stderr: &[u8]) -> Option<String> {
