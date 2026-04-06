@@ -10,12 +10,37 @@ use super::{
     TOOL_CONTINUATION_DIRECTIVE,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SkillPromptSummary {
+    name: String,
+    description: String,
+}
+
+impl SkillPromptSummary {
+    pub(super) fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+
+    fn render_bullet(&self) -> Option<String> {
+        let name = self.name.trim();
+        let description = self.description.trim();
+        if name.is_empty() || description.is_empty() {
+            return None;
+        }
+        Some(format!("- {name}: {description}"))
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RequestBuildContext<'a> {
     memory_context: Option<&'a str>,
     scratchpad_context: Option<&'a str>,
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&'a [SkillPromptSummary]>,
 }
 
 impl<'a> RequestBuildContext<'a> {
@@ -30,7 +55,16 @@ impl<'a> RequestBuildContext<'a> {
             scratchpad_context,
             thinking,
             notify_tool_guidance_enabled,
+            skill_prompt_summaries: None,
         }
+    }
+
+    pub(super) fn with_skill_prompt_summaries(
+        mut self,
+        skill_prompt_summaries: &'a [SkillPromptSummary],
+    ) -> Self {
+        self.skill_prompt_summaries = Some(skill_prompt_summaries);
+        self
     }
 }
 
@@ -179,6 +213,7 @@ pub(super) fn build_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
     CompletionRequest {
         model: params.model.to_string(),
@@ -219,6 +254,7 @@ pub(super) fn build_truncation_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
 
     CompletionRequest {
@@ -237,6 +273,7 @@ pub(super) fn build_reasoning_request(params: ReasoningRequestParams<'_>) -> Com
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
 
     CompletionRequest {
@@ -280,19 +317,26 @@ pub(super) fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
-    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
+    build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        false,
+        None,
+    )
 }
 
 pub(super) fn build_reasoning_system_prompt_with_notify_guidance(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         None,
         notify_tool_guidance_enabled,
+        skill_prompt_summaries,
     )
 }
 
@@ -306,6 +350,7 @@ fn build_forced_synthesis_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
         notify_tool_guidance_enabled,
+        None,
     );
     let directives = system_messages_to_prompt_directives(context_messages);
     if !directives.is_empty() {
@@ -329,19 +374,22 @@ pub(super) fn build_tool_continuation_system_prompt(
         memory_context,
         scratchpad_context,
         false,
+        None,
     )
 }
 
-fn build_tool_continuation_system_prompt_with_notify_guidance(
+pub(super) fn build_tool_continuation_system_prompt_with_notify_guidance(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         Some(TOOL_CONTINUATION_DIRECTIVE),
         notify_tool_guidance_enabled,
+        skill_prompt_summaries,
     )
 }
 
@@ -350,24 +398,56 @@ fn build_system_prompt(
     scratchpad_context: Option<&str>,
     extra_directive: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
-    let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    let mut sections = vec![REASONING_SYSTEM_PROMPT.to_string()];
+
+    if let Some(capabilities) = render_skill_capabilities(skill_prompt_summaries) {
+        sections.push(capabilities);
+    }
+
     if notify_tool_guidance_enabled {
-        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+        sections.push(strip_leading_blank_lines(NOTIFY_TOOL_GUIDANCE).to_string());
     }
     if let Some(extra_directive) = extra_directive {
-        prompt.push_str(extra_directive);
+        sections.push(strip_leading_blank_lines(extra_directive).to_string());
     }
     if let Some(scratchpad_context) = scratchpad_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(scratchpad_context);
+        sections.push(normalize_section(scratchpad_context).to_string());
     }
     if let Some(memory_context) = memory_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(memory_context);
-        prompt.push_str(MEMORY_INSTRUCTION);
+        sections.push(format!(
+            "{}\n\n{}",
+            normalize_section(memory_context),
+            strip_leading_blank_lines(MEMORY_INSTRUCTION)
+        ));
     }
-    prompt
+
+    sections.join("\n\n")
+}
+
+fn render_skill_capabilities(
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
+) -> Option<String> {
+    let skill_prompt_summaries = skill_prompt_summaries?;
+    let bullets = skill_prompt_summaries
+        .iter()
+        .filter_map(SkillPromptSummary::render_bullet)
+        .collect::<Vec<_>>();
+
+    if bullets.is_empty() {
+        return None;
+    }
+
+    Some(format!("Your capabilities:\n{}", bullets.join("\n")))
+}
+
+fn normalize_section(section: &str) -> &str {
+    section.trim_matches('\n')
+}
+
+fn strip_leading_blank_lines(section: &str) -> &str {
+    section.trim_start_matches('\n')
 }
 
 fn strip_system_messages(messages: &[Message]) -> Vec<Message> {

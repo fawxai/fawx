@@ -163,11 +163,124 @@ fn system_prompt_omits_notify_guidance_without_notification_channel() {
 
 #[test]
 fn system_prompt_includes_notify_guidance_when_notification_channel_is_active() {
-    let prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, true);
+    let prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, true, None);
     assert!(
         prompt.contains("You have a `notify` tool"),
         "system prompt should include notify guidance when notifications are available"
     );
+}
+
+#[test]
+fn system_prompt_renders_skill_capabilities_in_input_order() {
+    let summaries = vec![
+        SkillPromptSummary::new(
+            "git",
+            "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+        ),
+        SkillPromptSummary::new("github", "View and manage pull requests and issues."),
+    ];
+
+    let prompt =
+        build_reasoning_system_prompt_with_notify_guidance(None, None, false, Some(&summaries));
+
+    let git_index = prompt
+        .find("- git: Inspect and manage git repositories, branches, merges, pushes, and PR creation.")
+        .expect("prompt should include git summary");
+    let github_index = prompt
+        .find("- github: View and manage pull requests and issues.")
+        .expect("prompt should include github summary");
+
+    assert!(prompt.contains("Your capabilities:"));
+    assert!(
+        git_index < github_index,
+        "summaries should render in input order"
+    );
+}
+
+#[test]
+fn system_prompt_skips_blank_skill_descriptions() {
+    let summaries = vec![
+        SkillPromptSummary::new("git", "   "),
+        SkillPromptSummary::new("github", "View and manage pull requests and issues."),
+    ];
+
+    let prompt =
+        build_reasoning_system_prompt_with_notify_guidance(None, None, false, Some(&summaries));
+
+    assert!(
+        !prompt.contains("- git:"),
+        "blank skill descriptions should be omitted"
+    );
+    assert!(
+        prompt.contains("- github: View and manage pull requests and issues."),
+        "valid skill summaries should still render"
+    );
+}
+
+#[test]
+fn system_prompt_omits_skill_capabilities_when_no_usable_summaries_exist() {
+    let blank_only = vec![
+        SkillPromptSummary::new("git", " "),
+        SkillPromptSummary::new("github", "\n\t"),
+    ];
+
+    let absent_prompt = build_reasoning_system_prompt_with_notify_guidance(None, None, false, None);
+    let blank_prompt =
+        build_reasoning_system_prompt_with_notify_guidance(None, None, false, Some(&blank_only));
+
+    assert!(
+        !absent_prompt.contains("Your capabilities:"),
+        "capabilities section should be omitted when no summaries are provided"
+    );
+    assert!(
+        !blank_prompt.contains("Your capabilities:"),
+        "capabilities section should be omitted when all summaries are blank"
+    );
+}
+
+#[test]
+fn reasoning_and_tool_continuation_prompts_share_skill_capability_rendering() {
+    let summaries = vec![
+        SkillPromptSummary::new("git", "Inspect and manage git repositories."),
+        SkillPromptSummary::new("github", "View and manage pull requests and issues."),
+    ];
+
+    let reasoning_prompt =
+        build_reasoning_system_prompt_with_notify_guidance(None, None, false, Some(&summaries));
+    let continuation_prompt = build_tool_continuation_system_prompt_with_notify_guidance(
+        None,
+        None,
+        false,
+        Some(&summaries),
+    );
+
+    assert!(reasoning_prompt.contains("Your capabilities:"));
+    assert!(continuation_prompt.contains("Your capabilities:"));
+    assert!(reasoning_prompt.contains("- git: Inspect and manage git repositories."));
+    assert!(continuation_prompt.contains("- github: View and manage pull requests and issues."));
+}
+
+#[test]
+fn skill_capabilities_do_not_introduce_triple_blank_lines() {
+    let summaries = vec![SkillPromptSummary::new(
+        "git",
+        "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+    )];
+
+    let prompt = build_reasoning_system_prompt_with_notify_guidance(
+        Some("Persistent memory about the user"),
+        Some("Scratchpad context"),
+        true,
+        Some(&summaries),
+    );
+
+    assert!(
+        !prompt.contains("\n\n\n"),
+        "system prompt should not contain triple blank lines"
+    );
+    assert!(prompt.contains("Your capabilities:"));
+    assert!(prompt.contains("Persistent memory about the user"));
+    assert!(prompt.contains("Scratchpad context"));
 }
 
 #[test]
@@ -223,15 +336,24 @@ fn tool_continuation_prompt_prioritizes_answering_from_existing_results() {
 
 #[test]
 fn continuation_request_includes_tool_continuation_directive_once() {
+    let skill_summaries = vec![SkillPromptSummary::new(
+        "git",
+        "Inspect and manage git repositories.",
+    )];
     let request = build_continuation_request(ContinuationRequestParams::new(
         &[Message::assistant("intermediate")],
         "mock-model",
         ToolRequestConfig::new(vec![], true),
-        RequestBuildContext::new(None, None, None, false),
+        RequestBuildContext::new(None, None, None, false)
+            .with_skill_prompt_summaries(&skill_summaries),
     ));
     let prompt = request
         .system_prompt
         .expect("continuation request should include a system prompt");
+    assert!(
+        prompt.contains("Your capabilities:"),
+        "continuation request should include the capability summary section"
+    );
     assert_eq!(
         prompt.matches(TOOL_CONTINUATION_DIRECTIVE).count(),
         1,
