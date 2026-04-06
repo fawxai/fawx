@@ -3473,6 +3473,8 @@ mod tests {
                 runtime_skill_info("blank", Some("   ")),
             ];
         }
+        app.loop_engine
+            .set_runtime_info(Arc::clone(&app.runtime_info));
 
         app.process_message("hello")
             .await

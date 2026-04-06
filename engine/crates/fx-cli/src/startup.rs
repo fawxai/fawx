@@ -60,6 +60,7 @@ use std::fs;
 use std::io;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -484,6 +485,7 @@ fn build_loop_engine_with_options(
 ) -> Result<LoopEngineBundle, StartupError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let stream_callback_slot = Arc::new(std::sync::Mutex::new(None));
+    let runtime_skill_prompt_revision = Arc::new(AtomicU64::new(0));
     let kernel_budget = BudgetConfig::default();
     let budget = BudgetTracker::new(kernel_budget.clone(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
@@ -495,7 +497,13 @@ fn build_loop_engine_with_options(
     );
     let working_dir = registry_options.working_dir.clone();
     let improvement_provider_for_bundle = improvement_provider.clone();
-    let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
+    let skills = build_skill_registry(
+        &data_dir,
+        &config,
+        improvement_provider,
+        registry_options,
+        Arc::clone(&runtime_skill_prompt_revision),
+    );
     let synthesis = config
         .model
         .synthesis_instruction
@@ -547,7 +555,8 @@ fn build_loop_engine_with_options(
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
         .session_memory(Arc::clone(&skills.session_memory))
-        .scratchpad_provider(bridge);
+        .scratchpad_provider(bridge)
+        .runtime_skill_prompt_revision(Arc::clone(&runtime_skill_prompt_revision));
     if let Some(cancel_token) = options.cancel_token {
         builder = builder.cancel_token(cancel_token);
     }
@@ -916,6 +925,7 @@ fn build_skill_registry(
     config: &FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     options: SkillRegistryBuildOptions,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) -> SkillRegistryBundle {
     let permission_policy = permissions_to_policy(&config.permissions);
     let tool_config = ToolConfig {
@@ -1111,12 +1121,17 @@ fn build_skill_registry(
         }
     };
 
-    apply_skill_summaries(&runtime_info, registry.as_ref());
+    apply_skill_summaries(
+        &runtime_info,
+        registry.as_ref(),
+        runtime_skill_prompt_revision.as_ref(),
+    );
     start_skill_watcher(
         skills_dir,
         Arc::clone(&registry),
         lifecycle,
         Arc::clone(&runtime_info),
+        Arc::clone(&runtime_skill_prompt_revision),
     );
 
     SkillRegistryBundle {
@@ -1142,6 +1157,7 @@ fn start_skill_watcher(
     registry: Arc<SkillRegistry>,
     lifecycle: Arc<Mutex<SkillLifecycleManager>>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) {
     if let Err(error) = fs::create_dir_all(&skills_dir) {
         tracing::warn!(path = %skills_dir.display(), error = %error, "failed to create skills directory for watcher");
@@ -1160,6 +1176,7 @@ fn start_skill_watcher(
         reload_event_rx,
         runtime_info,
         registry,
+        runtime_skill_prompt_revision,
     ));
     handle.spawn(async move {
         if let Err(error) = skill_watcher.run().await {
@@ -1172,10 +1189,15 @@ async fn handle_skill_reload_events(
     mut reload_event_rx: mpsc::Receiver<ReloadEvent>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     registry: Arc<SkillRegistry>,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) {
     while let Some(event) = reload_event_rx.recv().await {
         log_skill_reload_event(&event);
-        apply_skill_summaries(&runtime_info, registry.as_ref());
+        apply_skill_summaries(
+            &runtime_info,
+            registry.as_ref(),
+            runtime_skill_prompt_revision.as_ref(),
+        );
     }
 }
 
@@ -1531,7 +1553,11 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
     }))
 }
 
-fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &SkillRegistry) {
+fn apply_skill_summaries(
+    runtime_info: &Arc<RwLock<RuntimeInfo>>,
+    registry: &SkillRegistry,
+    runtime_skill_prompt_revision: &AtomicU64,
+) {
     let skills = registry
         .skill_statuses()
         .into_iter()
@@ -1558,7 +1584,10 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
         .collect::<Vec<_>>();
 
     match runtime_info.write() {
-        Ok(mut info) => info.skills = skills,
+        Ok(mut info) => {
+            info.skills = skills;
+            runtime_skill_prompt_revision.fetch_add(1, Ordering::Release);
+        }
         Err(error) => eprintln!("warning: runtime info lock poisoned: {error}"),
     }
 }
@@ -2246,7 +2275,8 @@ mod tests {
         registry.register(Arc::new(JournalSkill::new(Arc::new(Mutex::new(journal)))));
 
         let runtime_info = new_runtime_info(&config, false);
-        apply_skill_summaries(&runtime_info, &registry);
+        let runtime_skill_prompt_revision = AtomicU64::new(0);
+        apply_skill_summaries(&runtime_info, &registry, &runtime_skill_prompt_revision);
 
         let runtime_info = runtime_info.read().expect("runtime info");
         let expected = [

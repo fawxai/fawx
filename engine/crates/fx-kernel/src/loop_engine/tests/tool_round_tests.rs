@@ -269,6 +269,22 @@ fn runtime_info_with_skills(skills: Vec<SkillInfo>) -> Arc<RwLock<RuntimeInfo>> 
     }))
 }
 
+fn runtime_skill_info(name: &str, description: &str) -> SkillInfo {
+    SkillInfo {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        tool_names: Vec::new(),
+        capabilities: Vec::new(),
+        version: None,
+        source: None,
+        revision_hash: None,
+        manifest_hash: None,
+        activated_at_ms: None,
+        signature_status: None,
+        stale_source: None,
+    }
+}
+
 fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
@@ -400,35 +416,11 @@ async fn act_with_tools_executes_all_calls_and_returns_completion_text() {
 async fn act_with_tools_includes_runtime_skill_capabilities_in_continuation_request() {
     let mut engine = p4_engine();
     engine.set_runtime_info(runtime_info_with_skills(vec![
-        SkillInfo {
-            name: "git".to_string(),
-            description: Some(
-                "Inspect and manage git repositories, branches, merges, pushes, and PR creation."
-                    .to_string(),
-            ),
-            tool_names: Vec::new(),
-            capabilities: Vec::new(),
-            version: None,
-            source: None,
-            revision_hash: None,
-            manifest_hash: None,
-            activated_at_ms: None,
-            signature_status: None,
-            stale_source: None,
-        },
-        SkillInfo {
-            name: "blank".to_string(),
-            description: Some("   ".to_string()),
-            tool_names: Vec::new(),
-            capabilities: Vec::new(),
-            version: None,
-            source: None,
-            revision_hash: None,
-            manifest_hash: None,
-            activated_at_ms: None,
-            signature_status: None,
-            stale_source: None,
-        },
+        runtime_skill_info(
+            "git",
+            "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+        ),
+        runtime_skill_info("blank", "   "),
     ]));
 
     let decision = Decision::UseTools(vec![read_file_call("1", "a.txt")]);

@@ -46,7 +46,7 @@ pub(super) struct RequestBuildContext<'a> {
     scratchpad_context: Option<&'a str>,
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
-    skill_prompt_summaries: Vec<SkillPromptSummary>,
+    skill_prompt_summaries: Option<&'a [SkillPromptSummary]>,
 }
 
 impl<'a> RequestBuildContext<'a> {
@@ -61,16 +61,21 @@ impl<'a> RequestBuildContext<'a> {
             scratchpad_context,
             thinking,
             notify_tool_guidance_enabled,
-            skill_prompt_summaries: Vec::new(),
+            skill_prompt_summaries: None,
         }
     }
 
     pub(super) fn with_skill_prompt_summaries(
         mut self,
-        skill_prompt_summaries: Vec<SkillPromptSummary>,
+        skill_prompt_summaries: &'a [SkillPromptSummary],
     ) -> Self {
-        self.skill_prompt_summaries = skill_prompt_summaries;
+        self.skill_prompt_summaries = Some(skill_prompt_summaries);
         self
+    }
+
+    fn skill_summaries_slice(&self) -> Option<&[SkillPromptSummary]> {
+        self.skill_prompt_summaries
+            .filter(|summaries| !summaries.is_empty())
     }
 }
 
@@ -219,8 +224,7 @@ pub(super) fn build_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
-        (!params.context.skill_prompt_summaries.is_empty())
-            .then_some(params.context.skill_prompt_summaries.as_slice()),
+        params.context.skill_summaries_slice(),
     );
     CompletionRequest {
         model: params.model.to_string(),
@@ -236,6 +240,8 @@ pub(super) fn build_continuation_request(
 pub(super) fn build_forced_synthesis_request(
     params: ForcedSynthesisRequestParams<'_>,
 ) -> CompletionRequest {
+    // Forced synthesis is a recovery path, so it keeps the base reasoning
+    // prompt shape without runtime skill routing summaries.
     let system_prompt = build_forced_synthesis_system_prompt_with_notify_guidance(
         params.context_messages,
         params.memory_context,
@@ -261,8 +267,7 @@ pub(super) fn build_truncation_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
-        (!params.context.skill_prompt_summaries.is_empty())
-            .then_some(params.context.skill_prompt_summaries.as_slice()),
+        params.context.skill_summaries_slice(),
     );
 
     CompletionRequest {
@@ -281,8 +286,7 @@ pub(super) fn build_reasoning_request(params: ReasoningRequestParams<'_>) -> Com
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
-        (!params.context.skill_prompt_summaries.is_empty())
-            .then_some(params.context.skill_prompt_summaries.as_slice()),
+        params.context.skill_summaries_slice(),
     );
 
     CompletionRequest {
