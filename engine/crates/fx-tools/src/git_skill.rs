@@ -347,6 +347,10 @@ impl Skill for GitSkill {
         "git"
     }
 
+    fn description(&self) -> &str {
+        "Inspect and manage git repos, branches, merges, pushes, and pull requests."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![
             git_status_definition(),

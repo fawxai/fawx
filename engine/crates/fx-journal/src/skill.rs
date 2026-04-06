@@ -155,6 +155,10 @@ impl Skill for JournalSkill {
         "journal"
     }
 
+    fn description(&self) -> &str {
+        "Record and search lessons and prior session context."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![
             journal_write_definition(),

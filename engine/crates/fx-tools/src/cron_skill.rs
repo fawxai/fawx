@@ -147,6 +147,10 @@ impl Skill for CronSkill {
         "cron"
     }
 
+    fn description(&self) -> &str {
+        "Schedule, inspect, run, and remove recurring cron jobs."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         cron_tool_definitions()
     }

@@ -238,6 +238,10 @@ impl Skill for TransactionSkill {
         "transaction_skill"
     }
 
+    fn description(&self) -> &str {
+        "Stage multi-file edits and commit or roll them back as one transaction."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![
             begin_transaction_definition(),

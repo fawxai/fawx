@@ -38,6 +38,10 @@ impl Skill for SessionMemorySkill {
         "session_memory"
     }
 
+    fn description(&self) -> &str {
+        "Keep durable session context about the project, decisions, and active files."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![tool_definition()]
     }
