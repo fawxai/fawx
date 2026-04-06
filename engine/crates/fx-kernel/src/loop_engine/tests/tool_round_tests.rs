@@ -131,6 +131,39 @@ impl ToolExecutor for Phase4NoDecomposeExecutor {
 }
 
 #[derive(Debug)]
+struct Phase4OutputToolExecutor {
+    output: String,
+}
+
+#[async_trait]
+impl ToolExecutor for Phase4OutputToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: self.output.clone(),
+                failure_class: None,
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]
+    }
+}
+
+#[derive(Debug)]
 struct Phase4MockLlm {
     responses: Mutex<VecDeque<CompletionResponse>>,
     requests: Mutex<Vec<CompletionRequest>>,
@@ -361,6 +394,17 @@ fn tool_use_response(calls: Vec<ToolCall>) -> CompletionResponse {
     }
 }
 
+fn tool_use_response_with_text(text: &str, calls: Vec<ToolCall>) -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        tool_calls: calls,
+        usage: None,
+        stop_reason: Some("tool_use".to_string()),
+    }
+}
+
 fn text_response(text: &str) -> CompletionResponse {
     CompletionResponse {
         content: vec![ContentBlock::Text {
@@ -410,6 +454,135 @@ async fn act_with_tools_executes_all_calls_and_returns_completion_text() {
     assert_eq!(action.tool_results[0].tool_name, "read_file");
     assert_eq!(action.tool_results[1].tool_name, "read_file");
     assert_eq!(action.response_text, "combined tool output");
+}
+
+#[test]
+fn task_contract_extraction_strips_internal_plan_block_from_visible_text() {
+    let extracted = extract_task_contract_from_text(
+        "Task plan:\n- [ ] ENGINEERING.md\n- [ ] TASTE.md\n\nReady to gather context.",
+    );
+
+    let contract = extracted.contract.expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Gathering);
+    assert_eq!(contract.inputs.len(), 2);
+    assert_eq!(contract.inputs[0].description, "ENGINEERING.md");
+    assert_eq!(contract.inputs[1].description, "TASTE.md");
+    assert_eq!(
+        extracted.visible_text.as_deref(),
+        Some("Ready to gather context.")
+    );
+}
+
+#[test]
+fn task_contract_extraction_accepts_checked_checkbox_prefixes() {
+    let extracted =
+        extract_task_contract_from_text("Task plan:\n- [x] Issue 1740\n- [X] ENGINEERING.md");
+
+    let contract = extracted.contract.expect("task contract");
+    assert_eq!(contract.inputs.len(), 2);
+    assert_eq!(contract.inputs[0].description, "Issue 1740");
+    assert_eq!(contract.inputs[1].description, "ENGINEERING.md");
+}
+
+#[tokio::test]
+async fn task_contract_satisfied_round_strips_follow_up_tools() {
+    let mut engine = p4_engine();
+    let decision = Decision::UseTools(vec![
+        read_file_call("1", "/repo/ENGINEERING.md"),
+        read_file_call("2", "/repo/TASTE.md"),
+    ]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md\n- TASTE.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("I have enough context now.")]);
+    let context_messages = vec![Message::user("read the doctrine docs")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "I have enough context now.");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].tools.is_empty(),
+        "task contract satisfaction should force synthesis without more tools"
+    );
+    let contract = engine.task_contract.as_ref().expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Synthesizing);
+    assert!(contract.inputs.iter().all(|input| input.satisfied));
+}
+
+#[tokio::test]
+async fn task_contract_ignores_unrelated_tool_output_when_matching_inputs() {
+    let mut engine = p4_engine_with_executor(
+        BudgetConfig::default(),
+        3,
+        Arc::new(Phase4OutputToolExecutor {
+            output: "README.md happens to mention ENGINEERING.md in the body.".to_string(),
+        }),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("1", "/repo/README.md")]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("Still gathering context.")]);
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &[Message::user("Read README.md first, then keep gathering.")],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "Still gathering context.");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].tools.is_empty(),
+        "unrelated tool output should not force synthesis"
+    );
+    let contract = engine.task_contract.as_ref().expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Gathering);
+    assert!(!contract.inputs[0].satisfied);
+}
+
+#[tokio::test]
+async fn task_contract_plan_text_does_not_leak_into_visible_response() {
+    let mut engine = p4_engine();
+    let decision = Decision::UseTools(vec![read_file_call("1", "/repo/ENGINEERING.md")]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("Summarized the file contents.")]);
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &[Message::user("read ENGINEERING.md")],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "Summarized the file contents.");
+    assert!(!action.response_text.contains("Task plan:"));
 }
 
 #[tokio::test]

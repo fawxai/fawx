@@ -1427,6 +1427,7 @@ impl LoopEngine {
             ..
         } = executed;
         self.record_successful_tool_classifications(state, &calls, &results);
+        self.record_task_contract_progress(&calls, &results);
         self.record_tool_round_result_bytes(&results);
         self.record_round_messages(state, &calls, &results, has_tool_errors)?;
         self.record_tool_round_kind(&calls);
@@ -1525,12 +1526,17 @@ impl LoopEngine {
         state: &mut ToolRoundState,
         request: ToolRoundContinuationRequest<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
+        let continuation_tools = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else {
+            request.continuation_tools
+        };
         request.stream.phase(Phase::Synthesize);
         let response = self
             .request_tool_continuation(
                 request.llm,
                 &state.continuation_messages,
-                request.continuation_tools,
+                continuation_tools,
                 &mut state.tokens_used,
                 request.stream,
             )
@@ -1553,6 +1559,10 @@ impl LoopEngine {
         round: u32,
         continuation_messages: &mut Vec<Message>,
     ) -> Vec<ToolDefinition> {
+        if self.task_contract_blocks_tools() {
+            return Vec::new();
+        }
+
         let termination = self.current_termination_config();
         let config = termination.as_ref();
         let tool_nudge = u32::from(config.tool_round_nudge_after);
@@ -1658,6 +1668,12 @@ impl LoopEngine {
         ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
                 system_prompt.push_str(&directive);
             }
         }
