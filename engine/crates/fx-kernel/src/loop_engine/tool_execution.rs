@@ -3,9 +3,7 @@ use super::bounded_local::{
     BoundedLocalTerminalReason, TurnExecutionProfile,
 };
 use super::compaction::CompactionScope;
-use super::request::{
-    build_continuation_request, ContinuationRequestParams, RequestBuildContext, ToolRequestConfig,
-};
+use super::request::{build_continuation_request, ContinuationRequestParams, ToolRequestConfig};
 use super::retry::{partition_by_retry_policy, BlockedToolCall};
 use super::streaming::{StreamingRequestContext, TextStreamVisibility};
 use super::{
@@ -1656,12 +1654,7 @@ impl LoopEngine {
             context_messages,
             llm.model_name(),
             ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
-            RequestBuildContext::new(
-                self.memory_context.as_deref(),
-                self.scratchpad_context.as_deref(),
-                self.thinking_config.clone(),
-                self.notify_tool_guidance_enabled,
-            ),
+            self.request_build_context(),
         ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {

@@ -2539,6 +2539,7 @@ mod tests {
     #[cfg(feature = "http")]
     use fx_api::engine::AppEngine;
     use fx_bus::{BusStore, Payload};
+    use fx_core::runtime_info::SkillInfo;
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
     use fx_kernel::cancellation::CancellationToken;
@@ -2577,6 +2578,22 @@ mod tests {
             .synthesis_instruction("Summarize".to_string())
             .build()
             .expect("test engine")
+    }
+
+    fn runtime_skill_info(name: &str, description: Option<&str>) -> SkillInfo {
+        SkillInfo {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            tool_names: Vec::new(),
+            capabilities: Vec::new(),
+            version: None,
+            source: None,
+            revision_hash: None,
+            manifest_hash: None,
+            activated_at_ms: None,
+            signature_status: None,
+            stale_source: None,
+        }
     }
 
     fn shared_router(router: ModelRouter) -> SharedModelRouter {
@@ -3426,6 +3443,63 @@ mod tests {
         assert!(!request_replays_tool_use(&captured_request, "call_orphan"));
     }
 
+    #[tokio::test]
+    async fn process_message_includes_runtime_skill_capabilities_in_reasoning_request() {
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReplaySafeCaptureProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("replay-safe-model")
+            .expect("set active replay-safe model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("replay-safe-model".to_string());
+        let mut app = HeadlessApp::new(headless_deps(router, config)).expect("app");
+
+        if let Ok(mut info) = app.runtime_info.write() {
+            info.skills = vec![
+                runtime_skill_info(
+                    "git",
+                    Some(
+                        "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+                    ),
+                ),
+                runtime_skill_info("blank", Some("   ")),
+            ];
+        }
+        app.loop_engine.invalidate_runtime_skill_prompt_cache();
+
+        app.process_message("hello")
+            .await
+            .expect("process message should succeed");
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+        let system_prompt = captured_request
+            .system_prompt
+            .as_deref()
+            .expect("reasoning request should include a system prompt");
+
+        assert!(system_prompt.contains("Your capabilities:"));
+        assert!(
+            system_prompt.contains(
+                "- git: Inspect and manage git repositories, branches, merges, pushes, and PR creation."
+            )
+        );
+        assert!(
+            !system_prompt.contains("- blank:"),
+            "blank runtime skill descriptions should not render as empty bullets"
+        );
+    }
+
     #[test]
     fn build_turn_tool_history_messages_reassigns_tool_results_by_tool_use_id() {
         let snapshot = SessionTurnSnapshot {
@@ -3862,10 +3936,13 @@ mod tests {
         }
 
         seed_headless_router_active_model(&mut router, &config);
+        let runtime_info = test_runtime_info();
+        let mut loop_engine = test_engine();
+        loop_engine.set_runtime_info(Arc::clone(&runtime_info));
         HeadlessAppDeps {
-            loop_engine: test_engine(),
+            loop_engine,
             router: shared_router(router),
-            runtime_info: test_runtime_info(),
+            runtime_info,
             config,
             memory: None,
             embedding_index_persistence: None,

@@ -33,6 +33,7 @@ use async_trait::async_trait;
 #[cfg(test)]
 use futures_util::StreamExt;
 use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
+use fx_core::runtime_info::RuntimeInfo;
 #[cfg(test)]
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
@@ -47,8 +48,8 @@ use fx_session::SessionMemory;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -88,15 +89,15 @@ use self::request::{build_continuation_request, ContinuationRequestParams};
 use self::request::{
     build_forced_synthesis_request, build_reasoning_messages, build_reasoning_request,
     build_truncation_continuation_request, completion_request_to_prompt,
-    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, ToolRequestConfig,
-    TruncationContinuationRequestParams,
+    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, SkillPromptSummary,
+    ToolRequestConfig, TruncationContinuationRequestParams,
 };
 #[cfg(test)]
 use self::request::{
     build_reasoning_system_prompt, build_reasoning_system_prompt_with_notify_guidance,
     build_tool_continuation_system_prompt,
     build_tool_continuation_system_prompt_with_notify_guidance, decompose_tool_definition,
-    reasoning_user_prompt, tool_definitions_with_decompose, SkillPromptSummary,
+    reasoning_user_prompt, tool_definitions_with_decompose,
 };
 #[cfg(test)]
 use self::retry::same_call_failure_reason;
@@ -595,6 +596,12 @@ pub struct LoopEngine {
     error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    /// Runtime snapshot used to surface loaded skill summaries in prompts.
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
+    /// Revision counter for cached runtime skill summaries.
+    runtime_skill_prompt_revision: Option<Arc<AtomicU64>>,
+    cached_runtime_skill_prompt_revision: u64,
+    cached_runtime_skill_prompt_summaries: Vec<SkillPromptSummary>,
     /// Whether this runner may expose and honor the kernel-level decompose tool.
     decompose_enabled: bool,
     /// Root-turn ownership for direct-inspection classification during decomposition.
@@ -644,6 +651,25 @@ impl std::fmt::Debug for LoopEngine {
             .field(
                 "last_emitted_public_progress",
                 &self.last_emitted_public_progress,
+            )
+            .field(
+                "runtime_info",
+                &self.runtime_info.as_ref().map(|_| "RuntimeInfo"),
+            )
+            .field(
+                "runtime_skill_prompt_revision",
+                &self
+                    .runtime_skill_prompt_revision
+                    .as_ref()
+                    .map(|_| "AtomicU64"),
+            )
+            .field(
+                "cached_runtime_skill_prompt_revision",
+                &self.cached_runtime_skill_prompt_revision,
+            )
+            .field(
+                "cached_runtime_skill_prompt_summaries",
+                &self.cached_runtime_skill_prompt_summaries.len(),
             )
             .field(
                 "direct_inspection_ownership",
@@ -723,6 +749,8 @@ pub struct LoopEngineBuilder {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
+    runtime_skill_prompt_revision: Option<Arc<AtomicU64>>,
     decompose_enabled: Option<bool>,
     execution_visibility: ExecutionVisibility,
 }
@@ -761,6 +789,17 @@ impl std::fmt::Debug for LoopEngineBuilder {
                     .map(|_| "ScratchpadProvider"),
             )
             .field("thinking_config", &self.thinking_config)
+            .field(
+                "runtime_info",
+                &self.runtime_info.as_ref().map(|_| "RuntimeInfo"),
+            )
+            .field(
+                "runtime_skill_prompt_revision",
+                &self
+                    .runtime_skill_prompt_revision
+                    .as_ref()
+                    .map(|_| "AtomicU64"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -861,6 +900,16 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn runtime_info(mut self, runtime_info: Arc<RwLock<RuntimeInfo>>) -> Self {
+        self.runtime_info = Some(runtime_info);
+        self
+    }
+
+    pub fn runtime_skill_prompt_revision(mut self, revision: Arc<AtomicU64>) -> Self {
+        self.runtime_skill_prompt_revision = Some(revision);
+        self
+    }
+
     pub fn allow_decompose(mut self, enabled: bool) -> Self {
         self.decompose_enabled = Some(enabled);
         self
@@ -886,7 +935,7 @@ impl LoopEngineBuilder {
             .unwrap_or_else(|| default_session_memory(compaction_config.model_context_limit));
         configure_session_memory(&session_memory, compaction_config.model_context_limit);
 
-        Ok(LoopEngine {
+        let mut engine = LoopEngine {
             budget,
             context,
             tool_executor,
@@ -930,6 +979,10 @@ impl LoopEngineBuilder {
             last_emitted_public_progress: None,
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
+            runtime_info: self.runtime_info,
+            runtime_skill_prompt_revision: self.runtime_skill_prompt_revision,
+            cached_runtime_skill_prompt_revision: 0,
+            cached_runtime_skill_prompt_summaries: Vec::new(),
             decompose_enabled: self.decompose_enabled.unwrap_or(true),
             direct_inspection_ownership: DirectInspectionOwnership::DetectFromTurn,
             turn_execution_profile: TurnExecutionProfile::Standard,
@@ -938,7 +991,13 @@ impl LoopEngineBuilder {
             bounded_local_recovery_focus: Vec::new(),
             bounded_local_terminal_reason: None,
             channel_registry: ChannelRegistry::new(),
-        })
+        };
+
+        if engine.runtime_info.is_some() || engine.runtime_skill_prompt_revision.is_some() {
+            engine.refresh_runtime_skill_prompt_summaries();
+        }
+
+        Ok(engine)
     }
 }
 
@@ -1292,6 +1351,17 @@ impl LoopEngine {
         self.thinking_config = config;
     }
 
+    /// Attach runtime info so request builders can surface loaded skill summaries.
+    pub fn set_runtime_info(&mut self, runtime_info: Arc<RwLock<RuntimeInfo>>) {
+        self.runtime_info = Some(runtime_info);
+        self.refresh_runtime_skill_prompt_summaries();
+    }
+
+    /// Clear the cached prompt summaries after mutating the runtime snapshot.
+    pub fn invalidate_runtime_skill_prompt_cache(&mut self) {
+        self.refresh_runtime_skill_prompt_summaries();
+    }
+
     /// Return a reference to the channel registry.
     pub fn channel_registry(&self) -> &ChannelRegistry {
         &self.channel_registry
@@ -1332,6 +1402,69 @@ impl LoopEngine {
             let rendered = provider.render_for_context();
             self.set_scratchpad_context(rendered);
         }
+    }
+
+    fn request_build_context(&mut self) -> RequestBuildContext<'_> {
+        self.sync_runtime_skill_prompt_summaries();
+        let skill_prompt_summaries = self.runtime_skill_prompt_summaries();
+        RequestBuildContext::new(
+            self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
+            self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
+        )
+        .with_skill_prompt_summaries(skill_prompt_summaries)
+    }
+
+    fn sync_runtime_skill_prompt_summaries(&mut self) {
+        if let Some(revision) = &self.runtime_skill_prompt_revision {
+            let current = revision.load(Ordering::Acquire);
+            if current != self.cached_runtime_skill_prompt_revision {
+                self.refresh_runtime_skill_prompt_summaries();
+            }
+        }
+    }
+
+    fn runtime_skill_prompt_summaries(&self) -> &[SkillPromptSummary] {
+        self.cached_runtime_skill_prompt_summaries.as_slice()
+    }
+
+    fn refresh_runtime_skill_prompt_summaries(&mut self) {
+        self.cached_runtime_skill_prompt_summaries =
+            self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_revision = self
+            .runtime_skill_prompt_revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::Acquire))
+            .unwrap_or(0);
+    }
+
+    fn collect_runtime_skill_prompt_summaries(&self) -> Vec<SkillPromptSummary> {
+        let Some(runtime_info) = &self.runtime_info else {
+            return Vec::new();
+        };
+
+        let info = match runtime_info.read() {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                return Vec::new();
+            }
+        };
+
+        info.skills
+            .iter()
+            .filter_map(|skill| {
+                let description = skill.description.as_deref()?.trim();
+                if description.is_empty() || skill.name.trim().is_empty() {
+                    return None;
+                }
+                Some(SkillPromptSummary::new(
+                    skill.name.clone(),
+                    description.to_string(),
+                ))
+            })
+            .collect()
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -2461,12 +2594,7 @@ impl LoopEngine {
             perception,
             llm.model_name(),
             ToolRequestConfig::new(tools, self.reasoning_decompose_enabled()),
-            RequestBuildContext::new(
-                self.memory_context.as_deref(),
-                self.scratchpad_context.as_deref(),
-                self.thinking_config.clone(),
-                self.notify_tool_guidance_enabled,
-            ),
+            self.request_build_context(),
         ));
         if let Some(directive) = self.pending_turn_commitment_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
@@ -2584,12 +2712,7 @@ impl LoopEngine {
                 llm.model_name(),
                 continuation_messages,
                 ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
-                RequestBuildContext::new(
-                    self.memory_context.as_deref(),
-                    self.scratchpad_context.as_deref(),
-                    self.thinking_config.clone(),
-                    self.notify_tool_guidance_enabled,
-                ),
+                self.request_build_context(),
                 step,
             ));
         if let Some(directive) = self.turn_execution_profile_directive() {
