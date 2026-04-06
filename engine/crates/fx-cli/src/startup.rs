@@ -2102,6 +2102,7 @@ mod tests {
     use fx_embeddings::test_support::create_test_model_dir;
     use fx_loadable::test_support::write_test_skill;
     use fx_subagent::test_support::StubSubagentControl;
+    use fx_tools::CronSkill;
     use std::cell::Cell;
     use std::io;
     use std::io::Write;
@@ -2210,6 +2211,81 @@ mod tests {
             address: Some("10.0.0.5".to_string()),
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
+        }
+    }
+
+    #[test]
+    fn apply_skill_summaries_surfaces_builtin_skill_descriptions() {
+        let (config, temp_dir) = test_config_with_temp_dir();
+        let root = temp_dir.path();
+        let registry = SkillRegistry::new();
+
+        registry.register(Arc::new(GitSkill::new(root.to_path_buf(), None, None)));
+
+        let cron_store = fx_cron::CronStore::open(&root.join("cron.redb")).expect("cron store");
+        registry.register(Arc::new(CronSkill::new(
+            Arc::new(tokio::sync::Mutex::new(cron_store)),
+            None,
+        )));
+
+        registry.register(Arc::new(SessionMemorySkill::new(Arc::new(Mutex::new(
+            fx_session::SessionMemory::default(),
+        )))));
+        registry.register(Arc::new(TransactionSkill::new(root.to_path_buf(), None)));
+        registry.register(Arc::new(BuiltinToolsSkill::new(FawxToolExecutor::new(
+            root.to_path_buf(),
+            ToolConfig::default(),
+        ))));
+        registry.register(Arc::new(ScratchpadSkill::new(
+            Arc::new(Mutex::new(Scratchpad::new())),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )));
+
+        let journal = fx_journal::Journal::load(root.join("journal.jsonl")).expect("journal");
+        registry.register(Arc::new(JournalSkill::new(Arc::new(Mutex::new(journal)))));
+
+        let runtime_info = new_runtime_info(&config, false);
+        apply_skill_summaries(&runtime_info, &registry);
+
+        let runtime_info = runtime_info.read().expect("runtime info");
+        let expected = [
+            (
+                "git",
+                "Inspect and manage git repos, branches, merges, pushes, and pull requests.",
+            ),
+            (
+                "cron",
+                "Schedule, inspect, run, and remove recurring cron jobs.",
+            ),
+            (
+                "session_memory",
+                "Keep durable session context about the project, decisions, and active files.",
+            ),
+            (
+                "transaction_skill",
+                "Stage multi-file edits and commit or roll them back as one transaction.",
+            ),
+            (
+                "fawx-builtin",
+                "Use core local tools like file, shell, search, time, and memory operations.",
+            ),
+            (
+                "scratchpad",
+                "Keep working notes, hypotheses, observations, and conclusions during a task.",
+            ),
+            (
+                "journal",
+                "Record and search lessons and prior session context.",
+            ),
+        ];
+
+        for (name, description) in expected {
+            let skill = runtime_info
+                .skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .unwrap_or_else(|| panic!("missing runtime skill summary for {name}"));
+            assert_eq!(skill.description.as_deref(), Some(description));
         }
     }
 

@@ -65,6 +65,10 @@ impl Skill for BuiltinToolsSkill {
         "fawx-builtin"
     }
 
+    fn description(&self) -> &str {
+        "Use core local tools like file, shell, search, time, and memory operations."
+    }
+
     fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
         self.executor.tool_definitions()
     }
