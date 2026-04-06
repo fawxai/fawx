@@ -493,9 +493,7 @@ api_version = "host_api_v1"
             tools: vec![],
             intent_hints: vec![
                 "review pr".to_string(),
-                std::iter::repeat('a')
-                    .take(MAX_INTENT_HINT_LENGTH + 1)
-                    .collect(),
+                "a".repeat(MAX_INTENT_HINT_LENGTH + 1),
             ],
             entry_point: "run".to_string(),
         };

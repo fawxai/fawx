@@ -1523,8 +1523,7 @@ impl LoopEngine {
     }
 
     fn refresh_runtime_skill_prompt_summaries(&mut self) {
-        self.cached_runtime_skill_prompt_summaries =
-            self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_summaries = self.collect_runtime_skill_prompt_summaries();
         self.cached_runtime_skill_prompt_revision = self
             .runtime_skill_prompt_revision
             .as_ref()
@@ -4655,7 +4654,7 @@ fn repeated_tool_failure_partial_response(
     let mut segments = Vec::new();
     push_response_segment(
         &mut segments,
-        action_partial.and_then(|text| meaningful_response_text(text)),
+        action_partial.and_then(meaningful_response_text),
     );
     stitched_response_text(&segments, Some(note))
 }

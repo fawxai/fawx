@@ -4,6 +4,8 @@ pub mod dag;
 pub mod dispatcher;
 pub mod engine;
 pub mod error;
+pub mod operations;
+pub mod thought;
 
 use fx_core::signals::Signal;
 use serde::{Deserialize, Serialize};
@@ -536,6 +538,11 @@ pub use engine::{
     format_fitness_context, parse_plan_json, validate_plan, Decomposer, LlmDecomposer,
 };
 pub use error::DecomposeError;
+pub use operations::{GraphOperation, MergeStrategy, ScoringStrategy, ValidationStrategy};
+pub use thought::{
+    GraphNodeId, ThoughtId, ThoughtIdAllocator, ThoughtMetadata, ThoughtMetadataValue, ThoughtPool,
+    ThoughtState,
+};
 
 #[cfg(test)]
 mod tests {
