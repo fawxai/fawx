@@ -184,6 +184,39 @@ pub fn validate_nonblank_string_entries(
     Ok(())
 }
 
+const MAX_INTENT_HINTS: usize = 64;
+const MAX_INTENT_HINT_LENGTH: usize = 256;
+
+/// Validate `intent_hints` for blank, duplicate, and unbounded entries.
+pub fn validate_intent_hints(intent_hints: &[String]) -> Result<(), SkillError> {
+    if intent_hints.len() > MAX_INTENT_HINTS {
+        return Err(SkillError::InvalidManifest(format!(
+            "intent_hints cannot contain more than {} entries",
+            MAX_INTENT_HINTS
+        )));
+    }
+
+    validate_nonblank_string_entries("intent_hints", intent_hints)?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, intent_hint) in intent_hints.iter().enumerate() {
+        if intent_hint.chars().count() > MAX_INTENT_HINT_LENGTH {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] cannot exceed {} characters",
+                MAX_INTENT_HINT_LENGTH
+            )));
+        }
+
+        if !seen.insert(intent_hint.as_str()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] duplicates a previous entry"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a skill manifest.
 pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
     validate_skill_name(&manifest.name)?;
@@ -228,7 +261,7 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
-    validate_nonblank_string_entries("intent_hints", &manifest.intent_hints)?;
+    validate_intent_hints(&manifest.intent_hints)?;
     validate_tools(&manifest.tools)?;
 
     Ok(())
@@ -407,6 +440,73 @@ api_version = "host_api_v1"
     }
 
     #[test]
+    fn test_validate_rejects_duplicate_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec!["review pr".to_string(), "review pr".to_string()],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicates a previous entry"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_too_many_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: (0..=MAX_INTENT_HINTS)
+                .map(|index| format!("hint-{index}"))
+                .collect(),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("more than 64 entries"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_overlong_intent_hint() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![
+                "review pr".to_string(),
+                std::iter::repeat('a')
+                    .take(MAX_INTENT_HINT_LENGTH + 1)
+                    .collect(),
+            ],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("cannot exceed 256 characters"))
+        );
+    }
+
+    #[test]
     fn test_validate_rejects_blank_intent_hints() {
         let manifest = SkillManifest {
             name: "review-helper".to_string(),
@@ -440,7 +540,7 @@ api_version = "host_api_v1"
                 description: "Weather".to_string(),
                 authority_surface: None,
                 direct_utility: true,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![SkillToolParameterManifest {
                     name: "location".to_string(),
                     kind: "string".to_string(),
@@ -448,7 +548,7 @@ api_version = "host_api_v1"
                     required: true,
                 }],
             }],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -478,7 +578,7 @@ name = "broken
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -497,7 +597,7 @@ name = "broken
             api_version: "host_api_v2".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
         assert!(validate_manifest(&manifest).is_ok());
@@ -513,7 +613,7 @@ name = "broken
             api_version: "v2".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -570,7 +670,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -587,7 +687,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -661,7 +761,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -678,7 +778,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -695,7 +795,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -716,7 +816,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -739,7 +839,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     description: "Search".to_string(),
                     authority_surface: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
                 SkillToolManifest {
@@ -747,11 +847,11 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     description: "Duplicate".to_string(),
                     authority_surface: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
             ],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -775,7 +875,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 description: "Search".to_string(),
                 authority_surface: None,
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![
                     SkillToolParameterManifest {
                         name: "query".to_string(),
@@ -791,7 +891,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     },
                 ],
             }],
-            intent_hints: Vec::new(),
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 

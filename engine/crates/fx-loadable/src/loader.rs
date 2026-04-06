@@ -100,10 +100,18 @@ impl SkillLoader {
                     );
                     return None;
                 }
-                if let Err(err) = fx_skills::manifest::validate_nonblank_string_entries(
-                    "intent_hints",
-                    &manifest.intent_hints,
-                ) {
+                if let Err(err) =
+                    fx_skills::manifest::validate_nonblank_string_entries("tools", &manifest.tools)
+                {
+                    warn!(
+                        path = %manifest_path.display(),
+                        error = %err,
+                        "skipping skill manifest: invalid tool names"
+                    );
+                    return None;
+                }
+                if let Err(err) = fx_skills::manifest::validate_intent_hints(&manifest.intent_hints)
+                {
                     warn!(
                         path = %manifest_path.display(),
                         error = %err,
@@ -219,6 +227,27 @@ description = "A good skill"
     }
 
     #[test]
+    fn discover_skips_manifest_with_blank_tool_names() {
+        let tmp = TempDir::new().unwrap();
+
+        let skill_dir = tmp.path().join("blank-tools");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+name = "blank-tools"
+version = "1.0.0"
+description = "blank tools"
+tools = ["say_hello", "   "]
+"#,
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new(tmp.path().to_path_buf());
+        assert!(loader.discover().is_empty());
+    }
+
+    #[test]
     fn discover_nonexistent_dir() {
         let loader = SkillLoader::new(PathBuf::from("/nonexistent/path"));
         assert!(loader.discover().is_empty());
@@ -245,26 +274,6 @@ description = "missing name"
     }
 
     #[test]
-    fn discover_skips_manifest_with_empty_version() {
-        let tmp = TempDir::new().unwrap();
-
-        let skill_dir = tmp.path().join("noversion");
-        std::fs::create_dir(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("skill.toml"),
-            r#"
-name = "noversion"
-version = ""
-description = "missing version"
-"#,
-        )
-        .unwrap();
-
-        let loader = SkillLoader::new(tmp.path().to_path_buf());
-        assert!(loader.discover().is_empty());
-    }
-
-    #[test]
     fn discover_skips_manifest_with_blank_intent_hints() {
         let tmp = TempDir::new().unwrap();
 
@@ -277,6 +286,26 @@ name = "blank-hints"
 version = "1.0.0"
 description = "blank hints"
 intent_hints = ["   "]
+"#,
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new(tmp.path().to_path_buf());
+        assert!(loader.discover().is_empty());
+    }
+
+    #[test]
+    fn discover_skips_manifest_with_empty_version() {
+        let tmp = TempDir::new().unwrap();
+
+        let skill_dir = tmp.path().join("noversion");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+name = "noversion"
+version = ""
+description = "missing version"
 "#,
         )
         .unwrap();

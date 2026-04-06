@@ -817,7 +817,7 @@ mod tests {
                 description: "Search".to_string(),
                 authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                     name: "query".to_string(),
                     kind: "string".to_string(),
@@ -830,7 +830,7 @@ mod tests {
                 description: "Fetch".to_string(),
                 authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![],
             },
         ];
@@ -855,7 +855,7 @@ mod tests {
             description: "Search".to_string(),
             authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
             direct_utility: false,
-            trigger_patterns: Vec::new(),
+            trigger_patterns: vec![],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                 name: "query".to_string(),
                 kind: "string".to_string(),
@@ -926,7 +926,7 @@ mod tests {
             description: "Calculate".to_string(),
             authority_surface: None,
             direct_utility: false,
-            trigger_patterns: Vec::new(),
+            trigger_patterns: vec![],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                 name: "expression".to_string(),
                 kind: "string".to_string(),
@@ -958,7 +958,7 @@ mod tests {
                 description: "Render table".to_string(),
                 authority_surface: None,
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                     name: "headers".to_string(),
                     kind: "string".to_string(),
@@ -971,7 +971,7 @@ mod tests {
                 description: "Render chart".to_string(),
                 authority_surface: None,
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
                     name: "data".to_string(),
                     kind: "string".to_string(),
