@@ -48,6 +48,7 @@ use fx_session::SessionMemory;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1108,6 +1109,7 @@ struct RepeatedToolFailureKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RepeatedToolFailureKind {
     MalformedArgumentsJson,
+    /// Hash of a normalized non-malformed tool error payload.
     OutputHash(u64),
 }
 
@@ -1126,6 +1128,9 @@ enum RepeatedToolFailureEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RepeatedToolFailureTracker {
+    /// Tracks one active failure family at a time. Alternating failure families
+    /// intentionally reset the breaker so it only trips on repeated same-family
+    /// loops rather than conflating broader instability patterns.
     active: Option<RepeatedToolFailureState>,
 }
 
@@ -1518,7 +1523,8 @@ impl LoopEngine {
     }
 
     fn refresh_runtime_skill_prompt_summaries(&mut self) {
-        self.cached_runtime_skill_prompt_summaries = self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_summaries =
+            self.collect_runtime_skill_prompt_summaries();
         self.cached_runtime_skill_prompt_revision = self
             .runtime_skill_prompt_revision
             .as_ref()
@@ -2063,7 +2069,7 @@ impl LoopEngine {
             return None;
         }
 
-        let threshold = self.budget.config().max_consecutive_failures.max(1);
+        let threshold = self.repeated_failure_streak_limit();
         let event = self
             .repeated_tool_failure_tracker
             .observe_action(&action.tool_results, threshold)?;
@@ -2410,6 +2416,12 @@ impl LoopEngine {
     fn root_turn_completion_retry_limit(&self) -> u8 {
         self.current_termination_config()
             .root_turn_completion_retry_limit
+    }
+
+    fn repeated_failure_streak_limit(&self) -> u16 {
+        self.current_termination_config()
+            .max_repeated_failure_streak
+            .max(1)
     }
 
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
@@ -4560,11 +4572,41 @@ fn repeated_tool_failure_summary(kind: &RepeatedToolFailureKind, output: &str) -
 }
 
 fn hash_tool_failure_output(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-
+    let normalized = normalize_tool_failure_output(text);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
+    normalized.hash(&mut hasher);
     hasher.finish()
+}
+
+fn normalize_tool_failure_output(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_space = false;
+    let mut previous_was_digit = false;
+
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+            previous_was_digit = false;
+            continue;
+        }
+
+        previous_was_space = false;
+        if ch.is_ascii_digit() {
+            if !previous_was_digit {
+                normalized.push('0');
+            }
+            previous_was_digit = true;
+            continue;
+        }
+
+        previous_was_digit = false;
+        normalized.push(ch);
+    }
+
+    normalized
 }
 
 fn repeated_tool_failure_guidance(state: &RepeatedToolFailureState) -> String {

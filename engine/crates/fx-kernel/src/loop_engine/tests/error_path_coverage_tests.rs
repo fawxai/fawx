@@ -1,6 +1,7 @@
 use super::test_fixtures::*;
 use super::*;
-use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};
+use crate::act::{ToolExecutor, ToolResult};
+use crate::budget::{BudgetConfig, BudgetTracker, DepthMode, TerminationConfig};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use fx_llm::{CompletionResponse, ToolCall};
@@ -397,6 +398,39 @@ async fn decompose_depth_cap_prevents_infinite_recursion_end_to_end() {
 // 3. Tool friction → escalation (repeated tool failures)
 // =========================================================================
 
+#[derive(Debug, Default)]
+struct NumberedFailureToolExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for NumberedFailureToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| {
+                let digits: String = call.id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+                let suffix = if digits.is_empty() { "0" } else { &digits };
+                ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: format!(
+                        "read failed at /tmp/build-{suffix}/artifact-{suffix}.log with pid {suffix}"
+                    ),
+                    failure_class: None,
+                }
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+        vec![read_file_def()]
+    }
+}
+
 /// When all tool calls fail repeatedly, the loop should not retry until
 /// budget is gone. It should synthesize a response from the failed results.
 #[tokio::test]
@@ -560,6 +594,75 @@ async fn repeated_malformed_tool_failures_inject_guidance_then_trip_circuit_brea
     );
     assert!(
         combined_prompt.contains("write_file"),
+        "guidance should identify the failing tool: {combined_prompt}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_non_malformed_failures_use_dedicated_streak_limit() {
+    let config = BudgetConfig {
+        max_consecutive_failures: 9,
+        termination: TerminationConfig {
+            max_repeated_failure_streak: 2,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine =
+        build_engine_with_executor(Arc::new(NumberedFailureToolExecutor), config, 0, 10);
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![read_file_call("call-1")]),
+        text_response("read_file failed again"),
+        tool_use_response(vec![read_file_call("call-2")]),
+        text_response("read_file failed again"),
+        tool_use_response(vec![read_file_call("call-3")]),
+        text_response("read_file failed again"),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("read the logs"), &llm)
+        .await
+        .expect("run_cycle should not panic");
+
+    match &result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            iterations,
+            ..
+        } => {
+            assert_eq!(
+                *iterations, 3,
+                "breaker should honor the dedicated repeated-failure streak limit"
+            );
+            assert!(
+                reason.contains("repeated tool failure circuit breaker tripped"),
+                "unexpected reason: {reason}"
+            );
+            let partial = partial_response
+                .as_deref()
+                .expect("circuit breaker should preserve a partial response");
+            assert!(
+                partial.contains("read_file"),
+                "partial should name the tool"
+            );
+            assert!(
+                partial.contains("read failed at"),
+                "partial should include the failing tool output: {partial}"
+            );
+        }
+        other => panic!("expected Incomplete, got: {other:?}"),
+    }
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 6, "unexpected request count");
+    let combined_prompt = completion_request_to_prompt(&requests[4]);
+    assert!(
+        combined_prompt.contains("Repeated tool failure circuit breaker"),
+        "expected repeated-failure guidance in the next reasoning pass: {combined_prompt}"
+    );
+    assert!(
+        combined_prompt.contains("read_file"),
         "guidance should identify the failing tool: {combined_prompt}"
     );
 }
