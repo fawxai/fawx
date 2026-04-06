@@ -1421,7 +1421,7 @@ async fn malformed_tool_args_skipped_with_error_result() {
         ToolCall {
             id: "malformed-1".to_string(),
             name: "write_file".to_string(),
-            arguments: serde_json::json!({"__fawx_raw_args": "{broken json"}),
+            arguments: fx_llm::parse_tool_arguments_object("{broken json"),
         },
     ];
     let results = engine
@@ -1442,6 +1442,16 @@ async fn malformed_tool_args_skipped_with_error_result() {
     assert!(
         malformed_result.output.contains("could not be parsed"),
         "should explain the failure: {}",
+        malformed_result.output
+    );
+    assert!(
+        malformed_result.output.contains("line 1 column"),
+        "should surface the parser error: {}",
+        malformed_result.output
+    );
+    assert!(
+        malformed_result.output.contains("Retry the same tool call"),
+        "should provide retry guidance: {}",
         malformed_result.output
     );
 }

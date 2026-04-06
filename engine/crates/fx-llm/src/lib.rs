@@ -161,18 +161,212 @@ pub(crate) fn normalize_tool_arguments(raw: &str) -> &str {
     }
 }
 
+const RAW_TOOL_ARGUMENTS_KEY: &str = "__fawx_raw_args";
+const RAW_TOOL_ARGUMENTS_ERROR_KEY: &str = "__fawx_raw_args_error";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArgumentsParseError {
+    message: String,
+}
+
+impl ToolArgumentsParseError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolArgumentsParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolArgumentsParseError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedToolArguments<'a> {
+    pub raw: &'a str,
+    pub error: &'a str,
+}
+
+impl std::fmt::Display for MalformedToolArguments<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}; raw={:?}", self.error, self.raw)
+    }
+}
+
 /// Parse tool call arguments into a JSON object, with a safe fallback.
 ///
 /// If parsing fails, wraps the raw string as `{"__fawx_raw_args": "..."}` so
 /// the value remains a valid JSON object (providers require this) and the
 /// original string is preserved for debugging. The `__fawx_raw_args` key is
 /// prefixed to avoid collisions with legitimate tool parameter names.
-pub(crate) fn parse_tool_arguments_object(raw: &str) -> serde_json::Value {
+pub fn parse_tool_arguments_object(raw: &str) -> serde_json::Value {
+    match try_parse_tool_arguments_object(raw) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "tool arguments JSON parse failed after repair attempts; wrapping as malformed tool arguments"
+            );
+            serde_json::json!({
+                RAW_TOOL_ARGUMENTS_KEY: raw,
+                RAW_TOOL_ARGUMENTS_ERROR_KEY: error.to_string(),
+            })
+        }
+    }
+}
+
+pub fn try_parse_tool_arguments_object(
+    raw: &str,
+) -> Result<serde_json::Value, ToolArgumentsParseError> {
     let normalized = normalize_tool_arguments(raw);
-    serde_json::from_str(normalized).unwrap_or_else(|e| {
-        tracing::warn!("tool arguments JSON parse failed: {e}, wrapping as __fawx_raw_args");
-        serde_json::json!({ "__fawx_raw_args": raw })
-    })
+    parse_tool_arguments_json(normalized)
+}
+
+pub fn malformed_tool_arguments(
+    arguments: &serde_json::Value,
+) -> Option<MalformedToolArguments<'_>> {
+    let raw = arguments
+        .get(RAW_TOOL_ARGUMENTS_KEY)
+        .and_then(serde_json::Value::as_str)?;
+    let error = arguments
+        .get(RAW_TOOL_ARGUMENTS_ERROR_KEY)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("arguments could not be parsed as valid JSON");
+    Some(MalformedToolArguments { raw, error })
+}
+
+fn parse_tool_arguments_json(raw: &str) -> Result<serde_json::Value, ToolArgumentsParseError> {
+    match serde_json::from_str(raw) {
+        Ok(arguments) => Ok(arguments),
+        Err(original_error) => {
+            let repaired = repair_tool_arguments_json(raw);
+            if repaired == raw {
+                return Err(ToolArgumentsParseError::new(original_error.to_string()));
+            }
+
+            match serde_json::from_str(&repaired) {
+                Ok(arguments) => {
+                    tracing::warn!(
+                        error = %original_error,
+                        "tool arguments JSON parse failed; repaired common string escaping issues"
+                    );
+                    Ok(arguments)
+                }
+                Err(repaired_error) => Err(ToolArgumentsParseError::new(format!(
+                    "{original_error}; automatic repair failed: {repaired_error}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Heuristically repair common malformed JSON patterns in streamed tool arguments.
+///
+/// This is a best-effort recovery pass for the specific failure modes LLMs
+/// commonly produce inside JSON string values: lone backslashes, unescaped
+/// inner quotes, raw control characters, and trailing commas before `}` or `]`.
+///
+/// The repair is intentionally conservative and still requires a full
+/// `serde_json` parse afterward. It is not a general JSON parser, and some
+/// adversarial inputs remain ambiguous. In particular, the quote-closing
+/// heuristic peeks at the next non-whitespace character, so a malformed string
+/// ending with `: ` followed by an unescaped quote can still be misclassified.
+pub fn repair_tool_arguments_json(raw: &str) -> String {
+    let mut repaired = String::with_capacity(raw.len() + 16);
+    let mut chars = raw.chars().peekable();
+    let mut in_string = false;
+    let mut in_escape = false;
+
+    while let Some(ch) = chars.next() {
+        if !in_string {
+            match ch {
+                '"' => {
+                    in_string = true;
+                    repaired.push(ch);
+                }
+                ',' if next_non_whitespace_is_closing(chars.clone()) => {}
+                _ => repaired.push(ch),
+            }
+            continue;
+        }
+
+        if in_escape {
+            repaired.push(ch);
+            in_escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                if escaped_quote_should_remain_literal(chars.clone()) {
+                    repaired.push('\\');
+                    repaired.push('\\');
+                } else if starts_valid_json_escape(chars.clone()) {
+                    repaired.push(ch);
+                    in_escape = true;
+                } else {
+                    repaired.push('\\');
+                    repaired.push('\\');
+                }
+            }
+            '"' => {
+                if string_quote_closes(chars.clone()) {
+                    in_string = false;
+                    repaired.push(ch);
+                } else {
+                    repaired.push('\\');
+                    repaired.push('"');
+                }
+            }
+            '\n' => repaired.push_str("\\n"),
+            '\r' => repaired.push_str("\\r"),
+            '\t' => repaired.push_str("\\t"),
+            other if other.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(repaired, "\\u{:04x}", other as u32);
+            }
+            other => repaired.push(other),
+        }
+    }
+
+    repaired
+}
+
+fn escaped_quote_should_remain_literal(
+    mut chars: std::iter::Peekable<std::str::Chars<'_>>,
+) -> bool {
+    matches!(chars.next(), Some('"')) && !string_quote_closes(chars)
+}
+
+fn starts_valid_json_escape(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    match chars.next() {
+        Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => true,
+        Some('u') => {
+            let hex_digits = chars.by_ref().take(4).collect::<Vec<_>>();
+            hex_digits.len() == 4 && hex_digits.iter().all(|digit| digit.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
+fn string_quote_closes(chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    for ch in chars {
+        if ch.is_whitespace() {
+            continue;
+        }
+        return matches!(ch, ',' | '}' | ']' | ':');
+    }
+    true
+}
+
+fn next_non_whitespace_is_closing(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    chars
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| matches!(ch, '}' | ']'))
 }
 
 #[cfg(test)]
@@ -237,6 +431,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn repair_tool_arguments_json_preserves_code_escapes() {
+        let raw = "{\n  \"path\": \"main.rs\",\n  \"content\": \"let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n\"\n}";
+        let repaired = repair_tool_arguments_json(raw);
+        assert!(
+            repaired.contains("\\\\\\\"hello\\\\\\\""),
+            "repaired JSON should preserve literal escaped quotes: {repaired}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
+        assert_eq!(
+            parsed["content"],
+            "let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n"
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_display_surfaces_error_and_raw_input() {
+        let malformed = MalformedToolArguments {
+            raw: "{\"path\":",
+            error: "EOF while parsing an object at line 1 column 8",
+        };
+        let display = malformed.to_string();
+        assert!(display.contains("EOF while parsing an object"));
+        assert!(display.contains(r#"raw="{\"path\":"#));
     }
 
     #[test]

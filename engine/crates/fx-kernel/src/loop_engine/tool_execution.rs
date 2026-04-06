@@ -1701,16 +1701,20 @@ fn collect_valid_tool_calls(
     allowed
         .iter()
         .filter_map(|call| {
-            if call.arguments.get("__fawx_raw_args").is_some() {
+            if let Some(details) = fx_llm::malformed_tool_arguments(&call.arguments) {
                 tracing::warn!(
                     tool = %call.name,
-                    "skipping tool call with malformed arguments"
+                    error = %details.error,
+                    "rejecting tool call with malformed arguments"
                 );
                 malformed_results.push(ToolResult {
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: false,
-                    output: "Tool call failed: arguments could not be parsed as valid JSON".into(),
+                    output: format!(
+                        "Tool call failed: arguments could not be parsed as valid JSON ({error}). Retry the same tool call with valid JSON escaping inside string values: use \\\\ for backslashes, \\\" for inner quotes, and \\n for newlines.",
+                        error = details.error
+                    ),
                     failure_class: None,
                 });
                 None
