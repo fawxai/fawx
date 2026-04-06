@@ -566,7 +566,8 @@ fn build_loop_engine_with_options(
             as Arc<dyn fx_kernel::conversation_compactor::CompactionMemoryFlush>);
     }
 
-    let engine = build_loop_engine_from_builder(builder)?;
+    let mut engine = build_loop_engine_from_builder(builder)?;
+    engine.set_runtime_info(Arc::clone(&skills.runtime_info));
     Ok(LoopEngineBundle {
         engine,
         memory: skills.memory,

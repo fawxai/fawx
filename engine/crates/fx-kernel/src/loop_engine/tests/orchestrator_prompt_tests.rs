@@ -345,7 +345,7 @@ fn continuation_request_includes_tool_continuation_directive_once() {
         "mock-model",
         ToolRequestConfig::new(vec![], true),
         RequestBuildContext::new(None, None, None, false)
-            .with_skill_prompt_summaries(&skill_summaries),
+            .with_skill_prompt_summaries(skill_summaries),
     ));
     let prompt = request
         .system_prompt

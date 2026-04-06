@@ -4,11 +4,12 @@ use crate::cancellation::CancellationToken;
 use crate::input::{loop_input_channel, LoopCommand};
 use async_trait::async_trait;
 use fx_core::error::LlmError as CoreLlmError;
+use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_llm::{CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Tool executor that tracks how many calls were actually executed
 /// and supports cooperative cancellation.
@@ -253,6 +254,21 @@ fn p4_engine_with_executor(
         .expect("test engine build")
 }
 
+fn runtime_info_with_skills(skills: Vec<SkillInfo>) -> Arc<RwLock<RuntimeInfo>> {
+    Arc::new(RwLock::new(RuntimeInfo {
+        active_model: String::new(),
+        provider: String::new(),
+        skills,
+        config_summary: ConfigSummary {
+            max_iterations: 3,
+            max_history: 20,
+            memory_enabled: false,
+        },
+        authority: None,
+        version: "test".to_string(),
+    }))
+}
+
 fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
@@ -378,6 +394,81 @@ async fn act_with_tools_executes_all_calls_and_returns_completion_text() {
     assert_eq!(action.tool_results[0].tool_name, "read_file");
     assert_eq!(action.tool_results[1].tool_name, "read_file");
     assert_eq!(action.response_text, "combined tool output");
+}
+
+#[tokio::test]
+async fn act_with_tools_includes_runtime_skill_capabilities_in_continuation_request() {
+    let mut engine = p4_engine();
+    engine.set_runtime_info(runtime_info_with_skills(vec![
+        SkillInfo {
+            name: "git".to_string(),
+            description: Some(
+                "Inspect and manage git repositories, branches, merges, pushes, and PR creation."
+                    .to_string(),
+            ),
+            tool_names: Vec::new(),
+            capabilities: Vec::new(),
+            version: None,
+            source: None,
+            revision_hash: None,
+            manifest_hash: None,
+            activated_at_ms: None,
+            signature_status: None,
+            stale_source: None,
+        },
+        SkillInfo {
+            name: "blank".to_string(),
+            description: Some("   ".to_string()),
+            tool_names: Vec::new(),
+            capabilities: Vec::new(),
+            version: None,
+            source: None,
+            revision_hash: None,
+            manifest_hash: None,
+            activated_at_ms: None,
+            signature_status: None,
+            stale_source: None,
+        },
+    ]));
+
+    let decision = Decision::UseTools(vec![read_file_call("1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-1", "README.md")]),
+        text_response("done"),
+    ]);
+    let context_messages = vec![Message::user("read the file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should trigger a continuation request"
+    );
+    let continuation_prompt = requests
+        .get(1)
+        .and_then(|request| request.system_prompt.as_deref())
+        .expect("continuation request should include a system prompt");
+
+    assert!(continuation_prompt.contains("Your capabilities:"));
+    assert!(continuation_prompt.contains(
+        "- git: Inspect and manage git repositories, branches, merges, pushes, and PR creation."
+    ));
+    assert!(
+        !continuation_prompt.contains("- blank:"),
+        "blank runtime skill descriptions should not render as empty bullets"
+    );
+    assert_eq!(action.response_text, "done");
 }
 
 #[tokio::test]
