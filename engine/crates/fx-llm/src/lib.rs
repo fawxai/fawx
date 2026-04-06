@@ -191,6 +191,12 @@ pub struct MalformedToolArguments<'a> {
     pub error: &'a str,
 }
 
+impl std::fmt::Display for MalformedToolArguments<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}; raw={:?}", self.error, self.raw)
+    }
+}
+
 /// Parse tool call arguments into a JSON object, with a safe fallback.
 ///
 /// If parsing fails, wraps the raw string as `{"__fawx_raw_args": "..."}` so
@@ -258,7 +264,18 @@ fn parse_tool_arguments_json(raw: &str) -> Result<serde_json::Value, ToolArgumen
     }
 }
 
-fn repair_tool_arguments_json(raw: &str) -> String {
+/// Heuristically repair common malformed JSON patterns in streamed tool arguments.
+///
+/// This is a best-effort recovery pass for the specific failure modes LLMs
+/// commonly produce inside JSON string values: lone backslashes, unescaped
+/// inner quotes, raw control characters, and trailing commas before `}` or `]`.
+///
+/// The repair is intentionally conservative and still requires a full
+/// `serde_json` parse afterward. It is not a general JSON parser, and some
+/// adversarial inputs remain ambiguous. In particular, the quote-closing
+/// heuristic peeks at the next non-whitespace character, so a malformed string
+/// ending with `: ` followed by an unescaped quote can still be misclassified.
+pub fn repair_tool_arguments_json(raw: &str) -> String {
     let mut repaired = String::with_capacity(raw.len() + 16);
     let mut chars = raw.chars().peekable();
     let mut in_string = false;
@@ -327,8 +344,7 @@ fn escaped_quote_should_remain_literal(
 
 fn starts_valid_json_escape(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
     match chars.next() {
-        Some('"') | Some('\\') | Some('/') | Some('b') | Some('f') | Some('n') | Some('r')
-        | Some('t') => true,
+        Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => true,
         Some('u') => {
             let hex_digits = chars.by_ref().take(4).collect::<Vec<_>>();
             hex_digits.len() == 4 && hex_digits.iter().all(|digit| digit.is_ascii_hexdigit())
@@ -337,8 +353,8 @@ fn starts_valid_json_escape(mut chars: std::iter::Peekable<std::str::Chars<'_>>)
     }
 }
 
-fn string_quote_closes(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
-    while let Some(ch) = chars.next() {
+fn string_quote_closes(chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    for ch in chars {
         if ch.is_whitespace() {
             continue;
         }
@@ -347,10 +363,9 @@ fn string_quote_closes(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> b
     true
 }
 
-fn next_non_whitespace_is_closing(chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+fn next_non_whitespace_is_closing(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
     chars
-        .skip_while(|ch| ch.is_whitespace())
-        .next()
+        .find(|ch| !ch.is_whitespace())
         .is_some_and(|ch| matches!(ch, '}' | ']'))
 }
 
@@ -433,6 +448,17 @@ mod tests {
             parsed["content"],
             "let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n"
         );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_display_surfaces_error_and_raw_input() {
+        let malformed = MalformedToolArguments {
+            raw: "{\"path\":",
+            error: "EOF while parsing an object at line 1 column 8",
+        };
+        let display = malformed.to_string();
+        assert!(display.contains("EOF while parsing an object"));
+        assert!(display.contains(r#"raw="{\"path\":"#));
     }
 
     #[test]

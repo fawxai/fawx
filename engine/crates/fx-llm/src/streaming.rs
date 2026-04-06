@@ -600,6 +600,19 @@ mod parse_tool_arguments_tests {
     }
 
     #[test]
+    fn repairs_trailing_commas_before_closing_delimiters() {
+        let result =
+            parse_tool_arguments(r#"{"path":"main.rs","lines":["a","b",],"mode":"write",}"#);
+        assert!(
+            malformed_tool_arguments(&result).is_none(),
+            "trailing commas should be repaired without sentinel metadata"
+        );
+        assert_eq!(result["path"], "main.rs");
+        assert_eq!(result["lines"], serde_json::json!(["a", "b"]));
+        assert_eq!(result["mode"], "write");
+    }
+
+    #[test]
     fn empty_string_normalizes_to_empty_object() {
         let result = parse_tool_arguments("");
         assert!(result.is_object());

@@ -1,0 +1,23 @@
+[package]
+name = "fx-llm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fx-llm = { path = ".." }
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[[bin]]
+name = "tool_argument_repair"
+path = "fuzz_targets/tool_argument_repair.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
