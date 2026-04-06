@@ -6,7 +6,8 @@ use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
-    JournalAction, SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification, ToolResult,
+    JournalAction, SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification,
+    ToolExecutionDiagnostics, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -99,6 +100,11 @@ pub trait Tool: Send + Sync {
     }
 
     fn journal_action(&self, _call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+        None
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        let _ = call_id;
         None
     }
 

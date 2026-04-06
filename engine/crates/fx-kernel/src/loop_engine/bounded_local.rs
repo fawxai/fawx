@@ -352,6 +352,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
                 call: call.clone(),
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
+                guidance: None,
             });
         } else {
             allowed.push(call.clone());

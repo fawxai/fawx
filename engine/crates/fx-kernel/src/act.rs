@@ -63,6 +63,49 @@ impl FailureClass {
     }
 }
 
+/// Structured diagnostics for a failed tool invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolExecutionDiagnostics {
+    /// Diagnostics for a failed `run_command` invocation.
+    RunCommand(RunCommandDiagnostics),
+}
+
+/// Diagnostics captured for a failed `run_command` invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RunCommandDiagnostics {
+    /// Command exit code when the process exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Short stderr sample for quick debugging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_snippet: Option<String>,
+    /// Total wall-clock duration of the command execution.
+    pub duration_ms: u64,
+    /// Whether the command was executed through a shell wrapper.
+    pub shell: bool,
+    /// Whether the command timed out before it could complete.
+    pub timed_out: bool,
+}
+
+impl ToolExecutionDiagnostics {
+    #[must_use]
+    pub fn as_run_command(&self) -> Option<&RunCommandDiagnostics> {
+        match self {
+            Self::RunCommand(diagnostics) => Some(diagnostics),
+        }
+    }
+
+    #[must_use]
+    pub fn as_metadata_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            serde_json::json!({
+                "kind": "unavailable",
+            })
+        })
+    }
+}
+
 /// Controls parallel execution of tool calls.
 #[derive(Debug, Clone, Default)]
 pub struct ConcurrencyPolicy {
@@ -322,6 +365,15 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
         result: &ToolResult,
     ) -> Option<JournalAction> {
         let _ = (call, result);
+        None
+    }
+
+    /// Retrieve execution diagnostics captured for a completed tool call.
+    ///
+    /// Implementations that do not support structured diagnostics should
+    /// return `None`.
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        let _ = call_id;
         None
     }
 

@@ -2,7 +2,8 @@
 
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
+    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutionDiagnostics, ToolExecutor,
+    ToolResult, TurnCommitment,
 };
 use crate::budget::{
     estimate_complexity, ActionCost, BudgetRemaining, BudgetState, BudgetTracker, TerminationConfig,
@@ -570,6 +571,8 @@ pub struct LoopEngine {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     /// Provider-specific tool output item identifiers keyed by stable tool call id.
     tool_call_provider_ids: HashMap<String, String>,
+    /// Structured diagnostics captured for the latest executed tool results.
+    pending_tool_result_diagnostics: HashMap<String, ToolExecutionDiagnostics>,
     /// Mixed text emitted alongside tool calls before tool execution begins.
     pending_tool_response_text: Option<String>,
     /// Optional scoped tool surface for the next root reasoning pass.
@@ -914,6 +917,7 @@ impl LoopEngineBuilder {
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             tool_call_provider_ids: HashMap::new(),
+            pending_tool_result_diagnostics: HashMap::new(),
             pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
@@ -1789,6 +1793,7 @@ impl LoopEngine {
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
         self.tool_call_provider_ids.clear();
+        self.pending_tool_result_diagnostics.clear();
         self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
@@ -3072,17 +3077,38 @@ impl LoopEngine {
             } else {
                 result.output.clone()
             };
+            let mut metadata = serde_json::json!({
+                "success": result.success,
+                "output": truncated_output,
+                "failure_class": result.failure_classification().map(|class| class.as_str()),
+                "classification": tool_call_classification_label(classification),
+            });
+            let diagnostics = self
+                .pending_tool_result_diagnostics
+                .remove(&result.tool_call_id);
+            if !result.success && result.tool_name == "run_command" {
+                if let Some(diagnostics) = diagnostics {
+                    metadata["diagnostics"] = diagnostics.as_metadata_value();
+                }
+            }
             self.emit_signal(
                 LoopStep::Act,
                 kind,
                 format!("tool {}", result.tool_name),
-                serde_json::json!({
-                    "success": result.success,
-                    "output": truncated_output,
-                    "failure_class": result.failure_classification().map(|class| class.as_str()),
-                    "classification": tool_call_classification_label(classification),
-                }),
+                metadata,
             );
+        }
+    }
+
+    fn capture_tool_execution_diagnostics(&mut self, results: &[ToolResult]) {
+        for result in results {
+            if let Some(diagnostics) = self
+                .tool_executor
+                .take_execution_diagnostics(&result.tool_call_id)
+            {
+                self.pending_tool_result_diagnostics
+                    .insert(result.tool_call_id.clone(), diagnostics);
+            }
         }
     }
 

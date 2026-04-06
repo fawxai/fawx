@@ -12,8 +12,8 @@ use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, FailureClass,
-    JournalAction, ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError,
-    ToolResult,
+    JournalAction, ToolCacheability, ToolCallClassification, ToolExecutionDiagnostics,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
@@ -34,6 +34,7 @@ use std::time::Duration;
 pub(crate) struct ToolFailure {
     pub(crate) message: String,
     pub(crate) class: FailureClass,
+    pub(crate) diagnostics: Option<ToolExecutionDiagnostics>,
 }
 
 impl ToolFailure {
@@ -41,7 +42,13 @@ impl ToolFailure {
         Self {
             message: message.into(),
             class,
+            diagnostics: None,
         }
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: ToolExecutionDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
     }
 
     pub(crate) fn permanent(message: impl Into<String>) -> Self {
@@ -54,6 +61,10 @@ impl ToolFailure {
 
     pub(crate) fn unknown(message: impl Into<String>) -> Self {
         Self::new(message, FailureClass::Unknown)
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<&ToolExecutionDiagnostics> {
+        self.diagnostics.as_ref()
     }
 }
 
@@ -185,6 +196,12 @@ impl ToolRegistry {
             .filter(|tool| tool.is_available())
             .map(|tool| tool.definition())
             .collect()
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.ordered
+            .iter()
+            .find_map(|tool| tool.take_execution_diagnostics(call_id))
     }
 }
 
@@ -600,6 +617,10 @@ impl ToolExecutor for FawxToolExecutor {
             .and_then(|tool| tool.journal_action(call, result))
     }
 
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.tools.take_execution_diagnostics(call_id)
+    }
+
     fn route_sub_goal_call(
         &self,
         request: &fx_kernel::act::SubGoalToolRoutingRequest,
@@ -872,6 +893,7 @@ mod tests {
     use fx_consensus::ProgressEvent;
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
+    use fx_kernel::act::RunCommandDiagnostics;
     use fx_llm::ModelRouter;
     use fx_memory::embedding_index::EmbeddingIndex;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
@@ -1066,6 +1088,14 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    fn expect_run_command_diagnostics(
+        diagnostics: ToolExecutionDiagnostics,
+    ) -> RunCommandDiagnostics {
+        match diagnostics {
+            ToolExecutionDiagnostics::RunCommand(diagnostics) => diagnostics,
+        }
     }
 
     fn executor_with_protected_branches(root: &Path, branches: &[&str]) -> FawxToolExecutor {
@@ -1990,6 +2020,39 @@ three
         assert!(result.output.contains("exit_code: 1"));
     }
 
+    #[tokio::test]
+    async fn run_command_failure_produces_structured_diagnostics() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "printf 'stderr burst\\n' >&2; exit 23",
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("run_command diagnostics"),
+        );
+        assert_eq!(diagnostics.exit_code, Some(23));
+        assert_eq!(diagnostics.shell, true);
+        assert!(!diagnostics.timed_out);
+        assert!(diagnostics
+            .stderr_snippet
+            .as_deref()
+            .is_some_and(|snippet| snippet.contains("stderr burst")));
+        assert!(
+            executor.take_execution_diagnostics("call-1").is_none(),
+            "diagnostics should be drained after the first read"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_classifies_signal_terminated_process_as_transient() {
@@ -2081,6 +2144,16 @@ three
             Some(FailureClass::Transient)
         );
         assert!(result.output.contains("timed out"));
+
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("timeout diagnostics"),
+        );
+        assert_eq!(diagnostics.exit_code, None);
+        assert_eq!(diagnostics.shell, false);
+        assert!(diagnostics.timed_out);
+        assert!(diagnostics.duration_ms >= 1);
     }
 
     #[tokio::test]
