@@ -105,6 +105,9 @@ pub struct SkillManifest {
     /// Optional tool definitions declared by the skill.
     #[serde(default)]
     pub tools: Vec<SkillToolManifest>,
+    /// Optional skill-level intent hints for future routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_hints: Vec<String>,
     /// Entry point function name
     #[serde(default = "default_entry_point")]
     pub entry_point: String,
@@ -162,6 +165,58 @@ pub fn validate_skill_name(name: &str) -> Result<(), SkillError> {
     Ok(())
 }
 
+/// Validate that every string entry in a manifest field is non-blank after trimming.
+pub fn validate_nonblank_string_entries(
+    field_name: &str,
+    values: &[String],
+) -> Result<(), SkillError> {
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.trim().is_empty())
+    {
+        return Err(SkillError::InvalidManifest(format!(
+            "{}[{}] cannot be blank",
+            field_name, index
+        )));
+    }
+
+    Ok(())
+}
+
+const MAX_INTENT_HINTS: usize = 64;
+const MAX_INTENT_HINT_LENGTH: usize = 256;
+
+/// Validate `intent_hints` for blank, duplicate, and unbounded entries.
+pub fn validate_intent_hints(intent_hints: &[String]) -> Result<(), SkillError> {
+    if intent_hints.len() > MAX_INTENT_HINTS {
+        return Err(SkillError::InvalidManifest(format!(
+            "intent_hints cannot contain more than {} entries",
+            MAX_INTENT_HINTS
+        )));
+    }
+
+    validate_nonblank_string_entries("intent_hints", intent_hints)?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, intent_hint) in intent_hints.iter().enumerate() {
+        if intent_hint.chars().count() > MAX_INTENT_HINT_LENGTH {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] cannot exceed {} characters",
+                MAX_INTENT_HINT_LENGTH
+            )));
+        }
+
+        if !seen.insert(intent_hint.as_str()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] duplicates a previous entry"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a skill manifest.
 pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
     validate_skill_name(&manifest.name)?;
@@ -206,6 +261,7 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
+    validate_intent_hints(&manifest.intent_hints)?;
     validate_tools(&manifest.tools)?;
 
     Ok(())
@@ -294,6 +350,7 @@ entry_point = "run"
         assert_eq!(manifest.api_version, "host_api_v1");
         assert_eq!(manifest.capabilities, vec![Capability::Network]);
         assert!(manifest.tools.is_empty());
+        assert!(manifest.intent_hints.is_empty());
         assert_eq!(manifest.entry_point, "run");
     }
 
@@ -341,6 +398,135 @@ required = true
     }
 
     #[test]
+    fn test_parse_manifest_with_intent_hints_round_trips() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![
+                "review pr".to_string(),
+                "github issue management".to_string(),
+            ],
+            entry_point: "run".to_string(),
+        };
+
+        let toml = toml::to_string(&manifest).expect("serialize manifest");
+        let parsed = parse_manifest(&toml).expect("parse manifest");
+
+        assert_eq!(parsed.name, manifest.name);
+        assert_eq!(parsed.version, manifest.version);
+        assert_eq!(parsed.description, manifest.description);
+        assert_eq!(parsed.author, manifest.author);
+        assert_eq!(parsed.api_version, manifest.api_version);
+        assert_eq!(parsed.intent_hints, manifest.intent_hints);
+    }
+
+    #[test]
+    fn test_parse_manifest_defaults_intent_hints_to_empty() {
+        let toml = r#"
+name = "review-helper"
+version = "1.0.0"
+description = "Review helper"
+author = "Fawx Team"
+api_version = "host_api_v1"
+        "#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        assert!(manifest.intent_hints.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec!["review pr".to_string(), "review pr".to_string()],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicates a previous entry"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_too_many_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: (0..=MAX_INTENT_HINTS)
+                .map(|index| format!("hint-{index}"))
+                .collect(),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("more than 64 entries"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_overlong_intent_hint() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![
+                "review pr".to_string(),
+                std::iter::repeat('a')
+                    .take(MAX_INTENT_HINT_LENGTH + 1)
+                    .collect(),
+            ],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("cannot exceed 256 characters"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec!["review pr".to_string(), "   ".to_string()],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("intent_hints[1]"))
+        );
+    }
+
+    #[test]
     fn test_validate_direct_utility_requires_trigger_patterns() {
         let manifest = SkillManifest {
             name: "weather".to_string(),
@@ -354,7 +540,7 @@ required = true
                 description: "Weather".to_string(),
                 authority_surface: None,
                 direct_utility: true,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![SkillToolParameterManifest {
                     name: "location".to_string(),
                     kind: "string".to_string(),
@@ -362,6 +548,7 @@ required = true
                     required: true,
                 }],
             }],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -391,6 +578,7 @@ name = "broken
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -409,6 +597,7 @@ name = "broken
             api_version: "host_api_v2".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
         assert!(validate_manifest(&manifest).is_ok());
@@ -424,6 +613,7 @@ name = "broken
             api_version: "v2".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -480,6 +670,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -496,6 +687,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -569,6 +761,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -585,6 +778,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -601,6 +795,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -621,6 +816,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -643,7 +839,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     description: "Search".to_string(),
                     authority_surface: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
                 SkillToolManifest {
@@ -651,10 +847,11 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     description: "Duplicate".to_string(),
                     authority_surface: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
             ],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
@@ -678,7 +875,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 description: "Search".to_string(),
                 authority_surface: None,
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![
                     SkillToolParameterManifest {
                         name: "query".to_string(),
@@ -694,6 +891,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     },
                 ],
             }],
+            intent_hints: vec![],
             entry_point: "run".to_string(),
         };
 
