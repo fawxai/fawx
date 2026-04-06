@@ -2,6 +2,7 @@ use crate::perceive::ProcessedPerception;
 use crate::signals::LoopStep;
 
 use fx_llm::{CompletionRequest, Message, MessageRole, ToolDefinition};
+use std::fmt;
 
 use super::{
     message_content_to_text, message_to_text, BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE,
@@ -10,12 +11,42 @@ use super::{
     TOOL_CONTINUATION_DIRECTIVE,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SkillPromptSummary {
+    name: String,
+    description: String,
+}
+
+impl SkillPromptSummary {
+    pub(super) fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.name.trim().is_empty() && !self.description.trim().is_empty()
+    }
+
+    fn render_bullet(&self) -> String {
+        format!("- {}: {}", self.name.trim(), self.description.trim())
+    }
+}
+
+impl fmt::Display for SkillPromptSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.name.trim(), self.description.trim())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RequestBuildContext<'a> {
     memory_context: Option<&'a str>,
     scratchpad_context: Option<&'a str>,
     thinking: Option<fx_llm::ThinkingConfig>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&'a [SkillPromptSummary]>,
 }
 
 impl<'a> RequestBuildContext<'a> {
@@ -30,7 +61,16 @@ impl<'a> RequestBuildContext<'a> {
             scratchpad_context,
             thinking,
             notify_tool_guidance_enabled,
+            skill_prompt_summaries: None,
         }
+    }
+
+    pub(super) fn with_skill_prompt_summaries(
+        mut self,
+        skill_prompt_summaries: &'a [SkillPromptSummary],
+    ) -> Self {
+        self.skill_prompt_summaries = Some(skill_prompt_summaries);
+        self
     }
 }
 
@@ -179,6 +219,7 @@ pub(super) fn build_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
     CompletionRequest {
         model: params.model.to_string(),
@@ -219,6 +260,7 @@ pub(super) fn build_truncation_continuation_request(
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
 
     CompletionRequest {
@@ -237,6 +279,7 @@ pub(super) fn build_reasoning_request(params: ReasoningRequestParams<'_>) -> Com
         params.context.memory_context,
         params.context.scratchpad_context,
         params.context.notify_tool_guidance_enabled,
+        params.context.skill_prompt_summaries,
     );
 
     CompletionRequest {
@@ -280,19 +323,26 @@ pub(super) fn build_reasoning_system_prompt(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
 ) -> String {
-    build_reasoning_system_prompt_with_notify_guidance(memory_context, scratchpad_context, false)
+    build_reasoning_system_prompt_with_notify_guidance(
+        memory_context,
+        scratchpad_context,
+        false,
+        None,
+    )
 }
 
 pub(super) fn build_reasoning_system_prompt_with_notify_guidance(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
     build_system_prompt(
         memory_context,
         scratchpad_context,
         None,
         notify_tool_guidance_enabled,
+        skill_prompt_summaries,
     )
 }
 
@@ -306,6 +356,7 @@ fn build_forced_synthesis_system_prompt_with_notify_guidance(
         memory_context,
         scratchpad_context,
         notify_tool_guidance_enabled,
+        None,
     );
     let directives = system_messages_to_prompt_directives(context_messages);
     if !directives.is_empty() {
@@ -329,19 +380,24 @@ pub(super) fn build_tool_continuation_system_prompt(
         memory_context,
         scratchpad_context,
         false,
+        None,
     )
 }
 
-fn build_tool_continuation_system_prompt_with_notify_guidance(
+pub(super) fn build_tool_continuation_system_prompt_with_notify_guidance(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
+    // Keep this visible to sibling test modules so both prompt paths can
+    // exercise the same renderer without duplicating setup.
     build_system_prompt(
         memory_context,
         scratchpad_context,
         Some(TOOL_CONTINUATION_DIRECTIVE),
         notify_tool_guidance_enabled,
+        skill_prompt_summaries,
     )
 }
 
@@ -350,24 +406,58 @@ fn build_system_prompt(
     scratchpad_context: Option<&str>,
     extra_directive: Option<&str>,
     notify_tool_guidance_enabled: bool,
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
-    let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    let mut sections = vec![REASONING_SYSTEM_PROMPT.to_string()];
+
+    if let Some(capabilities) = render_skill_capabilities(skill_prompt_summaries) {
+        sections.push(capabilities);
+    }
+
     if notify_tool_guidance_enabled {
-        prompt.push_str(NOTIFY_TOOL_GUIDANCE);
+        sections.push(trim_leading_newlines(NOTIFY_TOOL_GUIDANCE).to_string());
     }
     if let Some(extra_directive) = extra_directive {
-        prompt.push_str(extra_directive);
+        sections.push(trim_leading_newlines(extra_directive).to_string());
     }
     if let Some(scratchpad_context) = scratchpad_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(scratchpad_context);
+        sections.push(trim_section_newlines(scratchpad_context).to_string());
     }
     if let Some(memory_context) = memory_context {
-        prompt.push_str("\n\n");
-        prompt.push_str(memory_context);
-        prompt.push_str(MEMORY_INSTRUCTION);
+        sections.push(format!(
+            "{}\n\n{}",
+            trim_section_newlines(memory_context),
+            trim_leading_newlines(MEMORY_INSTRUCTION)
+        ));
     }
-    prompt
+
+    sections.join("\n\n")
+}
+
+fn render_skill_capabilities(
+    skill_prompt_summaries: Option<&[SkillPromptSummary]>,
+) -> Option<String> {
+    let skill_prompt_summaries = skill_prompt_summaries?;
+    // Preserve caller order and render every usable entry the caller hands us.
+    let bullets = skill_prompt_summaries
+        .iter()
+        .filter(|summary| summary.is_usable())
+        .map(SkillPromptSummary::render_bullet)
+        .collect::<Vec<_>>();
+
+    if bullets.is_empty() {
+        return None;
+    }
+
+    Some(format!("Your capabilities:\n{}", bullets.join("\n")))
+}
+
+fn trim_section_newlines(section: &str) -> &str {
+    section.trim_matches('\n')
+}
+
+fn trim_leading_newlines(section: &str) -> &str {
+    section.trim_start_matches('\n')
 }
 
 fn strip_system_messages(messages: &[Message]) -> Vec<Message> {

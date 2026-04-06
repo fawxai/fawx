@@ -94,8 +94,9 @@ use self::request::{
 #[cfg(test)]
 use self::request::{
     build_reasoning_system_prompt, build_reasoning_system_prompt_with_notify_guidance,
-    build_tool_continuation_system_prompt, decompose_tool_definition, reasoning_user_prompt,
-    tool_definitions_with_decompose,
+    build_tool_continuation_system_prompt,
+    build_tool_continuation_system_prompt_with_notify_guidance, decompose_tool_definition,
+    reasoning_user_prompt, tool_definitions_with_decompose, SkillPromptSummary,
 };
 #[cfg(test)]
 use self::retry::same_call_failure_reason;
