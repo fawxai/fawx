@@ -2,8 +2,8 @@
 
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutionDiagnostics, ToolExecutor,
-    ToolResult, TurnCommitment,
+    FailureClass, TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutionDiagnostics,
+    ToolExecutor, ToolResult, TurnCommitment,
 };
 use crate::budget::{
     estimate_complexity, ActionCost, BudgetRemaining, BudgetState, BudgetTracker, TerminationConfig,
@@ -563,6 +563,8 @@ pub struct LoopEngine {
     last_reasoning_messages: Vec<Message>,
     /// Tool retry tracker for the current cycle.
     tool_retry_tracker: RetryTracker,
+    /// Circuit breaker for repeated tool failures across outer-loop iterations.
+    repeated_tool_failure_tracker: RepeatedToolFailureTracker,
     /// Whether a successful `notify` tool call occurred during the current cycle.
     notify_called_this_cycle: bool,
     /// Whether this cycle currently has an active notification delivery channel.
@@ -633,6 +635,10 @@ impl std::fmt::Debug for LoopEngine {
             .field("consecutive_tool_turns", &self.consecutive_tool_turns)
             .field("observation_round_tracker", &self.observation_round_tracker)
             .field("tool_retry_tracker", &self.tool_retry_tracker)
+            .field(
+                "repeated_tool_failure_tracker",
+                &self.repeated_tool_failure_tracker,
+            )
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
                 "notify_tool_guidance_enabled",
@@ -962,6 +968,7 @@ impl LoopEngineBuilder {
             observation_round_tracker: ObservationRoundTracker::default(),
             last_reasoning_messages: Vec::new(),
             tool_retry_tracker: RetryTracker::default(),
+            repeated_tool_failure_tracker: RepeatedToolFailureTracker::default(),
             notify_called_this_cycle: false,
             notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
@@ -1081,6 +1088,86 @@ impl ObservationRoundTracker {
 
         self.seen_observation_fingerprints.insert(fingerprint);
         false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailure {
+    key: RepeatedToolFailureKey,
+    summary: String,
+    last_output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureKey {
+    tool_name: String,
+    failure_class: FailureClass,
+    kind: RepeatedToolFailureKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatedToolFailureKind {
+    MalformedArgumentsJson,
+    OutputHash(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureState {
+    failure: RepeatedToolFailure,
+    consecutive_failures: u16,
+    guidance_injected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatedToolFailureEvent {
+    InjectGuidance(RepeatedToolFailureState),
+    Trip(RepeatedToolFailureState),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureTracker {
+    active: Option<RepeatedToolFailureState>,
+}
+
+impl RepeatedToolFailureTracker {
+    fn observe_action(
+        &mut self,
+        results: &[ToolResult],
+        threshold: u16,
+    ) -> Option<RepeatedToolFailureEvent> {
+        let Some((failure, count)) = repeated_tool_failure_from_results(results) else {
+            self.active = None;
+            return None;
+        };
+
+        let mut state = match self.active.take() {
+            Some(active) if active.failure.key == failure.key => RepeatedToolFailureState {
+                failure,
+                consecutive_failures: active.consecutive_failures.saturating_add(count),
+                guidance_injected: active.guidance_injected,
+            },
+            _ => RepeatedToolFailureState {
+                failure,
+                consecutive_failures: count,
+                guidance_injected: false,
+            },
+        };
+
+        let event = if !state.guidance_injected && state.consecutive_failures >= threshold {
+            state.guidance_injected = true;
+            Some(RepeatedToolFailureEvent::InjectGuidance(state.clone()))
+        } else if state.guidance_injected && state.consecutive_failures > threshold {
+            Some(RepeatedToolFailureEvent::Trip(state.clone()))
+        } else {
+            None
+        };
+
+        self.active = Some(state);
+        event
+    }
+
+    fn clear(&mut self) {
+        self.active = None;
     }
 }
 
@@ -1233,6 +1320,7 @@ const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several r
 const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool rounds only gathering information. Stop doing more read-only research unless it is absolutely necessary. If you have enough context, switch to implementation-side tools now. Otherwise, respond with what you learned, what remains blocked, and what input you need.";
 const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls were blocked after repeated observation-only rounds. Do not request any more read-only tools. Use the remaining mutation/build/install tools now if you have enough context to proceed. If you still cannot proceed, answer with the current findings and the specific blocker.";
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
+const MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER: &str = "arguments could not be parsed as valid JSON";
 const DIRECT_INSPECTION_TASK_DIRECTIVE: &str = "\n\nThis turn is a direct local inspection request. Do not plan. Do not decompose. Use only the provided observation tools to inspect the explicit local path the user named. If the tool results answer the request, answer directly from that evidence. Do not broaden the task into repo research, code modification, testing, command execution, or web work.";
 const DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE: &str = "\n\nDirect inspection focus: read_local_path.\nUse `read_file` to inspect the explicit local path the user requested. Do not call unrelated tools or reopen the task as general research.";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
@@ -1430,8 +1518,7 @@ impl LoopEngine {
     }
 
     fn refresh_runtime_skill_prompt_summaries(&mut self) {
-        self.cached_runtime_skill_prompt_summaries =
-            self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_summaries = self.collect_runtime_skill_prompt_summaries();
         self.cached_runtime_skill_prompt_revision = self
             .runtime_skill_prompt_revision
             .as_ref()
@@ -1609,11 +1696,17 @@ impl LoopEngine {
 
         loop {
             stream.phase(Phase::Act);
-            let action = self
+            let mut action = self
                 .act(&decision, llm, &processed.context_window, stream)
                 .await?;
 
             let action_partial = action_partial_response(&action);
+
+            if let Some(result) =
+                self.apply_repeated_tool_failure_policy(&mut action, action_partial.as_deref())
+            {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
 
             state.tokens.accumulate(action.tokens_used);
             self.update_tool_turns(&action);
@@ -1924,6 +2017,7 @@ impl LoopEngine {
         self.observation_round_tracker = ObservationRoundTracker::default();
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
+        self.repeated_tool_failure_tracker.clear();
         self.notify_called_this_cycle = false;
         self.notify_tool_guidance_enabled = false;
         self.tool_call_provider_ids.clear();
@@ -1953,6 +2047,70 @@ impl LoopEngine {
             self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
         } else {
             self.consecutive_tool_turns = 0;
+        }
+    }
+
+    fn apply_repeated_tool_failure_policy(
+        &mut self,
+        action: &mut ActionResult,
+        action_partial: Option<&str>,
+    ) -> Option<LoopResult> {
+        if matches!(
+            action.next_step,
+            ActionNextStep::Finish(ActionTerminal::Complete { .. })
+        ) {
+            self.repeated_tool_failure_tracker.clear();
+            return None;
+        }
+
+        let threshold = self.budget.config().max_consecutive_failures.max(1);
+        let event = self
+            .repeated_tool_failure_tracker
+            .observe_action(&action.tool_results, threshold)?;
+
+        match event {
+            RepeatedToolFailureEvent::InjectGuidance(state) => {
+                let directive = render_repeated_tool_failure_directive(&state);
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Friction,
+                    format!(
+                        "injecting repeated failure guidance for '{}'",
+                        state.failure.key.tool_name
+                    ),
+                    serde_json::json!({
+                        "tool": state.failure.key.tool_name.as_str(),
+                        "consecutive_failures": state.consecutive_failures,
+                        "failure_summary": state.failure.summary.as_str(),
+                    }),
+                );
+                if let ActionNextStep::Continue(continuation) = &mut action.next_step {
+                    append_continuation_system_message(continuation, directive);
+                }
+                None
+            }
+            RepeatedToolFailureEvent::Trip(state) => {
+                let reason = repeated_tool_failure_terminal_reason(&state);
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    &reason,
+                    serde_json::json!({
+                        "tool": state.failure.key.tool_name.as_str(),
+                        "consecutive_failures": state.consecutive_failures,
+                        "failure_summary": state.failure.summary.as_str(),
+                    }),
+                );
+                Some(LoopResult::Incomplete {
+                    partial_response: repeated_tool_failure_partial_response(
+                        action_partial,
+                        &state,
+                    ),
+                    reason,
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                })
+            }
         }
     }
 
@@ -4342,6 +4500,133 @@ fn prepend_accumulated_text_to_action(
         }
     }
     action
+}
+
+fn repeated_tool_failure_from_results(
+    results: &[ToolResult],
+) -> Option<(RepeatedToolFailure, u16)> {
+    if results.is_empty() || results.iter().any(|result| result.success) {
+        return None;
+    }
+
+    let mut failed = results.iter().filter(|result| !result.success);
+    let mut failure = classify_repeated_tool_failure(failed.next()?);
+    let mut count = 1u16;
+
+    for result in failed {
+        let next = classify_repeated_tool_failure(result);
+        if next.key != failure.key {
+            return None;
+        }
+        failure.summary = next.summary;
+        failure.last_output = next.last_output;
+        count = count.saturating_add(1);
+    }
+
+    Some((failure, count))
+}
+
+fn classify_repeated_tool_failure(result: &ToolResult) -> RepeatedToolFailure {
+    let key = RepeatedToolFailureKey {
+        tool_name: result.tool_name.clone(),
+        failure_class: result
+            .failure_classification()
+            .unwrap_or(FailureClass::Unknown),
+        kind: repeated_tool_failure_kind(&result.output),
+    };
+    let summary = repeated_tool_failure_summary(&key.kind, &result.output);
+    RepeatedToolFailure {
+        key,
+        summary,
+        last_output: truncate_prompt_text(result.output.trim(), 240),
+    }
+}
+
+fn repeated_tool_failure_kind(output: &str) -> RepeatedToolFailureKind {
+    if output.contains(MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER) {
+        RepeatedToolFailureKind::MalformedArgumentsJson
+    } else {
+        RepeatedToolFailureKind::OutputHash(hash_tool_failure_output(output))
+    }
+}
+
+fn repeated_tool_failure_summary(kind: &RepeatedToolFailureKind, output: &str) -> String {
+    match kind {
+        RepeatedToolFailureKind::MalformedArgumentsJson => {
+            MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER.to_string()
+        }
+        RepeatedToolFailureKind::OutputHash(_) => truncate_prompt_text(output.trim(), 160),
+    }
+}
+
+fn hash_tool_failure_output(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn repeated_tool_failure_guidance(state: &RepeatedToolFailureState) -> String {
+    match (
+        state.failure.key.tool_name.as_str(),
+        &state.failure.key.kind,
+    ) {
+        ("write_file", RepeatedToolFailureKind::MalformedArgumentsJson) => "Use an alternative approach: write smaller chunks, simplify the content so the arguments stay valid JSON, or switch to `run_command` with a heredoc if that is safer.".to_string(),
+        (_, RepeatedToolFailureKind::MalformedArgumentsJson) => "Retry only if you can produce valid JSON arguments. Otherwise use a different tool shape or answer with the blocker instead of repeating the malformed call.".to_string(),
+        ("run_command", _) => "Stop repeating the same command. Change the command shape, inspect the repo/files directly, or explain the blocker to the user.".to_string(),
+        _ => "Do not repeat the same failing call. Try a different tool or narrower approach, or answer with what is blocked.".to_string(),
+    }
+}
+
+fn render_repeated_tool_failure_directive(state: &RepeatedToolFailureState) -> String {
+    format!(
+        "Repeated tool failure circuit breaker: `{tool}` has failed {count} consecutive times with the same failure: {summary}. {guidance} If the same failure happens again, stop using tools and answer the user with what you attempted and why it failed.",
+        tool = state.failure.key.tool_name,
+        count = state.consecutive_failures,
+        summary = state.failure.summary,
+        guidance = repeated_tool_failure_guidance(state),
+    )
+}
+
+fn repeated_tool_failure_terminal_reason(state: &RepeatedToolFailureState) -> String {
+    format!(
+        "repeated tool failure circuit breaker tripped after {count} consecutive `{tool}` failures ({summary})",
+        count = state.consecutive_failures,
+        tool = state.failure.key.tool_name,
+        summary = state.failure.summary,
+    )
+}
+
+fn repeated_tool_failure_partial_response(
+    action_partial: Option<&str>,
+    state: &RepeatedToolFailureState,
+) -> Option<String> {
+    let note = format!(
+        "I stopped early because `{tool}` failed {count} consecutive times with the same error: {summary}. Last error: {last_error}",
+        tool = state.failure.key.tool_name,
+        count = state.consecutive_failures,
+        summary = state.failure.summary,
+        last_error = state.failure.last_output,
+    );
+
+    let mut segments = Vec::new();
+    push_response_segment(
+        &mut segments,
+        action_partial.and_then(|text| meaningful_response_text(text)),
+    );
+    stitched_response_text(&segments, Some(note))
+}
+
+fn append_continuation_system_message(continuation: &mut ActionContinuation, message: String) {
+    if continuation.context_messages.is_empty() {
+        if let Some(context_message) = continuation.context_message.take() {
+            continuation
+                .context_messages
+                .push(Message::assistant(context_message));
+        }
+    }
+    continuation.context_messages.push(Message::system(message));
 }
 
 fn append_continuation_context(

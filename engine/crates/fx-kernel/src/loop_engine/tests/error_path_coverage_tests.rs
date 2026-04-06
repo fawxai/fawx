@@ -481,6 +481,89 @@ async fn tool_friction_caps_at_max_iterations() {
     }
 }
 
+#[tokio::test]
+async fn repeated_malformed_tool_failures_inject_guidance_then_trip_circuit_breaker() {
+    fn malformed_write_file_call(id: &str, raw_arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "write_file".to_string(),
+            arguments: fx_llm::parse_tool_arguments_object(raw_arguments),
+        }
+    }
+
+    let mut engine =
+        build_engine_with_executor(Arc::new(StubToolExecutor), BudgetConfig::default(), 0, 10);
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![malformed_write_file_call(
+            "call-1",
+            "{\"path\":\"/tmp/a.txt\",\"content\":\"unterminated",
+        )]),
+        text_response("write_file failed again"),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-2",
+            "{\"path\":\"/tmp/b.txt\",\"content\":\"still broken",
+        )]),
+        text_response("write_file failed again"),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-3",
+            "{\"path\":\"/tmp/c.txt\",\"content\":\"missing brace\"",
+        )]),
+        text_response("write_file failed again"),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-4",
+            "{\"path\":\"/tmp/d.txt\",\"content\":\"missing quote}",
+        )]),
+        text_response("write_file failed again"),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("write a file"), &llm)
+        .await
+        .expect("run_cycle should not panic");
+
+    match &result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            iterations,
+            ..
+        } => {
+            assert_eq!(
+                *iterations, 4,
+                "circuit breaker should stop after the first post-guidance repeat"
+            );
+            assert!(
+                reason.contains("repeated tool failure circuit breaker tripped"),
+                "unexpected reason: {reason}"
+            );
+            let partial = partial_response
+                .as_deref()
+                .expect("circuit breaker should preserve a partial response");
+            assert!(
+                partial.contains("write_file"),
+                "partial should name the tool"
+            );
+            assert!(
+                partial.contains("valid JSON"),
+                "partial should explain the malformed JSON failure: {partial}"
+            );
+        }
+        other => panic!("expected Incomplete, got: {other:?}"),
+    }
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 8, "unexpected request count");
+    let combined_prompt = completion_request_to_prompt(&requests[6]);
+    assert!(
+        combined_prompt.contains("Repeated tool failure circuit breaker"),
+        "expected repeated-failure guidance in the next reasoning pass: {combined_prompt}"
+    );
+    assert!(
+        combined_prompt.contains("write_file"),
+        "guidance should identify the failing tool: {combined_prompt}"
+    );
+}
+
 // =========================================================================
 // 4. Context overflow during tool round
 // =========================================================================
