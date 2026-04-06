@@ -549,6 +549,7 @@ mod tests {
 #[cfg(test)]
 mod parse_tool_arguments_tests {
     use super::parse_tool_arguments;
+    use crate::malformed_tool_arguments;
     use serde_json::Value;
 
     #[test]
@@ -570,10 +571,32 @@ mod parse_tool_arguments_tests {
             "must not be Value::String"
         );
         assert!(
-            result.get("__fawx_raw_args").is_some(),
-            "must contain __fawx_raw_args key"
+            malformed_tool_arguments(&result).is_some(),
+            "must preserve malformed arguments metadata"
         );
-        assert_eq!(result["__fawx_raw_args"], r#"{"path": "/tmp/test.md"#);
+        let malformed = malformed_tool_arguments(&result).expect("malformed arguments");
+        assert_eq!(malformed.raw, r#"{"path": "/tmp/test.md"#);
+        assert!(
+            malformed.error.contains("EOF while parsing"),
+            "must surface the parse error: {}",
+            malformed.error
+        );
+    }
+
+    #[test]
+    fn repairs_common_string_escaping_inside_tool_arguments() {
+        let result = parse_tool_arguments(
+            "{\n  \"path\": \"main.rs\",\n  \"content\": \"let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n\"\n}",
+        );
+        assert!(
+            malformed_tool_arguments(&result).is_none(),
+            "repairable arguments should parse without sentinel metadata"
+        );
+        assert_eq!(result["path"], "main.rs");
+        assert_eq!(
+            result["content"],
+            "let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n"
+        );
     }
 
     #[test]

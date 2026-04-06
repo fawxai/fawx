@@ -739,7 +739,7 @@ fn finalized_stream_tool_call_from_state(
     }
 
     let identity = finalized_stream_tool_identity(&state)?;
-    let arguments = parse_stream_tool_arguments(&state.arguments, &identity.id, &identity.name)?;
+    let arguments = parse_stream_tool_arguments(&state.arguments, &identity.id, &identity.name);
     Some(FinalizedStreamToolCall {
         provider_id: identity.provider_id,
         call: ToolCall {
@@ -775,28 +775,23 @@ fn normalized_provider_id(provider_id: Option<&str>, id: &str) -> Option<String>
     })
 }
 
-fn parse_stream_tool_arguments(
-    raw_arguments: &str,
-    id: &str,
-    name: &str,
-) -> Option<serde_json::Value> {
+fn parse_stream_tool_arguments(raw_arguments: &str, id: &str, name: &str) -> serde_json::Value {
     let raw_arguments = if raw_arguments.trim().is_empty() {
         "{}"
     } else {
         raw_arguments
     };
 
-    match serde_json::from_str::<serde_json::Value>(raw_arguments) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            tracing::warn!(
-                tool_id = %id,
-                tool_name = %name,
-                raw_arguments = %raw_arguments,
-                error = %error,
-                "dropping tool call with malformed JSON arguments"
-            );
-            None
-        }
+    let arguments = fx_llm::parse_tool_arguments_object(raw_arguments);
+    if let Some(details) = fx_llm::malformed_tool_arguments(&arguments) {
+        tracing::warn!(
+            tool_id = %id,
+            tool_name = %name,
+            raw_arguments = %details.raw,
+            error = %details.error,
+            "preserving malformed tool call for actionable rejection"
+        );
     }
+
+    arguments
 }
