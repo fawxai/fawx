@@ -45,8 +45,9 @@ engine/crates/fx-decompose/src/
 ├── operations.rs          # Step 1: typed graph operations
 ├── thought.rs             # Step 1: thought state model
 ├── graph_topology.rs      # Step 2: cyclic graph topology (replaces/extends dag.rs for GoT)
-├── graph_dispatcher.rs    # Step 3: fan-out/fan-in dispatcher with scoring
+├── graph_dispatcher.rs    # Step 3: fan-out/fan-in dispatcher with scoring + mock test infra
 ├── graph_builder.rs       # Step 4: fluent builder API
+├── reasoning_mode.rs      # Step 5: kernel integration types
 └── (existing files unchanged)
 ```
 
@@ -75,26 +76,38 @@ engine/crates/fx-kernel/src/loop_engine/decomposition.rs  # Step 5: reasoning mo
 
 ## Execution Plan
 
-Six PR-sized slices, executed sequentially:
+Five PR-sized slices, executed sequentially. Each slice uses **test-driven development**: tests are written first, verified to fail, then implementation makes them pass.
 
 | Step | Title | New Code | Difficulty |
 |---|---|---|---|
 | 1 | [Thought State & Operations](step1-thought-state-and-operations.md) | `thought.rs`, `operations.rs` | Easy |
 | 2 | [Cyclic Graph Topology](step2-cyclic-graph-topology.md) | `graph_topology.rs` | Medium |
-| 3 | [Graph Dispatcher](step3-graph-dispatcher.md) | `graph_dispatcher.rs` | Medium |
+| 3 | [Graph Dispatcher](step3-graph-dispatcher.md) | `graph_dispatcher.rs` + mock infra | Medium |
 | 4 | [Builder API](step4-builder-api.md) | `graph_builder.rs` | Easy |
-| 5 | [Kernel Integration](step5-kernel-integration.md) | kernel loop changes | Easy |
-| 6 | [Tests & Validation](step6-tests-and-validation.md) | integration tests | Routine |
+| 5 | [Kernel Integration](step5-kernel-integration.md) | `reasoning_mode.rs` + kernel loop | Easy |
 
-**Estimated total:** ~1,100 lines of new code, 2–3 days of implementation.
+**Estimated total:** ~1,400 lines of new code (including tests), 2–3 days of implementation.
 
 ---
+
+## TDD Workflow — Every Step
+
+Each step follows this strict sequence:
+
+1. **Write tests first.** Define the test module with all test functions. Each test asserts the behavior specified in the step's "Tests First" section.
+2. **Red.** Confirm the tests fail to compile or fail at runtime. This proves the tests are meaningful.
+3. **Implement.** Write the minimum code to make all tests pass.
+4. **Green.** Run the full validation gate. All new and existing tests must pass.
+5. **Refactor.** Clean up implementation if needed. Tests must still pass.
+
+Tests are not an afterthought — they are the **first artifact** of each PR.
 
 ## Execution Rules
 
 - One file in this folder = one PR-sized slice
 - Run sequentially, not in parallel
-- Each step spec defines its own acceptance criteria and validation gate
+- Tests are written and committed **before** implementation within each PR
+- Each step spec defines its exact test signatures in a "Tests First" section
 - Fresh worktree per slice, branch from current `origin/dev`
 - All existing tests must continue to pass — GoT is additive, no existing behavior changes
 
