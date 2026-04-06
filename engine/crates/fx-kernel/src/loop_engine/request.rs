@@ -2,6 +2,7 @@ use crate::perceive::ProcessedPerception;
 use crate::signals::LoopStep;
 
 use fx_llm::{CompletionRequest, Message, MessageRole, ToolDefinition};
+use std::fmt;
 
 use super::{
     message_content_to_text, message_to_text, BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE,
@@ -24,13 +25,18 @@ impl SkillPromptSummary {
         }
     }
 
-    fn render_bullet(&self) -> Option<String> {
-        let name = self.name.trim();
-        let description = self.description.trim();
-        if name.is_empty() || description.is_empty() {
-            return None;
-        }
-        Some(format!("- {name}: {description}"))
+    fn is_usable(&self) -> bool {
+        !self.name.trim().is_empty() && !self.description.trim().is_empty()
+    }
+
+    fn render_bullet(&self) -> String {
+        format!("- {}: {}", self.name.trim(), self.description.trim())
+    }
+}
+
+impl fmt::Display for SkillPromptSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.name.trim(), self.description.trim())
     }
 }
 
@@ -384,6 +390,8 @@ pub(super) fn build_tool_continuation_system_prompt_with_notify_guidance(
     notify_tool_guidance_enabled: bool,
     skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> String {
+    // Keep this visible to sibling test modules so both prompt paths can
+    // exercise the same renderer without duplicating setup.
     build_system_prompt(
         memory_context,
         scratchpad_context,
@@ -407,19 +415,19 @@ fn build_system_prompt(
     }
 
     if notify_tool_guidance_enabled {
-        sections.push(strip_leading_blank_lines(NOTIFY_TOOL_GUIDANCE).to_string());
+        sections.push(trim_leading_newlines(NOTIFY_TOOL_GUIDANCE).to_string());
     }
     if let Some(extra_directive) = extra_directive {
-        sections.push(strip_leading_blank_lines(extra_directive).to_string());
+        sections.push(trim_leading_newlines(extra_directive).to_string());
     }
     if let Some(scratchpad_context) = scratchpad_context {
-        sections.push(normalize_section(scratchpad_context).to_string());
+        sections.push(trim_section_newlines(scratchpad_context).to_string());
     }
     if let Some(memory_context) = memory_context {
         sections.push(format!(
             "{}\n\n{}",
-            normalize_section(memory_context),
-            strip_leading_blank_lines(MEMORY_INSTRUCTION)
+            trim_section_newlines(memory_context),
+            trim_leading_newlines(MEMORY_INSTRUCTION)
         ));
     }
 
@@ -430,9 +438,11 @@ fn render_skill_capabilities(
     skill_prompt_summaries: Option<&[SkillPromptSummary]>,
 ) -> Option<String> {
     let skill_prompt_summaries = skill_prompt_summaries?;
+    // Preserve caller order and render every usable entry the caller hands us.
     let bullets = skill_prompt_summaries
         .iter()
-        .filter_map(SkillPromptSummary::render_bullet)
+        .filter(|summary| summary.is_usable())
+        .map(SkillPromptSummary::render_bullet)
         .collect::<Vec<_>>();
 
     if bullets.is_empty() {
@@ -442,11 +452,11 @@ fn render_skill_capabilities(
     Some(format!("Your capabilities:\n{}", bullets.join("\n")))
 }
 
-fn normalize_section(section: &str) -> &str {
+fn trim_section_newlines(section: &str) -> &str {
     section.trim_matches('\n')
 }
 
-fn strip_leading_blank_lines(section: &str) -> &str {
+fn trim_leading_newlines(section: &str) -> &str {
     section.trim_start_matches('\n')
 }
 
