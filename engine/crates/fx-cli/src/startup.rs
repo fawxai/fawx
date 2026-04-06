@@ -555,6 +555,7 @@ fn build_loop_engine_with_options(
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
         .session_memory(Arc::clone(&skills.session_memory))
+        .runtime_info(Arc::clone(&skills.runtime_info))
         .scratchpad_provider(bridge)
         .runtime_skill_prompt_revision(Arc::clone(&runtime_skill_prompt_revision));
     if let Some(cancel_token) = options.cancel_token {
@@ -575,8 +576,7 @@ fn build_loop_engine_with_options(
             as Arc<dyn fx_kernel::conversation_compactor::CompactionMemoryFlush>);
     }
 
-    let mut engine = build_loop_engine_from_builder(builder)?;
-    engine.set_runtime_info(Arc::clone(&skills.runtime_info));
+    let engine = build_loop_engine_from_builder(builder)?;
     Ok(LoopEngineBundle {
         engine,
         memory: skills.memory,

@@ -1224,8 +1224,6 @@ impl HeadlessApp {
             ripcord_journal: deps.ripcord_journal,
             bus_receiver,
         };
-        app.loop_engine
-            .set_runtime_info(Arc::clone(&app.runtime_info));
         app.seed_runtime_info();
         if !app.active_model.is_empty() {
             update_context_limit_for_active_model(&mut app);
@@ -3473,8 +3471,7 @@ mod tests {
                 runtime_skill_info("blank", Some("   ")),
             ];
         }
-        app.loop_engine
-            .set_runtime_info(Arc::clone(&app.runtime_info));
+        app.loop_engine.invalidate_runtime_skill_prompt_cache();
 
         app.process_message("hello")
             .await
@@ -3939,10 +3936,13 @@ mod tests {
         }
 
         seed_headless_router_active_model(&mut router, &config);
+        let runtime_info = test_runtime_info();
+        let mut loop_engine = test_engine();
+        loop_engine.set_runtime_info(Arc::clone(&runtime_info));
         HeadlessAppDeps {
-            loop_engine: test_engine(),
+            loop_engine,
             router: shared_router(router),
-            runtime_info: test_runtime_info(),
+            runtime_info,
             config,
             memory: None,
             embedding_index_persistence: None,
