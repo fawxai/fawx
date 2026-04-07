@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// A typed operation in the Graph of Thoughts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +25,21 @@ pub enum GraphOperation {
     },
     /// Validate active thoughts against a ground-truth strategy.
     Validate { strategy: ValidationStrategy },
+}
+
+impl fmt::Display for GraphOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Generate { .. } => "generate",
+            Self::Score { .. } => "score",
+            Self::KeepBest { .. } => "keep_best",
+            Self::Merge { .. } => "merge",
+            Self::Refine { .. } => "refine",
+            Self::Validate { .. } => "validate",
+        };
+
+        formatter.write_str(label)
+    }
 }
 
 /// How to score a thought.
@@ -126,6 +142,52 @@ mod tests {
             let decoded: GraphOperation =
                 serde_json::from_str(&encoded).expect("deserialize operation");
             assert_eq!(decoded, operation);
+        }
+    }
+
+    #[test]
+    fn graph_operation_display_uses_stable_labels() {
+        let operations = vec![
+            (
+                GraphOperation::Generate {
+                    num_branches: 1,
+                    prompt_override: None,
+                },
+                "generate",
+            ),
+            (
+                GraphOperation::Score {
+                    strategy: ScoringStrategy::External,
+                },
+                "score",
+            ),
+            (GraphOperation::KeepBest { n: 1 }, "keep_best"),
+            (
+                GraphOperation::Merge {
+                    strategy: MergeStrategy::Concatenate {
+                        separator: "\n".to_string(),
+                    },
+                },
+                "merge",
+            ),
+            (
+                GraphOperation::Refine {
+                    max_iterations: 1,
+                    target_score: 0.5,
+                    scoring: ScoringStrategy::External,
+                },
+                "refine",
+            ),
+            (
+                GraphOperation::Validate {
+                    strategy: ValidationStrategy::AlwaysPass,
+                },
+                "validate",
+            ),
+        ];
+
+        for (operation, expected_label) in operations {
+            assert_eq!(operation.to_string(), expected_label);
         }
     }
 }
