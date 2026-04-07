@@ -20,7 +20,7 @@ use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
+    StreamChunk, ThinkingConfig, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use crate::validation::validate_tool_message_sequence;
 
@@ -117,6 +117,26 @@ fn anthropic_messages_loop_harness(model: &str) -> &'static dyn LoopHarness {
         model,
         null_loop_harness(),
     )
+}
+
+fn validate_anthropic_tool_schema(tool: &ToolDefinition) -> Result<(), LlmError> {
+    let Some(parameters) = tool.parameters.as_object() else {
+        return Err(LlmError::Config(format!(
+            "Anthropic tool `{}` input_schema must be a JSON object",
+            tool.name
+        )));
+    };
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if parameters.contains_key(keyword) {
+            return Err(LlmError::Config(format!(
+                "Anthropic tool `{}` input_schema cannot use top-level `{keyword}`; move conditional requirements into runtime validation or a provider-compatible schema",
+                tool.name
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Anthropic auth mode — determines how credentials are sent.
@@ -343,6 +363,10 @@ impl AnthropicProvider {
         stream: bool,
     ) -> Result<AnthropicRequestBody, LlmError> {
         self.ensure_supported_model(&request.model)?;
+
+        for tool in &request.tools {
+            validate_anthropic_tool_schema(tool)?;
+        }
 
         let mut system_prompt = request.system_prompt.clone();
 
@@ -1500,6 +1524,39 @@ mod tests {
         assert_eq!(serialized["system"], "System prelude\nFollow policy");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_build_request_body_rejects_top_level_schema_combinators() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-3-7-sonnet".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: vec![ToolDefinition {
+                name: "decompose".to_string(),
+                description: "Plan the task".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "allOf": [{"required": ["got_criteria"]}]
+                }),
+            }],
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let error = provider
+            .build_request_body(&request, false)
+            .expect_err("top-level allOf should be rejected");
+
+        assert!(
+            matches!(error, LlmError::Config(message) if message.contains("decompose") && message.contains("top-level `allOf`"))
+        );
     }
 
     #[tokio::test]

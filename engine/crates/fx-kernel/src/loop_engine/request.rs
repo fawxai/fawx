@@ -538,12 +538,12 @@ pub(super) fn decompose_tool_definition() -> ToolDefinition {
                         },
                         "required": ["description"]
                     },
-                    "description": "List of sub-goals to execute. Required when reasoning_mode is standard or omitted."
+                    "description": "List of sub-goals to execute. Required when reasoning_mode is standard or omitted. Do not send with GoT modes."
                 },
                 "strategy": {
                     "type": "string",
                     "enum": ["Sequential", "Parallel"],
-                    "description": "Execution strategy for standard decomposition mode. Not valid for GoT modes."
+                    "description": "Execution strategy for standard decomposition mode. Only valid when reasoning_mode is standard or omitted."
                 },
                 "reasoning_mode": {
                     "type": "string",
@@ -557,28 +557,9 @@ pub(super) fn decompose_tool_definition() -> ToolDefinition {
                 },
                 "got_criteria": {
                     "type": "string",
-                    "description": "Evaluation criteria for GoT scoring. Required for GoT modes."
+                    "description": "Evaluation criteria for GoT scoring. Required when reasoning_mode is got_chain, got_tree, got_graph, or got_consensus."
                 }
-            },
-            "allOf": [
-                {
-                    "if": {
-                        "properties": {
-                            "reasoning_mode": {
-                                "enum": ["got_chain", "got_tree", "got_graph", "got_consensus"]
-                            }
-                        },
-                        "required": ["reasoning_mode"]
-                    },
-                    "then": {
-                        "required": ["got_criteria"]
-                    },
-                    "else": {
-                        "required": ["sub_goals"]
-                    }
-                }
-            ],
-            "required": []
+            }
         }),
     }
 }

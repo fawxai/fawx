@@ -372,13 +372,20 @@ fn assert_decompose_tool_present(tools: &[ToolDefinition]) {
             "got_consensus"
         ])
     );
+    assert!(decompose_tools[0].parameters.get("allOf").is_none());
+    assert!(decompose_tools[0].parameters.get("anyOf").is_none());
+    assert!(decompose_tools[0].parameters.get("oneOf").is_none());
     assert_eq!(
-        decompose_tools[0].parameters["allOf"][0]["then"]["required"],
-        serde_json::json!(["got_criteria"])
+        decompose_tools[0].parameters["properties"]["sub_goals"]["description"],
+        serde_json::json!(
+            "List of sub-goals to execute. Required when reasoning_mode is standard or omitted. Do not send with GoT modes."
+        )
     );
     assert_eq!(
-        decompose_tools[0].parameters["allOf"][0]["else"]["required"],
-        serde_json::json!(["sub_goals"])
+        decompose_tools[0].parameters["properties"]["got_criteria"]["description"],
+        serde_json::json!(
+            "Evaluation criteria for GoT scoring. Required when reasoning_mode is got_chain, got_tree, got_graph, or got_consensus."
+        )
     );
 }
 
@@ -1061,6 +1068,26 @@ async fn decide_rejects_got_mode_when_combined_with_sub_goals() {
     assert!(error
         .reason
         .contains("cannot be combined with GoT reasoning modes"));
+}
+
+#[tokio::test]
+async fn decide_rejects_got_mode_without_criteria() {
+    let mut engine = decomposition_engine(budget_config(10, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "reasoning_mode": "got_chain"
+        }))],
+        usage: None,
+        stop_reason: None,
+    };
+
+    let error = engine
+        .decide(&response)
+        .await
+        .expect_err("got mode should require criteria");
+    assert_eq!(error.stage, "decide");
+    assert!(error.reason.contains("require `got_criteria`"));
 }
 
 #[tokio::test]
