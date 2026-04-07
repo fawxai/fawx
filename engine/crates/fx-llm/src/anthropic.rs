@@ -1,7 +1,7 @@
 //! Anthropic Messages API provider.
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, stream};
+use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -11,13 +11,12 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::provider::{
-    CompletionStream, LlmProvider, LoopHarness, LoopModelMatch, LoopModelProfile,
-    LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
     insert_bearer_authorization, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
+    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
-use crate::streaming::{StreamCallback, collect_completion_stream};
+use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
@@ -1318,7 +1317,7 @@ fn validate_request(body: &AnthropicRequestBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::{StreamEvent, collect_stream_chunks};
+    use crate::streaming::{collect_stream_chunks, StreamEvent};
     use crate::test_helpers::{
         callback_events, read_events, simple_pdf_with_text, spawn_json_server,
     };
@@ -1377,10 +1376,8 @@ mod tests {
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 match expected_after_id {
                     None => assert!(request.starts_with("GET /v1/models HTTP/1.1")),
-                    Some(after_id) => assert!(
-                        request
-                            .starts_with(&format!("GET /v1/models?after_id={after_id} HTTP/1.1"))
-                    ),
+                    Some(after_id) => assert!(request
+                        .starts_with(&format!("GET /v1/models?after_id={after_id} HTTP/1.1"))),
                 }
                 let body = if expected_after_id.is_none() {
                     first
@@ -1645,13 +1642,11 @@ mod tests {
         assert_eq!(chunks[1].tool_use_deltas[0].id.as_deref(), Some("toolu_01"));
 
         assert_eq!(chunks[2].tool_use_deltas.len(), 1);
-        assert!(
-            chunks[2].tool_use_deltas[0]
-                .arguments_delta
-                .as_deref()
-                .unwrap()
-                .contains("query")
-        );
+        assert!(chunks[2].tool_use_deltas[0]
+            .arguments_delta
+            .as_deref()
+            .unwrap()
+            .contains("query"));
         assert_eq!(
             chunks[2].tool_use_deltas[0].id.as_deref(),
             Some("toolu_01"),
@@ -1865,12 +1860,10 @@ mod tests {
         assert_eq!(serialized["source"]["type"], "base64");
         assert_eq!(serialized["source"]["media_type"], "application/pdf");
         assert_eq!(serialized["title"], "brief.pdf");
-        assert!(
-            serialized["source"]["data"]
-                .as_str()
-                .expect("base64 data")
-                .starts_with("JVBERi0")
-        );
+        assert!(serialized["source"]["data"]
+            .as_str()
+            .expect("base64 data")
+            .starts_with("JVBERi0"));
     }
 
     #[test]
@@ -2867,11 +2860,9 @@ mod tests {
             serde_json::from_str(json).expect("error_invalid_request.json must be valid JSON");
         assert_eq!(value["type"], "error");
         assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert!(
-            value["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("max_tokens")
-        );
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
     }
 }

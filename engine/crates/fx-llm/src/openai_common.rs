@@ -125,8 +125,8 @@ fn split_modality_side(side: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiModel, OpenAiModelArchitecture, filter_model_ids,
-        model_architecture_supports_text_chat,
+        filter_model_ids, model_architecture_supports_text_chat, OpenAiModel,
+        OpenAiModelArchitecture,
     };
 
     #[test]

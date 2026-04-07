@@ -107,7 +107,9 @@ impl ModelRouter {
 
     /// Return the provider for a model identifier, if registered.
     pub fn provider_for_model(&self, model: &str) -> Option<&str> {
-        self.models.get(model).map(|model| model.provider_name.as_str())
+        self.models
+            .get(model)
+            .map(|model| model.provider_name.as_str())
     }
 
     /// Return the provider for the active model, if any.
@@ -142,11 +144,7 @@ impl ModelRouter {
         fetch_available_models_from_catalog(self.provider_catalog()).await
     }
 
-    pub fn replace_provider_models(
-        &mut self,
-        provider_name: &str,
-        models: Vec<DiscoveredModel>,
-    ) {
+    pub fn replace_provider_models(&mut self, provider_name: &str, models: Vec<DiscoveredModel>) {
         self.models
             .retain(|_, model| model.provider_name != provider_name);
         for model in models {

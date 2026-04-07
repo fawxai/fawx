@@ -3,7 +3,7 @@
 //! Supports OpenAI and OpenRouter style APIs via configurable `base_url`.
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, stream};
+use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,22 +11,22 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::ModelCatalog;
 use crate::document::document_text_fallback;
-use crate::openai_common::{OpenAiModelsResponse, filter_model_ids};
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
-    CompletionStream, DiscoveredModel, LlmProvider, LoopHarness, LoopModelMatch, LoopModelProfile,
-    LoopPromptOverlayContext, ProviderCapabilities, ProviderCatalogFilters, StaticLoopModelProfile,
     bearer_auth_headers, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles,
+    resolve_loop_harness_from_profiles, CompletionStream, DiscoveredModel, LlmProvider,
+    LoopHarness, LoopModelMatch, LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities,
+    ProviderCatalogFilters, StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
-use crate::streaming::{StreamCallback, collect_completion_stream};
+use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
+use crate::ModelCatalog;
 
 const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
 When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
@@ -1350,7 +1350,7 @@ impl OpenAiSseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::{StreamEvent, collect_stream_chunks};
+    use crate::streaming::{collect_stream_chunks, StreamEvent};
     use crate::test_helpers::{
         callback_events, read_events, simple_pdf_with_text, spawn_json_server,
     };
@@ -1501,14 +1501,12 @@ mod tests {
             provider.supplemental_catalog_model_ids(&[FIREWORKS_KIMI_MODEL_ID.to_string()]),
             vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
         );
-        assert!(
-            provider
-                .supplemental_catalog_model_ids(&[
-                    FIREWORKS_KIMI_MODEL_ID.to_string(),
-                    FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
-                ])
-                .is_empty()
-        );
+        assert!(provider
+            .supplemental_catalog_model_ids(&[
+                FIREWORKS_KIMI_MODEL_ID.to_string(),
+                FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
+            ])
+            .is_empty());
     }
 
     #[test]

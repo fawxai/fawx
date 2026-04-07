@@ -5,30 +5,32 @@
 //! This is the wire format used by ChatGPT Plus/Pro subscriptions via OAuth tokens.
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt, stream};
-use http::{Request, header::HeaderValue};
+use futures::{stream, SinkExt, StreamExt};
+use http::{header::HeaderValue, Request};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use tokio_tungstenite::tungstenite::{
-    self, Message as WsMessage,
+    self,
     client::IntoClientRequest,
-    protocol::{CloseFrame, frame::coding::CloseCode},
+    protocol::{frame::coding::CloseCode, CloseFrame},
+    Message as WsMessage,
 };
 
 use crate::document::document_text_fallback;
 use crate::openai::{
-    OPENAI_THINKING_LEVELS, is_openai_chat_capable, openai_context_window, openai_models_endpoint,
-    openai_thinking_levels,
+    is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
+    OPENAI_THINKING_LEVELS,
 };
-use crate::openai_common::{OpenAiModelsResponse, filter_model_ids};
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{
-    CompletionStream, LlmProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
-    LoopModelProfile, LoopPromptOverlayContext, LoopStreamingRecoveryStrategy,
-    ProviderCapabilities, StaticLoopModelProfile, bearer_auth_headers, insert_header_value,
-    null_loop_harness, resolve_loop_harness_from_profiles,
+    bearer_auth_headers, insert_header_value, null_loop_harness,
+    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
+    LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch, LoopModelProfile,
+    LoopPromptOverlayContext, LoopStreamingRecoveryStrategy, ProviderCapabilities,
+    StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
@@ -1605,7 +1607,7 @@ mod tests {
     use super::*;
     use crate::test_helpers::{simple_pdf_with_text, spawn_json_server};
     use base64::Engine;
-    use futures::{StreamExt, pin_mut, stream};
+    use futures::{pin_mut, stream, StreamExt};
 
     #[test]
     fn endpoint_resolves_correctly() {

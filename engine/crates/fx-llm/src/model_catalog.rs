@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::AnthropicProvider;
 use crate::openai::OpenAiProvider;
-use crate::openai_common::{OpenAiModelArchitecture, model_architecture_supports_text_chat};
+use crate::openai_common::{model_architecture_supports_text_chat, OpenAiModelArchitecture};
 use crate::provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 use crate::types::{CompletionRequest, CompletionResponse, LlmError};
 
@@ -643,11 +643,9 @@ mod tests {
         let parsed = parse_models(provider.as_ref(), json);
 
         assert_eq!(parsed.len(), 2);
-        assert!(
-            parsed
-                .iter()
-                .any(|model| model.id == "anthropic/claude-sonnet-4")
-        );
+        assert!(parsed
+            .iter()
+            .any(|model| model.id == "anthropic/claude-sonnet-4"));
         assert!(parsed.iter().any(|model| model.id == "x-ai/grok-3"));
     }
 
