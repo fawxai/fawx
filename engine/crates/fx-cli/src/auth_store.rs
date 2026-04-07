@@ -215,7 +215,6 @@ fn should_recreate_auth_store(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("different machine identity")
         || error.contains("decrypt")
-        || error.contains("failed to open auth database")
         || error.contains("key derivation failed")
 }
 
@@ -682,6 +681,13 @@ mod tests {
 
         assert!(recovered.recreated);
         assert!(loaded.providers().is_empty());
+    }
+
+    #[test]
+    fn recovery_ignores_lock_and_other_open_failures() {
+        assert!(!should_recreate_auth_store(
+            "failed to open auth database: Database error: Failed to open database: Database already open. Cannot acquire lock."
+        ));
     }
 
     #[test]
