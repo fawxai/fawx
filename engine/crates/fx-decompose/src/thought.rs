@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt;
 
 /// Unique identifier for a thought node in the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -27,6 +28,12 @@ impl GraphNodeId {
 
     pub const fn index(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for GraphNodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -218,6 +225,11 @@ mod tests {
     #[test]
     fn thought_metadata_defaults_to_empty() {
         assert_eq!(ThoughtMetadata::default(), ThoughtMetadata::Empty);
+    }
+
+    #[test]
+    fn graph_node_id_displays_as_raw_index() {
+        assert_eq!(GraphNodeId::new(3).to_string(), "3");
     }
 
     #[test]
