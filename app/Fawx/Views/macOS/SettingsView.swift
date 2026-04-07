@@ -193,7 +193,8 @@ struct SettingsView: View {
         .sheet(isPresented: $isPresentingModelSelector) {
             NavigationStack {
                 ModelSelectionList(
-                    appState: appState,
+                    models: appState.availableModels,
+                    selectedModelID: appState.activeModel?.modelID,
                     disableSelection: disableServerControls,
                     selectModel: { modelID in
                         isPresentingModelSelector = false

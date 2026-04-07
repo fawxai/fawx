@@ -14,7 +14,15 @@ enum SetupStep: Int, CaseIterable, Identifiable, Sendable {
 enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
     case anthropic
     case openai
+    case openrouter
     case fireworks
+
+    static let visibleProviders: [SetupProvider] = [
+        .anthropic,
+        .openai,
+        .openrouter,
+        .fireworks,
+    ]
 
     var id: String { rawValue }
 
@@ -24,6 +32,8 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
             "Claude"
         case .openai:
             "ChatGPT"
+        case .openrouter:
+            "OpenRouter"
         case .fireworks:
             "Fireworks"
         }
@@ -35,6 +45,8 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
             "Anthropic"
         case .openai:
             "OpenAI"
+        case .openrouter:
+            "OpenRouter"
         case .fireworks:
             "Fireworks AI"
         }
@@ -48,8 +60,36 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .anthropic, .openai:
             [.subscription, .apiKey]
-        case .fireworks:
+        case .openrouter, .fireworks:
             [.apiKey]
+        }
+    }
+
+    var iconText: String {
+        switch self {
+        case .anthropic:
+            "A"
+        case .openai:
+            "O"
+        case .openrouter:
+            "R"
+        case .fireworks:
+            "F"
+        }
+    }
+
+    func credentialPrompt(for authMethod: SetupProviderAuthMethod) -> String {
+        switch (self, authMethod) {
+        case (.anthropic, .subscription):
+            "Paste the Anthropic setup token"
+        case (.anthropic, _):
+            "Paste your Anthropic API key"
+        case (.openai, _):
+            "Paste your OpenAI API key"
+        case (.openrouter, _):
+            "Paste your OpenRouter API key"
+        case (.fireworks, _):
+            "Paste your Fireworks API key"
         }
     }
 
@@ -199,16 +239,7 @@ final class SetupViewModel {
     }
 
     var providerFieldPrompt: String {
-        switch selectedProvider {
-        case .anthropic where selectedAuthMethod == .subscription:
-            "Paste the Anthropic setup token"
-        case .anthropic:
-            "Paste your Anthropic API key"
-        case .openai:
-            "Paste your OpenAI API key"
-        case .fireworks:
-            "Paste your Fireworks API key"
-        }
+        selectedProvider.credentialPrompt(for: selectedAuthMethod)
     }
 
     var readyAutoStartEnabled: Bool {

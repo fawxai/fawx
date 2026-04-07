@@ -6,25 +6,16 @@ struct ProviderStep: View {
     @State private var oauthCoordinator = OAuthSessionCoordinator()
 
     var body: some View {
-        SetupWizardCard(maxWidth: 520) {
+        SetupWizardCard(maxWidth: 560) {
             SetupWizardHeader(
                 title: "Add an AI Provider",
-                detail: "Connect Claude, ChatGPT, or Fireworks so your local server is ready to chat."
+                detail: "Connect Claude, ChatGPT, OpenRouter, or Fireworks so your local server is ready to chat."
             )
 
-            VStack(spacing: FawxSpacing.paddingMD) {
-                ForEach(SetupProvider.allCases) { provider in
-                    SetupChoiceCard(
-                        isSelected: viewModel.selectedProvider == provider,
-                        iconText: providerIconText(provider),
-                        title: provider.displayName,
-                        subtitle: provider.companyName,
-                        action: {
-                            viewModel.selectProvider(provider)
-                        }
-                    )
-                }
-            }
+            SetupProviderSelectionGrid(
+                selectedProvider: viewModel.selectedProvider,
+                onSelect: viewModel.selectProvider
+            )
             .disabled(viewModel.isRefreshing)
 
             VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
@@ -155,16 +146,5 @@ struct ProviderStep: View {
             }
             .disabled(viewModel.isRefreshing)
         }
-    }
-}
-
-private func providerIconText(_ provider: SetupProvider) -> String {
-    switch provider {
-    case .anthropic:
-        "A"
-    case .openai:
-        "O"
-    case .fireworks:
-        "F"
     }
 }

@@ -11,6 +11,7 @@ import UIKit
 
 struct InputBar: View {
     @Binding var text: String
+    @State private var isPresentingModelSelector = false
 #if os(macOS)
     @State private var macComposerHeight: CGFloat = macComposerMinimumHeight
 #endif
@@ -62,6 +63,34 @@ struct InputBar: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
         .fawxShadow(FawxShadow.floatingPanel)
+        .sheet(isPresented: $isPresentingModelSelector) {
+            NavigationStack {
+                ModelSelectionList(
+                    models: availableModels,
+                    selectedModelID: activeModel?.modelID,
+                    disableSelection: modelMenuDisabled,
+                    selectModel: { modelID in
+                        isPresentingModelSelector = false
+                        selectModel(modelID)
+                    }
+                )
+                .navigationTitle("Select Model")
+#if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
+#endif
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") {
+                            isPresentingModelSelector = false
+                        }
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 500, minHeight: 420)
+#endif
+            }
+            .fawxOpaqueModalPresentation()
+        }
     }
 
     private var effectivePlaceholder: String {
@@ -181,18 +210,24 @@ struct InputBar: View {
     }
 
     private var modelMenu: some View {
-        Menu {
-            ForEach(availableModels) { model in
-                Button(compactModelName(model.modelID, limit: 28)) {
-                    selectModel(model.modelID)
-                }
+        Button {
+            guard !modelMenuDisabled else {
+                return
             }
+            isPresentingModelSelector = true
         } label: {
-            ModelBadge(
-                title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20),
-                accessibilityLabel: "Selected model \(abbreviateModelName(activeModel?.modelID ?? "Unavailable"))"
-            )
+            HStack(spacing: 6) {
+                ModelBadge(
+                    title: compactModelName(activeModel?.modelID ?? "Unavailable", limit: 20),
+                    accessibilityLabel: "Selected model \(abbreviateModelName(activeModel?.modelID ?? "Unavailable"))"
+                )
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.fawxTextSecondary)
+            }
         }
+        .buttonStyle(.plain)
         .disabled(modelMenuDisabled)
         .help(modelHelpText)
     }

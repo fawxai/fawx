@@ -334,7 +334,8 @@ private struct iOSModelSelectionView: View {
 
     var body: some View {
         ModelSelectionList(
-            appState: appState,
+            models: appState.availableModels,
+            selectedModelID: appState.activeModel?.modelID,
             disableSelection: disableControls,
             selectModel: { modelID in
                 dismiss()

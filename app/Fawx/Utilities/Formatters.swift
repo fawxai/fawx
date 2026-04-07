@@ -76,9 +76,39 @@ func displayThinkingLevel(_ level: ThinkingLevel?, modelID: String? = nil) -> St
     return level.displayName
 }
 
+func displayProviderName(_ provider: String) -> String {
+    switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "openai":
+        return "OpenAI"
+    case "anthropic":
+        return "Anthropic"
+    case "google":
+        return "Google"
+    case "openrouter":
+        return "OpenRouter"
+    case "fireworks":
+        return "Fireworks"
+    default:
+        return humanReadableSettingToken(provider)
+    }
+}
+
+func displayAuthMethodName(_ authMethod: String) -> String {
+    switch authMethod.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "api_key":
+        return "API Key"
+    case "setup_token":
+        return "Setup Token"
+    case "oauth":
+        return "OAuth"
+    default:
+        return humanReadableSettingToken(authMethod)
+    }
+}
+
 func modelMetadataSummary(_ model: ModelInfo) -> String {
-    let provider = humanReadableSettingToken(model.provider)
-    let authMethod = humanReadableSettingToken(model.authMethod)
+    let provider = displayProviderName(model.provider)
+    let authMethod = displayAuthMethodName(model.authMethod)
     return "\(provider) · \(authMethod)"
 }
 
