@@ -315,10 +315,10 @@ private struct iOSModelThinkingSettingsView: View {
     }
 
     private var activeModelName: String {
-        guard let modelID = appState.activeModel?.modelID else {
+        guard let activeModel = appState.activeModel else {
             return "Unavailable"
         }
-        return abbreviateModelName(modelID)
+        return displayModelName(activeModel)
     }
 
     private var hasActiveModel: Bool {
@@ -334,7 +334,8 @@ private struct iOSModelSelectionView: View {
 
     var body: some View {
         ModelSelectionList(
-            appState: appState,
+            models: appState.availableModels,
+            selectedModelID: appState.activeModel?.modelID,
             disableSelection: disableControls,
             selectModel: { modelID in
                 dismiss()

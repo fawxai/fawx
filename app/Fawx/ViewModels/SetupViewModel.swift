@@ -14,30 +14,24 @@ enum SetupStep: Int, CaseIterable, Identifiable, Sendable {
 enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
     case anthropic
     case openai
+    case openrouter
     case fireworks
+
+    static let visibleProviders: [SetupProvider] = [
+        .anthropic,
+        .openai,
+        .openrouter,
+        .fireworks,
+    ]
 
     var id: String { rawValue }
 
     var displayName: String {
-        switch self {
-        case .anthropic:
-            "Claude"
-        case .openai:
-            "ChatGPT"
-        case .fireworks:
-            "Fireworks"
-        }
+        brand.setupDisplayName
     }
 
     var companyName: String {
-        switch self {
-        case .anthropic:
-            "Anthropic"
-        case .openai:
-            "OpenAI"
-        case .fireworks:
-            "Fireworks AI"
-        }
+        brand.companyName
     }
 
     var providerID: String {
@@ -48,8 +42,36 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .anthropic, .openai:
             [.subscription, .apiKey]
-        case .fireworks:
+        case .openrouter, .fireworks:
             [.apiKey]
+        }
+    }
+
+    var iconText: String {
+        switch self {
+        case .anthropic:
+            "A"
+        case .openai:
+            "O"
+        case .openrouter:
+            "R"
+        case .fireworks:
+            "F"
+        }
+    }
+
+    func credentialPrompt(for authMethod: SetupProviderAuthMethod) -> String {
+        switch (self, authMethod) {
+        case (.anthropic, .subscription):
+            "Paste the Anthropic setup token"
+        case (.anthropic, _):
+            "Paste your Anthropic API key"
+        case (.openai, _):
+            "Paste your OpenAI API key"
+        case (.openrouter, _):
+            "Paste your OpenRouter API key"
+        case (.fireworks, _):
+            "Paste your Fireworks API key"
         }
     }
 
@@ -59,6 +81,13 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
 
     func supportsAuthMethod(_ method: SetupProviderAuthMethod) -> Bool {
         supportedAuthMethods.contains(method)
+    }
+
+    private var brand: ProviderBrand {
+        guard let brand = ProviderBrand(rawValue: rawValue) else {
+            preconditionFailure("Missing provider brand for \(rawValue)")
+        }
+        return brand
     }
 }
 
@@ -199,16 +228,7 @@ final class SetupViewModel {
     }
 
     var providerFieldPrompt: String {
-        switch selectedProvider {
-        case .anthropic where selectedAuthMethod == .subscription:
-            "Paste the Anthropic setup token"
-        case .anthropic:
-            "Paste your Anthropic API key"
-        case .openai:
-            "Paste your OpenAI API key"
-        case .fireworks:
-            "Paste your Fireworks API key"
-        }
+        selectedProvider.credentialPrompt(for: selectedAuthMethod)
     }
 
     var readyAutoStartEnabled: Bool {

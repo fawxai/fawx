@@ -7,13 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::AnthropicProvider;
 use crate::openai::OpenAiProvider;
+use crate::openai_common::{OpenAiModelArchitecture, model_architecture_supports_text_chat};
 use crate::provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 use crate::types::{CompletionRequest, CompletionResponse, LlmError};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Maximum model age in seconds (~180 days). Models older than this are filtered out.
+/// Maximum model age in seconds (~180 days) for the shared "recommended" tier.
 const MODEL_AGE_CUTOFF_SECS: u64 = 180 * 24 * 60 * 60;
-/// Minimum input price per token (USD) to filter out weak-tier models.
+/// Minimum input price per token (USD) for the shared "recommended" tier.
 /// $3/M tokens = 0.000003 per token. Roughly sonnet-tier floor.
 const MIN_INPUT_PRICE_PER_TOKEN: f64 = 0.000003;
 
@@ -23,6 +24,7 @@ pub struct CatalogModel {
     pub id: String,
     pub display_name: Option<String>,
     pub provider: String,
+    pub recommended: bool,
 }
 
 /// In-memory dynamic model catalog with provider-scoped cache.
@@ -235,6 +237,7 @@ impl ModelCatalog {
                 id: id.to_string(),
                 display_name: None,
                 provider: provider_key.clone(),
+                recommended: true,
             })
             .collect()
     }
@@ -311,11 +314,7 @@ impl ModelCatalog {
                 continue;
             };
 
-            if !provider.is_chat_capable(id) {
-                continue;
-            }
-
-            if !quality_filters_allow(provider, &model, now_secs) {
+            if !model_is_chat_capable(provider, &model, id) {
                 continue;
             }
 
@@ -323,10 +322,13 @@ impl ModelCatalog {
                 continue;
             }
 
+            let recommended = quality_filters_allow(provider, &model, now_secs);
+
             models.push(CatalogModel {
                 id: id.clone(),
                 display_name: model.display_name.or(model.name),
                 provider: provider_key.clone(),
+                recommended,
             });
         }
 
@@ -343,6 +345,7 @@ impl ModelCatalog {
                 id: supplemental_id,
                 display_name: None,
                 provider: provider_key.clone(),
+                recommended: true,
             });
         }
 
@@ -368,6 +371,11 @@ fn quality_filters_allow(
         return true;
     }
     is_model_recent_enough(model.created, now_secs) && is_model_capable_enough(&model.pricing)
+}
+
+fn model_is_chat_capable(provider: &dyn CompletionProvider, model: &ModelEntry, id: &str) -> bool {
+    model_architecture_supports_text_chat(model.architecture.as_ref())
+        .unwrap_or_else(|| provider.is_chat_capable(id))
 }
 
 fn metadata_credential(credential: &str) -> &str {
@@ -448,6 +456,8 @@ struct ModelEntry {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    architecture: Option<OpenAiModelArchitecture>,
+    #[serde(default)]
     created: Option<u64>,
     #[serde(default)]
     pricing: Option<ModelPricing>,
@@ -500,6 +510,7 @@ mod tests {
             id: id.to_string(),
             display_name: None,
             provider: provider.to_string(),
+            recommended: true,
         }
     }
 
@@ -632,9 +643,11 @@ mod tests {
         let parsed = parse_models(provider.as_ref(), json);
 
         assert_eq!(parsed.len(), 2);
-        assert!(parsed
-            .iter()
-            .any(|model| model.id == "anthropic/claude-sonnet-4"));
+        assert!(
+            parsed
+                .iter()
+                .any(|model| model.id == "anthropic/claude-sonnet-4")
+        );
         assert!(parsed.iter().any(|model| model.id == "x-ai/grok-3"));
     }
 
@@ -975,8 +988,11 @@ mod tests {
 
         let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-within-cutoff");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-beyond-cutoff");
+        assert!(!parsed[0].recommended);
+        assert_eq!(parsed[1].id, "anthropic/claude-sonnet-within-cutoff");
+        assert!(parsed[1].recommended);
     }
 
     #[test]
@@ -1042,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_models_openrouter_filters_old_and_cheap_models() {
+    fn parse_models_openrouter_marks_old_and_cheap_models_not_recommended() {
         let provider = test_provider("openrouter");
         let now_secs = 1_900_000_000_u64;
         let recent = now_secs - (30 * 24 * 60 * 60);
@@ -1063,7 +1079,12 @@ mod tests {
                     {{
                         "id": "some-provider/cheap-model",
                         "created": {recent},
-                        "pricing": {{"prompt": "0.0000001"}}
+                        "pricing": {{"prompt": "0.0000001"}},
+                        "architecture": {{
+                            "modality": "text->text",
+                            "input_modalities": ["text"],
+                            "output_modalities": ["text"]
+                        }}
                     }}
                 ]
             }}"#
@@ -1071,8 +1092,72 @@ mod tests {
 
         let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].id, "anthropic/claude-3.5-sonnet");
+        assert!(!parsed[0].recommended);
+        assert_eq!(parsed[1].id, "anthropic/claude-sonnet-4");
+        assert!(parsed[1].recommended);
+        assert_eq!(parsed[2].id, "some-provider/cheap-model");
+        assert!(!parsed[2].recommended);
+    }
+
+    #[test]
+    fn parse_models_openrouter_uses_architecture_metadata_for_chat_capability() {
+        let provider = test_provider("openrouter");
+        let json = r#"{
+            "data": [
+                {
+                    "id": "z-ai/glm-4.5-air:free",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"]
+                    }
+                },
+                {
+                    "id": "arcee-ai/trinity-large-preview:free",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"]
+                    }
+                },
+                {
+                    "id": "mistralai/mistral-small-2603",
+                    "architecture": {
+                        "modality": "text+image->text"
+                    }
+                },
+                {
+                    "id": "openai/text-embedding-3-large",
+                    "architecture": {
+                        "modality": "text->embedding",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["embedding"]
+                    }
+                },
+                {
+                    "id": "openai/gpt-4o-transcribe",
+                    "architecture": {
+                        "modality": "audio->text",
+                        "input_modalities": ["audio"],
+                        "output_modalities": ["text"]
+                    }
+                }
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+        let ids = parsed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"z-ai/glm-4.5-air:free"));
+        assert!(ids.contains(&"arcee-ai/trinity-large-preview:free"));
+        assert!(ids.contains(&"mistralai/mistral-small-2603"));
+        assert!(!ids.contains(&"openai/text-embedding-3-large"));
+        assert!(!ids.contains(&"openai/gpt-4o-transcribe"));
     }
 
     #[test]

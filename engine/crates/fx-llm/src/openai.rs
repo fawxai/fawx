@@ -3,7 +3,7 @@
 //! Supports OpenAI and OpenRouter style APIs via configurable `base_url`.
 
 use async_trait::async_trait;
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,16 +11,17 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::ModelCatalog;
 use crate::document::document_text_fallback;
-use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
+use crate::openai_common::{OpenAiModelsResponse, filter_model_ids};
 use crate::provider::{
+    CompletionStream, DiscoveredModel, LlmProvider, LoopHarness, LoopModelMatch, LoopModelProfile,
+    LoopPromptOverlayContext, ProviderCapabilities, ProviderCatalogFilters, StaticLoopModelProfile,
     bearer_auth_headers, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
-    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, ProviderCatalogFilters,
-    StaticLoopModelProfile,
+    resolve_loop_harness_from_profiles,
 };
 use crate::sse::{SseFrame, SseFramer};
-use crate::streaming::{collect_completion_stream, StreamCallback};
+use crate::streaming::{StreamCallback, collect_completion_stream};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
@@ -174,15 +175,25 @@ pub(crate) fn openai_context_window(model_id: &str) -> usize {
 
 fn is_openrouter_chat_capable(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
-    id.contains("claude")
-        || id.contains("gpt-")
-        || id.contains("o4")
-        || id.contains("grok")
-        || id.contains("qwen")
-        || id.contains("minimax")
-        || id.contains("liquidai")
-        || id.contains("lfm")
-        || id.contains("deepseek")
+    let tail = id.rsplit('/').next().unwrap_or(id.as_str());
+    let excludes = [
+        "embed",
+        "embedding",
+        "rerank",
+        "reranker",
+        "tts",
+        "whisper",
+        "transcri",
+        "audio",
+        "moderation",
+        "realtime",
+        "search",
+        "dall-e",
+        "image-gen",
+        "image_generation",
+    ];
+
+    !excludes.iter().any(|needle| tail.contains(needle))
 }
 
 fn is_fireworks_chat_capable(model_id: &str) -> bool {
@@ -398,21 +409,14 @@ impl OpenAiProvider {
         parse_model_response(response, self, &self.supported_models).await
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<OpenAiRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
-
+        // The router owns model resolution against the live provider catalog.
+        // Re-validating here against this client's startup snapshot can reject
+        // dynamically discovered models that the router already accepted.
         let mut messages = map_messages_to_openai(&request.messages)?;
 
         if let Some(system_prompt) = &request.system_prompt {
@@ -758,6 +762,73 @@ impl LlmProvider for OpenAiProvider {
             Err(error) => {
                 tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai models; using static fallback");
                 Ok(self.supported_models())
+            }
+        }
+    }
+
+    async fn list_discovered_models(&self) -> Result<Vec<DiscoveredModel>, LlmError> {
+        if matches!(self.catalog_kind, OpenAiCatalogKind::Compatible) {
+            return self.list_models().await.map(|models| {
+                models
+                    .into_iter()
+                    .map(|id| DiscoveredModel {
+                        id,
+                        display_name: None,
+                        recommended: true,
+                    })
+                    .collect()
+            });
+        }
+
+        if self.api_key.trim().is_empty() {
+            return Ok(self
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect());
+        }
+
+        let catalog = ModelCatalog::with_timeout(Duration::from_secs(20));
+        match catalog
+            .fetch_live_models(self.name(), &self.api_key, self.auth_method())
+            .await
+        {
+            Ok(models) if !models.is_empty() => Ok(models
+                .into_iter()
+                .map(|model| DiscoveredModel {
+                    id: model.id,
+                    display_name: model.display_name,
+                    recommended: model.recommended,
+                })
+                .collect()),
+            Ok(_) => Ok(self
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()),
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.provider_name,
+                    error = %error,
+                    "failed to fetch openai catalog metadata; using static fallback"
+                );
+                Ok(self
+                    .supported_models()
+                    .into_iter()
+                    .map(|id| DiscoveredModel {
+                        id,
+                        display_name: None,
+                        recommended: true,
+                    })
+                    .collect())
             }
         }
     }
@@ -1279,7 +1350,7 @@ impl OpenAiSseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::{collect_stream_chunks, StreamEvent};
+    use crate::streaming::{StreamEvent, collect_stream_chunks};
     use crate::test_helpers::{
         callback_events, read_events, simple_pdf_with_text, spawn_json_server,
     };
@@ -1392,7 +1463,11 @@ mod tests {
             200_000
         );
         assert!(provider.is_chat_capable("x-ai/grok-3"));
+        assert!(provider.is_chat_capable("z-ai/glm-4.5-air:free"));
+        assert!(provider.is_chat_capable("arcee-ai/trinity-large-preview:free"));
+        assert!(provider.is_chat_capable("mistralai/mistral-small-2603"));
         assert!(!provider.is_chat_capable("openai/text-embedding-3-large"));
+        assert!(!provider.is_chat_capable("openai/gpt-4o-transcribe"));
         assert_eq!(provider.fallback_models(), OPENROUTER_FALLBACK_MODELS);
         assert!(provider.catalog_filters().apply_recency_and_price_floor);
     }
@@ -1426,12 +1501,14 @@ mod tests {
             provider.supplemental_catalog_model_ids(&[FIREWORKS_KIMI_MODEL_ID.to_string()]),
             vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
         );
-        assert!(provider
-            .supplemental_catalog_model_ids(&[
-                FIREWORKS_KIMI_MODEL_ID.to_string(),
-                FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
-            ])
-            .is_empty());
+        assert!(
+            provider
+                .supplemental_catalog_model_ids(&[
+                    FIREWORKS_KIMI_MODEL_ID.to_string(),
+                    FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
+                ])
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1905,13 +1982,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_rejects_unsupported_model() {
+    fn test_build_request_allows_model_outside_startup_snapshot() {
         let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
             .unwrap()
             .with_supported_models(vec!["gpt-4o-mini".to_string()]);
 
         let request = CompletionRequest {
-            model: "gpt-5".to_string(),
+            model: "arcee-ai/trinity-large-preview:free".to_string(),
             messages: vec![Message::user("hello")],
             tools: Vec::new(),
             temperature: None,
@@ -1921,7 +1998,7 @@ mod tests {
         };
 
         let result = provider.build_request_body(&request, false);
-        assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+        assert!(result.is_ok());
     }
 
     #[test]

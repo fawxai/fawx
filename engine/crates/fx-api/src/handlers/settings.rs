@@ -7,10 +7,24 @@ use axum::Json;
 use serde_json::{json, Value};
 
 pub async fn handle_list_models(State(state): State<HttpState>) -> Json<Value> {
-    let snap = state.shared.read().await;
+    let (active_model, thinking) = {
+        let snap = state.shared.read().await;
+        (snap.active_model, snap.thinking_level)
+    };
+    // Lock order is intentionally shared -> app -> shared. We snapshot the
+    // current selection first, fetch the dynamic catalog from the app without
+    // holding the shared lock, then publish the refreshed read model.
+    let models = {
+        let app = state.app.lock().await;
+        app.available_models_dynamic().await
+    };
+    state
+        .shared
+        .update_model(&active_model, &thinking, models.clone())
+        .await;
     Json(json!({
-        "active_model": snap.active_model,
-        "models": snap.available_models,
+        "active_model": active_model,
+        "models": models,
     }))
 }
 

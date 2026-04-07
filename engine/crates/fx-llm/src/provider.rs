@@ -32,6 +32,14 @@ pub struct ProviderCatalogFilters {
     pub apply_recency_and_price_floor: bool,
 }
 
+/// Typed metadata for a discovered provider model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub recommended: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopTextDeltaMode {
     Emit,
@@ -357,6 +365,20 @@ pub trait LlmProvider: Send + Sync {
     /// without a dynamic catalog override fall back to their static support list.
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         Ok(self.supported_models())
+    }
+
+    /// Fetch available models with typed catalog metadata.
+    async fn list_discovered_models(&self) -> Result<Vec<DiscoveredModel>, LlmError> {
+        self.list_models().await.map(|models| {
+            models
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()
+        })
     }
 
     /// Provider feature support contract.

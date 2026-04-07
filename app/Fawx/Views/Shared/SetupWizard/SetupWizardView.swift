@@ -84,6 +84,32 @@ struct SetupWizardHeader: View {
     }
 }
 
+struct SetupProviderSelectionGrid: View {
+    let selectedProvider: SetupProvider
+    let onSelect: (SetupProvider) -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: FawxSpacing.paddingMD, alignment: .top),
+        GridItem(.flexible(), spacing: FawxSpacing.paddingMD, alignment: .top),
+    ]
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: FawxSpacing.paddingMD) {
+            ForEach(SetupProvider.visibleProviders) { provider in
+                SetupChoiceCard(
+                    isSelected: selectedProvider == provider,
+                    iconText: provider.iconText,
+                    title: provider.displayName,
+                    subtitle: provider.companyName,
+                    action: {
+                        onSelect(provider)
+                    }
+                )
+            }
+        }
+    }
+}
+
 struct SetupWizardProgressView: View {
     let step: SetupStep
 
@@ -162,6 +188,7 @@ struct SetupChoiceCard: View {
                         .foregroundStyle(Color.fawxAccent)
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
             .padding(FawxSpacing.paddingMD)
             .background(isSelected ? Color.fawxAccentSubtle : Color.fawxBackground)
             .clipShape(RoundedRectangle(cornerRadius: 12))

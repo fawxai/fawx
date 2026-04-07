@@ -193,7 +193,8 @@ struct SettingsView: View {
         .sheet(isPresented: $isPresentingModelSelector) {
             NavigationStack {
                 ModelSelectionList(
-                    appState: appState,
+                    models: appState.availableModels,
+                    selectedModelID: appState.activeModel?.modelID,
                     disableSelection: disableServerControls,
                     selectModel: { modelID in
                         isPresentingModelSelector = false
@@ -289,10 +290,10 @@ struct SettingsView: View {
     }
 
     private var activeModelName: String {
-        guard let modelID = appState.activeModel?.modelID else {
+        guard let activeModel = appState.activeModel else {
             return "Unavailable"
         }
-        return abbreviateModelName(modelID)
+        return displayModelName(activeModel)
     }
 
     private var hasActiveModel: Bool {

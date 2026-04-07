@@ -4,9 +4,10 @@ use fx_config::ThinkingBudget;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopStatus};
 use fx_llm::{
-    null_loop_harness, CompletionRequest, LoopHarness, Message, ModelInfo, ModelRouter,
-    ProviderError, StreamCallback, StreamChunk, ThinkingConfig,
+    null_loop_harness, CompletionRequest, DiscoveredModel, LoopHarness, Message, ModelInfo,
+    ModelRouter, ProviderError, StreamCallback, StreamChunk, ThinkingConfig,
 };
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
@@ -155,6 +156,40 @@ pub(crate) fn write_router<T>(
 pub(crate) async fn fetch_shared_available_models(router: &SharedModelRouter) -> Vec<ModelInfo> {
     let catalog = read_router(router, ModelRouter::provider_catalog);
     fx_llm::fetch_available_models_from_catalog(catalog).await
+}
+
+pub(crate) async fn sync_shared_available_models(router: &SharedModelRouter) -> Vec<ModelInfo> {
+    let provider_names = read_router(router, |shared_router| {
+        shared_router
+            .provider_catalog()
+            .into_iter()
+            .map(|entry| entry.provider_name)
+            .collect::<Vec<_>>()
+    });
+    let models = fetch_shared_available_models(router).await;
+
+    let mut models_by_provider = HashMap::<String, Vec<DiscoveredModel>>::new();
+    for model in &models {
+        models_by_provider
+            .entry(model.provider_name.clone())
+            .or_default()
+            .push(DiscoveredModel {
+                id: model.model_id.clone(),
+                display_name: model.display_name.clone(),
+                recommended: model.recommended,
+            });
+    }
+
+    write_router(router, |shared_router| {
+        for provider_name in &provider_names {
+            shared_router.replace_provider_models(
+                provider_name,
+                models_by_provider.remove(provider_name).unwrap_or_default(),
+            );
+        }
+    });
+
+    models
 }
 
 fn prepare_router_request(
@@ -620,6 +655,49 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DynamicCatalogProvider {
+        provider_name: String,
+        supported_models: Vec<String>,
+        discovered_models: Vec<DiscoveredModel>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for DynamicCatalogProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            unimplemented!()
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            unimplemented!()
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.supported_models.clone()
+        }
+
+        async fn list_discovered_models(&self) -> Result<Vec<DiscoveredModel>, ProviderError> {
+            Ok(self.discovered_models.clone())
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
     #[test]
     fn resolve_model_alias_supports_new_claude_families() {
         let models = vec![
@@ -639,16 +717,22 @@ mod tests {
                 model_id: "claude-sonnet-4-20260514".to_string(),
                 provider_name: "Anthropic".to_string(),
                 auth_method: "subscription".to_string(),
+                display_name: None,
+                recommended: true,
             },
             ModelInfo {
                 model_id: "claude-opus-4-20260514".to_string(),
                 provider_name: "Anthropic".to_string(),
                 auth_method: "subscription".to_string(),
+                display_name: None,
+                recommended: true,
             },
             ModelInfo {
                 model_id: "gpt-4o".to_string(),
                 provider_name: "OpenAI".to_string(),
                 auth_method: "api_key".to_string(),
+                display_name: None,
+                recommended: true,
             },
         ];
 
@@ -804,6 +888,30 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "claude-opus-4-6");
         assert_eq!(models[0].provider_name, "Anthropic");
+    }
+
+    #[tokio::test]
+    async fn sync_shared_available_models_updates_router_registry() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(DynamicCatalogProvider {
+            provider_name: "OpenRouter".to_string(),
+            supported_models: Vec::new(),
+            discovered_models: vec![DiscoveredModel {
+                id: "openai/gpt-5.4".to_string(),
+                display_name: Some("GPT-5.4".to_string()),
+                recommended: false,
+            }],
+        }));
+        let router = shared_router(router);
+
+        let models = sync_shared_available_models(&router).await;
+        let registered_models = read_router(&router, ModelRouter::available_models);
+
+        assert_eq!(models, registered_models);
+        assert_eq!(registered_models.len(), 1);
+        assert_eq!(registered_models[0].model_id, "openai/gpt-5.4");
+        assert_eq!(registered_models[0].display_name.as_deref(), Some("GPT-5.4"));
+        assert!(!registered_models[0].recommended);
     }
 
     #[test]

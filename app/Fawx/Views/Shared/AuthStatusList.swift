@@ -40,7 +40,7 @@ struct AuthStatusList: View {
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxText)
 
-                    Text("Add Claude, ChatGPT, or Fireworks credentials here instead of dropping to setup commands. GitHub PAT management lives below for git push and pull request creation.")
+                    Text("Add Claude, ChatGPT, OpenRouter, or Fireworks credentials here instead of dropping to setup commands. GitHub PAT management lives below for git push and pull request creation.")
                         .font(FawxTypography.chatBody)
                         .foregroundStyle(Color.fawxTextSecondary)
                 }
@@ -359,29 +359,13 @@ struct AuthStatusList: View {
 
     private var preferredProviderForEditor: SetupProvider {
         let configuredProviders = Set(appState.authProviders.filter(\.isConfigured).map { $0.provider.lowercased() })
-        if !configuredProviders.contains(SetupProvider.openai.providerID) {
-            return .openai
-        }
-        if !configuredProviders.contains(SetupProvider.anthropic.providerID) {
-            return .anthropic
-        }
-        if !configuredProviders.contains(SetupProvider.fireworks.providerID) {
-            return .fireworks
-        }
-        return .openai
+        return SetupProvider.allCases.first(where: { provider in
+            !configuredProviders.contains(provider.providerID)
+        }) ?? .openai
     }
 
     private func setupProvider(for provider: String) -> SetupProvider? {
-        switch provider.lowercased() {
-        case SetupProvider.openai.providerID:
-            .openai
-        case SetupProvider.anthropic.providerID:
-            .anthropic
-        case SetupProvider.fireworks.providerID:
-            .fireworks
-        default:
-            nil
-        }
+        SetupProvider(rawValue: provider.lowercased())
     }
 
     private func verifyConfiguredProvider(_ provider: String) async {
@@ -432,6 +416,8 @@ struct AuthStatusList: View {
             "Google"
         case "openrouter":
             "OpenRouter"
+        case "fireworks":
+            "Fireworks"
         default:
             provider
                 .replacingOccurrences(of: "-", with: " ")
@@ -708,12 +694,12 @@ private struct ProviderManagementSheet: View {
                         .font(FawxTypography.sidebarTitle)
                         .foregroundStyle(Color.fawxText)
 
-                    Picker("Provider", selection: $selectedProvider) {
-                        ForEach(SetupProvider.allCases) { provider in
-                            Text(provider.displayName).tag(provider)
+                    SetupProviderSelectionGrid(
+                        selectedProvider: selectedProvider,
+                        onSelect: { provider in
+                            selectedProvider = provider
                         }
-                    }
-                    .pickerStyle(.segmented)
+                    )
                 }
 
                 settingsBlock {
@@ -756,7 +742,7 @@ private struct ProviderManagementSheet: View {
                 }
             }
         }
-        .frame(minWidth: 460, minHeight: 420)
+        .frame(minWidth: 520, minHeight: 500)
         .onChange(of: selectedProvider) { _, newProvider in
             selectedAuthMethod = normalizedAuthMethod(for: newProvider, requested: selectedAuthMethod)
         }
@@ -847,14 +833,7 @@ private struct ProviderManagementSheet: View {
     }
 
     private var providerFieldPrompt: String {
-        if selectedProvider == .anthropic && selectedAuthMethod == .subscription {
-            return "Paste the Anthropic setup token"
-        } else if selectedProvider == .anthropic {
-            return "Paste your Anthropic API key"
-        } else if selectedProvider == .fireworks {
-            return "Paste your Fireworks API key"
-        }
-        return "Paste your OpenAI API key"
+        selectedProvider.credentialPrompt(for: selectedAuthMethod)
     }
 
     private func settingsBlock<Content: View>(

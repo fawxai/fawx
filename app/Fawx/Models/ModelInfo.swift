@@ -14,13 +14,40 @@ struct ModelInfo: Codable, Identifiable, Sendable, Hashable {
     let modelID: String
     let provider: String
     let authMethod: String
+    let displayName: String?
+    let recommended: Bool
 
     var id: String { modelID }
+
+    init(
+        modelID: String,
+        provider: String,
+        authMethod: String,
+        displayName: String? = nil,
+        recommended: Bool = true
+    ) {
+        self.modelID = modelID
+        self.provider = provider
+        self.authMethod = authMethod
+        self.displayName = displayName
+        self.recommended = recommended
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelID = "model_id"
         case provider
         case authMethod = "auth_method"
+        case displayName = "display_name"
+        case recommended
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelID = try container.decode(String.self, forKey: .modelID)
+        provider = try container.decode(String.self, forKey: .provider)
+        authMethod = try container.decode(String.self, forKey: .authMethod)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        recommended = try container.decodeIfPresent(Bool.self, forKey: .recommended) ?? true
     }
 }
 

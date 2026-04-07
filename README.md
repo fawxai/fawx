@@ -24,7 +24,7 @@ cd fawx && cargo build --release
 ./target/release/fawx serve
 ```
 
-Bring your own API key (Anthropic, OpenAI, or local models). Fawx never sends data anywhere except the LLM provider you choose.
+Bring your own API key (Anthropic, OpenAI, OpenRouter, Fireworks, or local models). Fawx never sends data anywhere except the LLM provider you choose.
 
 ---
 
@@ -63,7 +63,8 @@ Fawx: [search_text] Searching for TODO patterns...
 │ ripcord  │ config, node │ tts, scheduler    │
 ├──────────┴──────────────┴───────────────────┤
 │  LLM Providers  ·  Memory  ·  Embeddings    │
-│  Claude · OpenAI · Local (llama.cpp)        │
+│  Claude · OpenAI · OpenRouter · Fireworks   │
+│  Local (llama.cpp)                          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -150,6 +151,8 @@ Available skills: [web search](https://github.com/fawxai/skill-brave-search) · 
 |----------|------|-----------|----------|----------|
 | Anthropic Claude | API key, setup token | ✓ | ✓ | ✓ |
 | OpenAI (GPT, Codex) | API key, OAuth PKCE | ✓ | ✓ | ✓ |
+| OpenRouter | API key | ✓ | ✓ | — |
+| Fireworks | API key | ✓ | ✓ | ✓ |
 | Local (llama.cpp) | None | ✓ | ✓ | — |
 
 Provider fallback with health tracking: if the primary provider fails, Fawx routes to the next healthy provider automatically.

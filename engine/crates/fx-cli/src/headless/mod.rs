@@ -93,8 +93,9 @@ use crate::context::load_context_files;
 #[cfg(test)]
 use crate::helpers::render_model_menu_text;
 use crate::helpers::{
-    format_memory_for_prompt, read_router, resolve_model_alias, trim_history, write_router,
-    AnalysisCompletionProvider, RouterLoopLlmProvider, SharedModelRouter,
+    format_memory_for_prompt, read_router, resolve_model_alias, sync_shared_available_models,
+    trim_history, write_router, AnalysisCompletionProvider, RouterLoopLlmProvider,
+    SharedModelRouter,
 };
 use crate::proposal_review::ReviewContext;
 use crate::startup::{
@@ -1781,6 +1782,14 @@ impl AppEngine for HeadlessApp {
 
     fn available_models(&self) -> Vec<ModelInfoDto> {
         HeadlessApp::available_models(self)
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
+    async fn available_models_dynamic(&self) -> Vec<ModelInfoDto> {
+        sync_shared_available_models(&self.router)
+            .await
             .into_iter()
             .map(ModelInfoDto::from)
             .collect()
@@ -4410,6 +4419,8 @@ mod tests {
                 model_id: "gpt-4o".to_string(),
                 provider_name: "openai".to_string(),
                 auth_method: "oauth".to_string(),
+                display_name: None,
+                recommended: true,
             }],
             vec![
                 StoredAuthProviderEntry {
@@ -4438,6 +4449,8 @@ mod tests {
                 model_id: "gpt-4o-mini".to_string(),
                 provider_name: "github".to_string(),
                 auth_method: "api_key".to_string(),
+                display_name: None,
+                recommended: true,
             }],
             vec![StoredAuthProviderEntry {
                 provider: "github".to_string(),

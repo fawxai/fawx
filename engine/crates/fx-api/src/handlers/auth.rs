@@ -305,6 +305,7 @@ fn unique_catalog_model_ids(models: Vec<fx_llm::CatalogModel>) -> Vec<String> {
 fn provider_display_name(provider: &str) -> &str {
     match provider {
         "anthropic" => "Anthropic",
+        "fireworks" => "Fireworks",
         "github" => "GitHub",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
@@ -330,7 +331,6 @@ pub(super) async fn save_auth_method(
     store
         .save_auth_manager(&auth_manager)
         .map_err(internal_error)?;
-    fx_config::clear_provider_model_cache(&state.data_dir, provider).map_err(internal_error)?;
     reload_app_providers(state).await;
     Ok(())
 }
@@ -381,6 +381,47 @@ fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::DeviceStore;
+    use crate::pairing::PairingState;
+    use crate::server_runtime::ServerRuntime;
+    use crate::state::{build_channel_runtime, in_memory_telemetry, HttpState, SharedReadState};
+    use crate::test_support::StubAppEngine;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    fn test_state(data_dir: std::path::PathBuf) -> HttpState {
+        let app = StubAppEngine::default();
+        let shared = Arc::new(SharedReadState::from_app(&app));
+
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
+            session_registry: None,
+            start_time: Instant::now(),
+            server_runtime: ServerRuntime::local(8400),
+            tailscale_ip: None,
+            bearer_token: "test-token".to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
+            channels: build_channel_runtime(None, Vec::new()),
+            data_dir: data_dir.clone(),
+            synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
+            fleet_manager: None,
+            cron_store: None,
+            experiment_registry: Arc::new(tokio::sync::Mutex::new(
+                crate::experiment_registry::ExperimentRegistry::new(data_dir.as_path())
+                    .expect("experiment registry"),
+            )),
+            improvement_provider: None,
+            telemetry: in_memory_telemetry(),
+        }
+    }
 
     #[test]
     fn setup_token_response_serializes_expected_shape() {
@@ -463,5 +504,41 @@ mod tests {
         assert_eq!(request.0, "anthropic");
         assert_eq!(request.1, "setup-token-123");
         assert_eq!(request.2, "setup_token");
+    }
+
+    #[tokio::test]
+    async fn save_auth_method_preserves_provider_model_cache() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fx_config::update_provider_model_cache(
+            temp.path(),
+            "openrouter",
+            &[
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ],
+        )
+        .expect("seed provider model cache");
+        let state = test_state(temp.path().to_path_buf());
+
+        save_auth_method(
+            &state,
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "or-test-key".to_string(),
+            },
+        )
+        .await
+        .expect("save auth");
+
+        let cache =
+            fx_config::load_provider_model_cache(temp.path()).expect("reload provider model cache");
+        assert_eq!(
+            cache.models_for("openrouter"),
+            Some(vec![
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ])
+        );
     }
 }

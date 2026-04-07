@@ -94,6 +94,13 @@ final class SetupViewModelTests: XCTestCase {
         XCTAssertNil(sut.bootstrapProgress)
     }
 
+    func testVisibleProvidersIncludeOpenRouterAndFireworks() {
+        XCTAssertEqual(
+            SetupProvider.visibleProviders,
+            [.anthropic, .openai, .openrouter, .fireworks]
+        )
+    }
+
     func testSelectingFireworksForcesAPIKeyAuthMethod() {
         let sut = SetupViewModel(appState: makeAppState())
 
@@ -105,6 +112,19 @@ final class SetupViewModelTests: XCTestCase {
         XCTAssertEqual(sut.providerActionTitle, "Save API Key")
         XCTAssertEqual(sut.providerFieldTitle, "API Key")
         XCTAssertEqual(sut.providerFieldPrompt, "Paste your Fireworks API key")
+    }
+
+    func testSelectingOpenRouterForcesAPIKeyAuthMethod() {
+        let sut = SetupViewModel(appState: makeAppState())
+
+        sut.selectProvider(.openrouter)
+
+        XCTAssertEqual(sut.selectedAuthMethod, .apiKey)
+        XCTAssertEqual(sut.availableAuthMethods, [.apiKey])
+        XCTAssertFalse(sut.supportsSubscriptionFlow)
+        XCTAssertEqual(sut.providerActionTitle, "Save API Key")
+        XCTAssertEqual(sut.providerFieldTitle, "API Key")
+        XCTAssertEqual(sut.providerFieldPrompt, "Paste your OpenRouter API key")
     }
 
     func testSelectingUnsupportedAuthMethodFallsBackToProviderDefault() {

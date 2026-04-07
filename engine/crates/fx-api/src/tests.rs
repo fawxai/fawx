@@ -17,6 +17,7 @@ use crate::sse::{send_sse_frame, serialize_stream_event};
 use crate::state::{
     build_channel_runtime, in_memory_telemetry, ChannelRuntime, HttpState, SharedReadState,
 };
+use crate::test_support::StubAppEngine;
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
     ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, DocumentPayload,
@@ -66,103 +67,10 @@ use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-secret-token-abc123";
 
-struct PromptStateApp {
-    prompt_state: Arc<PermissionPromptState>,
-}
-
-#[async_trait]
-impl AppEngine for PromptStateApp {
-    async fn process_message(
-        &mut self,
-        _input: &str,
-        _images: Vec<ImageAttachment>,
-        _documents: Vec<DocumentAttachment>,
-        _source: InputSource,
-        _callback: Option<StreamCallback>,
-    ) -> Result<ApiCycleResult, anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    async fn process_message_with_context(
-        &mut self,
-        _input: &str,
-        _images: Vec<ImageAttachment>,
-        _documents: Vec<DocumentAttachment>,
-        _context: Vec<Message>,
-        _source: InputSource,
-        _callback: Option<StreamCallback>,
-    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    fn active_model(&self) -> &str {
-        "mock-model"
-    }
-
-    fn available_models(&self) -> Vec<ModelInfoDto> {
-        Vec::new()
-    }
-
-    fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    fn thinking_level(&self) -> ThinkingLevelDto {
-        ThinkingLevelDto {
-            level: "normal".to_string(),
-            budget_tokens: None,
-            available: Vec::new(),
-        }
-    }
-
-    fn context_info(&self) -> ContextInfoDto {
-        ContextInfoDto {
-            used_tokens: 0,
-            max_tokens: 4_096,
-            percentage: 0.0,
-            compaction_threshold: 0.8,
-        }
-    }
-
-    fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
-        self.context_info()
-    }
-
-    fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
-        Ok(self.thinking_level())
-    }
-
-    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
-        Vec::new()
-    }
-
-    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
-        Vec::new()
-    }
-
-    fn config_manager(&self) -> Option<ConfigManagerHandle> {
-        None
-    }
-
-    fn session_bus(&self) -> Option<&SessionBus> {
-        None
-    }
-
-    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
-        Some(Arc::clone(&self.prompt_state))
-    }
-
-    fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
-        Vec::new()
-    }
-}
-
 #[test]
 fn app_permission_prompts_reuses_app_owned_prompt_state() {
     let prompt_state = Arc::new(PermissionPromptState::new());
-    let app = PromptStateApp {
-        prompt_state: Arc::clone(&prompt_state),
-    };
+    let app = StubAppEngine::default().with_permission_prompt_state(Arc::clone(&prompt_state));
 
     let resolved = crate::app_permission_prompts(&app);
 
@@ -1700,6 +1608,8 @@ mod routing_and_status {
                 model_id: "mock-model".to_string(),
                 provider: "test".to_string(),
                 auth_method: "none".to_string(),
+                display_name: None,
+                recommended: true,
             }]
         }
 
@@ -1900,6 +1810,46 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
             synthesis: synthesis_state(has_synthesis),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
+            fleet_manager: None,
+            cron_store: None,
+            experiment_registry: {
+                let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                Arc::new(tokio::sync::Mutex::new(registry))
+            },
+            improvement_provider: None,
+            telemetry: in_memory_telemetry(),
+        }
+    }
+
+    fn test_state_with_engine(app: impl AppEngine + 'static) -> HttpState {
+        let data_dir = std::env::temp_dir().join(format!(
+            "fawx-api-engine-tests-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        let shared = Arc::new(SharedReadState::from_app(&app));
+
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
+            session_registry: None,
+            start_time: Instant::now(),
+            server_runtime: test_server_runtime(),
+            tailscale_ip: None,
+            bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
+            channels: build_channel_runtime(None, Vec::new()),
+            data_dir,
+            synthesis: synthesis_state(false),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             ripcord: None,
@@ -4441,6 +4391,41 @@ allowed_chat_ids = [123]
         assert_eq!(json["models"].as_array().expect("models").len(), 2);
         assert_eq!(json["models"][0]["provider"], "anthropic");
         assert_eq!(json["models"][1]["model_id"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn list_models_prefers_dynamic_catalog_metadata() {
+        let state = test_state_with_engine(
+            StubAppEngine::default()
+                .with_active_model("openai/gpt-5.4")
+                .with_static_models(vec![ModelInfoDto {
+                    model_id: "stale-model".to_string(),
+                    provider: "openrouter".to_string(),
+                    auth_method: "api_key".to_string(),
+                    display_name: None,
+                    recommended: true,
+                }])
+                .with_dynamic_models(vec![ModelInfoDto {
+                    model_id: "openai/gpt-5.4".to_string(),
+                    provider: "openrouter".to_string(),
+                    auth_method: "api_key".to_string(),
+                    display_name: Some("GPT-5.4".to_string()),
+                    recommended: false,
+                }]),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/models"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["models"].as_array().expect("models").len(), 1);
+        assert_eq!(json["models"][0]["model_id"], "openai/gpt-5.4");
+        assert_eq!(json["models"][0]["display_name"], "GPT-5.4");
+        assert_eq!(json["models"][0]["recommended"], false);
     }
 
     #[tokio::test]

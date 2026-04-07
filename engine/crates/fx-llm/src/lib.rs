@@ -42,7 +42,7 @@ pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{
     default_loop_response_classification, default_loop_truncation_resume_messages,
-    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream,
+    null_loop_harness, resolve_loop_harness_from_profiles, CompletionStream, DiscoveredModel,
     LlmProvider as CompletionProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
     LoopModelProfile, LoopPromptOverlayContext, LoopResponseClassification,
     LoopResponseTextClassification, LoopStreamingRecoveryStrategy, LoopTextDeltaMode,

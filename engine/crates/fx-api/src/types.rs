@@ -252,6 +252,9 @@ pub struct ModelInfoDto {
     pub model_id: String,
     pub provider: String,
     pub auth_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub recommended: bool,
 }
 
 impl From<fx_llm::ModelInfo> for ModelInfoDto {
@@ -260,6 +263,8 @@ impl From<fx_llm::ModelInfo> for ModelInfoDto {
             model_id: m.model_id,
             provider: m.provider_name,
             auth_method: m.auth_method,
+            display_name: m.display_name,
+            recommended: m.recommended,
         }
     }
 }
