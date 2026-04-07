@@ -1,10 +1,10 @@
 use crate::{GraphBuilder, GraphNodeId, GraphOfOperations, GraphOperation, GraphTopologyError};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_PRESET_BRANCHES: usize = 3;
-const DEFAULT_GRAPH_KEEP: usize = 2;
-const DEFAULT_GRAPH_REFINE_ITERATIONS: usize = 2;
-const DEFAULT_GRAPH_TARGET_SCORE: f64 = 0.95;
+pub(crate) const DEFAULT_PRESET_BRANCHES: usize = 3;
+pub(crate) const DEFAULT_GRAPH_KEEP: usize = 2;
+pub(crate) const DEFAULT_GRAPH_REFINE_ITERATIONS: usize = 2;
+pub(crate) const DEFAULT_GRAPH_TARGET_SCORE: f64 = 0.95;
 
 /// How the agent should reason through a decomposition request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -19,6 +19,13 @@ pub enum ReasoningMode {
 impl ReasoningMode {
     pub const fn is_standard(&self) -> bool {
         matches!(self, Self::Standard)
+    }
+
+    pub fn estimated_llm_calls_lower_bound(&self) -> u32 {
+        match self {
+            Self::Standard => 0,
+            Self::GraphOfThoughts { graph } => graph.estimated_llm_calls_lower_bound(),
+        }
     }
 }
 
@@ -39,6 +46,9 @@ pub enum GraphOfOperationsSpec {
         criteria: String,
     },
     /// Build a graph from explicit operations and edges.
+    ///
+    /// This variant is reserved for programmatic callers and tests; the kernel
+    /// tool boundary currently exposes only named presets.
     Custom {
         operations: Vec<GraphOperation>,
         #[serde(default)]
@@ -72,6 +82,15 @@ impl GraphOfOperationsSpec {
             } => build_custom_graph(operations, edges, *max_iterations_per_cycle),
         }
     }
+
+    pub fn estimated_llm_calls_lower_bound(&self) -> u32 {
+        match self {
+            Self::Preset { name, branches, .. } => {
+                preset_llm_calls_lower_bound(*name, branches.unwrap_or(DEFAULT_PRESET_BRANCHES))
+            }
+            Self::Custom { operations, .. } => custom_llm_calls_lower_bound(operations),
+        }
+    }
 }
 
 /// A single edge in a custom graph specification.
@@ -89,6 +108,72 @@ pub enum GoTPreset {
     TreeOfThought,
     GraphOfThought,
     Consensus,
+}
+
+fn preset_llm_calls_lower_bound(preset: GoTPreset, branches: usize) -> u32 {
+    let branches = saturating_u32(branches);
+    match preset {
+        GoTPreset::ChainOfThought => 2,
+        GoTPreset::TreeOfThought => branches.saturating_mul(2),
+        GoTPreset::GraphOfThought => branches.saturating_mul(2).saturating_add(2),
+        GoTPreset::Consensus => branches.saturating_mul(2).saturating_add(1),
+    }
+}
+
+fn custom_llm_calls_lower_bound(operations: &[GraphOperation]) -> u32 {
+    let mut active_thoughts = 1_u32;
+    let mut llm_calls = 0_u32;
+
+    for operation in operations {
+        match operation {
+            GraphOperation::Generate { num_branches, .. } => {
+                let branches = saturating_u32(*num_branches);
+                llm_calls = llm_calls.saturating_add(active_thoughts.saturating_mul(branches));
+                active_thoughts = active_thoughts.saturating_mul(branches);
+            }
+            GraphOperation::Score { strategy } => {
+                if uses_llm_scoring(strategy) {
+                    llm_calls = llm_calls.saturating_add(active_thoughts);
+                }
+            }
+            GraphOperation::KeepBest { n } => {
+                active_thoughts = active_thoughts.min(saturating_u32(*n));
+            }
+            GraphOperation::Merge { strategy } => {
+                if active_thoughts > 0 {
+                    if matches!(strategy, crate::MergeStrategy::LlmSynthesis { .. }) {
+                        llm_calls = llm_calls.saturating_add(1);
+                    }
+                    active_thoughts = 1;
+                }
+            }
+            GraphOperation::Refine {
+                max_iterations,
+                scoring,
+                ..
+            } => {
+                if *max_iterations > 0 && uses_llm_scoring(scoring) {
+                    // Lower bound: refine always scores once before it can stop.
+                    llm_calls = llm_calls.saturating_add(active_thoughts);
+                }
+            }
+            GraphOperation::Validate { strategy } => {
+                if matches!(strategy, crate::ValidationStrategy::LlmJudge { .. }) {
+                    llm_calls = llm_calls.saturating_add(active_thoughts);
+                }
+            }
+        }
+    }
+
+    llm_calls
+}
+
+fn uses_llm_scoring(strategy: &crate::ScoringStrategy) -> bool {
+    matches!(strategy, crate::ScoringStrategy::LlmRating { .. })
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn build_preset_graph(
@@ -157,6 +242,16 @@ mod tests {
 
     #[test]
     fn preset_graph_specs_build_expected_topologies() {
+        let chain = GraphOfOperationsSpec::Preset {
+            name: GoTPreset::ChainOfThought,
+            branches: None,
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria: "focus".to_string(),
+        }
+        .build()
+        .expect("chain preset");
         let tree = GraphOfOperationsSpec::Preset {
             name: GoTPreset::TreeOfThought,
             branches: Some(4),
@@ -178,8 +273,16 @@ mod tests {
         .build()
         .expect("graph preset");
 
+        assert_eq!(chain.len(), 2);
         assert_eq!(tree.len(), 3);
         assert_eq!(graph.len(), 6);
+        assert!(matches!(
+            chain.nodes()[0].operation(),
+            GraphOperation::Generate {
+                num_branches: 1,
+                prompt_override: None
+            }
+        ));
         assert!(matches!(
             graph.nodes()[4].operation(),
             GraphOperation::Refine {
@@ -231,5 +334,28 @@ mod tests {
             graph.successors(GraphNodeId::new(2)),
             vec![GraphNodeId::new(3)]
         );
+    }
+
+    #[test]
+    fn llm_call_lower_bound_matches_presets() {
+        let chain = GraphOfOperationsSpec::Preset {
+            name: GoTPreset::ChainOfThought,
+            branches: None,
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria: "clarity".to_string(),
+        };
+        let graph = GraphOfOperationsSpec::Preset {
+            name: GoTPreset::GraphOfThought,
+            branches: Some(3),
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria: "quality".to_string(),
+        };
+
+        assert_eq!(chain.estimated_llm_calls_lower_bound(), 2);
+        assert_eq!(graph.estimated_llm_calls_lower_bound(), 8);
     }
 }

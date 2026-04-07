@@ -1278,6 +1278,7 @@ struct DecomposeToolArguments {
 #[serde(rename_all = "snake_case")]
 enum DecomposeReasoningMode {
     Standard,
+    GotChain,
     GotTree,
     GotGraph,
     GotConsensus,
@@ -3241,33 +3242,32 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Option<Result<ActionResult, LoopError>> {
-        if !plan.reasoning_mode.is_standard() {
-            return None;
-        }
-        if self.is_batch_plan(plan) {
-            if let Some(calls) = self.batch_to_tool_calls(plan) {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Trace,
-                    "decompose_batch_detected",
-                    serde_json::json!({
-                        "sub_goal_count": plan.sub_goals.len(),
-                        "common_tool": &plan.sub_goals[0].required_tools[0],
-                    }),
-                );
-                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+        if plan.reasoning_mode.is_standard() {
+            if self.is_batch_plan(plan) {
+                if let Some(calls) = self.batch_to_tool_calls(plan) {
+                    self.emit_signal(
+                        LoopStep::Act,
+                        SignalKind::Trace,
+                        "decompose_batch_detected",
+                        serde_json::json!({
+                            "sub_goal_count": plan.sub_goals.len(),
+                            "common_tool": &plan.sub_goals[0].required_tools[0],
+                        }),
+                    );
+                    return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+                }
             }
-        }
 
-        if self.is_trivial_plan(plan) {
-            if let Some(calls) = self.batch_to_tool_calls(plan) {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Trace,
-                    "decompose_complexity_floor",
-                    serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
-                );
-                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+            if self.is_trivial_plan(plan) {
+                if let Some(calls) = self.batch_to_tool_calls(plan) {
+                    self.emit_signal(
+                        LoopStep::Act,
+                        SignalKind::Trace,
+                        "decompose_complexity_floor",
+                        serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
+                    );
+                    return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+                }
             }
         }
 

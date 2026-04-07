@@ -6,7 +6,7 @@ use crate::context_manager::ContextCompactor;
 use async_trait::async_trait;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::types::{InputSource, ScreenState, UserInput};
-use fx_decompose::{AggregationStrategy, DecompositionPlan, ReasoningMode, SubGoal};
+use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
     ToolDefinition,
@@ -423,8 +423,8 @@ pub(super) fn build_engine_with_executor(
 }
 
 pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals: descriptions
+    DecompositionPlan::standard(
+        descriptions
             .iter()
             .map(|desc| {
                 SubGoal::with_definition_of_done(
@@ -435,8 +435,6 @@ pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
                 )
             })
             .collect(),
-        strategy: AggregationStrategy::Sequential,
-        reasoning_mode: ReasoningMode::Standard,
-        truncated_from: None,
-    }
+        AggregationStrategy::Sequential,
+    )
 }

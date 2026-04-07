@@ -134,8 +134,8 @@ fn decomposition_engine(config: BudgetConfig, depth: u32) -> LoopEngine {
 }
 
 fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals: descriptions
+    DecompositionPlan::standard(
+        descriptions
             .iter()
             .map(|description| {
                 SubGoal::with_definition_of_done(
@@ -146,10 +146,8 @@ fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
                 )
             })
             .collect(),
-        strategy: AggregationStrategy::Sequential,
-        reasoning_mode: ReasoningMode::Standard,
-        truncated_from: None,
-    }
+        AggregationStrategy::Sequential,
+    )
 }
 
 async fn collect_internal_events(
@@ -364,6 +362,24 @@ fn assert_decompose_tool_present(tools: &[ToolDefinition]) {
     assert!(decompose_tools[0].parameters["properties"]
         .get("got_criteria")
         .is_some());
+    assert_eq!(
+        decompose_tools[0].parameters["properties"]["reasoning_mode"]["enum"],
+        serde_json::json!([
+            "standard",
+            "got_chain",
+            "got_tree",
+            "got_graph",
+            "got_consensus"
+        ])
+    );
+    assert_eq!(
+        decompose_tools[0].parameters["allOf"][0]["then"]["required"],
+        serde_json::json!(["got_criteria"])
+    );
+    assert_eq!(
+        decompose_tools[0].parameters["allOf"][0]["else"]["required"],
+        serde_json::json!(["sub_goals"])
+    );
 }
 
 #[tokio::test]
@@ -1085,6 +1101,40 @@ async fn decide_accepts_got_mode_without_sub_goals() {
 }
 
 #[tokio::test]
+async fn decide_accepts_got_chain_mode_without_branches() {
+    let mut engine = decomposition_engine(budget_config(10, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "reasoning_mode": "got_chain",
+            "got_criteria": "reasoning quality"
+        }))],
+        usage: None,
+        stop_reason: None,
+    };
+
+    let decision = engine.decide(&response).await.expect("decision");
+    match decision {
+        Decision::Decompose(plan) => {
+            assert_eq!(
+                plan.reasoning_mode,
+                ReasoningMode::GraphOfThoughts {
+                    graph: GraphOfOperationsSpec::Preset {
+                        name: GoTPreset::ChainOfThought,
+                        branches: None,
+                        keep: None,
+                        refine_iterations: None,
+                        target_score: None,
+                        criteria: "reasoning quality".to_string(),
+                    },
+                }
+            );
+        }
+        other => panic!("expected decomposition decision, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn execute_decomposition_runs_got_tree_and_returns_best_thought() {
     let mut engine = decomposition_engine(budget_config(20, 6), 0);
     let response = CompletionResponse {
@@ -1255,8 +1305,8 @@ async fn decide_decompose_with_optional_fields() {
 }
 
 fn concurrent_plan(descriptions: &[&str]) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals: descriptions
+    DecompositionPlan::standard(
+        descriptions
             .iter()
             .map(|d| {
                 SubGoal::with_definition_of_done(
@@ -1267,10 +1317,8 @@ fn concurrent_plan(descriptions: &[&str]) -> DecompositionPlan {
                 )
             })
             .collect(),
-        strategy: AggregationStrategy::Parallel,
-        reasoning_mode: ReasoningMode::Standard,
-        truncated_from: None,
-    }
+        AggregationStrategy::Parallel,
+    )
 }
 
 #[tokio::test]

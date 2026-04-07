@@ -505,6 +505,26 @@ pub enum AggregationStrategy {
     Custom(String),
 }
 
+impl DecompositionPlan {
+    pub fn standard(sub_goals: Vec<SubGoal>, strategy: AggregationStrategy) -> Self {
+        Self {
+            sub_goals,
+            strategy,
+            reasoning_mode: reasoning_mode::ReasoningMode::Standard,
+            truncated_from: None,
+        }
+    }
+
+    pub fn graph_of_thoughts(graph: reasoning_mode::GraphOfOperationsSpec) -> Self {
+        Self {
+            sub_goals: Vec::new(),
+            strategy: AggregationStrategy::Sequential,
+            reasoning_mode: reasoning_mode::ReasoningMode::GraphOfThoughts { graph },
+            truncated_from: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubGoalResult {
     pub goal: SubGoal,

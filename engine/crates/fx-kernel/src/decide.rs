@@ -241,8 +241,8 @@ fn serialize_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_decompose::ReasoningMode;
     use crate::types::Goal;
+    use fx_decompose::ReasoningMode;
     use fx_decompose::{AggregationStrategy, SubGoal};
     use std::collections::HashMap;
 

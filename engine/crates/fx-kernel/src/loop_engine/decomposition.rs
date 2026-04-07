@@ -1376,7 +1376,7 @@ fn message_text(message: &Message) -> Option<String> {
 }
 
 fn parse_got_score(response: &str) -> f64 {
-    response
+    if let Some(score) = response
         .split(|character: char| !(character.is_ascii_digit() || character == '.'))
         .filter(|token| !token.is_empty())
         .find_map(|token| {
@@ -1385,7 +1385,16 @@ fn parse_got_score(response: &str) -> f64 {
                 .ok()
                 .filter(|score| (0.0..=1.0).contains(score))
         })
-        .unwrap_or(0.5)
+    {
+        return score;
+    }
+
+    tracing::warn!(
+        response_excerpt = %truncate_prompt_text(response, 120),
+        fallback_score = 0.5,
+        "failed to parse GoT score response; using neutral fallback"
+    );
+    0.5
 }
 
 pub(super) fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
@@ -1465,12 +1474,14 @@ pub(super) fn parse_decomposition_plan(
     } else {
         (Vec::new(), None)
     };
-    Ok(DecompositionPlan {
-        sub_goals,
-        strategy: parsed.strategy.unwrap_or(AggregationStrategy::Sequential),
-        reasoning_mode,
-        truncated_from,
-    })
+    let strategy = parsed.strategy.unwrap_or(AggregationStrategy::Sequential);
+    match reasoning_mode {
+        ReasoningMode::Standard => Ok(DecompositionPlan {
+            truncated_from,
+            ..DecompositionPlan::standard(sub_goals, strategy)
+        }),
+        ReasoningMode::GraphOfThoughts { graph } => Ok(DecompositionPlan::graph_of_thoughts(graph)),
+    }
 }
 
 fn reject_custom_strategy(strategy: Option<&AggregationStrategy>) -> Result<(), LoopError> {
@@ -1538,6 +1549,9 @@ fn parse_reasoning_mode(parsed: &DecomposeToolArguments) -> Result<ReasoningMode
     };
     match mode {
         DecomposeReasoningMode::Standard => Ok(ReasoningMode::Standard),
+        DecomposeReasoningMode::GotChain => {
+            build_got_reasoning_mode(parsed, GoTPreset::ChainOfThought)
+        }
         DecomposeReasoningMode::GotTree => {
             build_got_reasoning_mode(parsed, GoTPreset::TreeOfThought)
         }
@@ -1554,6 +1568,10 @@ fn build_got_reasoning_mode(
     parsed: &DecomposeToolArguments,
     preset: GoTPreset,
 ) -> Result<ReasoningMode, LoopError> {
+    let branches = match preset {
+        GoTPreset::ChainOfThought => None,
+        _ => parsed.got_branches,
+    };
     let criteria = parsed
         .got_criteria
         .as_deref()
@@ -1578,7 +1596,7 @@ fn build_got_reasoning_mode(
     Ok(ReasoningMode::GraphOfThoughts {
         graph: GraphOfOperationsSpec::Preset {
             name: preset,
-            branches: parsed.got_branches,
+            branches,
             keep: None,
             refine_iterations: None,
             target_score: None,
@@ -1589,7 +1607,17 @@ fn build_got_reasoning_mode(
 
 pub(super) fn estimate_plan_cost(plan: &DecompositionPlan) -> ActionCost {
     if !plan.reasoning_mode.is_standard() {
-        return ActionCost::default();
+        // GoT execution can perform more model calls than this lower bound during
+        // refinement or custom graph traversal. The budget gate uses the lower
+        // bound to reject obviously impossible plans while runtime enforcement
+        // remains the source of truth for exact usage.
+        let llm_calls = plan.reasoning_mode.estimated_llm_calls_lower_bound();
+        return ActionCost {
+            llm_calls,
+            tool_invocations: 0,
+            tokens: 0,
+            cost_cents: u64::from(llm_calls) * DEFAULT_LLM_CALL_COST_CENTS,
+        };
     }
     plan.sub_goals
         .iter()
