@@ -87,7 +87,7 @@ impl ThoughtMerger for MockMerger {
 ```rust
 #[tokio::test]
 async fn cot_equivalent_single_path() {
-    let graph = GraphBuilder::chain_of_thought("quality");
+    let graph = GraphBuilder::chain_of_thought("quality").unwrap();
     let result = execute_with_mocks(graph, "solve 2+2").await;
     assert_eq!(result.thoughts.len(), 1);
     assert!(result.best.is_some());
@@ -100,7 +100,7 @@ async fn cot_equivalent_single_path() {
 ```rust
 #[tokio::test]
 async fn tot_branches_and_prunes() {
-    let graph = GraphBuilder::tree_of_thought(4, "correctness");
+    let graph = GraphBuilder::tree_of_thought(4, "correctness").unwrap();
     let result = execute_with_mocks(graph, "sort this list").await;
     assert_eq!(result.thoughts.len(), 1); // KeepBest(1)
     assert!(result.best.unwrap().score.unwrap() > 0.0);
@@ -113,7 +113,7 @@ async fn tot_branches_and_prunes() {
 ```rust
 #[tokio::test]
 async fn full_got_pipeline() {
-    let graph = GraphBuilder::graph_of_thought(3, 2, 2, 0.95, "mathematical correctness");
+    let graph = GraphBuilder::graph_of_thought(3, 2, 2, 0.95, "mathematical correctness").unwrap();
     let result = execute_with_mocks(graph, "prove P != NP").await;
     // Should have executed: Generate(3) → Score → KeepBest(2) → Merge → Refine(2 iters) → Validate
     assert!(result.operations_executed >= 5);
@@ -189,7 +189,7 @@ fn empty_graph_build_fails() {
 ```rust
 #[tokio::test]
 async fn consensus_merges_branches() {
-    let graph = GraphBuilder::consensus(3, "factual accuracy");
+    let graph = GraphBuilder::consensus(3, "factual accuracy").unwrap();
     let result = execute_with_mocks(graph, "what is the capital of France").await;
     assert_eq!(result.thoughts.len(), 1); // merged into one
     assert!(result.best.unwrap().content.contains("+")); // MockMerger uses "+"
@@ -201,7 +201,7 @@ async fn consensus_merges_branches() {
 ```rust
 #[tokio::test]
 async fn budget_exhaustion_returns_partial() {
-    let graph = GraphBuilder::graph_of_thought(10, 5, 5, 0.99, "quality");
+    let graph = GraphBuilder::graph_of_thought(10, 5, 5, 0.99, "quality").unwrap();
     // Set budget to allow only 5 LLM calls
     let result = execute_with_budget(graph, "complex task", 5).await;
     assert!(result.best.is_some()); // Should still return best so far
@@ -214,16 +214,16 @@ async fn budget_exhaustion_returns_partial() {
 ```rust
 #[test]
 fn all_presets_produce_valid_graphs() {
-    let cot = GraphBuilder::chain_of_thought("test");
+    let cot = GraphBuilder::chain_of_thought("test").unwrap();
     assert!(cot.validate().is_ok());
 
-    let tot = GraphBuilder::tree_of_thought(3, "test");
+    let tot = GraphBuilder::tree_of_thought(3, "test").unwrap();
     assert!(tot.validate().is_ok());
 
-    let got = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "test");
+    let got = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "test").unwrap();
     assert!(got.validate().is_ok());
 
-    let con = GraphBuilder::consensus(3, "test");
+    let con = GraphBuilder::consensus(3, "test").unwrap();
     assert!(con.validate().is_ok());
 }
 ```
@@ -294,8 +294,8 @@ fn refine_followed_by_validate_wires_correctly() {
         .build()
         .unwrap();
 
-    // The validate node should be reachable from the last node of the refine cycle
-    // (not from the first node or disconnected)
+    // The validate node should be reachable from the refine node
+    // (not from a disconnected branch)
     let terminal = graph.terminal_nodes();
     assert_eq!(terminal.len(), 1);
     // Terminal node should be the Validate operation

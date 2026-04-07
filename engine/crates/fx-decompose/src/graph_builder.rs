@@ -1,22 +1,30 @@
 use crate::{
-    GraphNodeId, GraphOfOperations, GraphOperation, GraphTopologyError, MergeStrategy,
-    ScoringStrategy, ValidationStrategy,
+    GraphOfOperations, GraphOperation, GraphTopologyError, MergeStrategy, ScoringStrategy,
+    ValidationStrategy,
 };
 
 const DEFAULT_MAX_ITERATIONS_PER_CYCLE: usize = 1;
 
 /// Fluent builder for constructing `GraphOfOperations`.
+///
+/// This is a consuming builder: each chain step takes ownership and returns the
+/// updated builder, so callers keep a single linear construction path.
+///
+/// The builder owns topology only. It intentionally does not expose a
+/// `max_tokens()` setter because GoT token budgets live at the session and
+/// dispatcher layers, which are the single source of truth for execution
+/// limits.
 #[derive(Debug, Clone)]
 pub struct GraphBuilder {
-    graph: GraphOfOperations,
-    last_node: Option<GraphNodeId>,
+    max_iterations_per_cycle: usize,
+    operations: Vec<GraphOperation>,
 }
 
 impl GraphBuilder {
     pub fn new(max_iterations_per_cycle: usize) -> Self {
         Self {
-            graph: GraphOfOperations::new(max_iterations_per_cycle),
-            last_node: None,
+            max_iterations_per_cycle,
+            operations: Vec::new(),
         }
     }
 
@@ -116,30 +124,51 @@ impl GraphBuilder {
     }
 
     pub fn operation(mut self, operation: GraphOperation) -> Self {
-        self.append_operation(operation);
+        self.operations.push(operation);
         self
     }
 
+    /// Build a graph from the appended operations.
+    ///
+    /// Non-empty builders are topologically valid by construction because they
+    /// always compile to a simple forward-linked chain. `Result` is preserved so
+    /// callers get a recoverable error for empty builders and for any future
+    /// validation rules added to `GraphOfOperations`.
     pub fn build(self) -> Result<GraphOfOperations, GraphTopologyError> {
-        self.graph.validate()?;
-        Ok(self.graph)
+        let mut graph = GraphOfOperations::new(self.max_iterations_per_cycle);
+        let mut previous_node = None;
+
+        for operation in self.operations {
+            let label = operation.to_string();
+            let node_id = graph.add_node(operation, Some(label));
+            if let Some(previous_node_id) = previous_node {
+                graph.add_edge(previous_node_id, node_id)?;
+            }
+            previous_node = Some(node_id);
+        }
+
+        graph.validate()?;
+        Ok(graph)
     }
 
-    pub fn chain_of_thought(criteria: impl Into<String>) -> GraphOfOperations {
+    pub fn chain_of_thought(
+        criteria: impl Into<String>,
+    ) -> Result<GraphOfOperations, GraphTopologyError> {
         Self::new(DEFAULT_MAX_ITERATIONS_PER_CYCLE)
             .generate(1)
             .score(criteria)
             .build()
-            .expect("chain-of-thought preset should always build")
     }
 
-    pub fn tree_of_thought(branches: usize, criteria: impl Into<String>) -> GraphOfOperations {
+    pub fn tree_of_thought(
+        branches: usize,
+        criteria: impl Into<String>,
+    ) -> Result<GraphOfOperations, GraphTopologyError> {
         Self::new(DEFAULT_MAX_ITERATIONS_PER_CYCLE)
             .generate(branches)
             .score(criteria)
             .keep_best(1)
             .build()
-            .expect("tree-of-thought preset should always build")
     }
 
     pub fn graph_of_thought(
@@ -148,7 +177,7 @@ impl GraphBuilder {
         refine_iterations: usize,
         target_score: f64,
         criteria: impl Into<String>,
-    ) -> GraphOfOperations {
+    ) -> Result<GraphOfOperations, GraphTopologyError> {
         let criteria = criteria.into();
 
         Self::new(refine_iterations.max(DEFAULT_MAX_ITERATIONS_PER_CYCLE))
@@ -161,41 +190,17 @@ impl GraphBuilder {
                 strategy: ValidationStrategy::AlwaysPass,
             })
             .build()
-            .expect("graph-of-thought preset should always build")
     }
 
-    pub fn consensus(branches: usize, criteria: impl Into<String>) -> GraphOfOperations {
+    pub fn consensus(
+        branches: usize,
+        criteria: impl Into<String>,
+    ) -> Result<GraphOfOperations, GraphTopologyError> {
         Self::new(DEFAULT_MAX_ITERATIONS_PER_CYCLE)
             .generate(branches)
             .score(criteria)
             .merge()
             .build()
-            .expect("consensus preset should always build")
-    }
-
-    fn append_operation(&mut self, operation: GraphOperation) -> GraphNodeId {
-        let label = operation_label(&operation).to_string();
-        let node_id = self.graph.add_node(operation, Some(label));
-
-        if let Some(previous_node) = self.last_node {
-            self.graph
-                .add_edge(previous_node, node_id)
-                .expect("builder appends nodes in forward order");
-        }
-
-        self.last_node = Some(node_id);
-        node_id
-    }
-}
-
-fn operation_label(operation: &GraphOperation) -> &'static str {
-    match operation {
-        GraphOperation::Generate { .. } => "generate",
-        GraphOperation::Score { .. } => "score",
-        GraphOperation::KeepBest { .. } => "keep_best",
-        GraphOperation::Merge { .. } => "merge",
-        GraphOperation::Refine { .. } => "refine",
-        GraphOperation::Validate { .. } => "validate",
     }
 }
 
@@ -396,10 +401,10 @@ mod tests {
 
     #[test]
     fn all_presets_produce_valid_graphs() {
-        let chain = GraphBuilder::chain_of_thought("quality");
-        let tree = GraphBuilder::tree_of_thought(4, "correctness");
-        let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "test");
-        let consensus = GraphBuilder::consensus(3, "factual accuracy");
+        let chain = GraphBuilder::chain_of_thought("quality").unwrap();
+        let tree = GraphBuilder::tree_of_thought(4, "correctness").unwrap();
+        let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "test").unwrap();
+        let consensus = GraphBuilder::consensus(3, "factual accuracy").unwrap();
 
         assert!(chain.validate().is_ok());
         assert!(tree.validate().is_ok());
@@ -408,8 +413,66 @@ mod tests {
     }
 
     #[test]
+    fn chain_of_thought_preset_uses_expected_operation_sequence() {
+        let graph = GraphBuilder::chain_of_thought("quality").unwrap();
+
+        assert!(matches!(
+            operations(&graph).as_slice(),
+            [
+                GraphOperation::Generate {
+                    num_branches: 1,
+                    prompt_override: None,
+                },
+                GraphOperation::Score {
+                    strategy: ScoringStrategy::LlmRating { criteria },
+                },
+            ] if criteria == "quality"
+        ));
+    }
+
+    #[test]
+    fn tree_of_thought_preset_uses_expected_operation_sequence() {
+        let graph = GraphBuilder::tree_of_thought(4, "correctness").unwrap();
+
+        assert!(matches!(
+            operations(&graph).as_slice(),
+            [
+                GraphOperation::Generate {
+                    num_branches: 4,
+                    prompt_override: None,
+                },
+                GraphOperation::Score {
+                    strategy: ScoringStrategy::LlmRating { criteria },
+                },
+                GraphOperation::KeepBest { n: 1 },
+            ] if criteria == "correctness"
+        ));
+    }
+
+    #[test]
+    fn consensus_preset_uses_expected_operation_sequence() {
+        let graph = GraphBuilder::consensus(3, "factual accuracy").unwrap();
+
+        assert!(matches!(
+            operations(&graph).as_slice(),
+            [
+                GraphOperation::Generate {
+                    num_branches: 3,
+                    prompt_override: None,
+                },
+                GraphOperation::Score {
+                    strategy: ScoringStrategy::LlmRating { criteria },
+                },
+                GraphOperation::Merge {
+                    strategy: MergeStrategy::LlmSynthesis { instruction: None },
+                },
+            ] if criteria == "factual accuracy"
+        ));
+    }
+
+    #[test]
     fn graph_of_thought_preset_uses_expected_operation_sequence() {
-        let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "math");
+        let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.8, "math").unwrap();
 
         assert!(matches!(
             operations(&graph).as_slice(),
@@ -437,5 +500,24 @@ mod tests {
                 && score_criteria == "math"
                 && refine_criteria == "math"
         ));
+    }
+
+    #[test]
+    fn non_empty_builds_are_valid_by_construction() {
+        let builds = vec![
+            GraphBuilder::new(3).generate(1).build(),
+            GraphBuilder::new(3)
+                .score_heuristic("pass")
+                .keep_best(1)
+                .build(),
+            GraphBuilder::new(3)
+                .generate(2)
+                .merge()
+                .refine(2, 0.8, "quality")
+                .validate_llm("final answer quality")
+                .build(),
+        ];
+
+        assert!(builds.into_iter().all(|result| result.is_ok()));
     }
 }

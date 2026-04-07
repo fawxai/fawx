@@ -29,13 +29,18 @@ Manually calling `add_node`, `add_edge`, `add_back_edge` is tedious and error-pr
 ```rust
 /// Fluent builder for constructing a `GraphOfOperations`.
 ///
-/// Each method appends an operation node and automatically wires edges
-/// from the previous node. Back-edges for refinement loops are handled
-/// by the `refine()` method internally.
+/// This is a consuming builder: each method takes ownership and returns the
+/// updated builder, so callers follow a single linear construction path.
+///
+/// Each method appends an operation node and `build()` compiles the final
+/// `GraphOfOperations` by auto-wiring forward edges between consecutive nodes.
+///
+/// The builder intentionally does not expose `max_tokens(budget)`. Step 2
+/// removed per-graph token budgets so the session-level dispatcher budget
+/// remains the single source of truth.
 pub struct GraphBuilder {
-    graph: GraphOfOperations,
-    /// Index of the last appended node (for auto-wiring sequential edges).
-    last_node: Option<GraphNodeId>,
+    max_iterations_per_cycle: usize,
+    operations: Vec<GraphOperation>,
 }
 ```
 
@@ -70,12 +75,12 @@ impl GraphBuilder {
     /// Append a Merge operation using simple concatenation.
     pub fn concat(self, separator: impl Into<String>) -> Self;
 
-    /// Append a Refine operation: iterative score→improve loop.
+    /// Append a Refine operation node.
     ///
-    /// This internally creates multiple nodes (Score + Generate) with a back-edge
-    /// from Generate → Score. After `refine()` returns, `last_node` points to the
-    /// **last internal node** (the Generate node), so subsequent chained methods
-    /// wire correctly from the end of the refinement cycle.
+    /// Runtime refinement is owned by `GraphDispatcher`, which executes the
+    /// iterative score→improve loop for `GraphOperation::Refine`. The builder
+    /// keeps topology explicit by appending a single `Refine` node and wiring
+    /// subsequent operations from that node.
     pub fn refine(self, max_iterations: usize, target_score: f64, criteria: impl Into<String>) -> Self;
 
     /// Append a Validate operation with exact match.
@@ -105,11 +110,11 @@ Common GoT patterns as static constructors:
 impl GraphBuilder {
     /// Chain-of-Thought equivalent: Generate(1) → Score → done.
     /// Single linear reasoning path.
-    pub fn chain_of_thought(criteria: impl Into<String>) -> GraphOfOperations;
+    pub fn chain_of_thought(criteria: impl Into<String>) -> Result<GraphOfOperations, GraphTopologyError>;
 
     /// Tree-of-Thought equivalent: Generate(N) → Score → KeepBest(1).
     /// Branch, evaluate, pick the best.
-    pub fn tree_of_thought(branches: usize, criteria: impl Into<String>) -> GraphOfOperations;
+    pub fn tree_of_thought(branches: usize, criteria: impl Into<String>) -> Result<GraphOfOperations, GraphTopologyError>;
 
     /// Full GoT: Generate(N) → Score → KeepBest(K) → Merge → Refine → Validate.
     /// Branch, evaluate, prune, merge insights, refine, validate.
@@ -119,11 +124,11 @@ impl GraphBuilder {
         refine_iterations: usize,
         target_score: f64,
         criteria: impl Into<String>,
-    ) -> GraphOfOperations;
+    ) -> Result<GraphOfOperations, GraphTopologyError>;
 
     /// Simple consensus: Generate(N) → Score → Merge.
     /// Generate multiple perspectives, score them, merge the best insights.
-    pub fn consensus(branches: usize, criteria: impl Into<String>) -> GraphOfOperations;
+    pub fn consensus(branches: usize, criteria: impl Into<String>) -> Result<GraphOfOperations, GraphTopologyError>;
 }
 ```
 
@@ -147,13 +152,13 @@ let graph = GraphBuilder::new(3)
 
 ```rust
 // Full GoT with 4 branches, keep 2, refine up to 3 times, target 0.85
-let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.85, "mathematical correctness");
+let graph = GraphBuilder::graph_of_thought(4, 2, 3, 0.85, "mathematical correctness")?;
 ```
 
 ### Chain-of-Thought (degenerate case)
 
 ```rust
-let graph = GraphBuilder::chain_of_thought("reasoning quality");
+let graph = GraphBuilder::chain_of_thought("reasoning quality")?;
 ```
 
 ---
@@ -162,7 +167,7 @@ let graph = GraphBuilder::chain_of_thought("reasoning quality");
 
 1. The first node added becomes the entry node (index 0)
 2. Each subsequent node gets a forward edge from the previous node
-3. `refine()` creates two internal nodes (Score + Generate) with a back-edge from Generate → Score. After `refine()`, `last_node` points to the Generate node (the last one created), so the next chained method wires from the correct exit point of the cycle.
+3. `refine()` appends a single `GraphOperation::Refine` node. `GraphDispatcher` owns the iterative score→improve loop at execution time, and the next chained method wires from that `Refine` node.
 4. `build()` calls `graph.validate()` before returning
 
 ---
@@ -171,11 +176,12 @@ let graph = GraphBuilder::chain_of_thought("reasoning quality");
 
 - Builder produces valid `GraphOfOperations` for all common patterns
 - Auto-wiring creates correct edge sequences (verified by inspecting `graph.successors()`)
-- `refine()` correctly creates a back-edge with appropriate iteration limit
-- `refine()` sets `last_node` to the last internal node, not the first
+- `refine()` appends a `GraphOperation::Refine` node with the requested iteration and scoring configuration
+- Subsequent chained methods wire from the `Refine` node, not from a disconnected branch
 - All four presets (`chain_of_thought`, `tree_of_thought`, `graph_of_thought`, `consensus`) build without error
 - Presets produce topologically valid graphs (pass `validate()`)
-- `build()` returns `Err` if the graph is empty or invalid
+- `build()` returns `Err` for an empty builder
+- Non-empty builders are topologically valid by construction
 - Builder methods are chainable (move semantics via `self`)
 - Unit tests for each preset and for manual construction
 - Unit test verifying that `refine()` followed by another operation wires correctly
