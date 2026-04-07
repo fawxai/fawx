@@ -1963,6 +1963,7 @@ async fn concurrent_decompose_children_each_compact_independently() {
             },
         ],
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: fx_decompose::ReasoningMode::Standard,
         truncated_from: None,
     };
     let llm = RecordingLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);

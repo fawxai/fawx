@@ -242,6 +242,7 @@ fn serialize_params(
 mod tests {
     use super::*;
     use crate::types::Goal;
+    use fx_decompose::ReasoningMode;
     use fx_decompose::{AggregationStrategy, SubGoal};
     use std::collections::HashMap;
 
@@ -356,6 +357,7 @@ mod tests {
                 None,
             )],
             strategy: AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
         let decision = Decision::Decompose(plan.clone());

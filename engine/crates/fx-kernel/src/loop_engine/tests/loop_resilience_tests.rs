@@ -1274,6 +1274,7 @@ async fn decompose_blocked_when_budget_low() {
             complexity_hint: None,
         }],
         strategy: fx_decompose::AggregationStrategy::Sequential,
+        reasoning_mode: fx_decompose::ReasoningMode::Standard,
         truncated_from: None,
     };
     let decision = Decision::Decompose(plan.clone());
@@ -3085,6 +3086,7 @@ fn decomposition_continue_action() -> ActionResult {
         decision: Decision::Decompose(fx_decompose::DecompositionPlan {
             sub_goals: Vec::new(),
             strategy: fx_decompose::AggregationStrategy::Sequential,
+            reasoning_mode: fx_decompose::ReasoningMode::Standard,
             truncated_from: None,
         }),
         tool_results: Vec::new(),

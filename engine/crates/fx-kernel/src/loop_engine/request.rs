@@ -538,11 +538,47 @@ pub(super) fn decompose_tool_definition() -> ToolDefinition {
                         },
                         "required": ["description"]
                     },
-                    "description": "List of sub-goals to execute"
+                    "description": "List of sub-goals to execute. Required when reasoning_mode is standard or omitted."
                 },
-                "strategy": {"type": "string", "enum": ["Sequential", "Parallel"], "description": "Execution strategy"}
+                "strategy": {
+                    "type": "string",
+                    "enum": ["Sequential", "Parallel"],
+                    "description": "Execution strategy for standard decomposition mode. Not valid for GoT modes."
+                },
+                "reasoning_mode": {
+                    "type": "string",
+                    "enum": ["standard", "got_chain", "got_tree", "got_graph", "got_consensus"],
+                    "description": "Reasoning strategy. Default: standard. GoT modes construct their own execution graph and cannot be combined with sub_goals or strategy."
+                },
+                "got_branches": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of thought branches for got_tree, got_graph, or got_consensus. Default: 3."
+                },
+                "got_criteria": {
+                    "type": "string",
+                    "description": "Evaluation criteria for GoT scoring. Required for GoT modes."
+                }
             },
-            "required": ["sub_goals"]
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "reasoning_mode": {
+                                "enum": ["got_chain", "got_tree", "got_graph", "got_consensus"]
+                            }
+                        },
+                        "required": ["reasoning_mode"]
+                    },
+                    "then": {
+                        "required": ["got_criteria"]
+                    },
+                    "else": {
+                        "required": ["sub_goals"]
+                    }
+                }
+            ],
+            "required": []
         }),
     }
 }

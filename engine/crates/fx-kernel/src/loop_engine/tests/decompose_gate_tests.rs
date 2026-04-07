@@ -2,7 +2,10 @@ use super::*;
 use crate::act::ToolResult;
 use crate::budget::BudgetConfig;
 use async_trait::async_trait;
-use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
+use fx_decompose::{
+    AggregationStrategy, ComplexityHint, DecompositionPlan, GoTPreset, GraphOfOperationsSpec,
+    SubGoal,
+};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, ProviderError, ToolCall, ToolDefinition,
 };
@@ -137,11 +140,7 @@ fn sub_goal(description: &str, tools: &[&str], hint: Option<ComplexityHint>) -> 
 }
 
 fn plan(sub_goals: Vec<SubGoal>) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals,
-        strategy: AggregationStrategy::Parallel,
-        truncated_from: None,
-    }
+    DecompositionPlan::standard(sub_goals, AggregationStrategy::Parallel)
 }
 
 // --- Batch detection tests (1-5) ---
@@ -941,15 +940,14 @@ async fn sequential_strategy_excludes_complexity_floor() {
     let config = BudgetConfig::default();
     let mut engine = gate_engine(config);
     let llm = TextLlm;
-    let p = DecompositionPlan {
-        sub_goals: vec![
+    let p = DecompositionPlan::standard(
+        vec![
             sub_goal("a", &["tool_a"], Some(ComplexityHint::Trivial)),
             sub_goal("b", &["tool_b"], Some(ComplexityHint::Trivial)),
             sub_goal("c", &["tool_c"], Some(ComplexityHint::Trivial)),
         ],
-        strategy: AggregationStrategy::Sequential,
-        truncated_from: None,
-    };
+        AggregationStrategy::Sequential,
+    );
     let decision = Decision::Decompose(p.clone());
 
     let _result = engine
@@ -966,3 +964,54 @@ async fn sequential_strategy_excludes_complexity_floor() {
 }
 
 // --- estimate_plan_cost unit tests ---
+
+#[tokio::test]
+async fn got_plan_still_runs_cost_gate() {
+    let config = BudgetConfig {
+        max_cost_cents: 6,
+        ..BudgetConfig::default()
+    };
+    let mut engine = gate_engine(config);
+    let llm = TextLlm;
+    let p = DecompositionPlan::graph_of_thoughts(GraphOfOperationsSpec::Preset {
+        name: GoTPreset::GraphOfThought,
+        branches: Some(3),
+        keep: None,
+        refine_iterations: None,
+        target_score: None,
+        criteria: "reasoning quality".to_string(),
+    });
+    let decision = Decision::Decompose(p.clone());
+
+    let result = engine
+        .evaluate_decompose_gates(&p, &decision, &llm, &[])
+        .await;
+
+    assert!(result.is_some(), "GoT plans should still hit the cost gate");
+    let signals = engine.signals.drain_all();
+    assert!(signals.iter().any(|s| s.message == "decompose_cost_gate"));
+    assert!(!signals
+        .iter()
+        .any(|s| s.message == "decompose_batch_detected"));
+    assert!(!signals
+        .iter()
+        .any(|s| s.message == "decompose_complexity_floor"));
+}
+
+#[test]
+fn estimate_plan_cost_uses_got_lower_bound() {
+    let cost = estimate_plan_cost(&DecompositionPlan::graph_of_thoughts(
+        GraphOfOperationsSpec::Preset {
+            name: GoTPreset::GraphOfThought,
+            branches: Some(3),
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria: "reasoning quality".to_string(),
+        },
+    ));
+
+    assert_eq!(cost.llm_calls, 8);
+    assert_eq!(cost.tool_invocations, 0);
+    assert_eq!(cost.cost_cents, 16);
+}

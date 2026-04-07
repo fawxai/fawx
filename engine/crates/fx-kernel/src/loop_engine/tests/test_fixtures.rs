@@ -423,8 +423,8 @@ pub(super) fn build_engine_with_executor(
 }
 
 pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals: descriptions
+    DecompositionPlan::standard(
+        descriptions
             .iter()
             .map(|desc| {
                 SubGoal::with_definition_of_done(
@@ -435,7 +435,6 @@ pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
                 )
             })
             .collect(),
-        strategy: AggregationStrategy::Sequential,
-        truncated_from: None,
-    }
+        AggregationStrategy::Sequential,
+    )
 }

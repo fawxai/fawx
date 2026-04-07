@@ -562,7 +562,7 @@ impl ActionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_decompose::{AggregationStrategy, DecompositionPlan};
+    use fx_decompose::{AggregationStrategy, DecompositionPlan, ReasoningMode};
 
     #[derive(Debug)]
     struct NoMetadataExecutor;
@@ -671,6 +671,7 @@ mod tests {
             decision: Decision::Decompose(DecompositionPlan {
                 sub_goals: Vec::new(),
                 strategy: AggregationStrategy::Sequential,
+                reasoning_mode: ReasoningMode::Standard,
                 truncated_from: None,
             }),
             tool_results: Vec::new(),
