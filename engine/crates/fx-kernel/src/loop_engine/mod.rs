@@ -5025,7 +5025,7 @@ fn repeated_tool_failure_partial_response(
     let mut segments = Vec::new();
     push_response_segment(
         &mut segments,
-        action_partial.and_then(|text| meaningful_response_text(text)),
+        action_partial.and_then(meaningful_response_text),
     );
     stitched_response_text(&segments, Some(note))
 }
@@ -5065,13 +5065,13 @@ fn action_partial_response(action: &ActionResult) -> Option<String> {
             partial_response, ..
         }) => meaningful_response_text(&action.response_text).or_else(|| {
             partial_response
-                .as_ref()
-                .and_then(|text| meaningful_response_text(text))
+                .as_deref()
+                .and_then(meaningful_response_text)
         }),
         ActionNextStep::Continue(continuation) => continuation
             .partial_response
-            .as_ref()
-            .and_then(|text| meaningful_response_text(text)),
+            .as_deref()
+            .and_then(meaningful_response_text),
     }
 }
 
