@@ -58,3 +58,74 @@ pub enum ValidationStrategy {
     /// Always passes.
     AlwaysPass,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_operation_roundtrip_serde_covers_all_variants() {
+        let operations = vec![
+            GraphOperation::Generate {
+                num_branches: 3,
+                prompt_override: Some("be bold".to_string()),
+            },
+            GraphOperation::Score {
+                strategy: ScoringStrategy::LlmRating {
+                    criteria: "accuracy".to_string(),
+                },
+            },
+            GraphOperation::Score {
+                strategy: ScoringStrategy::Heuristic {
+                    pattern: "pass".to_string(),
+                },
+            },
+            GraphOperation::Score {
+                strategy: ScoringStrategy::External,
+            },
+            GraphOperation::KeepBest { n: 2 },
+            GraphOperation::Merge {
+                strategy: MergeStrategy::LlmSynthesis {
+                    instruction: Some("combine the strongest evidence".to_string()),
+                },
+            },
+            GraphOperation::Merge {
+                strategy: MergeStrategy::Concatenate {
+                    separator: "\n---\n".to_string(),
+                },
+            },
+            GraphOperation::Refine {
+                max_iterations: 4,
+                target_score: 0.9,
+                scoring: ScoringStrategy::LlmRating {
+                    criteria: "confidence".to_string(),
+                },
+            },
+            GraphOperation::Validate {
+                strategy: ValidationStrategy::ExactMatch {
+                    expected: "done".to_string(),
+                },
+            },
+            GraphOperation::Validate {
+                strategy: ValidationStrategy::Contains {
+                    expected: "needle".to_string(),
+                },
+            },
+            GraphOperation::Validate {
+                strategy: ValidationStrategy::LlmJudge {
+                    criteria: "meets the rubric".to_string(),
+                },
+            },
+            GraphOperation::Validate {
+                strategy: ValidationStrategy::AlwaysPass,
+            },
+        ];
+
+        for operation in operations {
+            let encoded = serde_json::to_string(&operation).expect("serialize operation");
+            let decoded: GraphOperation =
+                serde_json::from_str(&encoded).expect("deserialize operation");
+            assert_eq!(decoded, operation);
+        }
+    }
+}

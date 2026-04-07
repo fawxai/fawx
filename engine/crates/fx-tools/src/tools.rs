@@ -2041,7 +2041,7 @@ three
                 .expect("run_command diagnostics"),
         );
         assert_eq!(diagnostics.exit_code, Some(23));
-        assert!(diagnostics.shell);
+        assert_eq!(diagnostics.shell, true);
         assert!(!diagnostics.timed_out);
         assert!(diagnostics
             .stderr_snippet
@@ -2151,7 +2151,7 @@ three
                 .expect("timeout diagnostics"),
         );
         assert_eq!(diagnostics.exit_code, None);
-        assert!(!diagnostics.shell);
+        assert_eq!(diagnostics.shell, false);
         assert!(diagnostics.timed_out);
         assert!(diagnostics.duration_ms >= 1);
     }

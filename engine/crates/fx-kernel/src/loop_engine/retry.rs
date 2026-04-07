@@ -652,7 +652,7 @@ mod tests {
             .execute_tool_calls(std::slice::from_ref(&first))
             .await
             .expect("execute first failure");
-        engine.emit_action_signals(std::slice::from_ref(&first), &first_results);
+        engine.emit_action_signals(&[first.clone()], &first_results);
 
         engine
             .execute_tool_calls(std::slice::from_ref(&second))

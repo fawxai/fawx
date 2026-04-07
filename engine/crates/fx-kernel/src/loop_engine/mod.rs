@@ -4654,7 +4654,7 @@ fn repeated_tool_failure_partial_response(
     let mut segments = Vec::new();
     push_response_segment(
         &mut segments,
-        action_partial.and_then(meaningful_response_text),
+        action_partial.and_then(|text| meaningful_response_text(text)),
     );
     stitched_response_text(&segments, Some(note))
 }
