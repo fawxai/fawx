@@ -5,42 +5,68 @@ use std::collections::HashSet;
 #[derive(Debug, Clone)]
 pub struct GraphNode {
     /// Typed index of this node in the graph's node list.
-    pub id: GraphNodeId,
+    id: GraphNodeId,
     /// The operation this node performs.
-    pub operation: GraphOperation,
+    operation: GraphOperation,
     /// Human-readable label for debugging/logging.
-    pub label: Option<String>,
+    label: Option<String>,
+}
+
+impl GraphNode {
+    pub const fn id(&self) -> GraphNodeId {
+        self.id
+    }
+
+    pub const fn operation(&self) -> &GraphOperation {
+        &self.operation
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
 }
 
 /// A directed edge in the operation graph.
 #[derive(Debug, Clone)]
 pub struct GraphEdge {
-    pub from: GraphNodeId,
-    pub to: GraphNodeId,
+    from: GraphNodeId,
     /// If true, this is a back-edge (cycle). Subject to iteration limits.
-    pub is_back_edge: bool,
+    to: GraphNodeId,
+    is_back_edge: bool,
+}
+
+impl GraphEdge {
+    pub const fn from(&self) -> GraphNodeId {
+        self.from
+    }
+
+    pub const fn to(&self) -> GraphNodeId {
+        self.to
+    }
+
+    pub const fn is_back_edge(&self) -> bool {
+        self.is_back_edge
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum GraphTopologyError {
-    #[error("node {0:?} out of bounds (graph has {1} nodes)")]
+    #[error("node {0} out of bounds (graph has {1} nodes)")]
     NodeOutOfBounds(GraphNodeId, usize),
 
-    #[error(
-        "forward edge from {0:?} to {1:?} is invalid (target must be > source for forward edges)"
-    )]
+    #[error("forward edge from {0} to {1} is invalid (target must be > source for forward edges)")]
     InvalidForwardEdge(GraphNodeId, GraphNodeId),
 
-    #[error("back-edge from {0:?} to {1:?} is invalid (target must be <= source for back-edges)")]
+    #[error("back-edge from {0} to {1} is invalid (target must be <= source for back-edges)")]
     InvalidBackEdge(GraphNodeId, GraphNodeId),
 
     #[error("empty graph (no nodes)")]
     EmptyGraph,
 
-    #[error("entry node {0:?} does not exist")]
+    #[error("entry node {0} does not exist")]
     InvalidEntry(GraphNodeId),
 
-    #[error("duplicate edge from {0:?} to {1:?}")]
+    #[error("duplicate edge from {0} to {1}")]
     DuplicateEdge(GraphNodeId, GraphNodeId),
 }
 
@@ -49,7 +75,8 @@ pub enum GraphTopologyError {
 /// Unlike `ExecutionDag` (which is strictly level-based and acyclic), this
 /// supports arbitrary edges including back-edges for refinement loops.
 ///
-/// Back-edges are bounded by `max_iterations_per_cycle` to prevent runaway execution.
+/// Back-edges will be bounded by `max_iterations_per_cycle` when the executor
+/// traverses the graph to prevent runaway execution.
 ///
 /// Invariant: nodes must be added in topological order of the forward-edge
 /// subgraph. The builder will guarantee this for callers that do not construct
@@ -58,6 +85,7 @@ pub enum GraphTopologyError {
 pub struct GraphOfOperations {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
+    edge_pairs: HashSet<(GraphNodeId, GraphNodeId)>,
     entry: GraphNodeId,
     max_iterations_per_cycle: usize,
 }
@@ -68,6 +96,7 @@ impl GraphOfOperations {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
+            edge_pairs: HashSet::new(),
             entry: GraphNodeId::new(0),
             max_iterations_per_cycle,
         }
@@ -97,7 +126,7 @@ impl GraphOfOperations {
         self.ensure_node_exists(to)?;
         self.validate_forward_edge(from, to)?;
         self.ensure_edge_is_unique(from, to)?;
-        self.edges.push(GraphEdge {
+        self.record_edge(GraphEdge {
             from,
             to,
             is_back_edge: false,
@@ -115,7 +144,7 @@ impl GraphOfOperations {
         self.ensure_node_exists(to)?;
         self.validate_back_edge(from, to)?;
         self.ensure_edge_is_unique(from, to)?;
-        self.edges.push(GraphEdge {
+        self.record_edge(GraphEdge {
             from,
             to,
             is_back_edge: true,
@@ -130,6 +159,21 @@ impl GraphOfOperations {
         }
         self.entry = id;
         Ok(())
+    }
+
+    /// Return the node where traversal should begin.
+    pub const fn entry(&self) -> GraphNodeId {
+        self.entry
+    }
+
+    /// Borrow the full node list for topology traversal.
+    pub fn nodes(&self) -> &[GraphNode] {
+        &self.nodes
+    }
+
+    /// Borrow the full edge list for topology traversal.
+    pub fn edges(&self) -> &[GraphEdge] {
+        &self.edges
     }
 
     /// Get successors of a node (forward edges only).
@@ -170,7 +214,11 @@ impl GraphOfOperations {
         self.max_iterations_per_cycle
     }
 
-    /// Validate the graph: entry exists, all edge indices valid, at least one node.
+    /// Validate the stored topology.
+    ///
+    /// Insert-time builders already enforce these invariants as edges are added.
+    /// This pass exists as a final sanity check after construction and to detect
+    /// out-of-band mutation of the persisted node/edge lists.
     pub fn validate(&self) -> Result<(), GraphTopologyError> {
         if self.is_empty() {
             return Err(GraphTopologyError::EmptyGraph);
@@ -249,15 +297,16 @@ impl GraphOfOperations {
         from: GraphNodeId,
         to: GraphNodeId,
     ) -> Result<(), GraphTopologyError> {
-        if self
-            .edges
-            .iter()
-            .any(|edge| edge.from == from && edge.to == to)
-        {
+        if self.edge_pairs.contains(&(from, to)) {
             Err(GraphTopologyError::DuplicateEdge(from, to))
         } else {
             Ok(())
         }
+    }
+
+    fn record_edge(&mut self, edge: GraphEdge) {
+        self.edge_pairs.insert((edge.from, edge.to));
+        self.edges.push(edge);
     }
 }
 
@@ -284,13 +333,31 @@ mod tests {
         graph.add_edge(start, refine).unwrap();
         graph.add_edge(refine, validate).unwrap();
         graph.add_back_edge(validate, refine).unwrap();
+        graph.set_entry(refine).unwrap();
 
         assert_eq!(graph.len(), 3);
         assert!(!graph.is_empty());
+        assert_eq!(graph.entry(), refine);
         assert_eq!(graph.max_iterations(), 3);
         assert_eq!(
-            graph.node(refine).map(|node| node.label.as_deref()),
+            graph.node(refine).map(GraphNode::label),
             Some(Some("refine"))
+        );
+        assert_eq!(
+            graph.nodes().iter().map(GraphNode::id).collect::<Vec<_>>(),
+            vec![start, refine, validate]
+        );
+        assert_eq!(
+            graph
+                .edges()
+                .iter()
+                .map(|edge| (edge.from(), edge.to(), edge.is_back_edge()))
+                .collect::<Vec<_>>(),
+            vec![
+                (start, refine, false),
+                (refine, validate, false),
+                (validate, refine, true)
+            ]
         );
         assert_eq!(graph.successors(start), vec![refine]);
         assert_eq!(graph.all_successors(validate), vec![(refine, true)]);
@@ -367,6 +434,7 @@ mod tests {
             err,
             GraphTopologyError::NodeOutOfBounds(id, len) if id == missing && len == 1
         ));
+        assert_eq!(err.to_string(), "node 8 out of bounds (graph has 1 nodes)");
 
         let err = graph.add_back_edge(missing, first).unwrap_err();
         assert!(matches!(
