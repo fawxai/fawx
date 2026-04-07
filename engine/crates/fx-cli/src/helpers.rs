@@ -910,7 +910,10 @@ mod tests {
         assert_eq!(models, registered_models);
         assert_eq!(registered_models.len(), 1);
         assert_eq!(registered_models[0].model_id, "openai/gpt-5.4");
-        assert_eq!(registered_models[0].display_name.as_deref(), Some("GPT-5.4"));
+        assert_eq!(
+            registered_models[0].display_name.as_deref(),
+            Some("GPT-5.4")
+        );
         assert!(!registered_models[0].recommended);
     }
 

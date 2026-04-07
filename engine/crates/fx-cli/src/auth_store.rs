@@ -216,6 +216,8 @@ fn should_recreate_auth_store(error: &str) -> bool {
     error.contains("different machine identity")
         || error.contains("decrypt")
         || error.contains("key derivation failed")
+        || error.contains("invalid data")
+        || error.contains("not a sqlite database")
 }
 
 #[allow(dead_code)] // Reachable through recovery helpers in binary-only command flows.
