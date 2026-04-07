@@ -4,6 +4,7 @@ pub mod dag;
 pub mod dispatcher;
 pub mod engine;
 pub mod error;
+pub mod graph_dispatcher;
 pub mod graph_topology;
 pub mod operations;
 pub mod thought;
@@ -539,6 +540,11 @@ pub use engine::{
     format_fitness_context, parse_plan_json, validate_plan, Decomposer, LlmDecomposer,
 };
 pub use error::DecomposeError;
+pub use graph_dispatcher::{
+    parse_llm_score, ConcatMerger, GraphDispatcher, GraphExecutionResult, HeuristicThoughtScorer,
+    LlmThoughtGenerator, LlmThoughtMerger, LlmThoughtScorer, ThoughtGenerator, ThoughtMerger,
+    ThoughtScorer,
+};
 pub use graph_topology::{GraphEdge, GraphNode, GraphOfOperations, GraphTopologyError};
 pub use operations::{GraphOperation, MergeStrategy, ScoringStrategy, ValidationStrategy};
 pub use thought::{
