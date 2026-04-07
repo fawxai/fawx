@@ -30,8 +30,8 @@ impl GraphNode {
 #[derive(Debug, Clone)]
 pub struct GraphEdge {
     from: GraphNodeId,
-    /// If true, this is a back-edge (cycle). Subject to iteration limits.
     to: GraphNodeId,
+    /// If true, this is a back-edge (cycle). Subject to iteration limits.
     is_back_edge: bool,
 }
 
