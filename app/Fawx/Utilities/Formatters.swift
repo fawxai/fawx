@@ -85,20 +85,10 @@ func displayThinkingLevel(_ level: ThinkingLevel?, modelID: String? = nil) -> St
 }
 
 func displayProviderName(_ provider: String) -> String {
-    switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-    case "openai":
-        return "OpenAI"
-    case "anthropic":
-        return "Anthropic"
-    case "google":
-        return "Google"
-    case "openrouter":
-        return "OpenRouter"
-    case "fireworks":
-        return "Fireworks"
-    default:
-        return humanReadableSettingToken(provider)
+    if let knownProvider = ProviderBrand.resolve(provider) {
+        return knownProvider.companyName
     }
+    return humanReadableSettingToken(provider)
 }
 
 func displayAuthMethodName(_ authMethod: String) -> String {

@@ -283,130 +283,13 @@ private struct ModelSelectionRow: View {
         .background(isSelected ? Color.fawxAccent.opacity(0.08) : Color.fawxSurface)
         .overlay(
             RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
-                .stroke(isSelected ? Color.fawxAccent.opacity(0.35) : Color.fawxBorder, lineWidth: 1)
+                .stroke(
+                    isSelected ? Color.fawxAccent.opacity(0.35) : Color.fawxBorder,
+                    lineWidth: 1
+                )
         )
         .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
         .contentShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
-    }
-}
-
-struct ModelSelectionProviderOption: Identifiable, Hashable {
-    let id: String
-    let title: String
-}
-
-enum ModelSelectionScope: String, CaseIterable, Identifiable {
-    case recommended
-    case all
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .recommended:
-            return "Recommended"
-        case .all:
-            return "All Models"
-        }
-    }
-}
-
-struct ModelSelectionSection: Identifiable, Equatable {
-    let providerID: String
-    let title: String
-    let models: [ModelInfo]
-
-    var id: String { providerID }
-}
-
-enum ModelSelectionCatalog {
-    static let allProvidersID = "__all__"
-
-    static func providerOptions(for models: [ModelInfo]) -> [ModelSelectionProviderOption] {
-        var seen = Set<String>()
-        var options = [ModelSelectionProviderOption(id: allProvidersID, title: "All Providers")]
-
-        for model in models where seen.insert(model.provider).inserted {
-            options.append(
-                ModelSelectionProviderOption(
-                    id: model.provider,
-                    title: displayProviderName(model.provider)
-                )
-            )
-        }
-
-        return options
-    }
-
-    static func filteredSections(
-        models: [ModelInfo],
-        scope: ModelSelectionScope,
-        providerFilterID: String,
-        query: String
-    ) -> [ModelSelectionSection] {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let providerScopedModels = models.filter { model in
-            guard providerFilterID != allProvidersID else {
-                return true
-            }
-            return model.provider == providerFilterID
-        }
-
-        let recommendationScopedModels = providerScopedModels.filter { model in
-            guard scope == .recommended else {
-                return true
-            }
-            return model.recommended
-        }
-
-        let filteredModels = recommendationScopedModels.filter { model in
-            guard !trimmedQuery.isEmpty else {
-                return true
-            }
-
-            let normalizedQuery = trimmedQuery.lowercased()
-            let searchHaystack = [
-                model.modelID,
-                abbreviateModelName(model.modelID),
-                model.displayName ?? "",
-                model.provider,
-                displayProviderName(model.provider),
-                model.authMethod,
-                displayAuthMethodName(model.authMethod)
-            ]
-                .joined(separator: " ")
-                .lowercased()
-            return searchHaystack.contains(normalizedQuery)
-        }
-
-        var providerOrder: [String] = []
-        var groupedModels: [String: [ModelInfo]] = [:]
-
-        for model in filteredModels {
-            if groupedModels[model.provider] == nil {
-                providerOrder.append(model.provider)
-                groupedModels[model.provider] = []
-            }
-            groupedModels[model.provider, default: []].append(model)
-        }
-
-        return providerOrder.compactMap { providerID in
-            guard let sectionModels = groupedModels[providerID] else {
-                return nil
-            }
-
-            return ModelSelectionSection(
-                providerID: providerID,
-                title: displayProviderName(providerID),
-                models: sectionModels.sorted { left, right in
-                    if left.recommended != right.recommended {
-                        return left.recommended && !right.recommended
-                    }
-                    return displayModelName(left).localizedCaseInsensitiveCompare(displayModelName(right))
-                        == .orderedAscending
-                }
-            )
-        }
     }
 }
 

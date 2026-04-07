@@ -65,7 +65,7 @@ final class FormattersTests: XCTestCase {
     func testDisplayProviderNamePreservesKnownBrandCasing() {
         XCTAssertEqual(displayProviderName("openai"), "OpenAI")
         XCTAssertEqual(displayProviderName("openrouter"), "OpenRouter")
-        XCTAssertEqual(displayProviderName("fireworks"), "Fireworks")
+        XCTAssertEqual(displayProviderName("fireworks"), "Fireworks AI")
     }
 
     func testDisplayAuthMethodNameFormatsKnownAuthTokens() {
@@ -88,7 +88,7 @@ final class FormattersTests: XCTestCase {
             [
                 ModelSelectionProviderOption(id: ModelSelectionCatalog.allProvidersID, title: "All Providers"),
                 ModelSelectionProviderOption(id: "openrouter", title: "OpenRouter"),
-                ModelSelectionProviderOption(id: "fireworks", title: "Fireworks")
+                ModelSelectionProviderOption(id: "fireworks", title: "Fireworks AI")
             ]
         )
     }

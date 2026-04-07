@@ -11,6 +11,9 @@ pub async fn handle_list_models(State(state): State<HttpState>) -> Json<Value> {
         let snap = state.shared.read().await;
         (snap.active_model, snap.thinking_level)
     };
+    // Lock order is intentionally shared -> app -> shared. We snapshot the
+    // current selection first, fetch the dynamic catalog from the app without
+    // holding the shared lock, then publish the refreshed read model.
     let models = {
         let app = state.app.lock().await;
         app.available_models_dynamic().await

@@ -30,6 +30,8 @@
 		0EC64120FB0EC24ABB9E18DE /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30D703AD586AB7D1F2B5D6F4 /* OnboardingView.swift */; };
 		0F014E4839609EE4548002C0 /* Git.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6D3C5439AB0D7FBFD73E0EF /* Git.swift */; };
 		0FC9E8C91957FD190B49774C /* SetupViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EF63AD061A2371BAC4F03D3 /* SetupViewModel.swift */; };
+		1B1D54A1E4F5678901234568 /* ProviderBrand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1D54A1E4F5678901234567 /* ProviderBrand.swift */; };
+		1B1D54A1E4F5678901234569 /* ProviderBrand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1D54A1E4F5678901234567 /* ProviderBrand.swift */; };
 		0FCB780AFC429F0DCE4D9B06 /* GitPanelPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = C567870A2217B91648B47E9E /* GitPanelPresentation.swift */; };
 		10C52835C7D54B1722843A1A /* Synthesis.swift in Sources */ = {isa = PBXBuildFile; fileRef = C379D0DE77BBC0F8135DDD2C /* Synthesis.swift */; };
 		14454462BD5D89471EDE0C6D /* UsageViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75FE8A78B6B891D04A97F2E9 /* UsageViewModel.swift */; };
@@ -128,8 +130,10 @@
 		6133A70630254F54293BF325 /* ExperimentsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5034042A2AA2627984B5A5C5 /* ExperimentsViewModel.swift */; };
 		628187E4687D83596CCF2D60 /* SSEParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADFE086ECAE74F74DEC95BBF /* SSEParserTests.swift */; };
 		62D6A86D5E31EA975E546065 /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2822C7AA61307F89BAE00E0 /* Formatters.swift */; };
+		62D6A86D5E31EA975E546066 /* ModelSelectionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62D6A86D5E31EA975E546067 /* ModelSelectionCatalog.swift */; };
 		6350342BF81D33DDC2688337 /* ChatViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF04CF15FD6AF0630658E2F /* ChatViewModelTests.swift */; };
 		63A72093F2863A9042DD9BC4 /* ModelSelectionList.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27DEFB04586D7E73237C5B1C /* ModelSelectionList.swift */; };
+		63A72093F2863A9042DD9BC5 /* ModelSelectionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62D6A86D5E31EA975E546067 /* ModelSelectionCatalog.swift */; };
 		64175F9AE08DCBE56689543B /* ExperimentsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5034042A2AA2627984B5A5C5 /* ExperimentsViewModel.swift */; };
 		64B48B88589DAAA1CF142E9B /* SidebarSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946A14621A9A282DEB705EEC /* SidebarSelection.swift */; };
 		672964B7201DEB234FDD23C9 /* ExperimentsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94EBE1811C9FC5658072CEA1 /* ExperimentsViewModelTests.swift */; };
@@ -401,6 +405,7 @@
 		43A75068C7EB266AD29AF348 /* SessionRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionRowView.swift; sourceTree = "<group>"; };
 		499D9DF1AC854550AAB058AE /* ConnectionStateMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStateMachine.swift; sourceTree = "<group>"; };
 		4A283E2181E2E7E4F28576BB /* ModelInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelInfo.swift; sourceTree = "<group>"; };
+		1B1D54A1E4F5678901234567 /* ProviderBrand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderBrand.swift; sourceTree = "<group>"; };
 		4CCF91016EBF960C36D9BEB8 /* FawxUITests-macOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "FawxUITests-macOS.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		4D3206D1461F442ADBD0BA5E /* SetupViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupViewModelTests.swift; sourceTree = "<group>"; };
 		4EBAC07324B5BA38831E8F87 /* UsageSettingsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSettingsPanel.swift; sourceTree = "<group>"; };
@@ -463,6 +468,7 @@
 		B1AB5E3BFD623318C9101192 /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
 		B23786BFB2FFA2D5491FAFD3 /* LegalSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegalSection.swift; sourceTree = "<group>"; };
 		B2822C7AA61307F89BAE00E0 /* Formatters.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Formatters.swift; sourceTree = "<group>"; };
+		62D6A86D5E31EA975E546067 /* ModelSelectionCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSelectionCatalog.swift; sourceTree = "<group>"; };
 		B43FE3356B111C8A9C1185ED /* QueuedMessageChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueuedMessageChip.swift; sourceTree = "<group>"; };
 		B6916EA0A0788E34E33D95B8 /* Colors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Colors.swift; sourceTree = "<group>"; };
 		BD3B2154B09BF7D99E20294A /* ConnectionBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionBannerView.swift; sourceTree = "<group>"; };
@@ -736,6 +742,7 @@
 				9E4BE9EBBB93059B1E6AA12C /* MarketplaceView.swift */,
 				B1AB5E3BFD623318C9101192 /* MessageBubble.swift */,
 				A34A4F474A3C63738988C4F0 /* ModelBadge.swift */,
+				62D6A86D5E31EA975E546067 /* ModelSelectionCatalog.swift */,
 				27DEFB04586D7E73237C5B1C /* ModelSelectionList.swift */,
 				3FA64C89DB6E3ACE1FA8A99D /* NewSessionCopy.swift */,
 				30D703AD586AB7D1F2B5D6F4 /* OnboardingView.swift */,
@@ -819,6 +826,7 @@
 				7293FD0C7B8C4BFD74D1D776 /* MarketplaceSkill.swift */,
 				9F7F2D94A7051FB960EE5620 /* Message.swift */,
 				4A283E2181E2E7E4F28576BB /* ModelInfo.swift */,
+				1B1D54A1E4F5678901234567 /* ProviderBrand.swift */,
 				3F07B3D54545DE045D7EC042 /* OAuthFlow.swift */,
 				590BBABC228DCE73046BAEC0 /* Permission.swift */,
 				41C06784CE5006E4E7AC8B8C /* Ripcord.swift */,
@@ -1164,6 +1172,7 @@
 				6B111CB1715A4326A3021CA9 /* MessageBubble.swift in Sources */,
 				26BD6DA7FA76A4366F5AFF60 /* ModelBadge.swift in Sources */,
 				C68E000944DEE04BCD700B8D /* ModelInfo.swift in Sources */,
+				62D6A86D5E31EA975E546066 /* ModelSelectionCatalog.swift in Sources */,
 				5E280635AED4F622FA0233E3 /* ModelSelectionList.swift in Sources */,
 				7FF3697FF44B89A4C91D0040 /* NewSessionCopy.swift in Sources */,
 				B77CB6A8499F955A7441ECF2 /* NotificationService.swift in Sources */,
@@ -1174,6 +1183,7 @@
 				B6645E106D3B8B60D5A7927E /* Permission.swift in Sources */,
 				7BA020D7753EE877E81D979B /* PermissionsSettingsPanel.swift in Sources */,
 				0190B1F3E250D3220089AABB /* PermissionsViewModel.swift in Sources */,
+				1B1D54A1E4F5678901234568 /* ProviderBrand.swift in Sources */,
 				3F7B8BA7AC464855EB212A79 /* ProviderStep.swift in Sources */,
 				6CE5644EEE9CD995BB0D8788 /* QRCodeScannerSheet.swift in Sources */,
 				82CCDB95A716CD2B76DE53B3 /* QRCodeView.swift in Sources */,
@@ -1282,6 +1292,7 @@
 				518B0C1E3C8F9C25C2522CE9 /* MessageBubble.swift in Sources */,
 				8C277DC34AA3A272380684F6 /* ModelBadge.swift in Sources */,
 				D98D9598E28A58D9F2B890CC /* ModelInfo.swift in Sources */,
+				63A72093F2863A9042DD9BC5 /* ModelSelectionCatalog.swift in Sources */,
 				63A72093F2863A9042DD9BC4 /* ModelSelectionList.swift in Sources */,
 				4C3A7B6A1EA05E1CF4A3A03A /* NewSessionCopy.swift in Sources */,
 				4D3D066E6DCF4EC7157DE71F /* NotificationService.swift in Sources */,
@@ -1292,6 +1303,7 @@
 				AE525794B13CB7C413138BCE /* Permission.swift in Sources */,
 				F1680DCC5CE83B52D2D3A852 /* PermissionsSettingsPanel.swift in Sources */,
 				800A8B285C96FCBFFA367BDE /* PermissionsViewModel.swift in Sources */,
+				1B1D54A1E4F5678901234569 /* ProviderBrand.swift in Sources */,
 				2AF4D9AA513268FF12E565F6 /* ProviderStep.swift in Sources */,
 				24F7E781CDE097CE71703485 /* QRCodeScannerSheet.swift in Sources */,
 				B701CFFCB5584D5BDAC5B45D /* QRCodeView.swift in Sources */,

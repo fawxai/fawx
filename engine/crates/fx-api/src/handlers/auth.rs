@@ -382,106 +382,16 @@ fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
 mod tests {
     use super::*;
     use crate::devices::DeviceStore;
-    use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
     use crate::pairing::PairingState;
     use crate::server_runtime::ServerRuntime;
     use crate::state::{build_channel_runtime, in_memory_telemetry, HttpState, SharedReadState};
-    use crate::types::{AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto, ThinkingLevelDto};
-    use async_trait::async_trait;
-    use fx_bus::SessionBus;
-    use fx_core::types::InputSource;
-    use fx_llm::{DocumentAttachment, ImageAttachment, Message};
+    use crate::test_support::StubAppEngine;
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::Mutex;
 
-    struct NoopApp;
-
-    #[async_trait]
-    impl AppEngine for NoopApp {
-        async fn process_message(
-            &mut self,
-            _input: &str,
-            _images: Vec<ImageAttachment>,
-            _documents: Vec<DocumentAttachment>,
-            _source: InputSource,
-            _callback: Option<fx_kernel::StreamCallback>,
-        ) -> Result<ApiCycleResult, anyhow::Error> {
-            unreachable!("not used in auth cache tests")
-        }
-
-        async fn process_message_with_context(
-            &mut self,
-            _input: &str,
-            _images: Vec<ImageAttachment>,
-            _documents: Vec<DocumentAttachment>,
-            _context: Vec<Message>,
-            _source: InputSource,
-            _callback: Option<fx_kernel::StreamCallback>,
-        ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
-            unreachable!("not used in auth cache tests")
-        }
-
-        fn active_model(&self) -> &str {
-            "mock-model"
-        }
-
-        fn available_models(&self) -> Vec<ModelInfoDto> {
-            Vec::new()
-        }
-
-        fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
-            unreachable!("not used in auth cache tests")
-        }
-
-        fn thinking_level(&self) -> ThinkingLevelDto {
-            ThinkingLevelDto {
-                level: "normal".to_string(),
-                budget_tokens: None,
-                available: Vec::new(),
-            }
-        }
-
-        fn context_info(&self) -> ContextInfoDto {
-            ContextInfoDto {
-                used_tokens: 0,
-                max_tokens: 4_096,
-                percentage: 0.0,
-                compaction_threshold: 0.8,
-            }
-        }
-
-        fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
-            self.context_info()
-        }
-
-        fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
-            Ok(self.thinking_level())
-        }
-
-        fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
-            Vec::new()
-        }
-
-        fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
-            Vec::new()
-        }
-
-        fn config_manager(&self) -> Option<ConfigManagerHandle> {
-            None
-        }
-
-        fn session_bus(&self) -> Option<&SessionBus> {
-            None
-        }
-
-        fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
-            Vec::new()
-        }
-    }
-
     fn test_state(data_dir: std::path::PathBuf) -> HttpState {
-        let app = NoopApp;
+        let app = StubAppEngine::default();
         let shared = Arc::new(SharedReadState::from_app(&app));
 
         HttpState {

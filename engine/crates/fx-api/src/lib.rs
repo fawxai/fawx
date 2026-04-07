@@ -20,6 +20,8 @@ pub(crate) mod sse;
 pub(crate) mod state;
 pub mod tailscale;
 pub mod telegram;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token;
 pub(crate) mod types;
 

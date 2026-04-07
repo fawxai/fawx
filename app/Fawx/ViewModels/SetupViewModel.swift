@@ -27,29 +27,11 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 
     var displayName: String {
-        switch self {
-        case .anthropic:
-            "Claude"
-        case .openai:
-            "ChatGPT"
-        case .openrouter:
-            "OpenRouter"
-        case .fireworks:
-            "Fireworks"
-        }
+        brand.setupDisplayName
     }
 
     var companyName: String {
-        switch self {
-        case .anthropic:
-            "Anthropic"
-        case .openai:
-            "OpenAI"
-        case .openrouter:
-            "OpenRouter"
-        case .fireworks:
-            "Fireworks AI"
-        }
+        brand.companyName
     }
 
     var providerID: String {
@@ -99,6 +81,13 @@ enum SetupProvider: String, CaseIterable, Identifiable, Sendable {
 
     func supportsAuthMethod(_ method: SetupProviderAuthMethod) -> Bool {
         supportedAuthMethods.contains(method)
+    }
+
+    private var brand: ProviderBrand {
+        guard let brand = ProviderBrand(rawValue: rawValue) else {
+            preconditionFailure("Missing provider brand for \(rawValue)")
+        }
+        return brand
     }
 }
 
