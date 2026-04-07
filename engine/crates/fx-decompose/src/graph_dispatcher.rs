@@ -34,10 +34,10 @@ pub struct GraphExecutionResult {
     pub refinement_capped: bool,
 }
 
-pub struct GraphDispatcher {
-    generator: Arc<dyn ThoughtGenerator>,
-    scorer: Arc<dyn ThoughtScorer>,
-    merger: Arc<dyn ThoughtMerger>,
+pub struct GraphDispatcher<'a> {
+    generator: Arc<dyn ThoughtGenerator + 'a>,
+    scorer: Arc<dyn ThoughtScorer + 'a>,
+    merger: Arc<dyn ThoughtMerger + 'a>,
 }
 
 #[derive(Default)]
@@ -85,11 +85,11 @@ struct RefineConfig<'a> {
     scoring: &'a ScoringStrategy,
 }
 
-impl GraphDispatcher {
+impl<'a> GraphDispatcher<'a> {
     pub fn new(
-        generator: Arc<dyn ThoughtGenerator>,
-        scorer: Arc<dyn ThoughtScorer>,
-        merger: Arc<dyn ThoughtMerger>,
+        generator: Arc<dyn ThoughtGenerator + 'a>,
+        scorer: Arc<dyn ThoughtScorer + 'a>,
+        merger: Arc<dyn ThoughtMerger + 'a>,
     ) -> Self {
         Self {
             generator,
@@ -112,10 +112,15 @@ impl GraphDispatcher {
         let mut current = graph.entry();
 
         loop {
-            let Some(next) = self.execute_node(graph, current, &mut state).await? else {
-                break;
-            };
-            current = next;
+            match self.execute_node(graph, current, &mut state).await {
+                Ok(Some(next)) => current = next,
+                Ok(None) => break,
+                Err(DecomposeError::BudgetExceeded(reason)) => {
+                    tracing::debug!(reason, "stopping graph execution after budget exhaustion");
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(state.into_result())

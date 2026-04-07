@@ -363,6 +363,7 @@ fn emit(progress: Option<&DecompositionProgressCallback>, event: DecompositionEv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningMode;
     use crate::{ComplexityHint, SubGoalContract};
 
     fn sample_experiment() -> Experiment {
@@ -384,6 +385,7 @@ mod tests {
                 })
                 .collect(),
             strategy,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         }
     }

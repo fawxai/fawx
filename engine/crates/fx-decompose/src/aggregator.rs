@@ -397,6 +397,7 @@ impl WorkspaceProvider for DefaultWorkspaceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningMode;
     use crate::{ComplexityHint, SubGoal, SubGoalContract};
 
     fn sample_experiment() -> Experiment {
@@ -435,6 +436,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: vec![goal("A"), goal("B")],
             strategy: crate::AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
         let results = vec![completed("A", "diff-a"), completed("B", "diff-b")];
@@ -454,6 +456,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: vec![goal("A"), goal("B")],
             strategy: crate::AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
         let results = vec![completed("A", "diff-a"), failed_result("B")];
@@ -473,6 +476,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: vec![],
             strategy: crate::AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
         let aggregator = SimpleAggregator;
@@ -492,6 +496,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: vec![goal("A"), goal("B")],
             strategy: crate::AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
         let results = vec![completed("A", ""), completed("B", "")];

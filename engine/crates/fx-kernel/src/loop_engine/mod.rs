@@ -1262,9 +1262,25 @@ struct FollowUpDecomposeContext {
 
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
+    #[serde(default)]
     sub_goals: Vec<DecomposeSubGoalArguments>,
     #[serde(default)]
     strategy: Option<AggregationStrategy>,
+    #[serde(default)]
+    reasoning_mode: Option<DecomposeReasoningMode>,
+    #[serde(default)]
+    got_branches: Option<usize>,
+    #[serde(default)]
+    got_criteria: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DecomposeReasoningMode {
+    Standard,
+    GotTree,
+    GotGraph,
+    GotConsensus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3225,6 +3241,9 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Option<Result<ActionResult, LoopError>> {
+        if !plan.reasoning_mode.is_standard() {
+            return None;
+        }
         if self.is_batch_plan(plan) {
             if let Some(calls) = self.batch_to_tool_calls(plan) {
                 self.emit_signal(

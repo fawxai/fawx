@@ -8,6 +8,7 @@ pub mod graph_builder;
 pub mod graph_dispatcher;
 pub mod graph_topology;
 pub mod operations;
+pub mod reasoning_mode;
 pub mod thought;
 
 use fx_core::signals::Signal;
@@ -491,6 +492,8 @@ fn looks_unresolved_action_response(task: &str, response: &str) -> bool {
 pub struct DecompositionPlan {
     pub sub_goals: Vec<SubGoal>,
     pub strategy: AggregationStrategy,
+    #[serde(default)]
+    pub reasoning_mode: reasoning_mode::ReasoningMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_from: Option<usize>,
 }
@@ -549,6 +552,7 @@ pub use graph_dispatcher::{
 };
 pub use graph_topology::{GraphEdge, GraphNode, GraphOfOperations, GraphTopologyError};
 pub use operations::{GraphOperation, MergeStrategy, ScoringStrategy, ValidationStrategy};
+pub use reasoning_mode::{EdgeSpec, GoTPreset, GraphOfOperationsSpec, ReasoningMode};
 pub use thought::{
     GraphNodeId, ThoughtId, ThoughtIdAllocator, ThoughtMetadata, ThoughtMetadataValue, ThoughtPool,
     ThoughtState,
@@ -591,6 +595,7 @@ mod tests {
         let original = DecompositionPlan {
             sub_goals: vec![sample_sub_goal()],
             strategy: AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
 
@@ -652,6 +657,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: Vec::new(),
             strategy: AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
 

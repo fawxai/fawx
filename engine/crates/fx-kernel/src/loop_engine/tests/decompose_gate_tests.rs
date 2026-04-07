@@ -2,7 +2,9 @@ use super::*;
 use crate::act::ToolResult;
 use crate::budget::BudgetConfig;
 use async_trait::async_trait;
-use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
+use fx_decompose::{
+    AggregationStrategy, ComplexityHint, DecompositionPlan, ReasoningMode, SubGoal,
+};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, ProviderError, ToolCall, ToolDefinition,
 };
@@ -140,6 +142,7 @@ fn plan(sub_goals: Vec<SubGoal>) -> DecompositionPlan {
     DecompositionPlan {
         sub_goals,
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     }
 }
@@ -948,6 +951,7 @@ async fn sequential_strategy_excludes_complexity_floor() {
             sub_goal("c", &["tool_c"], Some(ComplexityHint::Trivial)),
         ],
         strategy: AggregationStrategy::Sequential,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let decision = Decision::Decompose(p.clone());

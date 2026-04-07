@@ -2,7 +2,10 @@ use super::*;
 use crate::budget::BudgetConfig;
 use async_trait::async_trait;
 use fx_core::message::InternalMessage;
-use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
+use fx_decompose::{
+    AggregationStrategy, DecompositionPlan, GoTPreset, GraphOfOperationsSpec, ReasoningMode,
+    SubGoal,
+};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
     ToolDefinition,
@@ -144,6 +147,7 @@ fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
             })
             .collect(),
         strategy: AggregationStrategy::Sequential,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     }
 }
@@ -345,10 +349,21 @@ fn assert_decompose_tool_present(tools: &[ToolDefinition]) {
         "decompose tool should be present once"
     );
     assert_eq!(decompose_tools[0].description, DECOMPOSE_TOOL_DESCRIPTION);
-    assert_eq!(
-        decompose_tools[0].parameters["required"],
-        serde_json::json!(["sub_goals"])
-    );
+    assert!(decompose_tools[0].parameters["properties"]
+        .get("sub_goals")
+        .is_some());
+    assert!(decompose_tools[0].parameters["properties"]
+        .get("strategy")
+        .is_some());
+    assert!(decompose_tools[0].parameters["properties"]
+        .get("reasoning_mode")
+        .is_some());
+    assert!(decompose_tools[0].parameters["properties"]
+        .get("got_branches")
+        .is_some());
+    assert!(decompose_tools[0].parameters["properties"]
+        .get("got_criteria")
+        .is_some());
 }
 
 #[tokio::test]
@@ -651,6 +666,7 @@ async fn concurrent_execution_emits_progress_events_via_event_bus() {
             SubGoal::new("second", Vec::new(), SubGoalContract::default(), None),
         ],
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let decision = Decision::Decompose(plan.clone());
@@ -713,6 +729,7 @@ async fn sequential_execution_emits_progress_events_via_event_bus() {
             SubGoal::new("second", Vec::new(), SubGoalContract::default(), None),
         ],
         strategy: AggregationStrategy::Sequential,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let decision = Decision::Decompose(plan.clone());
@@ -873,6 +890,7 @@ fn emit_decision_signals_includes_decomposition_metadata() {
     let decision = Decision::Decompose(DecompositionPlan {
         sub_goals: decomposition_plan(&["one", "two"]).sub_goals,
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     });
 
@@ -1006,6 +1024,148 @@ async fn decide_rejects_unsupported_strategy() {
 }
 
 #[tokio::test]
+async fn decide_rejects_got_mode_when_combined_with_sub_goals() {
+    let mut engine = decomposition_engine(budget_config(10, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "sub_goals": [{"description": "Inspect crate configuration"}],
+            "reasoning_mode": "got_graph",
+            "got_criteria": "reasoning quality"
+        }))],
+        usage: None,
+        stop_reason: None,
+    };
+
+    let error = engine
+        .decide(&response)
+        .await
+        .expect_err("got mode should reject sub_goals");
+    assert_eq!(error.stage, "decide");
+    assert!(error
+        .reason
+        .contains("cannot be combined with GoT reasoning modes"));
+}
+
+#[tokio::test]
+async fn decide_accepts_got_mode_without_sub_goals() {
+    let mut engine = decomposition_engine(budget_config(10, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "reasoning_mode": "got_tree",
+            "got_branches": 4,
+            "got_criteria": "reasoning quality"
+        }))],
+        usage: None,
+        stop_reason: None,
+    };
+
+    let decision = engine.decide(&response).await.expect("decision");
+    match decision {
+        Decision::Decompose(plan) => {
+            assert!(plan.sub_goals.is_empty());
+            assert_eq!(plan.strategy, AggregationStrategy::Sequential);
+            assert_eq!(
+                plan.reasoning_mode,
+                ReasoningMode::GraphOfThoughts {
+                    graph: GraphOfOperationsSpec::Preset {
+                        name: GoTPreset::TreeOfThought,
+                        branches: Some(4),
+                        keep: None,
+                        refine_iterations: None,
+                        target_score: None,
+                        criteria: "reasoning quality".to_string(),
+                    },
+                }
+            );
+        }
+        other => panic!("expected decomposition decision, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn execute_decomposition_runs_got_tree_and_returns_best_thought() {
+    let mut engine = decomposition_engine(budget_config(20, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "reasoning_mode": "got_tree",
+            "got_branches": 3,
+            "got_criteria": "reasoning quality"
+        }))],
+        usage: None,
+        stop_reason: Some("tool_use".to_string()),
+    };
+    let decision = engine.decide(&response).await.expect("decision");
+    let Decision::Decompose(plan) = decision.clone() else {
+        panic!("expected decomposition decision");
+    };
+    let llm = ScriptedLlm::new(vec![
+        Ok(text_response("candidate-0")),
+        Ok(text_response("candidate-1")),
+        Ok(text_response("candidate-2")),
+        Ok(text_response("0.2")),
+        Ok(text_response("0.9")),
+        Ok(text_response("0.5")),
+    ]);
+
+    let action = engine
+        .execute_decomposition(
+            &decision,
+            &plan,
+            &llm,
+            &[Message::user("Solve this carefully")],
+        )
+        .await
+        .expect("got decomposition");
+
+    assert_eq!(action.response_text, "candidate-1");
+    assert_eq!(llm.complete_calls(), 6);
+    let status = engine.status(current_time_ms());
+    assert_eq!(status.llm_calls_used, 6);
+    assert_eq!(status.remaining.llm_calls, 14);
+}
+
+#[tokio::test]
+async fn execute_decomposition_returns_partial_got_result_when_budget_is_exhausted() {
+    let mut engine = decomposition_engine(budget_config(2, 6), 0);
+    let response = CompletionResponse {
+        content: Vec::new(),
+        tool_calls: vec![decompose_tool_call(serde_json::json!({
+            "reasoning_mode": "got_graph",
+            "got_branches": 1,
+            "got_criteria": "reasoning quality"
+        }))],
+        usage: None,
+        stop_reason: Some("tool_use".to_string()),
+    };
+    let decision = engine.decide(&response).await.expect("decision");
+    let Decision::Decompose(plan) = decision.clone() else {
+        panic!("expected decomposition decision");
+    };
+    let llm = ScriptedLlm::new(vec![
+        Ok(text_response("candidate")),
+        Ok(text_response("0.8")),
+        Ok(text_response("merged")),
+    ]);
+
+    let action = engine
+        .execute_decomposition(
+            &decision,
+            &plan,
+            &llm,
+            &[Message::user("Solve this carefully")],
+        )
+        .await
+        .expect("got decomposition");
+
+    assert_eq!(action.response_text, "candidate");
+    assert_eq!(llm.complete_calls(), 2);
+    assert_eq!(engine.status(current_time_ms()).remaining.llm_calls, 0);
+}
+
+#[tokio::test]
 async fn decide_normal_tools_still_work_with_decompose_registered() {
     let mut engine = decomposition_engine(budget_config(10, 6), 0);
     let response = CompletionResponse {
@@ -1108,6 +1268,7 @@ fn concurrent_plan(descriptions: &[&str]) -> DecompositionPlan {
             })
             .collect(),
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     }
 }
@@ -1335,6 +1496,7 @@ fn sequential_adaptive_allocation_gives_more_to_complex_sub_goals() {
             },
         ],
         strategy: AggregationStrategy::Sequential,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let allocator = BudgetAllocator::new();
@@ -1370,6 +1532,7 @@ fn concurrent_adaptive_allocation_distributes_proportionally() {
             },
         ],
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let allocator = BudgetAllocator::new();
@@ -1961,6 +2124,7 @@ async fn concurrent_execution_with_empty_plan_returns_empty_results() {
     let plan = DecompositionPlan {
         sub_goals: Vec::new(),
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: ReasoningMode::Standard,
         truncated_from: None,
     };
     let llm = ScriptedLlm::new(vec![]);

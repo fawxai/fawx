@@ -540,9 +540,27 @@ pub(super) fn decompose_tool_definition() -> ToolDefinition {
                     },
                     "description": "List of sub-goals to execute"
                 },
-                "strategy": {"type": "string", "enum": ["Sequential", "Parallel"], "description": "Execution strategy"}
+                "strategy": {
+                    "type": "string",
+                    "enum": ["Sequential", "Parallel"],
+                    "description": "Execution strategy for standard decomposition mode"
+                },
+                "reasoning_mode": {
+                    "type": "string",
+                    "enum": ["standard", "got_tree", "got_graph", "got_consensus"],
+                    "description": "Reasoning strategy. Default: standard. GoT modes construct their own execution graph and cannot be combined with sub_goals or strategy."
+                },
+                "got_branches": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of thought branches for GoT modes. Default: 3"
+                },
+                "got_criteria": {
+                    "type": "string",
+                    "description": "Evaluation criteria for GoT scoring. Required for GoT modes."
+                }
             },
-            "required": ["sub_goals"]
+            "required": []
         }),
     }
 }
