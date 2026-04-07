@@ -541,9 +541,9 @@ pub use engine::{
 };
 pub use error::DecomposeError;
 pub use graph_dispatcher::{
-    parse_llm_score, ConcatMerger, GraphDispatcher, GraphExecutionResult, HeuristicThoughtScorer,
-    LlmThoughtGenerator, LlmThoughtMerger, LlmThoughtScorer, ThoughtGenerator, ThoughtMerger,
-    ThoughtScorer,
+    ConcatMerger, GeneratedThoughts, GraphDispatcher, GraphExecutionResult, HeuristicThoughtScorer,
+    LlmThoughtGenerator, LlmThoughtMerger, LlmThoughtScorer, MergedThought, ThoughtGenerator,
+    ThoughtMerger, ThoughtScore, ThoughtScorer,
 };
 pub use graph_topology::{GraphEdge, GraphNode, GraphOfOperations, GraphTopologyError};
 pub use operations::{GraphOperation, MergeStrategy, ScoringStrategy, ValidationStrategy};

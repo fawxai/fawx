@@ -1,45 +1,24 @@
 use crate::{
-    DecomposeError, DecompositionProgressCallback, GraphNodeId, GraphOfOperations, GraphOperation,
-    MergeStrategy, ScoringStrategy, ThoughtMetadata, ThoughtPool, ThoughtState, ValidationStrategy,
+    DecomposeError, GraphNodeId, GraphOfOperations, GraphOperation, MergeStrategy, ScoringStrategy,
+    ThoughtMetadata, ThoughtPool, ThoughtState, ValidationStrategy,
 };
-use async_trait::async_trait;
-use fx_llm::{completion_text, CompletionRequest, Message, ModelRouter};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-const DEFAULT_SCORE_FALLBACK: f64 = 0.5;
-const SCORE_RESPONSE_TOKEN_LIMIT: u32 = 64;
-const GENERATION_TOKEN_LIMIT: u32 = 512;
-const MERGE_TOKEN_LIMIT: u32 = 1024;
+mod thought_impls;
+mod traits;
 
-/// Pluggable scoring for thoughts. Used by Score and Refine operations.
-#[async_trait]
-pub trait ThoughtScorer: Send + Sync {
-    async fn score(&self, thought: &ThoughtState, criteria: &str) -> Result<f64, DecomposeError>;
-}
+#[cfg(test)]
+mod tests;
 
-/// Generates new thoughts from a parent thought.
-#[async_trait]
-pub trait ThoughtGenerator: Send + Sync {
-    async fn generate(
-        &self,
-        parent: &ThoughtState,
-        num_branches: usize,
-        prompt_override: Option<&str>,
-    ) -> Result<Vec<String>, DecomposeError>;
-}
-
-/// Merges multiple thoughts into one.
-#[async_trait]
-pub trait ThoughtMerger: Send + Sync {
-    async fn merge(
-        &self,
-        thoughts: &[&ThoughtState],
-        instruction: Option<&str>,
-    ) -> Result<String, DecomposeError>;
-}
+pub use thought_impls::{
+    ConcatMerger, HeuristicThoughtScorer, LlmThoughtGenerator, LlmThoughtMerger, LlmThoughtScorer,
+};
+pub use traits::{
+    GeneratedThoughts, MergedThought, ThoughtGenerator, ThoughtMerger, ThoughtScore, ThoughtScorer,
+};
 
 #[derive(Debug, Clone)]
 pub struct GraphExecutionResult {
@@ -70,6 +49,42 @@ struct ExecutionCounters {
     node_visit_counts: HashMap<GraphNodeId, usize>,
 }
 
+struct ExecutionState {
+    pool: ThoughtPool,
+    counters: ExecutionCounters,
+}
+
+impl ExecutionState {
+    fn new(initial_content: String, initial_metadata: ThoughtMetadata) -> Self {
+        let mut pool = ThoughtPool::new();
+        pool.create(initial_content, Vec::new(), initial_metadata);
+        Self {
+            pool,
+            counters: ExecutionCounters::default(),
+        }
+    }
+
+    fn into_result(self) -> GraphExecutionResult {
+        let thoughts = pool_snapshot(&self.pool);
+        let best = select_best(&thoughts);
+
+        GraphExecutionResult {
+            thoughts,
+            best,
+            llm_calls: self.counters.llm_calls,
+            operations_executed: self.counters.operations_executed,
+            refinement_capped: self.counters.refinement_capped,
+        }
+    }
+}
+
+struct RefineConfig<'a> {
+    node_id: GraphNodeId,
+    max_iterations: usize,
+    target_score: f64,
+    scoring: &'a ScoringStrategy,
+}
+
 impl GraphDispatcher {
     pub fn new(
         generator: Arc<dyn ThoughtGenerator>,
@@ -88,135 +103,116 @@ impl GraphDispatcher {
         graph: &GraphOfOperations,
         initial_content: String,
         initial_metadata: ThoughtMetadata,
-        _progress: Option<&DecompositionProgressCallback>,
     ) -> Result<GraphExecutionResult, DecomposeError> {
         graph.validate().map_err(|error| {
             DecomposeError::DecompositionFailed(format!("invalid graph topology: {error}"))
         })?;
 
-        let mut pool = ThoughtPool::new();
-        pool.create(initial_content, Vec::new(), initial_metadata);
-
-        let mut counters = ExecutionCounters::default();
+        let mut state = ExecutionState::new(initial_content, initial_metadata);
         let mut current = graph.entry();
 
         loop {
-            let node = graph.node(current).ok_or_else(|| {
-                DecomposeError::DecompositionFailed(format!(
-                    "graph node {current} disappeared during execution"
-                ))
-            })?;
-            let cycle = counters
-                .node_visit_counts
-                .get(&current)
-                .copied()
-                .unwrap_or(0);
-            let span = tracing::info_span!(
-                "got_operation",
-                node = %current,
-                op = operation_name(node.operation()),
-                cycle = cycle,
-            );
-            let _guard = span.enter();
-
-            counters.node_visit_counts.insert(current, cycle + 1);
-            self.apply_operation(current, node.operation(), &mut pool, &mut counters)
-                .await?;
-            counters.operations_executed += 1;
-
-            let Some(next) = next_node(graph, current, &mut counters.back_edge_counts) else {
+            let Some(next) = self.execute_node(graph, current, &mut state).await? else {
                 break;
             };
             current = next;
         }
 
-        let thoughts = pool_snapshot(&pool);
-        let best = select_best(&thoughts);
+        Ok(state.into_result())
+    }
 
-        Ok(GraphExecutionResult {
-            thoughts,
-            best,
-            llm_calls: counters.llm_calls,
-            operations_executed: counters.operations_executed,
-            refinement_capped: counters.refinement_capped,
-        })
+    async fn execute_node(
+        &self,
+        graph: &GraphOfOperations,
+        current: GraphNodeId,
+        state: &mut ExecutionState,
+    ) -> Result<Option<GraphNodeId>, DecomposeError> {
+        let node = graph.node(current).ok_or_else(|| {
+            DecomposeError::DecompositionFailed(format!(
+                "graph node {current} disappeared during execution"
+            ))
+        })?;
+        let cycle = state
+            .counters
+            .node_visit_counts
+            .get(&current)
+            .copied()
+            .unwrap_or(0);
+        let span = tracing::info_span!(
+            "got_operation",
+            node = %current,
+            op = operation_name(node.operation()),
+            cycle = cycle,
+        );
+        let _guard = span.enter();
+
+        state.counters.node_visit_counts.insert(current, cycle + 1);
+        self.apply_operation(current, node.operation(), state)
+            .await?;
+        state.counters.operations_executed += 1;
+
+        Ok(next_node(
+            graph,
+            current,
+            &mut state.counters.back_edge_counts,
+        ))
     }
 
     async fn apply_operation(
         &self,
         node_id: GraphNodeId,
         operation: &GraphOperation,
-        pool: &mut ThoughtPool,
-        counters: &mut ExecutionCounters,
+        state: &mut ExecutionState,
     ) -> Result<(), DecomposeError> {
         match operation {
             GraphOperation::Generate {
                 num_branches,
                 prompt_override,
             } => {
-                self.apply_generate(
-                    node_id,
-                    pool,
-                    *num_branches,
-                    prompt_override.as_deref(),
-                    &mut counters.llm_calls,
-                )
-                .await
+                self.apply_generate(node_id, state, *num_branches, prompt_override.as_deref())
+                    .await
             }
-            GraphOperation::Score { strategy } => self.apply_score(strategy, pool, counters).await,
+            GraphOperation::Score { strategy } => self.apply_score(strategy, state).await,
             GraphOperation::KeepBest { n } => {
-                self.apply_keep_best(*n, pool);
+                self.apply_keep_best(*n, state);
                 Ok(())
             }
-            GraphOperation::Merge { strategy } => {
-                self.apply_merge(node_id, strategy, pool, counters).await
-            }
+            GraphOperation::Merge { strategy } => self.apply_merge(node_id, strategy, state).await,
             GraphOperation::Refine {
                 max_iterations,
                 target_score,
                 scoring,
             } => {
-                self.apply_refine(
+                let config = RefineConfig {
                     node_id,
-                    *max_iterations,
-                    *target_score,
+                    max_iterations: *max_iterations,
+                    target_score: *target_score,
                     scoring,
-                    pool,
-                    counters,
-                )
-                .await
+                };
+                self.apply_refine(config, state).await
             }
-            GraphOperation::Validate { strategy } => {
-                self.apply_validate(strategy, pool, counters).await
-            }
+            GraphOperation::Validate { strategy } => self.apply_validate(strategy, state).await,
         }
     }
 
     async fn apply_generate(
         &self,
         node_id: GraphNodeId,
-        pool: &mut ThoughtPool,
+        state: &mut ExecutionState,
         num_branches: usize,
         prompt_override: Option<&str>,
-        llm_calls: &mut usize,
     ) -> Result<(), DecomposeError> {
-        for parent_id in pool.active_ids() {
-            let Some(parent) = pool.get(parent_id).cloned() else {
+        for parent_id in state.pool.active_ids() {
+            let Some(parent) = state.pool.get(parent_id).cloned() else {
                 continue;
             };
-            let generated = self
+            let generation = self
                 .generator
                 .generate(&parent, num_branches, prompt_override)
                 .await?;
-            *llm_calls += num_branches;
-
-            for content in generated {
-                let child_id = pool.create(content, vec![parent.id()], parent.metadata.clone());
-                if let Some(child) = pool.get_mut(child_id) {
-                    child.origin_operation = Some(node_id);
-                }
-            }
-            pool.remove(parent_id);
+            state.counters.llm_calls += generation.llm_calls;
+            validate_generation_count(&generation, parent.id().value(), num_branches)?;
+            replace_parent_with_children(node_id, &mut state.pool, &parent, generation.contents);
         }
 
         Ok(())
@@ -225,37 +221,70 @@ impl GraphDispatcher {
     async fn apply_score(
         &self,
         strategy: &ScoringStrategy,
-        pool: &mut ThoughtPool,
-        counters: &mut ExecutionCounters,
+        state: &mut ExecutionState,
     ) -> Result<(), DecomposeError> {
-        for thought_id in pool.active_ids() {
-            let Some(thought) = pool.get(thought_id).cloned() else {
+        match strategy {
+            ScoringStrategy::LlmRating { criteria } => self.apply_llm_score(criteria, state).await,
+            ScoringStrategy::Heuristic { pattern } => self.apply_heuristic_score(pattern, state),
+            ScoringStrategy::External => Ok(()),
+        }
+    }
+
+    async fn apply_llm_score(
+        &self,
+        criteria: &str,
+        state: &mut ExecutionState,
+    ) -> Result<(), DecomposeError> {
+        for thought_id in state.pool.active_ids() {
+            let Some(thought) = state.pool.get(thought_id).cloned() else {
                 continue;
             };
-            let Some(score) = self
-                .score_for_strategy(&thought, strategy, counters)
-                .await?
-            else {
-                continue;
-            };
-            if let Some(state) = pool.get_mut(thought_id) {
-                state.score = Some(score);
-            }
+            let score = self.scorer.score(&thought, criteria).await?;
+            let value = validate_score_range(score.value, "scoring")?;
+            state.counters.llm_calls += score.llm_calls;
+            update_score(&mut state.pool, thought_id, value);
         }
 
         Ok(())
     }
 
-    fn apply_keep_best(&self, n: usize, pool: &mut ThoughtPool) {
-        let keep_ids = pool
+    fn apply_heuristic_score(
+        &self,
+        pattern: &str,
+        state: &mut ExecutionState,
+    ) -> Result<(), DecomposeError> {
+        let regex = Regex::new(pattern).map_err(|error| {
+            DecomposeError::DecompositionFailed(format!(
+                "invalid heuristic scoring pattern {pattern:?}: {error}"
+            ))
+        })?;
+
+        for thought_id in state.pool.active_ids() {
+            let Some(thought) = state.pool.get(thought_id) else {
+                continue;
+            };
+            let score = if regex.is_match(&thought.content) {
+                1.0
+            } else {
+                0.0
+            };
+            update_score(&mut state.pool, thought_id, score);
+        }
+
+        Ok(())
+    }
+
+    fn apply_keep_best(&self, n: usize, state: &mut ExecutionState) {
+        let keep_ids = state
+            .pool
             .top_n(n)
             .into_iter()
             .map(ThoughtState::id)
             .collect::<HashSet<_>>();
 
-        for thought_id in pool.active_ids() {
+        for thought_id in state.pool.active_ids() {
             if !keep_ids.contains(&thought_id) {
-                pool.remove(thought_id);
+                state.pool.remove(thought_id);
             }
         }
     }
@@ -264,10 +293,9 @@ impl GraphDispatcher {
         &self,
         node_id: GraphNodeId,
         strategy: &MergeStrategy,
-        pool: &mut ThoughtPool,
-        counters: &mut ExecutionCounters,
+        state: &mut ExecutionState,
     ) -> Result<(), DecomposeError> {
-        let active = pool_snapshot(pool);
+        let active = pool_snapshot(&state.pool);
         if active.is_empty() {
             return Ok(());
         }
@@ -275,22 +303,24 @@ impl GraphDispatcher {
         let refs = active.iter().collect::<Vec<_>>();
         let merged_content = match strategy {
             MergeStrategy::LlmSynthesis { instruction } => {
-                let content = self.merger.merge(&refs, instruction.as_deref()).await?;
-                counters.llm_calls += 1;
-                content
+                let merged = self.merger.merge(&refs, instruction.as_deref()).await?;
+                state.counters.llm_calls += merged.llm_calls;
+                merged.content
             }
             MergeStrategy::Concatenate { separator } => join_contents(&refs, separator),
         };
 
         let parent_ids = active.iter().map(ThoughtState::id).collect::<Vec<_>>();
         let merged_metadata = merge_metadata(&active);
-        let merged_id = pool.create(merged_content, parent_ids.clone(), merged_metadata);
-        if let Some(merged) = pool.get_mut(merged_id) {
+        let merged_id = state
+            .pool
+            .create(merged_content, parent_ids.clone(), merged_metadata);
+        if let Some(merged) = state.pool.get_mut(merged_id) {
             merged.origin_operation = Some(node_id);
         }
 
         for parent_id in parent_ids {
-            pool.remove(parent_id);
+            state.pool.remove(parent_id);
         }
 
         Ok(())
@@ -298,48 +328,54 @@ impl GraphDispatcher {
 
     async fn apply_refine(
         &self,
-        node_id: GraphNodeId,
-        max_iterations: usize,
-        target_score: f64,
-        scoring: &ScoringStrategy,
-        pool: &mut ThoughtPool,
-        counters: &mut ExecutionCounters,
+        config: RefineConfig<'_>,
+        state: &mut ExecutionState,
     ) -> Result<(), DecomposeError> {
-        if max_iterations == 0 {
-            counters.refinement_capped = true;
+        if config.max_iterations == 0 {
+            state.counters.refinement_capped = true;
             return Ok(());
         }
 
-        for iteration in 0..max_iterations {
-            self.apply_score(scoring, pool, counters).await?;
-            if current_top_score(pool).is_some_and(|score| score >= target_score) {
+        for iteration in 0..config.max_iterations {
+            self.apply_score(config.scoring, state).await?;
+            if current_top_score(&state.pool).is_some_and(|score| score >= config.target_score) {
                 return Ok(());
             }
 
-            for parent_id in pool.active_ids() {
-                let Some(parent) = pool.get(parent_id).cloned() else {
-                    continue;
-                };
-                let prompt = build_refine_prompt(&parent, iteration, target_score, scoring);
-                let generated = self
-                    .generator
-                    .generate(&parent, 1, Some(prompt.as_str()))
-                    .await?;
-                counters.llm_calls += 1;
-
-                for content in generated {
-                    let child_id = pool.create(content, vec![parent.id()], parent.metadata.clone());
-                    if let Some(child) = pool.get_mut(child_id) {
-                        child.origin_operation = Some(node_id);
-                    }
-                }
-
-                pool.remove(parent_id);
+            self.refine_active_thoughts(iteration, &config, state)
+                .await?;
+            if iteration + 1 == config.max_iterations {
+                state.counters.refinement_capped = true;
             }
+        }
 
-            if iteration + 1 == max_iterations {
-                counters.refinement_capped = true;
-            }
+        Ok(())
+    }
+
+    async fn refine_active_thoughts(
+        &self,
+        iteration: usize,
+        config: &RefineConfig<'_>,
+        state: &mut ExecutionState,
+    ) -> Result<(), DecomposeError> {
+        for parent_id in state.pool.active_ids() {
+            let Some(parent) = state.pool.get(parent_id).cloned() else {
+                continue;
+            };
+            let prompt =
+                build_refine_prompt(&parent, iteration, config.target_score, config.scoring);
+            let generation = self
+                .generator
+                .generate(&parent, 1, Some(prompt.as_str()))
+                .await?;
+            state.counters.llm_calls += generation.llm_calls;
+            validate_generation_count(&generation, parent.id().value(), 1)?;
+            replace_parent_with_children(
+                config.node_id,
+                &mut state.pool,
+                &parent,
+                generation.contents,
+            );
         }
 
         Ok(())
@@ -348,285 +384,87 @@ impl GraphDispatcher {
     async fn apply_validate(
         &self,
         strategy: &ValidationStrategy,
-        pool: &mut ThoughtPool,
-        counters: &mut ExecutionCounters,
+        state: &mut ExecutionState,
     ) -> Result<(), DecomposeError> {
-        for thought_id in pool.active_ids() {
-            let Some(thought) = pool.get(thought_id).cloned() else {
+        for thought_id in state.pool.active_ids() {
+            let Some(thought) = state.pool.get(thought_id).cloned() else {
                 continue;
             };
-            let score = match strategy {
-                ValidationStrategy::ExactMatch { expected } => {
-                    if thought.content.trim() == expected.trim() {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                ValidationStrategy::Contains { expected } => {
-                    if thought.content.contains(expected) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                ValidationStrategy::LlmJudge { criteria } => {
-                    let score = self.scorer.score(&thought, criteria).await?;
-                    counters.llm_calls += 1;
-                    if validate_score_range(score, "validation")? >= 0.5 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                ValidationStrategy::AlwaysPass => 1.0,
-            };
-
-            if let Some(state) = pool.get_mut(thought_id) {
-                state.score = Some(score);
-            }
+            let score = self
+                .validate_thought(strategy, &thought, &mut state.counters.llm_calls)
+                .await?;
+            update_score(&mut state.pool, thought_id, score);
         }
 
         Ok(())
     }
 
-    async fn score_for_strategy(
+    async fn validate_thought(
         &self,
+        strategy: &ValidationStrategy,
         thought: &ThoughtState,
-        strategy: &ScoringStrategy,
-        counters: &mut ExecutionCounters,
-    ) -> Result<Option<f64>, DecomposeError> {
+        llm_calls: &mut usize,
+    ) -> Result<f64, DecomposeError> {
         match strategy {
-            ScoringStrategy::LlmRating { criteria } => {
-                let score = self.scorer.score(thought, criteria).await?;
-                counters.llm_calls += 1;
-                Ok(Some(validate_score_range(score, "scoring")?))
-            }
-            ScoringStrategy::Heuristic { pattern } => {
-                let regex = Regex::new(pattern).map_err(|error| {
-                    DecomposeError::DecompositionFailed(format!(
-                        "invalid heuristic scoring pattern {pattern:?}: {error}"
-                    ))
-                })?;
-                Ok(Some(if regex.is_match(&thought.content) {
+            ValidationStrategy::ExactMatch { expected } => {
+                Ok(if thought.content.trim() == expected.trim() {
                     1.0
                 } else {
                     0.0
-                }))
+                })
             }
-            ScoringStrategy::External => Ok(None),
+            ValidationStrategy::Contains { expected } => {
+                Ok(if thought.content.contains(expected) {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            ValidationStrategy::LlmJudge { criteria } => {
+                let score = self.scorer.score(thought, criteria).await?;
+                let value = validate_score_range(score.value, "validation")?;
+                *llm_calls += score.llm_calls;
+                Ok(if value >= 0.5 { 1.0 } else { 0.0 })
+            }
+            ValidationStrategy::AlwaysPass => Ok(1.0),
         }
     }
 }
 
-pub struct LlmThoughtScorer {
-    router: Arc<ModelRouter>,
-    model: String,
-}
-
-impl LlmThoughtScorer {
-    pub fn new(router: Arc<ModelRouter>, model: impl Into<String>) -> Self {
-        Self {
-            router,
-            model: model.into(),
+fn replace_parent_with_children(
+    node_id: GraphNodeId,
+    pool: &mut ThoughtPool,
+    parent: &ThoughtState,
+    contents: Vec<String>,
+) {
+    for content in contents {
+        let child_id = pool.create(content, vec![parent.id()], parent.metadata.clone());
+        if let Some(child) = pool.get_mut(child_id) {
+            child.origin_operation = Some(node_id);
         }
     }
+    pool.remove(parent.id());
 }
 
-#[async_trait]
-impl ThoughtScorer for LlmThoughtScorer {
-    async fn score(&self, thought: &ThoughtState, criteria: &str) -> Result<f64, DecomposeError> {
-        let prompt = format!(
-            "Rate the following reasoning on a scale of 0.0 to 1.0 based on this criteria:\n\
-             {criteria}\n\nReasoning:\n{}\n\nRespond with only a number between 0.0 and 1.0.",
-            thought.content
-        );
-        let response = complete_text_response(
-            &self.router,
-            &self.model,
-            prompt,
-            SCORE_RESPONSE_TOKEN_LIMIT,
-        )
-        .await?;
-        Ok(parse_llm_score(&response))
+fn update_score(pool: &mut ThoughtPool, thought_id: crate::ThoughtId, score: f64) {
+    if let Some(state) = pool.get_mut(thought_id) {
+        state.score = Some(score);
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HeuristicThoughtScorer;
-
-impl HeuristicThoughtScorer {
-    pub const fn new() -> Self {
-        Self
+fn validate_generation_count(
+    generation: &GeneratedThoughts,
+    parent_id: u64,
+    expected_branches: usize,
+) -> Result<(), DecomposeError> {
+    if generation.contents.len() == expected_branches {
+        return Ok(());
     }
-}
 
-#[async_trait]
-impl ThoughtScorer for HeuristicThoughtScorer {
-    async fn score(&self, thought: &ThoughtState, criteria: &str) -> Result<f64, DecomposeError> {
-        let regex = Regex::new(criteria).map_err(|error| {
-            DecomposeError::DecompositionFailed(format!(
-                "invalid heuristic scoring pattern {criteria:?}: {error}"
-            ))
-        })?;
-        Ok(if regex.is_match(&thought.content) {
-            1.0
-        } else {
-            0.0
-        })
-    }
-}
-
-pub struct LlmThoughtGenerator {
-    router: Arc<ModelRouter>,
-    model: String,
-}
-
-impl LlmThoughtGenerator {
-    pub fn new(router: Arc<ModelRouter>, model: impl Into<String>) -> Self {
-        Self {
-            router,
-            model: model.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl ThoughtGenerator for LlmThoughtGenerator {
-    async fn generate(
-        &self,
-        parent: &ThoughtState,
-        num_branches: usize,
-        prompt_override: Option<&str>,
-    ) -> Result<Vec<String>, DecomposeError> {
-        let mut branches = Vec::with_capacity(num_branches);
-        let base_prompt = prompt_override
-            .unwrap_or("Generate an alternative reasoning branch for the following thought.");
-
-        for branch_index in 0..num_branches {
-            let prompt = format!(
-                "{base_prompt}\n\nParent reasoning:\n{}\n\nProduce alternative {}/{} as plain text only.",
-                parent.content,
-                branch_index + 1,
-                num_branches
-            );
-            branches.push(
-                complete_text_response(&self.router, &self.model, prompt, GENERATION_TOKEN_LIMIT)
-                    .await?,
-            );
-        }
-
-        Ok(branches)
-    }
-}
-
-pub struct LlmThoughtMerger {
-    router: Arc<ModelRouter>,
-    model: String,
-}
-
-impl LlmThoughtMerger {
-    pub fn new(router: Arc<ModelRouter>, model: impl Into<String>) -> Self {
-        Self {
-            router,
-            model: model.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl ThoughtMerger for LlmThoughtMerger {
-    async fn merge(
-        &self,
-        thoughts: &[&ThoughtState],
-        instruction: Option<&str>,
-    ) -> Result<String, DecomposeError> {
-        let numbered = thoughts
-            .iter()
-            .enumerate()
-            .map(|(index, thought)| format!("Thought {}:\n{}", index + 1, thought.content))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let merge_instruction =
-            instruction.unwrap_or("Synthesize the strongest ideas into one concise thought.");
-        let prompt = format!(
-            "{merge_instruction}\n\nMerge the following reasoning paths into one improved thought:\n\n{numbered}"
-        );
-        complete_text_response(&self.router, &self.model, prompt, MERGE_TOKEN_LIMIT).await
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConcatMerger {
-    separator: String,
-}
-
-impl ConcatMerger {
-    pub fn new(separator: impl Into<String>) -> Self {
-        Self {
-            separator: separator.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl ThoughtMerger for ConcatMerger {
-    async fn merge(
-        &self,
-        thoughts: &[&ThoughtState],
-        instruction: Option<&str>,
-    ) -> Result<String, DecomposeError> {
-        let separator = instruction.unwrap_or(self.separator.as_str());
-        Ok(join_contents(thoughts, separator))
-    }
-}
-
-pub fn parse_llm_score(response: &str) -> f64 {
-    static SCORE_REGEX: OnceLock<Regex> = OnceLock::new();
-    let regex = SCORE_REGEX.get_or_init(|| {
-        Regex::new(r"(1(?:\.0+)?|0(?:\.\d+)?)").expect("score extraction regex is valid")
-    });
-
-    let Some(capture) = regex.find(response) else {
-        tracing::warn!(
-            response,
-            "unable to parse llm score; using midpoint fallback"
-        );
-        return DEFAULT_SCORE_FALLBACK;
-    };
-
-    match capture.as_str().parse::<f64>() {
-        Ok(score) => score,
-        Err(error) => {
-            tracing::warn!(
-                response,
-                %error,
-                "llm score looked numeric but failed to parse; using midpoint fallback"
-            );
-            DEFAULT_SCORE_FALLBACK
-        }
-    }
-}
-
-async fn complete_text_response(
-    router: &Arc<ModelRouter>,
-    model: &str,
-    prompt: String,
-    max_tokens: u32,
-) -> Result<String, DecomposeError> {
-    let request = CompletionRequest {
-        model: model.to_string(),
-        messages: vec![Message::user(prompt)],
-        tools: Vec::new(),
-        temperature: None,
-        max_tokens: Some(max_tokens),
-        system_prompt: None,
-        thinking: None,
-    };
-    let response = router.complete(request).await.map_err(|error| {
-        DecomposeError::DecompositionFailed(format!("thought-model request failed: {error}"))
-    })?;
-    Ok(completion_text(&response))
+    Err(DecomposeError::DecompositionFailed(format!(
+        "generator for parent thought {parent_id} returned {} branches, expected {expected_branches}",
+        generation.contents.len()
+    )))
 }
 
 fn operation_name(operation: &GraphOperation) -> &'static str {
@@ -647,9 +485,6 @@ fn next_node(
 ) -> Option<GraphNodeId> {
     let successors = graph.all_successors(current);
 
-    // A loop body may expose both a back-edge and a forward exit from the same
-    // node. Prefer the back-edge while budget remains so refinement cycles are
-    // explicit in topology rather than hidden in edge insertion order.
     for (target, is_back_edge) in &successors {
         if !*is_back_edge {
             continue;
@@ -674,12 +509,18 @@ fn pool_snapshot(pool: &ThoughtPool) -> Vec<ThoughtState> {
         .collect()
 }
 
+/// Choose a best thought only when the result is deterministic.
+///
+/// If at least one thought is scored, the highest score wins with a stable
+/// `ThoughtId` tie-breaker. If no thoughts are scored, we only report a best
+/// thought when exactly one thought remains; otherwise we return `None` rather
+/// than guessing among multiple unscored candidates.
 fn select_best(thoughts: &[ThoughtState]) -> Option<ThoughtState> {
     let best_scored = thoughts
         .iter()
-        .filter(|thought| thought.score.is_some())
-        .max_by(compare_scored_thoughts)
-        .cloned();
+        .filter_map(|thought| thought.score.map(|score| (thought, score)))
+        .max_by(compare_scored_candidates)
+        .map(|(thought, _)| thought.clone());
 
     if best_scored.is_some() {
         return best_scored;
@@ -688,27 +529,23 @@ fn select_best(thoughts: &[ThoughtState]) -> Option<ThoughtState> {
     (thoughts.len() == 1).then(|| thoughts[0].clone())
 }
 
-fn compare_scored_thoughts(left: &&ThoughtState, right: &&ThoughtState) -> Ordering {
-    let left_score = left
-        .score
-        .expect("scored thought comparison only runs on scored thoughts");
-    let right_score = right
-        .score
-        .expect("scored thought comparison only runs on scored thoughts");
-
-    left_score
-        .total_cmp(&right_score)
-        .then_with(|| right.id().cmp(&left.id()))
+fn compare_scored_candidates(
+    left: &(&ThoughtState, f64),
+    right: &(&ThoughtState, f64),
+) -> Ordering {
+    left.1
+        .total_cmp(&right.1)
+        .then_with(|| right.0.id().cmp(&left.0.id()))
 }
 
 fn current_top_score(pool: &ThoughtPool) -> Option<f64> {
-    pool.top_n(1)
+    pool.active_ids()
         .into_iter()
-        .next()
-        .and_then(|thought| thought.score)
+        .filter_map(|thought_id| pool.get(thought_id).and_then(|thought| thought.score))
+        .max_by(|left, right| left.total_cmp(right))
 }
 
-fn join_contents(thoughts: &[&ThoughtState], separator: &str) -> String {
+pub(super) fn join_contents(thoughts: &[&ThoughtState], separator: &str) -> String {
     thoughts
         .iter()
         .map(|thought| thought.content.as_str())
@@ -724,10 +561,14 @@ fn merge_metadata(thoughts: &[ThoughtState]) -> ThoughtMetadata {
         .iter()
         .all(|thought| thought.metadata == first.metadata)
     {
-        first.metadata.clone()
-    } else {
-        ThoughtMetadata::Empty
+        return first.metadata.clone();
     }
+
+    tracing::debug!(
+        thought_count = thoughts.len(),
+        "discarding heterogeneous thought metadata during merge"
+    );
+    ThoughtMetadata::Empty
 }
 
 fn build_refine_prompt(
@@ -736,24 +577,34 @@ fn build_refine_prompt(
     target_score: f64,
     scoring: &ScoringStrategy,
 ) -> String {
-    let criteria = match scoring {
-        ScoringStrategy::LlmRating { criteria } => criteria.as_str(),
-        ScoringStrategy::Heuristic { pattern } => pattern.as_str(),
-        ScoringStrategy::External => "the active external evaluation criteria",
-    };
     let current_score = thought
         .score
         .map(|score| score.to_string())
         .unwrap_or_else(|| "unscored".to_string());
 
     format!(
-        "Improve the following reasoning.\n\nIteration: {}\nCurrent score: {}\nTarget score: {}\nEvaluation criteria: {}\n\nReasoning:\n{}",
+        "Improve the following reasoning.\n\nIteration: {}\nCurrent score: {}\nTarget score: {}\n{}\n\nReasoning:\n{}",
         iteration + 1,
         current_score,
         target_score,
-        criteria,
+        refine_goal_description(scoring),
         thought.content
     )
+}
+
+fn refine_goal_description(scoring: &ScoringStrategy) -> String {
+    match scoring {
+        ScoringStrategy::LlmRating { criteria } => {
+            format!("Evaluation criteria:\n{criteria}")
+        }
+        ScoringStrategy::Heuristic { pattern } => format!(
+            "The scorer uses this regular expression. Improve the reasoning so the final text matches it:\n{pattern}"
+        ),
+        ScoringStrategy::External => {
+            "Evaluation is handled externally. Improve the reasoning for the strongest final answer."
+                .to_string()
+        }
+    }
 }
 
 fn validate_score_range(score: f64, context: &str) -> Result<f64, DecomposeError> {
@@ -763,347 +614,5 @@ fn validate_score_range(score: f64, context: &str) -> Result<f64, DecomposeError
         Err(DecomposeError::DecompositionFailed(format!(
             "{context} score must be between 0.0 and 1.0, got {score}"
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    struct MockGenerator {
-        suffix: &'static str,
-    }
-
-    #[async_trait]
-    impl ThoughtGenerator for MockGenerator {
-        async fn generate(
-            &self,
-            parent: &ThoughtState,
-            num_branches: usize,
-            _prompt_override: Option<&str>,
-        ) -> Result<Vec<String>, DecomposeError> {
-            Ok((0..num_branches)
-                .map(|index| format!("{}{}-{index}", parent.content, self.suffix))
-                .collect())
-        }
-    }
-
-    struct ImprovingGenerator;
-
-    #[async_trait]
-    impl ThoughtGenerator for ImprovingGenerator {
-        async fn generate(
-            &self,
-            parent: &ThoughtState,
-            num_branches: usize,
-            _prompt_override: Option<&str>,
-        ) -> Result<Vec<String>, DecomposeError> {
-            Ok((0..num_branches)
-                .map(|_| format!("{}-improved", parent.content))
-                .collect())
-        }
-    }
-
-    struct FailingGenerator;
-
-    #[async_trait]
-    impl ThoughtGenerator for FailingGenerator {
-        async fn generate(
-            &self,
-            _parent: &ThoughtState,
-            _num_branches: usize,
-            _prompt_override: Option<&str>,
-        ) -> Result<Vec<String>, DecomposeError> {
-            Err(DecomposeError::DecompositionFailed(
-                "simulated generation failure".to_string(),
-            ))
-        }
-    }
-
-    struct FixedScorer {
-        scores: HashMap<String, f64>,
-        default_score: f64,
-    }
-
-    #[async_trait]
-    impl ThoughtScorer for FixedScorer {
-        async fn score(
-            &self,
-            thought: &ThoughtState,
-            _criteria: &str,
-        ) -> Result<f64, DecomposeError> {
-            Ok(*self
-                .scores
-                .get(&thought.content)
-                .unwrap_or(&self.default_score))
-        }
-    }
-
-    struct JoiningMerger;
-
-    #[async_trait]
-    impl ThoughtMerger for JoiningMerger {
-        async fn merge(
-            &self,
-            thoughts: &[&ThoughtState],
-            _instruction: Option<&str>,
-        ) -> Result<String, DecomposeError> {
-            Ok(thoughts
-                .iter()
-                .map(|thought| thought.content.clone())
-                .collect::<Vec<_>>()
-                .join(" + "))
-        }
-    }
-
-    fn linear_graph(operations: Vec<GraphOperation>) -> GraphOfOperations {
-        let mut graph = GraphOfOperations::new(2);
-        let mut previous = None;
-        for operation in operations {
-            let node = graph.add_node(operation, None);
-            if let Some(previous) = previous {
-                graph.add_edge(previous, node).unwrap();
-            }
-            previous = Some(node);
-        }
-        graph
-    }
-
-    #[test]
-    fn parse_llm_score_extracts_wrapped_numeric_response() {
-        assert_eq!(
-            parse_llm_score("I'd rate this 0.7 because it's mostly correct"),
-            0.7
-        );
-        assert_eq!(parse_llm_score("0.85"), 0.85);
-        assert_eq!(parse_llm_score("Score: 0.6/1.0"), 0.6);
-        assert_eq!(parse_llm_score("The quality is moderate"), 0.5);
-    }
-
-    #[tokio::test]
-    async fn generate_score_keep_best_and_merge_produce_single_best_thought() {
-        let graph = linear_graph(vec![
-            GraphOperation::Generate {
-                num_branches: 3,
-                prompt_override: None,
-            },
-            GraphOperation::Score {
-                strategy: ScoringStrategy::LlmRating {
-                    criteria: "quality".to_string(),
-                },
-            },
-            GraphOperation::KeepBest { n: 2 },
-            GraphOperation::Merge {
-                strategy: MergeStrategy::Concatenate {
-                    separator: " + ".to_string(),
-                },
-            },
-        ]);
-
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(MockGenerator { suffix: "-branch" }),
-            Arc::new(FixedScorer {
-                scores: HashMap::from([
-                    ("seed-branch-0".to_string(), 0.1),
-                    ("seed-branch-1".to_string(), 0.9),
-                    ("seed-branch-2".to_string(), 0.5),
-                ]),
-                default_score: 0.0,
-            }),
-            Arc::new(JoiningMerger),
-        );
-
-        let result = dispatcher
-            .execute(&graph, "seed".to_string(), ThoughtMetadata::Empty, None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.operations_executed, 4);
-        assert_eq!(result.llm_calls, 6);
-        assert_eq!(result.thoughts.len(), 1);
-        assert_eq!(
-            result.thoughts[0].content,
-            "seed-branch-1 + seed-branch-2".to_string()
-        );
-        assert_eq!(
-            result.best.as_ref().map(|thought| thought.content.as_str()),
-            Some("seed-branch-1 + seed-branch-2")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_assigns_pass_fail_scores() {
-        let graph = linear_graph(vec![GraphOperation::Validate {
-            strategy: ValidationStrategy::ExactMatch {
-                expected: "answer".to_string(),
-            },
-        }]);
-
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(MockGenerator { suffix: "-branch" }),
-            Arc::new(FixedScorer {
-                scores: HashMap::new(),
-                default_score: 0.0,
-            }),
-            Arc::new(JoiningMerger),
-        );
-
-        let result = dispatcher
-            .execute(&graph, " answer ".to_string(), ThoughtMetadata::Empty, None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.operations_executed, 1);
-        assert_eq!(result.llm_calls, 0);
-        assert_eq!(result.thoughts.len(), 1);
-        assert_eq!(result.thoughts[0].score, Some(1.0));
-    }
-
-    #[tokio::test]
-    async fn refine_exits_early_when_target_score_is_reached() {
-        let graph = linear_graph(vec![GraphOperation::Refine {
-            max_iterations: 3,
-            target_score: 0.9,
-            scoring: ScoringStrategy::LlmRating {
-                criteria: "quality".to_string(),
-            },
-        }]);
-
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(ImprovingGenerator),
-            Arc::new(FixedScorer {
-                scores: HashMap::from([
-                    ("draft".to_string(), 0.4),
-                    ("draft-improved".to_string(), 0.95),
-                ]),
-                default_score: 0.1,
-            }),
-            Arc::new(JoiningMerger),
-        );
-
-        let result = dispatcher
-            .execute(&graph, "draft".to_string(), ThoughtMetadata::Empty, None)
-            .await
-            .unwrap();
-
-        assert!(!result.refinement_capped);
-        assert_eq!(result.operations_executed, 1);
-        assert_eq!(result.llm_calls, 3);
-        assert_eq!(result.thoughts.len(), 1);
-        assert_eq!(result.thoughts[0].content, "draft-improved");
-        assert_eq!(result.thoughts[0].score, Some(0.95));
-    }
-
-    #[tokio::test]
-    async fn refine_marks_result_when_iteration_cap_is_hit() {
-        let graph = linear_graph(vec![GraphOperation::Refine {
-            max_iterations: 2,
-            target_score: 0.9,
-            scoring: ScoringStrategy::LlmRating {
-                criteria: "quality".to_string(),
-            },
-        }]);
-
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(ImprovingGenerator),
-            Arc::new(FixedScorer {
-                scores: HashMap::from([
-                    ("draft".to_string(), 0.2),
-                    ("draft-improved".to_string(), 0.3),
-                ]),
-                default_score: 0.3,
-            }),
-            Arc::new(JoiningMerger),
-        );
-
-        let result = dispatcher
-            .execute(&graph, "draft".to_string(), ThoughtMetadata::Empty, None)
-            .await
-            .unwrap();
-
-        assert!(result.refinement_capped);
-        assert_eq!(result.operations_executed, 1);
-        assert_eq!(result.llm_calls, 4);
-        assert_eq!(result.thoughts.len(), 1);
-        assert_eq!(result.thoughts[0].content, "draft-improved-improved");
-    }
-
-    #[tokio::test]
-    async fn back_edges_repeat_until_iteration_budget_then_fall_through() {
-        let mut graph = GraphOfOperations::new(2);
-        let score = graph.add_node(
-            GraphOperation::Score {
-                strategy: ScoringStrategy::LlmRating {
-                    criteria: "quality".to_string(),
-                },
-            },
-            Some("score".to_string()),
-        );
-        let improve = graph.add_node(
-            GraphOperation::Generate {
-                num_branches: 1,
-                prompt_override: Some("improve".to_string()),
-            },
-            Some("improve".to_string()),
-        );
-        let validate = graph.add_node(
-            GraphOperation::Validate {
-                strategy: ValidationStrategy::AlwaysPass,
-            },
-            Some("validate".to_string()),
-        );
-
-        graph.add_edge(score, improve).unwrap();
-        graph.add_back_edge(improve, score).unwrap();
-        graph.add_edge(improve, validate).unwrap();
-
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(MockGenerator { suffix: "-x" }),
-            Arc::new(FixedScorer {
-                scores: HashMap::new(),
-                default_score: 0.3,
-            }),
-            Arc::new(JoiningMerger),
-        );
-
-        let result = dispatcher
-            .execute(&graph, "seed".to_string(), ThoughtMetadata::Empty, None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.operations_executed, 7);
-        assert_eq!(result.llm_calls, 6);
-        assert_eq!(result.thoughts.len(), 1);
-        assert_eq!(result.thoughts[0].content, "seed-x-0-x-0-x-0");
-        assert_eq!(result.thoughts[0].score, Some(1.0));
-    }
-
-    #[tokio::test]
-    async fn generate_failure_preserves_parent_until_a_complete_result_exists() {
-        let dispatcher = GraphDispatcher::new(
-            Arc::new(FailingGenerator),
-            Arc::new(FixedScorer {
-                scores: HashMap::new(),
-                default_score: 0.0,
-            }),
-            Arc::new(JoiningMerger),
-        );
-        let mut pool = ThoughtPool::new();
-        pool.create("seed".to_string(), Vec::new(), ThoughtMetadata::Empty);
-        let mut llm_calls = 0usize;
-
-        let error = dispatcher
-            .apply_generate(GraphNodeId::new(4), &mut pool, 3, None, &mut llm_calls)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, DecomposeError::DecompositionFailed(_)));
-        assert_eq!(llm_calls, 0);
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool.active_ids().len(), 1);
-        let only_thought = pool.get(pool.active_ids()[0]).unwrap();
-        assert_eq!(only_thought.content, "seed");
-        assert_eq!(only_thought.origin_operation, None);
     }
 }
