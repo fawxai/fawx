@@ -520,6 +520,32 @@ struct DeliverableSectionParse {
     block_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContract {
+    inputs: Vec<InputRequirement>,
+    phase: TaskPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputRequirement {
+    description: String,
+    normalized_description: String,
+    satisfied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskPhase {
+    Gathering,
+    Synthesizing,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContractExtraction {
+    contract: Option<TaskContract>,
+    visible_text: Option<String>,
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
 /// Note: `LoopEngine` previously derived `Clone`, but context compaction
@@ -586,6 +612,8 @@ pub struct LoopEngine {
     pending_turn_commitment: Option<TurnCommitment>,
     /// Typed completion contract for the active root turn, when the prompt declares one.
     root_turn_contract: Option<RootTurnContract>,
+    /// Active task-input lifecycle contract for the current root turn, when declared by the model.
+    task_contract: Option<TaskContract>,
     /// Explicit artifact path requested by the user for this turn, if any.
     requested_artifact_target: Option<String>,
     /// Active gate requiring the next root pass to write the requested artifact first.
@@ -648,6 +676,7 @@ impl std::fmt::Debug for LoopEngine {
             .field("pending_tool_scope", &self.pending_tool_scope)
             .field("pending_turn_commitment", &self.pending_turn_commitment)
             .field("root_turn_contract", &self.root_turn_contract)
+            .field("task_contract", &self.task_contract)
             .field("requested_artifact_target", &self.requested_artifact_target)
             .field(
                 "pending_artifact_write_target",
@@ -980,6 +1009,7 @@ impl LoopEngineBuilder {
             pending_tool_scope: None,
             pending_turn_commitment: None,
             root_turn_contract: None,
+            task_contract: None,
             requested_artifact_target: None,
             pending_artifact_write_target: None,
             last_turn_state_progress: None,
@@ -1301,6 +1331,8 @@ If the existing tool results already answer the user's request, answer immediate
 Only call another tool when the current results are missing critical information, are contradictory, or the user explicitly asked you to refresh/re-check something. \
 Never repeat an identical successful tool call in the same cycle. Reuse the result you already have and answer from it.";
 
+const TASK_CONTRACT_DECLARATION_DIRECTIVE: &str = "\n\nIf you are about to gather information with tools before you can answer, start that first tool-using response with an internal block exactly like:\nTask plan:\n- <required input 1>\n- <required input 2>\n\nList only the concrete inputs, files, documents, or records you still need. Do not list tools or implementation steps. After the block, request only the tools needed to satisfy those inputs.";
+
 const NOTIFY_TOOL_GUIDANCE: &str = "\n\nYou have a `notify` tool that sends native OS notifications to the user. \
 Use it when you complete a task that took multiple steps, have important results to share, or finish background work the user may not be watching. \
 Do not use it for simple one-turn replies, trivial acknowledgements, or every tool completion. \
@@ -1523,8 +1555,7 @@ impl LoopEngine {
     }
 
     fn refresh_runtime_skill_prompt_summaries(&mut self) {
-        self.cached_runtime_skill_prompt_summaries =
-            self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_summaries = self.collect_runtime_skill_prompt_summaries();
         self.cached_runtime_skill_prompt_revision = self
             .runtime_skill_prompt_revision
             .as_ref()
@@ -2032,6 +2063,7 @@ impl LoopEngine {
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
         self.root_turn_contract = None;
+        self.task_contract = None;
         self.requested_artifact_target = None;
         self.pending_artifact_write_target = None;
         self.last_turn_state_progress = None;
@@ -2313,6 +2345,84 @@ impl LoopEngine {
         }
     }
 
+    fn record_task_contract_progress(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let Some((satisfied_inputs, input_count, transitioned)) = ({
+            let Some(contract) = self.task_contract.as_mut() else {
+                return;
+            };
+            if contract.phase != TaskPhase::Gathering {
+                return;
+            }
+
+            let observations = task_contract_observations(&*self.tool_executor, calls, results);
+            let mut satisfied_inputs = Vec::new();
+            for input in &mut contract.inputs {
+                if input.satisfied
+                    || !observations
+                        .iter()
+                        .any(|observation| task_contract_matches_observation(input, observation))
+                {
+                    continue;
+                }
+                input.satisfied = true;
+                satisfied_inputs.push(input.description.clone());
+            }
+
+            let transitioned = contract.inputs.iter().all(|input| input.satisfied);
+            if transitioned {
+                contract.phase = TaskPhase::Synthesizing;
+            }
+
+            Some((satisfied_inputs, contract.inputs.len(), transitioned))
+        }) else {
+            return;
+        };
+
+        if !satisfied_inputs.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "task contract input satisfied",
+                serde_json::json!({ "inputs": satisfied_inputs }),
+            );
+        }
+
+        if transitioned {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "task contract gathering complete; entering synthesizing phase",
+                serde_json::json!({
+                    "input_count": input_count,
+                }),
+            );
+        }
+    }
+
+    fn mark_task_contract_complete(&mut self) {
+        let should_emit = match self.task_contract.as_mut() {
+            Some(contract) if contract.phase != TaskPhase::Complete => {
+                contract.phase = TaskPhase::Complete;
+                true
+            }
+            _ => false,
+        };
+        if !should_emit {
+            return;
+        }
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Success,
+            "task contract completed",
+            serde_json::json!({}),
+        );
+    }
+
+    fn finish_root_turn_terminal_response(&mut self, response: String) -> ActionNextStep {
+        self.mark_task_contract_complete();
+        ActionNextStep::Finish(ActionTerminal::Complete { response })
+    }
+
     fn guard_root_turn_terminal_completion(&mut self, terminal: ActionTerminal) -> ActionNextStep {
         let ActionTerminal::Complete { response } = terminal else {
             return ActionNextStep::Finish(terminal);
@@ -2320,13 +2430,11 @@ impl LoopEngine {
         let retry_limit = self.root_turn_completion_retry_limit();
 
         let Some(contract) = self.root_turn_contract.as_mut() else {
-            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+            return self.finish_root_turn_terminal_response(response);
         };
-
         let Some(block) = root_turn_completion_block(contract, &response) else {
-            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+            return self.finish_root_turn_terminal_response(response);
         };
-
         let allow_incomplete_terminal = contract.blocked_terminal_attempts >= retry_limit;
         let blocked_attempts = if allow_incomplete_terminal {
             contract.blocked_terminal_attempts
@@ -2349,7 +2457,7 @@ impl LoopEngine {
                     "pending_artifact_paths": &block.pending_artifact_paths,
                 }),
             );
-            return ActionNextStep::Finish(ActionTerminal::Complete { response });
+            return self.finish_root_turn_terminal_response(response);
         }
 
         self.emit_signal(
@@ -2375,8 +2483,16 @@ impl LoopEngine {
         )
     }
 
+    fn task_contract_blocks_tools(&self) -> bool {
+        self.task_contract
+            .as_ref()
+            .is_some_and(|contract| contract.phase != TaskPhase::Gathering)
+    }
+
     fn current_reasoning_tool_definitions(&self, should_strip_tools: bool) -> Vec<ToolDefinition> {
-        let base = if should_strip_tools {
+        let base = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else if should_strip_tools {
             let limited_tools = self.progress_limited_tool_definitions();
             tracing::info!(
                 turns = self.consecutive_tool_turns,
@@ -2403,6 +2519,26 @@ impl LoopEngine {
         self.root_turn_contract
             .as_ref()
             .map(render_root_turn_contract_directive)
+    }
+
+    fn task_contract_state_directive(&self) -> Option<String> {
+        self.task_contract
+            .as_ref()
+            .map(render_task_contract_state_directive)
+    }
+
+    fn task_contract_declaration_directive(
+        &self,
+        user_message: &str,
+        tools_available: bool,
+    ) -> Option<&'static str> {
+        if tools_available
+            && self.task_contract.is_none()
+            && should_request_task_contract_declaration(user_message)
+        {
+            return Some(TASK_CONTRACT_DECLARATION_DIRECTIVE.trim_start_matches('\n'));
+        }
+        None
     }
 
     fn pending_artifact_write_directive(&self) -> Option<String> {
@@ -2784,6 +2920,20 @@ impl LoopEngine {
                 system_prompt.push_str(&directive);
             }
         }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
+                system_prompt.push_str(&directive);
+            }
+        } else if let Some(directive) = self.task_contract_declaration_directive(
+            &perception.user_message,
+            !request.tools.is_empty(),
+        ) {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle declaration:\n");
+                system_prompt.push_str(directive);
+            }
+        }
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str(&directive);
@@ -2875,8 +3025,11 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
-        let continuation_tools =
-            self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+        let continuation_tools = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else {
+            self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions())
+        };
         let mut request =
             build_truncation_continuation_request(TruncationContinuationRequestParams::new(
                 llm.model_name(),
@@ -2887,6 +3040,12 @@ impl LoopEngine {
             ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
                 system_prompt.push_str(&directive);
             }
         }
@@ -2935,7 +3094,11 @@ impl LoopEngine {
 
     fn capture_tool_response_state(&mut self, response: &CompletionResponse) {
         self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
-        self.pending_tool_response_text = response_text_segment(response);
+        let extracted = extract_task_contract_from_response(response);
+        if self.task_contract.is_none() {
+            self.task_contract = extracted.contract;
+        }
+        self.pending_tool_response_text = extracted.visible_text;
     }
 
     fn clear_tool_response_state(&mut self) {
@@ -2949,7 +3112,11 @@ impl LoopEngine {
         response: &CompletionResponse,
     ) {
         self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
-        push_response_segment(&mut state.accumulated_text, response_text_segment(response));
+        let extracted = extract_task_contract_from_response(response);
+        if self.task_contract.is_none() {
+            self.task_contract = extracted.contract;
+        }
+        push_response_segment(&mut state.accumulated_text, extracted.visible_text);
     }
 
     /// Decide step.
@@ -4098,6 +4265,74 @@ fn prefix_context_contains_recent_write_verb(prefix_context: &str) -> bool {
         .any(|token| VERBS.contains(&token))
 }
 
+fn extract_task_contract_from_response(response: &CompletionResponse) -> TaskContractExtraction {
+    let raw = extract_response_text(response);
+    let readable = extract_readable_text(&raw);
+    extract_task_contract_from_text(&readable)
+}
+
+fn extract_task_contract_from_text(text: &str) -> TaskContractExtraction {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header_index) = lines
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case("task plan:"))
+    else {
+        return TaskContractExtraction {
+            contract: None,
+            visible_text: meaningful_response_text(text),
+        };
+    };
+
+    let mut descriptions = Vec::new();
+    let mut end_index = header_index + 1;
+    while end_index < lines.len() {
+        let trimmed = lines[end_index].trim();
+        if trimmed.is_empty() {
+            end_index += 1;
+            if !descriptions.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let Some(item) = parse_list_item(trimmed) else {
+            break;
+        };
+        let description = sanitize_task_contract_label(item);
+        if !description.is_empty() {
+            descriptions.push(description);
+        }
+        end_index += 1;
+    }
+
+    if descriptions.is_empty() {
+        return TaskContractExtraction {
+            contract: None,
+            visible_text: meaningful_response_text(text),
+        };
+    }
+
+    let mut visible_lines = Vec::new();
+    visible_lines.extend_from_slice(&lines[..header_index]);
+    visible_lines.extend_from_slice(&lines[end_index..]);
+    let visible_text = meaningful_response_text(&visible_lines.join("\n"));
+
+    TaskContractExtraction {
+        contract: Some(TaskContract {
+            inputs: descriptions
+                .into_iter()
+                .map(|description| InputRequirement {
+                    normalized_description: normalize_contract_label(&description),
+                    description,
+                    satisfied: false,
+                })
+                .collect(),
+            phase: TaskPhase::Gathering,
+        }),
+        visible_text,
+    }
+}
+
 fn extract_root_turn_contract(user_message: &str) -> RootTurnContractExtraction {
     let deliverable_parse = extract_deliverable_response_sections(user_message);
     let mut deliverables = deliverable_parse
@@ -4213,6 +4448,16 @@ fn sanitize_deliverable_label(item: &str) -> String {
         .to_string()
 }
 
+fn sanitize_task_contract_label(item: &str) -> String {
+    let trimmed = sanitize_deliverable_label(item);
+    for prefix in ["[ ]", "[x]", "[X]"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    trimmed
+}
+
 fn normalize_contract_label(text: &str) -> String {
     text.chars()
         .map(|ch| {
@@ -4226,6 +4471,108 @@ fn normalize_contract_label(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// Only ask for an internal task plan when the user has already named multiple
+// concrete inputs. That keeps one-off tool turns out of unnecessary planning
+// loops while preserving the structural contract for real context gathering.
+fn should_request_task_contract_declaration(user_message: &str) -> bool {
+    let mut references = HashSet::new();
+    let tokens: Vec<&str> = user_message.split_whitespace().collect();
+
+    for window in tokens.windows(2) {
+        let [keyword, number] = window else {
+            continue;
+        };
+        if normalize_contract_label(keyword) != "issue" {
+            continue;
+        }
+        let cleaned = trim_task_contract_reference_token(number);
+        if !cleaned.is_empty() && cleaned.chars().all(|ch| ch.is_ascii_digit()) {
+            references.insert(format!("issue-{cleaned}"));
+        }
+    }
+
+    for token in tokens {
+        let cleaned = trim_task_contract_reference_token(token);
+        if looks_like_task_contract_reference(cleaned) {
+            references.insert(cleaned.to_ascii_lowercase());
+        }
+    }
+
+    references.len() >= 2
+}
+
+fn trim_task_contract_reference_token(token: &str) -> &str {
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches('.')
+}
+
+fn looks_like_task_contract_reference(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if let Some(number) = token.strip_prefix('#') {
+        return !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit());
+    }
+    if token.contains('/') {
+        return true;
+    }
+    let Some((stem, extension)) = token.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && extension.len() >= 2
+        && stem.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn task_contract_observations(
+    executor: &dyn ToolExecutor,
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> Vec<String> {
+    let mut observations = Vec::new();
+    let call_map: HashMap<&str, &ToolCall> =
+        calls.iter().map(|call| (call.id.as_str(), call)).collect();
+
+    for result in results.iter().filter(|result| result.success) {
+        let Some(call) = call_map.get(result.tool_call_id.as_str()) else {
+            continue;
+        };
+        if executor.classify_call(call) != ToolCallClassification::Observation {
+            continue;
+        }
+
+        let normalized_observation =
+            normalize_contract_label(&format!("{} {}", call.name, call.arguments));
+        if !normalized_observation.is_empty() {
+            observations.push(normalized_observation);
+        }
+    }
+
+    observations
+}
+
+fn task_contract_matches_observation(input: &InputRequirement, observation: &str) -> bool {
+    if input.normalized_description.is_empty() || observation.is_empty() {
+        return false;
+    }
+    if observation.contains(&input.normalized_description) {
+        return true;
+    }
+
+    let observation_tokens: HashSet<&str> = observation.split_whitespace().collect();
+    input
+        .normalized_description
+        .split_whitespace()
+        .all(|token| observation_tokens.contains(token))
 }
 
 fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
@@ -4273,6 +4620,29 @@ fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
     directive.push_str(
         "If a deliverable is still missing, continue the turn instead of stopping at a progress-only update.",
     );
+    directive.trim_end().to_string()
+}
+
+fn render_task_contract_state_directive(contract: &TaskContract) -> String {
+    let mut directive = match contract.phase {
+        TaskPhase::Gathering => String::from(
+            "You are operating under a declared task-input contract.\nPhase: gathering.\nOnly call tools needed to satisfy the remaining unchecked inputs. Do not broaden the search beyond this list unless a listed input is impossible to obtain.\n",
+        ),
+        TaskPhase::Synthesizing => String::from(
+            "You are operating under a declared task-input contract.\nPhase: synthesizing.\nAll declared inputs are satisfied. Do not call more tools. Answer directly from the gathered evidence.\n",
+        ),
+        TaskPhase::Complete => String::from(
+            "You are operating under a declared task-input contract.\nPhase: complete.\nDo not reopen tool gathering.\n",
+        ),
+    };
+
+    directive.push_str("Declared inputs:\n");
+    for input in &contract.inputs {
+        directive.push_str(if input.satisfied { "- [x] " } else { "- [ ] " });
+        directive.push_str(&input.description);
+        directive.push('\n');
+    }
+
     directive.trim_end().to_string()
 }
 

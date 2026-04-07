@@ -4620,7 +4620,11 @@ mod tests {
         let debug = process_input_with_commands(&mut app, "/debug", None)
             .await
             .expect("process debug command");
-        assert_eq!(debug.response, "[Act/Friction] tool timed out (42)");
+        assert_eq!(
+            debug.response,
+            fx_kernel::signals::SignalCollector::from_signals(app.last_signals.clone())
+                .debug_dump()
+        );
     }
 
     #[tokio::test]

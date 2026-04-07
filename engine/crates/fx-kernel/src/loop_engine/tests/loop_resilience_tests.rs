@@ -1996,6 +1996,105 @@ async fn mutation_follow_up_injects_full_scope_turn_commitment_into_next_reasoni
 }
 
 #[tokio::test]
+async fn synthesizing_task_contract_removes_tools_from_next_reasoning_pass() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.task_contract = Some(TaskContract {
+        inputs: vec![
+            InputRequirement {
+                description: "ENGINEERING.md".to_string(),
+                normalized_description: normalize_contract_label("ENGINEERING.md"),
+                satisfied: true,
+            },
+            InputRequirement {
+                description: "TASTE.md".to_string(),
+                normalized_description: normalize_contract_label("TASTE.md"),
+                satisfied: true,
+            },
+        ],
+        phase: TaskPhase::Synthesizing,
+    });
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+
+    let processed = engine
+        .perceive(&test_snapshot("Continue with the fix."))
+        .await
+        .expect("perceive");
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].tools.is_empty(),
+        "synthesizing phase should not expose more tools"
+    );
+    let system_prompt = requests[0].system_prompt.as_deref().expect("system prompt");
+    assert!(system_prompt.contains("Task lifecycle contract:"));
+    assert!(system_prompt.contains("Phase: synthesizing."));
+    assert!(system_prompt.contains("Do not call more tools."));
+}
+
+#[tokio::test]
+async fn initial_reasoning_prompt_requests_a_task_plan_before_tool_gathering() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![tool_use_response(vec![ToolCall {
+        id: "read-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"ENGINEERING.md"}),
+    }])]);
+
+    let processed = engine
+        .perceive(&test_snapshot(
+            "Read ENGINEERING.md and TASTE.md before fixing the bug.",
+        ))
+        .await
+        .expect("perceive");
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let request = llm.requests().into_iter().next().expect("request");
+    let system_prompt = request.system_prompt.expect("system prompt");
+    assert!(system_prompt.contains("Task lifecycle declaration:"));
+    assert!(system_prompt.contains("Task plan:"));
+    assert!(system_prompt.contains("List only the concrete inputs"));
+}
+
+#[tokio::test]
+async fn single_input_reasoning_prompt_skips_task_plan_declaration() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let llm = RecordingLlm::ok(vec![tool_use_response(vec![ToolCall {
+        id: "read-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path":"README.md"}),
+    }])]);
+
+    let processed = engine
+        .perceive(&test_snapshot("Read README.md before answering."))
+        .await
+        .expect("perceive");
+    let _ = engine
+        .reason(&processed, &llm, CycleStream::disabled())
+        .await
+        .expect("reason");
+
+    let request = llm.requests().into_iter().next().expect("request");
+    let system_prompt = request.system_prompt.expect("system prompt");
+    assert!(!system_prompt.contains("Task lifecycle declaration:"));
+    assert!(!system_prompt.contains("Task plan:"));
+}
+
+#[test]
+fn declaration_heuristic_rejects_period_terminated_abbreviations() {
+    assert!(!should_request_task_contract_declaration(
+        "Check the U.S. and E.U. policies"
+    ));
+}
+
+#[tokio::test]
 async fn observation_follow_up_still_injects_mutation_commitment_into_next_reasoning_pass() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     let llm = RecordingLlm::ok(vec![
