@@ -64,6 +64,14 @@ func compactModelName(_ modelID: String, limit: Int? = nil) -> String {
     return String(abbreviated[..<startIndex]) + "…" + String(abbreviated[endIndex...])
 }
 
+func displayModelName(_ model: ModelInfo) -> String {
+    if let displayName = model.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !displayName.isEmpty {
+        return displayName
+    }
+    return abbreviateModelName(model.modelID)
+}
+
 func displayThinkingLevel(_ level: ThinkingLevel?, modelID: String? = nil) -> String {
     guard let level else {
         return "—"
@@ -109,7 +117,10 @@ func displayAuthMethodName(_ authMethod: String) -> String {
 func modelMetadataSummary(_ model: ModelInfo) -> String {
     let provider = displayProviderName(model.provider)
     let authMethod = displayAuthMethodName(model.authMethod)
-    return "\(provider) · \(authMethod)"
+    if model.recommended {
+        return "\(provider) · \(authMethod)"
+    }
+    return "\(provider) · \(authMethod) · Not Recommended"
 }
 
 // Claude 4.6 models default to adaptive thinking today, so they get the

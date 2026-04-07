@@ -100,6 +100,7 @@ final class FormattersTests: XCTestCase {
                 makeModel("openai/gpt-5.4", provider: "openrouter"),
                 makeModel("accounts/fireworks/models/llama-v3p1-8b-instruct", provider: "fireworks")
             ],
+            scope: .all,
             providerFilterID: "openrouter",
             query: "gpt"
         )
@@ -121,6 +122,7 @@ final class FormattersTests: XCTestCase {
             models: [
                 makeModel("anthropic/claude-sonnet-4-6", provider: "openrouter", authMethod: "api_key")
             ],
+            scope: .all,
             providerFilterID: ModelSelectionCatalog.allProvidersID,
             query: "API Key"
         )
@@ -135,6 +137,41 @@ final class FormattersTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    func testModelSelectionCatalogDefaultsToRecommendedScope() {
+        let sections = ModelSelectionCatalog.filteredSections(
+            models: [
+                makeModel("anthropic/claude-sonnet-4-6", provider: "openrouter", recommended: true),
+                makeModel("openai/gpt-4.1-mini", provider: "openrouter", recommended: false)
+            ],
+            scope: .recommended,
+            providerFilterID: ModelSelectionCatalog.allProvidersID,
+            query: ""
+        )
+
+        XCTAssertEqual(
+            sections,
+            [
+                ModelSelectionSection(
+                    providerID: "openrouter",
+                    title: "OpenRouter",
+                    models: [makeModel("anthropic/claude-sonnet-4-6", provider: "openrouter", recommended: true)]
+                )
+            ]
+        )
+    }
+
+    func testDisplayModelNamePrefersCatalogDisplayName() {
+        let name = displayModelName(
+            makeModel(
+                "accounts/fireworks/models/llama-v3p1-8b-instruct",
+                provider: "fireworks",
+                displayName: "Llama 3.1 8B Instruct"
+            )
+        )
+
+        XCTAssertEqual(name, "Llama 3.1 8B Instruct")
     }
 
     func testDisplayThinkingLevelMarksAdaptiveAsDefaultForClaude46Models() {
@@ -152,8 +189,16 @@ final class FormattersTests: XCTestCase {
     private func makeModel(
         _ modelID: String,
         provider: String,
-        authMethod: String = "api_key"
+        authMethod: String = "api_key",
+        displayName: String? = nil,
+        recommended: Bool = true
     ) -> ModelInfo {
-        ModelInfo(modelID: modelID, provider: provider, authMethod: authMethod)
+        ModelInfo(
+            modelID: modelID,
+            provider: provider,
+            authMethod: authMethod,
+            displayName: displayName,
+            recommended: recommended
+        )
     }
 }

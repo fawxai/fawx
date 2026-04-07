@@ -1,7 +1,7 @@
 //! Anthropic Messages API provider.
 
 use async_trait::async_trait;
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -11,12 +11,13 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::provider::{
+    CompletionStream, LlmProvider, LoopHarness, LoopModelMatch, LoopModelProfile,
+    LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
     insert_bearer_authorization, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
-    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
+    resolve_loop_harness_from_profiles,
 };
 use crate::sse::{SseFrame, SseFramer};
-use crate::streaming::{collect_completion_stream, StreamCallback};
+use crate::streaming::{StreamCallback, collect_completion_stream};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
@@ -349,21 +350,14 @@ impl AnthropicProvider {
         }
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<AnthropicRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
-
+        // The router already resolved the selected model against the provider's
+        // live catalog. A second check against this client's startup snapshot
+        // can reject newly discovered models after the picker has accepted them.
         for tool in &request.tools {
             validate_anthropic_tool_schema(tool)?;
         }
@@ -1324,7 +1318,7 @@ fn validate_request(body: &AnthropicRequestBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::{collect_stream_chunks, StreamEvent};
+    use crate::streaming::{StreamEvent, collect_stream_chunks};
     use crate::test_helpers::{
         callback_events, read_events, simple_pdf_with_text, spawn_json_server,
     };
@@ -1383,8 +1377,10 @@ mod tests {
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 match expected_after_id {
                     None => assert!(request.starts_with("GET /v1/models HTTP/1.1")),
-                    Some(after_id) => assert!(request
-                        .starts_with(&format!("GET /v1/models?after_id={after_id} HTTP/1.1"))),
+                    Some(after_id) => assert!(
+                        request
+                            .starts_with(&format!("GET /v1/models?after_id={after_id} HTTP/1.1"))
+                    ),
                 }
                 let body = if expected_after_id.is_none() {
                     first
@@ -1649,11 +1645,13 @@ mod tests {
         assert_eq!(chunks[1].tool_use_deltas[0].id.as_deref(), Some("toolu_01"));
 
         assert_eq!(chunks[2].tool_use_deltas.len(), 1);
-        assert!(chunks[2].tool_use_deltas[0]
-            .arguments_delta
-            .as_deref()
-            .unwrap()
-            .contains("query"));
+        assert!(
+            chunks[2].tool_use_deltas[0]
+                .arguments_delta
+                .as_deref()
+                .unwrap()
+                .contains("query")
+        );
         assert_eq!(
             chunks[2].tool_use_deltas[0].id.as_deref(),
             Some("toolu_01"),
@@ -1867,10 +1865,12 @@ mod tests {
         assert_eq!(serialized["source"]["type"], "base64");
         assert_eq!(serialized["source"]["media_type"], "application/pdf");
         assert_eq!(serialized["title"], "brief.pdf");
-        assert!(serialized["source"]["data"]
-            .as_str()
-            .expect("base64 data")
-            .starts_with("JVBERi0"));
+        assert!(
+            serialized["source"]["data"]
+                .as_str()
+                .expect("base64 data")
+                .starts_with("JVBERi0")
+        );
     }
 
     #[test]
@@ -1894,13 +1894,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_rejects_unsupported_model() {
+    fn test_build_request_allows_model_outside_startup_snapshot() {
         let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
             .unwrap()
             .with_supported_models(vec!["claude-3-5-sonnet".to_string()]);
 
         let request = CompletionRequest {
-            model: "claude-3-haiku".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
             messages: vec![Message::user("hi")],
             tools: Vec::new(),
             temperature: None,
@@ -1910,7 +1910,7 @@ mod tests {
         };
 
         let result = provider.build_request_body(&request, false);
-        assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2867,9 +2867,11 @@ mod tests {
             serde_json::from_str(json).expect("error_invalid_request.json must be valid JSON");
         assert_eq!(value["type"], "error");
         assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert!(value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("max_tokens"));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_tokens")
+        );
     }
 }

@@ -5,32 +5,30 @@
 //! This is the wire format used by ChatGPT Plus/Pro subscriptions via OAuth tokens.
 
 use async_trait::async_trait;
-use futures::{stream, SinkExt, StreamExt};
-use http::{header::HeaderValue, Request};
+use futures::{SinkExt, StreamExt, stream};
+use http::{Request, header::HeaderValue};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use tokio_tungstenite::tungstenite::{
-    self,
+    self, Message as WsMessage,
     client::IntoClientRequest,
-    protocol::{frame::coding::CloseCode, CloseFrame},
-    Message as WsMessage,
+    protocol::{CloseFrame, frame::coding::CloseCode},
 };
 
 use crate::document::document_text_fallback;
 use crate::openai::{
-    is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
-    OPENAI_THINKING_LEVELS,
+    OPENAI_THINKING_LEVELS, is_openai_chat_capable, openai_context_window, openai_models_endpoint,
+    openai_thinking_levels,
 };
-use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
+use crate::openai_common::{OpenAiModelsResponse, filter_model_ids};
 use crate::provider::{
-    bearer_auth_headers, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
-    LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch, LoopModelProfile,
-    LoopPromptOverlayContext, LoopStreamingRecoveryStrategy, ProviderCapabilities,
-    StaticLoopModelProfile,
+    CompletionStream, LlmProvider, LoopBufferedCompletionStrategy, LoopHarness, LoopModelMatch,
+    LoopModelProfile, LoopPromptOverlayContext, LoopStreamingRecoveryStrategy,
+    ProviderCapabilities, StaticLoopModelProfile, bearer_auth_headers, insert_header_value,
+    null_loop_harness, resolve_loop_harness_from_profiles,
 };
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
@@ -236,19 +234,14 @@ impl OpenAiResponsesProvider {
         Ok(self.fetch_models().await?.len())
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<ResponsesRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
+        // The router is the source of truth for model selection. Do not reject
+        // a router-resolved model here just because this provider instance was
+        // constructed with an older startup snapshot.
         validate_tool_message_sequence(&request.messages)?;
 
         let mut input = Vec::new();
@@ -1612,7 +1605,7 @@ mod tests {
     use super::*;
     use crate::test_helpers::{simple_pdf_with_text, spawn_json_server};
     use base64::Engine;
-    use futures::{pin_mut, stream, StreamExt};
+    use futures::{StreamExt, pin_mut, stream};
 
     #[test]
     fn endpoint_resolves_correctly() {
@@ -1712,6 +1705,26 @@ mod tests {
             "Bearer oauth-token-123"
         );
         assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+    }
+
+    #[test]
+    fn build_request_body_allows_model_outside_startup_snapshot() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(128),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let result = provider.build_request_body(&request, false);
+        assert!(result.is_ok());
     }
 
     #[test]

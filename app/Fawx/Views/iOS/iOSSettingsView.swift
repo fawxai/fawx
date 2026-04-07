@@ -315,10 +315,10 @@ private struct iOSModelThinkingSettingsView: View {
     }
 
     private var activeModelName: String {
-        guard let modelID = appState.activeModel?.modelID else {
+        guard let activeModel = appState.activeModel else {
             return "Unavailable"
         }
-        return abbreviateModelName(modelID)
+        return displayModelName(activeModel)
     }
 
     private var hasActiveModel: Bool {

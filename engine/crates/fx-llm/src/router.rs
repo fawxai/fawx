@@ -8,7 +8,7 @@ use fx_core::error::LlmError;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+use crate::provider::{CompletionStream, DiscoveredModel, LlmProvider as CompletionProvider};
 use crate::streaming::StreamCallback;
 use crate::types::{CompletionRequest, CompletionResponse, LlmError as ProviderLlmError};
 use crate::LlmProvider;
@@ -18,8 +18,15 @@ use crate::LlmProvider;
 pub struct ModelRouter {
     providers: HashMap<String, Arc<dyn CompletionProvider>>,
     active_model: Option<String>,
-    model_to_provider: HashMap<String, String>,
+    models: HashMap<String, RegisteredModel>,
     provider_auth_methods: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredModel {
+    provider_name: String,
+    display_name: Option<String>,
+    recommended: bool,
 }
 
 impl ModelRouter {
@@ -45,12 +52,19 @@ impl ModelRouter {
         let auth_method = auth_method.into();
         let supported_models = provider.supported_models();
 
-        for model in supported_models {
-            self.model_to_provider.insert(model, provider_name.clone());
-        }
-
         self.provider_auth_methods
             .insert(provider_name.clone(), auth_method);
+        self.replace_provider_models(
+            &provider_name,
+            supported_models
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect(),
+        );
         self.providers.insert(provider_name, provider);
     }
 
@@ -66,12 +80,12 @@ impl ModelRouter {
     }
 
     fn resolve_model(&self, model: &str) -> Result<String, RouterError> {
-        if self.model_to_provider.contains_key(model) {
+        if self.models.contains_key(model) {
             return Ok(model.to_string());
         }
 
         let mut prefix_matches = self
-            .model_to_provider
+            .models
             .keys()
             .filter(|candidate| candidate.starts_with(model));
 
@@ -93,7 +107,7 @@ impl ModelRouter {
 
     /// Return the provider for a model identifier, if registered.
     pub fn provider_for_model(&self, model: &str) -> Option<&str> {
-        self.model_to_provider.get(model).map(String::as_str)
+        self.models.get(model).map(|model| model.provider_name.as_str())
     }
 
     /// Return the provider for the active model, if any.
@@ -120,16 +134,31 @@ impl ModelRouter {
 
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
-        build_model_infos(
-            &self.model_to_provider,
-            &self.providers,
-            &self.provider_auth_methods,
-        )
+        build_model_infos(&self.models, &self.providers, &self.provider_auth_methods)
     }
 
     /// Fetch available models from all registered providers dynamically.
     pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
         fetch_available_models_from_catalog(self.provider_catalog()).await
+    }
+
+    pub fn replace_provider_models(
+        &mut self,
+        provider_name: &str,
+        models: Vec<DiscoveredModel>,
+    ) {
+        self.models
+            .retain(|_, model| model.provider_name != provider_name);
+        for model in models {
+            self.models.insert(
+                model.id,
+                RegisteredModel {
+                    provider_name: provider_name.to_string(),
+                    display_name: model.display_name,
+                    recommended: model.recommended,
+                },
+            );
+        }
     }
 
     pub fn context_window_for_model(&self, model: &str) -> Result<usize, RouterError> {
@@ -213,10 +242,11 @@ impl ModelRouter {
     ) -> Result<(String, Arc<dyn CompletionProvider>), RouterError> {
         let resolved_model = self.resolve_model(model)?;
         let provider_name = self
-            .model_to_provider
+            .models
             .get(&resolved_model)
+            .map(|model| model.provider_name.clone())
             .ok_or_else(|| RouterError::ModelNotFound(resolved_model.clone()))?;
-        let provider = self.providers.get(provider_name).cloned().ok_or_else(|| {
+        let provider = self.providers.get(&provider_name).cloned().ok_or_else(|| {
             RouterError::ProviderError(ProviderLlmError::Provider(format!(
                 "provider '{provider_name}' was not registered"
             )))
@@ -244,19 +274,27 @@ pub async fn fetch_available_models_from_catalog(
     });
     let mut model_entries = BTreeMap::new();
 
-    for (provider_name, auth_method, model_ids) in join_all(fetches).await {
-        add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
+    for (provider_name, auth_method, models) in join_all(fetches).await {
+        add_provider_models(&mut model_entries, &provider_name, &auth_method, models);
     }
 
     model_entries.into_values().collect()
 }
 
-async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<String> {
-    match provider.list_models().await {
+async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<DiscoveredModel> {
+    match provider.list_discovered_models().await {
         Ok(models) => models,
         Err(error) => {
             warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using registered fallback");
-            provider.supported_models()
+            provider
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()
         }
     }
 }
@@ -265,30 +303,38 @@ fn add_provider_models(
     model_entries: &mut BTreeMap<String, ModelInfo>,
     provider_name: &str,
     auth_method: &str,
-    model_ids: Vec<String>,
+    models: Vec<DiscoveredModel>,
 ) {
-    for model_id in model_ids {
+    for model in models {
         model_entries
-            .entry(model_id.clone())
+            .entry(model.id.clone())
             .or_insert_with(|| ModelInfo {
-                model_id,
+                model_id: model.id,
                 provider_name: provider_name.to_string(),
                 auth_method: auth_method.to_string(),
+                display_name: model.display_name,
+                recommended: model.recommended,
             });
     }
 }
 
 fn build_model_infos(
-    model_to_provider: &HashMap<String, String>,
+    models_by_id: &HashMap<String, RegisteredModel>,
     providers: &HashMap<String, Arc<dyn CompletionProvider>>,
     provider_auth_methods: &HashMap<String, String>,
 ) -> Vec<ModelInfo> {
-    let mut models = model_to_provider
+    let mut models = models_by_id
         .iter()
-        .map(|(model_id, provider_name)| ModelInfo {
+        .map(|(model_id, registered_model)| ModelInfo {
             model_id: model_id.clone(),
-            provider_name: provider_name.clone(),
-            auth_method: provider_auth_method(providers, provider_auth_methods, provider_name),
+            provider_name: registered_model.provider_name.clone(),
+            auth_method: provider_auth_method(
+                providers,
+                provider_auth_methods,
+                &registered_model.provider_name,
+            ),
+            display_name: registered_model.display_name.clone(),
+            recommended: registered_model.recommended,
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
@@ -304,6 +350,10 @@ pub struct ModelInfo {
     pub provider_name: String,
     /// Auth method category (`subscription`, `api_key`, etc.).
     pub auth_method: String,
+    /// Optional provider-supplied display name.
+    pub display_name: Option<String>,
+    /// Whether the provider marks this model as recommended.
+    pub recommended: bool,
 }
 
 /// Errors produced by model routing operations.

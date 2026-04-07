@@ -305,6 +305,7 @@ fn unique_catalog_model_ids(models: Vec<fx_llm::CatalogModel>) -> Vec<String> {
 fn provider_display_name(provider: &str) -> &str {
     match provider {
         "anthropic" => "Anthropic",
+        "fireworks" => "Fireworks",
         "github" => "GitHub",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
@@ -330,7 +331,6 @@ pub(super) async fn save_auth_method(
     store
         .save_auth_manager(&auth_manager)
         .map_err(internal_error)?;
-    fx_config::clear_provider_model_cache(&state.data_dir, provider).map_err(internal_error)?;
     reload_app_providers(state).await;
     Ok(())
 }
@@ -381,6 +381,137 @@ fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::DeviceStore;
+    use crate::engine::{AppEngine, ConfigManagerHandle, CycleResult as ApiCycleResult};
+    use crate::pairing::PairingState;
+    use crate::server_runtime::ServerRuntime;
+    use crate::state::{build_channel_runtime, in_memory_telemetry, HttpState, SharedReadState};
+    use crate::types::{AuthProviderDto, ContextInfoDto, ErrorRecordDto, ModelInfoDto, ModelSwitchDto, SkillSummaryDto, ThinkingLevelDto};
+    use async_trait::async_trait;
+    use fx_bus::SessionBus;
+    use fx_core::types::InputSource;
+    use fx_llm::{DocumentAttachment, ImageAttachment, Message};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    struct NoopApp;
+
+    #[async_trait]
+    impl AppEngine for NoopApp {
+        async fn process_message(
+            &mut self,
+            _input: &str,
+            _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
+            _source: InputSource,
+            _callback: Option<fx_kernel::StreamCallback>,
+        ) -> Result<ApiCycleResult, anyhow::Error> {
+            unreachable!("not used in auth cache tests")
+        }
+
+        async fn process_message_with_context(
+            &mut self,
+            _input: &str,
+            _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
+            _context: Vec<Message>,
+            _source: InputSource,
+            _callback: Option<fx_kernel::StreamCallback>,
+        ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+            unreachable!("not used in auth cache tests")
+        }
+
+        fn active_model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn available_models(&self) -> Vec<ModelInfoDto> {
+            Vec::new()
+        }
+
+        fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+            unreachable!("not used in auth cache tests")
+        }
+
+        fn thinking_level(&self) -> ThinkingLevelDto {
+            ThinkingLevelDto {
+                level: "normal".to_string(),
+                budget_tokens: None,
+                available: Vec::new(),
+            }
+        }
+
+        fn context_info(&self) -> ContextInfoDto {
+            ContextInfoDto {
+                used_tokens: 0,
+                max_tokens: 4_096,
+                percentage: 0.0,
+                compaction_threshold: 0.8,
+            }
+        }
+
+        fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+            self.context_info()
+        }
+
+        fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+            Ok(self.thinking_level())
+        }
+
+        fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+            Vec::new()
+        }
+
+        fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+            Vec::new()
+        }
+
+        fn config_manager(&self) -> Option<ConfigManagerHandle> {
+            None
+        }
+
+        fn session_bus(&self) -> Option<&SessionBus> {
+            None
+        }
+
+        fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+            Vec::new()
+        }
+    }
+
+    fn test_state(data_dir: std::path::PathBuf) -> HttpState {
+        let app = NoopApp;
+        let shared = Arc::new(SharedReadState::from_app(&app));
+
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
+            session_registry: None,
+            start_time: Instant::now(),
+            server_runtime: ServerRuntime::local(8400),
+            tailscale_ip: None,
+            bearer_token: "test-token".to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
+            channels: build_channel_runtime(None, Vec::new()),
+            data_dir: data_dir.clone(),
+            synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
+            fleet_manager: None,
+            cron_store: None,
+            experiment_registry: Arc::new(tokio::sync::Mutex::new(
+                crate::experiment_registry::ExperimentRegistry::new(data_dir.as_path())
+                    .expect("experiment registry"),
+            )),
+            improvement_provider: None,
+            telemetry: in_memory_telemetry(),
+        }
+    }
 
     #[test]
     fn setup_token_response_serializes_expected_shape() {
@@ -463,5 +594,41 @@ mod tests {
         assert_eq!(request.0, "anthropic");
         assert_eq!(request.1, "setup-token-123");
         assert_eq!(request.2, "setup_token");
+    }
+
+    #[tokio::test]
+    async fn save_auth_method_preserves_provider_model_cache() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fx_config::update_provider_model_cache(
+            temp.path(),
+            "openrouter",
+            &[
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ],
+        )
+        .expect("seed provider model cache");
+        let state = test_state(temp.path().to_path_buf());
+
+        save_auth_method(
+            &state,
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "or-test-key".to_string(),
+            },
+        )
+        .await
+        .expect("save auth");
+
+        let cache =
+            fx_config::load_provider_model_cache(temp.path()).expect("reload provider model cache");
+        assert_eq!(
+            cache.models_for("openrouter"),
+            Some(vec![
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ])
+        );
     }
 }

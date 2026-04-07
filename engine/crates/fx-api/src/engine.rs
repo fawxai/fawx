@@ -56,6 +56,12 @@ pub trait AppEngine: Send + Sync {
     /// List all available models from the router.
     fn available_models(&self) -> Vec<ModelInfoDto>;
 
+    /// Fetch the current available models, allowing implementations to refresh
+    /// dynamic provider catalogs before responding.
+    async fn available_models_dynamic(&self) -> Vec<ModelInfoDto> {
+        self.available_models()
+    }
+
     /// Switch the active model and return the resolved model ID.
     fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error>;
 

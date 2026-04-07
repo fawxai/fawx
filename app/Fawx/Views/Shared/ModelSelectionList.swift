@@ -7,6 +7,7 @@ struct ModelSelectionList: View {
     let selectModel: (String) -> Void
     @State private var searchText = ""
     @State private var selectedProviderID = ModelSelectionCatalog.allProvidersID
+    @State private var selectedCatalogScope: ModelSelectionScope = .recommended
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
@@ -17,6 +18,10 @@ struct ModelSelectionList: View {
 
                 if providerOptions.count > 2 {
                     providerFilterBar
+                }
+
+                if showsCatalogScopeFilter {
+                    catalogScopeFilterBar
                 }
 
                 if filteredSections.isEmpty {
@@ -132,6 +137,23 @@ struct ModelSelectionList: View {
         }
     }
 
+    private var catalogScopeFilterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: FawxSpacing.paddingSM) {
+                ForEach(ModelSelectionScope.allCases) { scope in
+                    ProviderFilterChip(
+                        title: scope.title,
+                        isSelected: selectedCatalogScope == scope,
+                        action: {
+                            selectedCatalogScope = scope
+                        }
+                    )
+                    .accessibilityIdentifier("modelCatalogScope_\(scope.rawValue)")
+                }
+            }
+        }
+    }
+
     private var providerOptions: [ModelSelectionProviderOption] {
         ModelSelectionCatalog.providerOptions(for: models)
     }
@@ -143,15 +165,29 @@ struct ModelSelectionList: View {
     private var filteredSections: [ModelSelectionSection] {
         ModelSelectionCatalog.filteredSections(
             models: models,
+            scope: selectedCatalogScope,
             providerFilterID: selectedProviderID,
             query: searchText
         )
+    }
+
+    private var showsCatalogScopeFilter: Bool {
+        models.contains(where: { !$0.recommended })
     }
 
     private var emptyResultsMessage: String {
         let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedProviderTitle = providerOptions.first(where: { $0.id == selectedProviderID })?.title
 
+        if selectedCatalogScope == .recommended {
+            if !trimmedQuery.isEmpty {
+                return "Try a shorter query, switch providers, or show all models."
+            }
+            if selectedProviderID != ModelSelectionCatalog.allProvidersID {
+                return "No recommended models are available for \(selectedProviderTitle ?? "this provider")."
+            }
+            return "No recommended models are available. Show all models to browse the full catalog."
+        }
         if !trimmedQuery.isEmpty, selectedProviderID != ModelSelectionCatalog.allProvidersID {
             return "No \(selectedProviderTitle ?? "provider") models match \"\(trimmedQuery)\"."
         }
@@ -215,12 +251,21 @@ private struct ModelSelectionRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
             VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
-                Text(abbreviateModelName(model.modelID))
-                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                Text(displayModelName(model))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.fawxText)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .multilineTextAlignment(.leading)
                     .lineLimit(2)
+
+                if model.displayName != nil {
+                    Text(compactModelName(model.modelID, limit: 40))
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .foregroundStyle(Color.fawxTextSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(1)
+                }
 
                 Text(modelMetadataSummary(model))
                     .font(FawxTypography.status)
@@ -248,6 +293,22 @@ private struct ModelSelectionRow: View {
 struct ModelSelectionProviderOption: Identifiable, Hashable {
     let id: String
     let title: String
+}
+
+enum ModelSelectionScope: String, CaseIterable, Identifiable {
+    case recommended
+    case all
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .recommended:
+            return "Recommended"
+        case .all:
+            return "All Models"
+        }
+    }
 }
 
 struct ModelSelectionSection: Identifiable, Equatable {
@@ -279,18 +340,26 @@ enum ModelSelectionCatalog {
 
     static func filteredSections(
         models: [ModelInfo],
+        scope: ModelSelectionScope,
         providerFilterID: String,
         query: String
     ) -> [ModelSelectionSection] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let scopedModels = models.filter { model in
+        let providerScopedModels = models.filter { model in
             guard providerFilterID != allProvidersID else {
                 return true
             }
             return model.provider == providerFilterID
         }
 
-        let filteredModels = scopedModels.filter { model in
+        let recommendationScopedModels = providerScopedModels.filter { model in
+            guard scope == .recommended else {
+                return true
+            }
+            return model.recommended
+        }
+
+        let filteredModels = recommendationScopedModels.filter { model in
             guard !trimmedQuery.isEmpty else {
                 return true
             }
@@ -299,6 +368,7 @@ enum ModelSelectionCatalog {
             let searchHaystack = [
                 model.modelID,
                 abbreviateModelName(model.modelID),
+                model.displayName ?? "",
                 model.provider,
                 displayProviderName(model.provider),
                 model.authMethod,
@@ -328,7 +398,13 @@ enum ModelSelectionCatalog {
             return ModelSelectionSection(
                 providerID: providerID,
                 title: displayProviderName(providerID),
-                models: sectionModels
+                models: sectionModels.sorted { left, right in
+                    if left.recommended != right.recommended {
+                        return left.recommended && !right.recommended
+                    }
+                    return displayModelName(left).localizedCaseInsensitiveCompare(displayModelName(right))
+                        == .orderedAscending
+                }
             )
         }
     }

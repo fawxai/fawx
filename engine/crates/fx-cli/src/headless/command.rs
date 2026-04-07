@@ -11,8 +11,8 @@ use crate::commands::slash::{
     ParsedCommand,
 };
 use crate::helpers::{
-    available_provider_names, fetch_shared_available_models, read_router, render_model_menu_text,
-    render_status_text, thinking_config_for_active_model,
+    available_provider_names, read_router, render_model_menu_text, render_status_text,
+    sync_shared_available_models, thinking_config_for_active_model,
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending};
 use fx_kernel::act::TokenUsage;
@@ -184,7 +184,7 @@ impl HeadlessApp {
     }
 
     async fn dynamic_models_or_fallback(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        let models = fetch_shared_available_models(&self.router).await;
+        let models = sync_shared_available_models(&self.router).await;
         if models.is_empty() {
             return Ok(self.available_models());
         }
