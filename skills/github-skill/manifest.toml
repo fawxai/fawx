@@ -1,6 +1,8 @@
 name = "github"
-version = "1.2.0"
-description = "GitHub integration: create PRs, comment on PRs, list PRs, probe PR metadata, inspect PR file inventories, fetch file-scoped PR patches, list issues, and create issues"
+# 2.0.0 is intentional: view_pr is now probe-first metadata only, and full
+# diff retrieval moved to list_pr_files + view_pr_file_patch.
+version = "2.0.0"
+description = "GitHub integration: create PRs, comment on PRs, list PRs, probe PR metadata without eager diff retrieval, inspect PR file inventories, fetch file-scoped PR patches, list issues, and create issues"
 author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = ["network", "storage"]
@@ -170,6 +172,8 @@ type = "integer"
 description = "Pull request number"
 required = true
 
+# Tool parameters are scoped per tool in this manifest format, so the shared
+# owner/repo/pr_number PR inputs stay duplicated here intentionally.
 [[tools]]
 name = "list_pr_files"
 description = "List changed files in a GitHub pull request with per-file change stats"

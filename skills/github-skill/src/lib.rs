@@ -32,20 +32,24 @@ extern "C" {
     ) -> u32;
 }
 
+// Native unit tests need these symbols to link, but any real execution outside
+// wasm32 should fail fast instead of silently pretending the host exists.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_log(_level: u32, _msg_ptr: *const u8, _msg_len: u32) {}
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_get_input() -> u32 {
-    0
+    panic!("host_get_input is only available in wasm32 builds");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn host_set_output(_text_ptr: *const u8, _text_len: u32) {}
+unsafe fn host_set_output(_text_ptr: *const u8, _text_len: u32) {
+    panic!("host_set_output is only available in wasm32 builds");
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_kv_get(_key_ptr: *const u8, _key_len: u32) -> u32 {
-    0
+    panic!("host_kv_get is only available in wasm32 builds");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -59,7 +63,7 @@ unsafe fn host_http_request(
     _body_ptr: *const u8,
     _body_len: u32,
 ) -> u32 {
-    0
+    panic!("host_http_request is only available in wasm32 builds");
 }
 
 // ── FFI Helpers ─────────────────────────────────────────────────────────────
@@ -131,7 +135,7 @@ struct HttpReq<'a> {
     body: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct HttpRequestPlan {
     method: &'static str,
     url: String,
@@ -497,6 +501,16 @@ struct GitHubPrFile {
     previous_filename: Option<String>,
 }
 
+impl GitHubPrFile {
+    fn matches_path(&self, requested_path: &str) -> bool {
+        self.filename == requested_path
+            || self
+                .previous_filename
+                .as_deref()
+                .is_some_and(|previous_path| previous_path == requested_path)
+    }
+}
+
 #[derive(Deserialize)]
 struct GitHubIssueLabel {
     name: String,
@@ -583,7 +597,34 @@ const BLOCKED_BASES: &[&str] = &["main", "master"];
 /// Default base branch when none is specified.
 const DEFAULT_BASE: &str = "staging";
 const PR_FILES_PAGE_SIZE: u32 = 100;
-const SUPPORTED_ACTIONS: &str = "'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_pr_files', 'view_pr_file_patch', 'list_issues', or 'create_issue'";
+const MAX_PR_FILE_PAGES: u32 = 30;
+// KEEP IN SYNC WITH Input enum variants.
+const SUPPORTED_ACTIONS: &[&str] = &[
+    "create_pr",
+    "comment_pr",
+    "list_prs",
+    "view_pr",
+    "list_pr_files",
+    "view_pr_file_patch",
+    "list_issues",
+    "create_issue",
+];
+
+fn supported_actions_message() -> String {
+    let (last, rest) = SUPPORTED_ACTIONS
+        .split_last()
+        .expect("supported actions must not be empty");
+    let quoted_rest = rest
+        .iter()
+        .map(|action| format!("'{action}'"))
+        .collect::<Vec<_>>();
+
+    if quoted_rest.is_empty() {
+        format!("'{last}'")
+    } else {
+        format!("{}, or '{}'", quoted_rest.join(", "), last)
+    }
+}
 
 fn validate_base(base: &str) -> Result<(), String> {
     if BLOCKED_BASES.contains(&base) {
@@ -621,6 +662,13 @@ fn check_pr_file_path(path: &str) -> Result<(), String> {
         return Err("PR file path cannot be empty".into());
     }
     Ok(())
+}
+
+fn next_pr_files_page(page: u32, limit_error: String) -> Result<u32, String> {
+    if page >= MAX_PR_FILE_PAGES {
+        return Err(limit_error);
+    }
+    Ok(page + 1)
 }
 
 // ── Core Logic ──────────────────────────────────────────────────────────────
@@ -1005,7 +1053,7 @@ fn fetch_all_pr_files(
             break;
         }
 
-        page += 1;
+        page = next_pr_files_page(page, "PR file list exceeded maximum page limit".into())?;
     }
 
     Ok(all_files)
@@ -1065,14 +1113,6 @@ fn handle_list_pr_files(input: ListPrFilesInput) -> String {
     }
 }
 
-fn requested_pr_file_matches(file: &GitHubPrFile, requested_path: &str) -> bool {
-    file.filename == requested_path
-        || file
-            .previous_filename
-            .as_deref()
-            .is_some_and(|previous_path| previous_path == requested_path)
-}
-
 fn fetch_pr_file(
     owner: &str,
     repo: &str,
@@ -1086,10 +1126,7 @@ fn fetch_pr_file(
         let page_files = fetch_pr_files_page(owner, repo, pr_number, page, token)?;
         let page_len = page_files.len();
 
-        if let Some(file) = page_files
-            .into_iter()
-            .find(|file| requested_pr_file_matches(file, path))
-        {
+        if let Some(file) = page_files.into_iter().find(|file| file.matches_path(path)) {
             return Ok(file);
         }
 
@@ -1097,7 +1134,13 @@ fn fetch_pr_file(
             break;
         }
 
-        page += 1;
+        page = next_pr_files_page(
+            page,
+            format!(
+                "PR file search exceeded maximum page limit while looking for '{}' in #{}",
+                path, pr_number
+            ),
+        )?;
     }
 
     Err(format!("PR file '{}' not found in #{}", path, pr_number))
@@ -1367,10 +1410,11 @@ fn parse_create_issue_response(response: Option<String>) -> String {
 #[no_mangle]
 pub extern "C" fn run() {
     let raw = get_input();
+    let supported_actions = supported_actions_message();
     if raw.is_empty() {
         set_output(&format!(
             r#"{{"error":"No input provided. Expected JSON with 'action' or 'tool': {}."}}"#,
-            SUPPORTED_ACTIONS
+            supported_actions
         ));
         return;
     }
@@ -1387,7 +1431,9 @@ pub extern "C" fn run() {
         Err(e) => {
             log(4, &format!("Failed to parse input: {e}"));
             serialize_output(&serde_json::json!({
-                "error": format!("Invalid input: {e}. Expected 'action' or 'tool': {SUPPORTED_ACTIONS}.")
+                "error": format!(
+                    "Invalid input: {e}. Expected 'action' or 'tool': {supported_actions}."
+                )
             }))
         }
     };
@@ -2185,7 +2231,39 @@ mod tests {
     }
 
     #[test]
-    fn requested_pr_file_matches_current_or_previous_path() {
+    fn http_request_plan_serializes_for_debugging() {
+        let plan = HttpRequestPlan {
+            method: "GET",
+            url: "https://api.github.com/repos/acme/widgets/pulls/42".into(),
+            headers: r#"{"Accept":"application/json"}"#.into(),
+            body: String::new(),
+        };
+        let parsed: serde_json::Value = serde_json::to_value(plan).unwrap();
+        assert_eq!(parsed["method"], "GET");
+        assert_eq!(
+            parsed["url"],
+            "https://api.github.com/repos/acme/widgets/pulls/42"
+        );
+    }
+
+    #[test]
+    fn next_pr_files_page_advances_before_limit() {
+        assert_eq!(
+            next_pr_files_page(MAX_PR_FILE_PAGES - 1, "too many pages".into()).unwrap(),
+            MAX_PR_FILE_PAGES
+        );
+    }
+
+    #[test]
+    fn next_pr_files_page_rejects_limit() {
+        assert_eq!(
+            next_pr_files_page(MAX_PR_FILE_PAGES, "too many pages".into()).unwrap_err(),
+            "too many pages"
+        );
+    }
+
+    #[test]
+    fn github_pr_file_matches_current_or_previous_path() {
         let file = GitHubPrFile {
             filename: "src/new.rs".into(),
             status: "renamed".into(),
@@ -2196,9 +2274,25 @@ mod tests {
             previous_filename: Some("src/old.rs".into()),
         };
 
-        assert!(requested_pr_file_matches(&file, "src/new.rs"));
-        assert!(requested_pr_file_matches(&file, "src/old.rs"));
-        assert!(!requested_pr_file_matches(&file, "src/other.rs"));
+        assert!(file.matches_path("src/new.rs"));
+        assert!(file.matches_path("src/old.rs"));
+        assert!(!file.matches_path("src/other.rs"));
+    }
+
+    #[test]
+    fn check_pr_file_path_rejects_empty() {
+        assert_eq!(
+            check_pr_file_path("").unwrap_err(),
+            "PR file path cannot be empty"
+        );
+    }
+
+    #[test]
+    fn check_pr_file_path_rejects_whitespace_only() {
+        assert_eq!(
+            check_pr_file_path("   ").unwrap_err(),
+            "PR file path cannot be empty"
+        );
     }
 
     // ── List Issues Response Parsing ────────────────────────────────────
