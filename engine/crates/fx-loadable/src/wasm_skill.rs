@@ -9,6 +9,7 @@ use crate::lifecycle::{current_time_millis, hash_string, SignatureStatus, SkillR
 use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
+use fx_core::tool_routing::{RouteAuthMode, ToolReadinessSummary, ToolRoutingSummary};
 use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
@@ -246,6 +247,66 @@ impl WasmSkill {
     }
 }
 
+pub(crate) fn manifest_routing_tools(
+    manifest: &SkillManifest,
+    credential_provider: Option<&dyn CredentialProvider>,
+) -> Vec<ToolRoutingSummary> {
+    manifest
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            tool.routing.clone().map(|metadata| ToolRoutingSummary {
+                tool_name: tool.name.clone(),
+                readiness: routing_readiness(
+                    manifest.name.as_str(),
+                    &metadata,
+                    credential_provider,
+                ),
+                metadata,
+            })
+        })
+        .collect()
+}
+
+fn routing_readiness(
+    skill_name: &str,
+    metadata: &fx_core::tool_routing::ToolRoutingMetadata,
+    credential_provider: Option<&dyn CredentialProvider>,
+) -> ToolReadinessSummary {
+    match &metadata.auth_mode {
+        RouteAuthMode::None => ToolReadinessSummary {
+            available: true,
+            ready: true,
+            readiness_reason: None,
+        },
+        RouteAuthMode::CredentialRequired { key } => {
+            let ready = credential_provider
+                .map(|provider| provider_has_credential(provider, skill_name, key))
+                .unwrap_or(false);
+            ToolReadinessSummary {
+                available: true,
+                ready,
+                readiness_reason: if ready {
+                    None
+                } else {
+                    Some("required credential not configured".to_string())
+                },
+            }
+        }
+    }
+}
+
+fn provider_has_credential(provider: &dyn CredentialProvider, skill_name: &str, key: &str) -> bool {
+    provider
+        .get_credential(&skill_scoped_credential_key(skill_name, key))
+        .is_some()
+        || provider.get_credential(key).is_some()
+}
+
+fn skill_scoped_credential_key(skill_name: &str, key: &str) -> String {
+    format!("skill:{skill_name}:{key}")
+}
+
 fn extract_legacy_input(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(mut object) => match object.remove("input") {
@@ -323,6 +384,10 @@ impl Skill for WasmSkill {
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+        manifest_routing_tools(&self.manifest, self.credential_provider.as_deref())
     }
 
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
@@ -769,6 +834,9 @@ mod tests {
     use crate::test_support::invocable_wasm_bytes;
     use fx_skills::loader::SkillLoader;
     use fx_skills::manifest::SkillManifest;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use zeroize::Zeroizing;
 
     fn test_manifest(name: &str) -> SkillManifest {
         SkillManifest {
@@ -794,6 +862,26 @@ mod tests {
             .expect("load test skill")
     }
 
+    #[derive(Debug, Default)]
+    struct MockCredentialProvider {
+        credentials: HashMap<String, String>,
+    }
+
+    impl MockCredentialProvider {
+        fn with_credential(mut self, key: &str, value: &str) -> Self {
+            self.credentials.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl CredentialProvider for MockCredentialProvider {
+        fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
+            self.credentials
+                .get(key)
+                .map(|value| Zeroizing::new(value.clone()))
+        }
+    }
+
     #[test]
     fn wasm_skill_name_matches_manifest() {
         let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
@@ -817,6 +905,7 @@ mod tests {
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
                 authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                routing: None,
                 direct_utility: false,
                 trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -830,6 +919,7 @@ mod tests {
                 name: "web_fetch".to_string(),
                 description: "Fetch".to_string(),
                 authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                routing: None,
                 direct_utility: false,
                 trigger_patterns: vec![],
                 parameters: vec![],
@@ -855,6 +945,7 @@ mod tests {
             name: "web_search".to_string(),
             description: "Search".to_string(),
             authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+            routing: None,
             direct_utility: false,
             trigger_patterns: vec![],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -881,6 +972,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wasm_skill_surfaces_only_route_capable_tools() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: fx_core::tool_routing::RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            },
+            fx_skills::manifest::SkillToolManifest {
+                name: "web_search".to_string(),
+                description: "Search".to_string(),
+                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+                routing: None,
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            },
+        ];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert_eq!(routing[0].tool_name, "web_fetch");
+        assert!(routing[0].readiness.ready);
+    }
+
+    #[test]
+    fn wasm_skill_marks_credential_backed_routes_not_ready_without_credential() {
+        let mut manifest = test_manifest("github");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "view_pr".to_string(),
+            description: "View pull request".to_string(),
+            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+            routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
+                resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
+                operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                auth_mode: fx_core::tool_routing::RouteAuthMode::CredentialRequired {
+                    key: "github_token".to_string(),
+                },
+                artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                fallback_rank: 10,
+            }),
+            direct_utility: false,
+            trigger_patterns: vec![],
+            parameters: vec![],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let skill = WasmSkill::new(loaded, None).expect("create");
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert!(routing[0].readiness.available);
+        assert!(!routing[0].readiness.ready);
+        assert_eq!(
+            routing[0].readiness.readiness_reason.as_deref(),
+            Some("required credential not configured")
+        );
+    }
+
+    #[test]
+    fn wasm_skill_marks_credential_backed_routes_ready_with_scoped_or_global_credential() {
+        let mut manifest = test_manifest("github");
+        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
+            name: "view_pr".to_string(),
+            description: "View pull request".to_string(),
+            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
+            routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
+                resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
+                operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                auth_mode: fx_core::tool_routing::RouteAuthMode::CredentialRequired {
+                    key: "github_token".to_string(),
+                },
+                artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                fallback_rank: 10,
+            }),
+            direct_utility: false,
+            trigger_patterns: vec![],
+            parameters: vec![],
+        }];
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), &manifest, None)
+            .expect("load test skill");
+        let provider = MockCredentialProvider::default()
+            .with_credential("skill:github:github_token", "scoped_token");
+        let skill = WasmSkill::new(loaded, Some(Arc::new(provider))).expect("create");
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert!(routing[0].readiness.ready);
+        assert_eq!(routing[0].readiness.readiness_reason, None);
+    }
+
     #[tokio::test]
     async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
         let mut manifest = test_manifest("weather");
@@ -888,6 +1090,7 @@ mod tests {
             name: "weather".to_string(),
             description: "Weather".to_string(),
             authority_surface: None,
+            routing: None,
             direct_utility: true,
             trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -926,6 +1129,7 @@ mod tests {
             name: "calculate".to_string(),
             description: "Calculate".to_string(),
             authority_surface: None,
+            routing: None,
             direct_utility: false,
             trigger_patterns: vec![],
             parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -958,6 +1162,7 @@ mod tests {
                 name: "render_table".to_string(),
                 description: "Render table".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: false,
                 trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
@@ -971,6 +1176,7 @@ mod tests {
                 name: "render_chart".to_string(),
                 description: "Render chart".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: false,
                 trigger_patterns: vec![],
                 parameters: vec![fx_skills::manifest::SkillToolParameterManifest {

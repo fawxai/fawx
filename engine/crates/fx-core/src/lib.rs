@@ -23,6 +23,7 @@ pub mod path;
 pub mod runtime_info;
 pub mod self_modify;
 pub mod signals;
+pub mod tool_routing;
 pub mod types;
 
 pub use config::Config;

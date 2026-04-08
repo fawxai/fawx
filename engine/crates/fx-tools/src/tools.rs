@@ -1020,19 +1020,50 @@ mod tests {
         Arc::new(RwLock::new(RuntimeInfo {
             active_model: model.to_string(),
             provider: "openai".to_string(),
-            skills: vec![fx_core::runtime_info::SkillInfo {
-                name: "fawx-builtin".to_string(),
-                description: Some("Built-in runtime tools".to_string()),
-                tool_names: vec!["read_file".to_string(), "self_info".to_string()],
-                capabilities: Vec::new(),
-                version: None,
-                source: None,
-                revision_hash: None,
-                manifest_hash: None,
-                activated_at_ms: None,
-                signature_status: None,
-                stale_source: None,
-            }],
+            skills: vec![
+                fx_core::runtime_info::SkillInfo {
+                    name: "fawx-builtin".to_string(),
+                    description: Some("Built-in runtime tools".to_string()),
+                    tool_names: vec!["read_file".to_string(), "self_info".to_string()],
+                    routing_tools: Vec::new(),
+                    capabilities: Vec::new(),
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
+                },
+                fx_core::runtime_info::SkillInfo {
+                    name: "browser".to_string(),
+                    description: Some("Browser skill".to_string()),
+                    tool_names: vec!["web_fetch".to_string()],
+                    routing_tools: vec![fx_core::tool_routing::ToolRoutingSummary {
+                        tool_name: "web_fetch".to_string(),
+                        metadata: fx_core::tool_routing::ToolRoutingMetadata {
+                            resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                            operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                            auth_mode: fx_core::tool_routing::RouteAuthMode::None,
+                            artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                            fallback_rank: 100,
+                        },
+                        readiness: fx_core::tool_routing::ToolReadinessSummary {
+                            available: true,
+                            ready: true,
+                            readiness_reason: None,
+                        },
+                    }],
+                    capabilities: vec!["network".to_string()],
+                    version: Some("1.0.0".to_string()),
+                    source: Some("installed".to_string()),
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
+                },
+            ],
             config_summary: fx_core::runtime_info::ConfigSummary {
                 max_iterations: 6,
                 max_history: 128,
@@ -3335,6 +3366,15 @@ three
 
         assert_eq!(object.len(), 1);
         assert_eq!(parsed["skills"][0]["name"], "fawx-builtin");
+        assert_eq!(
+            parsed["skills"][1]["routing_tools"][0]["metadata"]["resource_kinds"][0],
+            "generic_url"
+        );
+        assert!(
+            parsed["skills"][1]["routing_tools"][0]["readiness"]["ready"]
+                .as_bool()
+                .expect("ready bool")
+        );
     }
 
     #[test]
@@ -4374,8 +4414,7 @@ three
         let exec = test_executor(temp.path()).with_runtime_info(sample_runtime_info("m"));
         let result = exec.handle_fawx_status().expect("status");
         let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
-        // sample_runtime_info has 1 skill
-        assert_eq!(json["skills_loaded"], 1);
+        assert_eq!(json["skills_loaded"], 2);
     }
 
     #[test]
@@ -4414,6 +4453,14 @@ three
         assert_eq!(json["model"]["active_model"], "gpt-5.4");
         assert!(json["permissions"]["mode"].is_string());
         assert!(json["budget"]["max_llm_calls"].is_number());
+        assert_eq!(
+            json["tools"][1]["routing_tools"][0]["tool_name"],
+            "web_fetch"
+        );
+        assert_eq!(
+            json["tools"][1]["routing_tools"][0]["metadata"]["resource_kinds"][0],
+            "generic_url"
+        );
         assert!(json.get("tripwire").is_none(), "must not expose tripwires");
         assert!(json.get("ripcord").is_none(), "must not expose ripcord");
     }

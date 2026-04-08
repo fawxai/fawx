@@ -1,6 +1,9 @@
 use crate::registry::SkillRegistry;
 use crate::skill::Skill;
-use crate::wasm_skill::{load_wasm_artifact_from_dir, LoadedWasmArtifact, SignaturePolicy};
+use crate::wasm_skill::{
+    load_wasm_artifact_from_dir, manifest_routing_tools, LoadedWasmArtifact, SignaturePolicy,
+};
+use fx_core::tool_routing::ToolRoutingSummary;
 use fx_llm::ToolDefinition;
 use fx_skills::live_host_api::CredentialProvider;
 use serde::{Deserialize, Serialize};
@@ -125,6 +128,7 @@ pub struct SkillStatusSummary {
     pub name: String,
     pub description: String,
     pub tool_names: Vec<String>,
+    pub routing_tools: Vec<ToolRoutingSummary>,
     pub capabilities: Vec<String>,
     pub activation: SkillActivation,
     pub source_drift: Option<SourceDrift>,
@@ -363,6 +367,8 @@ pub fn read_statuses(skills_dir: &Path) -> Result<Vec<SkillStatusSummary>, Lifec
             continue;
         };
         let manifest = crate::wasm_skill::read_manifest(&skill_dir)?;
+        let description = manifest.description.clone();
+        let routing_tools = manifest_routing_tools(&manifest, None);
         let tool_names = activation
             .revision
             .tool_contracts
@@ -371,8 +377,9 @@ pub fn read_statuses(skills_dir: &Path) -> Result<Vec<SkillStatusSummary>, Lifec
             .collect();
         statuses.push(SkillStatusSummary {
             name,
-            description: manifest.description,
+            description,
             tool_names,
+            routing_tools,
             capabilities: manifest
                 .capabilities
                 .iter()

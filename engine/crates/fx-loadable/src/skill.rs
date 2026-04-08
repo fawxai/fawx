@@ -5,6 +5,7 @@
 //! which dispatches tool calls to the appropriate skill.
 
 use async_trait::async_trait;
+use fx_core::tool_routing::ToolRoutingSummary;
 use fx_kernel::act::{JournalAction, ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::FailureClass;
@@ -39,6 +40,11 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
 
     /// Declared skill capabilities / permissions.
     fn capabilities(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Route-capable tool metadata and current readiness for this skill.
+    fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
         Vec::new()
     }
 
@@ -180,6 +186,7 @@ mod tests {
         assert_eq!(skill.action_category("greet"), "unknown");
         assert_eq!(skill.authority_surface(&call), ToolAuthoritySurface::Other);
         assert_eq!(skill.journal_action(&call, &result), None);
+        assert!(skill.routing_tools().is_empty());
     }
 
     #[tokio::test]

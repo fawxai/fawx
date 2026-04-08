@@ -9,6 +9,7 @@ entry_point = "run"
 [[tools]]
 name = "web_fetch"
 description = "Fetch a web page and extract its readable content as markdown or plain text"
+routing = { resource_kinds = ["generic_url"], operations = ["fetch"], auth_mode = { kind = "none" }, artifact_strategy = "direct_fetch", fallback_rank = 100 }
 
 [[tools.parameters]]
 name = "url"

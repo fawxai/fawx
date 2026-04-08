@@ -164,6 +164,7 @@ impl SkillRegistry {
                     name: entry.skill.name().to_string(),
                     description: entry.skill.description().to_string(),
                     tool_names: tools,
+                    routing_tools: entry.skill.routing_tools(),
                     capabilities: entry.skill.capabilities(),
                     activation: entry.activation.clone(),
                     source_drift: None,
@@ -459,6 +460,7 @@ impl ToolExecutor for SkillRegistry {
 mod tests {
     use super::*;
     use crate::skill::Skill;
+    use fx_core::tool_routing::ToolRoutingSummary;
     use std::{path::PathBuf, sync::Arc};
 
     /// A deterministic mock skill for testing.
@@ -471,6 +473,7 @@ mod tests {
         action_category: &'static str,
         authority_surface: ToolAuthoritySurface,
         journal_action: Option<JournalAction>,
+        routing_tools: Vec<ToolRoutingSummary>,
     }
 
     impl MockSkill {
@@ -499,6 +502,7 @@ mod tests {
                 action_category: "unknown",
                 authority_surface: ToolAuthoritySurface::Other,
                 journal_action: None,
+                routing_tools: Vec::new(),
             }
         }
 
@@ -523,6 +527,16 @@ mod tests {
             skill.authority_surface = authority_surface;
             skill
         }
+
+        fn with_routing_tools(
+            name: &str,
+            tool_names: &[&str],
+            routing_tools: Vec<ToolRoutingSummary>,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.routing_tools = routing_tools;
+            skill
+        }
     }
 
     #[async_trait]
@@ -541,6 +555,10 @@ mod tests {
 
         fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
             self.cacheability
+        }
+
+        fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+            self.routing_tools.clone()
         }
 
         fn action_category(&self, _tool_name: &str) -> &'static str {
@@ -655,6 +673,35 @@ mod tests {
         assert_eq!(summaries[1].0, "net");
         assert_eq!(summaries[1].1, "net skill");
         assert_eq!(summaries[1].2, vec!["http_get"]);
+    }
+
+    #[test]
+    fn skill_statuses_include_routing_summaries() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_routing_tools(
+            "browser",
+            &["web_fetch"],
+            vec![ToolRoutingSummary {
+                tool_name: "web_fetch".to_string(),
+                metadata: fx_core::tool_routing::ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: fx_core::tool_routing::RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                },
+                readiness: fx_core::tool_routing::ToolReadinessSummary {
+                    available: true,
+                    ready: true,
+                    readiness_reason: None,
+                },
+            }],
+        )));
+
+        let statuses = reg.skill_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].routing_tools.len(), 1);
+        assert_eq!(statuses[0].routing_tools[0].tool_name, "web_fetch");
     }
 
     #[test]
