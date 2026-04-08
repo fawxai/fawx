@@ -113,9 +113,10 @@ async fn direct_inspection_blocks_hallucinated_mutation_tool_calls() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -560,12 +561,13 @@ async fn bounded_local_failed_mutation_gets_one_recovery_round_then_terminal() {
         }),
     };
     let recovery_results = engine
-        .execute_tool_calls_with_stream(
+        .execute_tool_calls_batch_with_stream(
             std::slice::from_ref(&recovery_call),
             CycleStream::disabled(),
         )
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(recovery_results.len(), 1);
     assert!(recovery_results[0].success);
@@ -706,9 +708,10 @@ async fn bounded_local_recovery_bypasses_generic_observation_only_restriction() 
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -740,9 +743,10 @@ async fn bounded_local_discovery_bypasses_generic_observation_only_restriction()
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -769,9 +773,10 @@ async fn bounded_local_discovery_blocks_run_command_before_editing() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -793,9 +798,10 @@ async fn bounded_local_mutation_blocks_noop_scratch_write() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -818,9 +824,10 @@ async fn bounded_local_mutation_blocks_tmp_scratch_edit() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -843,9 +850,10 @@ async fn bounded_local_mutation_blocks_edit_without_old_text() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -928,9 +936,10 @@ async fn bounded_local_verification_blocks_shell_repo_search() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -952,9 +961,10 @@ async fn bounded_local_verification_allows_focused_test_command() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(results[0].success);

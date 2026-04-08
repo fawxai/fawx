@@ -1,4 +1,5 @@
 use super::*;
+use crate::act::FailureClass;
 use crate::budget::{BudgetConfig, BudgetTracker, TerminationConfig};
 use crate::cancellation::CancellationToken;
 use crate::input::{loop_input_channel, LoopCommand};
@@ -322,6 +323,17 @@ fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
             ContentBlock::Text { text } => text.contains(TOOL_ROUND_PROGRESS_NUDGE),
+            _ => false,
+        })
+    })
+}
+
+fn has_retry_circuit_breaker_guidance(messages: &[Message], needle: &str) -> bool {
+    messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => {
+                text.contains("Retry circuit breaker:") && text.contains(needle)
+            }
             _ => false,
         })
     })
@@ -661,6 +673,85 @@ async fn act_with_tools_reprompts_on_follow_up_tool_calls() {
     assert_eq!(action.tool_results[0].tool_call_id, "call-1");
     assert_eq!(action.tool_results[1].tool_call_id, "call-2");
     assert_eq!(action.response_text, "done after two rounds");
+}
+
+#[tokio::test]
+async fn act_with_tools_relays_no_progress_retry_blocker_into_follow_up_prompt() {
+    let config = BudgetConfig {
+        max_no_progress: 1,
+        ..BudgetConfig::default()
+    };
+    let mut engine = p4_engine_with_executor(
+        config,
+        3,
+        Arc::new(Phase4OutputToolExecutor {
+            output: "same output".to_string(),
+        }),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "a.txt")]),
+        text_response("done after blocker"),
+    ]);
+    let context_messages = vec![Message::user("read file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "done after blocker");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        has_retry_circuit_breaker_guidance(
+            &requests[1].messages,
+            "Do not call `read_file` again with the same arguments"
+        ),
+        "expected retry circuit breaker guidance in follow-up prompt: {:?}",
+        requests[1].messages
+    );
+}
+
+#[tokio::test]
+async fn act_with_tools_relays_permanent_retry_blocker_into_follow_up_prompt() {
+    let mut engine = p4_engine();
+    engine.tool_retry_tracker.record_result_with_class(
+        &read_file_call("seed", "a.txt"),
+        false,
+        Some(FailureClass::Permanent),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![text_response("done after permanent blocker")]);
+    let context_messages = vec![Message::user("read file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "done after permanent blocker");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        has_retry_circuit_breaker_guidance(&requests[0].messages, "already failed permanently"),
+        "expected permanent retry circuit breaker guidance in follow-up prompt: {:?}",
+        requests[0].messages
+    );
 }
 
 #[tokio::test]
