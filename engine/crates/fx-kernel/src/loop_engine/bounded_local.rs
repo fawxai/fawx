@@ -9,7 +9,7 @@ use super::{
     BOUNDED_LOCAL_TERMINAL_PHASE_DIRECTIVE, BOUNDED_LOCAL_VERIFICATION_BLOCK_REASON,
     BOUNDED_LOCAL_VERIFICATION_DISCOVERY_BLOCK_REASON, BOUNDED_LOCAL_VERIFICATION_PHASE_DIRECTIVE,
 };
-use crate::act::{FailureClass, ToolResult};
+use crate::act::ToolResult;
 use crate::budget::TerminationConfig;
 use crate::loop_engine::direct_inspection::{
     direct_inspection_block_reason, direct_inspection_directive, direct_inspection_tool_names,
@@ -348,13 +348,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
         };
 
         if let Some(reason) = block_reason {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                retry_kind: None,
-                reason: reason.to_string(),
-                failure_class: Some(FailureClass::Permanent),
-                guidance: None,
-            });
+            blocked.push(BlockedToolCall::policy(call.clone(), reason));
         } else {
             allowed.push(call.clone());
         }
@@ -796,6 +790,7 @@ pub(super) fn bounded_local_terminal_partial_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::act::FailureClass;
 
     #[test]
     fn bounded_local_policy_blocks_are_classified_permanent() {

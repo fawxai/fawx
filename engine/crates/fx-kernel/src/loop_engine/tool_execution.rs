@@ -4,7 +4,7 @@ use super::bounded_local::{
 };
 use super::compaction::CompactionScope;
 use super::request::{build_continuation_request, ContinuationRequestParams, ToolRequestConfig};
-use super::retry::{partition_by_retry_policy, BlockedToolCall, RetryBlockKind};
+use super::retry::{partition_by_retry_policy, BlockedToolCall, BlockedToolSource, RetryBlockKind};
 use super::streaming::{StreamingRequestContext, TextStreamVisibility};
 use super::{
     continuation_budget_cost, current_time_ms, estimate_text_tokens, estimate_tokens,
@@ -18,7 +18,7 @@ use super::{
 };
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    FailureClass, TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
+    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
 };
 use crate::budget::{truncate_tool_result, ActionCost, BudgetState};
 use crate::decide::Decision;
@@ -52,9 +52,10 @@ impl PreparedToolCalls {
     }
 }
 
-struct ToolExecutionBatch {
-    results: Vec<ToolResult>,
-    blocked: Vec<BlockedToolCall>,
+#[derive(Debug)]
+pub(super) struct ToolExecutionBatch {
+    pub(super) results: Vec<ToolResult>,
+    pub(super) blocked: Vec<BlockedToolCall>,
 }
 
 #[derive(Debug)]
@@ -265,23 +266,13 @@ impl LoopEngine {
         &mut self,
         calls: &[ToolCall],
     ) -> Result<Vec<ToolResult>, LoopError> {
-        self.execute_tool_calls_with_stream(calls, CycleStream::disabled())
-            .await
-    }
-
-    #[cfg(test)]
-    pub(super) async fn execute_tool_calls_with_stream(
-        &mut self,
-        calls: &[ToolCall],
-        stream: CycleStream<'_>,
-    ) -> Result<Vec<ToolResult>, LoopError> {
         Ok(self
-            .execute_tool_calls_batch_with_stream(calls, stream)
+            .execute_tool_calls_batch_with_stream(calls, CycleStream::disabled())
             .await?
             .results)
     }
 
-    async fn execute_tool_calls_batch_with_stream(
+    pub(super) async fn execute_tool_calls_batch_with_stream(
         &mut self,
         calls: &[ToolCall],
         stream: CycleStream<'_>,
@@ -1759,31 +1750,85 @@ fn classification_for_tool_name(
 }
 
 fn render_retry_block_directive(blocked_call: &BlockedToolCall) -> Option<String> {
-    let kind = blocked_call.retry_kind?;
+    let BlockedToolSource::Retry(kind) = blocked_call.source else {
+        return None;
+    };
     let tool = blocked_call.call.name.as_str();
     let args = truncated_retry_arguments(&blocked_call.call.arguments);
 
     Some(match kind {
-        RetryBlockKind::PermanentFailure => format!(
-            "`{tool}` is blocked for the rest of this run with arguments {args} because the same call already failed permanently. Do not retry it unchanged; use a different tool, change the arguments, or answer with the blocker."
-        ),
-        RetryBlockKind::CycleFailureLimit => "This cycle hit the tool failure budget. Stop broad retry loops; only call another tool if it is materially different from the blocked attempts, otherwise answer from the current evidence or report the blocker.".to_string(),
-        RetryBlockKind::SameCallFailureLimit => format!(
-            "Do not call `{tool}` again with the same arguments {args}; that exact call has already failed repeatedly in this run. Change the arguments, use a different tool, or answer with the blocker."
-        ),
-        RetryBlockKind::NoProgress => format!(
-            "Do not call `{tool}` again with the same arguments {args}; that exact call already returned the same result repeatedly in this run. Reuse the current evidence, change the arguments, or use a different tool."
-        ),
+        RetryBlockKind::PermanentFailure => permanent_failure_retry_directive(tool, &args),
+        RetryBlockKind::CycleFailureLimit => cycle_failure_limit_retry_directive(),
+        RetryBlockKind::SameCallFailureLimit => same_call_retry_directive(tool, &args),
+        RetryBlockKind::NoProgress => no_progress_retry_directive(tool, &args),
     })
 }
 
 fn truncated_retry_arguments(arguments: &serde_json::Value) -> String {
+    const MAX_ARGUMENT_BYTES: usize = 160;
+    const ELLIPSIS: &str = "...";
+
     let canonical = canonicalized_tool_arguments(arguments);
-    if canonical.len() <= 160 {
+    if canonical.len() <= MAX_ARGUMENT_BYTES {
         canonical
     } else {
-        format!("{}...", &canonical[..157])
+        let truncated = truncate_utf8_bytes(&canonical, MAX_ARGUMENT_BYTES - ELLIPSIS.len());
+        format!("{truncated}{ELLIPSIS}")
     }
+}
+
+fn permanent_failure_retry_directive(tool: &str, args: &str) -> String {
+    format!(
+        concat!(
+            "`{}` is blocked for the rest of this run with arguments {} ",
+            "because the same call already failed permanently. Do not retry it unchanged; ",
+            "use a different tool, change the arguments, or answer with the blocker."
+        ),
+        tool, args
+    )
+}
+
+fn cycle_failure_limit_retry_directive() -> String {
+    concat!(
+        "This cycle hit the tool failure budget. Stop broad retry loops; only call another tool ",
+        "if it is materially different from the blocked attempts, otherwise answer from the ",
+        "current evidence or report the blocker."
+    )
+    .to_string()
+}
+
+fn same_call_retry_directive(tool: &str, args: &str) -> String {
+    format!(
+        concat!(
+            "Do not call `{}` again with the same arguments {}; that exact call has ",
+            "already failed repeatedly in this run. Change the arguments, use a different tool, ",
+            "or answer with the blocker."
+        ),
+        tool, args
+    )
+}
+
+fn no_progress_retry_directive(tool: &str, args: &str) -> String {
+    format!(
+        concat!(
+            "Do not call `{}` again with the same arguments {}; that exact call already ",
+            "returned the same result repeatedly in this run. Reuse the current evidence, change ",
+            "the arguments, or use a different tool."
+        ),
+        tool, args
+    )
+}
+
+fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
+    let mut end = 0;
+    for (start, ch) in input.char_indices() {
+        let next = start + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &input[..end]
 }
 
 fn collect_valid_tool_calls(
@@ -1829,13 +1874,7 @@ pub(super) fn partition_by_call_classification(
         if executor.classify_call(call) == required {
             allowed.push(call.clone());
         } else {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                retry_kind: None,
-                reason: reason.to_string(),
-                failure_class: Some(FailureClass::Permanent),
-                guidance: None,
-            });
+            blocked.push(BlockedToolCall::policy(call.clone(), reason));
         }
     }
     (allowed, blocked)
@@ -1853,13 +1892,7 @@ pub(super) fn partition_by_allowed_tool_names(
         if allowed_names.contains(call.name.as_str()) {
             allowed.push(call.clone());
         } else {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                retry_kind: None,
-                reason: reason.to_string(),
-                failure_class: Some(FailureClass::Permanent),
-                guidance: None,
-            });
+            blocked.push(BlockedToolCall::policy(call.clone(), reason));
         }
     }
     (allowed, blocked)
@@ -1872,13 +1905,7 @@ pub(super) fn build_uniform_blocked_calls(
     calls
         .iter()
         .cloned()
-        .map(|call| BlockedToolCall {
-            call,
-            retry_kind: None,
-            reason: reason.to_string(),
-            failure_class: Some(FailureClass::Permanent),
-            guidance: None,
-        })
+        .map(|call| BlockedToolCall::policy(call, reason))
         .collect()
 }
 
@@ -2304,6 +2331,7 @@ fn calls_are_all_classification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::act::FailureClass;
     use crate::budget::{BudgetConfig, BudgetTracker};
     use crate::cancellation::CancellationToken;
     use crate::context_manager::ContextCompactor;
@@ -2433,9 +2461,10 @@ mod tests {
         ];
 
         let results = engine
-            .execute_tool_calls_with_stream(&calls, CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&calls, CycleStream::disabled())
             .await
-            .expect("execute tool calls");
+            .expect("execute tool calls")
+            .results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].tool_call_id, "call-1");
@@ -2464,19 +2493,19 @@ mod tests {
         };
 
         run_command_engine
-            .execute_tool_calls_with_stream(&[first_run], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[first_run], CycleStream::disabled())
             .await
             .expect("execute first run_command failure");
         let first_run_cost = run_command_engine.budget.cost_cents_used();
 
         run_command_engine
-            .execute_tool_calls_with_stream(&[second_run], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[second_run], CycleStream::disabled())
             .await
             .expect("execute second run_command failure");
         let second_run_cost = run_command_engine.budget.cost_cents_used() - first_run_cost;
 
         run_command_engine
-            .execute_tool_calls_with_stream(&[third_run], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[third_run], CycleStream::disabled())
             .await
             .expect("execute third run_command failure");
         let third_run_cost =
@@ -2500,19 +2529,19 @@ mod tests {
         };
 
         read_file_engine
-            .execute_tool_calls_with_stream(&[first_read], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[first_read], CycleStream::disabled())
             .await
             .expect("execute first read_file failure");
         let first_read_cost = read_file_engine.budget.cost_cents_used();
 
         read_file_engine
-            .execute_tool_calls_with_stream(&[second_read], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[second_read], CycleStream::disabled())
             .await
             .expect("execute second read_file failure");
         let second_read_cost = read_file_engine.budget.cost_cents_used() - first_read_cost;
 
         read_file_engine
-            .execute_tool_calls_with_stream(&[third_read], CycleStream::disabled())
+            .execute_tool_calls_batch_with_stream(&[third_read], CycleStream::disabled())
             .await
             .expect("execute third read_file failure");
         let third_read_cost =
@@ -2540,6 +2569,7 @@ mod tests {
             partition_by_allowed_tool_names(&calls, &["read_file".to_string()], "disallowed");
 
         assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].source, BlockedToolSource::Policy);
         assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
         let results = build_blocked_tool_results(&blocked);
         assert_eq!(
@@ -2564,6 +2594,7 @@ mod tests {
         );
 
         assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].source, BlockedToolSource::Policy);
         assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
     }
 
@@ -2577,7 +2608,18 @@ mod tests {
 
         let blocked = build_uniform_blocked_calls(&calls, "policy");
         assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].source, BlockedToolSource::Policy);
         assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
+    }
+
+    #[test]
+    fn truncated_retry_arguments_preserves_utf8_boundaries() {
+        let truncated = truncated_retry_arguments(&serde_json::json!({
+            "query": "🙂".repeat(80),
+        }));
+
+        assert!(truncated.len() <= 160);
+        assert!(truncated.ends_with("..."));
     }
 
     #[test]

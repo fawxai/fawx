@@ -47,13 +47,47 @@ pub(super) enum RetryBlockKind {
     NoProgress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockedToolSource {
+    Policy,
+    Retry(RetryBlockKind),
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct BlockedToolCall {
     pub(super) call: ToolCall,
-    pub(super) retry_kind: Option<RetryBlockKind>,
+    pub(super) source: BlockedToolSource,
     pub(super) reason: String,
     pub(super) failure_class: Option<FailureClass>,
     pub(super) guidance: Option<String>,
+}
+
+impl BlockedToolCall {
+    pub(super) fn retry(
+        call: ToolCall,
+        kind: RetryBlockKind,
+        reason: String,
+        failure_class: Option<FailureClass>,
+        guidance: Option<String>,
+    ) -> Self {
+        Self {
+            call,
+            source: BlockedToolSource::Retry(kind),
+            reason,
+            failure_class,
+            guidance,
+        }
+    }
+
+    pub(super) fn policy(call: ToolCall, reason: impl Into<String>) -> Self {
+        Self {
+            call,
+            source: BlockedToolSource::Policy,
+            reason: reason.into(),
+            failure_class: Some(FailureClass::Permanent),
+            guidance: None,
+        }
+    }
 }
 
 impl RetryTracker {
@@ -216,13 +250,13 @@ pub(super) fn partition_by_retry_policy(
                 reason,
                 failure_class,
                 guidance,
-            } => blocked.push(BlockedToolCall {
-                call: call.clone(),
-                retry_kind: Some(kind),
+            } => blocked.push(BlockedToolCall::retry(
+                call.clone(),
+                kind,
                 reason,
                 failure_class,
                 guidance,
-            }),
+            )),
         }
     }
     (allowed, blocked)
@@ -966,6 +1000,28 @@ mod tests {
                 ..
             } if reason == &cycle_failure_limit_reason()
         ));
+    }
+
+    #[test]
+    fn partitioned_retry_blocks_preserve_retry_source() {
+        let config = RetryPolicyConfig {
+            max_consecutive_failures: 2,
+            ..RetryPolicyConfig::default()
+        };
+        let call = make_call("1", "read_file");
+        let mut tracker = RetryTracker::default();
+
+        tracker.record_result(&call, false);
+        tracker.record_result(&call, false);
+
+        let (_allowed, blocked) =
+            partition_by_retry_policy(std::slice::from_ref(&call), &tracker, &config);
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].source,
+            BlockedToolSource::Retry(RetryBlockKind::SameCallFailureLimit)
+        );
     }
 
     #[test]

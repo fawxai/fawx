@@ -1658,7 +1658,7 @@ async fn execute_tool_calls_emits_stream_error_on_executor_failure() {
     let calls = vec![read_file_call("call-1")];
 
     let error = engine
-        .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+        .execute_tool_calls_batch_with_stream(&calls, CycleStream::enabled(&callback))
         .await
         .expect_err("tool execution should fail");
     assert!(error.reason.contains("tool execution failed: tool crashed"));
@@ -1693,7 +1693,7 @@ async fn execute_tool_calls_emits_stream_error_when_retry_budget_blocks_tool() {
     let calls = vec![read_file_call("call-1")];
 
     let _ = engine
-        .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+        .execute_tool_calls_batch_with_stream(&calls, CycleStream::enabled(&callback))
         .await
         .expect("blocked tool call should return synthetic result");
     let events = events.lock().expect("lock").clone();
