@@ -85,6 +85,41 @@ struct SkillsView: View {
                 .fawxOpaqueModalPresentation()
             }
         }
+        .sheet(
+            isPresented: Binding(
+                get: { skillsViewModel.editingSkillSettings != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        skillsViewModel.cancelEditingSettings()
+                    }
+                }
+            )
+        ) {
+            if let settings = skillsViewModel.editingSkillSettings {
+                SkillSettingsEditor(
+                    settings: settings,
+                    draftValues: skillsViewModel.skillSettingsDraft,
+                    clearedSecretKeys: skillsViewModel.clearedSkillSecretKeys,
+                    errorMessage: skillsViewModel.skillSettingsErrorMessage,
+                    isSaving: skillsViewModel.savingSkillSettingsName == settings.skillName,
+                    updateValue: { key, value in
+                        skillsViewModel.setSkillSettingValue(key, value: value)
+                    },
+                    clearSecret: { key in
+                        skillsViewModel.clearSecretSetting(key)
+                    },
+                    saveAction: {
+                        Task {
+                            await skillsViewModel.saveEditingSettings()
+                        }
+                    },
+                    cancelAction: {
+                        skillsViewModel.cancelEditingSettings()
+                    }
+                )
+                .fawxOpaqueModalPresentation()
+            }
+        }
     }
 
     private var header: some View {
@@ -197,7 +232,14 @@ struct SkillsView: View {
                         SkillCardView(
                             skill: skill,
                             isRemoving: skillsViewModel.removingSkillNames.contains(skill.name),
+                            isLoadingSettings: skillsViewModel.loadingSkillSettingsName == skill.name,
+                            isSavingSettings: skillsViewModel.savingSkillSettingsName == skill.name,
                             isSavingPermissions: skillsViewModel.savingSkillPermissionsName == skill.name,
+                            editSettingsAction: {
+                                Task {
+                                    await skillsViewModel.beginEditingSettings(for: skill)
+                                }
+                            },
                             editPermissionsAction: {
                                 skillsViewModel.beginEditingPermissions(for: skill)
                             }
@@ -273,7 +315,10 @@ struct SkillsView: View {
 private struct SkillCardView: View {
     let skill: SkillSummary
     let isRemoving: Bool
+    let isLoadingSettings: Bool
+    let isSavingSettings: Bool
     let isSavingPermissions: Bool
+    let editSettingsAction: () -> Void
     let editPermissionsAction: () -> Void
     let removeAction: () -> Void
 
@@ -344,11 +389,17 @@ private struct SkillCardView: View {
             }
 
             HStack {
+                Button(isLoadingSettings ? "Loading..." : (isSavingSettings ? "Saving..." : "Settings")) {
+                    editSettingsAction()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
+
                 Button(isSavingPermissions ? "Saving..." : "Edit Permissions") {
                     editPermissionsAction()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isRemoving || isSavingPermissions)
+                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
 
                 Spacer(minLength: 0)
 
@@ -360,7 +411,7 @@ private struct SkillCardView: View {
                     removeAction()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isRemoving || isSavingPermissions)
+                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -671,6 +722,171 @@ private struct SkillPermissionsEditor: View {
 #else
         [GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingSM)]
 #endif
+    }
+}
+
+private struct SkillSettingsEditor: View {
+    let settings: SkillSettingsResponse
+    let draftValues: [String: String]
+    let clearedSecretKeys: Set<String>
+    let errorMessage: String?
+    let isSaving: Bool
+    let updateValue: (String, String) -> Void
+    let clearSecret: (String) -> Void
+    let saveAction: () -> Void
+    let cancelAction: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        Text(settings.skillName)
+                            .font(FawxTypography.heading1)
+                            .foregroundStyle(Color.fawxText)
+
+                        Text("These values are stored on the server and applied immediately to future skill runs. Secret values stay encrypted and are never shown back in full.")
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+                        ForEach(settings.schema.fields) { field in
+                            settingRow(for: field)
+                        }
+                    }
+
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxError)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(FawxSpacing.paddingLG)
+            }
+            .background(Color.fawxBackground)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: cancelAction)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "Saving..." : "Save", action: saveAction)
+                        .disabled(isSaving)
+                }
+            }
+        }
+#if os(iOS)
+        .presentationDetents([.medium, .large])
+#endif
+    }
+
+    @ViewBuilder
+    private func settingRow(for field: SkillSettingsField) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+            HStack(alignment: .firstTextBaseline, spacing: FawxSpacing.paddingSM) {
+                Text(field.label)
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+
+                if field.required {
+                    Text("Required")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxWarning)
+                }
+
+                if field.fieldType == .secret, isExistingSecretConfigured(for: field) {
+                    Text("Stored")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxSuccess)
+                }
+            }
+
+            if let helpText = field.helpText?.nonEmpty {
+                Text(helpText)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+            }
+
+            switch field.fieldType {
+            case .text:
+                TextField(
+                    field.placeholder ?? field.label,
+                    text: Binding(
+                        get: { draftValues[field.key] ?? "" },
+                        set: { updateValue(field.key, $0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+
+            case .secret:
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                    SecureField(
+                        field.placeholder ?? "Enter a new value",
+                        text: Binding(
+                            get: { draftValues[field.key] ?? "" },
+                            set: { updateValue(field.key, $0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack(spacing: FawxSpacing.paddingSM) {
+                        Text(secretHint(for: field))
+                            .font(FawxTypography.status)
+                            .foregroundStyle(Color.fawxTextSecondary)
+
+                        Spacer(minLength: 0)
+
+                        if isExistingSecretConfigured(for: field) {
+                            Button("Clear") {
+                                clearSecret(field.key)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+
+            case .boolean:
+                Toggle(
+                    isOn: Binding(
+                        get: { (draftValues[field.key] ?? "false") == "true" },
+                        set: { updateValue(field.key, $0 ? "true" : "false") }
+                    )
+                ) {
+                    Text("Enabled")
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxText)
+                }
+                .toggleStyle(.switch)
+            }
+        }
+        .padding(FawxSpacing.paddingMD)
+        .background(Color.fawxSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                .stroke(Color.fawxBorder, lineWidth: 1)
+        }
+    }
+
+    private func isExistingSecretConfigured(for field: SkillSettingsField) -> Bool {
+        guard field.fieldType == .secret else {
+            return false
+        }
+
+        return settings.values.first(where: { $0.key == field.key })?.isConfigured == true
+            && !clearedSecretKeys.contains(field.key)
+    }
+
+    private func secretHint(for field: SkillSettingsField) -> String {
+        if clearedSecretKeys.contains(field.key) {
+            return "This secret will be removed when you save."
+        }
+        if isExistingSecretConfigured(for: field) {
+            return "Leave blank to keep the current secret."
+        }
+        return "This secret is stored encrypted on the server."
     }
 }
 

@@ -41,6 +41,7 @@ struct ShellCommandResult {
 /// - `execute_http_request` for outbound HTTP (capability-gated)
 /// - Input/output buffers for skill invocation I/O
 pub struct LiveHostApi {
+    skill_name: String,
     storage: Arc<Mutex<SkillStorage>>,
     input: String,
     output: Arc<Mutex<String>>,
@@ -77,6 +78,7 @@ impl LiveHostApi {
     pub fn new(config: LiveHostApiConfig<'_>) -> Self {
         let quota = config.storage_quota.unwrap_or(DEFAULT_STORAGE_QUOTA);
         Self {
+            skill_name: config.skill_name.to_string(),
             storage: Arc::new(Mutex::new(SkillStorage::new(config.skill_name, quota))),
             input: config.input,
             output: Arc::new(Mutex::new(String::new())),
@@ -101,6 +103,10 @@ impl LiveHostApi {
     fn has_capability(&self, capability: Capability) -> bool {
         self.capabilities.contains(&capability)
     }
+
+    fn skill_scoped_setting_key(&self, key: &str) -> String {
+        format!("skill:{}:{key}", self.skill_name)
+    }
 }
 
 impl HostApi for LiveHostApi {
@@ -118,6 +124,9 @@ impl HostApi for LiveHostApi {
     fn kv_get(&self, key: &str) -> Option<String> {
         // Credential provider takes priority (bridges secrets to skills)
         if let Some(provider) = &self.credential_provider {
+            if let Some(value) = provider.get_credential(&self.skill_scoped_setting_key(key)) {
+                return Some((*value).clone());
+            }
             if let Some(value) = provider.get_credential(key) {
                 return Some((*value).clone());
             }
@@ -633,6 +642,22 @@ mod tests {
             api.kv_get("github_token"),
             Some("ghp_test_token_12345".to_string())
         );
+    }
+
+    #[test]
+    fn kv_get_prefers_skill_scoped_credential() {
+        let provider = MockCredentialProvider::new()
+            .with_credential("skill:test:github_token", "scoped_token")
+            .with_credential("github_token", "global_token");
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        });
+
+        assert_eq!(api.kv_get("github_token"), Some("scoped_token".to_string()));
     }
 
     #[test]

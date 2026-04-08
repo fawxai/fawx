@@ -1,8 +1,10 @@
 //! Skill manifest parsing and validation.
 
 use fx_core::error::SkillError;
+use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 /// Capability a skill can request.
@@ -80,6 +82,40 @@ pub enum SkillToolAuthoritySurface {
     Other,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSettingFieldType {
+    Text,
+    Secret,
+    Boolean,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillSettingsManifest {
+    #[serde(default = "default_settings_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub fields: Vec<SkillSettingFieldManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillSettingFieldManifest {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub field_type: SkillSettingFieldType,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub help_text: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub min_length: Option<usize>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -108,6 +144,9 @@ pub struct SkillManifest {
     /// Optional skill-level intent hints for future routing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_hints: Vec<String>,
+    /// Optional user-configurable settings exposed through shell UIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SkillSettingsManifest>,
     /// Entry point function name
     #[serde(default = "default_entry_point")]
     pub entry_point: String,
@@ -141,6 +180,10 @@ pub struct SkillToolParameterManifest {
 
 fn default_entry_point() -> String {
     "run".to_string()
+}
+
+const fn default_settings_version() -> u32 {
+    1
 }
 
 /// Parse a skill manifest from TOML.
@@ -262,7 +305,76 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
     }
 
     validate_intent_hints(&manifest.intent_hints)?;
+    validate_settings(manifest.settings.as_ref())?;
     validate_tools(&manifest.tools)?;
+
+    Ok(())
+}
+
+fn validate_settings(settings: Option<&SkillSettingsManifest>) -> Result<(), SkillError> {
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+
+    if settings.version != default_settings_version() {
+        return Err(SkillError::InvalidManifest(format!(
+            "unsupported settings version '{}'",
+            settings.version
+        )));
+    }
+
+    let mut seen_field_keys = BTreeSet::new();
+    for (index, field) in settings.fields.iter().enumerate() {
+        if field.key.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].key cannot be empty"
+            )));
+        }
+
+        if field.key.contains("..") || field.key.contains('/') || field.key.contains('\\') {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].key must not contain path separators or '..'"
+            )));
+        }
+
+        if !seen_field_keys.insert(field.key.as_str()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}] duplicates key '{}'",
+                field.key
+            )));
+        }
+
+        if field.label.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].label cannot be empty"
+            )));
+        }
+
+        if matches!(field.field_type, SkillSettingFieldType::Boolean)
+            && (field.min_length.is_some() || field.pattern.is_some())
+        {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings field '{}' cannot use min_length or pattern with boolean type",
+                field.key
+            )));
+        }
+
+        if let Some(pattern) = &field.pattern {
+            if pattern.trim().is_empty() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "settings field '{}' pattern cannot be empty",
+                    field.key
+                )));
+            }
+
+            Regex::new(pattern).map_err(|error| {
+                SkillError::InvalidManifest(format!(
+                    "settings field '{}' has invalid pattern: {}",
+                    field.key, error
+                ))
+            })?;
+        }
+    }
 
     Ok(())
 }
@@ -398,6 +510,124 @@ required = true
     }
 
     #[test]
+    fn test_parse_manifest_with_settings() {
+        let toml = r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx Team"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+min_length = 8
+
+[[settings.fields]]
+key = "safesearch"
+label = "Safe Search"
+type = "boolean"
+help_text = "Enable family-safe results."
+        "#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let settings = manifest.settings.expect("settings");
+        assert_eq!(settings.version, 1);
+        assert_eq!(settings.fields.len(), 2);
+        assert_eq!(settings.fields[0].key, "api_key");
+        assert_eq!(settings.fields[0].field_type, SkillSettingFieldType::Secret);
+        assert!(settings.fields[0].required);
+        assert_eq!(settings.fields[0].min_length, Some(8));
+        assert_eq!(
+            settings.fields[1].field_type,
+            SkillSettingFieldType::Boolean
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_settings_keys() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![
+                    SkillSettingFieldManifest {
+                        key: "api_key".to_string(),
+                        label: "API Key".to_string(),
+                        field_type: SkillSettingFieldType::Secret,
+                        placeholder: None,
+                        help_text: None,
+                        required: true,
+                        min_length: Some(8),
+                        pattern: None,
+                    },
+                    SkillSettingFieldManifest {
+                        key: "api_key".to_string(),
+                        label: "Replacement API Key".to_string(),
+                        field_type: SkillSettingFieldType::Secret,
+                        placeholder: None,
+                        help_text: None,
+                        required: false,
+                        min_length: None,
+                        pattern: None,
+                    },
+                ],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicates key"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_settings_pattern() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![SkillSettingFieldManifest {
+                    key: "region".to_string(),
+                    label: "Region".to_string(),
+                    field_type: SkillSettingFieldType::Text,
+                    placeholder: None,
+                    help_text: None,
+                    required: false,
+                    min_length: None,
+                    pattern: Some("[".to_string()),
+                }],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("invalid pattern"))
+        );
+    }
+
+    #[test]
     fn test_parse_manifest_with_intent_hints_round_trips() {
         let manifest = SkillManifest {
             name: "review-helper".to_string(),
@@ -411,6 +641,7 @@ required = true
                 "review pr".to_string(),
                 "github issue management".to_string(),
             ],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -450,6 +681,7 @@ api_version = "host_api_v1"
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec!["review pr".to_string(), "review pr".to_string()],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -472,6 +704,7 @@ api_version = "host_api_v1"
             intent_hints: (0..=MAX_INTENT_HINTS)
                 .map(|index| format!("hint-{index}"))
                 .collect(),
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -495,6 +728,7 @@ api_version = "host_api_v1"
                 "review pr".to_string(),
                 "a".repeat(MAX_INTENT_HINT_LENGTH + 1),
             ],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -515,6 +749,7 @@ api_version = "host_api_v1"
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec!["review pr".to_string(), "   ".to_string()],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -547,6 +782,7 @@ api_version = "host_api_v1"
                 }],
             }],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -577,6 +813,7 @@ name = "broken
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -596,6 +833,7 @@ name = "broken
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
         assert!(validate_manifest(&manifest).is_ok());
@@ -612,6 +850,7 @@ name = "broken
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -669,6 +908,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -686,6 +926,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -760,6 +1001,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -777,6 +1019,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -794,6 +1037,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -815,6 +1059,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -850,6 +1095,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 },
             ],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -890,6 +1136,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 ],
             }],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 

@@ -202,6 +202,7 @@ async fn test_skill_invocation_infrastructure() {
         capabilities: vec![],
         tools: vec![],
         intent_hints: vec![],
+        settings: None,
         entry_point: "run".to_string(),
     };
 
@@ -266,6 +267,7 @@ async fn test_skill_invocation_audit_trail() {
         capabilities: vec![],
         tools: vec![],
         intent_hints: vec![],
+        settings: None,
         entry_point: "run".to_string(),
     };
 
@@ -334,6 +336,7 @@ async fn test_skill_capability_manifest_verification() {
         capabilities: vec![Capability::Network],
         tools: vec![],
         intent_hints: vec![],
+        settings: None,
         entry_point: "main".to_string(),
     };
 
@@ -357,6 +360,7 @@ async fn test_skill_network_capability_denied() {
         capabilities: vec![], // No Network capability
         tools: vec![],
         intent_hints: vec![],
+        settings: None,
         entry_point: "main".to_string(),
     };
 

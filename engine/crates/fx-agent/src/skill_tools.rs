@@ -103,6 +103,7 @@ mod tests {
             capabilities: vec![],
             tools: vec![],
             intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         }
     }

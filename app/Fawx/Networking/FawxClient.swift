@@ -571,6 +571,26 @@ actor FawxClient {
         )
     }
 
+    func skillSettings(name: String) async throws -> SkillSettingsResponse {
+        try await performRequest(
+            path: "/v1/skills/\(Self.encodedPathComponent(name))/settings",
+            decodeAs: SkillSettingsResponse.self
+        )
+    }
+
+    func updateSkillSettings(
+        name: String,
+        values: [SkillSettingInput]
+    ) async throws -> UpdateSkillSettingsResponse {
+        let body = try encoder.encode(UpdateSkillSettingsRequest(values: values))
+        return try await performRequest(
+            path: "/v1/skills/\(Self.encodedPathComponent(name))/settings",
+            method: "PUT",
+            bodyData: body,
+            decodeAs: UpdateSkillSettingsResponse.self
+        )
+    }
+
     func fleetOverview() async throws -> FleetOverviewResponse {
         try await performRequest(path: "/v1/fleet/overview", decodeAs: FleetOverviewResponse.self)
     }
@@ -645,6 +665,19 @@ actor FawxClient {
         let body = try encoder.encode(memory)
         return try makeRequest(
             path: "/v1/sessions/\(id)/memory",
+            method: "PUT",
+            authRequired: true,
+            bodyData: body
+        )
+    }
+
+    func updateSkillSettingsRequestForTesting(
+        name: String,
+        values: [SkillSettingInput]
+    ) throws -> URLRequest {
+        let body = try encoder.encode(UpdateSkillSettingsRequest(values: values))
+        return try makeRequest(
+            path: "/v1/skills/\(Self.encodedPathComponent(name))/settings",
             method: "PUT",
             authRequired: true,
             bodyData: body
@@ -1144,6 +1177,10 @@ private struct InstallSkillRequest: Encodable {
 
 private struct UpdateSkillPermissionsRequest: Encodable {
     let capabilities: [String]
+}
+
+private struct UpdateSkillSettingsRequest: Encodable {
+    let values: [SkillSettingInput]
 }
 
 private struct FleetDispatchTaskBody: Encodable {

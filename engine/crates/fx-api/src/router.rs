@@ -100,6 +100,11 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             delete(handlers::marketplace::handle_remove_skill)
                 .patch(handlers::marketplace::handle_update_skill_permissions),
         )
+        .route(
+            "/skills/{name}/settings",
+            get(handlers::marketplace::handle_get_skill_settings)
+                .put(handlers::marketplace::handle_update_skill_settings),
+        )
         .route("/usage", get(handlers::usage::handle_usage))
         .route(
             "/experiments",
