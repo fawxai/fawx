@@ -458,6 +458,9 @@ impl LoopEngine {
         calls: &[ToolCall],
         context_messages: &[Message],
     ) -> ToolRoundState {
+        if !calls.is_empty() {
+            self.consume_preflight_route_plan("first_tool_round_started");
+        }
         self.pending_tool_result_diagnostics.clear();
         let initial_text = self.pending_tool_response_text.take();
         let mut state = ToolRoundState::new_empty_calls(context_messages, initial_text);

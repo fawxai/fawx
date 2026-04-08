@@ -3006,6 +3006,9 @@ mod bounded_local_tests;
 #[path = "../loop_resilience_tests/profile_boundary_tests.rs"]
 mod profile_boundary_tests;
 
+#[path = "../loop_resilience_tests/preflight_route_tests.rs"]
+mod preflight_route_tests;
+
 #[tokio::test]
 async fn synthesis_skipped_when_disabled() {
     let config = BudgetConfig {

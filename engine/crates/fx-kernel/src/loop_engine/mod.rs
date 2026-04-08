@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
 use fx_core::runtime_info::RuntimeInfo;
+use fx_core::tool_routing::ToolRoutingSummary;
 #[cfg(test)]
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
@@ -62,6 +63,7 @@ mod continuation;
 mod decomposition;
 mod direct_inspection;
 mod direct_utility;
+mod preflight_route;
 mod progress;
 mod request;
 mod retry;
@@ -85,6 +87,7 @@ use self::decomposition::{
     decomposition_results_all_skipped, estimate_plan_cost, is_decomposition_results_message,
     parse_decomposition_plan,
 };
+use self::preflight_route::{build_route_plan, detect_route_resource, RoutePlan};
 #[cfg(test)]
 use self::request::{build_continuation_request, ContinuationRequestParams};
 use self::request::{
@@ -610,6 +613,8 @@ pub struct LoopEngine {
     pending_tool_scope: Option<ContinuationToolScope>,
     /// Optional typed turn commitment for the next root reasoning pass.
     pending_turn_commitment: Option<TurnCommitment>,
+    /// Kernel-owned first-route plan for external-resource requests.
+    preflight_route_plan: Option<RoutePlan>,
     /// Typed completion contract for the active root turn, when the prompt declares one.
     root_turn_contract: Option<RootTurnContract>,
     /// Active task-input lifecycle contract for the current root turn, when declared by the model.
@@ -675,6 +680,7 @@ impl std::fmt::Debug for LoopEngine {
             )
             .field("pending_tool_scope", &self.pending_tool_scope)
             .field("pending_turn_commitment", &self.pending_turn_commitment)
+            .field("preflight_route_plan", &self.preflight_route_plan)
             .field("root_turn_contract", &self.root_turn_contract)
             .field("task_contract", &self.task_contract)
             .field("requested_artifact_target", &self.requested_artifact_target)
@@ -1008,6 +1014,7 @@ impl LoopEngineBuilder {
             pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
+            preflight_route_plan: None,
             root_turn_contract: None,
             task_contract: None,
             requested_artifact_target: None,
@@ -1608,6 +1615,68 @@ impl LoopEngine {
             .collect()
     }
 
+    fn collect_runtime_routing_tools(&self) -> Vec<ToolRoutingSummary> {
+        let Some(runtime_info) = &self.runtime_info else {
+            return Vec::new();
+        };
+
+        let info = match runtime_info.read() {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                return Vec::new();
+            }
+        };
+
+        info.skills
+            .iter()
+            .flat_map(|skill| skill.routing_tools.clone())
+            .collect()
+    }
+
+    fn apply_preflight_route_tool_surface(
+        &self,
+        tools: Vec<ToolDefinition>,
+    ) -> Vec<ToolDefinition> {
+        let Some(route_plan) = &self.preflight_route_plan else {
+            return tools;
+        };
+        let allowed: HashSet<&str> = route_plan
+            .primary_route
+            .tool_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut tool_map = tools
+            .into_iter()
+            .filter(|tool| allowed.contains(tool.name.as_str()))
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+
+        route_plan
+            .primary_route
+            .tool_names
+            .iter()
+            .filter_map(|tool_name| tool_map.remove(tool_name))
+            .collect()
+    }
+
+    fn consume_preflight_route_plan(&mut self, reason: &str) {
+        let Some(route_plan) = self.preflight_route_plan.take() else {
+            return;
+        };
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "consumed preflight route plan",
+            serde_json::json!({
+                "reason": reason,
+                "resource": &route_plan.resource,
+                "primary_route": &route_plan.primary_route,
+            }),
+        );
+    }
+
     pub fn synthesis_instruction(&self) -> &str {
         &self.synthesis_instruction
     }
@@ -2079,6 +2148,7 @@ impl LoopEngine {
         self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
+        self.preflight_route_plan = None;
         self.root_turn_contract = None;
         self.task_contract = None;
         self.requested_artifact_target = None;
@@ -2523,7 +2593,8 @@ impl LoopEngine {
 
         let scoped = self.apply_pending_tool_scope(base);
         let phased = self.apply_turn_execution_profile_tool_surface(scoped);
-        self.apply_pending_artifact_gate(phased)
+        let routed = self.apply_preflight_route_tool_surface(phased);
+        self.apply_pending_artifact_gate(routed)
     }
 
     fn pending_turn_commitment_directive(&self) -> Option<String> {
@@ -2793,14 +2864,16 @@ impl LoopEngine {
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
         };
+        let available_tools = self.tool_executor.tool_definitions();
         self.turn_execution_profile = detect_turn_execution_profile_for_ownership(
             &user_message,
-            &self.tool_executor.tool_definitions(),
+            &available_tools,
             self.direct_inspection_ownership,
         );
         self.bounded_local_phase = BoundedLocalPhase::Discovery;
         self.bounded_local_recovery_used = false;
         self.bounded_local_recovery_focus.clear();
+        self.preflight_route_plan = None;
         match &self.turn_execution_profile {
             TurnExecutionProfile::BoundedLocal => {
                 self.emit_signal(
@@ -2836,6 +2909,39 @@ impl LoopEngine {
                 );
             }
             TurnExecutionProfile::Standard => {}
+        }
+        if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard) {
+            if let Some(resource) = detect_route_resource(&user_message) {
+                let runtime_routing_tools = self.collect_runtime_routing_tools();
+                if let Some(route_plan) =
+                    build_route_plan(&resource, &available_tools, &runtime_routing_tools)
+                {
+                    self.emit_signal(
+                        LoopStep::Perceive,
+                        SignalKind::Trace,
+                        "planned preflight external resource route",
+                        serde_json::to_value(&route_plan).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "resource": &route_plan.resource,
+                                "primary_route": &route_plan.primary_route,
+                                "requires_probe": route_plan.requires_probe,
+                            })
+                        }),
+                    );
+                    self.preflight_route_plan = Some(route_plan);
+                } else {
+                    self.emit_signal(
+                        LoopStep::Perceive,
+                        SignalKind::Trace,
+                        "resource-bearing request has no ready typed preflight route",
+                        serde_json::json!({
+                            "resource": resource,
+                            "available_tools": available_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+                            "routing_tool_count": runtime_routing_tools.len(),
+                        }),
+                    );
+                }
+            }
         }
         self.requested_artifact_target = extract_requested_write_target(&user_message);
         let root_turn_contract = extract_root_turn_contract(&user_message);
@@ -3045,7 +3151,9 @@ impl LoopEngine {
         let continuation_tools = if self.task_contract_blocks_tools() {
             Vec::new()
         } else {
-            self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions())
+            let tools = self
+                .apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+            self.apply_preflight_route_tool_surface(tools)
         };
         let mut request =
             build_truncation_continuation_request(TruncationContinuationRequestParams::new(

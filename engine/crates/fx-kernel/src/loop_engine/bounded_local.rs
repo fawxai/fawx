@@ -181,6 +181,7 @@ impl LoopEngine {
     pub(super) fn effective_decompose_enabled(&self) -> bool {
         self.decompose_enabled
             && matches!(&self.turn_execution_profile, TurnExecutionProfile::Standard)
+            && self.preflight_route_plan.is_none()
     }
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
