@@ -19,6 +19,12 @@ final class SkillsViewModel {
     var skillPermissionsDraft: Set<String> = []
     var skillPermissionsErrorMessage: String?
     var savingSkillPermissionsName: String?
+    var editingSkillSettings: SkillSettingsResponse?
+    var loadingSkillSettingsName: String?
+    var skillSettingsDraft: [String: String] = [:]
+    var clearedSkillSecretKeys: Set<String> = []
+    var skillSettingsErrorMessage: String?
+    var savingSkillSettingsName: String?
 
     private let appState: AppState
     @ObservationIgnored private var marketplaceSearchGeneration = 0
@@ -228,7 +234,206 @@ final class SkillsViewModel {
         }
     }
 
+    func beginEditingSettings(for skill: SkillSummary) async {
+        guard loadingSkillSettingsName != skill.name else {
+            return
+        }
+
+        loadingSkillSettingsName = skill.name
+        skillSettingsErrorMessage = nil
+        defer { loadingSkillSettingsName = nil }
+
+        do {
+            let response = try await appState.client.skillSettings(name: skill.name)
+            guard !response.schema.fields.isEmpty else {
+                appState.showToast(
+                    message: "\(skill.name) does not expose any settings yet.",
+                    style: .info
+                )
+                return
+            }
+
+            editingSkillSettings = response
+            skillSettingsDraft = response.schema.fields.reduce(into: [:]) { draft, field in
+                if field.fieldType == .secret {
+                    draft[field.key] = ""
+                } else if let stored = response.values.first(where: { $0.key == field.key })?.value {
+                    draft[field.key] = stored
+                } else if field.fieldType == .boolean {
+                    draft[field.key] = "false"
+                } else {
+                    draft[field.key] = ""
+                }
+            }
+            clearedSkillSecretKeys = []
+            skillSettingsErrorMessage = nil
+        } catch {
+            if let apiError = error as? APIError, apiError.statusCode == 404 {
+                appState.showToast(
+                    message: "\(skill.name) does not expose any settings yet.",
+                    style: .info
+                )
+                return
+            }
+
+            skillSettingsErrorMessage = error.localizedDescription
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
+    func cancelEditingSettings() {
+        editingSkillSettings = nil
+        skillSettingsDraft = [:]
+        clearedSkillSecretKeys = []
+        skillSettingsErrorMessage = nil
+        savingSkillSettingsName = nil
+    }
+
+    func skillSettingDraftValue(for key: String) -> String {
+        skillSettingsDraft[key] ?? ""
+    }
+
+    func setSkillSettingValue(_ key: String, value: String) {
+        skillSettingsDraft[key] = value
+        if !value.isEmpty {
+            clearedSkillSecretKeys.remove(key)
+        }
+    }
+
+    func clearSecretSetting(_ key: String) {
+        skillSettingsDraft[key] = ""
+        clearedSkillSecretKeys.insert(key)
+    }
+
+    func saveEditingSettings() async {
+        guard let settings = editingSkillSettings else {
+            return
+        }
+
+        if let localValidationError = validateDraftSettings(settings) {
+            skillSettingsErrorMessage = localValidationError
+            appState.showToast(message: localValidationError, style: .error)
+            return
+        }
+
+        savingSkillSettingsName = settings.skillName
+        skillSettingsErrorMessage = nil
+        defer { savingSkillSettingsName = nil }
+
+        let values = settings.schema.fields.compactMap { field -> SkillSettingInput? in
+            switch field.fieldType {
+            case .secret:
+                if clearedSkillSecretKeys.contains(field.key) {
+                    return SkillSettingInput(key: field.key, value: nil)
+                }
+
+                let entered = trimmedDraftValue(for: field.key)
+                guard let entered, !entered.isEmpty else {
+                    return nil
+                }
+                return SkillSettingInput(key: field.key, value: entered)
+
+            case .boolean:
+                let normalized = (trimmedDraftValue(for: field.key) ?? "false").lowercased()
+                return SkillSettingInput(key: field.key, value: normalized)
+
+            case .text:
+                return SkillSettingInput(
+                    key: field.key,
+                    value: trimmedDraftValue(for: field.key)
+                )
+
+            case .unknown:
+                return nil
+            }
+        }
+
+        do {
+            let response = try await appState.client.updateSkillSettings(
+                name: settings.skillName,
+                values: values
+            )
+            editingSkillSettings = response.settings
+            appState.showToast(message: "Saved \(settings.skillName) settings.", style: .success)
+            cancelEditingSettings()
+        } catch {
+            skillSettingsErrorMessage = error.localizedDescription
+            appState.showToast(message: error.localizedDescription, style: .error)
+            await appState.noteRecoverableRequestFailure(error)
+        }
+    }
+
     func isLoadedOnServer(_ marketplaceSkill: MarketplaceSkillSummary) -> Bool {
         skills.contains(where: { $0.name == marketplaceSkill.name })
+    }
+
+    private func validateDraftSettings(_ settings: SkillSettingsResponse) -> String? {
+        for field in settings.schema.fields {
+            switch field.fieldType {
+            case .secret:
+                if let error = validateSecretDraftField(field, in: settings) {
+                    return error
+                }
+
+            case .unknown:
+                if let error = validateUnsupportedDraftField(field, in: settings) {
+                    return error
+                }
+
+            case .text, .boolean:
+                if let error = field.validate(skillSettingsDraft[field.key]) {
+                    return error
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func trimmedDraftValue(for key: String) -> String? {
+        skillSettingsDraft[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+    }
+
+    private func validateSecretDraftField(
+        _ field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> String? {
+        let entered = trimmedDraftValue(for: field.key)
+        if let entered {
+            return field.validate(entered)
+        }
+
+        if shouldValidateEmptySecretDraft(for: field, in: settings) {
+            return field.validate(nil)
+        }
+
+        return nil
+    }
+
+    private func shouldValidateEmptySecretDraft(
+        for field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> Bool {
+        let existingSecret = settings.values.first(where: { $0.key == field.key })
+        return clearedSkillSecretKeys.contains(field.key) || existingSecret?.isConfigured != true
+    }
+
+    private func validateUnsupportedDraftField(
+        _ field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> String? {
+        guard case .unknown(let rawType) = field.fieldType else {
+            return nil
+        }
+
+        let existingValue = settings.values.first(where: { $0.key == field.key })
+        if field.required && existingValue?.isConfigured != true {
+            return "Update Fawx to edit \(field.label) (\(rawType))."
+        }
+
+        return nil
     }
 }

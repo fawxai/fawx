@@ -53,6 +53,33 @@ final class FawxClientThinkingTests: XCTestCase {
         XCTAssertEqual(response.level, .high)
         XCTAssertEqual(response.validLevels.map(\.rawValue), ["off", "low", "high"])
     }
+
+    func testUpdateSkillSettingsBuildsPutRequest() async throws {
+        let client = FawxClient(
+            baseURL: URL(string: "http://localhost:8400"),
+            bearerToken: "test-token"
+        )
+
+        let request = try await client.updateSkillSettingsRequestForTesting(
+            name: "brave search",
+            values: [
+                SkillSettingInput(key: "api_key", value: "brv_secret_123"),
+                SkillSettingInput(key: "safesearch", value: "true"),
+            ]
+        )
+        let body = try XCTUnwrap(request.httpBody)
+        let components = try XCTUnwrap(request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        })
+        let payload = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        let values = payload?["values"] as? [[String: Any]]
+
+        XCTAssertEqual(request.httpMethod, "PUT")
+        XCTAssertEqual(components.percentEncodedPath, "/v1/skills/brave%20search/settings")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-token")
+        XCTAssertEqual(values?.count, 2)
+        XCTAssertEqual(values?.first?["key"] as? String, "api_key")
+    }
 }
 
 private final class MockThinkingURLProtocol: URLProtocol, @unchecked Sendable {

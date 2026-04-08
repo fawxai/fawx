@@ -4846,6 +4846,112 @@ thinking = "high"
         assert!(json["skills"].as_array().expect("skills").is_empty());
     }
 
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
+            r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+{fields_toml}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn get_skill_settings_returns_schema_and_redacted_secret_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[settings.fields]]
+key = "region"
+label = "Region"
+type = "text"
+"#,
+            ),
+        )
+        .expect("write manifest");
+        fx_auth::credential_store::EncryptedFileCredentialStore::open(temp.path())
+            .expect("open skill store")
+            .set_generic("skill:brave-search:api_key", "brv_secret_123")
+            .expect("store secret");
+
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/skills/brave-search/settings"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["skill_name"], "brave-search");
+        assert_eq!(json["schema"]["fields"][0]["key"], "api_key");
+        assert_eq!(json["values"][0]["is_secret"], true);
+        assert_eq!(json["values"][0]["is_configured"], true);
+        assert_eq!(json["values"][0]["value"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn update_skill_settings_persists_without_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[settings.fields]]
+key = "safesearch"
+label = "Safe Search"
+type = "boolean"
+"#,
+            ),
+        )
+        .expect("write manifest");
+
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/skills/brave-search/settings",
+                r#"{"values":[{"key":"api_key","value":"brv_secret_123"},{"key":"safesearch","value":"true"}]}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["updated"], true);
+        assert_eq!(json["settings"]["values"][1]["value"], "true");
+    }
+
     #[tokio::test]
     async fn list_auth_returns_provider_statuses() {
         let state = test_state_with_app(
@@ -4910,6 +5016,11 @@ thinking = "high"
             Request::builder()
                 .method("GET")
                 .uri("/v1/skills")
+                .body(Body::empty())
+                .expect("request"),
+            Request::builder()
+                .method("GET")
+                .uri("/v1/skills/brave-search/settings")
                 .body(Body::empty())
                 .expect("request"),
             Request::builder()

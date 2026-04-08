@@ -246,6 +246,12 @@ impl EncryptedFileCredentialStore {
             .map(generic_names)
             .map_err(|e| CredentialStoreError::Io(format!("list generic credentials: {e}")))
     }
+
+    pub fn clear_generic(&self, name: &str) -> Result<bool, CredentialStoreError> {
+        self.store
+            .delete_credential(&generic_key(name))
+            .map_err(|e| CredentialStoreError::Io(format!("delete generic credential: {e}")))
+    }
 }
 
 impl CredentialStore for EncryptedFileCredentialStore {
@@ -527,6 +533,22 @@ mod tests {
             .expect("get missing generic");
 
         assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn clear_generic_removes_value() {
+        let store = test_store();
+        store
+            .set_generic("brave_api_key", "brv_test_123")
+            .expect("set generic");
+
+        let existed = store.clear_generic("brave_api_key").expect("clear generic");
+
+        assert!(existed);
+        assert!(store
+            .get_generic("brave_api_key")
+            .expect("get cleared generic")
+            .is_none());
     }
 
     #[test]
