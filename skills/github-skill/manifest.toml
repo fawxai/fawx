@@ -10,6 +10,16 @@ entry_point = "run"
 name = "create_pr"
 description = "Create a GitHub pull request"
 
+[tools.routing]
+resource_kinds = ["github_repository"]
+operations = ["create"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+
 [[tools.parameters]]
 name = "owner"
 type = "string"
@@ -56,6 +66,16 @@ required = false
 name = "comment_pr"
 description = "Add a comment to a GitHub pull request"
 
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["comment"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+
 [[tools.parameters]]
 name = "owner"
 type = "string"
@@ -83,6 +103,16 @@ required = true
 [[tools]]
 name = "list_prs"
 description = "List GitHub pull requests for a repository"
+
+[tools.routing]
+resource_kinds = ["github_repository"]
+operations = ["list"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -112,6 +142,16 @@ required = false
 name = "view_pr"
 description = "View a GitHub pull request with details"
 
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["fetch"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+
 [[tools.parameters]]
 name = "owner"
 type = "string"
@@ -133,6 +173,16 @@ required = true
 [[tools]]
 name = "list_issues"
 description = "List GitHub issues for a repository"
+
+[tools.routing]
+resource_kinds = ["github_repository", "github_issue"]
+operations = ["list"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -167,6 +217,16 @@ required = false
 [[tools]]
 name = "create_issue"
 description = "Create a GitHub issue"
+
+[tools.routing]
+resource_kinds = ["github_repository", "github_issue"]
+operations = ["create"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"

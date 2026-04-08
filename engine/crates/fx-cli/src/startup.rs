@@ -690,6 +690,18 @@ pub(crate) fn open_credential_store(data_dir: &Path) -> Result<SharedCredentialS
     .map(Arc::new)
 }
 
+pub(crate) fn credential_provider_from_store(
+    data_dir: &Path,
+    credential_store: SharedCredentialStore,
+    token_broker: Option<SharedTokenBroker>,
+) -> Arc<dyn CredentialProvider> {
+    Arc::new(CredentialStoreBridge {
+        data_dir: data_dir.to_path_buf(),
+        store: credential_store,
+        token_broker,
+    }) as Arc<dyn CredentialProvider>
+}
+
 pub(crate) fn build_token_broker(
     config: &FawxConfig,
     credential_store: Option<&SharedCredentialStore>,
@@ -1053,11 +1065,11 @@ fn build_skill_registry(
 
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
-            Arc::new(CredentialStoreBridge {
-                data_dir: data_dir.to_path_buf(),
-                store: Arc::clone(store),
-                token_broker: options.token_broker.clone(),
-            }) as Arc<dyn CredentialProvider>
+            credential_provider_from_store(
+                data_dir,
+                Arc::clone(store),
+                options.token_broker.clone(),
+            )
         });
 
     // Wire GitSkill with GitHub token provider from credential bridge.
@@ -1571,6 +1583,7 @@ fn apply_skill_summaries(
                 name: status.name,
                 description: Some(status.description),
                 tool_names: status.tool_names,
+                routing_tools: status.routing_tools,
                 capabilities: status.capabilities,
                 version: Some(version),
                 source: Some(status.activation.source.display()),
@@ -2127,10 +2140,17 @@ fn permissions_to_policy(config: &fx_config::PermissionsConfig) -> PermissionPol
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use fx_config::manager::ConfigManager;
     use fx_core::memory::MemoryProvider;
+    use fx_core::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolReadinessSummary,
+        ToolRoutingMetadata, ToolRoutingSummary,
+    };
     use fx_embeddings::test_support::create_test_model_dir;
+    use fx_llm::ToolDefinition;
     use fx_loadable::test_support::write_test_skill;
+    use fx_loadable::Skill;
     use fx_subagent::test_support::StubSubagentControl;
     use fx_tools::CronSkill;
     use std::cell::Cell;
@@ -2231,6 +2251,55 @@ mod tests {
         .expect("skill watcher should register the new skill");
     }
 
+    #[derive(Debug)]
+    struct RoutingTestSkill;
+
+    #[async_trait]
+    impl Skill for RoutingTestSkill {
+        fn name(&self) -> &str {
+            "browser"
+        }
+
+        fn description(&self) -> &str {
+            "Browser skill"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "web_fetch".to_string(),
+                description: "Fetch a web page".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+            vec![ToolRoutingSummary {
+                tool_name: "web_fetch".to_string(),
+                metadata: ToolRoutingMetadata {
+                    resource_kinds: vec![ResourceKind::GenericUrl],
+                    operations: vec![RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                },
+                readiness: ToolReadinessSummary {
+                    available: true,
+                    ready: true,
+                    readiness_reason: None,
+                },
+            }]
+        }
+
+        async fn execute(
+            &self,
+            _tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, String>> {
+            None
+        }
+    }
+
     fn test_fleet_node_config() -> fx_config::NodeConfig {
         fx_config::NodeConfig {
             id: "build-node".to_string(),
@@ -2318,6 +2387,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing runtime skill summary for {name}"));
             assert_eq!(skill.description.as_deref(), Some(description));
         }
+    }
+
+    #[test]
+    fn apply_skill_summaries_carries_routing_tool_readiness() {
+        let (config, temp_dir) = test_config_with_temp_dir();
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(RoutingTestSkill));
+
+        let runtime_info = new_runtime_info(&config, false);
+        let runtime_skill_prompt_revision = AtomicU64::new(0);
+        apply_skill_summaries(&runtime_info, &registry, &runtime_skill_prompt_revision);
+
+        let runtime_info = runtime_info.read().expect("runtime info");
+        let skill = runtime_info
+            .skills
+            .iter()
+            .find(|skill| skill.name == "browser")
+            .expect("browser skill");
+
+        assert_eq!(skill.routing_tools.len(), 1);
+        assert_eq!(skill.routing_tools[0].tool_name, "web_fetch");
+        assert!(skill.routing_tools[0].readiness.ready);
+        assert_eq!(
+            skill.routing_tools[0].metadata.resource_kinds,
+            vec![ResourceKind::GenericUrl]
+        );
+        drop(temp_dir);
     }
 
     #[test]

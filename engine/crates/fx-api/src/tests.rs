@@ -1721,6 +1721,7 @@ mod routing_and_status {
                     name: (*name).to_string(),
                     description: (*description).map(ToString::to_string),
                     tool_names: tools.iter().map(ToString::to_string).collect(),
+                    routing_tools: Vec::new(),
                     capabilities: Vec::new(),
                     version: None,
                     source: None,

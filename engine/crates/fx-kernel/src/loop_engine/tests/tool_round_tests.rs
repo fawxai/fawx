@@ -308,6 +308,7 @@ fn runtime_skill_info(name: &str, description: &str) -> SkillInfo {
         name: name.to_string(),
         description: Some(description.to_string()),
         tool_names: Vec::new(),
+        routing_tools: Vec::new(),
         capabilities: Vec::new(),
         version: None,
         source: None,

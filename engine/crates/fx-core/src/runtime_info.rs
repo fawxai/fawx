@@ -1,3 +1,4 @@
+use crate::tool_routing::ToolRoutingSummary;
 use serde::Serialize;
 
 /// Runtime state snapshot for self-introspection.
@@ -18,6 +19,8 @@ pub struct SkillInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub tool_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing_tools: Vec<ToolRoutingSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,6 +1,7 @@
 //! Skill manifest parsing and validation.
 
 use fx_core::error::SkillError;
+use fx_core::tool_routing::{RouteAuthMode, ToolRoutingMetadata};
 use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -163,6 +164,8 @@ pub struct SkillToolManifest {
     pub description: String,
     #[serde(default)]
     pub authority_surface: Option<SkillToolAuthoritySurface>,
+    #[serde(default)]
+    pub routing: Option<ToolRoutingMetadata>,
     #[serde(default)]
     pub direct_utility: bool,
     #[serde(default)]
@@ -489,6 +492,9 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
                 tool.name
             )));
         }
+        if let Some(routing) = &tool.routing {
+            validate_tool_routing(&tool.name, routing)?;
+        }
         if !seen_tool_names.insert(tool.name.clone()) {
             return Err(SkillError::InvalidManifest(format!(
                 "duplicate tool name '{}'",
@@ -528,9 +534,37 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
     Ok(())
 }
 
+fn validate_tool_routing(tool_name: &str, routing: &ToolRoutingMetadata) -> Result<(), SkillError> {
+    if routing.resource_kinds.is_empty() {
+        return Err(SkillError::InvalidManifest(format!(
+            "tool '{}' routing.resource_kinds cannot be empty",
+            tool_name
+        )));
+    }
+
+    if routing.operations.is_empty() {
+        return Err(SkillError::InvalidManifest(format!(
+            "tool '{}' routing.operations cannot be empty",
+            tool_name
+        )));
+    }
+
+    if let RouteAuthMode::CredentialRequired { key } = &routing.auth_mode {
+        if key.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "tool '{}' routing.auth_mode credential key cannot be blank",
+                tool_name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::tool_routing::{ArtifactStrategy, ResourceKind, RouteOperation};
     use std::fs;
     use std::path::PathBuf;
 
@@ -605,6 +639,7 @@ required = true
             manifest.tools[0].authority_surface,
             Some(SkillToolAuthoritySurface::Network)
         );
+        assert_eq!(manifest.tools[0].routing, None);
         assert!(manifest.tools[0].direct_utility);
         assert_eq!(
             manifest.tools[0].trigger_patterns,
@@ -649,6 +684,73 @@ help_text = "Enable family-safe results."
             settings.fields[1].field_type,
             SkillSettingFieldType::Boolean
         );
+    }
+
+    #[test]
+    fn test_parse_manifest_with_routing_metadata() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "web_fetch"
+description = "Fetch a web page"
+routing = { resource_kinds = ["generic_url"], operations = ["fetch"], auth_mode = { kind = "none" }, artifact_strategy = "direct_fetch", fallback_rank = 100 }
+"#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let routing = manifest.tools[0].routing.clone().expect("routing");
+
+        assert_eq!(
+            routing.resource_kinds,
+            vec![fx_core::tool_routing::ResourceKind::GenericUrl]
+        );
+        assert_eq!(
+            routing.operations,
+            vec![fx_core::tool_routing::RouteOperation::Fetch]
+        );
+        assert_eq!(routing.auth_mode, RouteAuthMode::None);
+        assert_eq!(
+            routing.artifact_strategy,
+            fx_core::tool_routing::ArtifactStrategy::DirectFetch
+        );
+        assert_eq!(routing.fallback_rank, 100);
+    }
+
+    #[test]
+    fn test_parse_manifest_with_probe_first_routing_metadata() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "web_screenshot"
+description = "Capture a page screenshot"
+
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["fetch"]
+artifact_strategy = "probe_first"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
+"#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let routing = manifest.tools[0].routing.clone().expect("routing");
+
+        assert_eq!(routing.resource_kinds, vec![ResourceKind::GenericUrl]);
+        assert_eq!(routing.operations, vec![RouteOperation::Fetch]);
+        assert_eq!(routing.artifact_strategy, ArtifactStrategy::ProbeFirst);
     }
 
     #[test]
@@ -931,6 +1033,7 @@ api_version = "host_api_v1"
                 name: "weather".to_string(),
                 description: "Weather".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: true,
                 trigger_patterns: vec![],
                 parameters: vec![SkillToolParameterManifest {
@@ -948,6 +1051,113 @@ api_version = "host_api_v1"
         let result = validate_manifest(&manifest);
         assert!(result.is_err());
         assert!(matches!(result, Err(SkillError::InvalidManifest(_))));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_tool_routing_resource_kinds() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: Vec::new(),
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("routing.resource_kinds cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_tool_routing_operations() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                    operations: Vec::new(),
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("routing.operations cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_tool_routing_credential_key() {
+        let manifest = SkillManifest {
+            name: "github".to_string(),
+            version: "1.0.0".to_string(),
+            description: "GitHub".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "view_pr".to_string(),
+                description: "View pull request".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::CredentialRequired {
+                        key: "   ".to_string(),
+                    },
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 10,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("credential key cannot be blank"))
+        );
     }
 
     #[test]
@@ -1240,6 +1450,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     name: "web_search".to_string(),
                     description: "Search".to_string(),
                     authority_surface: None,
+                    routing: None,
                     direct_utility: false,
                     trigger_patterns: vec![],
                     parameters: vec![],
@@ -1248,6 +1459,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     name: "web_search".to_string(),
                     description: "Duplicate".to_string(),
                     authority_surface: None,
+                    routing: None,
                     direct_utility: false,
                     trigger_patterns: vec![],
                     parameters: vec![],
@@ -1277,6 +1489,7 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: false,
                 trigger_patterns: vec![],
                 parameters: vec![

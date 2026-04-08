@@ -2594,6 +2594,7 @@ mod tests {
             name: name.to_string(),
             description: description.map(str::to_string),
             tool_names: Vec::new(),
+            routing_tools: Vec::new(),
             capabilities: Vec::new(),
             version: None,
             source: None,
