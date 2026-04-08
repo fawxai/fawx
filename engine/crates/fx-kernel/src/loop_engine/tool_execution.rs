@@ -4,7 +4,7 @@ use super::bounded_local::{
 };
 use super::compaction::CompactionScope;
 use super::request::{build_continuation_request, ContinuationRequestParams, ToolRequestConfig};
-use super::retry::{partition_by_retry_policy, BlockedToolCall};
+use super::retry::{partition_by_retry_policy, BlockedToolCall, RetryBlockKind};
 use super::streaming::{StreamingRequestContext, TextStreamVisibility};
 use super::{
     continuation_budget_cost, current_time_ms, estimate_text_tokens, estimate_tokens,
@@ -52,6 +52,11 @@ impl PreparedToolCalls {
     }
 }
 
+struct ToolExecutionBatch {
+    results: Vec<ToolResult>,
+    blocked: Vec<BlockedToolCall>,
+}
+
 #[derive(Debug)]
 pub(super) enum ToolRoundOutcome {
     Cancelled,
@@ -82,6 +87,7 @@ enum ToolLoopExit {
 struct ExecutedToolRound {
     calls: Vec<ToolCall>,
     results: Vec<ToolResult>,
+    blocked: Vec<BlockedToolCall>,
     has_tool_errors: bool,
     started_at_ms: u64,
 }
@@ -263,11 +269,23 @@ impl LoopEngine {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn execute_tool_calls_with_stream(
         &mut self,
         calls: &[ToolCall],
         stream: CycleStream<'_>,
     ) -> Result<Vec<ToolResult>, LoopError> {
+        Ok(self
+            .execute_tool_calls_batch_with_stream(calls, stream)
+            .await?
+            .results)
+    }
+
+    async fn execute_tool_calls_batch_with_stream(
+        &mut self,
+        calls: &[ToolCall],
+        stream: CycleStream<'_>,
+    ) -> Result<ToolExecutionBatch, LoopError> {
         let prepared = self.prepare_tool_calls_for_execution(calls);
         self.emit_blocked_tool_errors(&prepared.blocked, stream);
         let mut results = self
@@ -278,7 +296,10 @@ impl LoopEngine {
         self.tool_retry_tracker
             .record_results(&prepared.allowed, &results);
         results.extend(build_blocked_tool_results(&prepared.blocked));
-        Ok(reorder_results_by_calls(calls, results))
+        Ok(ToolExecutionBatch {
+            results: reorder_results_by_calls(calls, results),
+            blocked: prepared.blocked,
+        })
     }
 
     fn prepare_tool_calls_for_execution(&self, calls: &[ToolCall]) -> PreparedToolCalls {
@@ -1404,12 +1425,15 @@ impl LoopEngine {
         let started_at_ms = current_time_ms();
         let calls = state.current_calls.clone();
         self.maybe_publish_tool_round_progress(round as usize, &calls, stream);
-        let results = self.execute_tool_calls_with_stream(&calls, stream).await?;
-        self.publish_tool_round(&calls, &results, stream);
-        let has_tool_errors = self.emit_tool_errors(&results, stream);
+        let batch = self
+            .execute_tool_calls_batch_with_stream(&calls, stream)
+            .await?;
+        self.publish_tool_round(&calls, &batch.results, stream);
+        let has_tool_errors = self.emit_tool_errors(&batch.results, stream);
         Ok(ExecutedToolRound {
             calls,
-            results,
+            results: batch.results,
+            blocked: batch.blocked,
             has_tool_errors,
             started_at_ms,
         })
@@ -1423,13 +1447,14 @@ impl LoopEngine {
         let ExecutedToolRound {
             calls,
             results,
+            blocked,
             has_tool_errors,
             ..
         } = executed;
         self.record_successful_tool_classifications(state, &calls, &results);
         self.record_task_contract_progress(&calls, &results);
         self.record_tool_round_result_bytes(&results);
-        self.record_round_messages(state, &calls, &results, has_tool_errors)?;
+        self.record_round_messages(state, &calls, &results, &blocked, has_tool_errors)?;
         self.record_tool_round_kind(&calls);
         self.advance_bounded_local_phase_after_tool_round(&calls, &results);
         state.all_tool_results.extend(results);
@@ -1446,6 +1471,7 @@ impl LoopEngine {
         state: &mut ToolRoundState,
         calls: &[ToolCall],
         results: &[ToolResult],
+        blocked: &[BlockedToolCall],
         has_tool_errors: bool,
     ) -> Result<(), LoopError> {
         record_tool_round_messages(
@@ -1456,6 +1482,7 @@ impl LoopEngine {
             results,
         )?;
         self.append_pending_round_notices(state);
+        self.append_retry_block_guidance(state, blocked);
         if has_tool_errors {
             self.append_tool_error_relay(state, results);
         }
@@ -1471,6 +1498,27 @@ impl LoopEngine {
         state
             .continuation_messages
             .push(Message::system(tool_error_relay_directive(&failed)));
+    }
+
+    fn append_retry_block_guidance(&self, state: &mut ToolRoundState, blocked: &[BlockedToolCall]) {
+        let mut directives = blocked
+            .iter()
+            .filter_map(render_retry_block_directive)
+            .collect::<Vec<_>>();
+        directives.sort();
+        directives.dedup();
+        if directives.is_empty() {
+            return;
+        }
+
+        let body = directives
+            .into_iter()
+            .map(|directive| format!("- {directive}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state
+            .continuation_messages
+            .push(Message::system(format!("Retry circuit breaker:\n{body}")));
     }
 
     fn append_pending_round_notices(&self, state: &mut ToolRoundState) {
@@ -1710,6 +1758,34 @@ fn classification_for_tool_name(
     }
 }
 
+fn render_retry_block_directive(blocked_call: &BlockedToolCall) -> Option<String> {
+    let kind = blocked_call.retry_kind?;
+    let tool = blocked_call.call.name.as_str();
+    let args = truncated_retry_arguments(&blocked_call.call.arguments);
+
+    Some(match kind {
+        RetryBlockKind::PermanentFailure => format!(
+            "`{tool}` is blocked for the rest of this run with arguments {args} because the same call already failed permanently. Do not retry it unchanged; use a different tool, change the arguments, or answer with the blocker."
+        ),
+        RetryBlockKind::CycleFailureLimit => "This cycle hit the tool failure budget. Stop broad retry loops; only call another tool if it is materially different from the blocked attempts, otherwise answer from the current evidence or report the blocker.".to_string(),
+        RetryBlockKind::SameCallFailureLimit => format!(
+            "Do not call `{tool}` again with the same arguments {args}; that exact call has already failed repeatedly in this run. Change the arguments, use a different tool, or answer with the blocker."
+        ),
+        RetryBlockKind::NoProgress => format!(
+            "Do not call `{tool}` again with the same arguments {args}; that exact call already returned the same result repeatedly in this run. Reuse the current evidence, change the arguments, or use a different tool."
+        ),
+    })
+}
+
+fn truncated_retry_arguments(arguments: &serde_json::Value) -> String {
+    let canonical = canonicalized_tool_arguments(arguments);
+    if canonical.len() <= 160 {
+        canonical
+    } else {
+        format!("{}...", &canonical[..157])
+    }
+}
+
 fn collect_valid_tool_calls(
     allowed: &[ToolCall],
     malformed_results: &mut Vec<ToolResult>,
@@ -1755,6 +1831,7 @@ pub(super) fn partition_by_call_classification(
         } else {
             blocked.push(BlockedToolCall {
                 call: call.clone(),
+                retry_kind: None,
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
                 guidance: None,
@@ -1778,6 +1855,7 @@ pub(super) fn partition_by_allowed_tool_names(
         } else {
             blocked.push(BlockedToolCall {
                 call: call.clone(),
+                retry_kind: None,
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
                 guidance: None,
@@ -1796,6 +1874,7 @@ pub(super) fn build_uniform_blocked_calls(
         .cloned()
         .map(|call| BlockedToolCall {
             call,
+            retry_kind: None,
             reason: reason.to_string(),
             failure_class: Some(FailureClass::Permanent),
             guidance: None,

@@ -32,15 +32,25 @@ struct ToolCallKey {
 enum RetryVerdict {
     Allow,
     Block {
+        kind: RetryBlockKind,
         reason: String,
         failure_class: Option<FailureClass>,
         guidance: Option<String>,
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetryBlockKind {
+    PermanentFailure,
+    CycleFailureLimit,
+    SameCallFailureLimit,
+    NoProgress,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct BlockedToolCall {
     pub(super) call: ToolCall,
+    pub(super) retry_kind: Option<RetryBlockKind>,
     pub(super) reason: String,
     pub(super) failure_class: Option<FailureClass>,
     pub(super) guidance: Option<String>,
@@ -50,6 +60,7 @@ impl RetryTracker {
     fn should_allow(&self, call: &ToolCall, config: &RetryPolicyConfig) -> RetryVerdict {
         if let Some(FailureClass::Permanent) = self.last_failure_class_for(call) {
             return RetryVerdict::Block {
+                kind: RetryBlockKind::PermanentFailure,
                 reason: permanent_failure_reason(),
                 failure_class: Some(FailureClass::Permanent),
                 guidance: blocked_run_command_guidance(
@@ -61,6 +72,7 @@ impl RetryTracker {
 
         if self.cycle_total_failures >= config.max_cycle_failures {
             return RetryVerdict::Block {
+                kind: RetryBlockKind::CycleFailureLimit,
                 reason: cycle_failure_limit_reason(),
                 failure_class: None,
                 guidance: blocked_run_command_guidance(call.name.as_str(), None),
@@ -70,6 +82,7 @@ impl RetryTracker {
         let failures = self.consecutive_failures_for(call);
         if failures >= config.max_consecutive_failures {
             return RetryVerdict::Block {
+                kind: RetryBlockKind::SameCallFailureLimit,
                 reason: same_call_failure_reason(failures),
                 failure_class: self.last_failure_class_for(call),
                 guidance: blocked_run_command_guidance(
@@ -83,6 +96,7 @@ impl RetryTracker {
         if let Some(state) = self.no_progress.get(&signature) {
             if state.consecutive_same >= config.max_no_progress {
                 return RetryVerdict::Block {
+                    kind: RetryBlockKind::NoProgress,
                     reason: no_progress_reason(&call.name, state.consecutive_same),
                     failure_class: None,
                     guidance: blocked_run_command_guidance(call.name.as_str(), None),
@@ -198,11 +212,13 @@ pub(super) fn partition_by_retry_policy(
         match tracker.should_allow(call, config) {
             RetryVerdict::Allow => allowed.push(call.clone()),
             RetryVerdict::Block {
+                kind,
                 reason,
                 failure_class,
                 guidance,
             } => blocked.push(BlockedToolCall {
                 call: call.clone(),
+                retry_kind: Some(kind),
                 reason,
                 failure_class,
                 guidance,
@@ -914,7 +930,11 @@ mod tests {
         assert_eq!(tracker.consecutive_failures_for(&call_b), 0);
         assert!(matches!(
             tracker.should_allow(&call_a, &config),
-            RetryVerdict::Block { ref reason, .. } if reason == &same_call_failure_reason(2)
+            RetryVerdict::Block {
+                kind: RetryBlockKind::SameCallFailureLimit,
+                ref reason,
+                ..
+            } if reason == &same_call_failure_reason(2)
         ));
         assert!(matches!(
             tracker.should_allow(&call_b, &config),
@@ -940,7 +960,11 @@ mod tests {
         assert_eq!(tracker.cycle_total_failures, 2);
         assert!(matches!(
             tracker.should_allow(&fresh_call, &config),
-            RetryVerdict::Block { ref reason, .. } if reason == &cycle_failure_limit_reason()
+            RetryVerdict::Block {
+                kind: RetryBlockKind::CycleFailureLimit,
+                ref reason,
+                ..
+            } if reason == &cycle_failure_limit_reason()
         ));
     }
 
@@ -959,7 +983,11 @@ mod tests {
 
         assert!(matches!(
             tracker.should_allow(&call, &config),
-            RetryVerdict::Block { ref reason, .. } if reason.contains("no progress detected")
+            RetryVerdict::Block {
+                kind: RetryBlockKind::NoProgress,
+                ref reason,
+                ..
+            } if reason.contains("no progress detected")
         ));
     }
 

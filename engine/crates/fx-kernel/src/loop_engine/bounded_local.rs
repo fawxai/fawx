@@ -350,6 +350,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
         if let Some(reason) = block_reason {
             blocked.push(BlockedToolCall {
                 call: call.clone(),
+                retry_kind: None,
                 reason: reason.to_string(),
                 failure_class: Some(FailureClass::Permanent),
                 guidance: None,
