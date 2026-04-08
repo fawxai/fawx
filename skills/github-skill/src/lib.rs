@@ -1,11 +1,13 @@
 //! GitHub skill — Manage pull requests and issues via the GitHub API.
 //!
-//! Actions: `create_pr`, `comment_pr`, `list_prs`, `view_pr`, `list_issues`, `create_issue`.
+//! Actions: `create_pr`, `comment_pr`, `list_prs`, `view_pr`, `list_pr_files`,
+//! `view_pr_file_patch`, `list_issues`, `create_issue`.
 
 use serde::{Deserialize, Serialize};
 
 // ── Host API FFI ────────────────────────────────────────────────────────────
 
+#[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "host_api_v1")]
 extern "C" {
     #[link_name = "log"]
@@ -28,6 +30,40 @@ extern "C" {
         body_ptr: *const u8,
         body_len: u32,
     ) -> u32;
+}
+
+// Native unit tests need these symbols to link, but any real execution outside
+// wasm32 should fail fast instead of silently pretending the host exists.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_log(_level: u32, _msg_ptr: *const u8, _msg_len: u32) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_get_input() -> u32 {
+    panic!("host_get_input is only available in wasm32 builds");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_set_output(_text_ptr: *const u8, _text_len: u32) {
+    panic!("host_set_output is only available in wasm32 builds");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_kv_get(_key_ptr: *const u8, _key_len: u32) -> u32 {
+    panic!("host_kv_get is only available in wasm32 builds");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_http_request(
+    _method_ptr: *const u8,
+    _method_len: u32,
+    _url_ptr: *const u8,
+    _url_len: u32,
+    _headers_ptr: *const u8,
+    _headers_len: u32,
+    _body_ptr: *const u8,
+    _body_len: u32,
+) -> u32 {
+    panic!("host_http_request is only available in wasm32 builds");
 }
 
 // ── FFI Helpers ─────────────────────────────────────────────────────────────
@@ -99,6 +135,24 @@ struct HttpReq<'a> {
     body: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct HttpRequestPlan {
+    method: &'static str,
+    url: String,
+    headers: String,
+    body: String,
+}
+
+fn execute_request(plan: &HttpRequestPlan) -> Option<String> {
+    let request = HttpReq {
+        method: plan.method,
+        url: &plan.url,
+        headers: &plan.headers,
+        body: &plan.body,
+    };
+    http_request(&request)
+}
+
 fn parse_input(raw: &str) -> Result<Input, serde_json::Error> {
     let mut value = serde_json::from_str::<serde_json::Value>(raw)?;
     if let Some(object) = value.as_object_mut() {
@@ -124,6 +178,18 @@ enum Input {
     ListPrs(ListPrsInput),
     #[serde(rename = "view_pr", alias = "view_pull_request", alias = "get_pr")]
     ViewPr(ViewPrInput),
+    #[serde(
+        rename = "list_pr_files",
+        alias = "list_pull_request_files",
+        alias = "list_pull_files"
+    )]
+    ListPrFiles(ListPrFilesInput),
+    #[serde(
+        rename = "view_pr_file_patch",
+        alias = "view_pull_request_file_patch",
+        alias = "get_pr_file_patch"
+    )]
+    ViewPrFilePatch(ViewPrFilePatchInput),
     #[serde(rename = "list_issues", alias = "list_issue")]
     ListIssues(ListIssuesInput),
     #[serde(rename = "create_issue", alias = "file_issue", alias = "open_issue")]
@@ -162,6 +228,22 @@ struct ViewPrInput {
     owner: String,
     repo: String,
     pr_number: u64,
+}
+
+#[derive(Deserialize)]
+struct ListPrFilesInput {
+    owner: String,
+    repo: String,
+    pr_number: u64,
+}
+
+#[derive(Deserialize)]
+struct ViewPrFilePatchInput {
+    owner: String,
+    repo: String,
+    pr_number: u64,
+    #[serde(alias = "filename", alias = "file_path")]
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -221,9 +303,65 @@ struct ViewPrOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     base_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    diff: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     comments_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_comments_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_files_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additions_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletions_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ListPrFilesOutput {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<PrFileInventoryItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PrFileInventoryItem {
+    path: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    changes: u64,
+    patch_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ViewPrFilePatchOutput {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -344,6 +482,33 @@ struct GitHubPrDetail {
     head: GitHubRef,
     base: GitHubRef,
     comments: u64,
+    review_comments: u64,
+    commits: u64,
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
+    draft: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GitHubPrFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    changes: u64,
+    patch: Option<String>,
+    previous_filename: Option<String>,
+}
+
+impl GitHubPrFile {
+    fn matches_path(&self, requested_path: &str) -> bool {
+        self.filename == requested_path
+            || self
+                .previous_filename
+                .as_deref()
+                .is_some_and(|previous_path| previous_path == requested_path)
+    }
 }
 
 #[derive(Deserialize)]
@@ -431,6 +596,35 @@ const BLOCKED_BASES: &[&str] = &["main", "master"];
 
 /// Default base branch when none is specified.
 const DEFAULT_BASE: &str = "staging";
+const PR_FILES_PAGE_SIZE: u32 = 100;
+const MAX_PR_FILE_PAGES: u32 = 30;
+// KEEP IN SYNC WITH Input enum variants.
+const SUPPORTED_ACTIONS: &[&str] = &[
+    "create_pr",
+    "comment_pr",
+    "list_prs",
+    "view_pr",
+    "list_pr_files",
+    "view_pr_file_patch",
+    "list_issues",
+    "create_issue",
+];
+
+fn supported_actions_message() -> String {
+    let (last, rest) = SUPPORTED_ACTIONS
+        .split_last()
+        .expect("supported actions must not be empty");
+    let quoted_rest = rest
+        .iter()
+        .map(|action| format!("'{action}'"))
+        .collect::<Vec<_>>();
+
+    if quoted_rest.is_empty() {
+        format!("'{last}'")
+    } else {
+        format!("{}, or '{}'", quoted_rest.join(", "), last)
+    }
+}
 
 fn validate_base(base: &str) -> Result<(), String> {
     if BLOCKED_BASES.contains(&base) {
@@ -461,6 +655,20 @@ fn check_owner_repo(owner: &str, repo: &str) -> Result<(), String> {
         return Err(format!("Invalid repo parameter: '{repo}'"));
     }
     Ok(())
+}
+
+fn check_pr_file_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("PR file path cannot be empty".into());
+    }
+    Ok(())
+}
+
+fn next_pr_files_page(page: u32, limit_error: String) -> Result<u32, String> {
+    if page >= MAX_PR_FILE_PAGES {
+        return Err(limit_error);
+    }
+    Ok(page + 1)
 }
 
 // ── Core Logic ──────────────────────────────────────────────────────────────
@@ -696,6 +904,18 @@ fn pr_summary_from_api(item: GitHubPrListItem) -> PrSummary {
 
 // ── View PR ─────────────────────────────────────────────────────────────────
 
+fn build_view_pr_request(input: &ViewPrInput, token: &str) -> HttpRequestPlan {
+    HttpRequestPlan {
+        method: "GET",
+        url: format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            input.owner, input.repo, input.pr_number
+        ),
+        headers: auth_headers(token),
+        body: String::new(),
+    }
+}
+
 fn handle_view_pr(input: ViewPrInput) -> String {
     if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
         return view_pr_error(e);
@@ -706,12 +926,6 @@ fn handle_view_pr(input: ViewPrInput) -> String {
         Err(e) => return view_pr_error(e),
     };
 
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/pulls/{}",
-        input.owner, input.repo, input.pr_number
-    );
-    let headers = auth_headers(&token);
-
     log(
         2,
         &format!(
@@ -720,34 +934,7 @@ fn handle_view_pr(input: ViewPrInput) -> String {
         ),
     );
 
-    let req = HttpReq {
-        method: "GET",
-        url: &url,
-        headers: &headers,
-        body: "",
-    };
-    let pr_response = http_request(&req);
-
-    let diff_headers = auth_headers_with_accept(&token, "application/vnd.github.diff");
-    let diff_req = HttpReq {
-        method: "GET",
-        url: &url,
-        headers: &diff_headers,
-        body: "",
-    };
-    let diff_response = http_request(&diff_req);
-
-    parse_view_pr_response(pr_response, diff_response)
-}
-
-fn auth_headers_with_accept(token: &str, accept: &str) -> String {
-    serde_json::json!({
-        "Authorization": format!("Bearer {token}"),
-        "Accept": accept,
-        "User-Agent": "fawx-github-skill/1.0",
-        "X-GitHub-Api-Version": "2022-11-28"
-    })
-    .to_string()
+    parse_view_pr_response(execute_request(&build_view_pr_request(&input, &token)))
 }
 
 fn view_pr_error(err: String) -> String {
@@ -760,13 +947,18 @@ fn view_pr_error(err: String) -> String {
         html_url: None,
         head_ref: None,
         base_ref: None,
-        diff: None,
         comments_count: None,
+        review_comments_count: None,
+        commits_count: None,
+        changed_files_count: None,
+        additions_count: None,
+        deletions_count: None,
+        draft: None,
         error: Some(err),
     })
 }
 
-fn parse_view_pr_response(pr_response: Option<String>, diff_response: Option<String>) -> String {
+fn parse_view_pr_response(pr_response: Option<String>) -> String {
     let Some(pr_json) = pr_response else {
         return view_pr_error("HTTP request failed".into());
     };
@@ -780,8 +972,6 @@ fn parse_view_pr_response(pr_response: Option<String>, diff_response: Option<Str
         }
     };
 
-    let diff = diff_response.unwrap_or_default();
-
     serialize_output(&ViewPrOutput {
         success: true,
         number: Some(pr.number),
@@ -791,10 +981,228 @@ fn parse_view_pr_response(pr_response: Option<String>, diff_response: Option<Str
         html_url: Some(pr.html_url),
         head_ref: Some(pr.head.ref_name),
         base_ref: Some(pr.base.ref_name),
-        diff: Some(diff),
         comments_count: Some(pr.comments),
+        review_comments_count: Some(pr.review_comments),
+        commits_count: Some(pr.commits),
+        changed_files_count: Some(pr.changed_files),
+        additions_count: Some(pr.additions),
+        deletions_count: Some(pr.deletions),
+        draft: Some(pr.draft),
         error: None,
     })
+}
+
+// ── PR File Inventory ───────────────────────────────────────────────────────
+
+fn build_list_pr_files_request(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    page: u32,
+    token: &str,
+) -> HttpRequestPlan {
+    HttpRequestPlan {
+        method: "GET",
+        url: format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page={}&page={}",
+            owner, repo, pr_number, PR_FILES_PAGE_SIZE, page
+        ),
+        headers: auth_headers(token),
+        body: String::new(),
+    }
+}
+
+fn parse_pr_files_page_response(response: Option<String>) -> Result<Vec<GitHubPrFile>, String> {
+    let Some(response) = response else {
+        return Err("HTTP request failed".into());
+    };
+
+    serde_json::from_str::<Vec<GitHubPrFile>>(&response).map_err(|_| {
+        let err_msg = error_from_response(&response);
+        log(4, &format!("List PR files failed: {err_msg}"));
+        err_msg
+    })
+}
+
+fn fetch_pr_files_page(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    page: u32,
+    token: &str,
+) -> Result<Vec<GitHubPrFile>, String> {
+    let plan = build_list_pr_files_request(owner, repo, pr_number, page, token);
+    parse_pr_files_page_response(execute_request(&plan))
+}
+
+fn fetch_all_pr_files(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    token: &str,
+) -> Result<Vec<GitHubPrFile>, String> {
+    let mut all_files = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let page_files = fetch_pr_files_page(owner, repo, pr_number, page, token)?;
+        let page_len = page_files.len();
+        all_files.extend(page_files);
+
+        if page_len < PR_FILES_PAGE_SIZE as usize {
+            break;
+        }
+
+        page = next_pr_files_page(page, "PR file list exceeded maximum page limit".into())?;
+    }
+
+    Ok(all_files)
+}
+
+fn pr_file_inventory_item(file: GitHubPrFile) -> PrFileInventoryItem {
+    PrFileInventoryItem {
+        path: file.filename,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        changes: file.changes,
+        patch_available: file.patch.is_some(),
+        previous_path: file.previous_filename,
+    }
+}
+
+fn list_pr_files_error(err: String) -> String {
+    serialize_output(&ListPrFilesOutput {
+        success: false,
+        files: None,
+        total_count: None,
+        error: Some(err),
+    })
+}
+
+fn handle_list_pr_files(input: ListPrFilesInput) -> String {
+    if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
+        return list_pr_files_error(e);
+    }
+
+    let token = match get_token() {
+        Ok(t) => t,
+        Err(e) => return list_pr_files_error(e),
+    };
+
+    log(
+        2,
+        &format!(
+            "Listing PR files for #{} in {}/{}",
+            input.pr_number, input.owner, input.repo
+        ),
+    );
+
+    match fetch_all_pr_files(&input.owner, &input.repo, input.pr_number, &token) {
+        Ok(files) => {
+            let total_count = files.len();
+            let inventory = files.into_iter().map(pr_file_inventory_item).collect();
+            serialize_output(&ListPrFilesOutput {
+                success: true,
+                files: Some(inventory),
+                total_count: Some(total_count),
+                error: None,
+            })
+        }
+        Err(err) => list_pr_files_error(err),
+    }
+}
+
+fn fetch_pr_file(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    path: &str,
+    token: &str,
+) -> Result<GitHubPrFile, String> {
+    let mut page = 1;
+
+    loop {
+        let page_files = fetch_pr_files_page(owner, repo, pr_number, page, token)?;
+        let page_len = page_files.len();
+
+        if let Some(file) = page_files.into_iter().find(|file| file.matches_path(path)) {
+            return Ok(file);
+        }
+
+        if page_len < PR_FILES_PAGE_SIZE as usize {
+            break;
+        }
+
+        page = next_pr_files_page(
+            page,
+            format!(
+                "PR file search exceeded maximum page limit while looking for '{}' in #{}",
+                path, pr_number
+            ),
+        )?;
+    }
+
+    Err(format!("PR file '{}' not found in #{}", path, pr_number))
+}
+
+fn view_pr_file_patch_error(err: String) -> String {
+    serialize_output(&ViewPrFilePatchOutput {
+        success: false,
+        path: None,
+        status: None,
+        additions: None,
+        deletions: None,
+        changes: None,
+        patch_available: None,
+        patch: None,
+        previous_path: None,
+        error: Some(err),
+    })
+}
+
+fn handle_view_pr_file_patch(input: ViewPrFilePatchInput) -> String {
+    if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
+        return view_pr_file_patch_error(e);
+    }
+    if let Err(e) = check_pr_file_path(&input.path) {
+        return view_pr_file_patch_error(e);
+    }
+
+    let token = match get_token() {
+        Ok(t) => t,
+        Err(e) => return view_pr_file_patch_error(e),
+    };
+
+    log(
+        2,
+        &format!(
+            "Viewing PR file patch '{}' for #{} in {}/{}",
+            input.path, input.pr_number, input.owner, input.repo
+        ),
+    );
+
+    match fetch_pr_file(
+        &input.owner,
+        &input.repo,
+        input.pr_number,
+        &input.path,
+        &token,
+    ) {
+        Ok(file) => serialize_output(&ViewPrFilePatchOutput {
+            success: true,
+            path: Some(file.filename),
+            status: Some(file.status),
+            additions: Some(file.additions),
+            deletions: Some(file.deletions),
+            changes: Some(file.changes),
+            patch_available: Some(file.patch.is_some()),
+            patch: file.patch,
+            previous_path: file.previous_filename,
+            error: None,
+        }),
+        Err(err) => view_pr_file_patch_error(err),
+    }
 }
 
 // ── List Issues ─────────────────────────────────────────────────────────────
@@ -1002,10 +1410,12 @@ fn parse_create_issue_response(response: Option<String>) -> String {
 #[no_mangle]
 pub extern "C" fn run() {
     let raw = get_input();
+    let supported_actions = supported_actions_message();
     if raw.is_empty() {
-        set_output(
-            r#"{"error":"No input provided. Expected JSON with 'action' or 'tool': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'."}"#,
-        );
+        set_output(&format!(
+            r#"{{"error":"No input provided. Expected JSON with 'action' or 'tool': {}."}}"#,
+            supported_actions
+        ));
         return;
     }
 
@@ -1014,12 +1424,16 @@ pub extern "C" fn run() {
         Ok(Input::CommentPr(input)) => handle_comment_pr(input),
         Ok(Input::ListPrs(input)) => handle_list_prs(input),
         Ok(Input::ViewPr(input)) => handle_view_pr(input),
+        Ok(Input::ListPrFiles(input)) => handle_list_pr_files(input),
+        Ok(Input::ViewPrFilePatch(input)) => handle_view_pr_file_patch(input),
         Ok(Input::ListIssues(input)) => handle_list_issues(input),
         Ok(Input::CreateIssue(input)) => handle_create_issue(input),
         Err(e) => {
             log(4, &format!("Failed to parse input: {e}"));
             serialize_output(&serde_json::json!({
-                "error": format!("Invalid input: {e}. Expected 'action' or 'tool': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'.")
+                "error": format!(
+                    "Invalid input: {e}. Expected 'action' or 'tool': {supported_actions}."
+                )
             }))
         }
     };
@@ -1389,6 +1803,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_list_pr_files_input() {
+        let json = r#"{
+            "action": "list_pr_files",
+            "owner": "acme",
+            "repo": "widgets",
+            "pr_number": 55
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        match input {
+            Input::ListPrFiles(files) => {
+                assert_eq!(files.owner, "acme");
+                assert_eq!(files.repo, "widgets");
+                assert_eq!(files.pr_number, 55);
+            }
+            _ => panic!("expected ListPrFiles variant"),
+        }
+    }
+
+    #[test]
+    fn parse_view_pr_file_patch_input() {
+        let json = r#"{
+            "action": "view_pr_file_patch",
+            "owner": "acme",
+            "repo": "widgets",
+            "pr_number": 55,
+            "path": "src/lib.rs"
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        match input {
+            Input::ViewPrFilePatch(file) => {
+                assert_eq!(file.owner, "acme");
+                assert_eq!(file.repo, "widgets");
+                assert_eq!(file.pr_number, 55);
+                assert_eq!(file.path, "src/lib.rs");
+            }
+            _ => panic!("expected ViewPrFilePatch variant"),
+        }
+    }
+
+    #[test]
+    fn parse_view_pr_file_patch_input_accepts_filename_alias() {
+        let json = r#"{
+            "action": "view_pr_file_patch",
+            "owner": "acme",
+            "repo": "widgets",
+            "pr_number": 55,
+            "filename": "src/lib.rs"
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        match input {
+            Input::ViewPrFilePatch(file) => assert_eq!(file.path, "src/lib.rs"),
+            _ => panic!("expected ViewPrFilePatch variant"),
+        }
+    }
+
     // ── List Issues Input Parsing ───────────────────────────────────────
 
     #[test]
@@ -1483,16 +1953,22 @@ mod tests {
             html_url: Some("https://github.com/acme/widgets/pull/42".into()),
             head_ref: Some("feat/big".into()),
             base_ref: Some("staging".into()),
-            diff: Some("diff --git a/file".into()),
             comments_count: Some(3),
+            review_comments_count: Some(2),
+            commits_count: Some(4),
+            changed_files_count: Some(7),
+            additions_count: Some(120),
+            deletions_count: Some(40),
+            draft: Some(false),
             error: None,
         };
         let json = serialize_output(&output);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["number"], 42);
-        assert_eq!(parsed["diff"], "diff --git a/file");
         assert_eq!(parsed["comments_count"], 3);
+        assert_eq!(parsed["changed_files_count"], 7);
+        assert!(parsed.get("diff").is_none());
     }
 
     #[test]
@@ -1506,14 +1982,65 @@ mod tests {
             html_url: None,
             head_ref: None,
             base_ref: None,
-            diff: None,
             comments_count: None,
+            review_comments_count: None,
+            commits_count: None,
+            changed_files_count: None,
+            additions_count: None,
+            deletions_count: None,
+            draft: None,
             error: Some("Not Found".into()),
         };
         let json = serialize_output(&output);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["success"], false);
         assert_eq!(parsed["error"], "Not Found");
+    }
+
+    #[test]
+    fn serialize_list_pr_files_success() {
+        let output = ListPrFilesOutput {
+            success: true,
+            files: Some(vec![PrFileInventoryItem {
+                path: "src/lib.rs".into(),
+                status: "modified".into(),
+                additions: 10,
+                deletions: 2,
+                changes: 12,
+                patch_available: true,
+                previous_path: None,
+            }]),
+            total_count: Some(1),
+            error: None,
+        };
+        let json = serialize_output(&output);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["files"][0]["path"], "src/lib.rs");
+        assert_eq!(parsed["files"][0]["patch_available"], true);
+        assert_eq!(parsed["total_count"], 1);
+    }
+
+    #[test]
+    fn serialize_view_pr_file_patch_success() {
+        let output = ViewPrFilePatchOutput {
+            success: true,
+            path: Some("src/lib.rs".into()),
+            status: Some("modified".into()),
+            additions: Some(10),
+            deletions: Some(2),
+            changes: Some(12),
+            patch_available: Some(true),
+            patch: Some("@@ -1 +1 @@".into()),
+            previous_path: None,
+            error: None,
+        };
+        let json = serialize_output(&output);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["path"], "src/lib.rs");
+        assert_eq!(parsed["patch_available"], true);
+        assert_eq!(parsed["patch"], "@@ -1 +1 @@");
     }
 
     // ── List Issues Output Serialization ────────────────────────────────
@@ -1596,21 +2123,28 @@ mod tests {
             "html_url": "https://github.com/acme/widgets/pull/42",
             "head": {"ref": "feat/x"},
             "base": {"ref": "staging"},
-            "comments": 5
+            "comments": 5,
+            "review_comments": 2,
+            "commits": 4,
+            "additions": 120,
+            "deletions": 40,
+            "changed_files": 7,
+            "draft": false
         }"#;
-        let diff = "diff --git a/file.rs b/file.rs\n+added line";
-        let result = parse_view_pr_response(Some(pr_json.into()), Some(diff.into()));
+        let result = parse_view_pr_response(Some(pr_json.into()));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["number"], 42);
         assert_eq!(parsed["comments_count"], 5);
-        assert!(parsed["diff"].as_str().unwrap().contains("+added line"));
+        assert_eq!(parsed["changed_files_count"], 7);
+        assert_eq!(parsed["additions_count"], 120);
+        assert!(parsed.get("diff").is_none());
     }
 
     #[test]
     fn parse_view_pr_response_api_error() {
         let response = r#"{"message": "Not Found"}"#;
-        let result = parse_view_pr_response(Some(response.into()), None);
+        let result = parse_view_pr_response(Some(response.into()));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], false);
         assert_eq!(parsed["error"], "Not Found");
@@ -1618,28 +2152,147 @@ mod tests {
 
     #[test]
     fn parse_view_pr_response_http_failure() {
-        let result = parse_view_pr_response(None, None);
+        let result = parse_view_pr_response(None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], false);
         assert_eq!(parsed["error"], "HTTP request failed");
     }
 
     #[test]
-    fn parse_view_pr_response_no_diff() {
-        let pr_json = r#"{
-            "number": 42,
-            "title": "Feature",
-            "body": null,
-            "state": "open",
-            "html_url": "https://github.com/acme/widgets/pull/42",
-            "head": {"ref": "feat/x"},
-            "base": {"ref": "staging"},
-            "comments": 0
-        }"#;
-        let result = parse_view_pr_response(Some(pr_json.into()), None);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], true);
-        assert_eq!(parsed["diff"], "");
+    fn parse_pr_files_page_response_success() {
+        let response = r#"[
+            {
+                "filename": "src/lib.rs",
+                "status": "modified",
+                "additions": 10,
+                "deletions": 2,
+                "changes": 12,
+                "patch": "@@ -1 +1 @@",
+                "previous_filename": null
+            },
+            {
+                "filename": "src/new.rs",
+                "status": "added",
+                "additions": 20,
+                "deletions": 0,
+                "changes": 20,
+                "patch": "@@ -0,0 +1,20 @@",
+                "previous_filename": null
+            }
+        ]"#;
+        let files = parse_pr_files_page_response(Some(response.into())).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename, "src/lib.rs");
+        assert_eq!(files[0].patch.as_deref(), Some("@@ -1 +1 @@"));
+    }
+
+    #[test]
+    fn parse_pr_files_page_response_api_error() {
+        let response = r#"{"message": "Not Found"}"#;
+        let error = parse_pr_files_page_response(Some(response.into())).unwrap_err();
+        assert_eq!(error, "Not Found");
+    }
+
+    #[test]
+    fn parse_pr_files_page_response_http_failure() {
+        let error = parse_pr_files_page_response(None).unwrap_err();
+        assert_eq!(error, "HTTP request failed");
+    }
+
+    #[test]
+    fn build_view_pr_request_uses_probe_metadata_endpoint() {
+        let plan = build_view_pr_request(
+            &ViewPrInput {
+                owner: "acme".into(),
+                repo: "widgets".into(),
+                pr_number: 42,
+            },
+            "ghp_test123",
+        );
+        let headers: serde_json::Value = serde_json::from_str(&plan.headers).unwrap();
+
+        assert_eq!(plan.method, "GET");
+        assert_eq!(
+            plan.url,
+            "https://api.github.com/repos/acme/widgets/pulls/42"
+        );
+        assert_eq!(headers["Accept"], "application/vnd.github+json");
+        assert!(!plan.headers.contains("application/vnd.github.diff"));
+    }
+
+    #[test]
+    fn build_list_pr_files_request_targets_inventory_endpoint() {
+        let plan = build_list_pr_files_request("acme", "widgets", 42, 3, "ghp_test123");
+        assert_eq!(plan.method, "GET");
+        assert_eq!(
+            plan.url,
+            "https://api.github.com/repos/acme/widgets/pulls/42/files?per_page=100&page=3"
+        );
+    }
+
+    #[test]
+    fn http_request_plan_serializes_for_debugging() {
+        let plan = HttpRequestPlan {
+            method: "GET",
+            url: "https://api.github.com/repos/acme/widgets/pulls/42".into(),
+            headers: r#"{"Accept":"application/json"}"#.into(),
+            body: String::new(),
+        };
+        let parsed: serde_json::Value = serde_json::to_value(plan).unwrap();
+        assert_eq!(parsed["method"], "GET");
+        assert_eq!(
+            parsed["url"],
+            "https://api.github.com/repos/acme/widgets/pulls/42"
+        );
+    }
+
+    #[test]
+    fn next_pr_files_page_advances_before_limit() {
+        assert_eq!(
+            next_pr_files_page(MAX_PR_FILE_PAGES - 1, "too many pages".into()).unwrap(),
+            MAX_PR_FILE_PAGES
+        );
+    }
+
+    #[test]
+    fn next_pr_files_page_rejects_limit() {
+        assert_eq!(
+            next_pr_files_page(MAX_PR_FILE_PAGES, "too many pages".into()).unwrap_err(),
+            "too many pages"
+        );
+    }
+
+    #[test]
+    fn github_pr_file_matches_current_or_previous_path() {
+        let file = GitHubPrFile {
+            filename: "src/new.rs".into(),
+            status: "renamed".into(),
+            additions: 10,
+            deletions: 4,
+            changes: 14,
+            patch: Some("@@ -1 +1 @@".into()),
+            previous_filename: Some("src/old.rs".into()),
+        };
+
+        assert!(file.matches_path("src/new.rs"));
+        assert!(file.matches_path("src/old.rs"));
+        assert!(!file.matches_path("src/other.rs"));
+    }
+
+    #[test]
+    fn check_pr_file_path_rejects_empty() {
+        assert_eq!(
+            check_pr_file_path("").unwrap_err(),
+            "PR file path cannot be empty"
+        );
+    }
+
+    #[test]
+    fn check_pr_file_path_rejects_whitespace_only() {
+        assert_eq!(
+            check_pr_file_path("   ").unwrap_err(),
+            "PR file path cannot be empty"
+        );
     }
 
     // ── List Issues Response Parsing ────────────────────────────────────
@@ -1720,16 +2373,6 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert_eq!(labels[0], "bug");
         assert_eq!(labels[1], "p1");
-    }
-
-    // ── Auth Headers With Accept ────────────────────────────────────────
-
-    #[test]
-    fn auth_headers_with_accept_uses_custom_accept() {
-        let headers = auth_headers_with_accept("ghp_test", "application/vnd.github.diff");
-        let parsed: serde_json::Value = serde_json::from_str(&headers).unwrap();
-        assert_eq!(parsed["Accept"], "application/vnd.github.diff");
-        assert_eq!(parsed["Authorization"], "Bearer ghp_test");
     }
 
     #[test]

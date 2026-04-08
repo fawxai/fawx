@@ -1,6 +1,8 @@
 name = "github"
-version = "1.1.0"
-description = "GitHub integration: create PRs, comment on PRs, list PRs, view PR details, list issues, and create issues"
+# 2.0.0 is intentional: view_pr is now probe-first metadata only, and full
+# diff retrieval moved to list_pr_files + view_pr_file_patch.
+version = "2.0.0"
+description = "GitHub integration: create PRs, comment on PRs, list PRs, probe PR metadata without eager diff retrieval, inspect PR file inventories, fetch file-scoped PR patches, list issues, and create issues"
 author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = ["network", "storage"]
@@ -140,12 +142,12 @@ required = false
 
 [[tools]]
 name = "view_pr"
-description = "View a GitHub pull request with details"
+description = "View GitHub pull request metadata and high-level stats without fetching diff bodies"
 
 [tools.routing]
 resource_kinds = ["github_pull_request"]
 operations = ["fetch"]
-artifact_strategy = "direct_fetch"
+artifact_strategy = "probe_first"
 fallback_rank = 10
 
 [tools.routing.auth_mode]
@@ -168,6 +170,78 @@ required = true
 name = "pr_number"
 type = "integer"
 description = "Pull request number"
+required = true
+
+# Tool parameters are scoped per tool in this manifest format, so the shared
+# owner/repo/pr_number PR inputs stay duplicated here intentionally.
+[[tools]]
+name = "list_pr_files"
+description = "List changed files in a GitHub pull request with per-file change stats"
+
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["list"]
+artifact_strategy = "probe_first"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "pr_number"
+type = "integer"
+description = "Pull request number"
+required = true
+
+[[tools]]
+name = "view_pr_file_patch"
+description = "Fetch patch details for one changed file in a GitHub pull request"
+
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["fetch"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 20
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+
+[[tools.parameters]]
+name = "owner"
+type = "string"
+description = "Repository owner or organization"
+required = true
+
+[[tools.parameters]]
+name = "repo"
+type = "string"
+description = "Repository name"
+required = true
+
+[[tools.parameters]]
+name = "pr_number"
+type = "integer"
+description = "Pull request number"
+required = true
+
+[[tools.parameters]]
+name = "path"
+type = "string"
+description = "Changed file path to inspect"
 required = true
 
 [[tools]]
