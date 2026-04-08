@@ -4846,13 +4846,8 @@ thinking = "high"
         assert!(json["skills"].as_array().expect("skills").is_empty());
     }
 
-    #[tokio::test]
-    async fn get_skill_settings_returns_schema_and_redacted_secret_status() {
-        let temp = TempDir::new().expect("tempdir");
-        let skills_dir = temp.path().join("skills").join("brave-search");
-        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
-        std::fs::write(
-            skills_dir.join("manifest.toml"),
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
             r#"
 name = "brave-search"
 version = "1.0.0"
@@ -4863,6 +4858,20 @@ api_version = "host_api_v1"
 [settings]
 version = 1
 
+{fields_toml}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn get_skill_settings_returns_schema_and_redacted_secret_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
@@ -4874,6 +4883,7 @@ key = "region"
 label = "Region"
 type = "text"
 "#,
+            ),
         )
         .expect("write manifest");
         fx_auth::credential_store::EncryptedFileCredentialStore::open(temp.path())
@@ -4906,16 +4916,8 @@ type = "text"
         std::fs::create_dir_all(&skills_dir).expect("create skills dir");
         std::fs::write(
             skills_dir.join("manifest.toml"),
-            r#"
-name = "brave-search"
-version = "1.0.0"
-description = "Search the web"
-author = "Fawx"
-api_version = "host_api_v1"
-
-[settings]
-version = 1
-
+            brave_search_settings_manifest_toml(
+                r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
@@ -4927,6 +4929,7 @@ key = "safesearch"
 label = "Safe Search"
 type = "boolean"
 "#,
+            ),
         )
         .expect("write manifest");
 
@@ -4946,7 +4949,6 @@ type = "boolean"
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["updated"], true);
-        assert_eq!(json["restart_required"], false);
         assert_eq!(json["settings"]["values"][1]["value"], "true");
     }
 

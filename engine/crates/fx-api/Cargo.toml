@@ -33,7 +33,6 @@ fx-storage.workspace = true
 fx-telemetry = { path = "../fx-telemetry" }
 fx-tools.workspace = true
 rand = "0.8"
-regex.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

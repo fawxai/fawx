@@ -4,10 +4,11 @@ use std::path::Path;
 
 use fx_auth::credential_store::EncryptedFileCredentialStore;
 use fx_skills::manifest::{
-    parse_manifest, validate_manifest, SkillManifest, SkillSettingFieldManifest,
+    compile_setting_patterns, parse_manifest, validate_manifest,
+    validate_setting_value as validate_manifest_setting_value,
+    validate_skill_name as validate_manifest_skill_name, SkillManifest, SkillSettingFieldManifest,
     SkillSettingFieldType, SkillSettingsManifest,
 };
-use regex::Regex;
 use toml_edit::{Array, DocumentMut, Item, Value};
 
 const EDITABLE_CAPABILITIES: [&str; 5] = [
@@ -333,55 +334,21 @@ fn validate_merged_settings(
     existing_values: &HashMap<String, Option<String>>,
     updates: &HashMap<String, Option<String>>,
 ) -> Result<(), SkillManifestError> {
+    let compiled_patterns = compile_setting_patterns(fields)
+        .map_err(|error| SkillManifestError::Invalid(error.to_string()))?;
+
     for field in fields {
         let merged = if let Some(value) = updates.get(field.key.as_str()) {
             value.clone()
         } else {
             existing_values.get(field.key.as_str()).cloned().flatten()
         };
-        validate_field_value(field, merged.as_deref())?;
-    }
-
-    Ok(())
-}
-
-fn validate_field_value(
-    field: &SkillSettingFieldManifest,
-    value: Option<&str>,
-) -> Result<(), SkillManifestError> {
-    if field.required && value.is_none() {
-        return Err(SkillManifestError::Invalid(format!(
-            "{} is required.",
-            field.label
-        )));
-    }
-
-    let Some(value) = value else {
-        return Ok(());
-    };
-
-    if let Some(min_length) = field.min_length {
-        if value.chars().count() < min_length {
-            return Err(SkillManifestError::Invalid(format!(
-                "{} must be at least {} characters.",
-                field.label, min_length
-            )));
-        }
-    }
-
-    if let Some(pattern) = &field.pattern {
-        let regex = Regex::new(pattern).map_err(|error| {
-            SkillManifestError::Invalid(format!(
-                "{} has an invalid pattern: {}",
-                field.label, error
-            ))
-        })?;
-        if !regex.is_match(value) {
-            return Err(SkillManifestError::Invalid(format!(
-                "{} is invalid.",
-                field.label
-            )));
-        }
+        validate_manifest_setting_value(
+            field,
+            merged.as_deref(),
+            compiled_patterns.get(field.key.as_str()),
+        )
+        .map_err(|error| SkillManifestError::Invalid(error.to_string()))?;
     }
 
     Ok(())
@@ -458,16 +425,8 @@ fn normalize_capabilities(
 }
 
 fn validate_skill_name(skill_name: &str) -> Result<(), SkillManifestError> {
-    if skill_name.trim().is_empty()
-        || skill_name.contains('/')
-        || skill_name.contains('\\')
-        || skill_name.contains("..")
-    {
-        return Err(SkillManifestError::Invalid(
-            "invalid skill name".to_string(),
-        ));
-    }
-    Ok(())
+    validate_manifest_skill_name(skill_name)
+        .map_err(|error| SkillManifestError::Invalid(error.to_string()))
 }
 
 fn manifest_path_for_skill_name(
@@ -515,6 +474,23 @@ fn manifest_path_for_skill_name(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
+            r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+{fields_toml}
+"#
+        )
+    }
 
     fn write_manifest(temp_dir: &TempDir, skill_name: &str, contents: &str) {
         let skill_dir = temp_dir.path().join(skill_name);
@@ -618,16 +594,8 @@ capabilities = []
         write_manifest_in_data_dir(
             &temp_dir,
             "brave-search",
-            r#"
-name = "brave-search"
-version = "1.0.0"
-description = "Search the web"
-author = "Fawx"
-api_version = "host_api_v1"
-
-[settings]
-version = 1
-
+            &brave_search_settings_manifest_toml(
+                r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
@@ -639,6 +607,7 @@ key = "safesearch"
 label = "Safe Search"
 type = "boolean"
 "#,
+            ),
         );
 
         let store = EncryptedFileCredentialStore::open(temp_dir.path()).expect("open store");
@@ -673,22 +642,15 @@ type = "boolean"
         write_manifest_in_data_dir(
             &temp_dir,
             "brave-search",
-            r#"
-name = "brave-search"
-version = "1.0.0"
-description = "Search the web"
-author = "Fawx"
-api_version = "host_api_v1"
-
-[settings]
-version = 1
-
+            &brave_search_settings_manifest_toml(
+                r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
 type = "secret"
 required = true
 min_length = 8
+max_length = 128
 
 [[settings.fields]]
 key = "region"
@@ -696,6 +658,7 @@ label = "Region"
 type = "text"
 pattern = "^[a-z-]+$"
 "#,
+            ),
         );
 
         let settings = update_skill_settings(
@@ -754,16 +717,8 @@ pattern = "^[a-z-]+$"
         write_manifest_in_data_dir(
             &temp_dir,
             "brave-search",
-            r#"
-name = "brave-search"
-version = "1.0.0"
-description = "Search the web"
-author = "Fawx"
-api_version = "host_api_v1"
-
-[settings]
-version = 1
-
+            &brave_search_settings_manifest_toml(
+                r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
@@ -775,6 +730,7 @@ key = "region"
 label = "Region"
 type = "text"
 "#,
+            ),
         );
 
         let store = EncryptedFileCredentialStore::open(temp_dir.path()).expect("open store");

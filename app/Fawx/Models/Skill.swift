@@ -62,10 +62,11 @@ struct SkillsResponse: Codable, Sendable, Hashable {
 }
 
 struct SkillSettingsField: Codable, Sendable, Hashable, Identifiable {
-    enum FieldType: String, Codable, Sendable, Hashable {
+    enum FieldType: Sendable, Hashable {
         case text
         case secret
         case boolean
+        case unknown(String)
     }
 
     let key: String
@@ -75,6 +76,7 @@ struct SkillSettingsField: Codable, Sendable, Hashable, Identifiable {
     let helpText: String?
     let required: Bool
     let minLength: Int?
+    let maxLength: Int?
     let pattern: String?
 
     var id: String { key }
@@ -87,7 +89,39 @@ struct SkillSettingsField: Codable, Sendable, Hashable, Identifiable {
         case helpText = "help_text"
         case required
         case minLength = "min_length"
+        case maxLength = "max_length"
         case pattern
+    }
+
+    init(
+        key: String,
+        label: String,
+        fieldType: FieldType,
+        placeholder: String?,
+        helpText: String?,
+        required: Bool,
+        minLength: Int?,
+        maxLength: Int?,
+        pattern: String?
+    ) {
+        self.key = key
+        self.label = label
+        self.fieldType = fieldType
+        self.placeholder = placeholder
+        self.helpText = helpText
+        self.required = required
+        self.minLength = minLength
+        self.maxLength = maxLength
+        self.pattern = pattern
+    }
+
+    var supportsInlineEditing: Bool {
+        switch fieldType {
+        case .text, .secret, .boolean:
+            true
+        case .unknown:
+            false
+        }
     }
 
     func validate(_ value: String?) -> String? {
@@ -105,19 +139,50 @@ struct SkillSettingsField: Codable, Sendable, Hashable, Identifiable {
             return "\(label) must be at least \(minLength) characters."
         }
 
-        if let pattern,
-           let regex = try? NSRegularExpression(pattern: pattern) {
-            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
-            if regex.firstMatch(in: trimmed, options: [], range: range) == nil {
-                return "\(label) is invalid."
-            }
+        if let maxLength, trimmed.count > maxLength {
+            return "\(label) must be at most \(maxLength) characters."
         }
 
         if fieldType == .boolean, trimmed != "true", trimmed != "false" {
             return "\(label) must be either true or false."
         }
 
+        // The server is authoritative for regex validation because Foundation
+        // and Rust's regex engines do not accept exactly the same syntax.
         return nil
+    }
+}
+
+extension SkillSettingsField.FieldType: Codable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+
+        switch rawValue {
+        case "text":
+            self = .text
+        case "secret":
+            self = .secret
+        case "boolean":
+            self = .boolean
+        default:
+            self = .unknown(rawValue)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+
+        switch self {
+        case .text:
+            try container.encode("text")
+        case .secret:
+            try container.encode("secret")
+        case .boolean:
+            try container.encode("boolean")
+        case .unknown(let rawValue):
+            try container.encode(rawValue)
+        }
     }
 }
 
@@ -155,18 +220,27 @@ struct SkillSettingsResponse: Codable, Sendable, Hashable {
 struct SkillSettingInput: Codable, Sendable, Hashable {
     let key: String
     let value: String?
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case value
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(key, forKey: .key)
+
+        if let value {
+            try container.encode(value, forKey: .value)
+        } else {
+            try container.encodeNil(forKey: .value)
+        }
+    }
 }
 
 struct UpdateSkillSettingsResponse: Codable, Sendable, Hashable {
     let updated: Bool
-    let restartRequired: Bool
     let settings: SkillSettingsResponse
-
-    enum CodingKeys: String, CodingKey {
-        case updated
-        case restartRequired = "restart_required"
-        case settings
-    }
 }
 
 struct UpdateSkillPermissionsResponse: Codable, Sendable, Hashable {

@@ -1412,7 +1412,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "rand 0.8.5",
- "regex",
  "reqwest",
  "ring",
  "rustls",

@@ -4,7 +4,7 @@ use fx_core::error::SkillError;
 use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 /// Capability a skill can request.
@@ -112,6 +112,10 @@ pub struct SkillSettingFieldManifest {
     pub required: bool,
     #[serde(default)]
     pub min_length: Option<usize>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
+    /// Optional server-side Rust `regex` pattern. The server is authoritative
+    /// for pattern validation because client regex engines may differ.
     #[serde(default)]
     pub pattern: Option<String>,
 }
@@ -230,6 +234,8 @@ pub fn validate_nonblank_string_entries(
 const MAX_INTENT_HINTS: usize = 64;
 const MAX_INTENT_HINT_LENGTH: usize = 256;
 
+pub type CompiledSettingPatterns = BTreeMap<String, Regex>;
+
 /// Validate `intent_hints` for blank, duplicate, and unbounded entries.
 pub fn validate_intent_hints(intent_hints: &[String]) -> Result<(), SkillError> {
     if intent_hints.len() > MAX_INTENT_HINTS {
@@ -253,6 +259,86 @@ pub fn validate_intent_hints(intent_hints: &[String]) -> Result<(), SkillError> 
         if !seen.insert(intent_hint.as_str()) {
             return Err(SkillError::InvalidManifest(format!(
                 "intent_hints[{index}] duplicates a previous entry"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn compile_setting_patterns(
+    fields: &[SkillSettingFieldManifest],
+) -> Result<CompiledSettingPatterns, SkillError> {
+    let mut compiled = BTreeMap::new();
+
+    for field in fields {
+        let Some(pattern) = field.pattern.as_deref() else {
+            continue;
+        };
+
+        let regex = Regex::new(pattern).map_err(|error| {
+            SkillError::InvalidManifest(format!(
+                "settings field '{}' has invalid pattern: {}",
+                field.key, error
+            ))
+        })?;
+        compiled.insert(field.key.clone(), regex);
+    }
+
+    Ok(compiled)
+}
+
+pub fn validate_setting_value(
+    field: &SkillSettingFieldManifest,
+    value: Option<&str>,
+    compiled_pattern: Option<&Regex>,
+) -> Result<(), SkillError> {
+    if field.required && value.is_none() {
+        return Err(SkillError::InvalidManifest(format!(
+            "{} is required.",
+            field.label
+        )));
+    }
+
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    if matches!(field.field_type, SkillSettingFieldType::Boolean)
+        && value != "true"
+        && value != "false"
+    {
+        return Err(SkillError::InvalidManifest(format!(
+            "{} must be either 'true' or 'false'",
+            field.label
+        )));
+    }
+
+    let length = value.chars().count();
+
+    if let Some(min_length) = field.min_length {
+        if length < min_length {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} must be at least {} characters.",
+                field.label, min_length
+            )));
+        }
+    }
+
+    if let Some(max_length) = field.max_length {
+        if length > max_length {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} must be at most {} characters.",
+                field.label, max_length
+            )));
+        }
+    }
+
+    if let Some(regex) = compiled_pattern {
+        if !regex.is_match(value) {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} is invalid.",
+                field.label
             )));
         }
     }
@@ -351,12 +437,21 @@ fn validate_settings(settings: Option<&SkillSettingsManifest>) -> Result<(), Ski
         }
 
         if matches!(field.field_type, SkillSettingFieldType::Boolean)
-            && (field.min_length.is_some() || field.pattern.is_some())
+            && (field.min_length.is_some() || field.max_length.is_some() || field.pattern.is_some())
         {
             return Err(SkillError::InvalidManifest(format!(
-                "settings field '{}' cannot use min_length or pattern with boolean type",
+                "settings field '{}' cannot use min_length, max_length, or pattern with boolean type",
                 field.key
             )));
+        }
+
+        if let (Some(min_length), Some(max_length)) = (field.min_length, field.max_length) {
+            if min_length > max_length {
+                return Err(SkillError::InvalidManifest(format!(
+                    "settings field '{}' has min_length greater than max_length",
+                    field.key
+                )));
+            }
         }
 
         if let Some(pattern) = &field.pattern {
@@ -366,15 +461,10 @@ fn validate_settings(settings: Option<&SkillSettingsManifest>) -> Result<(), Ski
                     field.key
                 )));
             }
-
-            Regex::new(pattern).map_err(|error| {
-                SkillError::InvalidManifest(format!(
-                    "settings field '{}' has invalid pattern: {}",
-                    field.key, error
-                ))
-            })?;
         }
     }
+
+    let _ = compile_setting_patterns(&settings.fields)?;
 
     Ok(())
 }
@@ -444,6 +534,23 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
+            r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx Team"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+{fields_toml}
+"#
+        )
+    }
+
     #[test]
     fn test_parse_valid_manifest() {
         let toml = r#"
@@ -511,31 +618,25 @@ required = true
 
     #[test]
     fn test_parse_manifest_with_settings() {
-        let toml = r#"
-name = "brave-search"
-version = "1.0.0"
-description = "Search the web"
-author = "Fawx Team"
-api_version = "host_api_v1"
-
-[settings]
-version = 1
-
+        let toml = brave_search_settings_manifest_toml(
+            r#"
 [[settings.fields]]
 key = "api_key"
 label = "API Key"
 type = "secret"
 required = true
 min_length = 8
+max_length = 128
 
 [[settings.fields]]
 key = "safesearch"
 label = "Safe Search"
 type = "boolean"
 help_text = "Enable family-safe results."
-        "#;
+"#,
+        );
 
-        let manifest = parse_manifest(toml).expect("parse manifest");
+        let manifest = parse_manifest(&toml).expect("parse manifest");
         let settings = manifest.settings.expect("settings");
         assert_eq!(settings.version, 1);
         assert_eq!(settings.fields.len(), 2);
@@ -543,6 +644,7 @@ help_text = "Enable family-safe results."
         assert_eq!(settings.fields[0].field_type, SkillSettingFieldType::Secret);
         assert!(settings.fields[0].required);
         assert_eq!(settings.fields[0].min_length, Some(8));
+        assert_eq!(settings.fields[0].max_length, Some(128));
         assert_eq!(
             settings.fields[1].field_type,
             SkillSettingFieldType::Boolean
@@ -571,6 +673,7 @@ help_text = "Enable family-safe results."
                         help_text: None,
                         required: true,
                         min_length: Some(8),
+                        max_length: None,
                         pattern: None,
                     },
                     SkillSettingFieldManifest {
@@ -581,6 +684,7 @@ help_text = "Enable family-safe results."
                         help_text: None,
                         required: false,
                         min_length: None,
+                        max_length: None,
                         pattern: None,
                     },
                 ],
@@ -615,6 +719,7 @@ help_text = "Enable family-safe results."
                     help_text: None,
                     required: false,
                     min_length: None,
+                    max_length: None,
                     pattern: Some("[".to_string()),
                 }],
             }),
@@ -624,6 +729,60 @@ help_text = "Enable family-safe results."
         let result = validate_manifest(&manifest);
         assert!(
             matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("invalid pattern"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_inverted_settings_length_bounds() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![SkillSettingFieldManifest {
+                    key: "region".to_string(),
+                    label: "Region".to_string(),
+                    field_type: SkillSettingFieldType::Text,
+                    placeholder: None,
+                    help_text: None,
+                    required: false,
+                    min_length: Some(8),
+                    max_length: Some(4),
+                    pattern: None,
+                }],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("min_length greater than max_length"))
+        );
+    }
+
+    #[test]
+    fn test_validate_setting_value_enforces_max_length() {
+        let field = SkillSettingFieldManifest {
+            key: "region".to_string(),
+            label: "Region".to_string(),
+            field_type: SkillSettingFieldType::Text,
+            placeholder: None,
+            help_text: None,
+            required: false,
+            min_length: None,
+            max_length: Some(4),
+            pattern: None,
+        };
+
+        let result = validate_setting_value(&field, Some("global"), None);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("at most 4 characters"))
         );
     }
 

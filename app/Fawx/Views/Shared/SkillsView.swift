@@ -231,23 +231,28 @@ struct SkillsView: View {
                     ForEach(filteredSkills) { skill in
                         SkillCardView(
                             skill: skill,
-                            isRemoving: skillsViewModel.removingSkillNames.contains(skill.name),
-                            isLoadingSettings: skillsViewModel.loadingSkillSettingsName == skill.name,
-                            isSavingSettings: skillsViewModel.savingSkillSettingsName == skill.name,
-                            isSavingPermissions: skillsViewModel.savingSkillPermissionsName == skill.name,
-                            editSettingsAction: {
-                                Task {
-                                    await skillsViewModel.beginEditingSettings(for: skill)
+                            state: SkillCardState(
+                                isRemoving: skillsViewModel.removingSkillNames.contains(skill.name),
+                                isLoadingSettings: skillsViewModel.loadingSkillSettingsName == skill.name,
+                                isSavingSettings: skillsViewModel.savingSkillSettingsName == skill.name,
+                                isSavingPermissions: skillsViewModel.savingSkillPermissionsName == skill.name
+                            ),
+                            actions: SkillCardActions(
+                                editSettings: {
+                                    Task {
+                                        await skillsViewModel.beginEditingSettings(for: skill)
+                                    }
+                                },
+                                editPermissions: {
+                                    skillsViewModel.beginEditingPermissions(for: skill)
+                                },
+                                remove: {
+                                    Task {
+                                        await skillsViewModel.removeInstalledSkill(named: skill.name)
+                                    }
                                 }
-                            },
-                            editPermissionsAction: {
-                                skillsViewModel.beginEditingPermissions(for: skill)
-                            }
-                        ) {
-                            Task {
-                                await skillsViewModel.removeInstalledSkill(named: skill.name)
-                            }
-                        }
+                            )
+                        )
                     }
                 }
                 .accessibilityIdentifier("skillsGrid")
@@ -312,15 +317,23 @@ struct SkillsView: View {
     }
 }
 
-private struct SkillCardView: View {
-    let skill: SkillSummary
+private struct SkillCardState {
     let isRemoving: Bool
     let isLoadingSettings: Bool
     let isSavingSettings: Bool
     let isSavingPermissions: Bool
-    let editSettingsAction: () -> Void
-    let editPermissionsAction: () -> Void
-    let removeAction: () -> Void
+}
+
+private struct SkillCardActions {
+    let editSettings: () -> Void
+    let editPermissions: () -> Void
+    let remove: () -> Void
+}
+
+private struct SkillCardView: View {
+    let skill: SkillSummary
+    let state: SkillCardState
+    let actions: SkillCardActions
 
     var body: some View {
         VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
@@ -389,17 +402,17 @@ private struct SkillCardView: View {
             }
 
             HStack {
-                Button(isLoadingSettings ? "Loading..." : (isSavingSettings ? "Saving..." : "Settings")) {
-                    editSettingsAction()
+                Button(state.isLoadingSettings ? "Loading..." : (state.isSavingSettings ? "Saving..." : "Settings")) {
+                    actions.editSettings()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
 
-                Button(isSavingPermissions ? "Saving..." : "Edit Permissions") {
-                    editPermissionsAction()
+                Button(state.isSavingPermissions ? "Saving..." : "Edit Permissions") {
+                    actions.editPermissions()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
 
                 Spacer(minLength: 0)
 
@@ -407,11 +420,11 @@ private struct SkillCardView: View {
 
                 Spacer(minLength: 0)
 
-                Button(isRemoving ? "Removing..." : "Remove", role: .destructive) {
-                    removeAction()
+                Button(state.isRemoving ? "Removing..." : "Remove", role: .destructive) {
+                    actions.remove()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isRemoving || isSavingPermissions || isLoadingSettings || isSavingSettings)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -859,6 +872,17 @@ private struct SkillSettingsEditor: View {
                         .foregroundStyle(Color.fawxText)
                 }
                 .toggleStyle(.switch)
+
+            case .unknown(let rawType):
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                    Text("Update Fawx to edit this field.")
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxText)
+
+                    Text("Unsupported setting type: \(rawType)")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
             }
         }
         .padding(FawxSpacing.paddingMD)

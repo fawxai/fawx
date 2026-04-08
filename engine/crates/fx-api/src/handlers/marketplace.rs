@@ -97,7 +97,6 @@ pub struct UpdateSkillSettingsRequest {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UpdateSkillSettingsResponse {
     pub updated: bool,
-    pub restart_required: bool,
     pub settings: SkillSettingsResponse,
 }
 
@@ -186,7 +185,6 @@ pub async fn handle_update_skill_settings(
 
     Ok(Json(UpdateSkillSettingsResponse {
         updated: true,
-        restart_required: false,
         settings: SkillSettingsResponse::from(settings),
     }))
 }

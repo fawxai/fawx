@@ -328,26 +328,24 @@ final class SkillsViewModel {
                     return SkillSettingInput(key: field.key, value: nil)
                 }
 
-                let entered = skillSettingsDraft[field.key]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let entered = trimmedDraftValue(for: field.key)
                 guard let entered, !entered.isEmpty else {
                     return nil
                 }
                 return SkillSettingInput(key: field.key, value: entered)
 
             case .boolean:
-                let normalized = (skillSettingsDraft[field.key] ?? "false")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
+                let normalized = (trimmedDraftValue(for: field.key) ?? "false").lowercased()
                 return SkillSettingInput(key: field.key, value: normalized)
 
             case .text:
-                let trimmed = skillSettingsDraft[field.key]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 return SkillSettingInput(
                     key: field.key,
-                    value: trimmed?.isEmpty == false ? trimmed : nil
+                    value: trimmedDraftValue(for: field.key)
                 )
+
+            case .unknown:
+                return nil
             }
         }
 
@@ -372,25 +370,68 @@ final class SkillsViewModel {
 
     private func validateDraftSettings(_ settings: SkillSettingsResponse) -> String? {
         for field in settings.schema.fields {
-            if field.fieldType == .secret {
-                let entered = skillSettingsDraft[field.key]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let entered, !entered.isEmpty, let error = field.validate(entered) {
+            switch field.fieldType {
+            case .secret:
+                if let error = validateSecretDraftField(field, in: settings) {
                     return error
                 }
 
-                let existingSecret = settings.values.first(where: { $0.key == field.key })
-                if clearedSkillSecretKeys.contains(field.key) || existingSecret?.isConfigured != true {
-                    if let error = field.validate(entered) {
-                        return error
-                    }
+            case .unknown:
+                if let error = validateUnsupportedDraftField(field, in: settings) {
+                    return error
                 }
-                continue
-            }
 
-            if let error = field.validate(skillSettingsDraft[field.key]) {
-                return error
+            case .text, .boolean:
+                if let error = field.validate(skillSettingsDraft[field.key]) {
+                    return error
+                }
             }
+        }
+
+        return nil
+    }
+
+    private func trimmedDraftValue(for key: String) -> String? {
+        skillSettingsDraft[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+    }
+
+    private func validateSecretDraftField(
+        _ field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> String? {
+        let entered = trimmedDraftValue(for: field.key)
+        if let entered {
+            return field.validate(entered)
+        }
+
+        if shouldValidateEmptySecretDraft(for: field, in: settings) {
+            return field.validate(nil)
+        }
+
+        return nil
+    }
+
+    private func shouldValidateEmptySecretDraft(
+        for field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> Bool {
+        let existingSecret = settings.values.first(where: { $0.key == field.key })
+        return clearedSkillSecretKeys.contains(field.key) || existingSecret?.isConfigured != true
+    }
+
+    private func validateUnsupportedDraftField(
+        _ field: SkillSettingsField,
+        in settings: SkillSettingsResponse
+    ) -> String? {
+        guard case .unknown(let rawType) = field.fieldType else {
+            return nil
+        }
+
+        let existingValue = settings.values.first(where: { $0.key == field.key })
+        if field.required && existingValue?.isConfigured != true {
+            return "Update Fawx to edit \(field.label) (\(rawType))."
         }
 
         return nil
