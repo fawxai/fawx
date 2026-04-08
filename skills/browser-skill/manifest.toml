@@ -9,7 +9,15 @@ entry_point = "run"
 [[tools]]
 name = "web_fetch"
 description = "Fetch a web page and extract its readable content as markdown or plain text"
-routing = { resource_kinds = ["generic_url"], operations = ["fetch"], auth_mode = { kind = "none" }, artifact_strategy = "direct_fetch", fallback_rank = 100 }
+
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["fetch"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
 
 [[tools.parameters]]
 name = "url"
@@ -33,6 +41,15 @@ required = false
 name = "web_search"
 description = "Search the web using a search engine API and return results with titles, URLs, and snippets"
 
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["list"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
+
 [[tools.parameters]]
 name = "query"
 type = "string"
@@ -48,6 +65,15 @@ required = false
 [[tools]]
 name = "web_screenshot"
 description = "Take a screenshot of a web page (requires a screenshot service URL in config)"
+
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["fetch"]
+artifact_strategy = "probe_first"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
 
 [[tools.parameters]]
 name = "url"

@@ -248,6 +248,10 @@ fn build_writable_roots(working_dir: &str, allow_paths: &[String]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolReadinessSummary,
+        ToolRoutingMetadata,
+    };
     use fx_config::{PermissionAction, PermissionPreset};
 
     struct TestFixture {
@@ -331,14 +335,14 @@ mod tests {
                     tool_names: vec!["web_search".to_string()],
                     routing_tools: vec![ToolRoutingSummary {
                         tool_name: "web_search".to_string(),
-                        metadata: crate::tool_routing::ToolRoutingMetadata {
-                            resource_kinds: vec![crate::tool_routing::ResourceKind::GenericUrl],
-                            operations: vec![crate::tool_routing::RouteOperation::List],
-                            auth_mode: crate::tool_routing::RouteAuthMode::None,
-                            artifact_strategy: crate::tool_routing::ArtifactStrategy::DirectFetch,
+                        metadata: ToolRoutingMetadata {
+                            resource_kinds: vec![ResourceKind::GenericUrl],
+                            operations: vec![RouteOperation::List],
+                            auth_mode: RouteAuthMode::None,
+                            artifact_strategy: ArtifactStrategy::DirectFetch,
                             fallback_rank: 100,
                         },
-                        readiness: crate::tool_routing::ToolReadinessSummary {
+                        readiness: ToolReadinessSummary {
                             available: true,
                             ready: true,
                             readiness_reason: None,
@@ -421,7 +425,7 @@ mod tests {
         );
         assert_eq!(
             manifest.tools[1].routing_tools[0].metadata.resource_kinds,
-            vec![crate::tool_routing::ResourceKind::GenericUrl]
+            vec![ResourceKind::GenericUrl]
         );
     }
 

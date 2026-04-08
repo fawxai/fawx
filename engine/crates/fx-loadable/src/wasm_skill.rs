@@ -832,8 +832,13 @@ fn read_skill_directories(skills_dir: &Path) -> Result<Vec<std::fs::DirEntry>, S
 mod tests {
     use super::*;
     use crate::test_support::invocable_wasm_bytes;
+    use fx_core::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolRoutingMetadata,
+    };
     use fx_skills::loader::SkillLoader;
-    use fx_skills::manifest::SkillManifest;
+    use fx_skills::manifest::{
+        SkillManifest, SkillToolAuthoritySurface, SkillToolManifest, SkillToolParameterManifest,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
     use zeroize::Zeroizing;
@@ -860,6 +865,38 @@ mod tests {
         loader
             .load(&wasm, &manifest, None)
             .expect("load test skill")
+    }
+
+    fn load_wasm_skill(
+        manifest: &SkillManifest,
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> WasmSkill {
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(&invocable_wasm_bytes(), manifest, None)
+            .expect("load test skill");
+        WasmSkill::new(loaded, credential_provider).expect("create")
+    }
+
+    fn test_tool_manifest(name: &str, routing: Option<ToolRoutingMetadata>) -> SkillToolManifest {
+        SkillToolManifest {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            authority_surface: Some(SkillToolAuthoritySurface::Network),
+            routing,
+            direct_utility: false,
+            trigger_patterns: vec![],
+            parameters: vec![],
+        }
+    }
+
+    fn required_string_parameter(name: &str, description: &str) -> SkillToolParameterManifest {
+        SkillToolParameterManifest {
+            name: name.to_string(),
+            kind: "string".to_string(),
+            description: description.to_string(),
+            required: true,
+        }
     }
 
     #[derive(Debug, Default)]
@@ -900,36 +937,13 @@ mod tests {
     #[test]
     fn wasm_skill_exposes_manifest_declared_tools() {
         let mut manifest = test_manifest("browser");
-        manifest.tools = vec![
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_search".to_string(),
-                description: "Search".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                routing: None,
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "query".to_string(),
-                    kind: "string".to_string(),
-                    description: "Search query".to_string(),
-                    required: true,
-                }],
-            },
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_fetch".to_string(),
-                description: "Fetch".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                routing: None,
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![],
-            },
-        ];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut web_search = test_tool_manifest("web_search", None);
+        web_search.description = "Search".to_string();
+        web_search.parameters = vec![required_string_parameter("query", "Search query")];
+        let mut web_fetch = test_tool_manifest("web_fetch", None);
+        web_fetch.description = "Fetch".to_string();
+        manifest.tools = vec![web_search, web_fetch];
+        let skill = load_wasm_skill(&manifest, None);
 
         let defs = skill.tool_definitions();
         assert_eq!(defs.len(), 2);
@@ -941,25 +955,11 @@ mod tests {
     #[test]
     fn wasm_skill_reports_manifest_authority_surface() {
         let mut manifest = test_manifest("browser");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "web_search".to_string(),
-            description: "Search".to_string(),
-            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-            routing: None,
-            direct_utility: false,
-            trigger_patterns: vec![],
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "query".to_string(),
-                kind: "string".to_string(),
-                description: "Search query".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut web_search = test_tool_manifest("web_search", None);
+        web_search.description = "Search".to_string();
+        web_search.parameters = vec![required_string_parameter("query", "Search query")];
+        manifest.tools = vec![web_search];
+        let skill = load_wasm_skill(&manifest, None);
         let call = ToolCall {
             id: "call_1".to_string(),
             name: "web_search".to_string(),
@@ -976,36 +976,19 @@ mod tests {
     fn wasm_skill_surfaces_only_route_capable_tools() {
         let mut manifest = test_manifest("browser");
         manifest.tools = vec![
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_fetch".to_string(),
-                description: "Fetch".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
-                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
-                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
-                    auth_mode: fx_core::tool_routing::RouteAuthMode::None,
-                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+            test_tool_manifest(
+                "web_fetch",
+                Some(ToolRoutingMetadata {
+                    resource_kinds: vec![ResourceKind::GenericUrl],
+                    operations: vec![RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: ArtifactStrategy::DirectFetch,
                     fallback_rank: 100,
                 }),
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![],
-            },
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_search".to_string(),
-                description: "Search".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                routing: None,
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![],
-            },
+            ),
+            test_tool_manifest("web_search", None),
         ];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let skill = load_wasm_skill(&manifest, None);
 
         let routing = skill.routing_tools();
         assert_eq!(routing.len(), 1);
@@ -1016,28 +999,21 @@ mod tests {
     #[test]
     fn wasm_skill_marks_credential_backed_routes_not_ready_without_credential() {
         let mut manifest = test_manifest("github");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "view_pr".to_string(),
-            description: "View pull request".to_string(),
-            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-            routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
-                resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
-                operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
-                auth_mode: fx_core::tool_routing::RouteAuthMode::CredentialRequired {
+        let mut view_pr = test_tool_manifest(
+            "view_pr",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GitHubPullRequest],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::CredentialRequired {
                     key: "github_token".to_string(),
                 },
-                artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                artifact_strategy: ArtifactStrategy::DirectFetch,
                 fallback_rank: 10,
             }),
-            direct_utility: false,
-            trigger_patterns: vec![],
-            parameters: vec![],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        );
+        view_pr.description = "View pull request".to_string();
+        manifest.tools = vec![view_pr];
+        let skill = load_wasm_skill(&manifest, None);
 
         let routing = skill.routing_tools();
         assert_eq!(routing.len(), 1);
@@ -1052,30 +1028,23 @@ mod tests {
     #[test]
     fn wasm_skill_marks_credential_backed_routes_ready_with_scoped_or_global_credential() {
         let mut manifest = test_manifest("github");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "view_pr".to_string(),
-            description: "View pull request".to_string(),
-            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-            routing: Some(fx_core::tool_routing::ToolRoutingMetadata {
-                resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
-                operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
-                auth_mode: fx_core::tool_routing::RouteAuthMode::CredentialRequired {
+        let mut view_pr = test_tool_manifest(
+            "view_pr",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GitHubPullRequest],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::CredentialRequired {
                     key: "github_token".to_string(),
                 },
-                artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                artifact_strategy: ArtifactStrategy::DirectFetch,
                 fallback_rank: 10,
             }),
-            direct_utility: false,
-            trigger_patterns: vec![],
-            parameters: vec![],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
+        );
+        view_pr.description = "View pull request".to_string();
+        manifest.tools = vec![view_pr];
         let provider = MockCredentialProvider::default()
             .with_credential("skill:github:github_token", "scoped_token");
-        let skill = WasmSkill::new(loaded, Some(Arc::new(provider))).expect("create");
+        let skill = load_wasm_skill(&manifest, Some(Arc::new(provider)));
 
         let routing = skill.routing_tools();
         assert_eq!(routing.len(), 1);
@@ -1083,28 +1052,39 @@ mod tests {
         assert_eq!(routing[0].readiness.readiness_reason, None);
     }
 
+    #[test]
+    fn wasm_skill_preserves_probe_first_artifact_strategy() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![test_tool_manifest(
+            "web_screenshot",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GenericUrl],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::None,
+                artifact_strategy: ArtifactStrategy::ProbeFirst,
+                fallback_rank: 100,
+            }),
+        )];
+        let skill = load_wasm_skill(&manifest, None);
+
+        let routing = skill.routing_tools();
+        assert_eq!(
+            routing[0].metadata.artifact_strategy,
+            ArtifactStrategy::ProbeFirst
+        );
+    }
+
     #[tokio::test]
     async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
         let mut manifest = test_manifest("weather");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "weather".to_string(),
-            description: "Weather".to_string(),
-            authority_surface: None,
-            routing: None,
-            direct_utility: true,
-            trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "location".to_string(),
-                kind: "string".to_string(),
-                description: "City or location".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut weather = test_tool_manifest("weather", None);
+        weather.description = "Weather".to_string();
+        weather.authority_surface = None;
+        weather.direct_utility = true;
+        weather.trigger_patterns = vec!["weather".to_string(), "forecast".to_string()];
+        weather.parameters = vec![required_string_parameter("location", "City or location")];
+        manifest.tools = vec![weather];
+        let skill = load_wasm_skill(&manifest, None);
 
         let defs = skill.tool_definitions();
         assert_eq!(defs[0].name, "weather");
@@ -1125,25 +1105,12 @@ mod tests {
     #[test]
     fn single_manifest_tool_keeps_structured_arguments_without_tool_wrapper() {
         let mut manifest = test_manifest("calculator");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "calculate".to_string(),
-            description: "Calculate".to_string(),
-            authority_surface: None,
-            routing: None,
-            direct_utility: false,
-            trigger_patterns: vec![],
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "expression".to_string(),
-                kind: "string".to_string(),
-                description: "Expression".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut calculate = test_tool_manifest("calculate", None);
+        calculate.description = "Calculate".to_string();
+        calculate.authority_surface = None;
+        calculate.parameters = vec![required_string_parameter("expression", "Expression")];
+        manifest.tools = vec![calculate];
+        let skill = load_wasm_skill(&manifest, None);
 
         let encoded = skill
             .encode_runtime_input("calculate", r#"{"expression":"2 + 2"}"#)
@@ -1157,41 +1124,16 @@ mod tests {
     #[test]
     fn multi_tool_manifest_inserts_explicit_tool_name_for_runtime_routing() {
         let mut manifest = test_manifest("canvas");
-        manifest.tools = vec![
-            fx_skills::manifest::SkillToolManifest {
-                name: "render_table".to_string(),
-                description: "Render table".to_string(),
-                authority_surface: None,
-                routing: None,
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "headers".to_string(),
-                    kind: "string".to_string(),
-                    description: "Headers".to_string(),
-                    required: true,
-                }],
-            },
-            fx_skills::manifest::SkillToolManifest {
-                name: "render_chart".to_string(),
-                description: "Render chart".to_string(),
-                authority_surface: None,
-                routing: None,
-                direct_utility: false,
-                trigger_patterns: vec![],
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "data".to_string(),
-                    kind: "string".to_string(),
-                    description: "Data".to_string(),
-                    required: true,
-                }],
-            },
-        ];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut render_table = test_tool_manifest("render_table", None);
+        render_table.description = "Render table".to_string();
+        render_table.authority_surface = None;
+        render_table.parameters = vec![required_string_parameter("headers", "Headers")];
+        let mut render_chart = test_tool_manifest("render_chart", None);
+        render_chart.description = "Render chart".to_string();
+        render_chart.authority_surface = None;
+        render_chart.parameters = vec![required_string_parameter("data", "Data")];
+        manifest.tools = vec![render_table, render_chart];
+        let skill = load_wasm_skill(&manifest, None);
 
         let encoded = skill
             .encode_runtime_input("render_table", r#"{"headers":"Name,Score"}"#)

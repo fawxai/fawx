@@ -564,6 +564,7 @@ fn validate_tool_routing(tool_name: &str, routing: &ToolRoutingMetadata) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::tool_routing::{ArtifactStrategy, ResourceKind, RouteOperation};
     use std::fs;
     use std::path::PathBuf;
 
@@ -718,6 +719,38 @@ routing = { resource_kinds = ["generic_url"], operations = ["fetch"], auth_mode 
             fx_core::tool_routing::ArtifactStrategy::DirectFetch
         );
         assert_eq!(routing.fallback_rank, 100);
+    }
+
+    #[test]
+    fn test_parse_manifest_with_probe_first_routing_metadata() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "web_screenshot"
+description = "Capture a page screenshot"
+
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["fetch"]
+artifact_strategy = "probe_first"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
+"#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let routing = manifest.tools[0].routing.clone().expect("routing");
+
+        assert_eq!(routing.resource_kinds, vec![ResourceKind::GenericUrl]);
+        assert_eq!(routing.operations, vec![RouteOperation::Fetch]);
+        assert_eq!(routing.artifact_strategy, ArtifactStrategy::ProbeFirst);
     }
 
     #[test]

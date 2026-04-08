@@ -9,7 +9,16 @@ entry_point = "run"
 [[tools]]
 name = "create_pr"
 description = "Create a GitHub pull request"
-routing = { resource_kinds = ["github_repository"], operations = ["create"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_repository"]
+operations = ["create"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -56,7 +65,16 @@ required = false
 [[tools]]
 name = "comment_pr"
 description = "Add a comment to a GitHub pull request"
-routing = { resource_kinds = ["github_pull_request"], operations = ["comment"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["comment"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -85,7 +103,16 @@ required = true
 [[tools]]
 name = "list_prs"
 description = "List GitHub pull requests for a repository"
-routing = { resource_kinds = ["github_repository"], operations = ["list"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_repository"]
+operations = ["list"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -114,7 +141,16 @@ required = false
 [[tools]]
 name = "view_pr"
 description = "View a GitHub pull request with details"
-routing = { resource_kinds = ["github_pull_request"], operations = ["fetch"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["fetch"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -137,7 +173,16 @@ required = true
 [[tools]]
 name = "list_issues"
 description = "List GitHub issues for a repository"
-routing = { resource_kinds = ["github_repository", "github_issue"], operations = ["list"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_repository", "github_issue"]
+operations = ["list"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"
@@ -172,7 +217,16 @@ required = false
 [[tools]]
 name = "create_issue"
 description = "Create a GitHub issue"
-routing = { resource_kinds = ["github_repository", "github_issue"], operations = ["create"], auth_mode = { kind = "credential_required", key = "github_token" }, artifact_strategy = "direct_fetch", fallback_rank = 10 }
+
+[tools.routing]
+resource_kinds = ["github_repository", "github_issue"]
+operations = ["create"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
 
 [[tools.parameters]]
 name = "owner"

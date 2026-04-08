@@ -690,6 +690,18 @@ pub(crate) fn open_credential_store(data_dir: &Path) -> Result<SharedCredentialS
     .map(Arc::new)
 }
 
+pub(crate) fn credential_provider_from_store(
+    data_dir: &Path,
+    credential_store: SharedCredentialStore,
+    token_broker: Option<SharedTokenBroker>,
+) -> Arc<dyn CredentialProvider> {
+    Arc::new(CredentialStoreBridge {
+        data_dir: data_dir.to_path_buf(),
+        store: credential_store,
+        token_broker,
+    }) as Arc<dyn CredentialProvider>
+}
+
 pub(crate) fn build_token_broker(
     config: &FawxConfig,
     credential_store: Option<&SharedCredentialStore>,
@@ -1053,11 +1065,11 @@ fn build_skill_registry(
 
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
-            Arc::new(CredentialStoreBridge {
-                data_dir: data_dir.to_path_buf(),
-                store: Arc::clone(store),
-                token_broker: options.token_broker.clone(),
-            }) as Arc<dyn CredentialProvider>
+            credential_provider_from_store(
+                data_dir,
+                Arc::clone(store),
+                options.token_broker.clone(),
+            )
         });
 
     // Wire GitSkill with GitHub token provider from credential bridge.

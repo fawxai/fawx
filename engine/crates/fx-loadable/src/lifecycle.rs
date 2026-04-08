@@ -360,6 +360,13 @@ impl SkillLifecycleManager {
 }
 
 pub fn read_statuses(skills_dir: &Path) -> Result<Vec<SkillStatusSummary>, LifecycleError> {
+    read_statuses_with_credential_provider(skills_dir, None)
+}
+
+pub fn read_statuses_with_credential_provider(
+    skills_dir: &Path,
+    credential_provider: Option<&dyn CredentialProvider>,
+) -> Result<Vec<SkillStatusSummary>, LifecycleError> {
     let mut statuses = Vec::new();
     for skill_dir in skill_source_dirs(skills_dir)? {
         let name = skill_dir_name(&skill_dir)?;
@@ -368,7 +375,7 @@ pub fn read_statuses(skills_dir: &Path) -> Result<Vec<SkillStatusSummary>, Lifec
         };
         let manifest = crate::wasm_skill::read_manifest(&skill_dir)?;
         let description = manifest.description.clone();
-        let routing_tools = manifest_routing_tools(&manifest, None);
+        let routing_tools = manifest_routing_tools(&manifest, credential_provider);
         let tool_names = activation
             .revision
             .tool_contracts
@@ -733,6 +740,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use zeroize::Zeroizing;
 
     fn new_manager(skills_dir: &Path) -> SkillLifecycleManager {
         SkillLifecycleManager::new(SkillLifecycleConfig {
@@ -741,6 +749,26 @@ mod tests {
             credential_provider: None,
             signature_policy: SignaturePolicy::default(),
         })
+    }
+
+    #[derive(Default)]
+    struct MockCredentialProvider {
+        credentials: HashMap<String, String>,
+    }
+
+    impl MockCredentialProvider {
+        fn with_credential(mut self, key: &str, value: &str) -> Self {
+            self.credentials.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl CredentialProvider for MockCredentialProvider {
+        fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
+            self.credentials
+                .get(key)
+                .map(|value| Zeroizing::new(value.clone()))
+        }
     }
 
     #[test]
@@ -926,6 +954,57 @@ mod tests {
         assert_ne!(
             active.revision.manifest_hash,
             initial.revision.manifest_hash
+        );
+    }
+
+    #[test]
+    fn read_statuses_with_credential_provider_hydrates_routing_readiness() {
+        let tmp = TempDir::new().expect("tempdir");
+        let skill_dir = tmp.path().join("github");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("manifest.toml"),
+            r#"
+name = "github"
+version = "1.0.0"
+description = "GitHub skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "view_pr"
+description = "View a pull request"
+
+[tools.routing]
+resource_kinds = ["github_pull_request"]
+operations = ["fetch"]
+artifact_strategy = "direct_fetch"
+fallback_rank = 10
+
+[tools.routing.auth_mode]
+kind = "credential_required"
+key = "github_token"
+"#,
+        )
+        .expect("write manifest");
+        fs::write(skill_dir.join("github.wasm"), invocable_wasm_bytes()).expect("write wasm");
+
+        let mut manager = new_manager(tmp.path());
+        manager.load_startup_skills().expect("load startup skills");
+
+        let provider =
+            MockCredentialProvider::default().with_credential("github_token", "ghp_test_token");
+        let statuses =
+            read_statuses_with_credential_provider(tmp.path(), Some(&provider)).expect("statuses");
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].routing_tools.len(), 1);
+        assert_eq!(statuses[0].routing_tools[0].tool_name, "view_pr");
+        assert!(statuses[0].routing_tools[0].readiness.ready);
+        assert_eq!(
+            statuses[0].routing_tools[0].readiness.readiness_reason,
+            None
         );
     }
 

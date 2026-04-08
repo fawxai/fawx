@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// External resource classes used by the route planner control plane.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     GenericUrl,
@@ -14,7 +14,7 @@ pub enum ResourceKind {
 }
 
 /// Supported operations over a routed external resource.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteOperation {
     Fetch,
@@ -24,7 +24,7 @@ pub enum RouteOperation {
 }
 
 /// Authentication contract for a route-capable tool.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RouteAuthMode {
     None,
@@ -32,7 +32,7 @@ pub enum RouteAuthMode {
 }
 
 /// Artifact retrieval strategy exposed to the control plane.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactStrategy {
     DirectFetch,
@@ -46,6 +46,7 @@ pub struct ToolRoutingMetadata {
     pub operations: Vec<RouteOperation>,
     pub auth_mode: RouteAuthMode,
     pub artifact_strategy: ArtifactStrategy,
+    /// Lower values win first when multiple tools can satisfy the same route.
     pub fallback_rank: u16,
 }
 
